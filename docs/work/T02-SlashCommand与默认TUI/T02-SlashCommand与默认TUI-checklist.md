@@ -49,28 +49,28 @@
 
 ## Task 5：实现 Command Registry 与 Parser
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_command_registry.py tests/test_command_parser.py`，全部通过。
-- [ ] 分别注册 canonical/canonical、alias/canonical、canonical/alias、alias/alias 和重复 alias 冲突，全部被拒绝且原 Registry 不变。
-- [ ] 注册含大写、空白、斜杠或非法字符的命令名和 alias，全部被拒绝；解析调用名时大小写不敏感并得到小写 canonical。
-- [ ] 通过 alias resolve 得到同一个 canonical Command Definition，`list_commands()` 保持稳定注册顺序和隐藏状态。
-- [ ] 普通文本返回非命令；`/` 只标记 Slash 输入但不产生可执行调用；未知命令产生结构化未知结果。
-- [ ] 解析 `/review 关注并发安全`，query 字节内容保持为 `关注并发安全`。
-- [ ] 解析 `/do "target one" -- 请实现并测试`，args 为一个带空格参数，query 保持原始文本。
-- [ ] 模拟引号不闭合、参数缺失和多余参数，得到可区分 Usage 错误而非执行异常。
-- [ ] 执行 `rg -n "textual|mewcode|firstcoder|SkillLoader" src/uthcode/application/commands`，返回 0 条运行时依赖或未来 Loader。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_command_registry.py tests/test_command_parser.py`，全部通过。
+- [x] 分别注册 canonical/canonical、alias/canonical、canonical/alias、alias/alias 和重复 alias 冲突，全部被拒绝且原 Registry 不变。
+- [x] 注册含大写、空白、斜杠或非法字符的命令名和 alias，全部被拒绝；解析调用名时大小写不敏感并得到小写 canonical。
+- [x] 通过 alias resolve 得到同一个 canonical Command Definition，`list_commands()` 保持稳定注册顺序和隐藏状态。
+- [x] 普通文本返回非命令；`/` 只标记 Slash 输入但不产生可执行调用；未知命令产生结构化未知结果。
+- [x] 解析 `/review 关注并发安全`，query 字节内容保持为 `关注并发安全`。
+- [x] 解析 `/do "target one" -- 请实现并测试`，args 为一个带空格参数，query 保持原始文本。
+- [x] 模拟引号不闭合、参数缺失和多余参数，得到可区分 Usage 错误而非执行异常。
+- [x] 执行 `rg -n "textual|mewcode|firstcoder|SkillLoader" src/uthcode/application/commands`，返回 0 条运行时依赖或未来 Loader。
 
 ## Task 6：实现 Completion、Dispatcher 与内置命令
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_command_completion.py tests/test_command_dispatcher.py`，全部通过。
-- [ ] 输入 `/` 得到全部非隐藏 canonical 命令，不受八项上限截断，`/help` 恰好出现一次且固定最后。
-- [ ] 输入 `/c` 得到 clear、compact 及 alias 匹配项，按 canonical 去重，`/help` 仍恰好一次且固定最后。
-- [ ] 未实现命令在候选中带未实现标记；命令解析完成后可得到 Registry 定义的 Usage 和参数提示。
-- [ ] 静态参数命令返回静态候选；`/model` 动态候选与 Application Model Catalog 的 Model Ref 集合完全一致。
-- [ ] 使用合成 LOCAL、LOCAL_UI、PROMPT 命令分别得到 output、结构化 ui_action、prompt，三者字段不混用。
-- [ ] `/help` 总帮助和单命令帮助、alias、Usage、实现状态均随测试 Registry 变化，不依赖第二份列表。
-- [ ] `/models` 与 `/m` resolve 到 canonical `/model`，Registry 中不存在 canonical `models`。
-- [ ] 分别分发 config、compact、plan、new、resume、login、memory、dream、do、review，均返回 `功能未实现：/<canonical>` 和 NOT_IMPLEMENTED 状态。
-- [ ] `/clear`、无参数 `/model`、`/quit` 分别返回 Clear Transcript、Open Model Picker、Quit Interface；Application 命令模块不导入 Textual。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_command_completion.py tests/test_command_dispatcher.py`，全部通过。
+- [x] 输入 `/` 得到全部非隐藏 canonical 命令，不受八项上限截断，`/help` 恰好出现一次且固定最后。
+- [x] 输入 `/c` 得到 clear、compact 及 alias 匹配项，按 canonical 去重，`/help` 仍恰好一次且固定最后。
+- [x] 未实现命令在候选中带未实现标记；命令解析完成后可得到 Registry 定义的 Usage 和参数提示。
+- [x] 静态参数命令返回静态候选；`/model` 动态候选与 Application Model Catalog 的 Model Ref 集合完全一致。
+- [x] 使用合成 LOCAL、LOCAL_UI、PROMPT 命令分别得到 output、结构化 ui_action、prompt，三者字段不混用。
+- [x] `/help` 总帮助和单命令帮助、alias、Usage、实现状态均随测试 Registry 变化，不依赖第二份列表。
+- [x] `/models` 与 `/m` resolve 到 canonical `/model`，Registry 中不存在 canonical `models`。
+- [x] 分别分发 config、compact、plan、new、resume、login、memory、dream、do、review，均返回 `功能未实现：/<canonical>` 和 NOT_IMPLEMENTED 状态。
+- [x] `/clear`、无参数 `/model`、`/quit` 分别返回 Clear Transcript、Open Model Picker、Quit Interface；Application 命令模块不导入 Textual。
 
 ## Task 7：实现默认 CLI 与 Headless exec
 
