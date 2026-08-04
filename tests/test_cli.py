@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+from uthcode.application import (
+    EffectiveConfig,
+    GenerationCancelled,
+    GenerationCompleted,
+    GenerationRequest,
+    LaunchOptions,
+    Message,
+    ProviderKind,
+    ProviderResponse,
+    TextDelta,
+    TextPart,
+    UthCodeApplication,
+    Usage,
+)
+from uthcode.core.provider import FinishReason, NetworkError
+from uthcode.interfaces.cli import main
+from uthcode.integrations.providers.fake import FakeProvider
+
+
+def _completed(text: str = "done") -> GenerationCompleted:
+    return GenerationCompleted(
+        ProviderResponse(
+            message=Message("assistant", (TextPart(text),)),
+            usage=Usage(),
+            finish_reason=FinishReason.STOP,
+        )
+    )
+
+
+def _config(model: str = "fake/ref") -> EffectiveConfig:
+    return EffectiveConfig.single_model(
+        model,
+        provider_profile_id="fake",
+        provider_kind=ProviderKind.FAKE,
+        remote_model_id="fake-model",
+    )
+
+
+def _application(
+    *,
+    events: tuple[object, ...] = (_completed("fake response"),),
+    error: NetworkError | None = None,
+) -> UthCodeApplication:
+    return UthCodeApplication(
+        FakeProvider(
+            events=events,  # type: ignore[arg-type]
+            error=error,
+        )
+    )
+
+
+def _injected_main(
+    argv: list[str],
+    application: UthCodeApplication,
+    *,
+    stdin: io.StringIO | None = None,
+) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result = main(
+        argv,
+        config_loader=lambda _options: _config(),
+        application_factory=lambda _config: application,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    return result, stdout.getvalue(), stderr.getvalue()
+
+
+def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> None:
+    application = _application()
+    seen: list[UthCodeApplication] = []
+
+    result = main(
+        [],
+        config_loader=lambda _options: _config(),
+        application_factory=lambda _config: application,
+        tui_runner=lambda received: seen.append(received) or 17,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert result == 17
+    assert seen == [application]
+
+
+def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
+    application = _application(events=(TextDelta("hello"), _completed("ignored")))
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 0
+    assert stdout == "hello\n"
+    assert stderr == ""
+    request = application.provider.recorded_requests[0]
+    assert request.messages[0].parts[0].text == "hello"
+
+
+def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
+    application = _application()
+
+    result, stdout, stderr = _injected_main(
+        ["exec"],
+        application,
+        stdin=io.StringIO("/help\n"),
+    )
+
+    assert result == 0
+    assert stdout == "fake response\n"
+    assert stderr == ""
+    assert application.provider.recorded_requests[0].messages[0].parts[0].text == "/help"
+
+
+def test_exec_rejects_empty_prompt_without_creating_a_request() -> None:
+    application = _application()
+    result, stdout, stderr = _injected_main(["exec"], application, stdin=io.StringIO("  \n"))
+
+    assert result == 2
+    assert stdout == ""
+    assert "prompt" in stderr
+    assert application.provider.recorded_requests == ()
+
+
+def test_exec_classifies_provider_errors_and_cancellation() -> None:
+    secret = "sk-live-secret"
+    failed = _application(events=(), error=NetworkError(secret))
+    result, stdout, stderr = _injected_main(["exec", "hello"], failed)
+    assert result == 1
+    assert stdout == ""
+    assert "provider error" in stderr
+    assert secret not in stderr
+
+    class CancelledApplication(UthCodeApplication):
+        async def stream_generation(self, request: GenerationRequest):
+            del request
+            raise GenerationCancelled()
+            yield  # pragma: no cover
+
+    cancelled = CancelledApplication(FakeProvider())
+    result, stdout, stderr = _injected_main(["exec", "hello"], cancelled)
+    assert result == 130
+    assert stdout == ""
+    assert "cancelled" in stderr
+
+
+@pytest.mark.parametrize("arguments", [["exec", "hello"], []])
+def test_provider_factory_errors_are_redacted_for_all_cli_entries(
+    arguments: list[str],
+) -> None:
+    secret = "sk-factory-secret"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    def fail_factory(_configuration: EffectiveConfig) -> UthCodeApplication:
+        raise NetworkError(secret)
+
+    result = main(
+        arguments,
+        config_loader=lambda _options: _config(),
+        application_factory=fail_factory,
+        tui_runner=lambda _application: 0,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert stdout.getvalue() == ""
+    assert "provider error" in stderr.getvalue()
+    assert secret not in stderr.getvalue()
+
+
+def test_exec_cwd_and_model_are_process_overrides_only(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    user_config = home / ".uthcode" / "config.toml"
+    user_config.parent.mkdir(parents=True)
+    original = '''model = "fake/ref"\n\n[providers.fake]\nkind = "fake"\n\n[models."fake/ref"]\nprovider = "fake"\nmodel = "fake-model"\n'''
+    user_config.write_text(original, encoding="utf-8")
+
+    captured: list[LaunchOptions] = []
+
+    def loader(options: LaunchOptions) -> EffectiveConfig:
+        captured.append(options)
+        return _config()
+
+    application = _application()
+    result = main(
+        ["exec", "--cwd", str(project), "--model", "fake/ref", "hello"],
+        config_loader=loader,
+        application_factory=lambda _config: application,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert result == 0
+    assert captured[0].cwd == project
+    assert captured[0].model == "fake/ref"
+    assert user_config.read_text(encoding="utf-8") == original
+
+
+def test_module_entry_import_does_not_require_a_textual_app_for_exec() -> None:
+    script = """
+import io
+import sys
+from uthcode.application import EffectiveConfig, ProviderKind, create_application
+from uthcode.interfaces.cli import main
+
+configuration = EffectiveConfig.single_model('fake/ref', provider_kind=ProviderKind.FAKE)
+result = main(
+    ['exec', 'hello'],
+    config_loader=lambda _options: configuration,
+    application_factory=create_application,
+    stdout=io.StringIO(),
+    stderr=io.StringIO(),
+)
+assert result == 0
+assert 'uthcode.interfaces.tui' not in sys.modules
+"""
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _subprocess_environment(home: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    return environment
+
+
+def _write_fake_user_config(home: Path) -> Path:
+    path = home / ".uthcode" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '''model = "local/echo"\n\n[providers.local]\nkind = "fake"\n\n[models."local/echo"]\nprovider = "local"\nmodel = "echo"\n''',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_formal_module_exec_uses_fake_config_without_tui_or_network(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_fake_user_config(home)
+    result = subprocess.run(
+        [sys.executable, "-m", "uthcode", "exec", "hello"],
+        cwd=tmp_path,
+        env=_subprocess_environment(home),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "fake response\n"
+    assert result.stderr == ""
+    assert "\x1b[" not in result.stdout + result.stderr
+
+
+def test_formal_module_exec_first_run_creates_template_and_stops(tmp_path: Path) -> None:
+    home = tmp_path / "empty-home"
+    result = subprocess.run(
+        [sys.executable, "-m", "uthcode", "exec", "hello"],
+        cwd=tmp_path,
+        env=_subprocess_environment(home),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    template = home / ".uthcode" / "config.toml"
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert str(template.resolve()) in result.stderr
+    assert template.is_file()
+    assert "sk-" not in template.read_text(encoding="utf-8")
+
+
+def test_formal_entries_reject_project_provider_data(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_fake_user_config(home)
+    root = tmp_path / "repo"
+    cwd = root / "nested"
+    cwd.mkdir(parents=True)
+    (root / ".git").mkdir()
+    project_config = root / ".uthcode" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        '[providers.evil]\nkind = "fake"\n',
+        encoding="utf-8",
+    )
+
+    for arguments in (
+        ["exec", "hello"],
+        [],
+    ):
+        result = subprocess.run(
+            [sys.executable, "-m", "uthcode", *arguments],
+            cwd=cwd,
+            env=_subprocess_environment(home),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert str(project_config.resolve()) in result.stderr
+        assert "providers" in result.stderr

@@ -43,15 +43,26 @@ def pytest_runtest_call(item: pytest.Item) -> Any:
         yield
         return
 
+    original_socket_connect = socket.socket.connect
+
     def blocked(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("real network access is forbidden in offline tests")
+
+    def blocked_socket_connect(sock: socket.socket, address: Any) -> Any:
+        # Windows' default asyncio loop uses a loopback socket pair during
+        # construction.  That is an in-process transport, not a provider
+        # network request; keep external connections blocked.
+        host = address[0] if isinstance(address, tuple) and address else None
+        if host in {"127.0.0.1", "::1", "localhost"}:
+            return original_socket_connect(sock, address)
+        return blocked(address)
 
     async def blocked_async(*_args: Any, **_kwargs: Any) -> None:
         blocked()
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(socket, "create_connection", blocked)
-    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect", blocked_socket_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", blocked)
     monkeypatch.setattr(asyncio, "open_connection", blocked_async)
     try:

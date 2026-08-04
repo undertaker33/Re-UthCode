@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,15 @@ async def test_generation_handles_cancel_independently_and_record_requests() -> 
     assert len(provider.recorded_requests) == 2
 
 
+def test_generation_handles_do_not_accept_shared_external_tokens() -> None:
+    assert "cancellation" not in inspect.signature(
+        UthCodeApplication.start_generation
+    ).parameters
+    assert "cancellation" not in inspect.signature(
+        UthCodeApplication.stream_generation
+    ).parameters
+
+
 @pytest.mark.asyncio
 async def test_stream_generation_is_a_convenience_over_generation_handle() -> None:
     class RecordingApplication(UthCodeApplication):
@@ -82,8 +92,8 @@ async def test_stream_generation_is_a_convenience_over_generation_handle() -> No
             super().__init__(provider)
             self.handles: list[GenerationHandle] = []
 
-        def start_generation(self, request, *, cancellation=None):  # type: ignore[no-untyped-def]
-            handle = super().start_generation(request, cancellation=cancellation)
+        def start_generation(self, request):  # type: ignore[no-untyped-def]
+            handle = super().start_generation(request)
             self.handles.append(handle)
             return handle
 

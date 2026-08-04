@@ -1,78 +1,123 @@
 # UthCode
 
-Re:UthCode is being rebuilt as a headless, embeddable coding-agent core.
+Re:UthCode is a small, embeddable coding-agent application with a single
+message Application API, a non-interactive CLI, and a default Textual TUI.
+This delivery is offline-testable and uses the UthCode-owned Provider contract
+with Fake, Anthropic, OpenAI Responses, and OpenAI-compatible integrations.
 
-This delivery provides the installable Python package, the UthCode-owned
-Provider contract, a formal headless Application composition root, a
-deterministic Fake Provider, and protocol integrations for Anthropic Messages,
-OpenAI Responses, and OpenAI-compatible Chat Completions.
-
-It deliberately does not provide a CLI, TUI, agent loop, tool execution,
-permissions, persistence, or session management.
-
-## Development environment
+## Install
 
 Use the project Conda environment:
 
 ```powershell
 conda activate re-uthcode
 python -m pip install -e . --group dev
+python -m pip check
+```
+
+The default test suite is offline:
+
+```powershell
 pytest -q
 ```
 
-The default test suite is offline. The three DeepSeek live smoke tests use
-`deepseek-v4-flash`, make two requests per protocol (six requests total), and
-may incur provider charges. Run them only after explicit confirmation of the
-network and cost impact, and set the key yourself in the current PowerShell
-session:
+The three protocol live tests are explicitly skipped unless both a live flag
+and a user-supplied API key are present. They are not part of the default
+verification flow.
 
-```powershell
-$env:DEEPSEEK_API_KEY = '<用户自行填写>'
-$env:UTHCODE_RUN_LIVE = '1'
-conda run -n re-uthcode pytest -q -m live
-Remove-Item Env:DEEPSEEK_API_KEY
-Remove-Item Env:UTHCODE_RUN_LIVE
+## First configuration
+
+UthCode reads the user configuration from `~/.uthcode/config.toml`. On the
+first run, a comment-only template is created atomically and the process
+stops. Fill in the template and run the command again.
+
+A minimal offline configuration is:
+
+```toml
+model = "local/echo"
+
+[providers.local]
+kind = "fake"
+
+[models."local/echo"]
+provider = "local"
+model = "echo"
+label = "Offline Echo"
 ```
 
-Without both the live flag and the key, live tests remain skipped. Test output
-and errors are designed not to include the key.
+Real Provider keys are read only from the environment variable named by
+`api_key_env`; key values never belong in TOML, logs, events, or output. A
+project configuration may select models and adjust non-secret model fields,
+but may not define or redirect Providers, endpoints, or secret sources.
+Inside a Git repository, project files are loaded from the repository root to
+the current directory. Outside Git, only the current directory's project file
+is considered.
 
-If the managed environment cannot write its default user-site directory,
-use a temporary writable user base for the editable install:
+## Default TUI
+
+Run without a subcommand to start the default interface:
 
 ```powershell
-$taskPythonUserBase = Join-Path $env:TEMP "re-uthcode-python-user"
-$env:PYTHONUSERBASE = $taskPythonUserBase
-python -m pip install -e . --group dev --user
+uthcode
 ```
 
-The package uses a `src` layout and can be imported as `uthcode` after an
-editable install. Root-package import does not construct a provider or make a
-network request.
+The interface contains a top bar, transcript, activity line, composer,
+command completion menu, and model picker. Ordinary input is one independent
+request; visible transcript entries are not sent as history to the next
+request. Enter sends, Shift+Enter inserts a newline, and a second Escape
+within one second cancels the active request.
 
-## Headless Application
+The implemented commands are `/help`, `/clear`, `/model` (also `/models` and
+`/m`), `/status`, and `/quit` (also `/q` and `/exit`). Registered commands
+that are not implemented remain discoverable and report a uniform
+not-implemented result. `/clear` only clears the visible transcript.
 
-The supported composition entry is `uthcode.application.create_application`.
-It constructs the configured Provider through the Integration Factory and
-returns a headless application; callers consume the Core events directly.
+## Headless execution
+
+`exec` never starts Textual and treats a leading slash as ordinary prompt
+text:
+
+```powershell
+uthcode exec "Explain this directory"
+"Explain this directory" | uthcode exec
+uthcode exec --cwd C:\work\project --model local/echo "hello"
+```
+
+Text deltas are written to stdout. Diagnostics are written to stderr. Exit
+codes are `0` for success, `1` for Provider failure, `2` for configuration or
+usage failure, and `130` for cancellation.
+
+## Embedded Python API
+
+The same Effective Config/Application composition is available without the
+CLI or TUI:
 
 ```python
 import asyncio
 
-from uthcode.application import EffectiveConfig, ProviderKind, create_application
-from uthcode.core import GenerationCompleted, GenerationRequest, Message, TextPart
+from uthcode.application import (
+    EffectiveConfig,
+    GenerationCompleted,
+    GenerationRequest,
+    Message,
+    ProviderKind,
+    TextPart,
+    create_application,
+)
 
 
 async def main() -> None:
     application = create_application(
         EffectiveConfig.single_model(
-            "fake/ref",
-            provider_profile_id="fake",
+            "local/echo",
+            provider_profile_id="local",
             provider_kind=ProviderKind.FAKE,
-            remote_model_id="fake-model",
+            remote_model_id="echo",
         )
     )
-    request = GenerationRequest(messages=(Message("user", (TextPart("hello"),)),))
+    request = GenerationRequest(
+        messages=(Message("user", (TextPart("hello"),)),)
+    )
     events = [event async for event in application.stream_generation(request)]
     assert isinstance(events[-1], GenerationCompleted)
 
@@ -80,33 +125,5 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Real Providers read their API key only from the named process environment
-variable. Construction itself does not make a network request:
-
-```python
-real_application = create_application(
-    EffectiveConfig.single_model(
-        "anthropic/your-model",
-        provider_profile_id="anthropic",
-        provider_kind=ProviderKind.ANTHROPIC,
-        remote_model_id="your-model",
-        api_key_env="DEEPSEEK_API_KEY",
-        base_url="https://your-anthropic-compatible-endpoint",
-    )
-)
-```
-
-An OpenAI-compatible Provider also requires an explicit `base_url` in its
-configuration. Do not put a real key in `.env.example`, source code, or
-configuration files.
-
-## Scope
-
-This delivery includes the installable skeleton, UthCode-owned Provider
-contract, formal `create_application` headless entry, deterministic Fake
-Provider, and the three protocol integrations listed above. The default test
-suite is offline, with the six-request DeepSeek live smoke suite available
-only through the explicitly authorized `live` marker.
-
-CLI, TUI, agent loop, tool execution, permissions, persistence, and session
-management are outside this delivery.
+`start_generation()` returns an independently cancellable `GenerationHandle`;
+`stream_generation()` is the convenient one-request form.

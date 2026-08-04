@@ -4,10 +4,26 @@ from __future__ import annotations
 
 from importlib import import_module
 from os import PathLike
+from pathlib import Path
 from typing import Any
 
 from .configuration import EffectiveConfig, LaunchOptions, ModelProfile, ProviderProfile
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
+
+
+class ConfigurationError(ValueError):
+    """A launch configuration could not be loaded safely."""
+
+
+class ConfigurationInitializationRequired(ConfigurationError):
+    """The user must fill in the first-run configuration template."""
+
+    def __init__(self, template_path: str | Path) -> None:
+        self.template_path = Path(template_path)
+        super().__init__(
+            "configuration template created; fill it in and run again: "
+            f"{self.template_path}"
+        )
 
 
 def _provider_config(
@@ -93,7 +109,25 @@ def load_effective_config(
     loader_module = import_module("uthcode.integrations.config.loader")
     load = loader_module.load_effective_config
 
-    return load(options, cwd=cwd, home=home, model=model)
+    try:
+        return load(options, cwd=cwd, home=home, model=model)
+    except Exception as exc:
+        initialization_error = getattr(
+            loader_module,
+            "ConfigurationInitializationRequired",
+            None,
+        )
+        if initialization_error is not None and isinstance(exc, initialization_error):
+            raise ConfigurationInitializationRequired(exc.template_path) from None
+        configuration_error = getattr(loader_module, "ConfigurationError", None)
+        if configuration_error is not None and isinstance(exc, configuration_error):
+            raise ConfigurationError(str(exc)) from None
+        raise
 
 
-__all__ = ["create_application", "load_effective_config"]
+__all__ = [
+    "ConfigurationError",
+    "ConfigurationInitializationRequired",
+    "create_application",
+    "load_effective_config",
+]

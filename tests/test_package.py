@@ -11,11 +11,13 @@ def test_root_package_exposes_version_without_provider_side_effects() -> None:
     assert "pydantic_ai" not in package.__dict__
 
 
-def test_task_one_has_only_the_root_package() -> None:
+def test_root_package_keeps_composition_in_subpackages() -> None:
     package_root = Path(__file__).parents[1] / "src" / "uthcode"
 
     assert (package_root / "__init__.py").is_file()
     assert not any(
         (package_root / name).is_file()
-        for name in ("application.py", "config.py", "runtime.py", "cli.py", "__main__.py")
+        for name in ("application.py", "config.py", "runtime.py", "cli.py")
     )
+    assert (package_root / "__main__.py").is_file()
+    assert (package_root / "interfaces" / "cli.py").is_file()
