@@ -10,6 +10,10 @@
 
 @docs/work/README.md
 
+## 开发环境
+
+使用 conda activate re-uthcode环境
+
 ## 非兼容性原则
 
 Re:UthCode 不兼容旧项目及自身此前实现中的旧类、旧 API、旧数据结构和旧行为，除非当前需求明确要求保留。

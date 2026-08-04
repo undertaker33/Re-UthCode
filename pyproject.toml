@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uthcode"
+version = "0.1.0"
+description = "A headless, embeddable coding agent core."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Re:UthCode contributors" }]
+dependencies = [
+    "pydantic-ai-slim[anthropic,openai]>=2.22,<2.23",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.1,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uthcode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
