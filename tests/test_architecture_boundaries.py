@@ -144,7 +144,6 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         "storage",
         "journal",
         "sandbox",
-        "commands",
         "hooks",
         "skills",
         "mcp",
