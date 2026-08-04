@@ -2,16 +2,98 @@
 
 from __future__ import annotations
 
-from .generation import UthCodeApplication
-from uthcode.integrations.providers.config import ProviderConfig
+from importlib import import_module
+from os import PathLike
+from typing import Any
+
+from .configuration import EffectiveConfig, LaunchOptions, ModelProfile, ProviderProfile
+from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
 
 
-def create_application(config: ProviderConfig) -> UthCodeApplication:
-    """Build a Headless Application from the Integration Provider factory."""
+def _provider_config(
+    provider: ProviderProfile,
+    model: ModelProfile,
+) -> Any:
+    from uthcode.integrations.providers.config import (
+        ProviderConfig,
+        ProviderKind,
+    )
 
+    return ProviderConfig(
+        kind=ProviderKind(provider.kind.value),
+        model=model.remote_model_id,
+        api_key_env=provider.api_key_env,
+        base_url=provider.base_url,
+        max_output_tokens=model.max_output_tokens,
+    )
+
+
+def _default_builder() -> ProviderBuilder:
     from uthcode.integrations.providers.factory import create_provider
 
-    return UthCodeApplication(create_provider(config))
+    def build(provider: ProviderProfile, model: ModelProfile) -> Any:
+        return create_provider(_provider_config(provider, model))
+
+    return build
 
 
-__all__ = ["create_application"]
+def _default_writer(configuration: EffectiveConfig) -> ModelWriter | None:
+    user_sources = tuple(
+        source
+        for source in configuration.sources
+        if source.kind == "user" and source.path is not None
+    )
+    if not user_sources:
+        return None
+    path = user_sources[0].path
+    assert path is not None
+    writer_module = import_module("uthcode.integrations.config.writer")
+    write_user_model = writer_module.write_user_model
+
+    def write(model_ref: str) -> object:
+        return write_user_model(path, model_ref)
+
+    return write
+
+
+def create_application(
+    config: EffectiveConfig,
+    *,
+    provider_builder: ProviderBuilder | None = None,
+    model_writer: ModelWriter | None = None,
+) -> UthCodeApplication:
+    """Build a Headless Application from one EffectiveConfig."""
+
+    if not isinstance(config, EffectiveConfig):
+        raise TypeError("config must be EffectiveConfig")
+    builder = _default_builder() if provider_builder is None else provider_builder
+
+    provider = builder(
+        config.providers[config.current_model.provider_profile_id],
+        config.current_model,
+    )
+    writer = model_writer if model_writer is not None else _default_writer(config)
+    return UthCodeApplication(
+        provider,
+        configuration=config,
+        provider_builder=builder,
+        model_writer=writer,
+    )
+
+
+def load_effective_config(
+    options: LaunchOptions | None = None,
+    *,
+    cwd: str | PathLike[str] | None = None,
+    home: str | PathLike[str] | None = None,
+    model: str | None = None,
+) -> EffectiveConfig:
+    """Load configuration through the Integration boundary."""
+
+    loader_module = import_module("uthcode.integrations.config.loader")
+    load = loader_module.load_effective_config
+
+    return load(options, cwd=cwd, home=home, model=model)
+
+
+__all__ = ["create_application", "load_effective_config"]

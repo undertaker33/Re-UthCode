@@ -31,7 +31,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     ToolResultPart,
 )
-from uthcode.application import ProviderConfig, ProviderKind, create_application
+from uthcode.application import EffectiveConfig, ProviderKind, create_application
 from uthcode.integrations.providers.openai_compat import build_openai_compat_provider
 
 
@@ -354,9 +354,11 @@ _LIVE_ENABLED = (
 @pytest.mark.asyncio
 async def test_chat_deepseek_live_headless_text_reasoning_tools_and_continuation() -> None:
     application = create_application(
-        ProviderConfig(
-            kind=ProviderKind.OPENAI_COMPAT,
-            model="deepseek-v4-flash",
+        EffectiveConfig.single_model(
+            "deepseek/deepseek-v4-flash",
+            provider_profile_id="deepseek",
+            provider_kind=ProviderKind.OPENAI_COMPAT,
+            remote_model_id="deepseek-v4-flash",
             api_key_env="DEEPSEEK_API_KEY",
             base_url="https://api.deepseek.com",
             max_output_tokens=512,

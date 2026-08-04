@@ -1,5 +1,7 @@
 # AGENTS.md
 
+本项目没有启用uth-governance，不要走uth场景路由，除非用户显式指定
+
 ## 以下引入作为AGENTS.md重构期间临时规则
 
 @SRe-AGENTS.md

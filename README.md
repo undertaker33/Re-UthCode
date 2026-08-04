@@ -59,13 +59,18 @@ returns a headless application; callers consume the Core events directly.
 ```python
 import asyncio
 
-from uthcode.application import ProviderConfig, ProviderKind, create_application
+from uthcode.application import EffectiveConfig, ProviderKind, create_application
 from uthcode.core import GenerationCompleted, GenerationRequest, Message, TextPart
 
 
 async def main() -> None:
     application = create_application(
-        ProviderConfig(kind=ProviderKind.FAKE, model="fake-model")
+        EffectiveConfig.single_model(
+            "fake/ref",
+            provider_profile_id="fake",
+            provider_kind=ProviderKind.FAKE,
+            remote_model_id="fake-model",
+        )
     )
     request = GenerationRequest(messages=(Message("user", (TextPart("hello"),)),))
     events = [event async for event in application.stream_generation(request)]
@@ -80,9 +85,11 @@ variable. Construction itself does not make a network request:
 
 ```python
 real_application = create_application(
-    ProviderConfig(
-        kind=ProviderKind.ANTHROPIC,
-        model="your-model",
+    EffectiveConfig.single_model(
+        "anthropic/your-model",
+        provider_profile_id="anthropic",
+        provider_kind=ProviderKind.ANTHROPIC,
+        remote_model_id="your-model",
         api_key_env="DEEPSEEK_API_KEY",
         base_url="https://your-anthropic-compatible-endpoint",
     )
