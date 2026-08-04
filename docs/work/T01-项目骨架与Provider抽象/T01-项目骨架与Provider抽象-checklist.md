@@ -4,40 +4,40 @@
 
 ## Task 1：建立可安装项目骨架
 
-- [ ] 执行 `conda run -n re-uthcode python --version`，输出为 Python 3.12.x。
-- [ ] 执行 `conda run -n re-uthcode python -m pip install -e . --group dev`，editable install 成功。
-- [ ] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
-- [ ] 执行 `conda run -n re-uthcode python -c "import uthcode; print(uthcode.__version__)"`，成功输出版本且不发起网络请求。
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_package.py`，全部通过。
-- [ ] 执行 `rg --files src/uthcode`，结果中除根包文件外不存在 `core/`、`application/`、`integrations/`、`interfaces/`、`cli.py`、`__main__.py` 或 `runtime.py` 占位内容。
+- [x] 执行 `conda run -n re-uthcode python --version`，输出为 Python 3.12.x。
+- [x] 执行 `conda run -n re-uthcode python -m pip install -e . --group dev`，editable install 成功。
+- [x] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
+- [x] 执行 `conda run -n re-uthcode python -c "import uthcode; print(uthcode.__version__)"`，成功输出版本且不发起网络请求。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_package.py`，全部通过。
+- [x] 执行 `rg --files src/uthcode`，结果中除根包文件外不存在 `core/`、`application/`、`integrations/`、`interfaces/`、`cli.py`、`__main__.py` 或 `runtime.py` 占位内容。
 
 ## Task 2：定义 Provider 核心契约
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_provider_contract.py`，全部通过。
-- [ ] 测试证明请求、响应、事件和 Native Item 可 JSON round-trip，嵌套 list/dict 在构造后不可被外部修改。
-- [ ] 测试向 JSON payload 传入 SDK、Pydantic Model、集合或任意运行时对象，均被拒绝。
-- [ ] 测试构造来自不同 Provider 的 Native Item，目标 Provider 只能恢复属于自身身份的项。
-- [ ] 测试重复调用取消操作，状态转换幂等且等待者均能观察到取消。
-- [ ] 执行 `rg -n "pydantic|openai|anthropic|langgraph|langchain" src/uthcode/core`，返回 0 条第三方导入或 Provider 名称分支。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_provider_contract.py`，全部通过。
+- [x] 测试证明请求、响应、事件和 Native Item 可 JSON round-trip，嵌套 list/dict 在构造后不可被外部修改。
+- [x] 测试向 JSON payload 传入 SDK、Pydantic Model、集合或任意运行时对象，均被拒绝。
+- [x] 测试构造来自不同 Provider 的 Native Item，目标 Provider 只能恢复属于自身身份的项。
+- [x] 测试重复调用取消操作，状态转换幂等且等待者均能观察到取消。
+- [x] 执行 `rg -n "pydantic|openai|anthropic|langgraph|langchain" src/uthcode/core`，返回 0 条第三方导入或 Provider 名称分支。
 
 ## Task 3：打通 Headless Application 与 Fake Provider
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_application.py`，全部通过。
-- [ ] 从 Application 正式方法向 Fake Provider 发送一次文本请求，逐项观察到文本事件、用量和唯一完成终态。
-- [ ] 使用 Fake Provider 输出完整 Tool Call 流，每个开始、参数增量和完成事件保持原顺序。
-- [ ] 分别模拟无终态、重复终态和终态后追加事件，Application 均拒绝该流且不生成伪成功响应。
-- [ ] 分别触发 UthCode 显式取消与 `asyncio` Task 取消，观察到不同且符合契约的结果。
-- [ ] 执行测试期间阻断网络构造，Fake 与 Application 测试仍全部通过。
-- [ ] 执行 `rg --files src/uthcode/application src/uthcode/integrations`，Application 为物理包，Integration 目录与 Fake Provider 同时出现，不存在根级 `application.py`。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_application.py`，全部通过。
+- [x] 从 Application 正式方法向 Fake Provider 发送一次文本请求，逐项观察到文本事件、用量和唯一完成终态。
+- [x] 使用 Fake Provider 输出完整 Tool Call 流，每个开始、参数增量和完成事件保持原顺序。
+- [x] 分别模拟无终态、重复终态和终态后追加事件，Application 均拒绝该流且不生成伪成功响应。
+- [x] 分别触发 UthCode 显式取消与 `asyncio` Task 取消，观察到不同且符合契约的结果。
+- [x] 执行测试期间阻断网络构造，Fake 与 Application 测试仍全部通过。
+- [x] 执行 `rg --files src/uthcode/application src/uthcode/integrations`，Application 为物理包，Integration 目录与 Fake Provider 同时出现，不存在根级 `application.py`。
 
 ## Task 4：建立 Pydantic AI Direct 集成边界
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
-- [ ] 使用 Pydantic AI Test/Function Model 流经共用桥接层，观察到 UthCode 自有事件、用量和终态。
-- [ ] 检查 Application、Core 公共注解和事件实例，不包含 Pydantic AI 或厂商 SDK 类型。
-- [ ] 模拟认证、限流、网络和非法响应异常，映射后的错误不包含测试秘密值。
-- [ ] 中途取消流后，Mock 资源记录显示异步上下文已退出且客户端所有权规则得到遵守。
-- [ ] 执行 `rg -n "pydantic_ai\.Agent|pydantic_graph|langgraph|langchain" src tests`，UthCode 实现中返回 0 条禁止使用记录；架构测试自身的禁止字符串断言除外。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
+- [x] 使用 Pydantic AI Test/Function Model 流经共用桥接层，观察到 UthCode 自有事件、用量和终态。
+- [x] 检查 Application、Core 公共注解和事件实例，不包含 Pydantic AI 或厂商 SDK 类型。
+- [x] 模拟认证、限流、网络和非法响应异常，映射后的错误不包含测试秘密值。
+- [x] 中途取消流后，Mock 资源记录显示异步上下文已退出且客户端所有权规则得到遵守。
+- [x] 执行 `rg -n "pydantic_ai\.Agent|pydantic_graph|langgraph|langchain" src tests`，UthCode 实现中返回 0 条禁止使用记录；架构测试自身的禁止字符串断言除外。
 
 ## Task 5：实现 Anthropic 协议适配
 

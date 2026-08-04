@@ -6,9 +6,11 @@
 
 | Worker 组 | Task | 串行理由 |
 | --- | --- | --- |
-| Foundation Worker | Task 1—Task 4 | 项目骨架、Core 契约、Application 与 Direct 边界共同冻结基础依赖方向 |
-| Protocol Worker | Task 5—Task 7 | 三个物理协议模块共享同一边界约定，需要统一 Native Item 与流映射规则 |
-| Delivery Worker | Task 8—Task 11 | 配置、正式接入、端到端验证和遗留清理必须基于完整协议能力收口 |
+| W01 Foundation Worker | Task 1—Task 4 | 项目骨架、Core 契约、Application 与 Direct 边界共同冻结基础依赖方向 |
+| W02 Protocol Worker | Task 5—Task 7 | 三个物理协议模块共享同一边界约定，需要统一 Native Item 与流映射规则 |
+| W03 Delivery Worker | Task 8—Task 11 | 配置、正式接入、端到端验证和遗留清理必须基于完整协议能力收口 |
+
+Worker 依赖顺序固定为 W01 → W02 → W03；后续 Worker 必须等待前一 Worker 完成并经用户决定继续后，才能由用户通过对应 Prompt 显式派发。
 
 所有 Python、安装和测试命令均在 Conda 环境 `re-uthcode` 中运行。不得修改旧 UthCode 或 MewCode；不得自动移动本工作包到归档目录。
 
