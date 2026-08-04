@@ -6,7 +6,7 @@ import socket
 import pytest
 
 from uthcode.application import (
-    ProviderConfig,
+    EffectiveConfig,
     ProviderKind,
     UthCodeApplication,
     create_application,
@@ -76,7 +76,12 @@ async def test_headless_application_streams_text_usage_and_one_terminal_event() 
 @pytest.mark.asyncio
 async def test_formal_bootstrap_builds_a_fake_headless_application() -> None:
     application = create_application(
-        ProviderConfig(kind=ProviderKind.FAKE, model="bootstrap-fake")
+        EffectiveConfig.single_model(
+            "bootstrap/ref",
+            provider_profile_id="bootstrap",
+            provider_kind=ProviderKind.FAKE,
+            remote_model_id="bootstrap-fake",
+        )
     )
 
     events = await _collect(application)

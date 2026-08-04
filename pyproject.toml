@@ -12,7 +12,12 @@ license = { text = "MIT" }
 authors = [{ name = "Re:UthCode contributors" }]
 dependencies = [
     "pydantic-ai-slim[anthropic,openai]>=2.22,<2.23",
+    "textual>=8.2,<9",
+    "tomlkit>=0.15,<0.16",
 ]
+
+[project.scripts]
+uthcode = "uthcode.interfaces.cli:main"
 
 [dependency-groups]
 dev = [

@@ -37,7 +37,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     ToolResultPart,
 )
-from uthcode.application import ProviderConfig, ProviderKind, create_application
+from uthcode.application import EffectiveConfig, ProviderKind, create_application
 from uthcode.integrations.providers.anthropic import AnthropicCodec, build_anthropic_provider
 
 
@@ -382,9 +382,11 @@ _LIVE_ENABLED = (
 @pytest.mark.asyncio
 async def test_anthropic_deepseek_live_headless_text_thinking_tools_and_continuation() -> None:
     application = create_application(
-        ProviderConfig(
-            kind=ProviderKind.ANTHROPIC,
-            model="deepseek-v4-flash",
+        EffectiveConfig.single_model(
+            "deepseek/deepseek-v4-flash",
+            provider_profile_id="deepseek",
+            provider_kind=ProviderKind.ANTHROPIC,
+            remote_model_id="deepseek-v4-flash",
             api_key_env="DEEPSEEK_API_KEY",
             base_url="https://api.deepseek.com/anthropic",
             max_output_tokens=512,

@@ -42,6 +42,7 @@
 ## 6. 当前交互层
 
 - 当前实现一个克制的简单 TUI，作为 Agent Core 的参考交互适配器。
+- 默认 Textual TUI 属于当前 Interface 适配器，只能调用 Application 公共 API，不得直接导入 Core、Integration 或 Provider SDK。
 - 简单 TUI 只负责输入、事件渲染、Tool 状态、权限确认、取消和恢复。
 - TUI 不拥有 RunState，不直接访问 Provider、Tool Registry、Permission Store 或持久化实现。
 - 文件树、Diff Viewer、多会话、主题、Web、Desktop 和正式完整 TUI 后置。
@@ -61,7 +62,7 @@
 - 完整 Context、Context Compiler、Context Budget 和结构化压缩。
 - Memory、Dream、完整 Session 产品和历史浏览。
 - OS Sandbox。
-- Slash Command、Hook、Skill、MCP、Worktree。
+- Hook、Skill、MCP、Worktree。
 - Subagent、Multi-Agent。
 - Web、桌面客户端、正式完整 TUI。
 - Artifact 系统、跨 Run 内容仓库、全局去重和 GC。
@@ -100,7 +101,10 @@
 - 用户级配置：~/.uthcode/config.toml。
 - 项目级配置：<workdir>/.uthcode/config.toml。
 - 普通配置按“默认值 → 用户配置 → 项目配置”合并。
+- Git 仓库内项目配置从仓库根到当前目录递归发现；非 Git 目录只读取当前目录；候选路径在加载前规范化、解析物理路径并去重。
 - 项目配置只能覆盖允许字段或收紧权限，不能修改秘密来源或提升到 full_access。
+- 项目配置只能引用用户配置中的可信 Provider，并调整非秘密 Model 数据；出现 Provider、端点、秘密来源、Key 或等价凭据重定向字段时必须硬失败。
+- 用户默认模型写回只原子修改用户配置顶层 model，不写入项目配置，不改变 Provider 表或 Model 表。
 - API key 真实值只从环境变量读取，不写入配置、事件、日志、Journal 或 Snapshot。
 - Permission 具体动作规则与普通 config.toml 分离。
 
