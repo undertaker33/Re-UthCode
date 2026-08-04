@@ -74,69 +74,69 @@
 
 ## Task 7：实现默认 CLI 与 Headless exec
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_cli.py`，全部通过且不打开真实终端或网络连接。
-- [ ] 调用无子命令 CLI，注入的 TUI runner 恰好执行一次并收到同一正式 Application。
-- [ ] `uthcode exec PROMPT` 与 stdin 两种路径均创建单消息请求，Text Delta 写 stdout，成功输出以换行结束且退出码为 0。
-- [ ] `uthcode exec "/help"` 将文本原样作为普通 Prompt，不调用 Command Dispatcher。
-- [ ] 空位置 Prompt 且 stdin 为空时，诊断写 stderr、stdout 为空、退出码为 2。
-- [ ] `--cwd` 改变配置发现起点；`--model` 改变当前进程选择但用户配置字节不变。
-- [ ] 配置初始化或配置错误返回 2；Provider/协议错误返回 1；显式取消或 Ctrl+C 返回 130。
-- [ ] 执行 `conda run -n re-uthcode python -m uthcode exec "hello"` 的 Fake 配置 smoke，输出无 ANSI TUI 控制序列。
-- [ ] 检查 `src/uthcode/interfaces/cli.py`，不导入 `uthcode.core`、`uthcode.integrations` 或 Textual Widget 模块。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_cli.py`，全部通过且不打开真实终端或网络连接。
+- [x] 调用无子命令 CLI，注入的 TUI runner 恰好执行一次并收到同一正式 Application。
+- [x] `uthcode exec PROMPT` 与 stdin 两种路径均创建单消息请求，Text Delta 写 stdout，成功输出以换行结束且退出码为 0。
+- [x] `uthcode exec "/help"` 将文本原样作为普通 Prompt，不调用 Command Dispatcher。
+- [x] 空位置 Prompt 且 stdin 为空时，诊断写 stderr、stdout 为空、退出码为 2。
+- [x] `--cwd` 改变配置发现起点；`--model` 改变当前进程选择但用户配置字节不变。
+- [x] 配置初始化或配置错误返回 2；Provider/协议错误返回 1；显式取消或 Ctrl+C 返回 130。
+- [x] 执行 `conda run -n re-uthcode python -m uthcode exec "hello"` 的 Fake 配置 smoke，输出无 ANSI TUI 控制序列。
+- [x] 检查 `src/uthcode/interfaces/cli.py`，不导入 `uthcode.core`、`uthcode.integrations` 或 Textual Widget 模块。
 
 ## Task 8：实现 TUI 基础组件和流式渲染
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_tui.py -k "state or composer or stream or scroll or markdown"`，全部通过。
-- [ ] Textual Pilot 中 Topbar 显示 UthCode、当前 Model Ref 和 cwd/project；Transcript、活动行和 Composer 布局均存在。
-- [ ] Composer 按 Enter 产生提交，Shift+Enter 插入换行，空白输入不产生提交。
-- [ ] 连续多个 Text Delta 在刷新间隔内只批量更新现有 Assistant Markdown，而非每个 token 新建 Widget。
-- [ ] Reasoning Delta 进入独立简洁 reasoning entry；完成、取消和异常前缓冲均被立即 flush。
-- [ ] 流式 Markdown 更新期间文本选择被阻止，终态后恢复；Textual 异步更新取消不被记录为应用错误。
-- [ ] 用户位于底部时新内容自动跟随；主动上滚后不跳到底；重新到底后恢复跟随；清空状态后复位。
-- [ ] 执行 `rg -n "Tool|Permission|Session|TaskPlan|Attachment|ImagePaste|firstcoder|mewcode" src/uthcode/interfaces/tui`，除许可证说明或明确禁止断言外返回 0 条迁移耦合。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_tui.py -k "state or composer or stream or scroll or markdown"`，全部通过。
+- [x] Textual Pilot 中 Topbar 显示 UthCode、当前 Model Ref 和 cwd/project；Transcript、活动行和 Composer 布局均存在。
+- [x] Composer 按 Enter 产生提交，Shift+Enter 插入换行，空白输入不产生提交。
+- [x] 连续多个 Text Delta 在刷新间隔内只批量更新现有 Assistant Markdown，而非每个 token 新建 Widget。
+- [x] Reasoning Delta 进入独立简洁 reasoning entry；完成、取消和异常前缓冲均被立即 flush。
+- [x] 流式 Markdown 更新期间文本选择被阻止，终态后恢复；Textual 异步更新取消不被记录为应用错误。
+- [x] 用户位于底部时新内容自动跟随；主动上滚后不跳到底；重新到底后恢复跟随；清空状态后复位。
+- [x] 执行 `rg -n "Tool|Permission|Session|TaskPlan|Attachment|ImagePaste|firstcoder|mewcode" src/uthcode/interfaces/tui`，除许可证说明或明确禁止断言外返回 0 条迁移耦合。
 
 ## Task 9：实现 Completion Menu、Model Picker 与双 Esc
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_tui.py`，全部通过。
-- [ ] 输入 `/` 打开可滚动 Command Completion Menu，Up/Down 改变选中项，Tab 补全 canonical，Enter 执行，Esc 只关闭菜单。
-- [ ] 无参数 `/model` 打开独立 Model Picker，显示全部模型的 Ref、label、Provider 和当前项；Up/Down/Enter 可切换，Esc 只关闭 Picker。
-- [ ] 静态检查和对象断言证明 Completion Menu 与 Model Picker 使用不同模块、Widget 类和状态类。
-- [ ] 普通输入写入 USER entry，只构造单消息请求，流事件生成 ASSISTANT/REASONING entry；下一次请求不携带上次消息。
-- [ ] 生成中第二个普通输入被拒绝；Slash Command 仍可分发；`/model` 直接调用和 Picker 选择均被拒绝且配置不变。
-- [ ] `/clear` 只清 Transcript 并复位滚动状态，Application 当前模型与配置保持；`/new` 仍返回未实现。
-- [ ] Completion 或 Picker 打开时 Esc 只关闭弹层；无弹层生成中第一次 Esc 显示再次按键提示，一秒内第二次调用当前 Handle.cancel()。
-- [ ] 超过一秒的第二次 Esc 重新进入 armed 状态，不取消；取消完成后缓冲 flush 且活动状态显示 cancelled。
-- [ ] `/quit` 退出 Interface；CLI `exec` 测试证明未实例化 Textual App。
-- [ ] 执行 `rg -n "uthcode\.(core|integrations)" src/uthcode/interfaces`，返回 0 条越界导入。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_tui.py`，全部通过。
+- [x] 输入 `/` 打开可滚动 Command Completion Menu，Up/Down 改变选中项，Tab 补全 canonical，Enter 执行，Esc 只关闭菜单。
+- [x] 无参数 `/model` 打开独立 Model Picker，显示全部模型的 Ref、label、Provider 和当前项；Up/Down/Enter 可切换，Esc 只关闭 Picker。
+- [x] 静态检查和对象断言证明 Completion Menu 与 Model Picker 使用不同模块、Widget 类和状态类。
+- [x] 普通输入写入 USER entry，只构造单消息请求，流事件生成 ASSISTANT/REASONING entry；下一次请求不携带上次消息。
+- [x] 生成中第二个普通输入被拒绝；Slash Command 仍可分发；`/model` 直接调用和 Picker 选择均被拒绝且配置不变。
+- [x] `/clear` 只清 Transcript 并复位滚动状态，Application 当前模型与配置保持；`/new` 仍返回未实现。
+- [x] Completion 或 Picker 打开时 Esc 只关闭弹层；无弹层生成中第一次 Esc 显示再次按键提示，一秒内第二次调用当前 Handle.cancel()。
+- [x] 超过一秒的第二次 Esc 重新进入 armed 状态，不取消；取消完成后缓冲 flush 且活动状态显示 cancelled。
+- [x] `/quit` 退出 Interface；CLI `exec` 测试证明未实例化 Textual App。
+- [x] 执行 `rg -n "uthcode\.(core|integrations)" src/uthcode/interfaces`，返回 0 条越界导入。
 
 ## Task 10：[接入主流程] 接入正式启动链路
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_cli.py tests/test_tui.py tests/test_application.py tests/test_application_runtime.py`，全部通过。
-- [ ] 安装后的 `uthcode`、`uthcode exec` 与 `python -m uthcode` 均经过同一配置加载与 Application 组合入口。
-- [ ] README 的首次配置、Fake TUI、`exec` 和 Headless Python 示例在临时 HOME/cwd 中可复现，且不访问网络。
-- [ ] README 不再声明“没有 CLI/TUI”，不展示 T01 已失效单 Provider bootstrap，也不承诺 Out of Scope 功能。
-- [ ] 检查 `application.__init__`，仅公开正式 Effective Config、加载、Application、Generation Handle、命令和调用方必需类型，不公开 TOMLKit、Textual 或 SDK 类型。
-- [ ] 搜索旧 `create_application(ProviderConfig` 调用与 T01 临时配置公开导出，源码、README 和测试中返回 0 条兼容路径。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_cli.py tests/test_tui.py tests/test_application.py tests/test_application_runtime.py`，全部通过。
+- [x] 安装后的 `uthcode`、`uthcode exec` 与 `python -m uthcode` 均经过同一配置加载与 Application 组合入口。
+- [x] README 的首次配置、Fake TUI、`exec` 和 Headless Python 示例在临时 HOME/cwd 中可复现，且不访问网络。
+- [x] README 不再声明“没有 CLI/TUI”，不展示 T01 已失效单 Provider bootstrap，也不承诺 Out of Scope 功能。
+- [x] 检查 `application.__init__`，仅公开正式 Effective Config、加载、Application、Generation Handle、命令和调用方必需类型，不公开 TOMLKit、Textual 或 SDK 类型。
+- [x] 搜索旧 `create_application(ProviderConfig` 调用与 T01 临时配置公开导出，源码、README 和测试中返回 0 条兼容路径。
 
 ## Task 11：[端到端验证] 验证真实离线用户流程
 
-- [ ] 在临时 HOME 中执行正式入口，用户配置不存在时创建模板并停止；网络拦截器记录 0 次请求。
-- [ ] 填写两个 Fake Provider/Model 后启动 `uthcode` Pilot，验证 `/`、`/c`、`/help`、普通流、`/clear`、`/model` 切换和双 Esc 取消完整流程。
-- [ ] 使用同一配置执行 `uthcode exec`，stdout 得到 Fake 文本、stderr 无 TUI 控制序列、退出码为 0。
-- [ ] 在项目配置定义 Provider 或秘密字段，从 `uthcode` 和 `uthcode exec` 两个入口均安全失败并报告路径/字段。
-- [ ] 执行 `conda run -n re-uthcode pytest -q`，全量离线测试通过，既有 live 测试明确 skipped。
-- [ ] 执行 `conda run -n re-uthcode python -m compileall -q src tests`，退出码为 0。
-- [ ] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
-- [ ] 在隔离 Textual/TUI 导入的测试进程中运行 Application、配置和 Headless 测试，全部通过。
+- [x] 在临时 HOME 中执行正式入口，用户配置不存在时创建模板并停止；网络拦截器记录 0 次请求。
+- [x] 填写两个 Fake Provider/Model 后启动 `uthcode` Pilot，验证 `/`、`/c`、`/help`、普通流、`/clear`、`/model` 切换和双 Esc 取消完整流程。
+- [x] 使用同一配置执行 `uthcode exec`，stdout 得到 Fake 文本、stderr 无 TUI 控制序列、退出码为 0。
+- [x] 在项目配置定义 Provider 或秘密字段，从 `uthcode` 和 `uthcode exec` 两个入口均安全失败并报告路径/字段。
+- [x] 执行 `conda run -n re-uthcode pytest -q`，全量离线测试通过，既有 live 测试明确 skipped。
+- [x] 执行 `conda run -n re-uthcode python -m compileall -q src tests`，退出码为 0。
+- [x] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
+- [x] 在隔离 Textual/TUI 导入的测试进程中运行 Application、配置和 Headless 测试，全部通过。
 
 ## Task 12：[遗留负担清理] 清理重复职责和越界依赖
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
-- [ ] 搜索 built-in Command Definition、帮助列表和补全命令来源，确认只有一个正式 Registry，TUI 不含第二份命令常量。
-- [ ] 搜索 Effective Config、配置 loader 和 Application bootstrap，确认各自只有一个正式实现，不存在 T01/新配置双轨。
-- [ ] 执行 `rg -n "uthcode\.(core|integrations)" src/uthcode/interfaces`，返回 0 条；执行 `rg -n "textual|tomlkit" src/uthcode/core src/uthcode/application`，除架构测试禁止字符串外返回 0 条越界依赖。
-- [ ] 执行 `rg -ni "dotenv|langgraph|langchain|mewcode|firstcoder" pyproject.toml src tests`，除许可证、参考说明或架构测试禁止字符串外返回 0 条运行时依赖/import。
-- [ ] 执行 `rg --files src/uthcode`，不存在 Tool、Permission、Session、Context、Memory、Dream、Skill、MCP、Hook、Worktree、Subagent、附件或 Diff 占位模块。
-- [ ] 搜索 `legacy_`、`compat_`、Adapter、Facade、旧入口和不可达分支，确认没有仅为兼容 Re:UthCode 早期实现而保留的逻辑。
-- [ ] 执行 `conda run -n re-uthcode pytest -q`、`conda run -n re-uthcode python -m compileall -q src tests` 和 `conda run -n re-uthcode python -m pip check`，全部通过。
-- [ ] 执行 `git diff --check`，无空白错误；执行 `git status --short`，没有秘密、缓存、构建产物或工作包外意外文件。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
+- [x] 搜索 built-in Command Definition、帮助列表和补全命令来源，确认只有一个正式 Registry，TUI 不含第二份命令常量。
+- [x] 搜索 Effective Config、配置 loader 和 Application bootstrap，确认各自只有一个正式实现，不存在 T01/新配置双轨。
+- [x] 执行 `rg -n "uthcode\.(core|integrations)" src/uthcode/interfaces`，返回 0 条；执行 `rg -n "textual|tomlkit" src/uthcode/core src/uthcode/application`，除架构测试禁止字符串外返回 0 条越界依赖。
+- [x] 执行 `rg -ni "dotenv|langgraph|langchain|mewcode|firstcoder" pyproject.toml src tests`，除许可证、参考说明或架构测试禁止字符串外返回 0 条运行时依赖/import。
+- [x] 执行 `rg --files src/uthcode`，不存在 Tool、Permission、Session、Context、Memory、Dream、Skill、MCP、Hook、Worktree、Subagent、附件或 Diff 占位模块。
+- [x] 搜索 `legacy_`、`compat_`、Adapter、Facade、旧入口和不可达分支，确认没有仅为兼容 Re:UthCode 早期实现而保留的逻辑。
+- [x] 执行 `conda run -n re-uthcode pytest -q`、`conda run -n re-uthcode python -m compileall -q src tests` 和 `conda run -n re-uthcode python -m pip check`，全部通过。
+- [x] 执行 `git diff --check`，无空白错误；执行 `git status --short`，没有秘密、缓存、构建产物或工作包外意外文件。

@@ -3,6 +3,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -131,8 +134,6 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
 
 def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
     forbidden_names = {
-        "cli.py",
-        "__main__.py",
         "runtime.py",
         "graph",
         "tools",
@@ -156,6 +157,63 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         if path.name != "__pycache__"
     }
     assert not forbidden_names.intersection(actual)
+
+
+def test_interfaces_only_depend_on_application_and_their_ui_toolkit() -> None:
+    interfaces = SRC / "interfaces"
+    assert interfaces.is_dir()
+
+    for source_path in interfaces.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imports = [
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        ] + [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        assert not any(
+            value.startswith("uthcode.core")
+            or value.startswith("uthcode.integrations")
+            or value.startswith("pydantic_ai")
+            or value.startswith("anthropic")
+            or value.startswith("openai")
+            for value in imports
+        ), source_path
+        if "tui" not in source_path.parts:
+            assert not any(value == "textual" or value.startswith("textual.") for value in imports), source_path
+
+
+def test_headless_application_runs_without_importing_the_interface_tree() -> None:
+    script = """
+import asyncio
+import sys
+from uthcode.application import EffectiveConfig, GenerationRequest, Message, TextPart, create_application
+
+async def main():
+    application = create_application(EffectiveConfig.single_model('fake/ref'))
+    request = GenerationRequest(messages=(Message('user', (TextPart('hello'),)),))
+    events = [event async for event in application.stream_generation(request)]
+    assert events
+    assert 'uthcode.interfaces' not in sys.modules
+
+asyncio.run(main())
+"""
+    environment = os.environ.copy()
+    source_root = str(SRC.parent)
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_provider_errors_are_classified_without_copying_secret_text() -> None:
@@ -291,7 +349,7 @@ def test_runtime_source_contains_no_legacy_graph_or_compatibility_names() -> Non
         source = source_path.read_text(encoding="utf-8").lower()
         assert not any(name in source for name in forbidden), source_path
 
-    assert not (SRC / "interfaces").exists()
+    assert (SRC / "interfaces").is_dir()
 
 
 def test_protocol_wire_fields_stay_in_their_physical_modules() -> None:

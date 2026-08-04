@@ -9,8 +9,27 @@ from .configuration import (
     ProviderKind,
     ProviderProfile,
 )
-from .bootstrap import create_application, load_effective_config
+from .bootstrap import (
+    ConfigurationError,
+    ConfigurationInitializationRequired,
+    create_application,
+    load_effective_config,
+)
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
+from uthcode.core import (
+    GenerationCancelled,
+    GenerationCompleted,
+    GenerationRequest,
+    Message,
+    ProviderError,
+    ProviderEvent,
+    ProviderIdentity,
+    ProviderResponse,
+    ReasoningDelta,
+    TextDelta,
+    TextPart,
+    Usage,
+)
 from .commands import (
     ArgumentSpec,
     CandidateProvider,
@@ -41,6 +60,8 @@ from .commands import (
 
 __all__ = [
     "ConfigSource",
+    "ConfigurationError",
+    "ConfigurationInitializationRequired",
     "ConfigurationModelError",
     "EffectiveConfig",
     "ApplicationStatus",
@@ -61,15 +82,27 @@ __all__ = [
     "CompletionCandidate",
     "CompletionEngine",
     "GenerationHandle",
+    "GenerationCancelled",
+    "GenerationCompleted",
+    "GenerationRequest",
     "InvocationStatus",
     "LaunchOptions",
     "ModelProfile",
+    "Message",
     "ModelSelected",
     "OpenModelPicker",
     "OutcomeStatus",
     "ProviderKind",
+    "ProviderError",
+    "ProviderEvent",
+    "ProviderIdentity",
+    "ProviderResponse",
     "ProviderProfile",
     "QuitInterface",
+    "ReasoningDelta",
+    "TextDelta",
+    "TextPart",
+    "Usage",
     "UthCodeApplication",
     "UiAction",
     "complete_commands",

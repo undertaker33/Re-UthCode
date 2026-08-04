@@ -12,7 +12,6 @@ from uthcode.application import (
     create_application,
 )
 from uthcode.core.provider import (
-    CancellationToken,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -44,10 +43,10 @@ def _completed() -> GenerationCompleted:
     )
 
 
-async def _collect(application: UthCodeApplication, token: CancellationToken | None = None) -> list[object]:
+async def _collect(application: UthCodeApplication) -> list[object]:
     return [
         event
-        async for event in application.stream_generation(_request(), cancellation=token)
+        async for event in application.stream_generation(_request())
     ]
 
 
@@ -139,11 +138,15 @@ async def test_invalid_terminal_shapes_are_rejected(script: tuple[object, ...]) 
 
 @pytest.mark.asyncio
 async def test_explicit_cancellation_is_distinct_from_task_cancellation() -> None:
-    token = CancellationToken()
     application = UthCodeApplication(FakeProvider(events=(_completed(),), delay=10))
-    task = asyncio.create_task(_collect(application, token))
+    handle = application.start_generation(_request())
+
+    async def collect_handle() -> list[object]:
+        return [event async for event in handle.events()]
+
+    task = asyncio.create_task(collect_handle())
     await asyncio.sleep(0.05)
-    token.cancel()
+    handle.cancel()
 
     with pytest.raises(GenerationCancelled):
         await task

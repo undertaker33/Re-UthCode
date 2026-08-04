@@ -1,0 +1,84 @@
+Screen {
+    background: $surface;
+}
+
+#main-column {
+    height: 1fr;
+    width: 100%;
+}
+
+#topbar {
+    height: 3;
+    padding: 1 2;
+    color: $text;
+    background: $panel;
+    text-style: bold;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 1 2;
+    scrollbar-size: 1 1;
+}
+
+.transcript-entry {
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+}
+
+.user-entry {
+    color: $text;
+    text-style: bold;
+}
+
+.command-entry {
+    color: $accent;
+}
+
+.system-entry {
+    color: $text-muted;
+}
+
+.error-entry {
+    color: $error;
+}
+
+.reasoning-entry {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+    text-style: italic;
+}
+
+.assistant-entry {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#activity {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+#completion-menu,
+#model-picker {
+    display: none;
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+    margin: 0 2;
+    color: $text;
+    background: $panel;
+    border: round $accent;
+    scrollbar-size: 1 1;
+}
+
+#composer {
+    height: auto;
+    min-height: 3;
+    max-height: 10;
+    margin: 1 2;
+    border: round $accent;
+}

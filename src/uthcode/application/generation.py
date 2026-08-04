@@ -176,26 +176,22 @@ class UthCodeApplication:
     def start_generation(
         self,
         request: GenerationRequest,
-        *,
-        cancellation: CancellationToken | None = None,
     ) -> GenerationHandle:
-        """Create one request handle with its own cancellation state."""
+        """Create one request handle with an independently owned token."""
 
         return GenerationHandle(
             self,
             request,
-            cancellation if cancellation is not None else CancellationToken(),
+            CancellationToken(),
         )
 
     async def stream_generation(
         self,
         request: GenerationRequest,
-        *,
-        cancellation: CancellationToken | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Convenience stream implemented by the formal GenerationHandle."""
 
-        handle = self.start_generation(request, cancellation=cancellation)
+        handle = self.start_generation(request)
         async for event in handle.events():
             yield event
 
