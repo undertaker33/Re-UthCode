@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 from pydantic_ai.direct import model_request_stream
@@ -67,10 +67,79 @@ from uthcode.core.provider import (
 )
 
 
+class _RecordedSource:
+    """Record one Direct Model source without changing its async-stream shape."""
+
+    def __init__(self, source: Any, filter_event: Callable[[Any], bool] | None = None) -> None:
+        self._source = source
+        self._iterator: AsyncIterator[Any] | None = None
+        self._filter_event = filter_event
+        self.events: list[Any] = []
+
+    def __aiter__(self) -> _RecordedSource:
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._iterator is None:
+            self._iterator = aiter(self._source)
+        while True:
+            value = await anext(self._iterator)
+            self.events.append(value)
+            if self._filter_event is None or self._filter_event(value):
+                return value
+
+    async def close(self) -> None:
+        close = getattr(self._source, "close", None)
+        if close is not None:
+            await close()
+            return
+        aclose = getattr(self._source, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    async def aclose(self) -> None:
+        await self.close()
+
+
+def record_model_stream(
+    model_stream: Any,
+    *,
+    filter_event: Callable[[Any], bool] | None = None,
+) -> _RecordedSource | None:
+    """Install a protocol-owned recorder on a Pydantic AI streamed response.
+
+    The shared bridge does not inspect recorded values. Protocol codecs may use
+    this extension point when the vendor stream contains identity or terminal
+    information that Pydantic AI intentionally normalizes away.
+    """
+
+    response_stream = getattr(model_stream, "_response", None)
+    source = getattr(response_stream, "source", None)
+    if source is None:
+        return None
+    if isinstance(source, _RecordedSource):
+        return source
+    # Direct Model implementations commonly peek once before yielding their
+    # StreamedResponse. In that case PeekableAsyncStream already owns an
+    # iterator, so replacing only ``source`` would miss every later chunk.
+    # Wrap the active iterator when it exists and otherwise wrap the source
+    # that PeekableAsyncStream will turn into an iterator.
+    active_iterator = getattr(response_stream, "_source_iter", None)
+    recorder = _RecordedSource(active_iterator or source, filter_event=filter_event)
+    if active_iterator is not None:
+        response_stream._source_iter = recorder
+    response_stream.source = recorder
+    return recorder
+
+
 def _plain_json(value: Any) -> Any:
     """Return ordinary JSON containers after validating a provider value."""
 
     try:
+        if isinstance(value, Mapping):
+            value = {key: _plain_json(item) for key, item in value.items()}
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            value = [_plain_json(item) for item in value]
         return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError) as exc:
         raise InvalidProviderResponseError(
@@ -118,7 +187,78 @@ def _native_details(items: tuple[NativeItem, ...]) -> dict[str, Any] | None:
     }
 
 
-def _message_to_model(message: Message, identity: ProviderIdentity) -> ModelMessage:
+class PydanticAICodec:
+    """Protocol extension points for the shared Direct Model lifecycle.
+
+    The default implementation retains the W01 generic bridge behavior. A
+    protocol module can override only message-part replay, native snapshots,
+    stream recording, and terminal validation; the provider lifecycle remains
+    identical for every protocol.
+    """
+
+    capture_provider_details = True
+
+    def encode_message(self, message: Message, identity: ProviderIdentity) -> ModelMessage:
+        return _message_to_model(message, identity, self)
+
+    def encode_assistant_part(
+        self,
+        part: TextPart | ReasoningPart | ToolCallPart,
+        *,
+        index: int,
+        native_items: Sequence[NativeItem],
+        identity: ProviderIdentity,
+    ) -> Any:
+        del index, native_items, identity
+        if isinstance(part, TextPart):
+            return AITextPart(part.text)
+        if isinstance(part, ReasoningPart):
+            return AIThinkingPart(part.text)
+        if isinstance(part, ToolCallPart):
+            return AIToolCallPart(
+                tool_name=part.name,
+                args=_plain_json(part.arguments),
+                tool_call_id=part.tool_call_id,
+            )
+        raise InvalidProviderResponseError(
+            f"Unsupported assistant message part: {type(part).__name__}"
+        )
+
+    def native_items_for_part(
+        self,
+        part: Any,
+        *,
+        index: int,
+        identity: ProviderIdentity,
+    ) -> tuple[NativeItem, ...]:
+        del part, index, identity
+        return ()
+
+    def native_items_for_response(
+        self,
+        response: ModelResponse,
+        *,
+        identity: ProviderIdentity,
+    ) -> tuple[NativeItem, ...]:
+        del response, identity
+        return ()
+
+    def usage_from_model_response(self, response: ModelResponse) -> Usage | None:
+        del response
+        return None
+
+    def bind_stream(self, model_stream: Any) -> None:
+        del model_stream
+
+    def validate_stream(self, model_stream: Any, response: ModelResponse) -> None:
+        del model_stream, response
+
+
+def _message_to_model(
+    message: Message,
+    identity: ProviderIdentity,
+    codec: PydanticAICodec,
+) -> ModelMessage:
     owned_items = message.native_items_for(identity)
     details = _native_details(owned_items)
 
@@ -144,23 +284,19 @@ def _message_to_model(message: Message, identity: ProviderIdentity) -> ModelMess
         return ModelRequest(parts)
     if message.role == "assistant":
         parts: list[Any] = []
-        for part in message.parts:
-            if isinstance(part, TextPart):
-                parts.append(AITextPart(part.text))
-            elif isinstance(part, ReasoningPart):
-                parts.append(AIThinkingPart(part.text))
-            elif isinstance(part, ToolCallPart):
-                parts.append(
-                    AIToolCallPart(
-                        tool_name=part.name,
-                        args=_plain_json(part.arguments),
-                        tool_call_id=part.tool_call_id,
-                    )
-                )
-            elif isinstance(part, ToolResultPart):
+        for index, part in enumerate(message.parts):
+            if isinstance(part, ToolResultPart):
                 raise InvalidProviderResponseError(
                     "An assistant message contains a tool result part"
                 )
+            parts.append(
+                codec.encode_assistant_part(
+                    part,
+                    index=index,
+                    native_items=owned_items,
+                    identity=identity,
+                )
+            )
         return ModelResponse(
             parts,
             provider_name=identity.provider,
@@ -173,8 +309,9 @@ def _message_to_model(message: Message, identity: ProviderIdentity) -> ModelMess
 def _request_messages(
     request: GenerationRequest,
     identity: ProviderIdentity,
+    codec: PydanticAICodec,
 ) -> list[ModelMessage]:
-    return [_message_to_model(message, identity) for message in request.messages]
+    return [codec.encode_message(message, identity) for message in request.messages]
 
 
 def _request_parameters(request: GenerationRequest) -> ModelRequestParameters:
@@ -186,7 +323,11 @@ def _request_parameters(request: GenerationRequest) -> ModelRequestParameters:
         )
         for tool in request.tools
     ]
-    return ModelRequestParameters(function_tools=tools)
+    thinking: bool | str | None = None
+    if request.reasoning is not None and request.reasoning.enabled:
+        effort = request.reasoning.effort
+        thinking = effort if effort in {"minimal", "low", "medium", "high", "xhigh"} else True
+    return ModelRequestParameters(function_tools=tools, thinking=thinking)
 
 
 def _model_settings(request: GenerationRequest) -> dict[str, Any] | None:
@@ -195,6 +336,12 @@ def _model_settings(request: GenerationRequest) -> dict[str, Any] | None:
         settings["max_tokens"] = request.max_output_tokens
     if request.temperature is not None:
         settings["temperature"] = request.temperature
+    if request.reasoning is not None and request.reasoning.enabled:
+        settings["thinking"] = (
+            request.reasoning.effort
+            if request.reasoning.effort in {"minimal", "low", "medium", "high", "xhigh"}
+            else True
+        )
     return settings or None
 
 
@@ -274,6 +421,19 @@ class _NativeTracker:
         self.items.append(item)
         return item
 
+    def add_item(self, item: NativeItem) -> NativeItem | None:
+        if not item.belongs_to(self.identity):
+            raise InvalidProviderResponseError(
+                "A codec returned a native item for a different provider identity"
+            )
+        plain = _plain_json(item.to_dict())
+        signature = json.dumps(plain, ensure_ascii=False, sort_keys=True)
+        if signature in self._signatures:
+            return None
+        self._signatures.add(signature)
+        self.items.append(item)
+        return item
+
 
 def _tool_delta_text(value: Any) -> str:
     if value is None:
@@ -288,6 +448,9 @@ def _events_from_model_event(
     *,
     started_tool_ids: set[str],
     native_tracker: _NativeTracker,
+    codec: PydanticAICodec,
+    identity: ProviderIdentity,
+    completed_tool_ids: set[str],
 ) -> list[ProviderEvent]:
     result: list[ProviderEvent] = []
 
@@ -296,23 +459,26 @@ def _events_from_model_event(
         if isinstance(part, AITextPart):
             if part.content:
                 result.append(TextDelta(part.content))
-            native = native_tracker.add(part.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(part.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         elif isinstance(part, AIThinkingPart):
             if part.content:
                 result.append(ReasoningDelta(part.content))
-            native = native_tracker.add(part.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(part.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         elif isinstance(part, AIToolCallPart):
             tool_id = part.tool_call_id
             if tool_id not in started_tool_ids:
                 started_tool_ids.add(tool_id)
                 result.append(ToolCallStarted(tool_id, part.tool_name))
-            native = native_tracker.add(part.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(part.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         return result
 
     if isinstance(event, PartDeltaEvent):
@@ -323,9 +489,10 @@ def _events_from_model_event(
         elif isinstance(delta, ThinkingPartDelta):
             if delta.content_delta:
                 result.append(ReasoningDelta(delta.content_delta))
-            native = native_tracker.add(delta.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(delta.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         elif isinstance(delta, ToolCallPartDelta):
             tool_id = delta.tool_call_id
             if tool_id is not None and tool_id not in started_tool_ids:
@@ -340,28 +507,57 @@ def _events_from_model_event(
                         _tool_delta_text(delta.args_delta),
                     )
                 )
-            native = native_tracker.add(delta.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(delta.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         return result
 
     if isinstance(event, PartEndEvent):
         part = event.part
         if isinstance(part, AIToolCallPart):
-            result.append(
-                ToolCallCompleted(
-                    tool_call_id=part.tool_call_id,
-                    name=part.tool_name,
-                    arguments=_tool_arguments(part.args),
+            # A provider may close a logical part when another indexed tool
+            # starts, before all argument deltas have arrived. The final
+            # response pass below emits completion once the accumulated JSON
+            # is complete; an invalid final value still fails there.
+            try:
+                arguments = _tool_arguments(part.args)
+            except InvalidProviderResponseError:
+                arguments = None
+            if arguments is not None and part.tool_call_id not in completed_tool_ids:
+                completed_tool_ids.add(part.tool_call_id)
+                result.append(
+                    ToolCallCompleted(
+                        tool_call_id=part.tool_call_id,
+                        name=part.tool_name,
+                        arguments=arguments,
+                    )
                 )
-            )
-            native = native_tracker.add(part.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(part.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
+            for native_item in codec.native_items_for_part(
+                part,
+                index=event.index,
+                identity=identity,
+            ):
+                native = native_tracker.add_item(native_item)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         elif isinstance(part, (AITextPart, AIThinkingPart)):
-            native = native_tracker.add(part.provider_details)
-            if native is not None:
-                result.append(NativeItemCompleted(native))
+            if codec.capture_provider_details:
+                native = native_tracker.add(part.provider_details)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
+            for native_item in codec.native_items_for_part(
+                part,
+                index=event.index,
+                identity=identity,
+            ):
+                native = native_tracker.add_item(native_item)
+                if native is not None:
+                    result.append(NativeItemCompleted(native))
         return result
 
     if isinstance(event, FinalResultEvent):
@@ -382,8 +578,17 @@ def _usage_from_model_response(response: ModelResponse) -> Usage:
     return Usage(
         input_tokens=getattr(raw_usage, "input_tokens", 0) or 0,
         output_tokens=getattr(raw_usage, "output_tokens", 0) or 0,
-        cache_read_tokens=plain_details.get("cache_read_tokens", 0) or 0,
-        cache_write_tokens=plain_details.get("cache_write_tokens", 0) or 0,
+        cache_read_tokens=(
+            plain_details.get("cache_read_tokens", plain_details.get("cache_read_input_tokens", 0))
+            or 0
+        ),
+        cache_write_tokens=(
+            plain_details.get(
+                "cache_write_tokens",
+                plain_details.get("cache_creation_input_tokens", 0),
+            )
+            or 0
+        ),
         details=plain_details,
     )
 
@@ -392,9 +597,10 @@ def _response_to_core(
     response: ModelResponse,
     identity: ProviderIdentity,
     native_tracker: _NativeTracker,
+    codec: PydanticAICodec,
 ) -> tuple[ProviderResponse, tuple[NativeItem, ...]]:
     parts: list[TextPart | ReasoningPart | ToolCallPart] = []
-    for part in response.parts:
+    for index, part in enumerate(response.parts):
         if isinstance(part, AITextPart):
             parts.append(TextPart(part.content))
         elif isinstance(part, AIThinkingPart):
@@ -411,9 +617,20 @@ def _response_to_core(
             raise InvalidProviderResponseError(
                 f"Unsupported Pydantic AI response part: {type(part).__name__}"
             )
-        native_tracker.add(getattr(part, "provider_details", None))
+        if codec.capture_provider_details:
+            native_tracker.add(getattr(part, "provider_details", None))
+        for native_item in codec.native_items_for_part(
+            part,
+            index=index,
+            identity=identity,
+        ):
+            native_tracker.add_item(native_item)
 
-    native_tracker.add(response.provider_details)
+    if codec.capture_provider_details:
+        native_tracker.add(response.provider_details)
+    for native_item in codec.native_items_for_response(response, identity=identity):
+        native_tracker.add_item(native_item)
+    native_tracker.items.sort(key=lambda item: item.sequence_index)
     message = Message(
         role="assistant",
         parts=tuple(parts),
@@ -427,7 +644,7 @@ def _response_to_core(
         details["provider_response_id"] = response.provider_response_id
     result = ProviderResponse(
         message=message,
-        usage=_usage_from_model_response(response),
+        usage=codec.usage_from_model_response(response) or _usage_from_model_response(response),
         finish_reason=_finish_reason(response.finish_reason),
         native_items=tuple(native_tracker.items),
         details=details,
@@ -470,11 +687,18 @@ async def _iter_with_cancellation(
 class PydanticAIProvider:
     """Adapt one Pydantic AI Direct Model to the UthCode ProviderPort."""
 
-    def __init__(self, model: Any, identity: ProviderIdentity) -> None:
+    def __init__(
+        self,
+        model: Any,
+        identity: ProviderIdentity,
+        *,
+        codec: PydanticAICodec | None = None,
+    ) -> None:
         if not isinstance(identity, ProviderIdentity):
             raise TypeError("identity must be ProviderIdentity")
         self._model = model
         self._identity = identity
+        self._codec = codec or PydanticAICodec()
 
     @property
     def identity(self) -> ProviderIdentity:
@@ -487,11 +711,12 @@ class PydanticAIProvider:
         cancellation: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
         cancellation.raise_if_cancelled()
-        model_messages = _request_messages(request, self._identity)
+        model_messages = _request_messages(request, self._identity, self._codec)
         request_parameters = _request_parameters(request)
         settings = _model_settings(request)
         native_tracker = _NativeTracker(self._identity)
         started_tool_ids: set[str] = set()
+        completed_tool_ids: set[str] = set()
 
         mapped_error: ProviderError | None = None
         try:
@@ -501,6 +726,7 @@ class PydanticAIProvider:
                 model_settings=settings,
                 model_request_parameters=request_parameters,
             ) as model_stream:
+                self._codec.bind_stream(model_stream)
                 async for model_event in _iter_with_cancellation(
                     model_stream,
                     cancellation,
@@ -509,19 +735,33 @@ class PydanticAIProvider:
                         model_event,
                         started_tool_ids=started_tool_ids,
                         native_tracker=native_tracker,
+                        codec=self._codec,
+                        identity=self._identity,
+                        completed_tool_ids=completed_tool_ids,
                     ):
                         yield event
 
+                response = model_stream.get()
+                self._codec.validate_stream(model_stream, response)
                 if model_stream.state != "complete":
                     raise InvalidProviderResponseError(
                         "Pydantic AI stream ended without a complete response"
                     )
                 native_count_before_response = len(native_tracker.items)
                 response, all_native_items = _response_to_core(
-                    model_stream.get(),
+                    response,
                     self._identity,
                     native_tracker,
+                    self._codec,
                 )
+                for part in response.message.parts:
+                    if isinstance(part, ToolCallPart) and part.tool_call_id not in completed_tool_ids:
+                        completed_tool_ids.add(part.tool_call_id)
+                        yield ToolCallCompleted(
+                            tool_call_id=part.tool_call_id,
+                            name=part.name,
+                            arguments=dict(part.arguments),
+                        )
                 for item in all_native_items[native_count_before_response:]:
                     yield NativeItemCompleted(item)
                 yield GenerationCompleted(response)
@@ -538,4 +778,4 @@ class PydanticAIProvider:
             raise mapped_error
 
 
-__all__ = ["PydanticAIProvider"]
+__all__ = ["PydanticAICodec", "PydanticAIProvider", "record_model_stream"]
