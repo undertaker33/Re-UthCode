@@ -41,30 +41,30 @@
 
 ## Task 5：实现 Anthropic 协议适配
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_anthropic_integration.py`，全部通过且无真实 HTTP 请求。
-- [ ] Mock Anthropic 流依次返回 Thinking、Signature、Redacted Thinking、Text 和 Tool Use，UthCode 事件及 Native Item 保持原顺序。
-- [ ] 将完成响应加入下一轮同协议请求，Mock Client 捕获的请求中签名、Redacted Thinking 数据、Tool Use ID 和参数保持不变。
-- [ ] 将同一响应切换到非 Anthropic Provider，捕获请求中不存在 Anthropic Native Item 或签名。
-- [ ] Mock 用量覆盖输入、输出、缓存读取与缓存写入，UthCode Usage 映射值正确。
-- [ ] Mock 认证、限流、网络错误及取消，观察到对应 UthCode 错误并确认资源关闭。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_anthropic_integration.py`，全部通过且无真实 HTTP 请求。
+- [x] Mock Anthropic 流依次返回 Thinking、Signature、Redacted Thinking、Text 和 Tool Use，UthCode 事件及 Native Item 保持原顺序。
+- [x] 将完成响应加入下一轮同协议请求，Mock Client 捕获的请求中签名、Redacted Thinking 数据、Tool Use ID 和参数保持不变。
+- [x] 将同一响应切换到非 Anthropic Provider，捕获请求中不存在 Anthropic Native Item 或签名。
+- [x] Mock 用量覆盖输入、输出、缓存读取与缓存写入，UthCode Usage 映射值正确。
+- [x] Mock 认证、限流、网络错误及取消，观察到对应 UthCode 错误并确认资源关闭。
 
 ## Task 6：实现 OpenAI Responses 协议适配
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_openai_responses_integration.py`，全部通过且无真实 HTTP 请求。
-- [ ] Mock Responses 流返回 Reasoning、Reasoning Summary、交错 Function Calls 和 Function Call Output，Item ID、Call ID、输出索引及顺序保持稳定。
-- [ ] 对至少两个交错 Function Call 分批发送参数，完成结果不串线且各自参数 JSON 正确。
-- [ ] Delta、Done 与 Terminal Snapshot 重复携带同一 Item 时只完成一次；完成后冲突内容被拒绝。
-- [ ] 分别模拟 completed、incomplete、failed、无终态 EOF 和终态时未完成调用，结果符合契约且非法流不生成成功终态。
-- [ ] 将完成响应加入下一轮 Responses 请求，Mock Client 捕获到 Reasoning、Function Call、Function Call Output 及关联 ID；切换其他 Provider 时这些 Native Item 不被发送。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_openai_responses_integration.py`，全部通过且无真实 HTTP 请求。
+- [x] Mock Responses 流返回 Reasoning、Reasoning Summary、交错 Function Calls 和 Function Call Output，Item ID、Call ID、输出索引及顺序保持稳定。
+- [x] 对至少两个交错 Function Call 分批发送参数，完成结果不串线且各自参数 JSON 正确。
+- [x] Delta、Done 与 Terminal Snapshot 重复携带同一 Item 时只完成一次；完成后冲突内容被拒绝。
+- [x] 分别模拟 completed、incomplete、failed、无终态 EOF 和终态时未完成调用，结果符合契约且非法流不生成成功终态。
+- [x] 将完成响应加入下一轮 Responses 请求，Mock Client 捕获到 Reasoning、Function Call、Function Call Output 及关联 ID；切换其他 Provider 时这些 Native Item 不被发送。
 
 ## Task 7：实现 OpenAI-compatible Chat Completions 协议适配
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_openai_compat_integration.py`，全部通过且无真实 HTTP 请求。
-- [ ] Mock Client 捕获的工具定义使用 Chat Completions function tool 结构，并保持名称、描述和参数 Schema。
-- [ ] Mock Chat 流按至少两个 index 交错返回 Tool Call，聚合后的 ID、名称和参数分别正确。
-- [ ] 下一轮请求中的 Tool Result 使用 `role=tool`、对应 Tool Call ID 和结果内容。
-- [ ] 捕获请求中不存在 Responses 专用 Function Call Item 或 Function Call Output Item。
-- [ ] Mock 文本、Thinking/Reasoning Carrier、缓存用量、完成原因、错误和取消均映射为 UthCode 类型。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_openai_compat_integration.py`，全部通过且无真实 HTTP 请求。
+- [x] Mock Client 捕获的工具定义使用 Chat Completions function tool 结构，并保持名称、描述和参数 Schema。
+- [x] Mock Chat 流按至少两个 index 交错返回 Tool Call，聚合后的 ID、名称和参数分别正确。
+- [x] 下一轮请求中的 Tool Result 使用 `role=tool`、对应 Tool Call ID 和结果内容。
+- [x] 捕获请求中不存在 Responses 专用 Function Call Item 或 Function Call Output Item。
+- [x] Mock 文本、Thinking/Reasoning Carrier、缓存用量、完成原因、错误和取消均映射为 UthCode 类型。
 
 ## Task 8：实现配置与 Provider 构造
 
