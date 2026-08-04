@@ -83,33 +83,50 @@ def test_shared_bridge_public_surface_does_not_leak_sdk_types() -> None:
 
 
 def test_core_and_application_have_only_allowed_dependency_edges() -> None:
-    for path in (SRC / "core", SRC / "application"):
-        for source_path in path.rglob("*.py"):
-            tree = ast.parse(source_path.read_text(encoding="utf-8"))
-            imports = [
-                node.module or ""
-                for node in ast.walk(tree)
-                if isinstance(node, ast.ImportFrom)
-            ]
-            imported_names = [
-                alias.name
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Import)
-                for alias in node.names
-            ]
-            values = imports + imported_names
-            assert not any(
-                forbidden in value
-                for value in values
-                for forbidden in (
-                    "pydantic_ai",
-                    "anthropic",
-                    "openai",
-                    "langgraph",
-                    "langchain",
-                    "integrations",
-                )
-            ), source_path
+    forbidden = (
+        "pydantic_ai",
+        "anthropic",
+        "openai",
+        "langgraph",
+        "langchain",
+    )
+    for source_path in (SRC / "core").rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        values = [
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        ] + [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        assert not any(forbidden_name in value for value in values for forbidden_name in forbidden), source_path
+
+    for source_path in (SRC / "application").rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imports = [
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        ]
+        imported_names = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        values = imports + imported_names
+        allowed_integration_imports = {
+            "uthcode.integrations.providers.config"
+        }
+        if source_path.name == "bootstrap.py":
+            allowed_integration_imports.add("uthcode.integrations.providers.factory")
+        for value in values:
+            if value.startswith("uthcode.integrations"):
+                assert value in allowed_integration_imports, source_path
+            assert not any(forbidden_name in value for forbidden_name in forbidden), source_path
 
 
 def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
@@ -258,3 +275,85 @@ async def test_cancellation_closes_function_stream_and_returns_uthcode_error() -
     assert closed is True
     assert model_context_entries == 0
     assert model_context_exits == 0
+
+
+def test_runtime_source_contains_no_legacy_graph_or_compatibility_names() -> None:
+    forbidden = (
+        "langgraph",
+        "langchain",
+        "stategraph",
+        "graphstate",
+        "checkpoint",
+        "mewcode",
+        "conversationmanager",
+    )
+
+    for source_path in SRC.rglob("*.py"):
+        source = source_path.read_text(encoding="utf-8").lower()
+        assert not any(name in source for name in forbidden), source_path
+
+    assert not (SRC / "interfaces").exists()
+
+
+def test_protocol_wire_fields_stay_in_their_physical_modules() -> None:
+    paths = {
+        "anthropic": SRC / "integrations" / "providers" / "anthropic.py",
+        "responses": SRC / "integrations" / "providers" / "openai_responses.py",
+        "chat": SRC / "integrations" / "providers" / "openai_compat.py",
+        "bridge": SRC / "integrations" / "providers" / "pydantic_ai.py",
+    }
+    sources = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
+    markers = {
+        "anthropic": ("redacted_thinking", "tool_use", "message_stop"),
+        "responses": ("function_call", "output_index", "encrypted_content"),
+        "chat": ("reasoning_carrier", "assistant_tool_call", "prompt_tokens_details"),
+    }
+
+    for owner, fields in markers.items():
+        for field in fields:
+            assert field in sources[owner], (owner, field)
+            assert all(
+                field not in sources[other]
+                for other in sources
+                if other != owner
+            ), (field, owner)
+
+
+def test_shared_bridge_has_no_provider_dispatch_branch() -> None:
+    bridge = (SRC / "integrations" / "providers" / "pydantic_ai.py").read_text(
+        encoding="utf-8"
+    ).lower()
+
+    for protocol_name in ("anthropic", "openai_responses", "openai_compat"):
+        assert protocol_name not in bridge
+
+    for protocol_field in (
+        "redacted_thinking",
+        "function_call",
+        "reasoning_carrier",
+        "prompt_tokens_details",
+    ):
+        assert protocol_field not in bridge
+
+
+def test_provider_construction_has_one_formal_composition_root() -> None:
+    factory = SRC / "integrations" / "providers" / "factory.py"
+    bootstrap = SRC / "application" / "bootstrap.py"
+    generation = SRC / "application" / "generation.py"
+    providers_init = SRC / "integrations" / "providers" / "__init__.py"
+
+    mentions = {
+        path.relative_to(SRC).as_posix()
+        for path in SRC.rglob("*.py")
+        if "create_provider" in path.read_text(encoding="utf-8")
+    }
+    assert mentions == {
+        "application/bootstrap.py",
+        "integrations/providers/factory.py",
+    }
+    assert factory.read_text(encoding="utf-8").count("def create_provider") == 1
+    assert "create_provider" not in generation.read_text(encoding="utf-8")
+    assert "create_provider" not in providers_init.read_text(encoding="utf-8")
+    assert '__all__ = ["create_provider"]' in factory.read_text(encoding="utf-8")
+    assert '__all__: list[str] = []' in providers_init.read_text(encoding="utf-8")
+    assert "create_provider" in bootstrap.read_text(encoding="utf-8")

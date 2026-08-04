@@ -5,7 +5,12 @@ import socket
 
 import pytest
 
-from uthcode.application import UthCodeApplication
+from uthcode.application import (
+    ProviderConfig,
+    ProviderKind,
+    UthCodeApplication,
+    create_application,
+)
 from uthcode.core.provider import (
     CancellationToken,
     FinishReason,
@@ -66,6 +71,20 @@ async def test_headless_application_streams_text_usage_and_one_terminal_event() 
     assert events[-1].response.usage.total_tokens == 6  # type: ignore[union-attr]
     assert sum(isinstance(event, GenerationCompleted) for event in events) == 1
     assert len(provider.recorded_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_formal_bootstrap_builds_a_fake_headless_application() -> None:
+    application = create_application(
+        ProviderConfig(kind=ProviderKind.FAKE, model="bootstrap-fake")
+    )
+
+    events = await _collect(application)
+
+    assert isinstance(application, UthCodeApplication)
+    assert application.provider.identity.model == "bootstrap-fake"
+    assert isinstance(events[-1], GenerationCompleted)
+    assert sum(isinstance(event, GenerationCompleted) for event in events) == 1
 
 
 @pytest.mark.asyncio

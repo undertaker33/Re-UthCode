@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,8 @@ from uthcode.core.provider import (
     InvalidProviderResponseError,
     Message,
     NativeItemCompleted,
+    ReasoningDelta,
+    ReasoningOptions,
     ReasoningPart,
     RateLimitError,
     TextDelta,
@@ -28,6 +31,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     ToolResultPart,
 )
+from uthcode.application import ProviderConfig, ProviderKind, create_application
 from uthcode.integrations.providers.openai_compat import build_openai_compat_provider
 
 
@@ -334,3 +338,84 @@ async def test_chat_explicit_cancellation_closes_stream() -> None:
     with pytest.raises(GenerationCancelled):
         await task
     assert client.stream.closed is True
+
+
+_LIVE_ENABLED = (
+    os.environ.get("UTHCODE_RUN_LIVE") == "1"
+    and bool(os.environ.get("DEEPSEEK_API_KEY"))
+)
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not _LIVE_ENABLED,
+    reason="set UTHCODE_RUN_LIVE=1 and DEEPSEEK_API_KEY for live validation",
+)
+@pytest.mark.asyncio
+async def test_chat_deepseek_live_headless_text_reasoning_tools_and_continuation() -> None:
+    application = create_application(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_COMPAT,
+            model="deepseek-v4-flash",
+            api_key_env="DEEPSEEK_API_KEY",
+            base_url="https://api.deepseek.com",
+            max_output_tokens=512,
+        )
+    )
+    request = GenerationRequest(
+        messages=(
+            Message(
+                "user",
+                (
+                    TextPart(
+                        "Use the lookup tool exactly once for query 'uthcode'. "
+                        "Think briefly before calling it and do not answer without the call."
+                    ),
+                ),
+            ),
+        ),
+        tools=(
+            ToolDefinition(
+                "lookup",
+                description="Look up one query.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            ),
+        ),
+        reasoning=ReasoningOptions(enabled=True, effort="medium"),
+    )
+
+    try:
+        first = [event async for event in application.stream_generation(request)]
+        first_terminal = next(event for event in first if isinstance(event, GenerationCompleted))
+        calls = [event for event in first if isinstance(event, ToolCallCompleted)]
+        assert any(isinstance(event, ReasoningDelta) for event in first)
+        assert calls
+
+        continuation = GenerationRequest(
+            messages=(
+                *request.messages,
+                first_terminal.response.message,
+                Message(
+                    "tool",
+                    tuple(
+                        ToolResultPart(call.tool_call_id, "verified lookup result")
+                        for call in calls
+                    ),
+                ),
+            ),
+            tools=request.tools,
+            reasoning=request.reasoning,
+        )
+        second = [
+            event
+            async for event in application.stream_generation(continuation)
+        ]
+        second_terminal = next(event for event in second if isinstance(event, GenerationCompleted))
+        assert any(isinstance(event, TextDelta) and event.text for event in first + second)
+        assert second_terminal.response.finish_reason.value == "stop"
+    finally:
+        os.environ.pop("DEEPSEEK_API_KEY", None)
