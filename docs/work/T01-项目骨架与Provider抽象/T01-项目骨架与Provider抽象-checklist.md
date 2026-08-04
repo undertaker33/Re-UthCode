@@ -68,46 +68,46 @@
 
 ## Task 8：实现配置与 Provider 构造
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_provider_factory.py`，全部通过。
-- [ ] 分别构造 Fake、Anthropic、OpenAI Responses 和 OpenAI-compatible Provider，构造期间网络拦截器记录 0 次请求。
-- [ ] 缺失秘密环境变量时构造真实 Provider，错误仅包含环境变量名称，不包含任何秘密值。
-- [ ] 检查配置对象、异常、repr 和测试输出，不出现注入的测试 Key。
-- [ ] 未提供自定义 base URL 时构造 OpenAI-compatible Provider 被拒绝；Fake 构造不要求秘密。
-- [ ] 构造两个相同配置的实例并分别修改可观测内部状态，实例之间互不影响。
-- [ ] 执行 `rg -n "create_provider|factory" src/uthcode/core src/uthcode/application/generation.py`，Core 和 Application 生成用例均不依赖 Factory 实现。
-- [ ] 执行 `Test-Path src/uthcode/config.py`，结果为 `False`；Provider 配置只存在于 `src/uthcode/integrations/providers/config.py`。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_provider_factory.py`，全部通过。
+- [x] 分别构造 Fake、Anthropic、OpenAI Responses 和 OpenAI-compatible Provider，构造期间网络拦截器记录 0 次请求。
+- [x] 缺失秘密环境变量时构造真实 Provider，错误仅包含环境变量名称，不包含任何秘密值。
+- [x] 检查配置对象、异常、repr 和测试输出，不出现注入的测试 Key。
+- [x] 未提供自定义 base URL 时构造 OpenAI-compatible Provider 被拒绝；Fake 构造不要求秘密。
+- [x] 构造两个相同配置的实例并分别修改可观测内部状态，实例之间互不影响。
+- [x] 执行 `rg -n "create_provider|factory" src/uthcode/core src/uthcode/application/generation.py`，Core 和 Application 生成用例均不依赖 Factory 实现。
+- [x] 执行 `Test-Path src/uthcode/config.py`，结果为 `False`；Provider 配置只存在于 `src/uthcode/integrations/providers/config.py`。
 
 ## Task 9：[接入主流程] 接入正式 Headless 调用链
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_application.py tests/test_provider_factory.py`，全部通过。
-- [ ] 从正式配置与 Provider 构造入口创建 Fake Provider，再由 Application 完成一次 Headless 请求并观察到唯一终态。
-- [ ] README 中的 Headless Fake 示例在 `re-uthcode` 环境直接运行成功，且不使用 CLI、stdin 或交互 UI。
-- [ ] 执行 `rg -n "anthropic|openai_responses|openai_compat" src/uthcode/application src/uthcode/core`，返回 0 条 Provider 名称分支。
-- [ ] 检查 `src/uthcode/application/bootstrap.py`，它是 Application 内唯一依赖 Integration Factory 的组合模块；`generation.py` 不导入 Integration。
-- [ ] 执行 `rg -n "FakeProvider\(|AnthropicModel\(|OpenAIResponsesModel\(|OpenAIChatModel\(" src/uthcode --glob '*.py'`，除各物理 Integration 模块和 Factory 外不存在阶段性直构入口。
-- [ ] 检查 `src/uthcode/application/__init__.py`，只从 Application 包公开用例、组合入口和调用方必需的 UthCode 类型；检查 `src/uthcode/integrations/providers/__init__.py`，不暴露 SDK 类型或第二个公开组合入口。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_application.py tests/test_provider_factory.py`，全部通过。
+- [x] 从正式配置与 Provider 构造入口创建 Fake Provider，再由 Application 完成一次 Headless 请求并观察到唯一终态。
+- [x] README 中的 Headless Fake 示例在 `re-uthcode` 环境直接运行成功，且不使用 CLI、stdin 或交互 UI。
+- [x] 执行 `rg -n "anthropic|openai_responses|openai_compat" src/uthcode/application src/uthcode/core`，返回 0 条 Provider 名称分支。
+- [x] 检查 `src/uthcode/application/bootstrap.py`，它是 Application 内唯一依赖 Integration Factory 的组合模块；`generation.py` 不导入 Integration。
+- [x] 执行 `rg -n "FakeProvider\(|AnthropicModel\(|OpenAIResponsesModel\(|OpenAIChatModel\(" src/uthcode --glob '*.py'`，除各物理 Integration 模块和 Factory 外不存在阶段性直构入口。
+- [x] 检查 `src/uthcode/application/__init__.py`，只从 Application 包公开用例、组合入口和调用方必需的 UthCode 类型；检查 `src/uthcode/integrations/providers/__init__.py`，不暴露 SDK 类型或第二个公开组合入口。
 
 ## Task 10：[端到端验证] 验证离线链路与真实三协议
 
-- [ ] 在未设置 live 标记和 `DEEPSEEK_API_KEY` 时执行 `conda run -n re-uthcode pytest -q`，全量离线测试通过，live 用例明确显示 skipped，网络拦截器记录 0 次请求。
-- [ ] 执行 `conda run -n re-uthcode python -m compileall -q src tests`，退出码为 0。
-- [ ] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
-- [ ] 在用户确认请求数量和费用影响后，仅在当前 PowerShell 会话设置 `DEEPSEEK_API_KEY`，不写入 `.env`、配置文件、命令日志或版本库。
-- [ ] 显式运行 Anthropic live 用例，从正式 Headless 入口观察到文本、Thinking、Tool Call、Tool Result 续轮和成功终态。
-- [ ] 显式运行 Responses live 用例，从正式 Headless 入口观察到文本、Reasoning、Function Call、Function Call Output 续轮和成功终态。
-- [ ] 显式运行 Chat Completions live 用例，从正式 Headless 入口观察到文本、Reasoning Carrier、Tool Call、`role=tool` 续轮和成功终态。
-- [ ] live 测试输出、pytest 报告、异常和 Git diff 中均搜索不到 API Key；测试结束后从当前进程环境移除该变量。
-- [ ] 若任一真实协议失败，记录 HTTP 状态、脱敏错误、协议和阶段，并保持对应测试失败，不通过删减断言或改走其他协议伪造通过。
+- [x] 在未设置 live 标记和 `DEEPSEEK_API_KEY` 时执行 `conda run -n re-uthcode pytest -q`，全量离线测试通过，live 用例明确显示 skipped，网络拦截器记录 0 次请求。
+- [x] 执行 `conda run -n re-uthcode python -m compileall -q src tests`，退出码为 0。
+- [x] 执行 `conda run -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
+- [x] 在用户确认请求数量和费用影响后，仅在当前 PowerShell 会话设置 `DEEPSEEK_API_KEY`，不写入 `.env`、配置文件、命令日志或版本库。
+- [x] 显式运行 Anthropic live 用例，从正式 Headless 入口观察到文本、Thinking、Tool Call、Tool Result 续轮和成功终态。
+- [x] 显式运行 Responses live 用例，从正式 Headless 入口观察到文本、Reasoning、Function Call、Function Call Output 续轮和成功终态。
+- [x] 显式运行 Chat Completions live 用例，从正式 Headless 入口观察到文本、Reasoning Carrier、Tool Call、`role=tool` 续轮和成功终态。
+- [x] live 测试输出、pytest 报告、异常和 Git diff 中均搜索不到 API Key；测试结束后从当前进程环境移除该变量。
+- [x] 若任一真实协议失败，记录 HTTP 状态、脱敏错误、协议和阶段，并保持对应测试失败，不通过删减断言或改走其他协议伪造通过。
 
 ## Task 11：[遗留负担清理] 清除兼容层与重复职责
 
-- [ ] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
-- [ ] 执行 `rg -ni "langgraph|langchain|StateGraph|GraphState|Checkpoint|mewcode" pyproject.toml src tests`，除架构测试的禁止字符串断言外返回 0 条运行时依赖或导入。
-- [ ] 执行 `rg --files src/uthcode`，不存在 `interfaces/` 以及 Prompt、Tool 执行、Permission、Context、Memory、Session、Storage、Journal、Sandbox、Command、Hook、Skill、MCP、Agent 或 Worktree 占位模块。
-- [ ] 搜索旧 Day1 公共类名、模块路径和旧入口，源码中返回 0 条兼容 Adapter、别名、Facade、包装层或双轨逻辑。
-- [ ] 检查三个真实协议文件，协议特有字段分别只位于对应物理模块；共用桥接层不存在 Provider 名称 switch/if 分支。
-- [ ] 检查 Factory 与包导出，Provider 构造只有一个正式出口，不存在已替代旧入口或不可达分支。
-- [ ] 执行 `Get-ChildItem src/uthcode -Force | Select-Object -ExpandProperty Name`，功能目录只包含当前实际存在的 `core`、`application`、`integrations`；根级除 `__init__.py` 外不存在承担上述职责的平级功能模块。
-- [ ] 执行 `conda run -n re-uthcode python -m pip list --not-required --format=freeze` 并结合 `pyproject.toml` 审查顶层包；移除不再被项目或传递链需要的额外依赖后，重新执行 `pip check` 通过。
-- [ ] 执行 `conda run -n re-uthcode python -m compileall -q src tests` 和 `conda run -n re-uthcode pytest -q`，全部通过。
-- [ ] 查看 `git diff --check`，无空白错误；查看 `git status --short`，没有真实秘密、缓存、构建产物或工作包外的意外文件。
+- [x] 执行 `conda run -n re-uthcode pytest -q tests/test_architecture_boundaries.py`，全部通过。
+- [x] 执行 `rg -ni "langgraph|langchain|StateGraph|GraphState|Checkpoint|mewcode" pyproject.toml src tests`，除架构测试的禁止字符串断言外返回 0 条运行时依赖或导入。
+- [x] 执行 `rg --files src/uthcode`，不存在 `interfaces/` 以及 Prompt、Tool 执行、Permission、Context、Memory、Session、Storage、Journal、Sandbox、Command、Hook、Skill、MCP、Agent 或 Worktree 占位模块。
+- [x] 搜索旧 Day1 公共类名、模块路径和旧入口，源码中返回 0 条兼容 Adapter、别名、Facade、包装层或双轨逻辑。
+- [x] 检查三个真实协议文件，协议特有字段分别只位于对应物理模块；共用桥接层不存在 Provider 名称 switch/if 分支。
+- [x] 检查 Factory 与包导出，Provider 构造只有一个正式出口，不存在已替代旧入口或不可达分支。
+- [x] 执行 `Get-ChildItem src/uthcode -Force | Select-Object -ExpandProperty Name`，功能目录只包含当前实际存在的 `core`、`application`、`integrations`；根级除 `__init__.py` 外不存在承担上述职责的平级功能模块。
+- [x] 执行 `conda run -n re-uthcode python -m pip list --not-required --format=freeze` 并结合 `pyproject.toml` 审查顶层包；移除不再被项目或传递链需要的额外依赖后，重新执行 `pip check` 通过。
+- [x] 执行 `conda run -n re-uthcode python -m compileall -q src tests` 和 `conda run -n re-uthcode pytest -q`，全部通过。
+- [x] 查看 `git diff --check`，无空白错误；查看 `git status --short`，没有真实秘密、缓存、构建产物或工作包外的意外文件。

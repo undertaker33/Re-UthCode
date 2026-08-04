@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,13 +19,17 @@ from uthcode.core.provider import (
     Message,
     NativeItemCompleted,
     ProviderIdentity,
+    ReasoningDelta,
+    ReasoningOptions,
     ReasoningPart,
     TextDelta,
     TextPart,
     ToolCallCompleted,
     ToolCallPart,
+    ToolDefinition,
     ToolResultPart,
 )
+from uthcode.application import ProviderConfig, ProviderKind, create_application
 from uthcode.integrations.providers.openai_responses import (
     OpenAIResponsesCodec,
     build_openai_responses_provider,
@@ -357,6 +362,35 @@ async def test_responses_actual_model_preserves_items_indices_and_usage() -> Non
     assert client.stream.closed is True
 
 
+def test_responses_nullable_cache_usage_is_normalized_to_zero() -> None:
+    class _Usage:
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            del mode
+            return {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "input_tokens_details": {
+                    "cached_tokens": None,
+                    "cache_write_tokens": None,
+                },
+            }
+
+    terminal = type(
+        "ResponseCompletedEvent",
+        (),
+        {"response": SimpleNamespace(usage=_Usage())},
+    )()
+    codec = OpenAIResponsesCodec()
+    codec._recorder = SimpleNamespace(events=[terminal])  # type: ignore[attr-defined]
+
+    usage = codec.usage_from_model_response(None)
+
+    assert usage is not None
+    assert usage.cache_read_tokens == 0
+    assert usage.cache_write_tokens == 0
+
+
 @pytest.mark.asyncio
 async def test_responses_duplicate_delta_done_and_terminal_frames_are_deduplicated() -> None:
     events = _item_events()
@@ -475,3 +509,92 @@ async def test_responses_explicit_cancellation_closes_stream() -> None:
     with pytest.raises(GenerationCancelled):
         await task
     assert client.stream.closed is True
+
+
+_LIVE_ENABLED = (
+    os.environ.get("UTHCODE_RUN_LIVE") == "1"
+    and bool(os.environ.get("DEEPSEEK_API_KEY"))
+)
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not _LIVE_ENABLED,
+    reason="set UTHCODE_RUN_LIVE=1 and DEEPSEEK_API_KEY for live validation",
+)
+@pytest.mark.asyncio
+async def test_responses_deepseek_live_headless_text_reasoning_tools_and_continuation() -> None:
+    application = create_application(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="deepseek-v4-flash",
+            api_key_env="DEEPSEEK_API_KEY",
+            base_url="https://api.deepseek.com",
+            max_output_tokens=512,
+        )
+    )
+    request = GenerationRequest(
+        messages=(
+            Message(
+                "user",
+                (
+                    TextPart(
+                        "Use the lookup tool exactly once for query 'uthcode'. "
+                        "Think briefly before calling it and do not answer without the call."
+                    ),
+                ),
+            ),
+        ),
+        tools=(
+            ToolDefinition(
+                "lookup",
+                description="Look up one query.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            ),
+        ),
+        reasoning=ReasoningOptions(enabled=True, effort="medium"),
+    )
+
+    try:
+        first = [event async for event in application.stream_generation(request)]
+        first_terminal = next(event for event in first if isinstance(event, GenerationCompleted))
+        calls = [event for event in first if isinstance(event, ToolCallCompleted)]
+        reasoning_observed = (
+            any(isinstance(event, ReasoningDelta) for event in first)
+            or any(
+                isinstance(part, ReasoningPart)
+                for part in first_terminal.response.message.parts
+            )
+            or any(item.kind == "reasoning" for item in first_terminal.response.native_items)
+        )
+        assert reasoning_observed
+        assert calls
+
+        continuation = GenerationRequest(
+            messages=(
+                *request.messages,
+                first_terminal.response.message,
+                Message(
+                    "tool",
+                    tuple(
+                        ToolResultPart(call.tool_call_id, "verified lookup result")
+                        for call in calls
+                    ),
+                ),
+            ),
+            tools=request.tools,
+            reasoning=request.reasoning,
+        )
+        second = [
+            event
+            async for event in application.stream_generation(continuation)
+        ]
+        second_terminal = next(event for event in second if isinstance(event, GenerationCompleted))
+        assert any(isinstance(event, TextDelta) and event.text for event in first + second)
+        assert second_terminal.response.finish_reason.value == "stop"
+    finally:
+        os.environ.pop("DEEPSEEK_API_KEY", None)

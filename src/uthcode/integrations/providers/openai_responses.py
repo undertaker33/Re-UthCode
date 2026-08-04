@@ -308,9 +308,14 @@ class OpenAIResponsesCodec(PydanticAICodec):
             raise InvalidProviderResponseError(
                 "Responses input token details must be a JSON object"
             )
-        cache_read = input_details.get("cached_tokens", 0)
-        cache_write = input_details.get("cache_write_tokens", 0)
-        if not isinstance(cache_read, int) or not isinstance(cache_write, int):
+        cache_read = input_details.get("cached_tokens") or 0
+        cache_write = input_details.get("cache_write_tokens") or 0
+        if (
+            isinstance(cache_read, bool)
+            or isinstance(cache_write, bool)
+            or not isinstance(cache_read, int)
+            or not isinstance(cache_write, int)
+        ):
             raise InvalidProviderResponseError(
                 "Responses cache usage values must be integers"
             )

@@ -26,3 +26,6 @@ packages = ["src/uthcode"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "live: explicitly authorized tests that may call a real model endpoint",
+]
