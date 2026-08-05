@@ -1,4 +1,6 @@
-"""Public UthCode Core provider contract."""
+"""Public UthCode Core contracts."""
+
+from .prompt import PromptSection, SystemPromptContext, build_system_prompt
 
 from .provider import (
     AuthenticationError,
@@ -61,6 +63,7 @@ __all__ = [
     "ProviderIdentity",
     "ProviderPort",
     "ProviderResponse",
+    "PromptSection",
     "provider_event_from_dict",
     "provider_event_from_json",
     "RateLimitError",
@@ -75,5 +78,7 @@ __all__ = [
     "ToolCallStarted",
     "ToolDefinition",
     "ToolResultPart",
+    "SystemPromptContext",
     "Usage",
+    "build_system_prompt",
 ]

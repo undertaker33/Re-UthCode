@@ -90,7 +90,7 @@ def _message_text(message: Message) -> str:
             values.append(part.content)
         else:
             raise InvalidProviderResponseError(
-                "Chat user or system message contains an unsupported part"
+                "Chat message contains an unsupported part"
             )
     return "".join(values)
 
@@ -180,8 +180,10 @@ def _request_messages(
     identity: ProviderIdentity,
 ) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
+    if request.system_prompt is not None:
+        messages.append({"role": "system", "content": request.system_prompt})
     for message in request.messages:
-        if message.role in {"system", "user"}:
+        if message.role == "user":
             messages.append(
                 {"role": message.role, "content": _message_text(message)}
             )

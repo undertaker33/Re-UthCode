@@ -115,6 +115,10 @@ uthcode exec "Explain this directory"
 uthcode exec --cwd C:\work\project --model local/echo "hello"
 ```
 
+The selected `--cwd` is normalized once and is used for both configuration
+discovery and the Application runtime context. The default TUI uses that same
+Application-owned workdir for its top bar and generation requests.
+
 Text deltas are written to stdout. Diagnostics are written to stderr. Exit
 codes are `0` for success, `1` for Provider failure, `2` for configuration or
 usage failure, and `130` for cancellation.
@@ -126,8 +130,10 @@ CLI or TUI:
 
 ```python
 import asyncio
+from pathlib import Path
 
 from uthcode.application import (
+    ApplicationRuntimeContext,
     EffectiveConfig,
     GenerationCompleted,
     GenerationRequest,
@@ -139,13 +145,15 @@ from uthcode.application import (
 
 
 async def main() -> None:
+    runtime_context = ApplicationRuntimeContext.from_system(workdir=Path.cwd())
     application = create_application(
         EffectiveConfig.single_model(
             "local/echo",
             provider_profile_id="local",
             provider_kind=ProviderKind.FAKE,
             remote_model_id="echo",
-        )
+        ),
+        runtime_context=runtime_context,
     )
     request = GenerationRequest(
         messages=(Message("user", (TextPart("hello"),)),)

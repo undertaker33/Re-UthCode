@@ -9,6 +9,7 @@ from typing import Any
 
 from .configuration import EffectiveConfig, LaunchOptions, ModelProfile, ProviderProfile
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
+from .runtime_context import ApplicationRuntimeContext
 
 
 class ConfigurationError(ValueError):
@@ -78,6 +79,7 @@ def create_application(
     *,
     provider_builder: ProviderBuilder | None = None,
     model_writer: ModelWriter | None = None,
+    runtime_context: ApplicationRuntimeContext | None = None,
 ) -> UthCodeApplication:
     """Build a Headless Application from one EffectiveConfig."""
 
@@ -95,6 +97,7 @@ def create_application(
         configuration=config,
         provider_builder=builder,
         model_writer=writer,
+        runtime_context=runtime_context,
     )
 
 

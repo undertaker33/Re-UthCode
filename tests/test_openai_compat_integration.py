@@ -160,8 +160,16 @@ def _delayed_identity_chunks() -> list[object]:
     ]
 
 
-def _request(*messages: Message, tools: tuple[ToolDefinition, ...] = ()) -> GenerationRequest:
-    return GenerationRequest(messages=messages, tools=tools)
+def _request(
+    *messages: Message,
+    system_prompt: str | None = None,
+    tools: tuple[ToolDefinition, ...] = (),
+) -> GenerationRequest:
+    return GenerationRequest(
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
 
 
 async def _collect(provider: object, request: GenerationRequest, token: CancellationToken | None = None) -> list[object]:
@@ -205,6 +213,7 @@ async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_or
     assert sum(isinstance(event, NativeItemCompleted) for event in events) == 4
     assert client.stream.closed is True
     assert client.calls[0]["stream_options"] == {"include_usage": True}
+    assert not any(message["role"] == "system" for message in client.calls[0]["messages"])
     assert client.calls[0]["tools"] == [
         {
             "type": "function",
@@ -311,10 +320,10 @@ async def test_chat_nullable_usage_is_normalized_and_history_uses_chat_shapes() 
     await _collect(
         history_provider,
         _request(
-            Message("system", (TextPart("rules"),)),
             Message("user", (TextPart("continue"),)),
             history_response.message,
             Message("tool", (ToolResultPart("call-1", "tool output"),)),
+            system_prompt="rules",
         ),
     )
     messages = history_client.calls[-1]["messages"]
@@ -325,6 +334,8 @@ async def test_chat_nullable_usage_is_normalized_and_history_uses_chat_shapes() 
         {"id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"two"}'}},
     ]
     assert messages[0] == {"role": "system", "content": "rules"}
+    assert messages[1] == {"role": "user", "content": "continue"}
+    assert sum(message["role"] == "system" for message in messages) == 1
     assert any(message == {"role": "tool", "tool_call_id": "call-1", "content": "tool output"} for message in messages)
     assert "function_call_output" not in repr(messages)
 

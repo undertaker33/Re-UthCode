@@ -347,13 +347,9 @@ def _native_at(
 def _request_input(
     request: GenerationRequest,
     identity: ProviderIdentity,
-) -> tuple[str | None, list[dict[str, object]]]:
-    instructions: list[str] = []
+) -> list[dict[str, object]]:
     values: list[dict[str, object]] = []
     for message in request.messages:
-        if message.role == "system":
-            instructions.append(_request_text(message))
-            continue
         if message.role == "user":
             values.append(
                 {
@@ -418,7 +414,7 @@ def _request_input(
                 )
             else:  # pragma: no cover - Core Message validates part types
                 raise InvalidProviderResponseError("Responses assistant part is unsupported")
-    return ("\n\n".join(instructions) if instructions else None), values
+    return values
 
 
 def _request_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
@@ -514,7 +510,7 @@ class OpenAIResponsesProvider:
         mapped_error: ProviderError | None = None
         completed: ProviderResponse | None = None
         try:
-            instructions, input_values = _request_input(request, self._identity)
+            input_values = _request_input(request, self._identity)
             max_output_tokens = (
                 request.max_output_tokens
                 if request.max_output_tokens is not None
@@ -528,8 +524,8 @@ class OpenAIResponsesProvider:
                 "max_output_tokens": max_output_tokens,
                 "stream": True,
             }
-            if instructions is not None:
-                kwargs["instructions"] = instructions
+            if request.system_prompt is not None:
+                kwargs["instructions"] = request.system_prompt
             if request.tools:
                 kwargs["tools"] = _request_tools(request.tools)
             if request.temperature is not None:

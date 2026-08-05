@@ -7,6 +7,7 @@ import pytest
 
 from uthcode.application import (
     ArgumentSpec,
+    ApplicationRuntimeContext,
     CommandDefinition,
     CommandKind,
     CompletionCandidate,
@@ -254,11 +255,22 @@ async def test_tui_argument_completion_uses_catalog_and_formal_model_dispatch() 
 
 @pytest.mark.asyncio
 async def test_tui_layout_composer_and_streamed_assistant_block() -> None:
-    application = _application(events=(TextDelta("hello"), _completed("ignored")))
-    tui = UthCodeTUI(application, cwd=Path("C:/workspace"))
+    context = ApplicationRuntimeContext.from_system(
+        workdir=Path("C:/workspace"),
+        platform_name="TestOS",
+        platform_release="1.0",
+        current_date="2026-08-05",
+    )
+    application = UthCodeApplication(
+        FakeProvider(events=(TextDelta("hello"), _completed("ignored"))),
+        runtime_context=context,
+    )
+    tui = UthCodeTUI(application)
 
     async with tui.run_test() as pilot:
-        assert "UthCode" in tui.query_one("#topbar").render().plain
+        topbar = tui.query_one("#topbar").render().plain
+        assert "UthCode" in topbar
+        assert str(context.workdir) in topbar
         composer = tui.query_one(ComposerTextArea)
         composer.focus()
         composer.text = "hello"
@@ -273,6 +285,10 @@ async def test_tui_layout_composer_and_streamed_assistant_block() -> None:
         ]
         assert transcript.state.entries[-1].text == "hello"
         assert len(tui.query(".assistant-entry")) == 1
+        prompt = application.provider.recorded_requests[0].system_prompt
+        assert prompt is not None
+        assert "模型选择：fake-model" in prompt
+        assert "工作目录：" in prompt
 
 
 @pytest.mark.asyncio
@@ -579,8 +595,18 @@ label = "Two"
         providers.append(instance)
         return instance
 
-    application = create_application(configuration, provider_builder=builder)
-    tui = UthCodeTUI(application, cwd=project)
+    context = ApplicationRuntimeContext.from_system(
+        workdir=project,
+        platform_name="TestOS",
+        platform_release="1.0",
+        current_date="2026-08-05",
+    )
+    application = create_application(
+        configuration,
+        provider_builder=builder,
+        runtime_context=context,
+    )
+    tui = UthCodeTUI(application)
 
     async with tui.run_test() as pilot:
         composer = tui.query_one(ComposerTextArea)
@@ -610,6 +636,11 @@ label = "Two"
         assert providers[0].recorded_requests[0].messages == (
             Message("user", (TextPart("first request"),)),
         )
+        first_prompt = providers[0].recorded_requests[0].system_prompt
+        assert first_prompt is not None
+        assert "模型选择：one/ref" in first_prompt
+        assert "远端模型：one" in first_prompt
+        assert "工作目录：" in first_prompt
 
         composer.text = "/clear"
         await pilot.press("enter")
@@ -638,6 +669,10 @@ label = "Two"
         assert providers[1].recorded_requests[0].messages == (
             Message("user", (TextPart("second request"),)),
         )
+        second_prompt = providers[1].recorded_requests[0].system_prompt
+        assert second_prompt is not None
+        assert "模型选择：two/ref" in second_prompt
+        assert "远端模型：two" in second_prompt
 
         composer.text = "cancel me"
         await pilot.press("enter")

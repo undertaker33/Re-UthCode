@@ -235,8 +235,16 @@ def _item_events(
     return events
 
 
-def _request(*messages: Message, tools: tuple[ToolDefinition, ...] = ()) -> GenerationRequest:
-    return GenerationRequest(messages=messages, tools=tools)
+def _request(
+    *messages: Message,
+    system_prompt: str | None = None,
+    tools: tuple[ToolDefinition, ...] = (),
+) -> GenerationRequest:
+    return GenerationRequest(
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
 
 
 async def _collect(provider: object, request: GenerationRequest, token: CancellationToken | None = None) -> list[object]:
@@ -275,6 +283,8 @@ async def test_responses_public_stream_preserves_items_indices_usage_and_reasoni
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert sum(isinstance(event, NativeItemCompleted) for event in events) == 4
     assert sum(isinstance(event, ToolCallCompleted) for event in events) == 2
+    assert "instructions" not in client.calls[0]
+    assert all(item.get("role") != "system" for item in client.calls[0]["input"])
     assert client.stream.closed is True
 
 
@@ -283,10 +293,25 @@ async def test_responses_request_shapes_tools_native_replay_and_cross_identity_f
     client = _OpenAIClient(_item_events())
     provider = build_openai_responses_provider("gpt-test", client=client)
     tools = (ToolDefinition("search", "Search", {"type": "object", "properties": {"q": {"type": "string"}}}),)
-    first = await _collect(provider, _request(Message("system", (TextPart("rules"),)), Message("user", (TextPart("hi"),)), tools=tools))
+    first = await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("hi"),)),
+            system_prompt="rules",
+            tools=tools,
+        ),
+    )
     response = next(event.response for event in first if isinstance(event, GenerationCompleted))
     client.stream = _AsyncStream(_item_events())
-    await _collect(provider, _request(Message("system", (TextPart("rules"),)), response.message, Message("tool", (ToolResultPart("call-1", "result"),)), tools=tools))
+    await _collect(
+        provider,
+        _request(
+            response.message,
+            Message("tool", (ToolResultPart("call-1", "result"),)),
+            system_prompt="rules",
+            tools=tools,
+        ),
+    )
     call = client.calls[-1]
     assert call["instructions"] == "rules"
     assert call["tools"] == [{"type": "function", "name": "search", "description": "Search", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}]
@@ -296,6 +321,7 @@ async def test_responses_request_shapes_tools_native_replay_and_cross_identity_f
     other_client = _OpenAIClient(_item_events())
     other = build_openai_responses_provider("other-model", client=other_client)
     await _collect(other, _request(response.message))
+    assert "instructions" not in other_client.calls[-1]
     input_values = other_client.calls[-1]["input"]
     assert not any(item.get("type") == "reasoning" for item in input_values)
     assert any(item.get("role") == "assistant" for item in input_values)
