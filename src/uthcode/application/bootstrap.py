@@ -16,12 +16,13 @@ class ConfigurationError(ValueError):
 
 
 class ConfigurationInitializationRequired(ConfigurationError):
-    """The user must fill in the first-run configuration template."""
+    """The user must enable and fill in the configuration template."""
 
     def __init__(self, template_path: str | Path) -> None:
         self.template_path = Path(template_path)
         super().__init__(
-            "configuration template created; fill it in and run again: "
+            "configuration is not initialized; edit and uncomment one complete "
+            "Provider and Model example, then run again: "
             f"{self.template_path}"
         )
 

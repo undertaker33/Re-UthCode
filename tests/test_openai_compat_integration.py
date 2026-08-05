@@ -236,6 +236,42 @@ async def test_chat_actual_model_maps_reasoning_text_indexed_tools_and_usage() -
 
 
 @pytest.mark.asyncio
+async def test_chat_nullable_usage_detail_objects_are_normalized_to_empty() -> None:
+    client = _OpenAICompatClient(
+        [
+            _chunk(ChoiceDelta(role="assistant", content="answer")),
+            _chunk(
+                ChoiceDelta(role="assistant"),
+                finish_reason="stop",
+                usage=CompletionUsage(
+                    prompt_tokens=3,
+                    completion_tokens=1,
+                    total_tokens=4,
+                    prompt_tokens_details=None,
+                    completion_tokens_details=None,
+                ),
+            ),
+        ]
+    )
+    provider = build_openai_compat_provider(
+        "deepseek-test",
+        base_url="https://mock.invalid/v1",
+        client=client,
+    )
+
+    events = await _collect(
+        provider,
+        _request(Message("user", (TextPart("hi"),))),
+    )
+
+    completed = next(event for event in events if isinstance(event, GenerationCompleted))
+    assert completed.response.usage.cache_read_tokens == 0
+    assert completed.response.usage.cache_write_tokens == 0
+    assert completed.response.usage.details["reasoning_tokens"] == 0
+    assert completed.response.finish_reason is FinishReason.STOP
+
+
+@pytest.mark.asyncio
 async def test_chat_history_replays_role_tool_and_never_emits_responses_items() -> None:
     client = _OpenAICompatClient(_chunks())
     provider = build_openai_compat_provider(

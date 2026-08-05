@@ -230,10 +230,14 @@ class OpenAICompatCodec(PydanticAICodec):
         plain = _plain_json(payload)
         if not isinstance(plain, dict):
             raise InvalidProviderResponseError("Chat usage must be a JSON object")
-        prompt_details = plain.get("prompt_tokens_details", {})
+        prompt_details = plain.get("prompt_tokens_details")
+        if prompt_details is None:
+            prompt_details = {}
         if not isinstance(prompt_details, dict):
             raise InvalidProviderResponseError("Chat prompt token details must be an object")
-        completion_details = plain.get("completion_tokens_details", {})
+        completion_details = plain.get("completion_tokens_details")
+        if completion_details is None:
+            completion_details = {}
         if not isinstance(completion_details, dict):
             raise InvalidProviderResponseError("Chat completion token details must be an object")
         cache_read = prompt_details.get("cached_tokens", 0) or 0

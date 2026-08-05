@@ -7,21 +7,34 @@ import uuid
 from pathlib import Path
 
 
-USER_CONFIG_TEMPLATE = """# UthCode configuration template
-# Fill in a Provider and a Model, then run UthCode again.
-# The values below are commented placeholders and are not usable credentials.
+USER_CONFIG_TEMPLATE = """# UthCode user configuration
 #
-# model = \"example/example-model\"
+# To configure an OpenAI-compatible Provider:
+# 1. Replace the example values below for your Provider and model.
+# 2. Uncomment the TOML configuration lines (leave these instructions commented).
+# 3. Set the environment variable named by api_key_env, then run `uthcode` again.
 #
-# [providers.example]
-# kind = \"fake\"
-# api_key_env = \"YOUR_API_KEY_ENVIRONMENT_VARIABLE\"
-# base_url = \"https://example.invalid/v1\"
+# PowerShell example for the current terminal only:
+# $env:DEEPSEEK_API_KEY = \"your-api-key\"
 #
-# [models.\"example/example-model\"]
-# provider = \"example\"
-# model = \"remote-model-id\"
-# label = \"Example model\"
+# Never put an API key value in this file. api_key_env is the environment
+# variable name, not the key itself.
+#
+# Supported real Provider kinds: openai_compat, openai_responses, anthropic.
+# Every real Provider requires api_key_env. openai_compat also requires base_url.
+# The fake kind is only for explicit offline testing.
+#
+# model = \"deepseek/chat\"
+#
+# [providers.deepseek]
+# kind = \"openai_compat\"
+# base_url = \"https://api.deepseek.com\"
+# api_key_env = \"DEEPSEEK_API_KEY\"
+#
+# [models.\"deepseek/chat\"]
+# provider = \"deepseek\"
+# model = \"deepseek-chat\"
+# label = \"DeepSeek Chat\"
 # max_output_tokens = 4096
 """
 

@@ -183,3 +183,60 @@
 - `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`。
 - `git diff --check` 与 Interface 依赖扫描通过；未增加依赖、秘密、缓存或工作包外产物。
 - 未修改原始需求、Spec、Tasks、Prompt 或 Checklist 文字/结构/顺序，未执行 Git commit、push、PR、merge 或归档。
+
+## 10. 第四轮返工（2026-08-05）
+
+### 10.1 返工原因
+
+- 首次运行生成的用户配置模板只有全部注释的 Fake/无效地址占位内容，没有列出真实 Provider `kind`、字段约束或环境变量设置方法，用户无法据此完成真实模型配置。
+- 用户未编辑模板便再次启动时，空映射落入普通模型校验并报告 `configuration requires a selected model`，没有指出配置仍处于未初始化状态。
+
+### 10.2 实际修改
+
+- `integrations/config/template.py` 的模板改为可直接替换参数并取消注释的 `openai_compat` 完整示例，列出 `openai_compat`、`openai_responses`、`anthropic` 三种真实 Provider 类型，说明真实 Provider 的 `api_key_env` 要求、`openai_compat` 的 `base_url` 要求以及 `fake` 仅供显式离线测试。
+- 模板加入当前 PowerShell 会话设置环境变量的示例，并明确 `api_key_env` 保存的是环境变量名，API Key 真实值不得写入 TOML。模板仍全部保持注释，首次运行不会自动启用 Fake Provider、无效地址或占位凭据。
+- 配置加载器现在把空文件和纯注释用户配置识别为既有 `ConfigurationInitializationRequired`，提示用户编辑并取消注释一套完整 Provider/Model 配置；已有部分有效 TOML 但缺少 `model` 时，仍保留原有 `model` 字段级错误。
+- Application 层保持相同异常类型和 `template_path` 接口，只同步安全初始化提示；没有改变配置字段、Provider 构造、项目配置安全边界或公开 Application API。
+- README 首次配置章节同步真实 OpenAI-compatible 示例、环境变量命令、支持的 Provider 类型和字段约束。
+- `/login` 仍按 T02 冻结范围返回未实现；本轮不允许无模型状态进入 TUI，也未引入凭据存储或配置交互 UI。
+
+### 10.3 测试与验证
+
+- 配置测试验证模板包含完整真实 Provider 示例、三种支持类型、环境变量说明和 Fake 限制，且不包含 `sk-` 形式的真实 Key。
+- 新增纯注释模板第二次加载测试，确认继续返回初始化指引；新增部分配置缺少 `model` 测试，确认仍返回字段级配置错误。
+- 正式 `python -m uthcode exec` 子进程测试覆盖首次创建模板和未编辑模板再次启动，两次均退出码 2、stdout 为空并输出不含秘密的初始化指引。
+- `conda run --no-capture-output -n re-uthcode pytest -q tests/test_configuration.py tests/test_cli.py`：`50 passed`。
+- `conda run --no-capture-output -n re-uthcode pytest -q`：`200 passed, 3 skipped`；跳过项仍为显式 live Provider 测试。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`、`python -m pip check` 和 `git diff --check` 均通过；未增加依赖。
+
+### 10.4 范围与遗留检查
+
+- 未修改原始需求、Spec、Tasks、Prompt 或 Checklist，未新建 T02-1，未实现 `/login`，未改变 TUI 启动架构。
+- 未引入兼容别名、双轨配置、额外 Provider 类型或真实秘密；未执行 Git commit、push、PR、merge 或工作包归档。
+
+## 11. 第五轮返工（2026-08-05）
+
+### 11.1 返工原因
+
+- 真实 DeepSeek OpenAI-compatible 流已经输出完整正文，但终态 usage 中 `prompt_tokens_details` 或 `completion_tokens_details` 为 JSON `null` 时，Codec 将其判为非法对象并抛出 `InvalidProviderResponseError`，导致 TUI 在成功正文后显示生成失败。
+- 同一个异常在 TUI 中先由 `StreamRenderer` 写入英文 `generation failed`，随后又由 TUI 写入中文 `生成失败`，Activity 再显示 `error`，造成重复失败提示。
+
+### 11.2 实际修改
+
+- `OpenAICompatCodec.usage_from_model_response()` 现在仅将可选 usage detail 的 `None` 规范化为空字典；非空且非字典的值仍按原安全边界拒绝。缺省缓存与 reasoning token 数继续归一为 0。
+- TUI Provider 异常和未知异常路径先调用普通 `renderer.flush()` 输出剩余正文，再只追加一条中文 `生成失败`；Activity 保留 `error` 状态。
+- 删除不再有调用方的 `StreamRenderer.finish_error()`、`RenderBatch.error` 及对应分支，没有保留废弃入口或双轨错误渲染。
+
+### 11.3 测试与真实验证
+
+- 新增 OpenAI-compatible 集成回归测试，构造两个 usage detail 均为 `None` 的标准完成流，确认产生 `GenerationCompleted`、终态为 `stop`，缓存与 reasoning token 均归一为 0。
+- TUI Pilot 错误终态测试现在断言 Transcript 只有一条 `生成失败`，同时确认剩余正文已 flush、Activity 为 `error`、Timer 和生成任务均已清理。
+- 定向失败测试在修复前稳定复现两项缺陷；修复后定向测试 `4 passed`，Provider/TUI/Application 聚合测试 `34 passed, 1 skipped`。
+- 使用当前用户 DeepSeek 配置发送一次最小真实请求，事件序列为 `TextDelta`、`NativeItemCompleted`、`GenerationCompleted`，终态 `finish_reason=stop`；没有记录正文、API Key 或其他秘密。
+- `conda run --no-capture-output -n re-uthcode pytest -q`：`201 passed, 3 skipped`；跳过项仍为既有显式 live 测试。
+- `compileall`、`pip check`、`git diff --check` 均通过；未增加依赖。
+
+### 11.4 范围与遗留检查
+
+- 本轮只修复已复现的 OpenAI-compatible 可空 usage 兼容性和 TUI 重复错误渲染，没有改变 Provider 公共模型、配置结构、命令系统或 `/login` 状态。
+- 未修改原始需求、Spec、Tasks、Prompt 或 Checklist，未执行 Git commit、push、PR、merge 或归档。

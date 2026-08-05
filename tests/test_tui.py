@@ -501,7 +501,13 @@ async def test_stream_terminal_paths_flush_buffer_and_stop_timer(mode: str) -> N
         if mode == "cancel":
             assert tui.query_one("#activity").render().plain == "cancelled"
         else:
-            assert any(entry.kind is TranscriptEntryKind.ERROR for entry in transcript.state.entries)
+            errors = [
+                entry.text
+                for entry in transcript.state.entries
+                if entry.kind is TranscriptEntryKind.ERROR
+            ]
+            assert errors == ["生成失败"]
+            assert tui.query_one("#activity").render().plain == "error"
 
 
 @pytest.mark.asyncio

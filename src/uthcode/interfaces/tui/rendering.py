@@ -20,7 +20,6 @@ class RenderBatch:
     reasoning: str = ""
     completed: bool = False
     cancelled: bool = False
-    error: str | None = None
 
 
 def _response_text(event: GenerationCompleted) -> str:
@@ -71,16 +70,12 @@ class StreamRenderer:
     def finish_cancelled(self) -> RenderBatch:
         return self._flush(self._clock(), cancelled=True)
 
-    def finish_error(self, message: str) -> RenderBatch:
-        return self._flush(self._clock(), error=message)
-
     def _flush(
         self,
         now: float,
         *,
         completed: bool = False,
         cancelled: bool = False,
-        error: str | None = None,
     ) -> RenderBatch:
         text, reasoning = self.state.flush(now)
         return RenderBatch(
@@ -88,7 +83,6 @@ class StreamRenderer:
             reasoning=reasoning,
             completed=completed,
             cancelled=cancelled,
-            error=error,
         )
 
 

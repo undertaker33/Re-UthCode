@@ -281,7 +281,7 @@ def test_formal_module_exec_uses_fake_config_without_tui_or_network(tmp_path: Pa
 
 def test_formal_module_exec_first_run_creates_template_and_stops(tmp_path: Path) -> None:
     home = tmp_path / "empty-home"
-    result = subprocess.run(
+    first_run = subprocess.run(
         [sys.executable, "-m", "uthcode", "exec", "hello"],
         cwd=tmp_path,
         env=_subprocess_environment(home),
@@ -291,11 +291,26 @@ def test_formal_module_exec_first_run_creates_template_and_stops(tmp_path: Path)
     )
 
     template = home / ".uthcode" / "config.toml"
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert str(template.resolve()) in result.stderr
+    assert first_run.returncode == 2
+    assert first_run.stdout == ""
+    assert str(template.resolve()) in first_run.stderr
+    assert "configuration is not initialized" in first_run.stderr
     assert template.is_file()
     assert "sk-" not in template.read_text(encoding="utf-8")
+
+    second_run = subprocess.run(
+        [sys.executable, "-m", "uthcode", "exec", "hello"],
+        cwd=tmp_path,
+        env=_subprocess_environment(home),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert second_run.returncode == 2
+    assert second_run.stdout == ""
+    assert "configuration is not initialized" in second_run.stderr
+    assert "edit and uncomment" in second_run.stderr
 
 
 def test_formal_entries_reject_project_provider_data(tmp_path: Path) -> None:
