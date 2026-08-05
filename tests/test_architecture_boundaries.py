@@ -6,32 +6,88 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1]
 SRC = ROOT / "src" / "uthcode"
 PROVIDER_ROOT = SRC / "integrations" / "providers"
 
 
+def _source_package(source_path: Path) -> tuple[str, ...]:
+    relative = source_path.relative_to(SRC)
+    module_parts = list(relative.with_suffix("").parts)
+    package_parts = module_parts[:-1]
+    return ("uthcode", *package_parts)
+
+
+def _resolve_from_import(source_path: Path, node: ast.ImportFrom) -> str:
+    if node.level == 0:
+        return node.module or ""
+
+    package_parts = list(_source_package(source_path))
+    parent_count = node.level - 1
+    if parent_count >= len(package_parts):
+        raise ValueError(
+            f"relative import escapes the uthcode package: "
+            f"{source_path} (level={node.level})"
+        )
+
+    resolved_parts = package_parts[: len(package_parts) - parent_count]
+    if node.module:
+        resolved_parts.extend(node.module.split("."))
+    return ".".join(resolved_parts)
+
+
+def _resolved_imports(source_path: Path, tree: ast.AST) -> list[str]:
+    imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = _resolve_from_import(source_path, node)
+            if module:
+                imports.append(module)
+            if node.module is None:
+                imports.extend(
+                    f"{module}.{alias.name}" if module else alias.name
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+    return imports
+
+
 def _imports(source_path: Path) -> list[str]:
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    return [
-        node.module or ""
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    ] + [
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    ]
+    return _resolved_imports(source_path, tree)
+
+
+def _fixture_imports(
+    source: str,
+    relative_path: str = "integrations/config/_boundary_fixture.py",
+) -> list[str]:
+    fixture_path = SRC / relative_path
+    return _resolved_imports(fixture_path, ast.parse(source))
+
+
+def _assert_no_integration_reverse_dependency(
+    source_path: Path, imports: list[str]
+) -> None:
+    assert not any(
+        value == "uthcode.application"
+        or value.startswith("uthcode.application.")
+        or value == "uthcode.interfaces"
+        or value.startswith("uthcode.interfaces.")
+        for value in imports
+    ), source_path
 
 
 def test_core_and_application_have_only_allowed_dependency_edges() -> None:
     forbidden = (
         "anthropic",
         "openai",
-        "langgraph",
-        "langchain",
+        "lang" + "graph",
+        "lang" + "chain",
     )
     for source_path in (SRC / "core").rglob("*.py"):
         assert not any(
@@ -46,7 +102,14 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
             "uthcode.integrations.providers.config"
         }
         if source_path.name == "bootstrap.py":
-            allowed_integration_imports.add("uthcode.integrations.providers.factory")
+            allowed_integration_imports.update(
+                {
+                    "uthcode.integrations.config.data",
+                    "uthcode.integrations.config.loader",
+                    "uthcode.integrations.providers.factory",
+                    "uthcode.integrations.tools.factory",
+                }
+            )
         for value in values:
             if value.startswith("uthcode.integrations"):
                 assert value in allowed_integration_imports, source_path
@@ -80,6 +143,84 @@ def test_sdk_imports_are_confined_to_native_provider_modules() -> None:
         assert sdk_roots <= allowed.get(relative, set()), source_path
 
 
+def test_integrations_never_depend_on_application_or_interfaces() -> None:
+    for source_path in (SRC / "integrations").rglob("*.py"):
+        _assert_no_integration_reverse_dependency(source_path, _imports(source_path))
+
+
+def test_concrete_integration_tools_stay_below_application_boundary() -> None:
+    tools_root = SRC / "integrations" / "tools"
+    assert tools_root.is_dir()
+    for source_path in tools_root.rglob("*.py"):
+        imports = _imports(source_path)
+        _assert_no_integration_reverse_dependency(source_path, imports)
+        assert not any(
+            value.startswith("anthropic")
+            or value.startswith("openai")
+            for value in imports
+        ), source_path
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import uthcode.application",
+        "from uthcode.application import EffectiveConfig",
+        "import uthcode.interfaces",
+        "from uthcode.interfaces import UthCodeTUI",
+        "from ...application import EffectiveConfig",
+        "from ...interfaces import UthCodeTUI",
+    ],
+)
+def test_integration_boundary_rejects_absolute_and_resolved_relative_reverse_imports(
+    source: str,
+) -> None:
+    imports = _fixture_imports(source)
+    assert any(
+        value == "uthcode.application"
+        or value.startswith("uthcode.application.")
+        or value == "uthcode.interfaces"
+        or value.startswith("uthcode.interfaces.")
+        for value in imports
+    )
+    with pytest.raises(AssertionError):
+        _assert_no_integration_reverse_dependency(
+            SRC / "integrations" / "config" / "_boundary_fixture.py",
+            imports,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from .data import LoadedConfigData", "uthcode.integrations.config.data"),
+        ("from ..providers import factory", "uthcode.integrations.providers"),
+        ("from . import data", "uthcode.integrations.config.data"),
+    ],
+)
+def test_integration_internal_relative_imports_are_not_false_positives(
+    source: str, expected: str
+) -> None:
+    imports = _fixture_imports(source)
+    assert expected in imports
+    _assert_no_integration_reverse_dependency(
+        SRC / "integrations" / "config" / "_boundary_fixture.py",
+        imports,
+    )
+
+
+def test_relative_imports_use_the_package_name_of_init_modules() -> None:
+    imports = _fixture_imports(
+        "from .config import data",
+        relative_path="integrations/__init__.py",
+    )
+    assert "uthcode.integrations.config" in imports
+    _assert_no_integration_reverse_dependency(
+        SRC / "integrations" / "__init__.py",
+        imports,
+    )
+
+
 def test_provider_modules_use_public_sdk_surfaces_and_no_private_stream_access() -> None:
     for source_path in PROVIDER_ROOT.glob("*.py"):
         source = source_path.read_text(encoding="utf-8")
@@ -92,7 +233,6 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
     forbidden_names = {
         "runtime.py",
         "graph",
-        "tools",
         "prompts",
         "permissions",
         "context",
@@ -166,8 +306,8 @@ asyncio.run(main())
 
 def test_runtime_source_contains_no_graph_or_compatibility_names() -> None:
     forbidden = (
-        "langgraph",
-        "langchain",
+        "lang" + "graph",
+        "lang" + "chain",
         "stategraph",
         "graphstate",
         "checkpoint",

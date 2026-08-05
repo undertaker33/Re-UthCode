@@ -13,6 +13,7 @@ authors = [{ name = "Re:UthCode contributors" }]
 dependencies = [
     "anthropic>=0.117,<1",
     "openai>=2.46,<3",
+    "jsonschema>=4.25,<5",
     "textual>=8.2,<9",
     "tomlkit>=0.15,<0.16",
 ]

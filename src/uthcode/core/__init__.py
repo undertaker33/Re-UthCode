@@ -1,6 +1,7 @@
 """Public UthCode Core contracts."""
 
 from .prompt import PromptSection, SystemPromptContext, build_system_prompt
+from .tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
 
 from .provider import (
     AuthenticationError,
@@ -72,11 +73,15 @@ __all__ = [
     "ReasoningPart",
     "TextDelta",
     "TextPart",
+    "Tool",
     "ToolCallArgumentsDelta",
     "ToolCallCompleted",
     "ToolCallPart",
     "ToolCallStarted",
     "ToolDefinition",
+    "ToolExecutionResult",
+    "ToolExecutor",
+    "ToolRegistry",
     "ToolResultPart",
     "SystemPromptContext",
     "Usage",

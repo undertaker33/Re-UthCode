@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import asyncio
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from uthcode.core import CancellationToken, ToolCallPart, ToolExecutor, ToolRegistry
+from uthcode.integrations.tools.process_tools import BashTool
+
+
+_DESCENDANT_DELAY_SECONDS = 2.0
+
+
+def _python_command(source: str) -> str:
+    values = [sys.executable, "-c", source]
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(values)
+    return " ".join(shlex.quote(value) for value in values)
+
+
+def _delayed_descendant_command(marker: Path) -> str:
+    child_source = (
+        "import time; from pathlib import Path; "
+        f"time.sleep({_DESCENDANT_DELAY_SECONDS!r}); "
+        f"Path({str(marker)!r}).write_text('late', encoding='utf-8')"
+    )
+    parent_source = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_source!r}])"
+    )
+    return _python_command(parent_source)
+
+
+@pytest.mark.asyncio
+async def test_bash_uses_application_workdir_and_current_shell(tmp_path: Path) -> None:
+    tool = BashTool(tmp_path)
+
+    result = await tool.execute(
+        {"command": _python_command("from pathlib import Path; print(Path.cwd())")},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    assert result.is_error is False
+    assert str(tmp_path) in result.content
+
+
+@pytest.mark.asyncio
+async def test_bash_distinguishes_stdout_stderr_and_nonzero_exit(tmp_path: Path) -> None:
+    tool = BashTool(tmp_path)
+    command = _python_command(
+        "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"
+    )
+
+    result = await tool.execute({"command": command}, cancellation=CancellationToken())  # type: ignore[arg-type]
+
+    assert result.is_error is True
+    assert "STDOUT:\nout" in result.content
+    assert "STDERR:\nerr" in result.content
+    assert "Exit code: 3" in result.content
+
+
+@pytest.mark.asyncio
+async def test_bash_reports_empty_output(tmp_path: Path) -> None:
+    tool = BashTool(tmp_path)
+
+    result = await tool.execute(
+        {"command": _python_command("")},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    assert result.is_error is False
+    assert result.content == "(no output)"
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_terminates_and_reaps_process(tmp_path: Path) -> None:
+    tool = BashTool(tmp_path)
+    started = time.monotonic()
+
+    result = await tool.execute(
+        {
+            "command": _python_command("import time; time.sleep(30)"),
+            "timeout_seconds": 1,
+        },  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    assert time.monotonic() - started < 8
+    assert result.is_error is True
+    assert result.content == "Error: command timed out after 1s"
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_terminates_descendant_after_shell_exit(
+    tmp_path: Path,
+) -> None:
+    tool = BashTool(tmp_path)
+    marker = tmp_path / "timeout-descendant-marker.txt"
+    started = time.monotonic()
+
+    result = await tool.execute(
+        {
+            "command": _delayed_descendant_command(marker),
+            "timeout_seconds": 1,
+        },  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    elapsed = time.monotonic() - started
+    assert elapsed < _DESCENDANT_DELAY_SECONDS
+    assert result.is_error is True
+    assert result.content == "Error: command timed out after 1s"
+
+    await asyncio.sleep(_DESCENDANT_DELAY_SECONDS + 0.3)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_cancellation_terminates_and_reaps_process(tmp_path: Path) -> None:
+    tool = BashTool(tmp_path)
+    cancellation = CancellationToken()
+    task = asyncio.create_task(
+        tool.execute(
+            {"command": _python_command("import time; time.sleep(30)")},  # type: ignore[arg-type]
+            cancellation=cancellation,
+        )
+    )
+    await asyncio.sleep(0.15)
+    cancellation.cancel()
+
+    result = await task
+
+    assert result.is_error is True
+    assert result.content == "Error: command cancelled"
+
+
+@pytest.mark.asyncio
+async def test_bash_cancellation_terminates_descendant_after_shell_exit(
+    tmp_path: Path,
+) -> None:
+    tool = BashTool(tmp_path)
+    marker = tmp_path / "token-descendant-marker.txt"
+    cancellation = CancellationToken()
+    task = asyncio.create_task(
+        tool.execute(
+            {"command": _delayed_descendant_command(marker)},  # type: ignore[arg-type]
+            cancellation=cancellation,
+        )
+    )
+    await asyncio.sleep(0.15)
+    cancellation.cancel()
+
+    started = time.monotonic()
+    result = await task
+
+    assert time.monotonic() - started < _DESCENDANT_DELAY_SECONDS
+    assert result.is_error is True
+    assert result.content == "Error: command cancelled"
+
+    await asyncio.sleep(_DESCENDANT_DELAY_SECONDS + 0.3)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_task_cancellation_terminates_descendant_after_shell_exit(
+    tmp_path: Path,
+) -> None:
+    tool = BashTool(tmp_path)
+    marker = tmp_path / "task-descendant-marker.txt"
+    task = asyncio.create_task(
+        tool.execute(
+            {"command": _delayed_descendant_command(marker)},  # type: ignore[arg-type]
+            cancellation=CancellationToken(),
+        )
+    )
+    await asyncio.sleep(0.15)
+
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert time.monotonic() - started < _DESCENDANT_DELAY_SECONDS
+    await asyncio.sleep(_DESCENDANT_DELAY_SECONDS + 0.3)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_schema_rejects_timeout_outside_one_to_six_hundred(tmp_path: Path) -> None:
+    registry = ToolRegistry((BashTool(tmp_path),))
+    executor = ToolExecutor(registry)
+
+    results = await executor.execute_batch(
+        (
+            ToolCallPart("too-small", "Bash", {"command": "", "timeout_seconds": 0}),
+            ToolCallPart("too-large", "Bash", {"command": "", "timeout_seconds": 601}),
+        ),
+        cancellation=CancellationToken(),
+    )
+
+    assert all(result.is_error for result in results)
+    assert all("invalid arguments" in result.content for result in results)
+
+
+@pytest.mark.asyncio
+async def test_bash_output_is_truncated_by_core_executor(tmp_path: Path) -> None:
+    registry = ToolRegistry((BashTool(tmp_path),))
+    executor = ToolExecutor(registry)
+
+    results = await executor.execute_batch(
+        (
+            ToolCallPart(
+                "large-output",
+                "Bash",
+                {"command": _python_command("print('x' * 11000)")},
+            ),
+        ),
+        cancellation=CancellationToken(),
+    )
+
+    assert results[0].is_error is False
+    assert results[0].content.endswith("\n[Output truncated to 10000 characters]")

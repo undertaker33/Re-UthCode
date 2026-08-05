@@ -123,6 +123,40 @@ Text deltas are written to stdout. Diagnostics are written to stderr. Exit
 codes are `0` for success, `1` for Provider failure, `2` for configuration or
 usage failure, and `130` for cancellation.
 
+## Headless tool calls
+
+The Application is the only public tool entry point. A headless caller opts in
+to tools for each request, executes Provider-returned calls, and manually
+places the results into the next request:
+
+```python
+tool_definitions = application.tool_definitions()
+first_request = GenerationRequest(
+    messages=(Message("user", (TextPart("read note.txt"),)),),
+    tools=tool_definitions,
+)
+
+# After the Provider returns a ToolCallPart named `call`:
+results = await application.execute_tool_calls((call,))
+next_request = GenerationRequest(
+    messages=(
+        *first_request.messages,
+        Message("assistant", (call,)),
+        Message("tool", (results[0],)),
+    ),
+    tools=tool_definitions,
+)
+```
+
+`start_generation()` does not inject tools, execute calls, append messages, or
+run an automatic loop. The caller owns the single-round request and result
+backfill. `ReadFile`, `WriteFile`, `EditFile`, `Glob`, and `Grep` restrict paths
+to the normalized Application runtime workdir, including physical symlink
+boundary checks. `Bash` runs in that workdir using the current operating-system
+shell and current user privileges; it is unsandboxed process execution, not an
+OS Sandbox, and it does not add permission approval or a dangerous-command
+policy.
+
 ## Embedded Python API
 
 The same Effective Config/Application composition is available without the

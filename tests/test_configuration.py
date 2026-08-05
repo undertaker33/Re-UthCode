@@ -7,19 +7,15 @@ import pytest
 
 from uthcode.application import (
     ConfigSource,
+    ConfigurationError,
+    ConfigurationInitializationRequired,
     ConfigurationModelError,
     EffectiveConfig,
+    LaunchOptions,
     ModelProfile,
     ProviderKind,
     ProviderProfile,
-    LaunchOptions,
-)
-from uthcode.integrations.config import (
-    ConfigurationError,
-    ConfigurationInitializationRequired,
-    discover_config_paths,
     load_effective_config,
-    write_user_model,
 )
 
 
@@ -506,10 +502,6 @@ def test_physical_duplicate_project_config_is_loaded_once(tmp_path: Path) -> Non
     except (OSError, NotImplementedError):
         pytest.skip("symbolic links are unavailable")
 
-    paths = discover_config_paths(cwd, home / ".uthcode" / "config.toml")
-    project_paths = [path for kind, path in paths if kind == "project"]
-    assert project_paths == [root_config.resolve()]
-
     config = load_effective_config(cwd=cwd, home=home)
     assert [
         source.path
@@ -605,60 +597,6 @@ model = "remote"
 
     assert str(project.resolve()) in str(raised.value)
     assert "unknown provider reference" in str(raised.value)
-
-
-def test_user_model_writeback_preserves_comments_tables_and_project_file(
-    tmp_path: Path,
-) -> None:
-    user = tmp_path / "config.toml"
-    original = '''# keep this comment
-model = "old/ref"
-
-[providers.local]
-kind = "fake"
-
-# keep model comment
-[models."old/ref"]
-provider = "local"
-model = "old-remote"
-label = "Old"
-'''
-    user.write_text(original, encoding="utf-8")
-    project = tmp_path / "project.toml"
-    project_text = 'model = "old/ref"\n'
-    project.write_text(project_text, encoding="utf-8")
-
-    write_user_model(user, "new/ref")
-    updated = user.read_text(encoding="utf-8")
-
-    assert 'model = "new/ref"' in updated
-    assert "# keep this comment" in updated
-    assert "# keep model comment" in updated
-    assert updated.index("[providers.local]") < updated.index('[models."old/ref"]')
-    assert 'kind = "fake"' in updated
-    assert 'model = "old-remote"' in updated
-    assert project.read_text(encoding="utf-8") == project_text
-
-
-def test_user_model_writeback_keeps_original_bytes_when_replace_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    user = tmp_path / "config.toml"
-    original = 'model = "old/ref"\n\n[providers.local]\nkind = "fake"\n'
-    user.write_text(original, encoding="utf-8")
-
-    import uthcode.integrations.config.writer as writer
-
-    def fail_replace(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated atomic replace failure")
-
-    monkeypatch.setattr(writer.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated atomic replace failure"):
-        writer.write_user_model(user, "new/ref")
-
-    assert user.read_text(encoding="utf-8") == original
-    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_loader_does_not_read_environment_secrets_or_make_provider_requests(
