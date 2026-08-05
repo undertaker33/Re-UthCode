@@ -318,10 +318,47 @@ def test_missing_user_config_creates_safe_template_and_stops(tmp_path: Path) -> 
     assert template.is_file()
     content = template.read_text(encoding="utf-8")
     assert "# model =" in content
-    assert "# [providers." in content
-    assert "# api_key_env" in content
+    assert '# kind = "openai_compat"' in content
+    assert '# base_url = "https://api.deepseek.com"' in content
+    assert '# api_key_env = "DEEPSEEK_API_KEY"' in content
+    assert "openai_responses" in content
+    assert "anthropic" in content
+    assert "fake kind is only for explicit offline testing" in content
+    assert '$env:DEEPSEEK_API_KEY = "your-api-key"' in content
     assert "sk-" not in content
-    assert "YOUR_API_KEY_ENVIRONMENT_VARIABLE" in content
+    assert "not the key itself" in content
+
+
+def test_comment_only_user_template_reports_initialization_guidance(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    with pytest.raises(ConfigurationInitializationRequired):
+        load_effective_config(cwd=tmp_path, home=home)
+
+    with pytest.raises(ConfigurationInitializationRequired) as raised:
+        load_effective_config(cwd=tmp_path, home=home)
+
+    assert raised.value.template_path == (home / ".uthcode" / "config.toml").resolve()
+    assert "configuration is not initialized" in str(raised.value)
+    assert "edit and uncomment" in str(raised.value)
+
+
+def test_partially_enabled_user_config_without_model_keeps_field_error(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user_config = home / ".uthcode" / "config.toml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text('[providers.local]\nkind = "fake"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as raised:
+        load_effective_config(cwd=tmp_path, home=home)
+
+    assert not isinstance(raised.value, ConfigurationInitializationRequired)
+    assert raised.value.field == "model"
+    assert "configuration requires a selected model" in str(raised.value)
 
 
 @pytest.mark.parametrize(

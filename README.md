@@ -29,7 +29,10 @@ verification flow.
 
 UthCode reads the user configuration from `~/.uthcode/config.toml`. On the
 first run, a comment-only template is created atomically and the process
-stops. Fill in the template and run the command again.
+stops. Replace the example values, uncomment one complete Provider and Model
+configuration, set the named API-key environment variable, and run the command
+again. Leaving the file empty or fully commented reports initialization
+guidance instead of treating it as a partially configured model.
 
 A minimal offline configuration is:
 
@@ -44,6 +47,35 @@ provider = "local"
 model = "echo"
 label = "Offline Echo"
 ```
+
+A real OpenAI-compatible configuration follows the same structure:
+
+```toml
+model = "deepseek/chat"
+
+[providers.deepseek]
+kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek/chat"]
+provider = "deepseek"
+model = "deepseek-chat"
+label = "DeepSeek Chat"
+max_output_tokens = 4096
+```
+
+Set the referenced variable before starting UthCode, for example in
+PowerShell for the current terminal:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "your-api-key"
+uthcode
+```
+
+Supported real Provider kinds are `openai_compat`, `openai_responses`, and
+`anthropic`. Every real Provider requires `api_key_env`; `openai_compat` also
+requires `base_url`. The `fake` kind is only for explicit offline testing.
 
 Real Provider keys are read only from the environment variable named by
 `api_key_env`; key values never belong in TOML, logs, events, or output. A

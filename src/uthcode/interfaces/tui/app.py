@@ -369,12 +369,12 @@ class UthCodeTUI(App[None]):
                 self._set_activity("cancelled")
         except ProviderError:
             if not self._closing:
-                self._apply_batch(renderer.finish_error("generation failed"))
+                self._apply_batch(renderer.flush())
                 self._show_error("生成失败")
                 self._set_activity("error")
         except Exception:
             if not self._closing:
-                self._apply_batch(renderer.finish_error("generation failed"))
+                self._apply_batch(renderer.flush())
                 self._show_error("生成失败")
                 self._set_activity("error")
         else:
@@ -413,8 +413,6 @@ class UthCodeTUI(App[None]):
             transcript.append_reasoning(batch.reasoning)
         if batch.text:
             transcript.append_assistant(batch.text)
-        if batch.error:
-            self._show_error(batch.error)
         if batch.completed:
             transcript.finish_stream()
 

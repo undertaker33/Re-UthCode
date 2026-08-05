@@ -43,12 +43,13 @@ class ConfigurationError(ValueError):
 
 
 class ConfigurationInitializationRequired(ConfigurationError):
-    """The first-run template was created and must be filled in."""
+    """The user configuration template must be enabled and filled in."""
 
     def __init__(self, path: Path) -> None:
         self.template_path = path
         super().__init__(
-            "configuration template created; fill it in and run again",
+            "configuration is not initialized; edit and uncomment one complete "
+            "Provider and Model example, then run again",
             path=path,
         )
 
@@ -437,6 +438,8 @@ def load_effective_config(
     user_kind, user_path = paths[0]
     del user_kind
     user_mapping = _read_mapping(user_path)
+    if not user_mapping:
+        raise ConfigurationInitializationRequired(user_path)
     _validate_user_mapping(user_mapping, path=user_path)
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
