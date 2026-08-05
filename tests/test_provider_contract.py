@@ -70,6 +70,38 @@ def test_contract_values_are_deeply_immutable_and_json_round_trip() -> None:
     }
 
 
+@pytest.mark.parametrize("system_prompt", [None, "Use concise Chinese."])
+def test_generation_request_system_prompt_round_trip(system_prompt: str | None) -> None:
+    request = GenerationRequest(
+        messages=(Message(role="user", parts=(TextPart("hello"),)),),
+        system_prompt=system_prompt,
+    )
+
+    assert request.to_dict()["system_prompt"] == system_prompt
+    assert GenerationRequest.from_dict(request.to_dict()) == request
+    assert GenerationRequest.from_json(request.to_json()) == request
+
+
+@pytest.mark.parametrize("system_prompt", ["", " \n\t", 123, False, []])
+def test_generation_request_rejects_blank_or_invalid_system_prompt(system_prompt: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="system_prompt"):
+        GenerationRequest(
+            messages=(Message(role="user", parts=(TextPart("hello"),)),),
+            system_prompt=system_prompt,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("role", ["system", "developer", "", "USER", None, 1])
+def test_message_rejects_non_core_roles(role: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="role"):
+        Message(role=role)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
+def test_message_accepts_only_the_three_core_roles(role: str) -> None:
+    assert Message(role=role).role == role
+
+
 def test_all_provider_events_have_type_safe_json_round_trip() -> None:
     native = NativeItem(
         "fake",

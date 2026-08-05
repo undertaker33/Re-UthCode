@@ -16,6 +16,7 @@ from .bootstrap import (
     load_effective_config,
 )
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
+from .runtime_context import ApplicationRuntimeContext
 from uthcode.core import (
     GenerationCancelled,
     GenerationCompleted,
@@ -65,6 +66,7 @@ __all__ = [
     "ConfigurationModelError",
     "EffectiveConfig",
     "ApplicationStatus",
+    "ApplicationRuntimeContext",
     "ArgumentSpec",
     "CandidateProvider",
     "ClearTranscript",

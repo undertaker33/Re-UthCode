@@ -6,6 +6,7 @@ import socket
 import pytest
 
 from uthcode.application import (
+    ApplicationRuntimeContext,
     EffectiveConfig,
     ProviderKind,
     UthCodeApplication,
@@ -18,6 +19,7 @@ from uthcode.core.provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    ProviderIdentity,
     ProviderResponse,
     TextDelta,
     TextPart,
@@ -70,6 +72,50 @@ async def test_headless_application_streams_text_usage_and_one_terminal_event() 
     assert events[-1].response.usage.total_tokens == 6  # type: ignore[union-attr]
     assert sum(isinstance(event, GenerationCompleted) for event in events) == 1
     assert len(provider.recorded_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_application_injects_authoritative_prompt_without_mutating_request(
+    tmp_path,
+) -> None:
+    context = ApplicationRuntimeContext.from_system(
+        workdir=tmp_path / "project",
+        platform_name="TestOS",
+        platform_release="1.0",
+        current_date="2026-08-05",
+    )
+    provider = FakeProvider(
+        identity=ProviderIdentity("fake", "test-protocol", "remote-model"),
+        events=(_completed(),),
+    )
+    application = UthCodeApplication(provider, runtime_context=context)
+    request = _request()
+    original = request.to_dict()
+
+    events = [event async for event in application.stream_generation(request)]
+
+    assert isinstance(events[-1], GenerationCompleted)
+    assert len(provider.recorded_requests) == 1
+    prepared = provider.recorded_requests[0]
+    assert prepared is not request
+    assert prepared.system_prompt is not None
+    workdir_line = next(
+        line
+        for line in prepared.system_prompt.splitlines()
+        if line.startswith("- 工作目录：")
+    )
+    rendered_workdir = workdir_line.removeprefix("- 工作目录：")
+    expected_workdir = str(context.workdir).replace("\\", "\\\\").replace(
+        "_", "\\_"
+    )
+    assert rendered_workdir == expected_workdir
+    assert "平台：TestOS / 1.0" in prepared.system_prompt
+    assert "当前日期：2026-08-05" in prepared.system_prompt
+    assert "模型选择：remote-model" in prepared.system_prompt
+    assert "Provider 协议：test-protocol" in prepared.system_prompt
+    assert "远端模型：remote-model" in prepared.system_prompt
+    assert request.to_dict() == original
+    assert request.system_prompt is None
 
 
 @pytest.mark.asyncio
@@ -159,3 +205,50 @@ async def test_explicit_cancellation_is_distinct_from_task_cancellation() -> Non
 
     with pytest.raises(asyncio.CancelledError):
         await task_cancelled
+
+
+def test_application_rejects_caller_system_prompt_before_provider_call() -> None:
+    provider = FakeProvider()
+    application = UthCodeApplication(provider)
+    request = GenerationRequest(
+        system_prompt="caller-owned prompt",
+        messages=(Message("user", (TextPart("hello"),)),),
+    )
+
+    with pytest.raises(ValueError, match="system_prompt"):
+        application.start_generation(request)
+
+    assert provider.recorded_requests == ()
+
+
+def test_application_rejects_caller_model_before_provider_call() -> None:
+    provider = FakeProvider()
+    application = UthCodeApplication(provider)
+    request = GenerationRequest(
+        model="caller-selected-model",
+        messages=(Message("user", (TextPart("hello"),)),),
+    )
+
+    with pytest.raises(ValueError, match="model"):
+        application.start_generation(request)
+
+    assert provider.recorded_requests == ()
+
+
+def test_prompt_build_failure_rejects_request_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uthcode.application.generation as generation_module
+
+    provider = FakeProvider()
+    application = UthCodeApplication(provider)
+
+    def fail(_context: object) -> str:
+        raise RuntimeError("prompt build failed")
+
+    monkeypatch.setattr(generation_module, "build_system_prompt", fail)
+
+    with pytest.raises(RuntimeError, match="prompt build failed"):
+        application.start_generation(_request())
+
+    assert provider.recorded_requests == ()

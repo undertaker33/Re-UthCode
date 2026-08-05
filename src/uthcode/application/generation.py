@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from uthcode.core.provider import (
@@ -15,8 +15,10 @@ from uthcode.core.provider import (
     ProviderIdentity,
     ProviderPort,
 )
+from uthcode.core.prompt import SystemPromptContext, build_system_prompt
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
+from .runtime_context import ApplicationRuntimeContext
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
@@ -52,15 +54,23 @@ class ApplicationStatus:
 class GenerationHandle:
     """One independently cancellable Application generation."""
 
-    __slots__ = ("_application", "_request", "_cancellation", "_started")
+    __slots__ = (
+        "_application",
+        "_provider",
+        "_request",
+        "_cancellation",
+        "_started",
+    )
 
     def __init__(
         self,
         application: UthCodeApplication,
+        provider: ProviderPort,
         request: GenerationRequest,
         cancellation: CancellationToken,
     ) -> None:
         self._application = application
+        self._provider = provider
         self._request = request
         self._cancellation = cancellation
         self._started = False
@@ -79,6 +89,7 @@ class GenerationHandle:
             raise RuntimeError("GenerationHandle.events() can only be consumed once")
         self._started = True
         async for event in self._application._stream_with_token(
+            self._provider,
             self._request,
             self._cancellation,
         ):
@@ -95,11 +106,17 @@ class UthCodeApplication:
         configuration: EffectiveConfig | None = None,
         provider_builder: ProviderBuilder | None = None,
         model_writer: ModelWriter | None = None,
+        runtime_context: ApplicationRuntimeContext | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
         self._provider_builder = provider_builder
         self._model_writer = model_writer
+        if runtime_context is None:
+            runtime_context = ApplicationRuntimeContext.from_system()
+        if not isinstance(runtime_context, ApplicationRuntimeContext):
+            raise TypeError("runtime_context must be ApplicationRuntimeContext")
+        self._runtime_context = runtime_context
         self._current_model_ref = (
             configuration.model if configuration is not None else provider.identity.model
         )
@@ -111,6 +128,10 @@ class UthCodeApplication:
     @property
     def configuration(self) -> EffectiveConfig | None:
         return self._configuration
+
+    @property
+    def runtime_context(self) -> ApplicationRuntimeContext:
+        return self._runtime_context
 
     @property
     def current_model_ref(self) -> str:
@@ -179,11 +200,41 @@ class UthCodeApplication:
     ) -> GenerationHandle:
         """Create one request handle with an independently owned token."""
 
+        provider = self._provider
+        prepared_request = self._prepare_request(request, provider)
         return GenerationHandle(
             self,
-            request,
+            provider,
+            prepared_request,
             CancellationToken(),
         )
+
+    def _prepare_request(
+        self,
+        request: GenerationRequest,
+        provider: ProviderPort,
+    ) -> GenerationRequest:
+        if not isinstance(request, GenerationRequest):
+            raise TypeError("request must be GenerationRequest")
+        if request.system_prompt is not None:
+            raise ValueError(
+                "Application owns system_prompt; caller must leave it unset"
+            )
+        if request.model is not None:
+            raise ValueError("Application owns model; caller must leave it unset")
+
+        identity = provider.identity
+        prompt_context = SystemPromptContext(
+            workdir=str(self._runtime_context.workdir),
+            platform_name=self._runtime_context.platform_name,
+            platform_release=self._runtime_context.platform_release,
+            current_date=self._runtime_context.current_date,
+            model_ref=self._current_model_ref,
+            provider_protocol=identity.protocol,
+            remote_model_id=identity.model,
+        )
+        system_prompt = build_system_prompt(prompt_context)
+        return replace(request, system_prompt=system_prompt)
 
     async def stream_generation(
         self,
@@ -197,13 +248,14 @@ class UthCodeApplication:
 
     async def _stream_with_token(
         self,
+        provider: ProviderPort,
         request: GenerationRequest,
         token: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
         """Yield one provider stream and enforce its terminal-event contract."""
 
         terminal: GenerationCompleted | None = None
-        stream = self._provider.stream(request, cancellation=token)
+        stream = provider.stream(request, cancellation=token)
         try:
             async for event in stream:
                 if terminal is not None:

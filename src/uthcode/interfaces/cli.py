@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TextIO
 
 from uthcode.application import (
+    ApplicationRuntimeContext,
     ConfigurationError,
     ConfigurationInitializationRequired,
     EffectiveConfig,
@@ -29,7 +30,7 @@ from uthcode.application import (
 
 
 ConfigLoader = Callable[[LaunchOptions], EffectiveConfig]
-ApplicationFactory = Callable[[EffectiveConfig], UthCodeApplication]
+ApplicationFactory = Callable[..., UthCodeApplication]
 TuiRunner = Callable[[UthCodeApplication], object]
 
 
@@ -63,15 +64,19 @@ def _launch_options(
 
 def _load_application(
     *,
-    cwd: Path | None,
+    runtime_context: ApplicationRuntimeContext,
     model: str | None,
     config_loader: ConfigLoader,
     application_factory: ApplicationFactory,
 ) -> UthCodeApplication:
     configuration = config_loader(
-        _launch_options(cwd=cwd, home=None, model=model)
+        _launch_options(
+            cwd=runtime_context.workdir,
+            home=None,
+            model=model,
+        )
     )
-    return application_factory(configuration)
+    return application_factory(configuration, runtime_context=runtime_context)
 
 
 def _message_text(message: object) -> str:
@@ -158,12 +163,10 @@ def _run_exec(
 
 def _default_tui_runner(
     application: UthCodeApplication,
-    *,
-    cwd: Path | None = None,
 ) -> object:
     from uthcode.interfaces.tui import run_tui
 
-    return run_tui(application, cwd=Path.cwd() if cwd is None else cwd)
+    return run_tui(application)
 
 
 def main(
@@ -205,8 +208,9 @@ def main(
             _write_diagnostic(error_stream, "usage error: a non-empty prompt is required")
             return 2
         try:
+            runtime_context = ApplicationRuntimeContext.from_system(workdir=cwd)
             application = _load_application(
-                cwd=cwd,
+                runtime_context=runtime_context,
                 model=model,
                 config_loader=loader,
                 application_factory=factory,
@@ -231,17 +235,17 @@ def main(
         )
 
     try:
+        runtime_context = ApplicationRuntimeContext.from_system(
+            workdir=arguments.global_cwd
+        )
         application = _load_application(
-            cwd=arguments.global_cwd,
+            runtime_context=runtime_context,
             model=arguments.global_model,
             config_loader=loader,
             application_factory=factory,
         )
         if tui_runner is None:
-            result = _default_tui_runner(
-                application,
-                cwd=arguments.global_cwd,
-            )
+            result = _default_tui_runner(application)
         else:
             result = tui_runner(application)
         return result if isinstance(result, int) else 0

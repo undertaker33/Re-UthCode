@@ -70,7 +70,7 @@ def _injected_main(
     result = main(
         argv,
         config_loader=lambda _options: _config(),
-        application_factory=lambda _config: application,
+        application_factory=lambda _config, *, runtime_context: application,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -85,7 +85,7 @@ def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> N
     result = main(
         [],
         config_loader=lambda _options: _config(),
-        application_factory=lambda _config: application,
+        application_factory=lambda _config, *, runtime_context: application,
         tui_runner=lambda received: seen.append(received) or 17,
         stdout=io.StringIO(),
         stderr=io.StringIO(),
@@ -162,7 +162,11 @@ def test_provider_factory_errors_are_redacted_for_all_cli_entries(
     stdout = io.StringIO()
     stderr = io.StringIO()
 
-    def fail_factory(_configuration: EffectiveConfig) -> UthCodeApplication:
+    def fail_factory(
+        _configuration: EffectiveConfig,
+        *,
+        runtime_context,
+    ) -> UthCodeApplication:
         raise NetworkError(secret)
 
     result = main(
@@ -199,7 +203,7 @@ def test_exec_cwd_and_model_are_process_overrides_only(tmp_path: Path) -> None:
     result = main(
         ["exec", "--cwd", str(project), "--model", "fake/ref", "hello"],
         config_loader=loader,
-        application_factory=lambda _config: application,
+        application_factory=lambda _config, *, runtime_context: application,
         stdout=io.StringIO(),
         stderr=io.StringIO(),
     )
@@ -208,6 +212,78 @@ def test_exec_cwd_and_model_are_process_overrides_only(tmp_path: Path) -> None:
     assert captured[0].cwd == project
     assert captured[0].model == "fake/ref"
     assert user_config.read_text(encoding="utf-8") == original
+
+
+def test_exec_uses_one_normalized_workdir_for_config_and_prompt(
+    tmp_path: Path,
+) -> None:
+    requested = tmp_path / "nested" / ".." / "project"
+    expected = (tmp_path / "project").resolve()
+    captured_options: list[LaunchOptions] = []
+    captured_contexts = []
+    providers: list[FakeProvider] = []
+
+    def loader(options: LaunchOptions) -> EffectiveConfig:
+        captured_options.append(options)
+        return _config()
+
+    def factory(
+        _configuration: EffectiveConfig,
+        *,
+        runtime_context,
+    ) -> UthCodeApplication:
+        captured_contexts.append(runtime_context)
+        provider = FakeProvider(events=(_completed("response"),))
+        providers.append(provider)
+        return UthCodeApplication(provider, runtime_context=runtime_context)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result = main(
+        ["exec", "--cwd", str(requested), "hello"],
+        config_loader=loader,
+        application_factory=factory,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 0
+    assert captured_options[0].cwd == expected
+    assert captured_contexts[0].workdir == expected
+    prompt = providers[0].recorded_requests[0].system_prompt
+    assert prompt is not None
+    assert "工作目录：" in prompt
+    assert "project" in prompt
+
+
+def test_exec_default_workdir_is_shared_with_application_context() -> None:
+    workdir = Path.cwd()
+    captured_options: list[LaunchOptions] = []
+    captured_contexts = []
+
+    def loader(options: LaunchOptions) -> EffectiveConfig:
+        captured_options.append(options)
+        return _config()
+
+    def factory(
+        _configuration: EffectiveConfig,
+        *,
+        runtime_context,
+    ) -> UthCodeApplication:
+        captured_contexts.append(runtime_context)
+        return _application()
+
+    result = main(
+        ["exec", "hello"],
+        config_loader=loader,
+        application_factory=factory,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert result == 0
+    assert captured_options[0].cwd == workdir.resolve()
+    assert captured_contexts[0].workdir == workdir.resolve()
 
 
 def test_module_entry_import_does_not_require_a_textual_app_for_exec() -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import shlex
 import time
-from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -53,12 +52,9 @@ class UthCodeTUI(App[None]):
     def __init__(
         self,
         application: UthCodeApplication,
-        *,
-        cwd: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.application = application
-        self.cwd = Path.cwd() if cwd is None else Path(cwd)
         self.registry = create_builtin_registry()
         self.parser = CommandParser(self.registry)
         self.dispatcher = CommandDispatcher(self.registry, application)
@@ -70,7 +66,10 @@ class UthCodeTUI(App[None]):
         self._esc = EscArmState()
 
     def compose(self) -> ComposeResult:
-        yield Topbar(self.application.current_model_ref, self.cwd)
+        yield Topbar(
+            self.application.current_model_ref,
+            self.application.runtime_context.workdir,
+        )
         with Vertical(id="main-column"):
             yield TranscriptWidget()
             yield Static("ready", id="activity")
@@ -489,12 +488,10 @@ class UthCodeTUI(App[None]):
 
 def run_tui(
     application: UthCodeApplication,
-    *,
-    cwd: str | Path | None = None,
 ) -> object:
     """Start the default TUI for one already-composed Application."""
 
-    return UthCodeTUI(application, cwd=cwd).run()
+    return UthCodeTUI(application).run()
 
 
 __all__ = ["UthCodeTUI", "run_tui"]

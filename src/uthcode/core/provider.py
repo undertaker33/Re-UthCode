@@ -164,6 +164,9 @@ def _require_text(value: str, field_name: str) -> str:
     return value
 
 
+_MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
+
+
 def _require_non_negative_int(value: int | None, field_name: str) -> int | None:
     if value is None:
         return None
@@ -368,6 +371,8 @@ class Message(_JsonModel):
 
     def __post_init__(self) -> None:
         _require_text(self.role, "role")
+        if self.role not in _MESSAGE_ROLES:
+            raise ValueError("role must be one of: user, assistant, tool")
         parts = _as_tuple(self.parts, "parts")
         if not all(
             isinstance(part, (TextPart, ReasoningPart, ToolCallPart, ToolResultPart))
@@ -446,6 +451,7 @@ class ReasoningOptions(_JsonModel):
 @dataclass(frozen=True, slots=True)
 class GenerationRequest(_JsonModel):
     messages: tuple[Message, ...]
+    system_prompt: str | None = None
     model: str | None = None
     tools: tuple[ToolDefinition, ...] = ()
     reasoning: ReasoningOptions | None = None
@@ -457,6 +463,10 @@ class GenerationRequest(_JsonModel):
         messages = _as_tuple(self.messages, "messages")
         if not all(isinstance(message, Message) for message in messages):
             raise TypeError("messages must contain Message values")
+        if self.system_prompt is not None:
+            _require_text(self.system_prompt, "system_prompt")
+            if not self.system_prompt.strip():
+                raise ValueError("system_prompt must be a non-empty string or None")
         tools = _as_tuple(self.tools, "tools")
         if not all(isinstance(tool, ToolDefinition) for tool in tools):
             raise TypeError("tools must contain ToolDefinition values")
@@ -492,6 +502,7 @@ class GenerationRequest(_JsonModel):
             )
         return cls(
             messages=tuple(Message.from_dict(item) for item in value.get("messages", ())),
+            system_prompt=value.get("system_prompt"),
             model=value.get("model"),
             tools=tuple(
                 ToolDefinition(

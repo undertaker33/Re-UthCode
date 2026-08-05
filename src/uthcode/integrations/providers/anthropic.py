@@ -95,7 +95,7 @@ def _message_text(message: Message) -> str:
             values.append(part.content)
         else:
             raise InvalidProviderResponseError(
-                "Anthropic user or system message contains an unsupported part"
+                "Anthropic message contains an unsupported part"
             )
     return "".join(values)
 
@@ -179,7 +179,7 @@ def _assistant_content(
 def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[str, object]]:
     if message.role == "assistant":
         return _assistant_content(message, identity)
-    if message.role in {"user", "system"}:
+    if message.role == "user":
         return [{"type": "text", "text": _message_text(message)}]
     if message.role == "tool":
         blocks: list[dict[str, object]] = []
@@ -203,13 +203,9 @@ def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[s
 def _request_messages(
     request: GenerationRequest,
     identity: ProviderIdentity,
-) -> tuple[str | None, list[dict[str, object]]]:
-    system_parts: list[str] = []
+) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
     for message in request.messages:
-        if message.role == "system":
-            system_parts.append(_message_text(message))
-            continue
         role = "assistant" if message.role == "assistant" else "user"
         messages.append(
             {
@@ -217,7 +213,7 @@ def _request_messages(
                 "content": _message_blocks(message, identity),
             }
         )
-    return ("\n\n".join(system_parts) if system_parts else None), messages
+    return messages
 
 
 def _request_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
@@ -291,7 +287,7 @@ class AnthropicProvider:
         mapped_error: ProviderError | None = None
         completed: ProviderResponse | None = None
         try:
-            system, messages = _request_messages(request, self._identity)
+            messages = _request_messages(request, self._identity)
             max_output_tokens = (
                 request.max_output_tokens
                 if request.max_output_tokens is not None
@@ -305,8 +301,8 @@ class AnthropicProvider:
                 "max_tokens": max_output_tokens,
                 "stream": True,
             }
-            if system is not None:
-                kwargs["system"] = system
+            if request.system_prompt is not None:
+                kwargs["system"] = request.system_prompt
             if request.tools:
                 kwargs["tools"] = _request_tools(request.tools)
             if request.temperature is not None:

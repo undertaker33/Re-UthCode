@@ -225,8 +225,16 @@ def _rich_events() -> list[object]:
     return events
 
 
-def _request(*messages: Message, tools: tuple[ToolDefinition, ...] = ()) -> GenerationRequest:
-    return GenerationRequest(messages=messages, tools=tools)
+def _request(
+    *messages: Message,
+    system_prompt: str | None = None,
+    tools: tuple[ToolDefinition, ...] = (),
+) -> GenerationRequest:
+    return GenerationRequest(
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
 
 
 async def _collect(provider: object, request: GenerationRequest, token: CancellationToken | None = None) -> list[object]:
@@ -253,7 +261,27 @@ async def test_anthropic_public_stream_maps_text_usage_and_closes() -> None:
     assert completed.response.usage.cache_read_tokens == 5
     assert completed.response.usage.cache_write_tokens == 2
     assert completed.response.finish_reason is FinishReason.STOP
+    assert "system" not in client.calls[0]
+    assert all(message["role"] != "system" for message in client.calls[0]["messages"])
     assert client.stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_anthropic_system_prompt_maps_only_to_top_level_system() -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("hi"),)),
+            system_prompt="rules",
+        ),
+    )
+
+    call = client.calls[0]
+    assert call["system"] == "rules"
+    assert all(message["role"] != "system" for message in call["messages"])
 
 
 @pytest.mark.asyncio
