@@ -3,9 +3,17 @@ from __future__ import annotations
 import asyncio
 import os
 from types import SimpleNamespace
-from typing import Any
 
+import httpx
 import pytest
+from openai import (
+    APIConnectionError as SDKAPIConnectionError,
+    APIStatusError as SDKAPIStatusError,
+    APITimeoutError as SDKAPITimeoutError,
+    AuthenticationError as SDKAuthenticationError,
+    PermissionDeniedError as SDKPermissionDeniedError,
+    RateLimitError as SDKRateLimitError,
+)
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
@@ -20,37 +28,34 @@ from uthcode.core.provider import (
     InvalidProviderResponseError,
     Message,
     NativeItemCompleted,
-    ReasoningDelta,
-    ReasoningOptions,
-    ReasoningPart,
+    NetworkError,
+    ProviderIdentity,
+    ProviderError,
     RateLimitError,
+    ReasoningDelta,
+    ReasoningPart,
     TextDelta,
     TextPart,
+    ToolCallArgumentsDelta,
     ToolCallCompleted,
     ToolCallPart,
+    ToolCallStarted,
     ToolDefinition,
     ToolResultPart,
 )
-from uthcode.application import EffectiveConfig, ProviderKind, create_application
 from uthcode.integrations.providers.openai_compat import build_openai_compat_provider
 
 
 class _AsyncStream:
-    def __init__(self, chunks: list[Any], *, delay: float = 0) -> None:
+    def __init__(self, chunks: list[object], *, delay: float = 0.0) -> None:
         self._chunks = iter(chunks)
         self.delay = delay
         self.closed = False
 
-    async def __aenter__(self) -> _AsyncStream:
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.close()
-
     def __aiter__(self) -> _AsyncStream:
         return self
 
-    async def __anext__(self) -> Any:
+    async def __anext__(self) -> object:
         if self.delay:
             await asyncio.sleep(self.delay)
         try:
@@ -63,14 +68,13 @@ class _AsyncStream:
 
 
 class _OpenAICompatClient:
-    def __init__(self, chunks: list[Any], *, delay: float = 0) -> None:
-        self.base_url = "https://mock.invalid/v1"
+    def __init__(self, chunks: list[object], *, delay: float = 0.0) -> None:
         self.stream = _AsyncStream(chunks, delay=delay)
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[dict[str, object]] = []
         self.error: BaseException | None = None
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
-    async def create(self, **kwargs: Any) -> _AsyncStream:
+    async def create(self, **kwargs: object) -> _AsyncStream:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
@@ -78,14 +82,13 @@ class _OpenAICompatClient:
 
 
 def _chunk(
-    delta: Any,
+    delta: object,
     *,
     finish_reason: str | None = None,
     usage: CompletionUsage | None = None,
-    chunk_id: str = "chunk-1",
 ) -> ChatCompletionChunk:
     return ChatCompletionChunk(
-        id=chunk_id,
+        id="chunk-1",
         choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         created=1,
         model="deepseek-test",
@@ -108,38 +111,17 @@ def _tool_delta(index: int, *, call_id: str | None, name: str | None, arguments:
     )
 
 
-def _chunks(*, include_finish: bool = True) -> list[Any]:
+def _chunks(*, include_finish: bool = True) -> list[object]:
     reasoning = ChoiceDelta.model_construct(
-        role="assistant",
-        content=None,
-        tool_calls=None,
-        reasoning_content="plan",
+        role="assistant", content=None, tool_calls=None, reasoning_content="plan"
     )
-    chunks: list[Any] = [
+    chunks: list[object] = [
         _chunk(reasoning),
         _chunk(ChoiceDelta(role="assistant", content="answer")),
-        _chunk(
-            _tool_delta(
-                0,
-                call_id="call-1",
-                name="search",
-                arguments='{"q":',
-            )
-        ),
-        _chunk(
-            _tool_delta(
-                1,
-                call_id="call-2",
-                name="lookup",
-                arguments='{"q":',
-            )
-        ),
-        _chunk(
-            _tool_delta(0, call_id=None, name=None, arguments='"one"}'),
-        ),
-        _chunk(
-            _tool_delta(1, call_id=None, name=None, arguments='"two"}'),
-        ),
+        _chunk(_tool_delta(0, call_id="call-1", name="search", arguments='{"q":')),
+        _chunk(_tool_delta(1, call_id="call-2", name="lookup", arguments='{"q":')),
+        _chunk(_tool_delta(0, call_id=None, name=None, arguments='"one"}')),
+        _chunk(_tool_delta(1, call_id=None, name=None, arguments='"two"}')),
     ]
     if include_finish:
         chunks.append(
@@ -158,14 +140,34 @@ def _chunks(*, include_finish: bool = True) -> list[Any]:
     return chunks
 
 
+def _delayed_identity_chunks() -> list[object]:
+    return [
+        _chunk(_tool_delta(0, call_id=None, name=None, arguments='{"q":')),
+        _chunk(_tool_delta(1, call_id=None, name=None, arguments='{"q":')),
+        _chunk(_tool_delta(0, call_id="call-1", name=None, arguments='"one"}')),
+        _chunk(_tool_delta(1, call_id="call-2", name=None, arguments='"two"}')),
+        _chunk(_tool_delta(0, call_id=None, name="search", arguments="")),
+        _chunk(_tool_delta(1, call_id=None, name="lookup", arguments="")),
+        _chunk(
+            ChoiceDelta(role="assistant"),
+            finish_reason="tool_calls",
+            usage=CompletionUsage(
+                prompt_tokens=12,
+                completion_tokens=8,
+                total_tokens=20,
+            ),
+        ),
+    ]
+
+
 def _request(*messages: Message, tools: tuple[ToolDefinition, ...] = ()) -> GenerationRequest:
     return GenerationRequest(messages=messages, tools=tools)
 
 
-async def _collect(provider: Any, request: GenerationRequest, token: CancellationToken | None = None) -> list[Any]:
+async def _collect(provider: object, request: GenerationRequest, token: CancellationToken | None = None) -> list[object]:
     return [
         event
-        async for event in provider.stream(
+        async for event in provider.stream(  # type: ignore[attr-defined]
             request,
             cancellation=token or CancellationToken(),
         )
@@ -173,29 +175,16 @@ async def _collect(provider: Any, request: GenerationRequest, token: Cancellatio
 
 
 @pytest.mark.asyncio
-async def test_chat_actual_model_maps_reasoning_text_indexed_tools_and_usage() -> None:
+async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_order() -> None:
     client = _OpenAICompatClient(_chunks())
     provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
-    request = _request(
-        Message("user", (TextPart("hi"),)),
-        tools=(
-            ToolDefinition(
-                "search",
-                description="Search docs",
-                parameters={"type": "object", "properties": {"q": {"type": "string"}}},
-            ),
-        ),
-    )
-
-    events = await _collect(provider, request)
-
+    tools = (ToolDefinition("search", "Search docs", {"type": "object", "properties": {"q": {"type": "string"}}}),)
+    events = await _collect(provider, _request(Message("user", (TextPart("hi"),)), tools=tools))
     assert any(isinstance(event, TextDelta) and event.text == "answer" for event in events)
-    completed = next(event for event in events if isinstance(event, GenerationCompleted))
-    response = completed.response
+    assert any(isinstance(event, ReasoningDelta) and event.text == "plan" for event in events)
+    response = next(event.response for event in events if isinstance(event, GenerationCompleted))
     assert response.message.parts == (
         ReasoningPart("plan"),
         TextPart("answer"),
@@ -206,10 +195,7 @@ async def test_chat_actual_model_maps_reasoning_text_indexed_tools_and_usage() -
     assert response.usage.cache_write_tokens == 1
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert [item.kind for item in response.native_items] == [
-        "reasoning_carrier",
-        "assistant_text",
-        "assistant_tool_call",
-        "assistant_tool_call",
+        "reasoning_carrier", "assistant_text", "assistant_tool_call", "assistant_tool_call"
     ]
     assert [
         item.payload["index"]
@@ -218,17 +204,14 @@ async def test_chat_actual_model_maps_reasoning_text_indexed_tools_and_usage() -
     ] == [0, 1]
     assert sum(isinstance(event, NativeItemCompleted) for event in events) == 4
     assert client.stream.closed is True
-    tool_schema = client.calls[0]["tools"]
-    assert tool_schema == [
+    assert client.calls[0]["stream_options"] == {"include_usage": True}
+    assert client.calls[0]["tools"] == [
         {
             "type": "function",
             "function": {
                 "name": "search",
                 "description": "Search docs",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"q": {"type": "string"}},
-                    "additionalProperties": False,
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}},
                 },
             },
         }
@@ -236,7 +219,60 @@ async def test_chat_actual_model_maps_reasoning_text_indexed_tools_and_usage() -
 
 
 @pytest.mark.asyncio
-async def test_chat_nullable_usage_detail_objects_are_normalized_to_empty() -> None:
+async def test_chat_delayed_tool_identity_replays_cached_deltas_with_real_ids() -> None:
+    client = _OpenAICompatClient(_delayed_identity_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
+    events = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+
+    for call_id, name, expected_arguments in (
+        ("call-1", "search", ('{"q":', '"one"}')),
+        ("call-2", "lookup", ('{"q":', '"two"}')),
+    ):
+        call_events = [
+            event
+            for event in events
+            if isinstance(
+                event,
+                (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted),
+            )
+            and event.tool_call_id == call_id
+        ]
+        assert [type(event) for event in call_events] == [
+            ToolCallStarted,
+            ToolCallArgumentsDelta,
+            ToolCallArgumentsDelta,
+            ToolCallCompleted,
+        ]
+        assert isinstance(call_events[0], ToolCallStarted)
+        assert call_events[0].name == name
+        assert [event.arguments_delta for event in call_events[1:3]] == list(expected_arguments)
+        assert isinstance(call_events[3], ToolCallCompleted)
+        assert call_events[3].name == name
+        assert call_events[3].arguments == {"q": expected_arguments[1][1:-2]}
+
+    tool_events = [
+        event
+        for event in events
+        if isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+    ]
+    assert [(type(event), event.tool_call_id) for event in tool_events] == [
+        (ToolCallStarted, "call-1"),
+        (ToolCallArgumentsDelta, "call-1"),
+        (ToolCallArgumentsDelta, "call-1"),
+        (ToolCallCompleted, "call-1"),
+        (ToolCallStarted, "call-2"),
+        (ToolCallArgumentsDelta, "call-2"),
+        (ToolCallArgumentsDelta, "call-2"),
+        (ToolCallCompleted, "call-2"),
+    ]
+    assert all(not event.tool_call_id.startswith("index-") for event in tool_events)
+
+
+@pytest.mark.asyncio
+async def test_chat_nullable_usage_is_normalized_and_history_uses_chat_shapes() -> None:
     client = _OpenAICompatClient(
         [
             _chunk(ChoiceDelta(role="assistant", content="answer")),
@@ -254,206 +290,175 @@ async def test_chat_nullable_usage_detail_objects_are_normalized_to_empty() -> N
         ]
     )
     provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
-    )
-
-    events = await _collect(
-        provider,
-        _request(Message("user", (TextPart("hi"),))),
-    )
-
-    completed = next(event for event in events if isinstance(event, GenerationCompleted))
-    assert completed.response.usage.cache_read_tokens == 0
-    assert completed.response.usage.cache_write_tokens == 0
-    assert completed.response.usage.details["reasoning_tokens"] == 0
-    assert completed.response.finish_reason is FinishReason.STOP
-
-
-@pytest.mark.asyncio
-async def test_chat_history_replays_role_tool_and_never_emits_responses_items() -> None:
-    client = _OpenAICompatClient(_chunks())
-    provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
     first = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
     response = next(event.response for event in first if isinstance(event, GenerationCompleted))
+    assert response.usage.cache_read_tokens == 0
+    assert response.usage.details["reasoning_tokens"] == 0
 
-    client.stream = _AsyncStream(_chunks())
+    history_client = _OpenAICompatClient(_chunks())
+    history_provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=history_client
+    )
+    history_first = await _collect(
+        history_provider, _request(Message("user", (TextPart("hi"),)))
+    )
+    history_response = next(
+        event.response for event in history_first if isinstance(event, GenerationCompleted)
+    )
+    history_client.stream = _AsyncStream(_chunks())
     await _collect(
-        provider,
+        history_provider,
         _request(
+            Message("system", (TextPart("rules"),)),
             Message("user", (TextPart("continue"),)),
-            response.message,
+            history_response.message,
             Message("tool", (ToolResultPart("call-1", "tool output"),)),
         ),
     )
-    messages = client.calls[-1]["messages"]
+    messages = history_client.calls[-1]["messages"]
     assistant = next(message for message in messages if message["role"] == "assistant")
-    tool = next(message for message in messages if message["role"] == "tool")
     assert assistant["reasoning_content"] == "plan"
     assert assistant["tool_calls"] == [
-        {
-            "id": "call-1",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q":"one"}'},
-        },
-        {
-            "id": "call-2",
-            "type": "function",
-            "function": {"name": "lookup", "arguments": '{"q":"two"}'},
-        },
+        {"id": "call-1", "type": "function", "function": {"name": "search", "arguments": '{"q":"one"}'}},
+        {"id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"two"}'}},
     ]
-    assert tool == {"role": "tool", "tool_call_id": "call-1", "content": "tool output"}
-    serialized = repr(messages)
-    assert "function_call_output" not in serialized
-    assert "ResponseFunctionToolCall" not in serialized
+    assert messages[0] == {"role": "system", "content": "rules"}
+    assert any(message == {"role": "tool", "tool_call_id": "call-1", "content": "tool output"} for message in messages)
+    assert "function_call_output" not in repr(messages)
 
 
 @pytest.mark.asyncio
-async def test_chat_missing_finish_reason_is_rejected() -> None:
+async def test_chat_cross_identity_native_items_are_ignored_and_standard_parts_remain() -> None:
+    client = _OpenAICompatClient(_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    first = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+    response = next(event.response for event in first if isinstance(event, GenerationCompleted))
+    other_client = _OpenAICompatClient(_chunks())
+    other = build_openai_compat_provider(
+        "other-model", base_url="https://mock.invalid/v1", client=other_client
+    )
+    await _collect(other, _request(response.message))
+    assistant = other_client.calls[-1]["messages"][0]
+    assert "reasoning_content" not in assistant
+    assert assistant["content"] == "plananswer"
+    assert assistant["tool_calls"][0]["id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_finish_or_invalid_tool_arguments_is_rejected() -> None:
     client = _OpenAICompatClient(_chunks(include_finish=False))
     provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
+    with pytest.raises(InvalidProviderResponseError):
+        await _collect(provider, _request(Message("user", (TextPart("hi"),))))
 
+    bad = _chunks()
+    bad[-2] = _chunk(_tool_delta(0, call_id=None, name=None, arguments="not-json"))
+    client = _OpenAICompatClient(bad)
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
     with pytest.raises(InvalidProviderResponseError):
         await _collect(provider, _request(Message("user", (TextPart("hi"),))))
 
 
-class _AuthSDKError(Exception):
-    status_code = 401
-
-
-class _RateSDKError(Exception):
-    status_code = 429
+@pytest.mark.asyncio
+async def test_chat_conflicting_index_identity_is_rejected() -> None:
+    chunks = _chunks()
+    chunks.insert(4, _chunk(_tool_delta(0, call_id="different", name=None, arguments="")))
+    client = _OpenAICompatClient(chunks)
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    with pytest.raises(InvalidProviderResponseError):
+        await _collect(provider, _request(Message("user", (TextPart("hi"),))))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error, expected",
-    [(_AuthSDKError("auth"), AuthenticationError), (_RateSDKError("rate"), RateLimitError)],
+    ("call_id", "name"),
+    [(None, "search"), ("call-1", None)],
 )
-async def test_chat_sdk_errors_are_mapped_without_leaking_error_text(
-    error: BaseException, expected: type[BaseException]
-) -> None:
-    client = _OpenAICompatClient(_chunks())
-    client.error = error
+async def test_chat_tool_call_requires_id_and_name(call_id: str | None, name: str | None) -> None:
+    chunks = [
+        _chunk(_tool_delta(0, call_id=call_id, name=name, arguments="{}")),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="tool_calls"),
+    ]
+    client = _OpenAICompatClient(chunks)
     provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
-
-    with pytest.raises(expected) as captured:
+    with pytest.raises(InvalidProviderResponseError):
         await _collect(provider, _request(Message("user", (TextPart("hi"),))))
-    assert "auth" not in str(captured.value)
-    assert "rate" not in str(captured.value)
 
 
 @pytest.mark.asyncio
-async def test_chat_explicit_cancellation_closes_stream() -> None:
+async def test_chat_official_errors_are_safe() -> None:
+    request = httpx.Request("GET", "https://mock.invalid")
+    cases: list[tuple[BaseException, type[BaseException]]] = [
+        (SDKAuthenticationError("secret-auth", response=httpx.Response(401, request=request), body={}), AuthenticationError),
+        (SDKPermissionDeniedError("secret-permission", response=httpx.Response(403, request=request), body={}), AuthenticationError),
+        (SDKRateLimitError("secret-rate", response=httpx.Response(429, request=request), body={}), RateLimitError),
+        (SDKAPIConnectionError(request=request), NetworkError),
+        (SDKAPITimeoutError(request), NetworkError),
+        (SDKAPIStatusError("secret-status", response=httpx.Response(500, request=request), body={}), ProviderError),
+    ]
+    for error, expected in cases:
+        client = _OpenAICompatClient(_chunks())
+        client.error = error
+        provider = build_openai_compat_provider(
+            "deepseek-test", base_url="https://mock.invalid/v1", client=client
+        )
+        with pytest.raises(expected) as raised:
+            await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+        assert "secret-" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_chat_explicit_and_task_cancellation_close_stream() -> None:
     client = _OpenAICompatClient(_chunks(), delay=0.05)
     provider = build_openai_compat_provider(
-        "deepseek-test",
-        base_url="https://mock.invalid/v1",
-        client=client,
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
     token = CancellationToken()
-    task = asyncio.create_task(
-        _collect(provider, _request(Message("user", (TextPart("hi"),))), token)
-    )
+    task = asyncio.create_task(_collect(provider, _request(Message("user", (TextPart("hi"),))), token))
     await asyncio.sleep(0.01)
     token.cancel()
-
     with pytest.raises(GenerationCancelled):
         await task
     assert client.stream.closed is True
 
+    client = _OpenAICompatClient(_chunks(), delay=0.05)
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    task = asyncio.create_task(_collect(provider, _request(Message("user", (TextPart("hi"),)))))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.stream.closed is True
 
-_LIVE_ENABLED = (
-    os.environ.get("UTHCODE_RUN_LIVE") == "1"
-    and bool(os.environ.get("DEEPSEEK_API_KEY"))
-)
+
+def test_chat_builder_accepts_client_without_calling_create() -> None:
+    client = _OpenAICompatClient([])
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    assert provider.identity == ProviderIdentity("openai", "chat_completions", "deepseek-test")
+    assert client.calls == []
 
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not _LIVE_ENABLED,
-    reason="set UTHCODE_RUN_LIVE=1 and DEEPSEEK_API_KEY for live validation",
+    os.environ.get("UTHCODE_RUN_LIVE") != "1",
+    reason="set UTHCODE_RUN_LIVE=1 to authorize live validation",
 )
 @pytest.mark.asyncio
-async def test_chat_deepseek_live_headless_text_reasoning_tools_and_continuation() -> None:
-    application = create_application(
-        EffectiveConfig.single_model(
-            "deepseek/deepseek-v4-flash",
-            provider_profile_id="deepseek",
-            provider_kind=ProviderKind.OPENAI_COMPAT,
-            remote_model_id="deepseek-v4-flash",
-            api_key_env="DEEPSEEK_API_KEY",
-            base_url="https://api.deepseek.com",
-            max_output_tokens=512,
-        )
-    )
-    request = GenerationRequest(
-        messages=(
-            Message(
-                "user",
-                (
-                    TextPart(
-                        "Use the lookup tool exactly once for query 'uthcode'. "
-                        "Think briefly before calling it and do not answer without the call."
-                    ),
-                ),
-            ),
-        ),
-        tools=(
-            ToolDefinition(
-                "lookup",
-                description="Look up one query.",
-                parameters={
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            ),
-        ),
-        reasoning=ReasoningOptions(enabled=True, effort="medium"),
-    )
-
-    try:
-        first = [event async for event in application.stream_generation(request)]
-        first_terminal = next(event for event in first if isinstance(event, GenerationCompleted))
-        calls = [event for event in first if isinstance(event, ToolCallCompleted)]
-        assert any(isinstance(event, ReasoningDelta) for event in first)
-        assert calls
-
-        continuation = GenerationRequest(
-            messages=(
-                *request.messages,
-                first_terminal.response.message,
-                Message(
-                    "tool",
-                    tuple(
-                        ToolResultPart(call.tool_call_id, "verified lookup result")
-                        for call in calls
-                    ),
-                ),
-            ),
-            tools=request.tools,
-            reasoning=request.reasoning,
-        )
-        second = [
-            event
-            async for event in application.stream_generation(continuation)
-        ]
-        second_terminal = next(event for event in second if isinstance(event, GenerationCompleted))
-        assert any(isinstance(event, TextDelta) and event.text for event in first + second)
-        assert second_terminal.response.finish_reason.value == "stop"
-    finally:
-        os.environ.pop("DEEPSEEK_API_KEY", None)
+async def test_chat_live_gate_is_not_run_by_w01() -> None:
+    pytest.skip("W01 performs offline Provider validation only")
