@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from uthcode.core.provider import (
     FinishReason,
@@ -23,12 +22,6 @@ from .config import ProviderConfig, ProviderKind
 from .fake import FakeProvider
 from .openai_compat import build_openai_compat_provider
 from .openai_responses import build_openai_responses_provider
-
-
-def _model_settings(config: ProviderConfig) -> dict[str, Any] | None:
-    if config.max_output_tokens is None:
-        return None
-    return {"max_tokens": config.max_output_tokens}
 
 
 def _secret_for(config: ProviderConfig) -> str:
@@ -71,28 +64,26 @@ def create_provider(config: ProviderConfig) -> ProviderPort:
         )
 
     api_key = _secret_for(config)
-    settings = _model_settings(config)
-
     if config.kind is ProviderKind.ANTHROPIC:
         return build_anthropic_provider(
             config.model,
             api_key=api_key,
             base_url=config.base_url,
-            settings=settings,
+            max_output_tokens=config.max_output_tokens,
         )
     if config.kind is ProviderKind.OPENAI_RESPONSES:
         return build_openai_responses_provider(
             config.model,
             api_key=api_key,
             base_url=config.base_url,
-            settings=settings,
+            max_output_tokens=config.max_output_tokens,
         )
     if config.kind is ProviderKind.OPENAI_COMPAT:
         return build_openai_compat_provider(
             config.model,
             base_url=config.base_url,
             api_key=api_key,
-            settings=settings,
+            max_output_tokens=config.max_output_tokens,
         )
     raise ProviderConfigurationError(f"unsupported provider kind: {config.kind.value}")
 
