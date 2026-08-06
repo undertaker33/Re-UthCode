@@ -568,6 +568,8 @@ class AgentTurnExecution:
         "_result_future",
         "_result_value",
         "_terminal_emitted",
+        "_completion_listeners",
+        "_completion_notified",
         "_batch_number",
         "_reasoning_segment",
         "_reasoning_open",
@@ -591,6 +593,8 @@ class AgentTurnExecution:
         self._result_future: asyncio.Future[TurnResult] | None = None
         self._result_value: TurnResult | None = None
         self._terminal_emitted = False
+        self._completion_listeners: list[Callable[[TurnResult], object]] = []
+        self._completion_notified = False
         self._batch_number = 0
         self._reasoning_segment = 0
         self._reasoning_open = False
@@ -611,6 +615,33 @@ class AgentTurnExecution:
 
     def cancelled(self) -> bool:
         return self._cancellation.cancelled
+
+    def start(self) -> None:
+        """Start the single Core producer in the current event loop."""
+
+        self._ensure_started()
+
+    def add_completion_listener(
+        self,
+        listener: Callable[[TurnResult], object],
+    ) -> None:
+        """Notify one synchronous listener when this Turn reaches a terminal.
+
+        Registration itself is synchronous so Application can attach the
+        listener during ``start_turn()``.  If the terminal already exists, the
+        listener is invoked immediately; otherwise it is called exactly once
+        by the Core producer.  Listener failures are isolated from the Agent
+        Loop and never become user-visible diagnostics.
+        """
+
+        if not callable(listener):
+            raise TypeError("listener must be callable")
+        if self._completion_notified:
+            result = self._result_value
+            if result is not None:
+                self._invoke_completion_listener(listener, result)
+            return
+        self._completion_listeners.append(listener)
 
     async def run(self) -> TurnResult:
         return await self.result()
@@ -669,6 +700,7 @@ class AgentTurnExecution:
                 return
             result = await self._fail_turn(TerminationReason.INTERNAL_ERROR)
         self._result_value = result
+        self._notify_completion(result)
         if not self._result_future.done():
             self._result_future.set_result(result)
         await self._queue.put(_END)
@@ -1053,14 +1085,36 @@ class AgentTurnExecution:
             iteration_count=self._state.iteration_count,
             tool_call_count=self._state.tool_call_count,
         )
+        self._result_value = result
+        self._notify_completion(result)
         if status is RunStatus.COMPLETED:
             await self._emit(TurnCompleted(self._state.run_id, self._state.turn_id, final_text or ""))
         elif status is RunStatus.CANCELLED:
             await self._emit(TurnCancelled(self._state.run_id, self._state.turn_id))
         else:
             await self._emit(TurnFailed(self._state.run_id, self._state.turn_id, reason))
-        self._result_value = result
         return result
+
+    def _notify_completion(self, result: TurnResult) -> None:
+        if self._completion_notified:
+            return
+        self._completion_notified = True
+        listeners = tuple(self._completion_listeners)
+        self._completion_listeners.clear()
+        for listener in listeners:
+            self._invoke_completion_listener(listener, result)
+
+    @staticmethod
+    def _invoke_completion_listener(
+        listener: Callable[[TurnResult], object],
+        result: TurnResult,
+    ) -> None:
+        try:
+            listener(result)
+        except Exception:
+            # Completion is a Core fact.  A consumer callback must not change
+            # terminal semantics or expose an exception from this boundary.
+            return
 
 
 __all__ = [

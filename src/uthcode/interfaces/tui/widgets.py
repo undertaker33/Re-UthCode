@@ -1,4 +1,4 @@
-"""Textual widgets for the small UthCode transcript interface."""
+"""Small Textual widgets for the AgentEvent transcript projection."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from textual.events import Key, MouseScrollDown, MouseScrollUp
 from textual.message import Message
 from textual.widgets import Markdown, Static, TextArea
 
+from .rendering import ToolUpdate
 from .state import TranscriptEntryKind, TranscriptState
 
 
@@ -59,6 +60,50 @@ class SelectableMarkdown(Markdown):
         self.ALLOW_SELECT = True
 
 
+class UserMessageBlock(Static):
+    """A full-width, padded container for one user message."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        super().__init__(f"› {text}", classes="user-message-block")
+
+
+class AgentTextBlock(SelectableMarkdown):
+    """One reusable normal-colour block for reasoning or assistant text."""
+
+    def __init__(self, kind: str, text: str = "") -> None:
+        if kind not in {"reasoning", "assistant"}:
+            raise ValueError("AgentTextBlock kind must be reasoning or assistant")
+        self.kind = kind
+        self.content_text = text
+        super().__init__(text, classes=f"agent-text-block {kind}-agent-entry")
+
+    def set_content(self, text: str, *, streaming: bool) -> None:
+        self.content_text = text
+        self.set_markdown(text, streaming=streaming)
+
+
+class ToolActivityRow(Static):
+    """A muted row showing only Application-provided Tool activity metadata."""
+
+    def __init__(self, update: ToolUpdate) -> None:
+        self.tool_call_id = update.tool_call_id
+        self.tool_name = update.tool_name
+        self.command = update.command
+        self.status = update.status
+        super().__init__(self.display_text, classes="tool-activity-row")
+
+    @property
+    def display_text(self) -> str:
+        return f"• {self.status}  {self.tool_name}  {self.command}"
+
+    def update_activity(self, update: ToolUpdate) -> None:
+        self.tool_name = update.tool_name
+        self.command = update.command
+        self.status = update.status
+        self.update(self.display_text)
+
+
 class ComposerTextArea(TextArea):
     """Send on Enter and insert a line break on Shift+Enter."""
 
@@ -83,7 +128,7 @@ class ComposerTextArea(TextArea):
 
 
 class TranscriptWidget(VerticalScroll):
-    """Render transcript entries while keeping the assistant block reusable."""
+    """Project display-safe batches into reusable transcript widgets."""
 
     def __init__(
         self,
@@ -92,10 +137,7 @@ class TranscriptWidget(VerticalScroll):
         id: str | None = "transcript",
     ) -> None:
         super().__init__(id=id, can_focus=True)
-        self.state = state or TranscriptState()
-        self._assistant_widget: SelectableMarkdown | None = None
-        self._assistant_text = ""
-        self._reasoning_widget: Static | None = None
+        self.state = state if state is not None else TranscriptState()
 
     def on_mouse_scroll_up(self, _event: MouseScrollUp) -> None:
         self.state.scroll.observe(self.scroll_y, self.max_scroll_y)
@@ -114,68 +156,89 @@ class TranscriptWidget(VerticalScroll):
         if hasattr(self, "state"):
             self.state.scroll.observe(new_value, self.max_scroll_y)
 
+    def add_user_message(self, message_id: str, text: str) -> None:
+        if message_id in self.state.widgets:
+            return
+        widget = UserMessageBlock(text)
+        self.state.add(TranscriptEntryKind.USER, text, display_id=message_id)
+        self.state.widgets[message_id] = widget
+        self._mount(widget)
+        self._follow_bottom()
+
     def add_entry(self, kind: TranscriptEntryKind, text: str) -> None:
+        """Add a local command/system/error display entry."""
+
+        widget = Static(text, classes=f"transcript-entry {kind.value}-entry")
         self.state.add(kind, text)
-        if kind is TranscriptEntryKind.ASSISTANT:
-            widget = SelectableMarkdown(text, classes="assistant-entry")
-            self._assistant_widget = widget
-            self._assistant_text = text
-        elif kind is TranscriptEntryKind.REASONING:
-            widget = Static(text, classes="reasoning-entry")
-            self._reasoning_widget = widget
-        else:
-            widget = Static(
-                text,
-                classes=f"transcript-entry {kind.value}-entry",
+        self._mount(widget)
+        self._follow_bottom()
+
+    def append_agent_text(self, block_id: str, kind: str, text: str) -> None:
+        if not text:
+            return
+        entry_kind = (
+            TranscriptEntryKind.REASONING
+            if kind == "reasoning"
+            else TranscriptEntryKind.ASSISTANT
+        )
+        widget = self.state.widgets.get(block_id)
+        if not isinstance(widget, AgentTextBlock):
+            widget = AgentTextBlock(kind)
+            self.state.widgets[block_id] = widget
+            self.state.add(entry_kind, "", display_id=block_id)
+            self._mount(widget)
+        full_text = widget.content_text + text
+        widget.set_content(full_text, streaming=True)
+        self.state.update_display(block_id, full_text)
+        self._follow_bottom()
+
+    def replace_agent_text(self, block_id: str, kind: str, text: str) -> None:
+        entry_kind = (
+            TranscriptEntryKind.REASONING
+            if kind == "reasoning"
+            else TranscriptEntryKind.ASSISTANT
+        )
+        widget = self.state.widgets.get(block_id)
+        if not isinstance(widget, AgentTextBlock):
+            widget = AgentTextBlock(kind)
+            self.state.widgets[block_id] = widget
+            self.state.add(entry_kind, "", display_id=block_id)
+            self._mount(widget)
+        widget.set_content(text, streaming=True)
+        self.state.update_display(block_id, text)
+        self._follow_bottom()
+
+    def update_tool_activity(self, update: ToolUpdate) -> None:
+        row = self.state.tool_rows.get(update.tool_call_id)
+        if not isinstance(row, ToolActivityRow):
+            row = ToolActivityRow(update)
+            self.state.tool_rows[update.tool_call_id] = row
+            self.state.add(
+                TranscriptEntryKind.TOOL,
+                row.display_text,
+                display_id=update.tool_call_id,
             )
-        try:
-            self.mount(widget)
-        except Exception:
-            return
-        self._follow_bottom()
-
-    def begin_stream(self) -> None:
-        """Start a fresh assistant block for the next single message."""
-
-        self._assistant_widget = None
-        self._assistant_text = ""
-        self._reasoning_widget = None
-
-    def append_assistant(self, text: str) -> None:
-        if not text:
-            return
-        if self._assistant_widget is None:
-            self.add_entry(TranscriptEntryKind.ASSISTANT, "")
-        self._assistant_text += text
-        if self.state.entries and self.state.entries[-1].kind is TranscriptEntryKind.ASSISTANT:
-            self.state.append_to_last(TranscriptEntryKind.ASSISTANT, text)
-        elif not self.state.entries or self.state.entries[-1].kind is not TranscriptEntryKind.ASSISTANT:
-            self.state.add(TranscriptEntryKind.ASSISTANT, text)
-        if self._assistant_widget is not None:
-            self._assistant_widget.set_markdown(self._assistant_text, streaming=True)
-        self._follow_bottom()
-
-    def append_reasoning(self, text: str) -> None:
-        if not text:
-            return
-        if self._reasoning_widget is None:
-            self.add_entry(TranscriptEntryKind.REASONING, text)
-            return
-        self.state.append_to_last(TranscriptEntryKind.REASONING, text)
-        self._reasoning_widget.update(self.state.entries[-1].text)
+            self._mount(row)
+        else:
+            row.update_activity(update)
+            self.state.update_display(update.tool_call_id, row.display_text)
         self._follow_bottom()
 
     def finish_stream(self) -> None:
-        if self._assistant_widget is not None:
-            self._assistant_widget.finish_stream()
+        for widget in self.state.widgets.values():
+            if isinstance(widget, AgentTextBlock):
+                widget.finish_stream()
 
     def clear_transcript(self) -> None:
         self.state.clear()
-        self._assistant_widget = None
-        self._reasoning_widget = None
-        self._assistant_text = ""
         try:
             self.remove_children()
+        except Exception:
+            return
+
+    def _mount(self, widget: Static) -> None:
+        try:
+            self.mount(widget)
         except Exception:
             return
 
@@ -188,8 +251,11 @@ class TranscriptWidget(VerticalScroll):
 
 
 __all__ = [
+    "AgentTextBlock",
     "ComposerTextArea",
     "SelectableMarkdown",
+    "ToolActivityRow",
     "Topbar",
     "TranscriptWidget",
+    "UserMessageBlock",
 ]

@@ -270,7 +270,12 @@ async def test_reasoning_segments_and_tool_result_are_ordered_and_authoritative(
         encoded = json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True)
         assert secret not in encoded
         assert "arguments" not in encoded
+        assert "tool-result" not in encoded
     assert all("tool-result" not in event.to_json() for event in events if isinstance(event, ToolFinished))
+    assert sum(
+        isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled))
+        for event in events
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -614,3 +619,19 @@ async def test_events_has_one_consumer_and_result_can_be_read_repeatedly() -> No
     second = await execution.result()
     assert first == second
     assert events[-1].event_type == "turn_completed"
+
+
+@pytest.mark.asyncio
+async def test_completion_listener_runs_once_for_shared_events_and_result_producer() -> None:
+    provider = ScriptedProvider([[_response(TextPart("done"))]])
+    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello")
+    completions: list[object] = []
+    execution.add_completion_listener(completions.append)
+
+    events_task = asyncio.create_task(_collect(execution))
+    result_task = asyncio.create_task(execution.result())
+    _events, result = await events_task
+    assert await result_task is result
+
+    assert completions == [result]
+    assert provider.call_count == 1

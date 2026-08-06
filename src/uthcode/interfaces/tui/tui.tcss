@@ -27,9 +27,32 @@ Screen {
     margin: 0 0 1 0;
 }
 
-.user-entry {
+.user-message-block {
+    width: 100%;
+    height: auto;
+    padding: 1 2;
+    margin: 0 0 1 0;
     color: $text;
-    text-style: bold;
+    background: $panel;
+}
+
+.agent-text-block,
+.assistant-agent-entry,
+.reasoning-agent-entry {
+    height: auto;
+    margin: 0 0 1 0;
+    color: $text;
+    text-style: none;
+}
+
+.tool-activity-row {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    color: $text-muted;
+    background: $surface;
+    text-style: none;
 }
 
 .command-entry {
@@ -42,18 +65,6 @@ Screen {
 
 .error-entry {
     color: $error;
-}
-
-.reasoning-entry {
-    height: auto;
-    padding: 0 1;
-    color: $text-muted;
-    text-style: italic;
-}
-
-.assistant-entry {
-    height: auto;
-    margin: 0 0 1 0;
 }
 
 #activity {

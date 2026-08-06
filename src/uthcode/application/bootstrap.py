@@ -139,13 +139,22 @@ def create_application(
         if tools is None
         else tuple(tools)
     )
+    secret_env_names = tuple(
+        profile.api_key_env
+        for profile in config.providers.values()
+        if profile.api_key_env is not None
+    )
     return UthCodeApplication(
         provider,
         configuration=config,
         provider_builder=builder,
         model_writer=writer,
         runtime_context=runtime_context,
-        tool_service=ApplicationToolService(tool_values),
+        tool_service=ApplicationToolService(
+            tool_values,
+            workdir=runtime_context.workdir,
+            secret_env_names=secret_env_names,
+        ),
     )
 
 

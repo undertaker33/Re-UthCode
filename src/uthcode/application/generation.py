@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from uthcode.core.agent import AgentLoop, AgentTurnExecution, RunState
 from uthcode.core.provider import (
     CancellationToken,
     GenerationRequest,
@@ -169,6 +170,13 @@ class UthCodeApplication:
 
         return self._tool_service.definitions()
 
+    def create_run(self, *, run_id: str | None = None) -> AgentRun:
+        """Create one isolated in-memory Agent Run."""
+
+        from .runs import AgentRun
+
+        return AgentRun(self, run_id=run_id)
+
     async def execute_tool_calls(
         self,
         calls: Sequence[ToolCallPart],
@@ -236,10 +244,54 @@ class UthCodeApplication:
             CancellationToken(),
         )
 
+    def _start_agent_turn(
+        self,
+        state: RunState,
+        user_input: str,
+        *,
+        turn_id: str,
+        cancellation: CancellationToken,
+    ) -> AgentTurnExecution:
+        """Start a Core Turn with Application-owned snapshots.
+
+        This is an internal composition boundary used by ``AgentRun``.  The
+        Provider object, model reference, ordered definitions, and summary
+        callable are captured before Core receives the Turn, so a later model
+        switch cannot alter an active Turn.
+        """
+
+        provider = self._provider
+        model_ref = self._current_model_ref
+        tool_definitions = self._tool_service.definitions()
+
+        def prepare(
+            messages: tuple[Message, ...],
+            _definitions: tuple[ToolDefinition, ...],
+        ) -> GenerationRequest:
+            request = GenerationRequest(messages=messages, tools=tool_definitions)
+            return self._prepare_request(
+                request,
+                provider,
+                model_ref=model_ref,
+            )
+
+        loop = self._tool_service._create_agent_loop(provider, prepare)
+        execution = loop.start_turn(
+            state,
+            user_input,
+            turn_id=turn_id,
+            cancellation=cancellation,
+        )
+        if execution.state.messages[-1].role != "user":  # pragma: no cover
+            raise RuntimeError("Agent Loop did not append the user message")
+        return execution
+
     def _prepare_request(
         self,
         request: GenerationRequest,
         provider: ProviderPort,
+        *,
+        model_ref: str | None = None,
     ) -> GenerationRequest:
         if not isinstance(request, GenerationRequest):
             raise TypeError("request must be GenerationRequest")
@@ -251,12 +303,15 @@ class UthCodeApplication:
             raise ValueError("Application owns model; caller must leave it unset")
 
         identity = provider.identity
+        selected_model_ref = (
+            self._current_model_ref if model_ref is None else model_ref
+        )
         prompt_context = SystemPromptContext(
             workdir=str(self._runtime_context.workdir),
             platform_name=self._runtime_context.platform_name,
             platform_release=self._runtime_context.platform_release,
             current_date=self._runtime_context.current_date,
-            model_ref=self._current_model_ref,
+            model_ref=selected_model_ref,
             provider_protocol=identity.protocol,
             remote_model_id=identity.model,
         )

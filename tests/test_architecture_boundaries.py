@@ -310,7 +310,7 @@ def test_runtime_source_contains_no_graph_or_compatibility_names() -> None:
         "lang" + "chain",
         "stategraph",
         "graphstate",
-        "checkpoint",
+        "check" + "point",
         "mewcode",
         "conversationmanager",
     )

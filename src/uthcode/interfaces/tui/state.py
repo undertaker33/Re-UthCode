@@ -1,4 +1,4 @@
-"""Small, interface-local state machines for the default Textual view."""
+"""Display-only state for the default Textual interface."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ class TranscriptEntryKind(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
     REASONING = "reasoning"
+    TOOL = "tool"
     COMMAND = "command"
     SYSTEM = "system"
     ERROR = "error"
@@ -20,12 +21,15 @@ class TranscriptEntryKind(str, Enum):
 class TranscriptEntry:
     kind: TranscriptEntryKind
     text: str
+    display_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TranscriptEntryKind):
             object.__setattr__(self, "kind", TranscriptEntryKind(self.kind))
         if not isinstance(self.text, str):
             raise TypeError("transcript text must be a string")
+        if self.display_id is not None and not isinstance(self.display_id, str):
+            raise TypeError("display_id must be a string or None")
 
 
 @dataclass(slots=True)
@@ -72,62 +76,67 @@ class EscArmState:
 
 
 @dataclass(slots=True)
-class StreamRenderState:
-    """Accumulate deltas until the renderer reaches its batch boundary."""
-
-    text_buffer: str = ""
-    reasoning_buffer: str = ""
-    rendered_text: str = ""
-    rendered_reasoning: str = ""
-    last_flush_at: float = field(default_factory=time.monotonic)
-
-    def append_text(self, text: str) -> None:
-        self.text_buffer += text
-
-    def append_reasoning(self, text: str) -> None:
-        self.reasoning_buffer += text
-
-    @property
-    def has_pending(self) -> bool:
-        return bool(self.text_buffer or self.reasoning_buffer)
-
-    def flush(self, now: float | None = None) -> tuple[str, str]:
-        text = self.text_buffer
-        reasoning = self.reasoning_buffer
-        self.text_buffer = ""
-        self.reasoning_buffer = ""
-        self.rendered_text += text
-        self.rendered_reasoning += reasoning
-        self.last_flush_at = time.monotonic() if now is None else now
-        return text, reasoning
-
-
-@dataclass(slots=True)
 class TranscriptState:
-    entries: list[TranscriptEntry] = field(default_factory=list)
-    scroll: ScrollFollowState = field(default_factory=ScrollFollowState)
+    """The transcript's visible entries and widget associations only.
 
-    def add(self, kind: TranscriptEntryKind, text: str) -> TranscriptEntry:
-        entry = TranscriptEntry(kind, text)
+    This state never stores an AgentEvent or a Provider/Core object.  The
+    widget maps contain display widgets keyed by public message/tool IDs; tool
+    result content is therefore not retained by the interface state.
+    """
+
+    entries: list[TranscriptEntry] = field(default_factory=list)
+    widgets: dict[str, object] = field(default_factory=dict)
+    tool_rows: dict[str, object] = field(default_factory=dict)
+    scroll: ScrollFollowState = field(default_factory=ScrollFollowState)
+    active_turn_id: str | None = None
+    cancel_prompt: str | None = None
+
+    def add(
+        self,
+        kind: TranscriptEntryKind,
+        text: str,
+        *,
+        display_id: str | None = None,
+    ) -> TranscriptEntry:
+        entry = TranscriptEntry(kind, text, display_id)
         self.entries.append(entry)
         return entry
 
-    def clear(self) -> None:
-        self.entries.clear()
-        self.scroll.reset()
+    def update_display(self, display_id: str, text: str) -> None:
+        for index in range(len(self.entries) - 1, -1, -1):
+            entry = self.entries[index]
+            if entry.display_id == display_id:
+                self.entries[index] = TranscriptEntry(
+                    entry.kind,
+                    text,
+                    display_id,
+                )
+                return
+        raise KeyError(display_id)
 
     def append_to_last(self, kind: TranscriptEntryKind, text: str) -> None:
         if not self.entries or self.entries[-1].kind is not kind:
             self.add(kind, text)
             return
         current = self.entries[-1]
-        self.entries[-1] = TranscriptEntry(kind, current.text + text)
+        self.entries[-1] = TranscriptEntry(
+            kind,
+            current.text + text,
+            current.display_id,
+        )
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.widgets.clear()
+        self.tool_rows.clear()
+        self.scroll.reset()
+        self.active_turn_id = None
+        self.cancel_prompt = None
 
 
 __all__ = [
     "EscArmState",
     "ScrollFollowState",
-    "StreamRenderState",
     "TranscriptEntry",
     "TranscriptEntryKind",
     "TranscriptState",

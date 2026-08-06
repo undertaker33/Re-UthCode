@@ -13,20 +13,17 @@ from textual.timer import Timer
 from textual.widgets import Static
 
 from uthcode.application import (
+    AgentEvent,
+    AgentRun,
     ClearTranscript,
     CommandDispatcher,
     CommandParser,
     CompletionEngine,
-    GenerationCancelled,
-    GenerationHandle,
-    GenerationRequest,
-    GenerationCompleted,
-    Message,
     ModelSelected,
     OpenModelPicker,
     ProviderError,
     QuitInterface,
-    TextPart,
+    TurnHandle,
     UthCodeApplication,
     create_builtin_registry,
 )
@@ -34,9 +31,9 @@ from uthcode.application import (
 from .completion import CommandCompletionMenu, CompletionMenuItem
 from .picker import ModelPicker
 from .rendering import (
+    AgentEventRenderer,
     STREAM_RENDER_INTERVAL_SECONDS,
     RenderBatch,
-    StreamRenderer,
 )
 from .state import EscArmState, TranscriptEntryKind
 from .widgets import ComposerTextArea, Topbar, TranscriptWidget
@@ -55,12 +52,13 @@ class UthCodeTUI(App[None]):
     ) -> None:
         super().__init__()
         self.application = application
+        self._run: AgentRun = application.create_run()
         self.registry = create_builtin_registry()
         self.parser = CommandParser(self.registry)
         self.dispatcher = CommandDispatcher(self.registry, application)
-        self._active_handle: GenerationHandle | None = None
+        self._active_handle: TurnHandle | None = None
         self._generation_task: asyncio.Task[None] | None = None
-        self._stream_renderer: StreamRenderer | None = None
+        self._stream_renderer: AgentEventRenderer | None = None
         self._stream_timer: Timer | None = None
         self._closing = False
         self._esc = EscArmState()
@@ -184,7 +182,10 @@ class UthCodeTUI(App[None]):
         task = self._generation_task
         if task is not None and not task.done():
             task.cancel()
-            await task
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     def application_completion(self, text: str):
         engine = CompletionEngine(self.registry, self.application)
@@ -333,38 +334,34 @@ class UthCodeTUI(App[None]):
                 self._show_error("生成进行中，请等待当前请求结束")
 
     def _start_generation(self, prompt: str) -> None:
-        self._transcript().add_entry(TranscriptEntryKind.USER, prompt)
-        self._transcript().begin_stream()
-        request = GenerationRequest(
-            messages=(Message("user", (TextPart(prompt),)),)
-        )
-        handle = self.application.start_generation(request)
+        handle = self._run.start_turn(prompt)
         self._active_handle = handle
         self._esc.clear()
         self._set_activity("generating")
-        self._generation_task = asyncio.create_task(self._consume_generation(handle))
+        self._generation_task = asyncio.create_task(self._consume_turn(handle))
 
-    async def _consume_generation(self, handle: GenerationHandle) -> None:
-        renderer = StreamRenderer()
+    async def _consume_turn(self, handle: TurnHandle) -> None:
+        renderer = AgentEventRenderer()
         self._stream_renderer = renderer
         self._stream_timer = self.set_interval(
             STREAM_RENDER_INTERVAL_SECONDS,
             self._flush_stream_timer,
             name="stream-render",
         )
+        terminal: str | None = None
         try:
             async for event in handle.events():
+                if not isinstance(event, AgentEvent):  # pragma: no cover
+                    raise RuntimeError("Application returned an invalid AgentEvent")
                 batch = renderer.push(event)
                 if batch is not None:
                     self._apply_batch(batch)
+                    if batch.terminal is not None:
+                        terminal = batch.terminal
                 await asyncio.sleep(0)
-        except GenerationCancelled:
-            if not self._closing:
-                self._apply_batch(renderer.finish_cancelled())
-                self._set_activity("cancelled")
         except asyncio.CancelledError:
             if not self._closing:
-                self._apply_batch(renderer.finish_cancelled())
+                self._apply_batch(renderer.flush())
                 self._set_activity("cancelled")
         except ProviderError:
             if not self._closing:
@@ -379,7 +376,8 @@ class UthCodeTUI(App[None]):
         else:
             if not self._closing:
                 self._transcript().finish_stream()
-                self._set_activity("ready")
+                if terminal is None and self._active_handle is handle:
+                    self._set_activity("ready")
         finally:
             self._stop_stream_timer()
             self._stream_renderer = None
@@ -397,7 +395,7 @@ class UthCodeTUI(App[None]):
         if renderer is None or self._active_handle is None:
             return
         batch = renderer.flush()
-        if batch.text or batch.reasoning:
+        if batch.has_updates:
             self._apply_batch(batch)
 
     def _stop_stream_timer(self) -> None:
@@ -408,23 +406,42 @@ class UthCodeTUI(App[None]):
 
     def _apply_batch(self, batch: RenderBatch) -> None:
         transcript = self._transcript()
-        if batch.reasoning:
-            transcript.append_reasoning(batch.reasoning)
-        if batch.text:
-            transcript.append_assistant(batch.text)
-        if batch.completed:
+        for message_id, text in batch.users:
+            transcript.add_user_message(message_id, text)
+        for update in batch.text:
+            if update.mode == "replace":
+                transcript.replace_agent_text(update.block_id, update.kind, update.text)
+            else:
+                transcript.append_agent_text(update.block_id, update.kind, update.text)
+        for update in batch.tools:
+            transcript.update_tool_activity(update)
+        if batch.terminal == "completed":
+            transcript.state.cancel_prompt = None
             transcript.finish_stream()
+            self._set_activity("ready")
+        elif batch.terminal == "cancelled":
+            transcript.state.cancel_prompt = None
+            transcript.finish_stream()
+            self._set_activity("cancelled")
+        elif batch.terminal == "failed":
+            transcript.state.cancel_prompt = None
+            transcript.finish_stream()
+            self._show_error("生成失败")
+            self._set_activity("error")
 
     def _handle_escape(self) -> None:
         if self._active_handle is None:
             return
         now = time.monotonic()
         if self._esc.consume(now):
+            self._transcript().state.cancel_prompt = None
             self._active_handle.cancel()
             self._set_activity("cancelling")
         else:
             self._esc.arm(now)
-            self._set_activity("press Esc again within 1 second to cancel")
+            prompt = "press Esc again within 1 second to cancel"
+            self._transcript().state.cancel_prompt = prompt
+            self._set_activity(prompt)
 
     def _open_model_picker(self) -> None:
         if self._active_handle is not None:
@@ -464,6 +481,7 @@ class UthCodeTUI(App[None]):
         self._submit_text(candidate.value)
 
     def _show_error(self, text: str) -> None:
+        self._transcript().state.cancel_prompt = None
         self._transcript().add_entry(TranscriptEntryKind.ERROR, text)
         self._set_activity("error")
 

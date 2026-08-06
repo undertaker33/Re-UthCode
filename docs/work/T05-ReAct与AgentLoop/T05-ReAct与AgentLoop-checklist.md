@@ -31,89 +31,89 @@
 
 ## Task 3：Application Run/Turn 与安全 Tool 摘要
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py tests/test_application_runs.py tests/test_package.py`，全部用例通过。
-- [ ] 同一 Run 连续两个 Turn 时，第二次 Provider 请求可观察到第一 Turn 的权威 conversation；不同 Run 不共享 messages、状态或取消。
-- [ ] 活动 Turn 尚未 terminal 时再次 `start_turn()` 明确失败；terminal 后下一 Turn 可以启动。
-- [ ] 只消费 `events()`、只等待异步 `result()`、两者同时使用三种场景均只启动一次 Provider/Tool 执行。
-- [ ] `events()` 第二个消费者被拒绝；`result()` 可重复 await 并返回同一个不可变结果值。
-- [ ] `cancel()` 首次返回状态转换、后续幂等；terminal 后 Run 被释放。
-- [ ] Turn 开始后切换 Application 模型，当前 Turn 的 Provider/Model/System Prompt 不变，下一 Turn 使用新选择。
-- [ ] Agent iteration 请求自动包含固定有序 Tool definitions；raw generation 请求仍不自动注入 tools。
-- [ ] 同一 Application 的 Runs 使用同一 T04 Tool Runtime，不同 Application 的文件读取状态继续隔离。
-- [ ] Bash、文件、搜索和 unknown Tool 摘要分别验证；写入正文、秘密、环境变量值和 unknown 参数值均不出现。
-- [ ] 超长摘要稳定截断，摘要生成异常返回安全占位且对应 Tool 仍实际执行。
-- [ ] Application 公共导出不包含 RunState、ToolRegistry、ToolExecutor 或具体 Integration Tool。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py tests/test_application_runs.py tests/test_package.py`，全部用例通过。
+- [x] 同一 Run 连续两个 Turn 时，第二次 Provider 请求可观察到第一 Turn 的权威 conversation；不同 Run 不共享 messages、状态或取消。
+- [x] 活动 Turn 尚未 terminal 时再次 `start_turn()` 明确失败；terminal 后下一 Turn 可以启动。
+- [x] 只消费 `events()`、只等待异步 `result()`、两者同时使用三种场景均只启动一次 Provider/Tool 执行。
+- [x] `events()` 第二个消费者被拒绝；`result()` 可重复 await 并返回同一个不可变结果值。
+- [x] `cancel()` 首次返回状态转换、后续幂等；terminal 后 Run 被释放。
+- [x] Turn 开始后切换 Application 模型，当前 Turn 的 Provider/Model/System Prompt 不变，下一 Turn 使用新选择。
+- [x] Agent iteration 请求自动包含固定有序 Tool definitions；raw generation 请求仍不自动注入 tools。
+- [x] 同一 Application 的 Runs 使用同一 T04 Tool Runtime，不同 Application 的文件读取状态继续隔离。
+- [x] Bash、文件、搜索和 unknown Tool 摘要分别验证；写入正文、秘密、环境变量值和 unknown 参数值均不出现。
+- [x] 超长摘要稳定截断，摘要生成异常返回安全占位且对应 Tool 仍实际执行。
+- [x] Application 公共导出不包含 RunState、ToolRegistry、ToolExecutor 或具体 Integration Tool。
 
 ## Task 4：Headless Agent 端到端闭环
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_agent_loop.py tests/test_application_runs.py`，全部用例通过。
-- [ ] 从 `create_application(temp_workdir) → create_run() → start_turn()` 正式入口运行离线 E2E，不直接调用私有 helper。
-- [ ] Fake Provider 先产生 reasoning 和 ReadFile ToolCall，真实 Integration Tool 读取临时文件，第二次 Provider 请求包含同 ID、真实内容的 ToolResult。
-- [ ] E2E 事件流包含 reasoning、ToolStarted、ToolFinished、final 和唯一 TurnCompleted，事件顺序与实际执行一致。
-- [ ] ToolStarted command 是安全摘要；ToolFinished、TurnResult、RunSnapshot 均不包含临时文件正文。
-- [ ] `TurnResult.final_text` 只包含 final answer，不包含 reasoning、progress 或 ToolResult。
-- [ ] Headless E2E 模块加载记录证明没有导入 `uthcode.interfaces`。
-- [ ] README Headless 示例使用正式 Run/Turn API，并明确其与低层单轮 Generation/手动 Tool API 的区别。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_agent_loop.py tests/test_application_runs.py`，全部用例通过。
+- [x] 从 `create_application(temp_workdir) → create_run() → start_turn()` 正式入口运行离线 E2E，不直接调用私有 helper。
+- [x] Fake Provider 先产生 reasoning 和 ReadFile ToolCall，真实 Integration Tool 读取临时文件，第二次 Provider 请求包含同 ID、真实内容的 ToolResult。
+- [x] E2E 事件流包含 reasoning、ToolStarted、ToolFinished、final 和唯一 TurnCompleted，事件顺序与实际执行一致。
+- [x] ToolStarted command 是安全摘要；ToolFinished、TurnResult、RunSnapshot 均不包含临时文件正文。
+- [x] `TurnResult.final_text` 只包含 final answer，不包含 reasoning、progress 或 ToolResult。
+- [x] Headless E2E 模块加载记录证明没有导入 `uthcode.interfaces`。
+- [x] README Headless 示例使用正式 Run/Turn API，并明确其与低层单轮 Generation/手动 Tool API 的区别。
 
 ## Task 5：CLI AgentEvent 投影
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_cli.py`，全部用例通过。
-- [ ] final 场景断言 stdout 只有 final answer 和必要结尾换行，reasoning、progress、事件字典和内部诊断均不在 stdout。
-- [ ] reasoning、progress、incomplete 和 Tool activity 场景断言对应文本只进入 stderr。
-- [ ] Tool 行只出现 status、tool name 和安全 command；构造含独特秘密的 ToolResult 后，stdout/stderr 均搜索不到该秘密。
-- [ ] failed 返回 1，cancelled 和 Ctrl+C 返回 130，参数/配置错误返回 2，completed 返回 0。
-- [ ] stdin 输入 `/help` 时仍作为普通 Prompt 进入 Agent Turn，不进入 Slash Command Dispatcher。
-- [ ] 模块导入与正式 `uthcode exec` 测试证明未加载 Textual/TUI。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_cli.py`，全部用例通过。
+- [x] final 场景断言 stdout 只有 final answer 和必要结尾换行，reasoning、progress、事件字典和内部诊断均不在 stdout。
+- [x] reasoning、progress、incomplete 和 Tool activity 场景断言对应文本只进入 stderr。
+- [x] Tool 行只出现 status、tool name 和安全 command；构造含独特秘密的 ToolResult 后，stdout/stderr 均搜索不到该秘密。
+- [x] failed 返回 1，cancelled 和 Ctrl+C 返回 130，参数/配置错误返回 2，completed 返回 0。
+- [x] stdin 输入 `/help` 时仍作为普通 Prompt 进入 Agent Turn，不进入 Slash Command Dispatcher。
+- [x] 模块导入与正式 `uthcode exec` 测试证明未加载 Textual/TUI。
 
 ## Task 6：TUI 活动流与视觉层级
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_tui.py`，全部用例通过。
-- [ ] 普通输入通过 AgentRun 启动 Turn；第二 Turn 的 Fake Provider 请求包含第一 Turn conversation。
-- [ ] 活动 Turn 期间第二普通输入和 `/model` 均被拒绝；完成后模型切换只影响下一 Turn。
-- [ ] `/clear` 后 DOM 显示为空，但下一 Turn 的 Provider 请求仍包含清除前 conversation。
-- [ ] 用户消息 Widget 是宽度覆盖完整消息容器的背景块，具有非零 padding，并使用主题正常文本色。
-- [ ] Agent reasoning 与 final 使用相同正常正文 token，均无 dim/italic；Tool 行使用 muted/secondary token。
-- [ ] Tool 行显示 running/finished/failed 状态、name 和 Application command，并按 tool_call_id 更新或稳定成对显示。
-- [ ] 构造带独特正文的 ToolResult 后，DOM、render tree、Transcript state 和 snapshot 均搜索不到该正文，且不存在展开按钮。
-- [ ] 长 command 使用 Application 已截断摘要；TUI 测试证明没有读取原始 Tool arguments。
-- [ ] reasoning 流式增量复用当前 Agent block，不为每个字符创建新 Widget。
-- [ ] 双 Esc 只取消活动 TurnHandle；Completion/Picker 打开时 Esc 只关闭对应弹层；退出时 timer 和活动任务完成收口。
-- [ ] Slash Command、Completion、Model Picker、Composer Enter/Shift+Enter、滚动保护和 Topbar 回归通过。
-- [ ] `tui.tcss` 使用 Textual 主题 token，无硬编码 RGB；主题切换后用户背景、正文和 muted Tool 层级仍可读。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_tui.py`，全部用例通过。
+- [x] 普通输入通过 AgentRun 启动 Turn；第二 Turn 的 Fake Provider 请求包含第一 Turn conversation。
+- [x] 活动 Turn 期间第二普通输入和 `/model` 均被拒绝；完成后模型切换只影响下一 Turn。
+- [x] `/clear` 后 DOM 显示为空，但下一 Turn 的 Provider 请求仍包含清除前 conversation。
+- [x] 用户消息 Widget 是宽度覆盖完整消息容器的背景块，具有非零 padding，并使用主题正常文本色。
+- [x] Agent reasoning 与 final 使用相同正常正文 token，均无 dim/italic；Tool 行使用 muted/secondary token。
+- [x] Tool 行显示 running/finished/failed 状态、name 和 Application command，并按 tool_call_id 更新或稳定成对显示。
+- [x] 构造带独特正文的 ToolResult 后，DOM、render tree、Transcript state 和 snapshot 均搜索不到该正文，且不存在展开按钮。
+- [x] 长 command 使用 Application 已截断摘要；TUI 测试证明没有读取原始 Tool arguments。
+- [x] reasoning 流式增量复用当前 Agent block，不为每个字符创建新 Widget。
+- [x] 双 Esc 只取消活动 TurnHandle；Completion/Picker 打开时 Esc 只关闭对应弹层；退出时 timer 和活动任务完成收口。
+- [x] Slash Command、Completion、Model Picker、Composer Enter/Shift+Enter、滚动保护和 Topbar 回归通过。
+- [x] `tui.tcss` 使用 Textual 主题 token，无硬编码 RGB；主题切换后用户背景、正文和 muted Tool 层级仍可读。
 
 ## Task 7：[接入主流程] 统一正式 Agent 路径
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application_runs.py tests/test_cli.py tests/test_tui.py tests/test_architecture_boundaries.py tests/test_package.py`，全部用例通过。
-- [ ] 从 Headless、CLI、TUI 三个正式入口分别观察到 `Application Run/Turn → Core AgentLoop`，不存在 Interface 自动执行的第二条路径。
-- [ ] 执行 `rg -n "ProviderEvent|GenerationHandle" src/uthcode/interfaces`，普通输入实现返回 0 条；若仅剩明确的低层类型说明，逐条记录并证明无运行调用方。
-- [ ] 执行 `rg -n "uthcode\.core|uthcode\.integrations" src/uthcode/interfaces`，返回 0 条。
-- [ ] 低层 `start_generation()`、`stream_generation()`、`tool_definitions()`、`execute_tool_calls()` 的既有测试全部通过。
-- [ ] 包导出测试确认 Application 公开 Agent API，但不公开 RunState、ToolRegistry、ToolExecutor 或 SDK 类型。
-- [ ] README 只描述一条正式 Agent 路径，并保留低层 API 的明确用途说明。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application_runs.py tests/test_cli.py tests/test_tui.py tests/test_architecture_boundaries.py tests/test_package.py`，全部用例通过。
+- [x] 从 Headless、CLI、TUI 三个正式入口分别观察到 `Application Run/Turn → Core AgentLoop`，不存在 Interface 自动执行的第二条路径。
+- [x] 执行 `rg -n "ProviderEvent|GenerationHandle" src/uthcode/interfaces`，普通输入实现返回 0 条；若仅剩明确的低层类型说明，逐条记录并证明无运行调用方。
+- [x] 执行 `rg -n "uthcode\.core|uthcode\.integrations" src/uthcode/interfaces`，返回 0 条。
+- [x] 低层 `start_generation()`、`stream_generation()`、`tool_definitions()`、`execute_tool_calls()` 的既有测试全部通过。
+- [x] 包导出测试确认 Application 公开 Agent API，但不公开 RunState、ToolRegistry、ToolExecutor 或 SDK 类型。
+- [x] README 只描述一条正式 Agent 路径，并保留低层 API 的明确用途说明。
 
 ## Task 8：[端到端验证] 全链路与回归验证
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`，退出码为 0。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_agent_policy.py tests/test_agent_events.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py tests/test_cli.py tests/test_tui.py`，全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_provider_contract.py tests/test_anthropic_integration.py tests/test_openai_responses_integration.py tests/test_openai_compat_integration.py`，全部离线用例通过，live 用例保持 skip。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_architecture_boundaries.py tests/test_package.py`，全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode pytest -q`，全量测试通过，未授权 live Provider 用例没有发起网络请求。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
-- [ ] 执行 `git diff --check`，退出码为 0。
-- [ ] Headless、CLI 和 TUI 三条真实离线 E2E 同时证明 reasoning 可见、Tool activity 可见、ToolResult 正文隐藏、final 正确且 terminal 唯一。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`，退出码为 0。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_agent_policy.py tests/test_agent_events.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py tests/test_cli.py tests/test_tui.py`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_provider_contract.py tests/test_anthropic_integration.py tests/test_openai_responses_integration.py tests/test_openai_compat_integration.py`，全部离线用例通过，live 用例保持 skip。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q tests/test_architecture_boundaries.py tests/test_package.py`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode pytest -q`，全量测试通过，未授权 live Provider 用例没有发起网络请求。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
+- [x] 执行 `git diff --check`，退出码为 0。
+- [x] Headless、CLI 和 TUI 三条真实离线 E2E 同时证明 reasoning 可见、Tool activity 可见、ToolResult 正文隐藏、final 正确且 terminal 唯一。
 
 ## Task 9：[遗留负担清理] 删除旧路径与重复职责
 
-- [ ] 执行 `rg -n "from mewcode|import mewcode|langgraph|langchain" src tests README.md`，返回 0 条。
-- [ ] 执行 `rg -n "StateGraph|GraphState|checkpoint|ConversationManager" src tests`，除否定性测试的运行时拼接外返回 0 条。
-- [ ] 执行 `rg -n "uthcode\.application|uthcode\.interfaces" src/uthcode/integrations`，返回 0 条。
-- [ ] 执行 `rg -n "uthcode\.core|uthcode\.integrations" src/uthcode/interfaces`，返回 0 条。
-- [ ] 执行 `rg -n "ProviderEvent" src/uthcode/interfaces`，返回 0 条。
-- [ ] 执行 `rg -n "tool_result|ToolResultPart" src/uthcode/interfaces/tui`，返回 0 条。
-- [ ] 执行 `rg -n "asyncio\.gather|TaskGroup" src/uthcode/core/agent.py`，返回 0 条。
-- [ ] AST/导出测试确认只有一套 Agent Loop、AgentEvent、RunState 和 Tool DTO；不存在 Manager/Repository/Facade/Shim/deprecated alias。
-- [ ] 扫描确认不存在无调用方旧 renderer、旧单轮 state、ToolResult 展开入口、Interface 原始参数摘要逻辑和不可达分支。
-- [ ] 扫描确认没有 Permission、Context、Memory、Session、Journal、Diff、Sandbox、Hook、Skill、MCP、Worktree、Subagent 或 Multi-Agent 实现/占位。
-- [ ] README 与源码中的 Bash 描述明确为当前用户权限的 unsandboxed process execution，不包含 Sandbox 成功承诺。
-- [ ] 重新执行架构、package 和全量测试，全部通过；T04/T05 工作包仍在 `docs/work/` 且未被 Agent 归档。
+- [x] 执行 `rg -n "from mewcode|import mewcode|langgraph|langchain" src tests README.md`，返回 0 条。
+- [x] 执行 `rg -n "StateGraph|GraphState|checkpoint|ConversationManager" src tests`，除否定性测试的运行时拼接外返回 0 条。
+- [x] 执行 `rg -n "uthcode\.application|uthcode\.interfaces" src/uthcode/integrations`，返回 0 条。
+- [x] 执行 `rg -n "uthcode\.core|uthcode\.integrations" src/uthcode/interfaces`，返回 0 条。
+- [x] 执行 `rg -n "ProviderEvent" src/uthcode/interfaces`，返回 0 条。
+- [x] 执行 `rg -n "tool_result|ToolResultPart" src/uthcode/interfaces/tui`，返回 0 条。
+- [x] 执行 `rg -n "asyncio\.gather|TaskGroup" src/uthcode/core/agent.py`，返回 0 条。
+- [x] AST/导出测试确认只有一套 Agent Loop、AgentEvent、RunState 和 Tool DTO；不存在 Manager/Repository/Facade/Shim/deprecated alias。
+- [x] 扫描确认不存在无调用方旧 renderer、旧单轮 state、ToolResult 展开入口、Interface 原始参数摘要逻辑和不可达分支。
+- [x] 扫描确认没有 Permission、Context、Memory、Session、Journal、Diff、Sandbox、Hook、Skill、MCP、Worktree、Subagent 或 Multi-Agent 实现/占位。
+- [x] README 与源码中的 Bash 描述明确为当前用户权限的 unsandboxed process execution，不包含 Sandbox 成功承诺。
+- [x] 重新执行架构、package 和全量测试，全部通过；T04/T05 工作包仍在 `docs/work/` 且未被 Agent 归档。
