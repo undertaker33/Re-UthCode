@@ -2,6 +2,38 @@
 
 from .prompt import PromptSection, SystemPromptContext, build_system_prompt
 from .tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
+from .agent import (
+    AgentLoop,
+    AgentLoopConfig,
+    AgentLoopConfigError,
+    AgentTurnExecution,
+    AssistantMessageKind,
+    RunSnapshot,
+    RunState,
+    RunStatus,
+    TerminationReason,
+    TurnResult,
+)
+from .agent_events import (
+    AgentEvent,
+    AgentEventValue,
+    AssistantMessageCompleted,
+    AssistantMessageDelta,
+    IterationStarted,
+    ReasoningFinished,
+    ReasoningStarted,
+    ToolBatchFinished,
+    ToolBatchStarted,
+    ToolFinished,
+    ToolStarted,
+    TurnCancelled,
+    TurnCompleted,
+    TurnFailed,
+    TurnStarted,
+    UsageUpdated,
+    agent_event_from_dict,
+    agent_event_from_json,
+)
 
 from .provider import (
     AuthenticationError,
@@ -40,9 +72,19 @@ from .provider import (
     ToolDefinition,
     ToolResultPart,
     Usage,
+    validated_provider_stream,
 )
 
 __all__ = [
+    "AgentEvent",
+    "AgentEventValue",
+    "AgentLoop",
+    "AgentLoopConfig",
+    "AgentLoopConfigError",
+    "AgentTurnExecution",
+    "AssistantMessageCompleted",
+    "AssistantMessageDelta",
+    "AssistantMessageKind",
     "AuthenticationError",
     "CancellationToken",
     "FinishReason",
@@ -83,7 +125,24 @@ __all__ = [
     "ToolExecutor",
     "ToolRegistry",
     "ToolResultPart",
+    "ToolBatchFinished",
+    "ToolBatchStarted",
+    "ToolFinished",
+    "ToolStarted",
+    "TurnCancelled",
+    "TurnCompleted",
+    "TurnFailed",
+    "TurnStarted",
+    "RunSnapshot",
+    "RunState",
+    "RunStatus",
+    "TerminationReason",
+    "TurnResult",
+    "UsageUpdated",
+    "agent_event_from_dict",
+    "agent_event_from_json",
     "SystemPromptContext",
     "Usage",
+    "validated_provider_stream",
     "build_system_prompt",
 ]
