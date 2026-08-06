@@ -14,7 +14,9 @@ dependencies = [
     "anthropic>=0.117,<1",
     "openai>=2.46,<3",
     "jsonschema>=4.25,<5",
-    "textual>=8.2,<9",
+    "prompt_toolkit>=3.0.52,<4",
+    "regex>=2025.7,<2027",
+    "rich>=15,<16",
     "tomlkit>=0.15,<0.16",
 ]
 

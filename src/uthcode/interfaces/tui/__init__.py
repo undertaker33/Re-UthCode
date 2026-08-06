@@ -1,4 +1,4 @@
-"""Default Textual interface entry point."""
+"""Default native-scrollback terminal interface."""
 
 from .app import UthCodeTUI, run_tui
 
