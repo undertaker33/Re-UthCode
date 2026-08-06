@@ -10,19 +10,16 @@ from pathlib import Path
 from typing import TextIO
 
 from uthcode.application import (
+    AgentEvent,
+    AgentRun,
     ApplicationRuntimeContext,
     ConfigurationError,
     ConfigurationInitializationRequired,
     EffectiveConfig,
-    GenerationCancelled,
-    GenerationCompleted,
-    GenerationRequest,
     LaunchOptions,
-    Message,
     ProviderError,
-    ReasoningDelta,
-    TextDelta,
     TextPart,
+    TurnHandle,
     UthCodeApplication,
     create_application,
     load_effective_config,
@@ -79,18 +76,101 @@ def _load_application(
     return application_factory(configuration, runtime_context=runtime_context)
 
 
-def _message_text(message: object) -> str:
-    parts = getattr(message, "parts", ())
-    return "".join(
-        str(getattr(part, "text", ""))
-        for part in parts
-        if isinstance(getattr(part, "text", ""), str)
-    )
-
-
 def _write_diagnostic(stderr: TextIO, text: str) -> None:
     stderr.write(text.rstrip("\n") + "\n")
     stderr.flush()
+
+
+def _message_text(message: object) -> str:
+    parts = getattr(message, "parts", ())
+    return "".join(
+        part.text
+        for part in parts
+        if isinstance(part, TextPart)
+    )
+
+
+def _event_value(event: AgentEvent, name: str, default: object = None) -> object:
+    return getattr(event, name, default)
+
+
+def _enum_value(value: object) -> str:
+    candidate = getattr(value, "value", value)
+    return candidate if isinstance(candidate, str) else str(candidate)
+
+
+def _tool_diagnostic(event: AgentEvent) -> str:
+    status = "running" if event.event_type == "tool_started" else _enum_value(
+        _event_value(event, "status", "finished")
+    )
+    name = _event_value(event, "tool_name", "unknown tool")
+    command = _event_value(event, "command", "<tool summary unavailable>")
+    return f"tool {status}: {name} ({command})"
+
+
+class _ExecProjection:
+    """Project one AgentEvent stream into the CLI's two output channels."""
+
+    __slots__ = ("_pending_assistant", "_final_text")
+
+    def __init__(self) -> None:
+        self._pending_assistant: dict[str, str] = {}
+        self._final_text: str | None = None
+
+    def consume(self, event: AgentEvent, *, stdout: TextIO, stderr: TextIO) -> int | None:
+        event_type = event.event_type
+        if event_type == "assistant_message_delta":
+            message_id = _event_value(event, "message_id")
+            text = _event_value(event, "text", "")
+            if isinstance(message_id, str) and isinstance(text, str):
+                self._pending_assistant[message_id] = (
+                    self._pending_assistant.get(message_id, "") + text
+                )
+            return None
+
+        if event_type == "assistant_message_completed":
+            message_id = _event_value(event, "message_id")
+            text = _message_text(_event_value(event, "message"))
+            if isinstance(message_id, str):
+                self._pending_assistant[message_id] = text
+            kind = _enum_value(_event_value(event, "kind", "incomplete"))
+            if kind == "final":
+                self._final_text = text
+            else:
+                if text:
+                    _write_diagnostic(stderr, text)
+            return None
+
+        if event_type == "reasoning_delta":
+            text = _event_value(event, "text", "")
+            if isinstance(text, str) and text:
+                _write_diagnostic(stderr, text)
+            return None
+
+        if event_type in {"tool_started", "tool_finished"}:
+            _write_diagnostic(stderr, _tool_diagnostic(event))
+            return None
+
+        if event_type == "turn_completed":
+            final_text = _event_value(event, "final_text", self._final_text or "")
+            if not isinstance(final_text, str):
+                final_text = self._final_text or ""
+            stdout.write(final_text)
+            if not final_text.endswith("\n"):
+                stdout.write("\n")
+            stdout.flush()
+            return 0
+
+        if event_type == "turn_cancelled":
+            _write_diagnostic(stderr, "generation cancelled")
+            return 130
+
+        if event_type == "turn_failed":
+            reason = _enum_value(_event_value(event, "termination_reason", "internal_error"))
+            _write_diagnostic(stderr, f"generation failed: {reason}")
+            return 1
+
+        return None
 
 
 async def _stream_exec(
@@ -100,30 +180,15 @@ async def _stream_exec(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
-    request = GenerationRequest(
-        messages=(Message("user", (TextPart(prompt),)),)
-    )
-    wrote_text = False
-    wrote_newline = False
+    run: AgentRun = application.create_run()
+    turn: TurnHandle = run.start_turn(prompt)
+    projection = _ExecProjection()
+    terminal_code: int | None = None
     try:
-        async for event in application.stream_generation(request):
-            if isinstance(event, TextDelta):
-                stdout.write(event.text)
-                stdout.flush()
-                wrote_text = True
-                wrote_newline = event.text.endswith("\n")
-            elif isinstance(event, ReasoningDelta):
-                _write_diagnostic(stderr, event.text)
-            elif isinstance(event, GenerationCompleted) and not wrote_text:
-                response_text = _message_text(event.response.message)
-                if response_text:
-                    stdout.write(response_text)
-                    stdout.flush()
-                    wrote_text = True
-                    wrote_newline = response_text.endswith("\n")
-    except GenerationCancelled:
-        _write_diagnostic(stderr, "generation cancelled")
-        return 130
+        async for event in turn.events():
+            result = projection.consume(event, stdout=stdout, stderr=stderr)
+            if result is not None:
+                terminal_code = result
     except asyncio.CancelledError:
         _write_diagnostic(stderr, "generation cancelled")
         return 130
@@ -133,11 +198,10 @@ async def _stream_exec(
     except Exception:
         _write_diagnostic(stderr, "provider error: generation failed")
         return 1
-
-    if not wrote_text or not wrote_newline:
-        stdout.write("\n")
-        stdout.flush()
-    return 0
+    if terminal_code is None:
+        _write_diagnostic(stderr, "provider error: turn ended without a terminal event")
+        return 1
+    return terminal_code
 
 
 def _run_exec(

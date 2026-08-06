@@ -5,34 +5,51 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from collections.abc import AsyncIterator, Iterable
 
 import pytest
 
 from uthcode.application import (
+    ApplicationRuntimeContext,
     EffectiveConfig,
-    GenerationCancelled,
     GenerationCompleted,
-    GenerationRequest,
     LaunchOptions,
     Message,
     ProviderKind,
     ProviderResponse,
+    create_application,
     TextDelta,
     TextPart,
     UthCodeApplication,
     Usage,
 )
-from uthcode.core.provider import FinishReason, NetworkError
+from uthcode.core.provider import (
+    CancellationToken,
+    FinishReason,
+    GenerationCancelled,
+    GenerationRequest,
+    NetworkError,
+    ProviderEvent,
+    ReasoningPart,
+    ReasoningDelta,
+    ToolCallPart,
+    ToolDefinition,
+)
+from uthcode.core.tool import ToolExecutionResult
 from uthcode.interfaces.cli import main
 from uthcode.integrations.providers.fake import FakeProvider
 
 
-def _completed(text: str = "done") -> GenerationCompleted:
+def _completed(
+    text: str = "done",
+    *parts: object,
+    finish_reason: FinishReason = FinishReason.STOP,
+) -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
-            message=Message("assistant", (TextPart(text),)),
+            message=Message("assistant", (TextPart(text), *parts)),
             usage=Usage(),
-            finish_reason=FinishReason.STOP,
+            finish_reason=finish_reason,
         )
     )
 
@@ -57,6 +74,59 @@ def _application(
             error=error,
         )
     )
+
+
+class _ScriptedProvider(FakeProvider):
+    def __init__(self, scripts: Iterable[Iterable[ProviderEvent]]) -> None:
+        super().__init__()
+        self._scripts = tuple(tuple(script) for script in scripts)
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        cancellation.raise_if_cancelled()
+        index = min(len(self.requests) - 1, len(self._scripts) - 1)
+        for event in self._scripts[index]:
+            cancellation.raise_if_cancelled()
+            yield event
+
+
+class _CancelledProvider(FakeProvider):
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        del request, cancellation
+        raise GenerationCancelled()
+        yield  # pragma: no cover
+
+
+class _SecretTool:
+    definition = ToolDefinition(
+        "Reveal",
+        "Return a secret test value.",
+        {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+
+    async def execute(
+        self,
+        arguments: dict[str, object],
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionResult:
+        del arguments, cancellation
+        return ToolExecutionResult("CLI-TOOL-RESULT-SECRET")
 
 
 def _injected_main(
@@ -101,7 +171,7 @@ def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
     result, stdout, stderr = _injected_main(["exec", "hello"], application)
 
     assert result == 0
-    assert stdout == "hello\n"
+    assert stdout == "ignored\n"
     assert stderr == ""
     request = application.provider.recorded_requests[0]
     assert request.messages[0].parts[0].text == "hello"
@@ -138,20 +208,74 @@ def test_exec_classifies_provider_errors_and_cancellation() -> None:
     result, stdout, stderr = _injected_main(["exec", "hello"], failed)
     assert result == 1
     assert stdout == ""
-    assert "provider error" in stderr
+    assert "provider" in stderr
     assert secret not in stderr
 
-    class CancelledApplication(UthCodeApplication):
-        async def stream_generation(self, request: GenerationRequest):
-            del request
-            raise GenerationCancelled()
-            yield  # pragma: no cover
-
-    cancelled = CancelledApplication(FakeProvider())
+    cancelled = UthCodeApplication(_CancelledProvider())
     result, stdout, stderr = _injected_main(["exec", "hello"], cancelled)
     assert result == 130
     assert stdout == ""
     assert "cancelled" in stderr
+
+
+def test_exec_projects_reasoning_and_unclassified_text_only_to_stderr_or_terminal() -> None:
+    application = _application(
+        events=(
+            # The first delta is deliberately not classified until the
+            # terminal assistant message arrives.
+            ReasoningDelta("thinking"),
+            TextDelta("unclassified partial"),
+            _completed("final answer", ReasoningPart("terminal reasoning")),
+        )
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 0
+    assert stdout == "final answer\n"
+    assert stderr == "thinking\n"
+    assert "unclassified partial" not in stdout + stderr
+
+
+def test_exec_projects_incomplete_message_to_stderr_and_fails() -> None:
+    application = _application(
+        events=(_completed("incomplete answer", finish_reason=FinishReason.INCOMPLETE),)
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 1
+    assert stdout == ""
+    assert "incomplete answer" in stderr
+    assert "max_output_tokens" in stderr
+
+
+def test_exec_projects_tool_activity_without_tool_result_or_arguments() -> None:
+    secret = "CLI-TOOL-RESULT-SECRET"
+    call = ToolCallPart("call-1", "Reveal", {"value": secret})
+    provider = _ScriptedProvider(
+        (
+            (_completed("working", call, finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed("final answer"),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=Path.cwd()),
+        tools=(_SecretTool(),),
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 0
+    assert stdout == "final answer\n"
+    assert "working" in stderr
+    assert "tool running: Reveal (Reveal)" in stderr
+    assert "tool finished: Reveal (Reveal)" in stderr
+    assert secret not in stdout + stderr
+    assert "ToolResult" not in stdout + stderr
+    assert provider.requests[1].messages[-1].parts[0].content == secret
 
 
 @pytest.mark.parametrize("arguments", [["exec", "hello"], []])

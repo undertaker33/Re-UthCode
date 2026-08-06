@@ -17,7 +17,9 @@ from .bootstrap import (
 )
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
 from .runtime_context import ApplicationRuntimeContext
+from .runs import AgentRun, TurnHandle
 from uthcode.core import (
+    AgentEvent,
     CancellationToken,
     GenerationCancelled,
     GenerationCompleted,
@@ -28,11 +30,15 @@ from uthcode.core import (
     ProviderIdentity,
     ProviderResponse,
     ReasoningDelta,
+    RunSnapshot,
+    RunStatus,
+    TerminationReason,
     TextDelta,
     TextPart,
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
+    TurnResult,
     Usage,
 )
 from .commands import (
@@ -71,6 +77,8 @@ __all__ = [
     "EffectiveConfig",
     "ApplicationStatus",
     "ApplicationRuntimeContext",
+    "AgentEvent",
+    "AgentRun",
     "ArgumentSpec",
     "CandidateProvider",
     "ClearTranscript",
@@ -107,11 +115,16 @@ __all__ = [
     "ProviderProfile",
     "QuitInterface",
     "ReasoningDelta",
+    "RunSnapshot",
+    "RunStatus",
     "TextDelta",
     "TextPart",
     "ToolCallPart",
     "ToolDefinition",
     "ToolResultPart",
+    "TerminationReason",
+    "TurnHandle",
+    "TurnResult",
     "Usage",
     "UthCodeApplication",
     "UiAction",

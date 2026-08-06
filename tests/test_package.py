@@ -86,15 +86,29 @@ def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
 def test_application_exposes_core_tool_values_without_integration_runtime_types() -> None:
     import uthcode.application as application
     from uthcode.application import (
+        AgentEvent,
+        AgentRun,
         CancellationToken,
+        RunSnapshot,
+        RunStatus,
         ToolCallPart,
         ToolDefinition,
         ToolResultPart,
+        TurnHandle,
+        TurnResult,
     )
 
+    assert AgentEvent is not None
+    assert AgentRun is not None
     assert CancellationToken is not None
+    assert RunSnapshot is not None
+    assert RunStatus is not None
     assert ToolCallPart is not None
     assert ToolDefinition is not None
     assert ToolResultPart is not None
+    assert TurnHandle is not None
+    assert TurnResult is not None
     assert "ToolRegistry" not in application.__all__
     assert "ToolExecutor" not in application.__all__
+    assert "RunState" not in application.__all__
+    assert not hasattr(application, "RunState")
