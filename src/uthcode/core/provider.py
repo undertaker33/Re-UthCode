@@ -881,6 +881,56 @@ class CancellationToken:
             raise GenerationCancelled()
 
 
+async def validated_provider_stream(
+    provider: ProviderPort,
+    request: GenerationRequest,
+    *,
+    cancellation: CancellationToken,
+) -> AsyncIterator[ProviderEvent]:
+    """Yield one provider stream with its terminal held until EOF.
+
+    A ``GenerationCompleted`` event is only authoritative after the provider
+    iterator reaches normal EOF.  This keeps low-level Generation and the Core
+    Agent Loop from committing a response that is later invalidated by a
+    trailing event or an iterator error.  The underlying stream is closed on
+    every exit path.
+    """
+
+    terminal: GenerationCompleted | None = None
+    stream = provider.stream(request, cancellation=cancellation)
+    provider_event_types = (
+        TextDelta,
+        ReasoningDelta,
+        ToolCallStarted,
+        ToolCallArgumentsDelta,
+        ToolCallCompleted,
+        NativeItemCompleted,
+        GenerationCompleted,
+    )
+    try:
+        async for event in stream:
+            if terminal is not None:
+                raise InvalidProviderResponseError(
+                    "Provider emitted an event after GenerationCompleted"
+                )
+            if not isinstance(event, provider_event_types):
+                raise InvalidProviderResponseError("Provider emitted an unsupported event")
+            if isinstance(event, GenerationCompleted):
+                terminal = event
+                continue
+            yield event
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
+
+    if terminal is None:
+        raise InvalidProviderResponseError(
+            "Provider stream ended without GenerationCompleted"
+        )
+    yield terminal
+
+
 @runtime_checkable
 class ProviderPort(Protocol):
     @property
@@ -935,4 +985,5 @@ __all__ = [
     "ToolDefinition",
     "ToolResultPart",
     "Usage",
+    "validated_provider_stream",
 ]

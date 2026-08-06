@@ -26,6 +26,7 @@ from uthcode.core.provider import (
     ToolCallStarted,
     ToolDefinition,
     Usage,
+    validated_provider_stream,
     provider_event_from_json,
 )
 
@@ -181,3 +182,84 @@ async def test_cancellation_is_idempotent_and_wakes_all_waiters() -> None:
     await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
     assert token.cancelled is True
     assert token.is_cancelled is True
+
+
+class _TrackedStream:
+    def __init__(self, events: tuple[object, ...], closed: list[bool]) -> None:
+        self._events = events
+        self._closed = closed
+
+    def __aiter__(self) -> _TrackedStream:
+        return self
+
+    async def __anext__(self) -> object:
+        if not self._events:
+            raise StopAsyncIteration
+        event, *remaining = self._events
+        self._events = tuple(remaining)
+        return event
+
+    async def aclose(self) -> None:
+        self._closed.append(True)
+
+
+class _ProviderWithTrackedStream:
+    def __init__(self, stream: _TrackedStream) -> None:
+        self._stream = stream
+
+    def stream(self, request: GenerationRequest, *, cancellation: CancellationToken) -> _TrackedStream:
+        del request, cancellation
+        return self._stream
+
+
+def _completed() -> GenerationCompleted:
+    return GenerationCompleted(
+        ProviderResponse(
+            message=Message(role="assistant", parts=(TextPart("done"),)),
+            usage=Usage(input_tokens=1, output_tokens=2),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_validated_provider_stream_holds_terminal_until_eof_and_closes() -> None:
+    closed: list[bool] = []
+    terminal = _completed()
+    provider = _ProviderWithTrackedStream(_TrackedStream((TextDelta("partial"), terminal), closed))
+
+    events = [
+        event
+        async for event in validated_provider_stream(
+            provider,  # type: ignore[arg-type]
+            GenerationRequest(messages=(Message(role="user", parts=(TextPart("hello"),)),),),
+            cancellation=CancellationToken(),
+        )
+    ]
+
+    assert events == [TextDelta("partial"), terminal]
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stream_events",
+    [
+        (TextDelta("partial"),),
+        (_completed(), _completed()),
+        (_completed(), TextDelta("after")),
+        (TextDelta("partial"), object()),
+    ],
+)
+async def test_validated_provider_stream_rejects_invalid_terminal_shapes(stream_events: tuple[object, ...]) -> None:
+    closed: list[bool] = []
+    provider = _ProviderWithTrackedStream(_TrackedStream(stream_events, closed))
+    with pytest.raises(Exception):
+        _ = [
+            event
+            async for event in validated_provider_stream(
+                provider,  # type: ignore[arg-type]
+                GenerationRequest(messages=(Message(role="user", parts=(TextPart("hello"),)),),),
+                cancellation=CancellationToken(),
+            )
+        ]
+    assert closed == [True]

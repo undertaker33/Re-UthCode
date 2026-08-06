@@ -63,6 +63,26 @@ def test_core_exposes_the_single_tool_contract() -> None:
     assert ToolRegistry is not None
 
 
+def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
+    from uthcode.core import (
+        AgentEvent,
+        AgentLoop,
+        AgentLoopConfig,
+        AgentTurnExecution,
+        RunSnapshot,
+        RunState,
+        TurnResult,
+    )
+
+    assert AgentEvent is not None
+    assert AgentLoop is not None
+    assert AgentLoopConfig is not None
+    assert AgentTurnExecution is not None
+    assert RunSnapshot is not None
+    assert RunState is not None
+    assert TurnResult is not None
+
+
 def test_application_exposes_core_tool_values_without_integration_runtime_types() -> None:
     import uthcode.application as application
     from uthcode.application import (

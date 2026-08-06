@@ -8,15 +8,14 @@ from typing import Any
 
 from uthcode.core.provider import (
     CancellationToken,
-    GenerationCompleted,
     GenerationRequest,
-    InvalidProviderResponseError,
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
+    validated_provider_stream,
 )
 from uthcode.core.prompt import SystemPromptContext, build_system_prompt
 
@@ -280,33 +279,14 @@ class UthCodeApplication:
         request: GenerationRequest,
         token: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
-        """Yield one provider stream and enforce its terminal-event contract."""
+        """Yield one provider stream through the shared Core validator."""
 
-        terminal: GenerationCompleted | None = None
-        stream = provider.stream(request, cancellation=token)
-        try:
-            async for event in stream:
-                if terminal is not None:
-                    raise InvalidProviderResponseError(
-                        "Provider emitted an event after GenerationCompleted"
-                    )
-                if isinstance(event, GenerationCompleted):
-                    # A terminal event is only trustworthy after the provider
-                    # iterator reaches EOF. Hold it back until then so callers
-                    # can never observe a success that is later invalidated.
-                    terminal = event
-                    continue
-                yield event
-        finally:
-            close = getattr(stream, "aclose", None)
-            if close is not None:
-                await close()
-
-        if terminal is None:
-            raise InvalidProviderResponseError(
-                "Provider stream ended without GenerationCompleted"
-            )
-        yield terminal
+        async for event in validated_provider_stream(
+            provider,
+            request,
+            cancellation=token,
+        ):
+            yield event
 
 
 __all__ = [
