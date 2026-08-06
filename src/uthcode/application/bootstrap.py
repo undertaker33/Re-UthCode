@@ -2,18 +2,54 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from importlib import import_module
 from os import PathLike
 from pathlib import Path
 from typing import Any
 
-from .configuration import EffectiveConfig, LaunchOptions, ModelProfile, ProviderProfile
+from uthcode.integrations.config.data import LoadedConfigData
+from uthcode.integrations.config.loader import (
+    ConfigurationError as IntegrationConfigurationError,
+    ConfigurationInitializationRequired as IntegrationConfigurationInitializationRequired,
+    load_config_data,
+)
+from uthcode.integrations.tools.factory import create_default_tools
+from uthcode.core.tool import Tool
+
+from .configuration import (
+    ConfigurationModelError,
+    ConfigSource,
+    EffectiveConfig,
+    LaunchOptions,
+    ModelProfile,
+    ProviderProfile,
+)
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
 from .runtime_context import ApplicationRuntimeContext
+from .tools import ApplicationToolService
 
 
 class ConfigurationError(ValueError):
     """A launch configuration could not be loaded safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | Path | None = None,
+        field: str | None = None,
+    ) -> None:
+        self.message = message
+        self.path = Path(path) if path is not None else None
+        self.field = field
+        parts = []
+        if self.path is not None:
+            parts.append(str(self.path))
+        if field is not None:
+            parts.append(field)
+        prefix = ": ".join(parts)
+        super().__init__(f"{prefix}: {message}" if prefix else message)
 
 
 class ConfigurationInitializationRequired(ConfigurationError):
@@ -24,8 +60,9 @@ class ConfigurationInitializationRequired(ConfigurationError):
         super().__init__(
             "configuration is not initialized; edit and uncomment one complete "
             "Provider and Model example, then run again: "
-            f"{self.template_path}"
+            f"{self.template_path}",
         )
+        self.path = self.template_path
 
 
 def _provider_config(
@@ -80,11 +117,16 @@ def create_application(
     provider_builder: ProviderBuilder | None = None,
     model_writer: ModelWriter | None = None,
     runtime_context: ApplicationRuntimeContext | None = None,
+    tools: Sequence[Tool] | None = None,
 ) -> UthCodeApplication:
     """Build a Headless Application from one EffectiveConfig."""
 
     if not isinstance(config, EffectiveConfig):
         raise TypeError("config must be EffectiveConfig")
+    if runtime_context is None:
+        runtime_context = ApplicationRuntimeContext.from_system()
+    elif not isinstance(runtime_context, ApplicationRuntimeContext):
+        raise TypeError("runtime_context must be ApplicationRuntimeContext")
     builder = _default_builder() if provider_builder is None else provider_builder
 
     provider = builder(
@@ -92,13 +134,35 @@ def create_application(
         config.current_model,
     )
     writer = model_writer if model_writer is not None else _default_writer(config)
+    tool_values = (
+        create_default_tools(runtime_context.workdir)
+        if tools is None
+        else tuple(tools)
+    )
     return UthCodeApplication(
         provider,
         configuration=config,
         provider_builder=builder,
         model_writer=writer,
         runtime_context=runtime_context,
+        tool_service=ApplicationToolService(tool_values),
     )
+
+
+def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
+    sources = tuple(ConfigSource(source.kind, source.path) for source in data.sources)
+    try:
+        return EffectiveConfig.from_mapping(
+            {
+                "model": data.model,
+                "providers": data.providers,
+                "models": data.models,
+            },
+            sources=sources,
+        )
+    except (ConfigurationModelError, TypeError, ValueError) as exc:
+        source_path = data.sources[-1].path if data.sources else None
+        raise ConfigurationError(str(exc), path=source_path) from None
 
 
 def load_effective_config(
@@ -110,23 +174,31 @@ def load_effective_config(
 ) -> EffectiveConfig:
     """Load configuration through the Integration boundary."""
 
-    loader_module = import_module("uthcode.integrations.config.loader")
-    load = loader_module.load_effective_config
-
-    try:
-        return load(options, cwd=cwd, home=home, model=model)
-    except Exception as exc:
-        initialization_error = getattr(
-            loader_module,
-            "ConfigurationInitializationRequired",
-            None,
+    if options is None:
+        launch = LaunchOptions(
+            cwd=Path(cwd) if cwd is not None else None,
+            home=Path(home) if home is not None else None,
+            model=model,
         )
-        if initialization_error is not None and isinstance(exc, initialization_error):
-            raise ConfigurationInitializationRequired(exc.template_path) from None
-        configuration_error = getattr(loader_module, "ConfigurationError", None)
-        if configuration_error is not None and isinstance(exc, configuration_error):
-            raise ConfigurationError(str(exc)) from None
-        raise
+    else:
+        if any(value is not None for value in (cwd, home, model)):
+            raise TypeError("pass LaunchOptions or keyword launch overrides, not both")
+        launch = options
+    try:
+        raw = load_config_data(
+            cwd=launch.cwd,
+            home=launch.home,
+            model=launch.model,
+        )
+    except IntegrationConfigurationInitializationRequired as exc:
+        raise ConfigurationInitializationRequired(exc.template_path) from None
+    except IntegrationConfigurationError as exc:
+        raise ConfigurationError(
+            exc.message,
+            path=exc.path,
+            field=exc.field,
+        ) from None
+    return _effective_config_from_raw(raw)
 
 
 __all__ = [

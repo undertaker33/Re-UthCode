@@ -42,3 +42,39 @@ def test_root_package_keeps_composition_in_subpackages() -> None:
     )
     assert (package_root / "__main__.py").is_file()
     assert (package_root / "interfaces" / "cli.py").is_file()
+
+
+def test_config_integration_exposes_raw_loader_not_effective_config() -> None:
+    import uthcode.integrations.config as config
+
+    assert "load_config_data" in config.__all__
+    assert "LoadedConfigData" in config.__all__
+    assert "LoadedConfigSource" in config.__all__
+    assert "load_effective_config" not in config.__dict__
+    assert "load_effective_config" not in config.__all__
+
+
+def test_core_exposes_the_single_tool_contract() -> None:
+    from uthcode.core import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
+
+    assert Tool is not None
+    assert ToolExecutionResult is not None
+    assert ToolExecutor is not None
+    assert ToolRegistry is not None
+
+
+def test_application_exposes_core_tool_values_without_integration_runtime_types() -> None:
+    import uthcode.application as application
+    from uthcode.application import (
+        CancellationToken,
+        ToolCallPart,
+        ToolDefinition,
+        ToolResultPart,
+    )
+
+    assert CancellationToken is not None
+    assert ToolCallPart is not None
+    assert ToolDefinition is not None
+    assert ToolResultPart is not None
+    assert "ToolRegistry" not in application.__all__
+    assert "ToolExecutor" not in application.__all__

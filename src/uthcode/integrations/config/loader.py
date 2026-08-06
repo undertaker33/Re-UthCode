@@ -9,15 +9,7 @@ from typing import Any
 
 from tomlkit import parse
 
-from uthcode.application.configuration import (
-    ConfigSource,
-    ConfigurationModelError,
-    EffectiveConfig,
-    LaunchOptions,
-    ModelProfile,
-    ProviderProfile,
-)
-
+from .data import LoadedConfigData, LoadedConfigSource
 from .template import create_user_template
 
 
@@ -31,6 +23,7 @@ class ConfigurationError(ValueError):
         path: Path | None = None,
         field: str | None = None,
     ) -> None:
+        self.message = message
         self.path = path
         self.field = field
         parts = []
@@ -57,6 +50,9 @@ class ConfigurationInitializationRequired(ConfigurationError):
 _ROOT_FIELDS = frozenset({"model", "providers", "models"})
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key_env"})
 _MODEL_FIELDS = frozenset({"provider", "model", "label", "max_output_tokens"})
+_SUPPORTED_PROVIDER_KINDS = frozenset(
+    {"fake", "anthropic", "openai_responses", "openai_compat"}
+)
 _PROJECT_FORBIDDEN_FIELDS = frozenset(
     {
         "providers",
@@ -308,9 +304,13 @@ def _validate_project_mapping(mapping: Mapping[str, Any], *, path: Path) -> None
     _validate_model_tables(mapping, path=path, project=True)
 
 
-def _provider_profiles(mapping: Mapping[str, Any], *, path: Path) -> dict[str, ProviderProfile]:
+def _provider_profiles(
+    mapping: Mapping[str, Any],
+    *,
+    path: Path,
+) -> dict[str, dict[str, object]]:
     raw_providers = _require_table(mapping.get("providers", {}), path=path, field="providers")
-    result: dict[str, ProviderProfile] = {}
+    result: dict[str, dict[str, object]] = {}
     for profile_id, raw_profile in raw_providers.items():
         if not isinstance(profile_id, str):
             raise ConfigurationError("Provider Profile IDs must be strings", path=path, field="providers")
@@ -319,19 +319,38 @@ def _provider_profiles(mapping: Mapping[str, Any], *, path: Path) -> dict[str, P
             path=path,
             field=f"providers.{profile_id}",
         )
-        try:
-            result[profile_id] = ProviderProfile(
-                provider_profile_id=profile_id,
-                kind=profile.get("kind"),
-                base_url=profile.get("base_url"),
-                api_key_env=profile.get("api_key_env"),
+        kind = profile.get("kind")
+        base_url = profile.get("base_url")
+        api_key_env = profile.get("api_key_env")
+        if (
+            not isinstance(kind, str)
+            or not kind.strip()
+            or kind.strip().lower() not in _SUPPORTED_PROVIDER_KINDS
+            or (base_url is not None and (not isinstance(base_url, str) or not base_url.strip()))
+            or (
+                api_key_env is not None
+                and (not isinstance(api_key_env, str) or not api_key_env.strip())
             )
-        except (ConfigurationModelError, TypeError, ValueError):
+            or (
+                kind.strip().lower() != "fake"
+                and (not isinstance(api_key_env, str) or not api_key_env.strip())
+            )
+            or (
+                kind.strip().lower() == "openai_compat"
+                and (not isinstance(base_url, str) or not base_url.strip())
+            )
+        ):
             raise ConfigurationError(
                 "invalid Provider profile",
                 path=path,
                 field=f"providers.{profile_id}",
-            ) from None
+            )
+        raw: dict[str, object] = {"kind": kind}
+        if "base_url" in profile:
+            raw["base_url"] = base_url
+        if "api_key_env" in profile:
+            raw["api_key_env"] = api_key_env
+        result[profile_id] = raw
     return result
 
 
@@ -354,23 +373,44 @@ def _model_profiles(
     raw_models: Mapping[str, Mapping[str, Any]],
     *,
     path: Path,
-) -> dict[str, ModelProfile]:
-    result: dict[str, ModelProfile] = {}
+) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
     for model_ref, raw_profile in raw_models.items():
-        try:
-            result[model_ref] = ModelProfile(
-                model_ref=model_ref,
-                provider_profile_id=raw_profile["provider"],
-                remote_model_id=raw_profile["model"],
-                label=raw_profile.get("label"),
-                max_output_tokens=raw_profile.get("max_output_tokens"),
+        provider_profile_id = raw_profile.get("provider")
+        remote_model_id = raw_profile.get("model")
+        label = raw_profile.get("label")
+        max_output_tokens = raw_profile.get("max_output_tokens")
+        if (
+            not isinstance(model_ref, str)
+            or not model_ref.strip()
+            or not isinstance(provider_profile_id, str)
+            or not provider_profile_id.strip()
+            or not isinstance(remote_model_id, str)
+            or not remote_model_id.strip()
+            or (label is not None and (not isinstance(label, str) or not label.strip()))
+            or (
+                max_output_tokens is not None
+                and (
+                    isinstance(max_output_tokens, bool)
+                    or not isinstance(max_output_tokens, int)
+                    or max_output_tokens <= 0
+                )
             )
-        except (ConfigurationModelError, KeyError, TypeError, ValueError):
+        ):
             raise ConfigurationError(
                 "invalid Model profile",
                 path=path,
                 field=f"models.{model_ref}",
-            ) from None
+            )
+        raw: dict[str, object] = {
+            "provider_profile_id": provider_profile_id,
+            "remote_model_id": remote_model_id,
+        }
+        if "label" in raw_profile:
+            raw["label"] = label
+        if "max_output_tokens" in raw_profile:
+            raw["max_output_tokens"] = max_output_tokens
+        result[model_ref] = raw
     return result
 
 
@@ -385,41 +425,16 @@ def _merge_models(
         current.update(raw_profile)
 
 
-def _options(
-    options: LaunchOptions | None,
-    *,
-    cwd: str | os.PathLike[str] | Path | None,
-    home: str | os.PathLike[str] | Path | None,
-    model: str | None,
-) -> LaunchOptions:
-    if options is None:
-        return LaunchOptions(
-            cwd=Path(cwd) if cwd is not None else None,
-            home=Path(home) if home is not None else None,
-            model=model,
-        )
-    if any(value is not None for value in (cwd, home, model)):
-        raise TypeError("pass LaunchOptions or keyword launch overrides, not both")
-    return options
-
-
-def load_effective_config(
-    options: LaunchOptions | None = None,
+def load_config_data(
     *,
     cwd: str | os.PathLike[str] | Path | None = None,
     home: str | os.PathLike[str] | Path | None = None,
     model: str | None = None,
-) -> EffectiveConfig:
-    """Load one immutable EffectiveConfig without constructing a Provider."""
+) -> LoadedConfigData:
+    """Load immutable raw configuration data without constructing Application objects."""
 
-    launch = _options(
-        options,
-        cwd=cwd,
-        home=home,
-        model=model,
-    )
-    cwd_path = _physical_path(launch.cwd or Path.cwd())
-    home_path = _user_home(launch.home)
+    cwd_path = _physical_path(cwd or Path.cwd())
+    home_path = _user_home(_physical_path(home) if home is not None else None)
     user_config = _physical_path(home_path / ".uthcode" / "config.toml")
     if not user_config.is_file():
         try:
@@ -444,7 +459,7 @@ def load_effective_config(
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
     selected_ref = user_mapping.get("model")
-    sources = [ConfigSource("user", user_path)]
+    sources = [LoadedConfigSource("user", user_path)]
 
     for kind, path in paths[1:]:
         project_mapping = _read_mapping(path)
@@ -452,11 +467,11 @@ def load_effective_config(
         _merge_models(models, project_mapping, path=path)
         if "model" in project_mapping:
             selected_ref = project_mapping["model"]
-        sources.append(ConfigSource(kind, path))
+        sources.append(LoadedConfigSource(kind, path))
 
-    if launch.model is not None:
-        selected_ref = launch.model
-        sources.append(ConfigSource("cli"))
+    if model is not None:
+        selected_ref = model
+        sources.append(LoadedConfigSource("cli"))
     if not isinstance(selected_ref, str) or not selected_ref.strip():
         raise ConfigurationError(
             "configuration requires a selected model",
@@ -464,21 +479,17 @@ def load_effective_config(
             field="model",
         )
 
-    try:
-        return EffectiveConfig(
-            model=selected_ref,
-            providers=providers,
-            models=_model_profiles(models, path=user_path),
-            sources=tuple(sources),
-        )
-    except (ConfigurationModelError, TypeError, ValueError) as exc:
-        source_path = sources[-1].path if sources else user_path
-        raise ConfigurationError(str(exc), path=source_path) from None
+    return LoadedConfigData(
+        model=selected_ref,
+        providers=providers,
+        models=_model_profiles(models, path=user_path),
+        sources=tuple(sources),
+    )
 
 
 __all__ = [
     "ConfigurationError",
     "ConfigurationInitializationRequired",
     "discover_config_paths",
-    "load_effective_config",
+    "load_config_data",
 ]

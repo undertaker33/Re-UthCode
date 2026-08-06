@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -14,11 +14,15 @@ from uthcode.core.provider import (
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
+    ToolCallPart,
+    ToolDefinition,
+    ToolResultPart,
 )
 from uthcode.core.prompt import SystemPromptContext, build_system_prompt
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .runtime_context import ApplicationRuntimeContext
+from .tools import ApplicationToolService
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
@@ -107,6 +111,7 @@ class UthCodeApplication:
         provider_builder: ProviderBuilder | None = None,
         model_writer: ModelWriter | None = None,
         runtime_context: ApplicationRuntimeContext | None = None,
+        tool_service: ApplicationToolService | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -117,6 +122,11 @@ class UthCodeApplication:
         if not isinstance(runtime_context, ApplicationRuntimeContext):
             raise TypeError("runtime_context must be ApplicationRuntimeContext")
         self._runtime_context = runtime_context
+        if tool_service is None:
+            tool_service = ApplicationToolService(())
+        if not isinstance(tool_service, ApplicationToolService):
+            raise TypeError("tool_service must be an ApplicationToolService")
+        self._tool_service = tool_service
         self._current_model_ref = (
             configuration.model if configuration is not None else provider.identity.model
         )
@@ -154,6 +164,24 @@ class UthCodeApplication:
         if self._configuration is None:
             return ()
         return self._configuration.model_catalog()
+
+    def tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        """Return the Application's immutable, ordered Tool definitions."""
+
+        return self._tool_service.definitions()
+
+    async def execute_tool_calls(
+        self,
+        calls: Sequence[ToolCallPart],
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> tuple[ToolResultPart, ...]:
+        """Execute a caller-provided ToolCall batch through the Application."""
+
+        return await self._tool_service.execute_calls(
+            calls,
+            cancellation=cancellation,
+        )
 
     def status(self) -> ApplicationStatus:
         profile = self.current_provider_profile

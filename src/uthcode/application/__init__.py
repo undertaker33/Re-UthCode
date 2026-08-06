@@ -18,6 +18,7 @@ from .bootstrap import (
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
 from .runtime_context import ApplicationRuntimeContext
 from uthcode.core import (
+    CancellationToken,
     GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
@@ -29,6 +30,9 @@ from uthcode.core import (
     ReasoningDelta,
     TextDelta,
     TextPart,
+    ToolCallPart,
+    ToolDefinition,
+    ToolResultPart,
     Usage,
 )
 from .commands import (
@@ -83,6 +87,7 @@ __all__ = [
     "CommandRegistry",
     "CompletionCandidate",
     "CompletionEngine",
+    "CancellationToken",
     "GenerationHandle",
     "GenerationCancelled",
     "GenerationCompleted",
@@ -104,6 +109,9 @@ __all__ = [
     "ReasoningDelta",
     "TextDelta",
     "TextPart",
+    "ToolCallPart",
+    "ToolDefinition",
+    "ToolResultPart",
     "Usage",
     "UthCodeApplication",
     "UiAction",
