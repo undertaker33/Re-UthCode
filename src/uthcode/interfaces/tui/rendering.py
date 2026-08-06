@@ -1,15 +1,16 @@
-"""AgentEvent projection and bounded stream batching for the TUI."""
+"""Public AgentEvent projection and immutable Markdown stream assembly."""
 
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass, replace
 from typing import Literal
 
 from uthcode.application import AgentEvent, TextPart
 
 
-STREAM_RENDER_INTERVAL_SECONDS = 0.2
+_STREAM_RENDER_INTERVAL_SECONDS = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,10 +19,6 @@ class TextUpdate:
     kind: str
     text: str
     mode: Literal["append", "replace"] = "append"
-
-    def __post_init__(self) -> None:
-        if self.mode not in {"append", "replace"}:
-            raise ValueError("text update mode must be append or replace")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +43,81 @@ class RenderBatch:
 
 
 @dataclass(slots=True)
+class MarkdownStream:
+    """Split an append-only Markdown stream into committed and preview text."""
+
+    committed: str = ""
+    pending: str = ""
+
+    @property
+    def full_text(self) -> str:
+        return self.committed + self.pending
+
+    def append(self, text: str) -> tuple[str, ...]:
+        self.pending += text
+        return self._drain_complete_blocks()
+
+    def replace(self, authoritative: str) -> tuple[tuple[str, ...], bool]:
+        current = self.full_text
+        if authoritative.startswith(self.committed):
+            self.pending = authoritative[len(self.committed) :]
+            return self._drain_complete_blocks(), False
+        if authoritative == current:
+            return (), False
+        self.pending = ""
+        return (), True
+
+    def force(self) -> str:
+        value = self.pending
+        self.committed += value
+        self.pending = ""
+        return value
+
+    def _drain_complete_blocks(self) -> tuple[str, ...]:
+        boundary = _safe_markdown_boundary(self.pending)
+        if boundary <= 0:
+            return ()
+        value = self.pending[:boundary]
+        self.pending = self.pending[boundary:]
+        self.committed += value
+        return (value,)
+
+
+def _safe_markdown_boundary(text: str) -> int:
+    """Return the last block boundary safe to print irreversibly."""
+
+    in_fence = False
+    fence_char = ""
+    fence_size = 0
+    last_safe = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if not line.endswith(("\n", "\r")):
+            break
+        body = line.rstrip("\r\n")
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", body)
+        if fence is not None:
+            marker, remainder = fence.groups()
+            char = marker[0]
+            count = len(marker)
+            if not in_fence:
+                in_fence = True
+                fence_char = char
+                fence_size = count
+            elif (
+                char == fence_char
+                and count >= fence_size
+                and not remainder.strip()
+            ):
+                in_fence = False
+                last_safe = offset + len(line)
+        elif not in_fence and not body.strip():
+            last_safe = offset + len(line)
+        offset += len(line)
+    return last_safe
+
+
+@dataclass(slots=True)
 class _TextBuffer:
     kind: str
     pending: str = ""
@@ -54,10 +126,9 @@ class _TextBuffer:
 
 
 def _message_text(message: object) -> str:
-    parts = getattr(message, "parts", ())
     return "".join(
         part.text
-        for part in parts
+        for part in getattr(message, "parts", ())
         if isinstance(part, TextPart)
     )
 
@@ -67,24 +138,13 @@ def _text_value(event: AgentEvent, name: str, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
-def _block_id(message_id: str, kind: str) -> str:
-    return f"{message_id}:{kind}"
-
-
 class AgentEventRenderer:
-    """Convert public AgentEvent values into display-only batches.
-
-    Only display-safe fields exposed by AgentEvent are read.  In particular,
-    this renderer never receives or inspects a ToolResult or raw ToolCall
-    arguments; Tool rows use the Application-provided command summary.
-    """
-
-    __slots__ = ("_clock", "_last_flush_at", "_buffers", "interval_seconds")
+    """Batch display-safe public events without retaining tool results."""
 
     def __init__(
         self,
         *,
-        interval_seconds: float = STREAM_RENDER_INTERVAL_SECONDS,
+        interval_seconds: float = _STREAM_RENDER_INTERVAL_SECONDS,
         clock=time.monotonic,
     ) -> None:
         if interval_seconds <= 0:
@@ -97,69 +157,55 @@ class AgentEventRenderer:
     def push(self, event: AgentEvent) -> RenderBatch | None:
         if not isinstance(event, AgentEvent):
             raise TypeError("event must be an AgentEvent")
-
         event_type = event.event_type
         if event_type == "turn_started":
-            message_id = _text_value(event, "message_id")
             return RenderBatch(
-                users=((message_id, _message_text(getattr(event, "message", None))),),
+                users=(
+                    (
+                        _text_value(event, "message_id"),
+                        _message_text(getattr(event, "message", None)),
+                    ),
+                )
             )
-
         if event_type in {"reasoning_delta", "assistant_message_delta"}:
             kind = "reasoning" if event_type == "reasoning_delta" else "assistant"
-            message_id = _text_value(event, "message_id")
+            key = f"{_text_value(event, 'message_id')}:{kind}"
             text = _text_value(event, "text")
             if not text:
                 return None
-            buffer = self._buffers.setdefault(
-                _block_id(message_id, kind),
-                _TextBuffer(kind),
-            )
-            buffer.pending += text
-            buffer.completed = None
+            self._buffers.setdefault(key, _TextBuffer(kind)).pending += text
             if self._clock() - self._last_flush_at >= self.interval_seconds:
                 return self.flush()
             return None
-
         if event_type == "assistant_message_completed":
-            message_id = _text_value(event, "message_id")
-            kind = "assistant"
-            buffer = self._buffers.setdefault(
-                _block_id(message_id, kind),
-                _TextBuffer(kind),
-            )
+            key = f"{_text_value(event, 'message_id')}:assistant"
+            buffer = self._buffers.setdefault(key, _TextBuffer("assistant"))
             buffer.completed = _message_text(getattr(event, "message", None))
             return self.flush()
-
         if event_type in {"tool_started", "tool_finished"}:
             batch = self.flush()
-            status = "running" if event_type == "tool_started" else _text_value(
-                event,
-                "status",
-                "finished",
+            status = (
+                "running"
+                if event_type == "tool_started"
+                else _text_value(event, "status", "finished")
             )
             update = ToolUpdate(
-                tool_call_id=_text_value(event, "tool_call_id"),
-                tool_name=_text_value(event, "tool_name", "unknown tool"),
-                command=_text_value(event, "command", "<tool summary unavailable>"),
-                status=status,
+                _text_value(event, "tool_call_id"),
+                _text_value(event, "tool_name", "unknown tool"),
+                _text_value(event, "command", "<tool summary unavailable>"),
+                status,
             )
             return replace(batch, tools=batch.tools + (update,))
-
         if event_type == "turn_completed":
-            batch = self.flush()
             return replace(
-                batch,
+                self.flush(),
                 terminal="completed",
                 final_text=_text_value(event, "final_text"),
             )
-
         if event_type == "turn_failed":
             return replace(self.flush(), terminal="failed")
-
         if event_type == "turn_cancelled":
             return replace(self.flush(), terminal="cancelled")
-
         return None
 
     def flush(self) -> RenderBatch:
@@ -167,30 +213,30 @@ class AgentEventRenderer:
         for block_id, buffer in self._buffers.items():
             if buffer.completed is not None:
                 desired = buffer.completed
-                current = buffer.rendered
-                if desired.startswith(current):
-                    delta = desired[len(current) :]
+                if desired.startswith(buffer.rendered):
+                    text = desired[len(buffer.rendered) :]
                     mode: Literal["append", "replace"] = "append"
                 else:
-                    delta = desired
+                    text = desired
                     mode = "replace"
                 buffer.completed = None
+                buffer.pending = ""
+                buffer.rendered = desired
             else:
-                desired = buffer.rendered + buffer.pending
-                delta = buffer.pending
+                text = buffer.pending
                 mode = "append"
-            buffer.pending = ""
-            buffer.rendered = desired
-            if delta or mode == "replace":
-                updates.append(TextUpdate(block_id, buffer.kind, delta, mode))
+                buffer.pending = ""
+                buffer.rendered += text
+            if text or mode == "replace":
+                updates.append(TextUpdate(block_id, buffer.kind, text, mode))
         self._last_flush_at = self._clock()
         return RenderBatch(text=tuple(updates))
 
 
 __all__ = [
     "AgentEventRenderer",
+    "MarkdownStream",
     "RenderBatch",
-    "STREAM_RENDER_INTERVAL_SECONDS",
     "TextUpdate",
     "ToolUpdate",
 ]
