@@ -18,6 +18,7 @@ from .provider import (
     ToolDefinition,
     ToolResultPart,
 )
+from .permission import Effect, PermissionAction, ResourceScope
 
 
 _DEFAULT_MAX_RESULT_CHARS = 10_000
@@ -40,7 +41,13 @@ class ToolExecutionResult:
 
 @runtime_checkable
 class Tool(Protocol):
-    """The only execution contract required from an Integration Tool."""
+    """The only execution contract required from an Integration Tool.
+
+    Permission-aware concrete tools additionally expose a synchronous
+    ``preflight(arguments)`` hook.  The hook is intentionally optional at the
+    structural Core Tool boundary so existing embedded tools remain valid;
+    tools without it receive a conservative UNKNOWN Action.
+    """
 
     @property
     def definition(self) -> ToolDefinition:
@@ -53,6 +60,56 @@ class Tool(Protocol):
         cancellation: CancellationToken,
     ) -> ToolExecutionResult:
         ...
+
+
+@runtime_checkable
+class ToolPreflight(Protocol):
+    """The no-side-effect preparation implemented by trusted tools."""
+
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPreparation:
+    """Trusted Action plus the exact immutable payload reserved for execute."""
+
+    action: PermissionAction
+    execution_arguments: JsonPayload
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, PermissionAction):
+            raise TypeError("action must be a PermissionAction")
+        if not isinstance(self.execution_arguments, JsonPayload):
+            object.__setattr__(
+                self,
+                "execution_arguments",
+                JsonPayload(self.execution_arguments),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedToolCall:
+    """A registered, schema-validated, preflighted call before execution."""
+
+    call: ToolCallPart
+    tool: Tool
+    action: PermissionAction
+    execution_arguments: JsonPayload
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.call, ToolCallPart):
+            raise TypeError("call must be a ToolCallPart")
+        if not isinstance(self.tool, Tool):
+            raise TypeError("tool must implement the Tool protocol")
+        if not isinstance(self.action, PermissionAction):
+            raise TypeError("action must be a PermissionAction")
+        if not isinstance(self.execution_arguments, JsonPayload):
+            object.__setattr__(
+                self,
+                "execution_arguments",
+                JsonPayload(self.execution_arguments),
+            )
 
 
 class ToolRegistry:
@@ -123,8 +180,26 @@ class ToolExecutor:
         *,
         cancellation: CancellationToken,
     ) -> ToolResultPart:
+        prepared = self.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            return prepared
+        return await self.execute_prepared(prepared, cancellation=cancellation)
+
+    def prepare_call(
+        self,
+        call: ToolCallPart,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> PreparedToolCall | ToolResultPart:
+        """Validate and preflight one call without invoking ``Tool.execute``.
+
+        A ``ToolResultPart`` is returned for unknown, invalid, cancelled, or
+        otherwise unpreparable calls so callers can preserve the existing
+        FIFO/error contract without entering Permission evaluation.
+        """
+
         _require_tool_call(call)
-        if cancellation.cancelled:
+        if cancellation is not None and cancellation.cancelled:
             return self._cancelled(call)
 
         tool = self._registry.get(call.name)
@@ -140,11 +215,47 @@ class ToolExecutor:
         except ValidationError as exc:
             return self._error(call, _invalid_arguments_message(call.name, exc))
 
-        if cancellation.cancelled:
+        if cancellation is not None and cancellation.cancelled:
             return self._cancelled(call)
 
         try:
-            result = await tool.execute(call.arguments, cancellation=cancellation)
+            preparation = _preflight_tool(tool, call)
+        except (TypeError, ValueError) as exc:
+            message = str(exc) or f"Error: tool preflight failed for {call.name}"
+            if not message.startswith("Error:"):
+                message = f"Error: tool preflight failed for {call.name}: {message}"
+            return self._error(call, message)
+        except Exception:
+            return self._error(call, f"Error: tool preflight failed for {call.name}")
+
+        return PreparedToolCall(
+            call=call,
+            tool=tool,
+            action=preparation.action,
+            execution_arguments=preparation.execution_arguments,
+        )
+
+    async def execute_prepared(
+        self,
+        prepared: PreparedToolCall,
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolResultPart:
+        """Execute one already-prepared call without validation or preflight."""
+
+        if not isinstance(prepared, PreparedToolCall):
+            raise TypeError("prepared must be a PreparedToolCall")
+        if not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken")
+        call = prepared.call
+        tool = prepared.tool
+        if cancellation.cancelled:
+            return self._cancelled(call)
+        try:
+            result = await tool.execute(
+                prepared.execution_arguments,
+                cancellation=cancellation,
+            )
         except GenerationCancelled:
             return self._cancelled(call)
         except asyncio.CancelledError:
@@ -205,6 +316,25 @@ def _require_tool_call(call: ToolCallPart) -> None:
         raise TypeError("call must be a ToolCallPart")
 
 
+def _preflight_tool(tool: Tool, call: ToolCallPart) -> ToolPreparation:
+    preflight = getattr(tool, "preflight", None)
+    if preflight is None:
+        return ToolPreparation(
+            action=PermissionAction(
+                tool=call.name,
+                action="execute",
+                effect=Effect.UNKNOWN,
+                resource=None,
+                scope=ResourceScope.UNKNOWN,
+            ),
+            execution_arguments=call.arguments,
+        )
+    preparation = preflight(call.arguments)
+    if not isinstance(preparation, ToolPreparation):
+        raise TypeError("tool preflight must return a ToolPreparation")
+    return preparation
+
+
 def _to_json_data(value: object) -> object:
     """Convert immutable Core JSON values to ordinary data for jsonschema."""
 
@@ -228,8 +358,11 @@ def _invalid_arguments_message(name: str, error: ValidationError) -> str:
 
 
 __all__ = [
+    "PreparedToolCall",
     "Tool",
     "ToolExecutionResult",
     "ToolExecutor",
+    "ToolPreflight",
+    "ToolPreparation",
     "ToolRegistry",
 ]

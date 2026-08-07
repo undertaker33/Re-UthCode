@@ -114,6 +114,11 @@ async def test_default_tools_are_ordered_and_not_injected_into_generation() -> N
         "Grep",
         "Bash",
     ]
+    assert all(
+        "effect" not in definition.parameters
+        and "permission" not in definition.parameters
+        for definition in definitions
+    )
 
     _ = [event async for event in application.stream_generation(_request())]
     assert provider.recorded_requests[0].tools == ()

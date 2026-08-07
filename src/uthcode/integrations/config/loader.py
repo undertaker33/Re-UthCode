@@ -126,11 +126,35 @@ def _project_directories(cwd: Path) -> tuple[Path, ...]:
     return tuple(chain)
 
 
-def discover_config_paths(
+def physical_path(path: str | os.PathLike[str] | Path) -> Path:
+    """Return the shared lexical-normalized physical path representation."""
+
+    return _physical_path(path)
+
+
+def resolve_user_home(explicit: Path | None = None) -> Path:
+    """Resolve the user home using the same configuration discovery rules."""
+
+    return _user_home(explicit)
+
+
+def discover_scoped_paths(
     cwd: str | os.PathLike[str] | Path,
-    user_config: str | os.PathLike[str] | Path,
+    user_path: str | os.PathLike[str] | Path,
+    project_relative_path: str | os.PathLike[str] | Path,
 ) -> tuple[tuple[str, Path], ...]:
-    """Return unique existing files in user-to-cwd precedence order."""
+    """Discover one user file and recursive project files in stable order.
+
+    The helper is shared by ordinary configuration and permission rules.  It
+    intentionally owns the only Git-root-to-cwd traversal in the Integration
+    layer; callers supply only the file name that lives below each project.
+    Results are ordered from the least-specific user source to the
+    root-to-cwd project sources and are deduplicated by physical path.
+    """
+
+    relative = Path(project_relative_path)
+    if relative.is_absolute():
+        raise ValueError("project_relative_path must be relative")
 
     cwd_path = _physical_path(cwd)
     candidates: list[tuple[str, Path]] = []
@@ -146,10 +170,19 @@ def discover_config_paths(
         seen.add(key)
         candidates.append((kind, physical))
 
-    add("user", _physical_path(user_config))
+    add("user", _physical_path(user_path))
     for directory in _project_directories(cwd_path):
-        add("project", directory / ".uthcode" / "config.toml")
+        add("project", directory / relative)
     return tuple(candidates)
+
+
+def discover_config_paths(
+    cwd: str | os.PathLike[str] | Path,
+    user_config: str | os.PathLike[str] | Path,
+) -> tuple[tuple[str, Path], ...]:
+    """Return unique existing files in user-to-cwd precedence order."""
+
+    return discover_scoped_paths(cwd, user_config, ".uthcode/config.toml")
 
 
 def _plain(value: Any) -> Any:
@@ -491,5 +524,8 @@ __all__ = [
     "ConfigurationError",
     "ConfigurationInitializationRequired",
     "discover_config_paths",
+    "discover_scoped_paths",
     "load_config_data",
+    "physical_path",
+    "resolve_user_home",
 ]

@@ -1,7 +1,30 @@
 """Public UthCode Core contracts."""
 
 from .prompt import PromptSection, SystemPromptContext, build_system_prompt
-from .tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
+from .tool import (
+    PreparedToolCall,
+    Tool,
+    ToolExecutionResult,
+    ToolExecutor,
+    ToolPreflight,
+    ToolPreparation,
+    ToolRegistry,
+)
+from .permission import (
+    Decision,
+    DecisionReason,
+    Effect,
+    PermissionAction,
+    PermissionDecision,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+    Rule,
+    RuleKind,
+    RuleSet,
+    SessionGrant,
+    evaluate_permission,
+)
 from .agent import (
     AgentExecutionSegment,
     AgentLoop,
@@ -148,7 +171,23 @@ __all__ = [
     "ToolDefinition",
     "ToolExecutionResult",
     "ToolExecutor",
+    "ToolPreflight",
+    "ToolPreparation",
+    "PreparedToolCall",
     "ToolRegistry",
+    "Decision",
+    "DecisionReason",
+    "Effect",
+    "PermissionAction",
+    "PermissionDecision",
+    "PermissionEvaluator",
+    "PermissionMode",
+    "ResourceScope",
+    "Rule",
+    "RuleKind",
+    "RuleSet",
+    "SessionGrant",
+    "evaluate_permission",
     "ToolResultPart",
     "ToolBatchFinished",
     "ToolBatchStarted",

@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
-from uthcode.core.tool import ToolExecutionResult
+from uthcode.core.tool import ToolExecutionResult, ToolPreparation
 
 from .workspace import FileReadTracker, WorkspacePathError, WorkspacePathResolver
 
@@ -39,6 +40,19 @@ class ReadFileTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))
+        return ToolPreparation(
+            action=PermissionAction(
+                tool="ReadFile",
+                action="read",
+                effect=Effect.READ,
+                resource=self._resolver.display(path),
+                scope=scope,
+            ),
+            execution_arguments=_bind_path(arguments, path),
+        )
 
     async def execute(
         self,
@@ -108,6 +122,19 @@ class WriteFileTool:
     def definition(self) -> ToolDefinition:
         return self._definition
 
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))
+        return ToolPreparation(
+            action=PermissionAction(
+                tool="WriteFile",
+                action="write",
+                effect=Effect.WRITE,
+                resource=self._resolver.display(path),
+                scope=scope,
+            ),
+            execution_arguments=_bind_path(arguments, path),
+        )
+
     async def execute(
         self,
         arguments: JsonPayload,
@@ -171,6 +198,19 @@ class EditFileTool:
     def definition(self) -> ToolDefinition:
         return self._definition
 
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))
+        return ToolPreparation(
+            action=PermissionAction(
+                tool="EditFile",
+                action="edit",
+                effect=Effect.WRITE,
+                resource=self._resolver.display(path),
+                scope=scope,
+            ),
+            execution_arguments=_bind_path(arguments, path),
+        )
+
     async def execute(
         self,
         arguments: JsonPayload,
@@ -224,6 +264,12 @@ class EditFileTool:
         return ToolExecutionResult(
             f"Successfully edited {self._resolver.display(path)}"
         )
+
+
+def _bind_path(arguments: JsonPayload, path: Path) -> JsonPayload:
+    values = dict(arguments)
+    values["path"] = str(path)
+    return JsonPayload(values)
 
 
 def _text(arguments: Mapping[str, object], name: str) -> str:

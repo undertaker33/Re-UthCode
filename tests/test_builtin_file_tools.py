@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from uthcode.core import CancellationToken, ToolCallPart, ToolExecutor, ToolRegistry
+from uthcode.core import (
+    CancellationToken,
+    PreparedToolCall,
+    ToolCallPart,
+    ToolExecutor,
+    ToolRegistry,
+)
+from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.tools.file_tools import (
     EditFileTool,
     ReadFileTool,
@@ -24,16 +31,23 @@ def _tools(root: Path):
     return resolver, tracker, ReadFileTool(resolver, tracker), WriteFileTool(resolver, tracker), EditFileTool(resolver, tracker)
 
 
-def test_workspace_resolver_rejects_escape_null_and_external_absolute_path(
+def test_workspace_resolver_resolves_outside_scope_and_rejects_null(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
     workspace.mkdir()
+    outside.write_text("outside", encoding="utf-8")
     resolver = WorkspacePathResolver(workspace)
 
-    for value in ("../outside.txt", str(tmp_path / "outside.txt"), "bad\x00path"):
+    for value in ("bad\x00path",):
         with pytest.raises(WorkspacePathError):
             resolver.resolve(value)
+
+    resolved, scope = resolver.resolve_with_scope("../outside.txt")
+    assert resolved == outside.resolve()
+    assert scope is ResourceScope.OUTSIDE
+    assert resolver.display(resolved) == outside.resolve().as_posix()
 
 
 def test_workspace_resolver_allows_new_nested_path_and_displays_posix_relative(
@@ -49,7 +63,7 @@ def test_workspace_resolver_allows_new_nested_path_and_displays_posix_relative(
     assert resolver.display(resolved) == "nested/file.txt"
 
 
-def test_workspace_resolver_rejects_file_and_directory_symlinks_to_outside(
+def test_workspace_resolver_classifies_file_and_directory_symlinks_to_outside(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -64,10 +78,33 @@ def test_workspace_resolver_rejects_file_and_directory_symlinks_to_outside(
         pytest.skip("symlinks not available in this environment")
 
     resolver = WorkspacePathResolver(workspace)
-    with pytest.raises(WorkspacePathError):
-        resolver.resolve("secret.txt")
-    with pytest.raises(WorkspacePathError):
-        resolver.resolve("directory/secret.txt")
+    resolved_file, file_scope = resolver.resolve_with_scope("secret.txt")
+    assert resolved_file == (outside / "secret.txt").resolve()
+    assert file_scope is ResourceScope.OUTSIDE
+    resolved_directory, directory_scope = resolver.resolve_with_scope(
+        "directory/secret.txt"
+    )
+    assert resolved_directory == (outside / "secret.txt").resolve()
+    assert directory_scope is ResourceScope.OUTSIDE
+
+
+def test_file_tools_preflight_produces_trusted_effect_and_ignores_pseudo_effect(
+    tmp_path: Path,
+) -> None:
+    resolver = WorkspacePathResolver(tmp_path)
+    tracker = FileReadTracker()
+    read = ReadFileTool(resolver, tracker)
+    write = WriteFileTool(resolver, tracker)
+    edit = EditFileTool(resolver, tracker)
+
+    read_action = read.preflight({"path": "note.txt", "effect": "write"}).action  # type: ignore[arg-type]
+    write_action = write.preflight({"path": "note.txt", "effect": "read"}).action  # type: ignore[arg-type]
+    edit_action = edit.preflight({"path": "note.txt"}).action  # type: ignore[arg-type]
+
+    assert (read_action.effect, read_action.scope) == (Effect.READ, ResourceScope.INSIDE)
+    assert (write_action.effect, write_action.scope) == (Effect.WRITE, ResourceScope.INSIDE)
+    assert (edit_action.effect, edit_action.scope) == (Effect.WRITE, ResourceScope.INSIDE)
+    assert read_action.resource == write_action.resource == edit_action.resource == "note.txt"
 
 
 def test_tracker_requires_read_and_detects_content_change_with_restored_mtime(
@@ -105,6 +142,153 @@ async def test_read_file_returns_one_based_pages_and_records_state(tmp_path: Pat
 
     assert result == type(result)("2\ttwo")
     assert tracker.check(target) == (True, "")
+
+
+@pytest.mark.asyncio
+async def test_prepared_read_binds_the_original_physical_symlink_target(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    inside = workspace / "inside.txt"
+    inside.write_text("inside marker\n", encoding="utf-8")
+    outside.write_text("outside marker\n", encoding="utf-8")
+    alias = workspace / "alias.txt"
+    try:
+        alias.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    tracker = FileReadTracker()
+    registry = ToolRegistry((ReadFileTool(resolver, tracker),))
+    executor = ToolExecutor(registry)
+    prepared = executor.prepare_call(
+        ToolCallPart("read-link", "ReadFile", {"path": "alias.txt"}),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.resource == "inside.txt"
+
+    alias.unlink()
+    alias.symlink_to(outside)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert "inside marker" in result.content
+    assert "outside marker" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_prepared_write_binds_the_original_physical_symlink_target(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    inside = workspace / "inside.txt"
+    inside.write_text("before\n", encoding="utf-8")
+    outside.write_text("outside stays\n", encoding="utf-8")
+    alias = workspace / "alias.txt"
+    try:
+        alias.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    tracker = FileReadTracker()
+    read = ReadFileTool(resolver, tracker)
+    registry = ToolRegistry((WriteFileTool(resolver, tracker),))
+    executor = ToolExecutor(registry)
+    await read.execute({"path": "alias.txt"}, cancellation=CancellationToken())  # type: ignore[arg-type]
+    prepared = executor.prepare_call(
+        ToolCallPart("write-link", "WriteFile", {"path": "alias.txt", "content": "inside changed\n"}),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.resource == "inside.txt"
+
+    alias.unlink()
+    alias.symlink_to(outside)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert inside.read_text(encoding="utf-8") == "inside changed\n"
+    assert outside.read_text(encoding="utf-8") == "outside stays\n"
+
+
+@pytest.mark.asyncio
+async def test_prepared_edit_binds_the_original_physical_symlink_target(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    inside = workspace / "inside.txt"
+    inside.write_text("before\n", encoding="utf-8")
+    outside.write_text("outside stays\n", encoding="utf-8")
+    alias = workspace / "alias.txt"
+    try:
+        alias.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    tracker = FileReadTracker()
+    read = ReadFileTool(resolver, tracker)
+    registry = ToolRegistry((EditFileTool(resolver, tracker),))
+    executor = ToolExecutor(registry)
+    await read.execute({"path": "alias.txt"}, cancellation=CancellationToken())  # type: ignore[arg-type]
+    prepared = executor.prepare_call(
+        ToolCallPart(
+            "edit-link",
+            "EditFile",
+            {"path": "alias.txt", "old_string": "before", "new_string": "inside changed"},
+        ),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.resource == "inside.txt"
+
+    alias.unlink()
+    alias.symlink_to(outside)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert inside.read_text(encoding="utf-8") == "inside changed\n"
+    assert outside.read_text(encoding="utf-8") == "outside stays\n"
+
+
+@pytest.mark.asyncio
+async def test_file_tools_can_operate_on_outside_target_after_scope_classification(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    outside.write_text("outside", encoding="utf-8")
+    resolver, tracker, read, write, _ = _tools(workspace)
+
+    action = read.preflight({"path": str(outside)}).action  # type: ignore[arg-type]
+    assert action.scope is ResourceScope.OUTSIDE
+
+    read_result = await read.execute(
+        {"path": str(outside)},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+    assert read_result.is_error is False
+    assert read_result.content == "1\toutside"
+    assert tracker.check(outside) == (True, "")
+
+    write_action = write.preflight({"path": str(outside)}).action  # type: ignore[arg-type]
+    assert write_action.scope is ResourceScope.OUTSIDE
+    write_result = await write.execute(
+        {"path": str(outside), "content": "changed"},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+    assert write_result.is_error is False
+    assert outside.read_text(encoding="utf-8") == "changed"
 
 
 @pytest.mark.asyncio
