@@ -212,9 +212,10 @@ class UthCodeTUI:
         )
 
     async def shutdown(self) -> None:
+        handle = self._active_handle
         self._closing = True
-        if self._active_handle is not None:
-            self._active_handle.cancel()
+        if handle is not None:
+            handle.cancel()
         task = self._generation_task
         if task is not None and not task.done():
             task.cancel()
@@ -222,6 +223,8 @@ class UthCodeTUI:
                 await task
             except asyncio.CancelledError:
                 pass
+        if handle is not None:
+            await handle.result()
         pending = tuple(task for task in self._background_tasks if not task.done())
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
@@ -591,77 +594,110 @@ class UthCodeTUI:
     async def _consume_turn(self, handle: TurnHandle) -> None:
         renderer = AgentEventRenderer()
         terminal: str | None = None
+        failure_message: str | None = None
+        cancelled = False
+        event_task: asyncio.Task[AgentEvent] | None = None
         try:
-            ticker = asyncio.create_task(self._flush_renderer_periodically(renderer))
-            try:
-                async for event in handle.events():
-                    if not isinstance(event, AgentEvent):
-                        raise RuntimeError("Application returned an invalid AgentEvent")
-                    if event.event_type == "turn_pausing":
-                        self.activity = "pausing…"
-                        self._invalidate()
-                        continue
-                    if event.event_type == "turn_paused":
-                        pause = getattr(event, "pause", None)
-                        if pause is not None:
-                            self.interaction.open_pause(pause)
-                            self._esc.clear()
-                            self.activity = "paused"
-                            self.buffer.set_document(Document("", 0), bypass_readonly=True)
-                            self._invalidate()
-                        continue
-                    if event.event_type == "turn_resumed":
-                        self.interaction.close()
-                        self._esc.clear()
-                        self.activity = "generating"
-                        self._invalidate()
-                        continue
-                    batch = renderer.push(event)
-                    if batch is not None:
+            events = handle.events().__aiter__()
+            while True:
+                event_task = asyncio.create_task(anext(events))
+                while not event_task.done():
+                    done, _pending = await asyncio.wait(
+                        (event_task,),
+                        timeout=renderer.interval_seconds,
+                    )
+                    if done:
+                        break
+                    batch = renderer.flush()
+                    if batch.has_updates:
                         await self._apply_batch(batch)
-                        terminal = batch.terminal or terminal
-            finally:
-                ticker.cancel()
                 try:
-                    await ticker
-                except asyncio.CancelledError:
-                    pass
-        except asyncio.CancelledError:
-            if not self._closing:
-                await self._apply_batch(renderer.flush())
-                await self._flush_streams()
-                self.activity = "cancelled"
-        except ProviderError:
-            if not self._closing:
-                await self._apply_batch(renderer.flush())
-                await self._flush_streams()
-                await self._show_error("生成失败")
-        except Exception as exc:
-            if not self._closing:
-                await self._apply_batch(renderer.flush())
-                await self._flush_streams()
-                await self._show_error(f"生成失败：{type(exc).__name__}")
-        else:
+                    event = event_task.result()
+                except StopAsyncIteration:
+                    event_task = None
+                    break
+                event_task = None
+                if not isinstance(event, AgentEvent):
+                    raise RuntimeError("Application returned an invalid AgentEvent")
+                if event.event_type == "turn_pausing":
+                    self.activity = "pausing…"
+                    self._invalidate()
+                    continue
+                if event.event_type == "turn_paused":
+                    pause = getattr(event, "pause", None)
+                    if pause is not None:
+                        self.interaction.open_pause(pause)
+                        self._esc.clear()
+                        self.activity = "paused"
+                        self.buffer.set_document(Document("", 0), bypass_readonly=True)
+                        self._invalidate()
+                    continue
+                if event.event_type == "turn_resumed":
+                    self.interaction.close()
+                    self._esc.clear()
+                    self.activity = "generating"
+                    self._invalidate()
+                    continue
+                batch = renderer.push(event)
+                if batch is not None:
+                    await self._apply_batch(batch)
+                    terminal = batch.terminal or terminal
+
             if terminal is None and not self._closing:
                 await self._flush_streams()
                 self.activity = "ready"
+        except asyncio.CancelledError:
+            cancelled = True
+        except ProviderError:
+            failure_message = "生成失败"
+        except Exception as exc:
+            failure_message = f"生成失败：{type(exc).__name__}"
         finally:
-            if self._active_handle is handle:
-                self._active_handle = None
-            self.interaction.close()
-            self._generation_task = None
-            self._esc.clear()
-            self._invalidate()
+            if event_task is not None:
+                event_task.cancel()
+                await asyncio.gather(event_task, return_exceptions=True)
+            try:
+                if not self._closing:
+                    if cancelled:
+                        await self._finish_consumer_output(renderer)
+                        self.activity = "cancelled"
+                    elif failure_message is not None:
+                        await self._finish_consumer_output(
+                            renderer,
+                            error_message=failure_message,
+                        )
+            finally:
+                if failure_message is not None or (cancelled and not self._closing):
+                    handle.cancel()
+                await handle.result()
+                if self._active_handle is handle:
+                    self._active_handle = None
+                self.interaction.close()
+                self._generation_task = None
+                self._esc.clear()
+                self._invalidate()
 
-    async def _flush_renderer_periodically(
+    async def _finish_consumer_output(
         self,
         renderer: AgentEventRenderer,
+        *,
+        error_message: str | None = None,
     ) -> None:
-        while True:
-            await asyncio.sleep(renderer.interval_seconds)
-            batch = renderer.flush()
-            if batch.has_updates:
-                await self._apply_batch(batch)
+        """Best-effort UI closure that never owns Application Turn cleanup."""
+
+        try:
+            await self._apply_batch(renderer.flush())
+        except Exception:
+            pass
+        try:
+            await self._flush_streams()
+        except Exception:
+            pass
+        if error_message is not None:
+            try:
+                await self._show_error(error_message)
+            except Exception:
+                pass
 
     async def _apply_batch(self, batch: RenderBatch) -> None:
         self._sync_renderer_width()
@@ -806,8 +842,7 @@ class UthCodeTUI:
             self.interaction.mode is InteractionMode.QUESTIONS
             and self.interaction.other_mode
         ):
-            self.interaction.other_mode = False
-            self.interaction.draft = ""
+            self.interaction.exit_other()
             self._sync_interaction_buffer()
         elif self.interaction.previous_question():
             self._sync_interaction_buffer()

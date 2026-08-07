@@ -309,7 +309,7 @@ def test_exec_projects_tool_activity_without_tool_result_or_arguments() -> None:
     assert provider.requests[1].messages[-1].parts[0].content == secret
 
 
-def test_exec_cancels_turn_when_agent_pauses_for_user_input(
+def test_exec_cancels_turn_when_agent_pauses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cancel_calls = 0

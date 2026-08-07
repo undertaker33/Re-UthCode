@@ -912,7 +912,7 @@ async def test_application_network_retry_rejects_stale_response_without_mutating
 
 
 @pytest.mark.asyncio
-async def test_headless_ask_user_is_application_injected_and_manual_tools_stay_ordinary() -> None:
+async def test_headless_ask_user_round_trip_resumes_same_turn() -> None:
     question = UserQuestion("answer", "Answer", "What should be used?", QuestionKind.TEXT)
     request = UserInputRequest((question,))
     ask_call = ToolCallPart("ask-1", "AskUserQuestion", request.to_dict())
@@ -924,7 +924,8 @@ async def test_headless_ask_user_is_application_injected_and_manual_tools_stay_o
         )
     )
     application = UthCodeApplication(provider)
-    handle = application.create_run().start_turn("ask")
+    run = application.create_run(run_id="ask-run")
+    handle = run.start_turn("ask")
     events_task = asyncio.create_task(_collect(handle))
     for _ in range(100):
         if handle.pending_pause is not None:
@@ -934,6 +935,7 @@ async def test_headless_ask_user_is_application_injected_and_manual_tools_stay_o
     assert pending is not None
     assert pending.kind is PauseKind.USER_INPUT_REQUIRED
     assert pending.tool_call_id == "ask-1"
+    assert pending.run_id == "ask-run"
     assert all(definition.name != ASK_USER_TOOL_DEFINITION.name for definition in application.tool_definitions())
     assert provider.requests[0].tools[-1] == ASK_USER_TOOL_DEFINITION
 
@@ -950,13 +952,114 @@ async def test_headless_ask_user_is_application_injected_and_manual_tools_stay_o
     result = await handle.result()
 
     assert result.status is RunStatus.COMPLETED
+    assert result.run_id == pending.run_id
+    assert result.turn_id == pending.turn_id
+    started = next(event for event in events if isinstance(event, TurnStarted))
+    assert started.run_id == pending.run_id
+    assert started.turn_id == pending.turn_id
     assert provider.requests[1].tools[-1] == ASK_USER_TOOL_DEFINITION
+    assert provider.requests[1].messages[-1].parts[0] == ToolResultPart(
+        "ask-1", '{"answers": {"answer": ["Ada"]}}'
+    )
+    assert provider.requests[1].messages[-1].parts[1] == ToolResultPart(
+        "later-1", "Error: unknown tool: missing", is_error=True
+    )
     assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
         "ask-1",
         "later-1",
     ]
+    event_types = [event.event_type for event in events]
+    assert event_types.count("turn_started") == 1
+    assert event_types.count("turn_paused") == 1
+    assert event_types.count("turn_resumed") == 1
+    assert event_types.count("turn_completed") == 1
+    assert event_types.index("turn_paused") < event_types.index("turn_resumed")
+    assert event_types.index("turn_resumed") < event_types.index("turn_completed")
     assert len([event for event in events if isinstance(event, TurnResumed)]) == 1
     assert len([event for event in events if isinstance(event, TurnCompleted)]) == 1
+
+
+@pytest.mark.asyncio
+async def test_headless_two_ask_user_prompts_resume_fifo_in_one_turn() -> None:
+    first_request = UserInputRequest(
+        (UserQuestion("first", "First", "What is the first value?", QuestionKind.TEXT),)
+    )
+    second_request = UserInputRequest(
+        (UserQuestion("second", "Second", "What is the second value?", QuestionKind.TEXT),)
+    )
+    provider = _ScriptedProvider(
+        (
+            (
+                _response(
+                    ToolCallPart("ask-1", "AskUserQuestion", first_request.to_dict()),
+                    ToolCallPart("ask-2", "AskUserQuestion", second_request.to_dict()),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = UthCodeApplication(provider)
+    run = application.create_run(run_id="two-ask-run")
+    handle = run.start_turn("ask twice")
+    events_task = asyncio.create_task(_collect(handle))
+
+    for _ in range(100):
+        if handle.pending_pause is not None:
+            break
+        await asyncio.sleep(0)
+    first_pause = handle.pending_pause
+    assert first_pause is not None
+    assert first_pause.tool_call_id == "ask-1"
+    assert handle.resume(
+        UserInputResponse(
+            first_pause.pause_id,
+            first_pause.run_id,
+            first_pause.turn_id,
+            "ask-1",
+            {"first": ["Ada"]},
+        )
+    ) is True
+
+    for _ in range(100):
+        pending = handle.pending_pause
+        if pending is not None and pending.tool_call_id == "ask-2":
+            break
+        await asyncio.sleep(0)
+    second_pause = handle.pending_pause
+    assert second_pause is not None
+    assert second_pause.tool_call_id == "ask-2"
+    assert second_pause.pause_id != first_pause.pause_id
+    assert second_pause.run_id == first_pause.run_id == "two-ask-run"
+    assert second_pause.turn_id == first_pause.turn_id
+    assert handle.resume(
+        UserInputResponse(
+            second_pause.pause_id,
+            second_pause.run_id,
+            second_pause.turn_id,
+            "ask-2",
+            {"second": ["Grace"]},
+        )
+    ) is True
+
+    events = await events_task
+    result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.run_id == first_pause.run_id
+    assert result.turn_id == first_pause.turn_id
+    assert len(provider.requests) == 2
+    assert provider.requests[1].messages[-1].parts == (
+        ToolResultPart("ask-1", '{"answers": {"first": ["Ada"]}}'),
+        ToolResultPart("ask-2", '{"answers": {"second": ["Grace"]}}'),
+    )
+    assert [
+        event.tool_call_id for event in events if isinstance(event, ToolFinished)
+    ] == ["ask-1", "ask-2"]
+    event_types = [event.event_type for event in events]
+    assert event_types.count("turn_paused") == 2
+    assert event_types.count("turn_resumed") == 2
+    assert event_types.count("turn_completed") == 1
 
 
 @pytest.mark.asyncio

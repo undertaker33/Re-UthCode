@@ -25,10 +25,12 @@ from uthcode.application import (
     QuestionOption,
     QuestionKind,
     RetryProviderResponse,
+    RunStatus,
     TextDelta,
     TextPart,
     TurnHandle,
     ToolCallPart,
+    ToolResultPart,
     Usage,
     UthCodeApplication,
     UserInputRequest,
@@ -50,6 +52,7 @@ from uthcode.interfaces.tui.app import (
 )
 from uthcode.interfaces.tui.interaction import InteractionMode, TuiInteractionState
 from uthcode.interfaces.tui.rendering import (
+    AgentEventRenderer,
     MarkdownStream,
     RenderBatch,
     TextUpdate,
@@ -212,6 +215,50 @@ async def _stop_tui(
     pipe_context.__exit__(None, None, None)
 
 
+async def _assert_tui_shutdown_cleanup(
+    tui: UthCodeTUI,
+    run: AgentRun,
+    handle: TurnHandle,
+) -> None:
+    driver = handle._driver
+    assert driver._result_future is not None
+    assert driver._result_future.done()
+    result = await handle.result()
+    assert result.status is RunStatus.CANCELLED
+    assert run._active_turn is None
+    assert handle.pending_pause is None
+    assert tui._generation_task is None
+    assert tui._active_handle is None
+    assert not tui._background_tasks
+    assert driver._task is None
+    assert driver._response_waiter is None
+    assert driver._segment_signal is None
+
+
+async def _assert_consumer_failure_cleanup(
+    tui: UthCodeTUI,
+    run: AgentRun,
+    handle: TurnHandle,
+    task: asyncio.Task[None],
+) -> None:
+    assert task.done()
+    assert not task.cancelled()
+    assert task.exception() is None
+    driver = handle._driver
+    assert driver._result_future is not None
+    assert driver._result_future.done()
+    result = await handle.result()
+    assert result.status is RunStatus.CANCELLED
+    assert run._active_turn is None
+    assert handle.pending_pause is None
+    assert driver._task is None
+    assert driver._response_waiter is None
+    assert driver._segment_signal is None
+    assert tui._active_handle is None
+    assert tui._generation_task is None
+    assert not tui._background_tasks
+
+
 def test_grapheme_backspace_lengths_cover_chinese_combining_and_emoji() -> None:
     assert previous_grapheme_length("你好") == 1
     assert previous_grapheme_length("e\u0301") == 2
@@ -293,6 +340,58 @@ def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
     response = state.user_input_response()
     assert response is not None
     assert response.answers["other"] == ["a partner"]
+
+
+def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None:
+    question = UserQuestion(
+        "mode",
+        "Mode",
+        "Choose a mode",
+        QuestionKind.SINGLE_SELECT,
+        (
+            QuestionOption("fast", "Fast mode"),
+            QuestionOption("safe", "Safe mode"),
+        ),
+        allow_other=True,
+    )
+    pause = PauseRequest(
+        "pause",
+        "run",
+        "turn",
+        PauseKind.USER_INPUT_REQUIRED,
+        PauseReason.USER_INPUT_REQUIRED,
+        1,
+        "now",
+        "call",
+        UserInputRequest((question,)),
+    )
+    state = TuiInteractionState()
+    state.open_pause(pause)
+
+    state.move(1)
+    assert state.toggle_option() is True
+    state.move(1)
+    assert state.option_index == len(question.options)
+    assert state.choose_other() is True
+    state.set_draft("custom")
+
+    assert state.exit_other() is True
+    assert state.other_mode is False
+    assert state.draft == ""
+    assert state.option_index == 1
+    assert state.selected_options == {1}
+    assert 0 <= state.option_index < len(question.options)
+
+    state.open_pause(pause)
+    state.move(len(question.options))
+    assert state.choose_other() is True
+    state.set_draft("custom")
+    assert state.exit_other() is True
+    assert state.other_mode is False
+    assert state.draft == ""
+    assert state.option_index == 0
+    assert state.selected_options == set()
+    assert 0 <= state.option_index < len(question.options)
 
 
 def test_markdown_stream_waits_for_real_fence_closure() -> None:
@@ -651,6 +750,98 @@ async def test_tui_double_escape_pauses_and_resume_keeps_the_turn_alive() -> Non
 
 
 @pytest.mark.asyncio
+async def test_tui_pause_resume_and_ask_user_pilot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCallPart(
+        "ask-1",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "Value",
+                    "question": "What value should be used?",
+                    "kind": "text",
+                }
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        (
+            (_completed("discarded before pause"),),
+            (_completed("need input", call, finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed("已完成"),),
+        ),
+        delays=(5.0, 0.0, 0.0),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    started_handles: list[TurnHandle] = []
+    original_start_turn = AgentRun.start_turn
+
+    def record_start(run: AgentRun, prompt: str) -> TurnHandle:
+        handle = original_start_turn(run, prompt)
+        started_handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(AgentRun, "start_turn", record_start)
+    tui, pipe_state, task, output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(lambda: tui._active_handle is not None and len(provider.requests) == 1)
+        pipe.send_text("\x1b\x1b")
+        await _wait_until(
+            lambda: tui._active_handle is not None
+            and tui._active_handle.pending_pause is not None
+            and tui.activity == "paused",
+            attempts=500,
+        )
+        handle = tui._active_handle
+        assert handle is not None
+        assert len(started_handles) == 1
+        assert not handle.cancelled()
+
+        # Resume the same Turn through the public TUI action menu.  The retry
+        # reaches a second pause for AskUserQuestion without starting a new Turn.
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._active_handle is handle
+            and tui.interaction.mode is InteractionMode.QUESTIONS
+            and handle.pending_pause is not None
+            and len(provider.requests) == 2,
+            attempts=500,
+        )
+        pipe.send_text("答案\r")
+        await _wait_until(lambda: tui.interaction.mode is InteractionMode.REVIEW)
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._generation_task is None
+            and tui._active_handle is None
+            and tui.interaction.mode is InteractionMode.CLOSED,
+            attempts=500,
+        )
+
+        assert len(started_handles) == 1
+        assert len(provider.requests) == 3
+        assert "已完成" in output.getvalue()
+        assert provider.requests[2].messages[-1].parts == (
+            ToolResultPart("ask-1", '{"answers": {"q1": ["答案"]}}'),
+        )
+        assert not tui._background_tasks
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
 async def test_tui_pause_cancel_cleans_turn_without_saved_state() -> None:
     provider = _ScriptedProvider(
         ((_completed("不会完成"),), (_completed("不会完成"),)),
@@ -686,6 +877,298 @@ async def test_tui_pause_cancel_cleans_turn_without_saved_state() -> None:
         assert not tui._background_tasks
     finally:
         await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_tui_shutdown_waits_for_active_turn_terminal_and_releases_run() -> None:
+    provider = _ScriptedProvider(
+        (
+            (_completed("cancelled response"),),
+            (_completed("after shutdown"),),
+        ),
+        delays=(5.0, 0.0),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(
+            lambda: tui._active_handle is not None and bool(provider.requests),
+            attempts=500,
+        )
+        handle = tui._active_handle
+        assert handle is not None
+        run = tui._run
+
+        await tui.shutdown()
+
+        await _assert_tui_shutdown_cleanup(tui, run, handle)
+        next_handle = run.start_turn("after shutdown")
+        assert (await next_handle.result()).status is RunStatus.COMPLETED
+        await tui.shutdown()
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause_case", ("user_requested", "ask_user"))
+async def test_tui_shutdown_cleans_paused_or_ask_user_turn_and_is_idempotent(
+    pause_case: str,
+) -> None:
+    ask_call = ToolCallPart(
+        "ask-shutdown",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "Value",
+                    "question": "What value should be used?",
+                    "kind": "text",
+                }
+            ]
+        },
+    )
+    if pause_case == "user_requested":
+        provider = _ScriptedProvider(
+            ((_completed("paused response"),),),
+            delays=(5.0,),
+        )
+    else:
+        provider = _ScriptedProvider(
+            ((_completed("need input", ask_call, finish_reason=FinishReason.TOOL_CALLS),),)
+        )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        if pause_case == "user_requested":
+            await _wait_until(
+                lambda: tui._active_handle is not None and bool(provider.requests),
+                attempts=500,
+            )
+            pipe.send_text("\x1b\x1b")
+            await _wait_until(
+                lambda: tui._active_handle is not None
+                and tui._active_handle.pending_pause is not None
+                and tui.activity == "paused",
+                attempts=500,
+            )
+        else:
+            await _wait_until(
+                lambda: tui.interaction.mode is InteractionMode.QUESTIONS,
+                attempts=500,
+            )
+        handle = tui._active_handle
+        assert handle is not None
+        assert handle.pending_pause is not None
+        run = tui._run
+
+        await tui.shutdown()
+
+        await _assert_tui_shutdown_cleanup(tui, run, handle)
+        await tui.shutdown()
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_tui_renderer_failure_closes_application_turn_before_dropping_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_completed("cancelled response"),),
+            (_completed("next turn"),),
+        ),
+        delays=(5.0, 0.0),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+
+    def fail_projection(
+        self: AgentEventRenderer,
+        event: object,
+    ) -> RenderBatch | None:
+        del self, event
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(AgentEventRenderer, "push", fail_projection)
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    tui._start_generation("hello")
+    handle = tui._active_handle
+    task = tui._generation_task
+    assert handle is not None
+    assert task is not None
+    run = tui._run
+
+    await task
+
+    await _assert_consumer_failure_cleanup(tui, run, handle, task)
+    next_handle = run.start_turn("after failure")
+    assert (await next_handle.result()).status is RunStatus.COMPLETED
+    await tui.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tui_periodic_flush_failure_closes_stalled_application_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(
+        ((_completed("cancelled response"),),),
+        delays=(5.0,),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+
+    def fail_flush(self: AgentEventRenderer) -> RenderBatch:
+        del self
+        raise RuntimeError("periodic flush failed")
+
+    monkeypatch.setattr(AgentEventRenderer, "flush", fail_flush)
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    tui._start_generation("hello")
+    handle = tui._active_handle
+    task = tui._generation_task
+    assert handle is not None
+    assert task is not None
+    run = tui._run
+
+    await task
+
+    await _assert_consumer_failure_cleanup(tui, run, handle, task)
+    await tui.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tui_secondary_error_display_failure_still_closes_application_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(
+        ((_completed("cancelled response"),),),
+        delays=(5.0,),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+
+    def fail_projection(
+        self: AgentEventRenderer,
+        event: object,
+    ) -> RenderBatch | None:
+        del self, event
+        raise RuntimeError("projection failed")
+
+    async def fail_error_display(text: str) -> None:
+        del text
+        raise RuntimeError("error display failed")
+
+    monkeypatch.setattr(AgentEventRenderer, "push", fail_projection)
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    monkeypatch.setattr(tui, "_show_error", fail_error_display)
+    tui._start_generation("hello")
+    handle = tui._active_handle
+    task = tui._generation_task
+    assert handle is not None
+    assert task is not None
+    run = tui._run
+
+    await task
+
+    await _assert_consumer_failure_cleanup(tui, run, handle, task)
+    await tui.shutdown()
+    await tui.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tui_ask_user_projection_failure_clears_pending_waiter_and_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ask_call = ToolCallPart(
+        "ask-consumer-failure",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "Value",
+                    "question": "What value should be used?",
+                    "kind": "text",
+                }
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        ((_completed("need input", ask_call, finish_reason=FinishReason.TOOL_CALLS),),)
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+
+    def fail_open_pause(
+        self: TuiInteractionState,
+        pause: PauseRequest,
+    ) -> None:
+        del self, pause
+        raise RuntimeError("interaction projection failed")
+
+    monkeypatch.setattr(TuiInteractionState, "open_pause", fail_open_pause)
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    tui._start_generation("hello")
+    handle = tui._active_handle
+    task = tui._generation_task
+    assert handle is not None
+    assert task is not None
+    run = tui._run
+
+    await task
+
+    await _assert_consumer_failure_cleanup(tui, run, handle, task)
+    await tui.shutdown()
 
 
 @pytest.mark.asyncio
@@ -738,6 +1221,115 @@ async def test_tui_pause_question_panel_submits_through_application_turn() -> No
             "答案" in getattr(part, "content", "")
             for part in provider.requests[1].messages[-1].parts
         )
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCallPart(
+        "ask-other",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "mode",
+                    "header": "Mode",
+                    "question": "Choose a mode.",
+                    "kind": "single_select",
+                    "options": [
+                        {"label": "fast", "description": "Fast"},
+                        {"label": "safe", "description": "Safe"},
+                    ],
+                    "allow_other": True,
+                }
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        (
+            (_completed("need mode", call, finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed("done"),),
+        )
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    started_handles: list[TurnHandle] = []
+    resume_calls: list[object] = []
+    original_start_turn = AgentRun.start_turn
+    original_resume = TurnHandle.resume
+
+    def record_start(run: AgentRun, prompt: str) -> TurnHandle:
+        handle = original_start_turn(run, prompt)
+        started_handles.append(handle)
+        return handle
+
+    def record_resume(handle: TurnHandle, response: object) -> bool:
+        resume_calls.append(response)
+        return original_resume(handle, response)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(AgentRun, "start_turn", record_start)
+    monkeypatch.setattr(TurnHandle, "resume", record_resume)
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(
+            lambda: tui.interaction.mode is InteractionMode.QUESTIONS,
+            attempts=500,
+        )
+        question = tui.interaction.current_question
+        assert question is not None
+        tui.interaction.move(len(question.options))
+        assert tui.interaction.option_index == len(question.options)
+        assert tui.interaction.toggle_option() is True
+        assert tui.interaction.other_mode is True
+        pipe.send_text("custom-owner")
+        await _wait_until(lambda: tui.buffer.text == "custom-owner")
+
+        pipe.send_text("\x1b[27u")
+        await _wait_until(
+            lambda: not tui.interaction.other_mode
+            and tui.buffer.text == ""
+            and 0 <= tui.interaction.option_index < len(question.options),
+            attempts=500,
+        )
+        assert tui.interaction.draft == ""
+        assert tui.interaction.selected_options == set()
+        assert resume_calls == []
+
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui.interaction.mode is InteractionMode.REVIEW)
+        assert tui.interaction.answers["mode"] == ["fast"]
+        assert resume_calls == []
+
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._generation_task is None
+            and tui._active_handle is None
+            and tui.interaction.mode is InteractionMode.CLOSED
+            and not tui._background_tasks,
+            attempts=500,
+        )
+        assert len(started_handles) == 1
+        assert len(provider.requests) == 2
+        assert len(resume_calls) == 1
+        response = resume_calls[0]
+        assert type(response).__name__ == "UserInputResponse"
+        assert response.answers["mode"] == ["fast"]  # type: ignore[union-attr]
+        assert provider.requests[1].messages[-1].parts == (
+            ToolResultPart("ask-other", '{"answers": {"mode": ["fast"]}}'),
+        )
+        assert "custom-owner" not in provider.requests[1].messages[-1].parts[0].content
     finally:
         await _stop_tui(tui, pipe_state, task)
 
@@ -1113,30 +1705,43 @@ def test_transient_height_budget_fits_small_terminal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stalled_stream_delta_reaches_temporary_preview() -> None:
-    class FlushProbe:
-        interval_seconds = 0.01
+async def test_stalled_stream_delta_reaches_temporary_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(
+        ((_completed("done"),),),
+        delays=(0.2,),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    original_flush = AgentEventRenderer.flush
+    sent = False
 
-        def __init__(self) -> None:
-            self.sent = False
-
-        def flush(self) -> RenderBatch:
-            if self.sent:
-                return RenderBatch()
-            self.sent = True
+    def flush_with_partial(renderer: AgentEventRenderer) -> RenderBatch:
+        nonlocal sent
+        if not sent:
+            sent = True
             return RenderBatch(
                 text=(TextUpdate("assistant", "assistant", "partial"),)
             )
+        return original_flush(renderer)
 
-    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
-    probe = FlushProbe()
-    task = asyncio.create_task(tui._flush_renderer_periodically(probe))  # type: ignore[arg-type]
-    try:
-        await _wait_until(lambda: tui._pending_text() == "partial")
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    monkeypatch.setattr(AgentEventRenderer, "flush", flush_with_partial)
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    tui._start_generation("hello")
+    task = tui._generation_task
+    assert task is not None
+
+    await _wait_until(lambda: tui._pending_text() == "partial")
+    await tui.shutdown()
+    await task
 
 
 @pytest.mark.asyncio

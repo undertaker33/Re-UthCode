@@ -322,6 +322,41 @@ def test_runtime_source_contains_no_graph_or_compatibility_names() -> None:
     assert (SRC / "interfaces").is_dir()
 
 
+def test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path() -> None:
+    core_pause_sources = (
+        SRC / "core" / "agent.py",
+        SRC / "core" / "interaction.py",
+    )
+    forbidden_async_names = {"Future", "Event", "Queue", "Task", "Lock"}
+    for source_path in core_pause_sources:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        asyncio_imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "asyncio"
+            for alias in node.names
+        }
+        assert not asyncio_imported_names.intersection(forbidden_async_names), source_path
+        assert not {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+        }.intersection(forbidden_async_names), source_path
+
+    integration_sources = (SRC / "integrations").rglob("*.py")
+    assert not any(
+        "AskUserQuestion" in source_path.read_text(encoding="utf-8")
+        or "ASK_USER_TOOL_DEFINITION" in source_path.read_text(encoding="utf-8")
+        for source_path in integration_sources
+    )
+
+    application_tools = (SRC / "application" / "tools.py").read_text(encoding="utf-8")
+    generation = (SRC / "application" / "generation.py").read_text(encoding="utf-8")
+    assert "AskUserQuestion is reserved for the Application Agent path" in application_tools
+    assert "AskUserQuestion is not available through manual Tool execution" in application_tools
+    assert "ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)" in generation
+
+
 def test_protocol_wire_fields_stay_in_their_physical_modules() -> None:
     paths = {
         "anthropic": PROVIDER_ROOT / "anthropic.py",
