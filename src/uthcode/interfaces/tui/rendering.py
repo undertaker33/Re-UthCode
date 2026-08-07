@@ -36,10 +36,11 @@ class RenderBatch:
     tools: tuple[ToolUpdate, ...] = ()
     terminal: str | None = None
     final_text: str | None = None
+    activity: str | None = None
 
     @property
     def has_updates(self) -> bool:
-        return bool(self.users or self.text or self.tools or self.terminal)
+        return bool(self.users or self.text or self.tools or self.terminal or self.activity)
 
 
 @dataclass(slots=True)
@@ -196,6 +197,12 @@ class AgentEventRenderer:
                 status,
             )
             return replace(batch, tools=batch.tools + (update,))
+        if event_type == "turn_pausing":
+            return replace(self.flush(), activity="pausing…")
+        if event_type == "turn_paused":
+            return replace(self.flush(), activity="paused")
+        if event_type == "turn_resumed":
+            return replace(self.flush(), activity="generating")
         if event_type == "turn_completed":
             return replace(
                 self.flush(),

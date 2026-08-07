@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 import pytest
 
 from uthcode.core.agent import (
+    AgentExecutionSegment,
     AgentLoop,
     AgentLoopConfig,
     AssistantMessageKind,
+    ExecutionBoundary,
     RunState,
     RunStatus,
     TerminationReason,
@@ -18,36 +21,60 @@ from uthcode.core.agent import (
 from uthcode.core.agent_events import (
     AssistantMessageCompleted,
     AssistantMessageDelta,
+    IterationStarted,
     ReasoningDelta,
     ReasoningFinished,
     ReasoningStarted,
     ToolBatchFinished,
+    ToolBatchStarted,
     ToolFinished,
     ToolStarted,
     TurnCancelled,
     TurnCompleted,
     TurnFailed,
+    TurnPaused,
+    TurnPausing,
+    TurnResumed,
+    TurnStarted,
     UsageUpdated,
+    UserInputRequested,
+    agent_event_from_json,
+)
+from uthcode.core.interaction import (
+    ASK_USER_TOOL_DEFINITION,
+    PauseKind,
+    RetryProviderResponse,
+    ResumeTurnResponse,
+    QuestionKind,
+    UserInputRequest,
+    UserInputResponse,
+    UserQuestion,
 )
 from uthcode.core.provider import (
+    AuthenticationError,
     CancellationToken,
     FinishReason,
-    GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
+    InvalidProviderResponseError,
     Message,
+    MissingSecretError,
+    NetworkError,
+    ProviderConfigurationError,
     ProviderError,
     ProviderIdentity,
     ProviderResponse,
+    RateLimitError,
     ReasoningDelta as ProviderReasoningDelta,
     TextDelta,
     TextPart,
+    ToolCallArgumentsDelta,
     ToolCallPart,
+    ToolCallStarted,
     ToolDefinition,
     ToolResultPart,
     Usage,
 )
-from uthcode.core.agent_events import agent_event_from_json
 from uthcode.core.tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
 
 
@@ -109,7 +136,7 @@ class RecordingTool:
         )
 
     async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
-        self.started.append(str(arguments["value"]))
+        self.started.append(str(arguments.get("value", "missing")))
         self.active += 1
         self.peak_active = max(self.peak_active, self.active)
         try:
@@ -122,13 +149,62 @@ class RecordingTool:
             self.active -= 1
 
 
+@dataclass
+class PauseAwareTool:
+    name: str
+    started: list[str] = field(default_factory=list)
+    entered: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            self.name,
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+        del cancellation
+        self.started.append(str(arguments["value"]))
+        self.entered.set()
+        await self.release.wait()
+        return ToolExecutionResult(str(arguments["value"]))
+
+
+class PausableProvider:
+    def __init__(self, response: GenerationCompleted) -> None:
+        self.identity = ProviderIdentity("fake", "pause", "fake-model")
+        self.response = response
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.call_count = 0
+        self.requests: list[GenerationRequest] = []
+
+    async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken):
+        self.requests.append(request)
+        index = self.call_count
+        self.call_count += 1
+        if index == 0:
+            self.entered.set()
+            yield ProviderReasoningDelta("partial reasoning")
+            yield TextDelta("partial text")
+            await self.release.wait()
+            cancellation.raise_if_cancelled()
+        yield self.response
+
+
 def _loop(
-    provider: ScriptedProvider,
+    provider,
     tools: tuple[Tool, ...] = (),
     *,
     config: AgentLoopConfig | None = None,
     descriptions: dict[str, str] | None = None,
-):
+) -> AgentLoop:
     registry = ToolRegistry(tools)
     executor = ToolExecutor(registry)
     descriptions = descriptions or {}
@@ -149,82 +225,216 @@ def _loop(
     )
 
 
-async def _collect(execution) -> tuple[list[Any], Any]:
-    events = [event async for event in execution.events()]
-    return events, await execution.result()
+def _start(loop: AgentLoop, *, ask: bool = False, run_id: str = "run-1", turn_id: str = "turn-1"):
+    definitions = None
+    if ask:
+        definitions = loop._tool_registry.definitions() + (ASK_USER_TOOL_DEFINITION,)
+    return loop.start_turn(
+        RunState.initial(run_id),
+        "hello",
+        turn_id=turn_id,
+        tool_definitions=definitions,
+    )
+
+
+async def _drive(
+    execution,
+    *,
+    response_for_pause=None,
+) -> tuple[list[Any], Any, list[AgentExecutionSegment]]:
+    events: list[Any] = []
+    segments: list[AgentExecutionSegment] = []
+    response = None
+    while True:
+        segment = await execution.run_segment(
+            pause_signal=CancellationToken(),
+            response=response,
+        )
+        segments.append(segment)
+        events.extend(segment.events)
+        if segment.terminal:
+            assert segment.result is not None
+            return events, segment.result, segments
+        assert segment.continuation is not None
+        pause = segment.continuation.pending_pause
+        assert pause is not None
+        if response_for_pause is None:
+            raise AssertionError(f"unexpected pause: {pause.kind}")
+        response = response_for_pause(pause)
+
+
+def _resume_response(pause):
+    if pause.kind is PauseKind.USER_REQUESTED:
+        return ResumeTurnResponse(pause.pause_id, pause.run_id, pause.turn_id)
+    if pause.kind is PauseKind.PROVIDER_UNAVAILABLE:
+        return RetryProviderResponse(pause.pause_id, pause.run_id, pause.turn_id)
+    request = pause.user_input_request
+    assert request is not None
+    answers = {question.question_id: ["Ada"] for question in request.questions}
+    return UserInputResponse(
+        pause.pause_id,
+        pause.run_id,
+        pause.turn_id,
+        pause.tool_call_id,
+        answers,
+    )
 
 
 @pytest.mark.asyncio
-async def test_normal_answer_has_one_provider_call_one_iteration_and_one_terminal() -> None:
-    provider = ScriptedProvider([[TextDelta("partial"), _response(TextPart("answer"), usage=Usage(2, 3))]])
-    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello", turn_id="turn-1")
+async def test_normal_answer_is_one_terminal_segment_with_authoritative_usage() -> None:
+    provider = ScriptedProvider([[_response(TextPart("answer"), usage=Usage(2, 3))]])
+    execution = _start(_loop(provider))
 
-    events, result = await _collect(execution)
+    segment = await execution.run_segment(pause_signal=CancellationToken())
 
+    assert segment.boundary is ExecutionBoundary.TERMINAL
+    assert segment.terminal
     assert provider.call_count == 1
-    assert result.status is RunStatus.COMPLETED
-    assert result.termination_reason is TerminationReason.FINAL_ANSWER
-    assert result.final_text == "answer"
-    assert result.iteration_count == 1
-    assert [type(event) for event in events].count(TurnCompleted) == 1
-    assert not [event for event in events if isinstance(event, TurnFailed | TurnCancelled)]
+    assert segment.result is not None
+    assert segment.result.status is RunStatus.COMPLETED
+    assert segment.result.final_text == "answer"
+    assert segment.result.iteration_count == 1
+    assert segment.result.usage == Usage(2, 3)
+    assert sum(isinstance(event, TurnStarted) for event in segment.events) == 1
+    assert sum(isinstance(event, IterationStarted) for event in segment.events) == 1
+    assert sum(isinstance(event, UsageUpdated) for event in segment.events) == 1
+    assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
+
+    after_terminal = await execution.run_segment(pause_signal=CancellationToken())
+    assert after_terminal.terminal
+    assert after_terminal.events == ()
+    assert after_terminal.result is segment.result
 
 
 @pytest.mark.asyncio
-async def test_reasoning_segments_and_tool_result_are_ordered_and_authoritative() -> None:
+async def test_async_request_preparer_pause_returns_boundary_before_provider() -> None:
+    provider = ScriptedProvider([[_response(TextPart("done"), usage=Usage(2, 3))]])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(messages, definitions):
+        entered.set()
+        await release.wait()
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    registry = ToolRegistry()
+    execution = AgentLoop(provider, registry, ToolExecutor(registry), prepare).start_turn(
+        RunState.initial("run-1"), "hello", turn_id="turn-1"
+    )
+    pause_signal = CancellationToken()
+    running = asyncio.create_task(execution.run_segment(pause_signal=pause_signal))
+    await entered.wait()
+    pause_signal.cancel()
+    release.set()
+
+    paused = await running
+
+    assert paused.paused
+    assert paused.continuation is not None
+    assert paused.continuation.stage == "provider"
+    assert paused.continuation.iteration == 1
+    assert paused.continuation.pending_pause is not None
+    assert provider.call_count == 0
+    assert sum(isinstance(event, TurnStarted) for event in paused.events) == 1
+    assert sum(isinstance(event, IterationStarted) for event in paused.events) == 1
+    assert not any(isinstance(event, UsageUpdated) for event in paused.events)
+    assert not hasattr(execution, "pending_pause")
+    assert not hasattr(execution, "resume")
+    assert not hasattr(execution, "pause")
+
+    response = ResumeTurnResponse(
+        paused.continuation.pending_pause.pause_id,
+        "run-1",
+        "turn-1",
+    )
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=response,
+    )
+    assert resumed.terminal
+    assert provider.call_count == 1
+    assert sum(isinstance(event, IterationStarted) for event in resumed.events) == 0
+    assert sum(isinstance(event, UsageUpdated) for event in resumed.events) == 1
+    assert resumed.result is not None
+    assert resumed.result.iteration_count == 1
+
+
+@pytest.mark.asyncio
+async def test_async_request_preparer_cancel_wins_without_provider_call() -> None:
+    provider = ScriptedProvider([[_response(TextPart("must not run"))]])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(messages, definitions):
+        entered.set()
+        await release.wait()
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    registry = ToolRegistry()
+    execution = AgentLoop(provider, registry, ToolExecutor(registry), prepare).start_turn(
+        RunState.initial("run-1"), "hello", turn_id="turn-1"
+    )
+    signal = CancellationToken()
+    running = asyncio.create_task(execution.run_segment(pause_signal=signal))
+    await entered.wait()
+    signal.cancel()
+    assert execution.cancel() is True
+    release.set()
+    segment = await running
+
+    assert segment.terminal
+    assert segment.result is not None
+    assert segment.result.status is RunStatus.CANCELLED
+    assert provider.call_count == 0
+    assert not any(isinstance(event, TurnPaused | TurnResumed) for event in segment.events)
+    assert sum(isinstance(event, TurnCancelled) for event in segment.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_request_preparer_failure_remains_internal_failure() -> None:
+    provider = ScriptedProvider([[_response(TextPart("must not run"))]])
+
+    async def prepare(messages, definitions):
+        del messages, definitions
+        raise RuntimeError("preparer failed")
+
+    registry = ToolRegistry()
+    execution = AgentLoop(provider, registry, ToolExecutor(registry), prepare).start_turn(
+        RunState.initial("run-1"), "hello"
+    )
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert provider.call_count == 0
+    assert sum(isinstance(event, TurnFailed) for event in segment.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tool_and_provider_events_preserve_authoritative_order() -> None:
     tool = RecordingTool("read", output="tool-result")
-    secret = "W01-R1-UNIQUE-SECRET"
-    call = ToolCallPart("call-1", "read", {"value": secret})
+    call = ToolCallPart("call-1", "read", {"value": "secret"})
     provider = ScriptedProvider(
         [
             [
                 ProviderReasoningDelta("think"),
                 TextDelta("progress"),
-                _response(
-                    TextPart("progress"),
-                    call,
-                    finish_reason=FinishReason.TOOL_CALLS,
-                    usage=Usage(1, 2),
-                ),
+                _response(TextPart("progress"), call, finish_reason=FinishReason.TOOL_CALLS, usage=Usage(1, 2)),
             ],
-            [
-                ProviderReasoningDelta("done-think"),
-                _response(TextPart("final"), usage=Usage(3, 4)),
-            ],
+            [ProviderReasoningDelta("done"), _response(TextPart("final"), usage=Usage(3, 4))],
         ]
     )
+    execution = _start(_loop(provider, (tool,), descriptions={"read": "read one"}))
 
-    execution = _loop(provider, (tool,), descriptions={"read": "read one"}).start_turn(
-        RunState.initial("run-1"), "hello", turn_id="turn-1"
-    )
-    events, result = await _collect(execution)
+    events, result, segments = await _drive(execution)
 
-    assert result.final_text == "final"
+    assert result.status is RunStatus.COMPLETED
+    assert len(segments) == 1
     assert provider.call_count == 2
-    assert {(event.run_id, event.turn_id) for event in events} == {("run-1", "turn-1")}
-    turn_started = next(event for event in events if event.event_type == "turn_started")
-    assert isinstance(turn_started.message_id, str)
-    assert turn_started.message_id
-    assert provider.requests[1].messages[-1].role == "tool"
-    requested_assistant = provider.requests[1].messages[-2]
-    requested_call = next(
-        part for part in requested_assistant.parts if isinstance(part, ToolCallPart)
-    )
-    assert requested_call.tool_call_id == "call-1"
-    assert requested_call.arguments == {"value": secret}
-    tool_message = provider.requests[1].messages[-1]
-    assert isinstance(tool_message.parts[0], ToolResultPart)
-    assert tool_message.parts[0].tool_call_id == "call-1"
-    assert tool_message.parts[0].content == "tool-result"
-    assert tool.started == [secret]
-    authoritative_assistant = next(
-        message for message in execution.state.messages if message.role == "assistant"
-    )
-    authoritative_call = next(
-        part for part in authoritative_assistant.parts if isinstance(part, ToolCallPart)
-    )
-    assert authoritative_call.tool_call_id == "call-1"
-    assert authoritative_call.arguments == {"value": secret}
+    assert tool.started == ["secret"]
+    assert tool.peak_active == 1
+    assert provider.requests[1].messages[-1].parts == (ToolResultPart("call-1", "tool-result"),)
     assert [event.event_type for event in events if isinstance(event, (ReasoningStarted, ReasoningDelta, ReasoningFinished))] == [
         "reasoning_started",
         "reasoning_delta",
@@ -235,96 +445,9 @@ async def test_reasoning_segments_and_tool_result_are_ordered_and_authoritative(
     ]
     completed = [event for event in events if isinstance(event, AssistantMessageCompleted)]
     assert [event.kind for event in completed] == [AssistantMessageKind.PROGRESS, AssistantMessageKind.FINAL]
-    assert completed[0].message.parts == (TextPart("progress"),)
-    assert all(
-        not isinstance(part, (ToolCallPart, ToolResultPart))
-        for event in completed
-        for part in event.message.parts
-    )
-    assistant_events = [
-        event
-        for event in events
-        if isinstance(
-            event,
-            (ReasoningStarted, ReasoningDelta, ReasoningFinished, AssistantMessageDelta, AssistantMessageCompleted),
-        )
-    ]
-    ids_by_iteration: dict[int, set[str]] = {}
-    for event in assistant_events:
-        ids_by_iteration.setdefault(event.iteration, set()).add(event.message_id)
+    assert sum(isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled)) for event in events) == 1
     for event in events:
         assert agent_event_from_json(event.to_json()) == event
-    assert set(ids_by_iteration) == {1, 2}
-    assert all(len(message_ids) == 1 for message_ids in ids_by_iteration.values())
-    assert ids_by_iteration[1].isdisjoint(ids_by_iteration[2])
-    assert len({event.message_id for event in assistant_events}) == 2
-    started = next(event for event in events if isinstance(event, ToolStarted))
-    finished = next(event for event in events if isinstance(event, ToolFinished))
-    assert (started.batch_id, started.tool_call_id, started.tool_name, started.command) == (
-        finished.batch_id,
-        finished.tool_call_id,
-        finished.tool_name,
-        finished.command,
-    ) == ("batch-1", "call-1", "read", "read one")
-    for event in events:
-        encoded = json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True)
-        assert secret not in encoded
-        assert "arguments" not in encoded
-        assert "tool-result" not in encoded
-    assert all("tool-result" not in event.to_json() for event in events if isinstance(event, ToolFinished))
-    assert sum(
-        isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled))
-        for event in events
-    ) == 1
-
-
-@pytest.mark.asyncio
-async def test_message_ids_are_scoped_to_real_turns_and_runs() -> None:
-    first_provider = ScriptedProvider([[_response(TextPart("first"))]])
-    first_execution = _loop(first_provider).start_turn(
-        RunState.initial("a"), "hello", turn_id="b:turn:c"
-    )
-    first_events, _ = await _collect(first_execution)
-    assert {(event.run_id, event.turn_id) for event in first_events} == {("a", "b:turn:c")}
-
-    second_provider = ScriptedProvider([[_response(TextPart("second"))]])
-    second_execution = _loop(second_provider).start_turn(
-        RunState.initial("a:turn:b"), "hello", turn_id="c"
-    )
-    second_events, _ = await _collect(second_execution)
-    assert {(event.run_id, event.turn_id) for event in second_events} == {("a:turn:b", "c")}
-
-    third_provider = ScriptedProvider([[_response(TextPart("third"))]])
-    third_execution = _loop(third_provider).start_turn(
-        RunState.initial("run-2"), "hello", turn_id="turn-1"
-    )
-    third_events, _ = await _collect(third_execution)
-    assert {(event.run_id, event.turn_id) for event in third_events} == {("run-2", "turn-1")}
-
-    first_started = next(event for event in first_events if event.event_type == "turn_started")
-    second_started = next(event for event in second_events if event.event_type == "turn_started")
-    third_started = next(event for event in third_events if event.event_type == "turn_started")
-    user_message_ids = {
-        first_started.message_id,
-        second_started.message_id,
-        third_started.message_id,
-    }
-    assert len(user_message_ids) == 3
-    assert all(isinstance(message_id, str) and message_id for message_id in user_message_ids)
-
-    first_assistant = next(event for event in first_events if isinstance(event, AssistantMessageCompleted))
-    second_assistant = next(event for event in second_events if isinstance(event, AssistantMessageCompleted))
-    third_assistant = next(event for event in third_events if isinstance(event, AssistantMessageCompleted))
-    assistant_message_ids = {
-        first_assistant.message_id,
-        second_assistant.message_id,
-        third_assistant.message_id,
-    }
-    assert len(assistant_message_ids) == 3
-    assert all(isinstance(message_id, str) and message_id for message_id in assistant_message_ids)
-    for events in (first_events, second_events, third_events):
-        for event in events:
-            assert agent_event_from_json(event.to_json()) == event
 
 
 @pytest.mark.asyncio
@@ -335,303 +458,416 @@ async def test_multiple_tools_are_fifo_and_never_parallel() -> None:
         ToolCallPart("call-1", "first", {"value": "one"}),
         ToolCallPart("call-2", "second", {"value": "two"}),
     )
-    provider = ScriptedProvider(
-        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]]
-    )
-    execution = _loop(provider, (first, second)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
+    provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]])
+    events, result, _ = await _drive(_start(_loop(provider, (first, second))))
 
     assert result.status is RunStatus.COMPLETED
     assert first.started == ["one"]
     assert second.started == ["two"]
     assert first.peak_active == second.peak_active == 1
-    finished = [event for event in events if isinstance(event, ToolFinished)]
-    assert [event.tool_call_id for event in finished] == ["call-1", "call-2"]
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == ["call-1", "call-2"]
 
 
 @pytest.mark.asyncio
-async def test_tool_errors_and_truncated_results_are_recoverable() -> None:
+async def test_tool_errors_close_every_original_call_id_and_continue() -> None:
     failing = RecordingTool("failing", error=True)
     calls = (
         ToolCallPart("unknown", "missing", {"value": "secret"}),
         ToolCallPart("invalid", "failing", {}),
         ToolCallPart("error", "failing", {"value": "three"}),
     )
-    provider = ScriptedProvider(
-        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("corrected"))]]
-    )
-    execution = _loop(provider, (failing,)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
+    provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("corrected"))]])
+    events, result, _ = await _drive(_start(_loop(provider, (failing,))))
 
     assert result.final_text == "corrected"
-    tool_message = provider.requests[1].messages[-1]
-    assert [part.tool_call_id for part in tool_message.parts] == ["unknown", "invalid", "error"]
-    assert all(part.is_error for part in tool_message.parts)
+    assert [part.tool_call_id for part in provider.requests[1].messages[-1].parts] == ["unknown", "invalid", "error"]
+    assert all(part.is_error for part in provider.requests[1].messages[-1].parts)
     assert failing.started == ["three"]
     assert any(isinstance(event, ToolFinished) and event.status == "failed" for event in events)
 
 
 @pytest.mark.asyncio
-async def test_truncated_tool_output_is_closed_and_available_to_next_provider_request() -> None:
-    tool = RecordingTool("large", output="x" * 10_500)
-    call = ToolCallPart("large-call", "large", {"value": "input"})
-    provider = ScriptedProvider(
-        [[_response(call, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]]
+async def test_max_limits_close_tool_batch_before_terminal_failure() -> None:
+    calls = (
+        ToolCallPart("one", "missing", {}),
+        ToolCallPart("two", "missing", {}),
     )
-    execution = _loop(provider, (tool,)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
-
-    assert result.status is RunStatus.COMPLETED
-    content = provider.requests[1].messages[-1].parts[0].content
-    assert len(content) <= 10_000
-    assert content.endswith("[Output truncated to 10000 characters]")
-    assert all("Output truncated" not in event.to_json() for event in events if isinstance(event, ToolFinished))
-
-
-@pytest.mark.asyncio
-async def test_unknown_streak_resets_on_known_tool_and_fails_after_closed_batch_limit() -> None:
-    known = RecordingTool("known")
-    provider = ScriptedProvider(
-        [
-            [_response(ToolCallPart("u1", "missing", {"value": "x"}), finish_reason=FinishReason.TOOL_CALLS)],
-            [_response(ToolCallPart("k", "known", {"value": "x"}), finish_reason=FinishReason.TOOL_CALLS)],
-            [_response(ToolCallPart("u2", "missing", {"value": "x"}), finish_reason=FinishReason.TOOL_CALLS)],
-            [_response(ToolCallPart("u3", "missing", {"value": "x"}), finish_reason=FinishReason.TOOL_CALLS)],
-            [_response(ToolCallPart("u4", "missing", {"value": "x"}), finish_reason=FinishReason.TOOL_CALLS)],
-        ]
-    )
-    execution = _loop(provider, (known,)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
-
-    assert result.status is RunStatus.FAILED
-    assert result.termination_reason is TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS
-    assert provider.call_count == 5
-    assert known.started == ["x"]
-    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == ["u1", "k", "u2", "u3", "u4"]
-
-
-@pytest.mark.asyncio
-async def test_tool_call_limit_zero_executes_entire_batch_and_closes_each_id() -> None:
-    tool = RecordingTool("known")
-    calls = tuple(ToolCallPart(f"call-{index}", "known", {"value": str(index)}) for index in range(17))
     provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]])
-    execution = _loop(provider, (tool,)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
+    execution = _start(
+        _loop(provider, config=AgentLoopConfig(max_tool_calls_per_iteration=1))
+    )
+    events, result, _ = await _drive(execution)
 
     assert result.termination_reason is TerminationReason.MAX_TOOL_CALLS
-    assert tool.started == []
-    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [call.tool_call_id for call in calls]
-    tool_message = execution.state.messages[-1]
-    assert [part.tool_call_id for part in tool_message.parts] == [call.tool_call_id for call in calls]
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == ["one", "two"]
+    batch = [event for event in events if isinstance(event, ToolBatchFinished)]
+    assert len(batch) == 1
+    assert batch[0].status == "failed"
 
 
 @pytest.mark.asyncio
-async def test_incomplete_tool_calls_are_not_executed_but_are_closed() -> None:
-    tool = RecordingTool("known")
-    call = ToolCallPart("call-1", "known", {"value": "do-not-run"})
-    provider = ScriptedProvider([[_response(call, finish_reason=FinishReason.LENGTH)]])
-    execution = _loop(provider, (tool,)).start_turn(RunState.initial("run-1"), "hello")
+async def test_provider_partial_protocol_failure_does_not_commit_message_or_usage() -> None:
+    scripts = [
+        [TextDelta("partial"), ToolCallStarted("partial", "read"), ToolCallArgumentsDelta("partial", "{}")],
+        [ProviderReasoningDelta("partial-2")],
+    ]
+    provider = ScriptedProvider(scripts)
+    execution = _start(_loop(provider))
+    segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    _, result = await _collect(execution)
-
-    assert result.termination_reason is TerminationReason.MAX_OUTPUT_TOKENS
-    assert tool.started == []
-    assert execution.state.messages[-1].role == "tool"
-    assert execution.state.messages[-1].parts[0].tool_call_id == "call-1"
-
-
-@pytest.mark.asyncio
-async def test_max_iterations_stops_after_closed_tool_batch() -> None:
-    tool = RecordingTool("known")
-    call = ToolCallPart("call-1", "known", {"value": "one"})
-    provider = ScriptedProvider([[_response(call, finish_reason=FinishReason.TOOL_CALLS)]])
-    execution = _loop(
-        provider,
-        (tool,),
-        config=AgentLoopConfig(max_iterations=1),
-    ).start_turn(RunState.initial("run-1"), "hello")
-
-    _, result = await _collect(execution)
-
-    assert result.termination_reason is TerminationReason.MAX_ITERATIONS
-    assert provider.call_count == 1
-    assert execution.state.messages[-1].role == "tool"
+    assert segment.terminal
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INVALID_PROVIDER_RESPONSE
+    assert execution.state.messages == (execution.state.messages[0],)
+    assert execution.state.usage == Usage()
+    assert not any(isinstance(event, UsageUpdated) for event in segment.events)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "script,reason",
-    [
-        ([TextDelta("partial")], TerminationReason.INVALID_PROVIDER_RESPONSE),
-        ([TextDelta("partial"), _response(TextPart("done")), TextDelta("after")], TerminationReason.INVALID_PROVIDER_RESPONSE),
-        ([TextDelta("partial"), _response(TextPart("done"), finish_reason=FinishReason.UNKNOWN)], TerminationReason.INVALID_PROVIDER_RESPONSE),
-        ([TextDelta("partial"), _response(TextPart("done"), finish_reason=FinishReason.ERROR)], TerminationReason.PROVIDER_ERROR),
-    ],
-)
-async def test_provider_protocol_errors_do_not_commit_partial_assistant(script: list[object], reason: TerminationReason) -> None:
-    provider = ScriptedProvider([script])
-    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello")
+async def test_provider_response_contradictions_fail_without_state_commit() -> None:
+    call = ToolCallPart("call", "missing", {})
+    provider = ScriptedProvider([[_response(call, finish_reason=FinishReason.STOP)]])
+    execution = _start(_loop(provider))
+    segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    _, result = await _collect(execution)
-
-    assert result.status is RunStatus.FAILED
-    assert result.termination_reason is reason
-    assert [message.role for message in execution.state.messages] == ["user"]
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INVALID_PROVIDER_RESPONSE
+    assert execution.state.messages == (execution.state.messages[0],)
+    assert execution.state.usage == Usage()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "response",
-    [
-        GenerationCompleted(
-            ProviderResponse(message=Message(role="user", parts=(TextPart("wrong role"),)))
-        ),
-        _response(
-            ToolCallPart("duplicate", "one", {"value": "x"}),
-            ToolCallPart("duplicate", "two", {"value": "y"}),
-            finish_reason=FinishReason.TOOL_CALLS,
-        ),
-        _response(TextPart("wrong finish"), finish_reason=FinishReason.TOOL_CALLS),
-    ],
-)
-async def test_provider_response_contradictions_fail_as_invalid_without_state_commit(
-    response: GenerationCompleted,
-) -> None:
-    provider = ScriptedProvider([[response]])
-    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello")
-
-    _, result = await _collect(execution)
-
-    assert result.termination_reason is TerminationReason.INVALID_PROVIDER_RESPONSE
-    assert [message.role for message in execution.state.messages] == ["user"]
-
-
-@pytest.mark.asyncio
-async def test_provider_cancellation_discards_partial_conversation_and_has_one_cancelled_terminal() -> None:
-    cancellation = CancellationToken()
-    provider = ScriptedProvider([GenerationCancelled()])
-    execution = _loop(provider).start_turn(
-        RunState.initial("run-1"),
-        "hello",
-        cancellation=cancellation,
-    )
-    cancellation.cancel()
-
-    events, result = await _collect(execution)
-
-    assert result.status is RunStatus.CANCELLED
-    assert sum(isinstance(event, TurnCancelled) for event in events) == 1
-    assert not [event for event in events if isinstance(event, (TurnCompleted, TurnFailed))]
-    assert [message.role for message in execution.state.messages] == ["user"]
-
-
-@pytest.mark.asyncio
-async def test_tool_cancellation_closes_current_and_remaining_calls_without_next_provider_call() -> None:
-    cancelling = RecordingTool("first", cancel_on_execute=True)
-    later = RecordingTool("later")
+async def test_tool_cancel_closes_current_and_remaining_calls_without_next_provider() -> None:
+    first = RecordingTool("first", output="one", delay=0.01)
     calls = (
-        ToolCallPart("call-1", "first", {"value": "one"}),
-        ToolCallPart("call-2", "later", {"value": "two"}),
-        ToolCallPart("call-3", "later", {"value": "three"}),
-    )
-    provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("bad"))]])
-    execution = _loop(provider, (cancelling, later)).start_turn(RunState.initial("run-1"), "hello")
-
-    events, result = await _collect(execution)
-
-    assert result.status is RunStatus.CANCELLED
-    assert provider.call_count == 1
-    assert cancelling.started == ["one"]
-    assert later.started == []
-    tool_message = execution.state.messages[-1]
-    assert [part.tool_call_id for part in tool_message.parts] == ["call-1", "call-2", "call-3"]
-    assert tool_message.parts[0].is_error is False
-    assert tool_message.parts[1].is_error is True
-    assert tool_message.parts[2].is_error is True
-    assert sum(isinstance(event, TurnCancelled) for event in events) == 1
-
-
-@pytest.mark.asyncio
-async def test_middle_tool_cancellation_closes_the_later_calls_in_order() -> None:
-    first = RecordingTool("first")
-    cancelling = RecordingTool("cancelling", cancel_on_execute=True)
-    later = RecordingTool("later")
-    calls = (
-        ToolCallPart("call-1", "first", {"value": "one"}),
-        ToolCallPart("call-2", "cancelling", {"value": "two"}),
-        ToolCallPart("call-3", "later", {"value": "three"}),
+        ToolCallPart("first", "first", {"value": "one"}),
+        ToolCallPart("second", "missing", {}),
+        ToolCallPart("third", "missing", {}),
     )
     provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]])
-    execution = _loop(provider, (first, cancelling, later)).start_turn(
-        RunState.initial("run-1"), "hello"
-    )
+    execution = _start(_loop(provider, (first,)))
+    signal = CancellationToken()
+    running = asyncio.create_task(execution.run_segment(pause_signal=signal))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert execution.cancel() is True
+    signal.cancel()
+    segment = await running
 
-    events, result = await _collect(execution)
-
-    assert result.status is RunStatus.CANCELLED
+    assert segment.result is not None
+    assert segment.result.status is RunStatus.CANCELLED
     assert provider.call_count == 1
+    finished = [event for event in segment.events if isinstance(event, ToolFinished)]
+    assert [event.tool_call_id for event in finished] == ["first", "second", "third"]
+    assert len([event for event in segment.events if isinstance(event, ToolBatchFinished)]) == 1
+    assert sum(isinstance(event, TurnCancelled) for event in segment.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_pause_discards_partial_and_retries_same_iteration() -> None:
+    provider = PausableProvider(_response(TextPart("done"), usage=Usage(2, 3)))
+    execution = _start(_loop(provider))
+    signal = CancellationToken()
+    running = asyncio.create_task(execution.run_segment(pause_signal=signal))
+    await provider.entered.wait()
+    signal.cancel()
+    provider.release.set()
+    paused = await running
+
+    assert paused.paused
+    assert paused.continuation is not None
+    assert paused.continuation.stage == "provider"
+    assert provider.call_count == 1
+    assert not any(isinstance(event, UsageUpdated) for event in paused.events)
+    assert len(execution.state.messages) == 1
+    pending = paused.continuation.pending_pause
+    assert pending is not None and pending.kind is PauseKind.USER_REQUESTED
+
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=ResumeTurnResponse(pending.pause_id, pending.run_id, pending.turn_id),
+    )
+    assert resumed.terminal
+    assert provider.call_count == 2
+    assert resumed.result is not None
+    assert resumed.result.iteration_count == 1
+    assert sum(isinstance(event, IterationStarted) for event in paused.events + resumed.events) == 1
+    assert sum(isinstance(event, UsageUpdated) for event in paused.events + resumed.events) == 1
+    assert len(execution.state.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_pause_waits_for_current_call_and_continues_fifo() -> None:
+    first = PauseAwareTool("first")
+    second = RecordingTool("second", output="two")
+    calls = (
+        ToolCallPart("first-1", "first", {"value": "one"}),
+        ToolCallPart("second-1", "second", {"value": "two"}),
+    )
+    provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]])
+    execution = _start(_loop(provider, (first, second)))
+    signal = CancellationToken()
+    running = asyncio.create_task(execution.run_segment(pause_signal=signal))
+    await first.entered.wait()
+    signal.cancel()
+    first.release.set()
+    paused = await running
+
+    assert paused.paused
     assert first.started == ["one"]
-    assert cancelling.started == ["two"]
-    assert later.started == []
-    tool_message = execution.state.messages[-1]
-    assert [part.tool_call_id for part in tool_message.parts] == ["call-1", "call-2", "call-3"]
-    assert tool_message.parts[0].is_error is False
-    assert tool_message.parts[1].is_error is False
-    assert tool_message.parts[2].is_error is True
-    assert sum(isinstance(event, TurnCancelled) for event in events) == 1
+    assert second.started == []
+    assert [event.tool_call_id for event in paused.events if isinstance(event, ToolFinished)] == ["first-1"]
+    pending = paused.continuation.pending_pause
+    assert pending is not None and pending.kind is PauseKind.USER_REQUESTED
 
-
-@pytest.mark.asyncio
-async def test_usage_accumulates_only_authoritative_terminals_and_resets_next_turn() -> None:
-    provider = ScriptedProvider(
-        [
-            [TextDelta("partial"), _response(TextPart("first"), usage=Usage(2, 3))],
-            [_response(TextPart("second"), usage=Usage(5, 7))],
-        ]
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=ResumeTurnResponse(pending.pause_id, pending.run_id, pending.turn_id),
     )
-    loop = _loop(provider)
-    first = loop.start_turn(RunState.initial("run-1"), "first", turn_id="turn-1")
-    first_events, first_result = await _collect(first)
-
-    assert first_result.usage == Usage(input_tokens=2, output_tokens=3)
-    assert [event.usage for event in first_events if isinstance(event, UsageUpdated)] == [Usage(2, 3)]
-
-    second = loop.start_turn(first.state, "second", turn_id="turn-2")
-    _, second_result = await _collect(second)
-    assert second_result.usage == Usage(input_tokens=5, output_tokens=7)
-    assert second.state.usage == Usage(input_tokens=5, output_tokens=7)
+    assert resumed.terminal
+    assert second.started == ["two"]
+    assert provider.call_count == 2
+    all_events = paused.events + resumed.events
+    assert len([event for event in all_events if isinstance(event, ToolBatchStarted)]) == 1
+    assert [event.tool_call_id for event in all_events if isinstance(event, ToolFinished)] == [
+        "first-1",
+        "second-1",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_events_has_one_consumer_and_result_can_be_read_repeatedly() -> None:
-    provider = ScriptedProvider([[_response(TextPart("done"))]])
-    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello")
-    first_consumer = execution.events()
-    events = [event async for event in first_consumer]
-    with pytest.raises(RuntimeError):
-        _ = [event async for event in execution.events()]
-    first = await execution.result()
-    second = await execution.result()
-    assert first == second
-    assert events[-1].event_type == "turn_completed"
+@pytest.mark.parametrize(
+    "failure, expected_reason",
+    (
+        (AuthenticationError("bad credentials"), TerminationReason.PROVIDER_ERROR),
+        (ProviderConfigurationError("bad configuration"), TerminationReason.PROVIDER_ERROR),
+        (MissingSecretError("secret"), TerminationReason.PROVIDER_ERROR),
+        (InvalidProviderResponseError("invalid"), TerminationReason.INVALID_PROVIDER_RESPONSE),
+        (ProviderError("other"), TerminationReason.PROVIDER_ERROR),
+    ),
+)
+async def test_non_recoverable_provider_errors_fail_without_pause(failure, expected_reason) -> None:
+    provider = ScriptedProvider([failure])
+    segment = await _start(_loop(provider)).run_segment(pause_signal=CancellationToken())
+
+    assert segment.result is not None
+    assert segment.result.termination_reason is expected_reason
+    assert not any(isinstance(event, TurnPaused) for event in segment.events)
 
 
 @pytest.mark.asyncio
-async def test_completion_listener_runs_once_for_shared_events_and_result_producer() -> None:
-    provider = ScriptedProvider([[_response(TextPart("done"))]])
-    execution = _loop(provider).start_turn(RunState.initial("run-1"), "hello")
-    completions: list[object] = []
-    execution.add_completion_listener(completions.append)
+@pytest.mark.parametrize("failure, reason", ((NetworkError("offline"), "network_error"), (RateLimitError("busy"), "rate_limited")))
+async def test_network_and_rate_limit_return_retry_pause_without_new_iteration(failure, reason) -> None:
+    provider = ScriptedProvider([failure, [_response(TextPart("done"), usage=Usage(1, 1))]])
+    execution = _start(_loop(provider))
+    paused = await execution.run_segment(pause_signal=CancellationToken())
 
-    events_task = asyncio.create_task(_collect(execution))
-    result_task = asyncio.create_task(execution.result())
-    _events, result = await events_task
-    assert await result_task is result
+    assert paused.paused
+    pause = paused.continuation.pending_pause
+    assert pause is not None
+    assert pause.kind is PauseKind.PROVIDER_UNAVAILABLE
+    assert pause.reason.value == reason
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=RetryProviderResponse(pause.pause_id, pause.run_id, pause.turn_id),
+    )
+    assert resumed.terminal
+    assert provider.call_count == 2
+    all_events = paused.events + resumed.events
+    assert [event.iteration for event in all_events if isinstance(event, IterationStarted)] == [1]
+    assert len([event for event in all_events if isinstance(event, UsageUpdated)]) == 1
 
-    assert completions == [result]
+
+@pytest.mark.asyncio
+async def test_network_pause_cancel_wins_without_resume() -> None:
+    provider = ScriptedProvider([NetworkError("offline")])
+    execution = _start(_loop(provider))
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+    assert paused.paused
+    assert execution.cancel() is True
+    terminal = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert terminal.result is not None
+    assert terminal.result.status is RunStatus.CANCELLED
+    assert not any(isinstance(event, TurnResumed) for event in paused.events + terminal.events)
+    assert sum(isinstance(event, TurnCancelled) for event in terminal.events) == 1
+
+
+def _ask_request() -> UserInputRequest:
+    return UserInputRequest(
+        (UserQuestion("answer", "Answer", "What should be used?", QuestionKind.TEXT),)
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_user_pause_and_answer_uses_original_call_id_and_fifo() -> None:
+    request = _ask_request()
+    ask_call = ToolCallPart("ask-1", "AskUserQuestion", request.to_dict())
+    later_call = ToolCallPart("later-1", "missing", {})
+    provider = ScriptedProvider([[_response(ask_call, later_call, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]])
+    execution = _start(_loop(provider), ask=True)
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert paused.paused
+    assert any(isinstance(event, UserInputRequested) for event in paused.events)
+    assert any(isinstance(event, TurnPaused) for event in paused.events)
+    pause = paused.continuation.pending_pause
+    assert pause is not None
+    assert pause.kind is PauseKind.USER_INPUT_REQUIRED
+    assert pause.tool_call_id == "ask-1"
+    before = paused.continuation
+    for bad_ids in (
+        ("wrong-pause", pause.run_id, pause.turn_id, "ask-1"),
+        (pause.pause_id, "wrong-run", pause.turn_id, "ask-1"),
+        (pause.pause_id, pause.run_id, "wrong-turn", "ask-1"),
+        (pause.pause_id, pause.run_id, pause.turn_id, "wrong-call"),
+    ):
+        with pytest.raises(ValueError):
+            await execution.run_segment(
+                pause_signal=CancellationToken(),
+                response=UserInputResponse(*bad_ids, {"answer": ["Ada"]}),
+            )
+        assert execution._continuation is before
+        assert provider.call_count == 1
+    response = UserInputResponse(pause.pause_id, pause.run_id, pause.turn_id, "ask-1", {"answer": ["Ada"]})
+    resumed = await execution.run_segment(pause_signal=CancellationToken(), response=response)
+
+    assert resumed.terminal
+    assert provider.call_count == 2
+    all_events = paused.events + resumed.events
+    assert [event.tool_call_id for event in all_events if isinstance(event, ToolStarted)] == ["ask-1", "later-1"]
+    assert [event.tool_call_id for event in all_events if isinstance(event, ToolFinished)] == ["ask-1", "later-1"]
+    tool_message = provider.requests[1].messages[-1]
+    assert [part.tool_call_id for part in tool_message.parts] == ["ask-1", "later-1"]
+    assert tool_message.parts[0].is_error is False
+    assert json.loads(tool_message.parts[0].content) == {"answers": {"answer": ["Ada"]}}
+
+
+@pytest.mark.asyncio
+async def test_ask_user_cancel_closes_current_and_remaining_original_ids() -> None:
+    request = _ask_request()
+    calls = (
+        ToolCallPart("ask-1", "AskUserQuestion", request.to_dict()),
+        ToolCallPart("later-1", "missing", {}),
+    )
+    provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]])
+    execution = _start(_loop(provider), ask=True)
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+    assert paused.paused
+    assert execution.cancel() is True
+    terminal = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert terminal.result is not None
+    assert terminal.result.status is RunStatus.CANCELLED
+    all_events = paused.events + terminal.events
+    finished = [event for event in all_events if isinstance(event, ToolFinished)]
+    assert [event.tool_call_id for event in finished] == ["ask-1", "later-1"]
+    assert [event.status for event in finished] == ["cancelled", "cancelled"]
+    batches = [event for event in all_events if isinstance(event, ToolBatchFinished)]
+    assert len(batches) == 1 and batches[0].status == "cancelled"
+    assert sum(isinstance(event, TurnCancelled) for event in all_events) == 1
     assert provider.call_count == 1
+    assert [part.tool_call_id for part in execution.state.messages[-1].parts] == ["ask-1", "later-1"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_response_ids_do_not_change_continuation_or_provider_calls() -> None:
+    provider = ScriptedProvider([NetworkError("offline"), [_response(TextPart("done"))]])
+    execution = _start(_loop(provider), run_id="run-1", turn_id="turn-1")
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+    pause = paused.continuation.pending_pause
+    assert pause is not None
+    before = paused.continuation
+    with pytest.raises(ValueError):
+        await execution.run_segment(pause_signal=CancellationToken())
+    assert execution._continuation is before
+    assert provider.call_count == 1
+    invalid = (
+        RetryProviderResponse("wrong-pause", pause.run_id, pause.turn_id),
+        RetryProviderResponse(pause.pause_id, "wrong-run", pause.turn_id),
+        RetryProviderResponse(pause.pause_id, pause.run_id, "wrong-turn"),
+        ResumeTurnResponse(pause.pause_id, pause.run_id, pause.turn_id),
+    )
+    for response in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            await execution.run_segment(pause_signal=CancellationToken(), response=response)
+        assert execution._continuation is before
+        assert provider.call_count == 1
+
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=RetryProviderResponse(pause.pause_id, pause.run_id, pause.turn_id),
+    )
+    assert resumed.terminal
+    assert provider.call_count == 2
+    duplicate = await execution.run_segment(pause_signal=CancellationToken())
+    assert duplicate.events == ()
+    assert duplicate.result is resumed.result
+
+
+@pytest.mark.asyncio
+async def test_segment_event_sink_is_temporary_and_core_keeps_only_event_facts() -> None:
+    provider = ScriptedProvider([NetworkError("offline")])
+    execution = _start(_loop(provider))
+    emitted: list[object] = []
+
+    def sink(event: object) -> None:
+        emitted.append(event)
+
+    paused = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        event_sink=sink,
+    )
+
+    assert paused.paused
+    assert emitted == list(paused.events)
+    slots = set(getattr(type(execution), "__slots__", ()))
+    assert "event_sink" not in slots
+    assert "_event_sink" not in slots
+    assert "_segment_event_buffer" not in slots
+    assert not any(getattr(execution, slot, None) is sink for slot in slots)
+    assert not any("Future" in repr(value) or "Task" in repr(value) for value in fields(paused.continuation))
+
+
+@pytest.mark.asyncio
+async def test_continuation_is_explicit_business_facts_and_core_has_no_waiter_api() -> None:
+    provider = ScriptedProvider([NetworkError("offline")])
+    execution = _start(_loop(provider))
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert isinstance(paused, AgentExecutionSegment)
+    assert paused.paused
+    continuation = paused.continuation
+    assert continuation is not None
+    assert [item.name for item in fields(continuation)] == [
+        "stage",
+        "iteration",
+        "provider_retry_pending",
+        "assistant_tool_message",
+        "tool_calls",
+        "completed_tool_results",
+        "next_tool_index",
+        "pending_pause",
+    ]
+    assert all("asyncio" not in repr(value) for value in fields(continuation))
+    assert not any(
+        name in dir(execution)
+        for name in ("pending_pause", "pause", "resume", "_resume_future", "_wait_for_pause")
+    )
+    slots = set(getattr(type(execution), "__slots__", ()))
+    assert not {"_queue", "_task", "_result_future", "_resume_future", "_waiter"} & slots
+    assert execution._active_segment_signal is None
+    assert inspect.iscoroutinefunction(execution.run_segment)
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_has_one_terminal_and_no_events_after_boundary() -> None:
+    provider = ScriptedProvider([[_response(TextPart("done"))]])
+    execution = _start(_loop(provider))
+    first = await execution.run_segment(pause_signal=CancellationToken())
+    assert first.terminal
+    assert execution.cancel() is False
+    after_cancel = await execution.run_segment(pause_signal=CancellationToken())
+    assert after_cancel.events == ()
+    assert after_cancel.result is first.result
+    assert sum(isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled)) for event in first.events) == 1

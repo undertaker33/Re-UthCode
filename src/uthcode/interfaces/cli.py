@@ -17,6 +17,7 @@ from uthcode.application import (
     ConfigurationInitializationRequired,
     EffectiveConfig,
     LaunchOptions,
+    PauseKind,
     ProviderError,
     TextPart,
     TurnHandle,
@@ -111,11 +112,17 @@ def _tool_diagnostic(event: AgentEvent) -> str:
 class _ExecProjection:
     """Project one AgentEvent stream into the CLI's two output channels."""
 
-    __slots__ = ("_pending_assistant", "_final_text")
+    __slots__ = ("_pending_assistant", "_final_text", "_suppress_terminal")
 
     def __init__(self) -> None:
         self._pending_assistant: dict[str, str] = {}
         self._final_text: str | None = None
+        self._suppress_terminal = False
+
+    def suppress_terminal(self) -> None:
+        """Prevent a paused non-interactive turn from projecting a final."""
+
+        self._suppress_terminal = True
 
     def consume(self, event: AgentEvent, *, stdout: TextIO, stderr: TextIO) -> int | None:
         event_type = event.event_type
@@ -152,6 +159,8 @@ class _ExecProjection:
             return None
 
         if event_type == "turn_completed":
+            if self._suppress_terminal:
+                return None
             final_text = _event_value(event, "final_text", self._final_text or "")
             if not isinstance(final_text, str):
                 final_text = self._final_text or ""
@@ -162,6 +171,8 @@ class _ExecProjection:
             return 0
 
         if event_type == "turn_cancelled":
+            if self._suppress_terminal:
+                return None
             _write_diagnostic(stderr, "generation cancelled")
             return 130
 
@@ -171,6 +182,16 @@ class _ExecProjection:
             return 1
 
         return None
+
+
+def _pause_diagnostic(event: AgentEvent) -> str:
+    pause = _event_value(event, "pause")
+    kind = _enum_value(_event_value(pause, "kind", ""))
+    if kind == PauseKind.USER_INPUT_REQUIRED.value:
+        return "generation requires interactive input"
+    if kind == PauseKind.PROVIDER_UNAVAILABLE.value:
+        return "provider temporarily unavailable"
+    return "generation paused and cannot continue non-interactively"
 
 
 async def _stream_exec(
@@ -184,8 +205,19 @@ async def _stream_exec(
     turn: TurnHandle = run.start_turn(prompt)
     projection = _ExecProjection()
     terminal_code: int | None = None
+    paused_for_noninteractive = False
     try:
         async for event in turn.events():
+            if event.event_type == "turn_paused":
+                if not paused_for_noninteractive:
+                    paused_for_noninteractive = True
+                    projection.suppress_terminal()
+                    _write_diagnostic(stderr, _pause_diagnostic(event))
+                    # ``exec`` has no response channel.  Cancel exactly once
+                    # and keep consuming the same public event stream until
+                    # Application closes the Turn.
+                    turn.cancel()
+                continue
             result = projection.consume(event, stdout=stdout, stderr=stderr)
             if result is not None:
                 terminal_code = result
@@ -197,6 +229,8 @@ async def _stream_exec(
         return 1
     except Exception:
         _write_diagnostic(stderr, "provider error: generation failed")
+        return 1
+    if paused_for_noninteractive:
         return 1
     if terminal_code is None:
         _write_diagnostic(stderr, "provider error: turn ended without a terminal event")

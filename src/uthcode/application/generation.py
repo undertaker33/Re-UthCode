@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from uthcode.core.agent import AgentLoop, AgentTurnExecution, RunState
+from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.provider import (
     CancellationToken,
     GenerationRequest,
@@ -262,7 +263,8 @@ class UthCodeApplication:
 
         provider = self._provider
         model_ref = self._current_model_ref
-        tool_definitions = self._tool_service.definitions()
+        ordinary_tool_definitions = self._tool_service.definitions()
+        tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
 
         def prepare(
             messages: tuple[Message, ...],
@@ -281,6 +283,7 @@ class UthCodeApplication:
             user_input,
             turn_id=turn_id,
             cancellation=cancellation,
+            tool_definitions=tool_definitions,
         )
         if execution.state.messages[-1].role != "user":  # pragma: no cover
             raise RuntimeError("Agent Loop did not append the user message")
