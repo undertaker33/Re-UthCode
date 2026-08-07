@@ -1,6 +1,6 @@
 # T06 暂停、恢复与询问用户 Checklist
 
-> 状态：未派工。所有验收项均须由对应 Worker 完成并提供证据。
+> 状态：实施完成，待用户验收。
 
 ## Task 1 — Core 交互协议与事件
 
@@ -45,25 +45,25 @@
 
 ## Task 6 [接入主流程] — 统一活动 Turn 调用链
 
-- [ ] Core、Application、CLI 与 TUI 通过正式公共边界完成接线。
-- [ ] Ask 工具自动可用且不会出现在常规工具管理、Provider 集成或用户配置注册路径中。
-- [ ] 同一 Turn 可经历多次暂停/恢复，事件顺序与最终结果保持一致。
-- [ ] 主流程接入没有新增兼容层、别名、包装入口或双轨逻辑。
+- [x] Core、Application、CLI 与 TUI 通过正式公共边界完成接线。
+- [x] Ask 工具自动可用且不会出现在常规工具管理、Provider 集成或用户配置注册路径中。
+- [x] 同一 Turn 可经历多次暂停/恢复，事件顺序与最终结果保持一致。
+- [x] 主流程接入没有新增兼容层、别名、包装入口或双轨逻辑。
 
 ## Task 7 [端到端验证] — Headless、CLI 与 TUI 全链验收
 
-- [ ] `test_headless_ask_user_round_trip_resumes_same_turn` 通过。
-- [ ] `test_exec_cancels_turn_when_agent_pauses` 通过。
-- [ ] `test_tui_pause_resume_and_ask_user_pilot` 通过。
-- [ ] Anthropic、OpenAI Responses、OpenAI Compatible 三组 Provider 集成测试通过。
-- [ ] 自由文本、单选、多选、确认、连续两次询问、取消和错误恢复均有端到端证据。
-- [ ] 测试证明暂停期间 Core 不持有用户回答 waiter，Application 清理全部私有协调资源。
+- [x] `test_headless_ask_user_round_trip_resumes_same_turn` 通过。
+- [x] `test_exec_cancels_turn_when_agent_pauses` 通过。
+- [x] `test_tui_pause_resume_and_ask_user_pilot` 通过。
+- [x] Anthropic、OpenAI Responses、OpenAI Compatible 三组 Provider 集成测试通过。
+- [x] 自由文本、单选、多选、确认、连续两次询问、取消和错误恢复均有端到端证据。
+- [x] 测试证明暂停期间 Core 不持有用户回答 waiter，Application 清理全部私有协调资源。
 
 ## Task 8 [遗留负担清理] — 删除重复职责与持久恢复占位
 
-- [ ] 删除被本任务替代的旧暂停等待器、旧入口、旧测试与不可达分支。
-- [ ] 扫描确认不存在禁止的旧模块名、兼容别名、双轨模型或重复职责实现。
-- [ ] 扫描确认 Core 暂停路径不存在异步协调原语，Ask 不位于 Core 普通工具或 integrations。
-- [ ] 全量 `pytest`、编译检查和安装检查通过。
-- [ ] `git diff --check`、UTF-8 校验、Markdown 围栏校验和工作区状态检查通过。
-- [ ] Feedback 记录改动、测试命令、输出摘要、未决风险和逐项 Checklist 证据。
+- [x] 删除被本任务替代的旧暂停等待器、旧入口、旧测试与不可达分支。
+- [x] 扫描确认不存在禁止的旧模块名、兼容别名、双轨模型或重复职责实现。
+- [x] 扫描确认 Core 暂停路径不存在异步协调原语，Ask 不位于 Core 普通工具或 integrations。
+- [x] 全量 `pytest`、编译检查和安装检查通过。
+- [x] `git diff --check`、UTF-8 校验、Markdown 围栏校验和工作区状态检查通过。
+- [x] Feedback 记录改动、测试命令、输出摘要、未决风险和逐项 Checklist 证据。

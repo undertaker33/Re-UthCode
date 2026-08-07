@@ -149,6 +149,30 @@ class TuiInteractionState:
         self.draft = ""
         return True
 
+    def exit_other(self) -> bool:
+        """Leave Other input and restore a legal ordinary option focus."""
+
+        if not self.other_mode:
+            return False
+        question = self.current_question
+        self.other_mode = False
+        self.draft = ""
+        if question is None:
+            self.selected_options.clear()
+            self.option_index = 0
+            return True
+
+        valid_selected = {
+            index
+            for index in self.selected_options
+            if 0 <= index < len(question.options)
+        }
+        if question.kind.value == "single_select" and valid_selected:
+            valid_selected = {min(valid_selected)}
+        self.selected_options = valid_selected
+        self.option_index = min(valid_selected, default=0)
+        return True
+
     def set_draft(self, value: str) -> None:
         self.draft = value
 

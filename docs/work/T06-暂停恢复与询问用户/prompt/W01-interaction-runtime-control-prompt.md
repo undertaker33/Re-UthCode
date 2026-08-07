@@ -7,7 +7,7 @@
 1. `AGENTS.md`
 2. `SRe-AGENTS.md`
 3. `docs/work/README.md`
-4. `docs/work/T06-暂停恢复与询问用户.md`
+4. `docs/work/T06-暂停恢复与询问用户/T06-暂停恢复与询问用户.md`
 5. `docs/work/T06-暂停恢复与询问用户/T06-暂停恢复与询问用户-spec.md`
 6. `docs/work/T06-暂停恢复与询问用户/T06-暂停恢复与询问用户-tasks.md`
 7. `docs/work/T06-暂停恢复与询问用户/T06-暂停恢复与询问用户-checklist.md`
