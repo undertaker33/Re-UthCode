@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 
 import pytest
@@ -11,17 +12,35 @@ from prompt_toolkit.layout import VSplit
 from prompt_toolkit.output import DummyOutput
 
 from uthcode.application import (
+    AgentRun,
     ApplicationRuntimeContext,
     GenerationCompleted,
+    GenerationRequest,
     Message,
     ModelProfile,
+    PauseKind,
+    PauseReason,
+    PauseRequest,
     ProviderResponse,
+    QuestionOption,
+    QuestionKind,
+    RetryProviderResponse,
     TextDelta,
     TextPart,
+    TurnHandle,
+    ToolCallPart,
     Usage,
     UthCodeApplication,
+    UserInputRequest,
+    UserQuestion,
 )
-from uthcode.core.provider import FinishReason
+from uthcode.core.provider import (
+    CancellationToken,
+    FinishReason,
+    NetworkError,
+    ProviderEvent,
+    RateLimitError,
+)
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.interfaces.tui.app import (
     UthCodeTUI,
@@ -29,6 +48,7 @@ from uthcode.interfaces.tui.app import (
     _tail_for_preview,
     _window_start,
 )
+from uthcode.interfaces.tui.interaction import InteractionMode, TuiInteractionState
 from uthcode.interfaces.tui.rendering import (
     MarkdownStream,
     RenderBatch,
@@ -72,12 +92,73 @@ class RecordingOutput(DummyOutput):
         )
 
 
-def _completed(text: str = "done") -> GenerationCompleted:
+class _ScriptedProvider(FakeProvider):
+    def __init__(
+        self,
+        scripts: Iterable[Iterable[ProviderEvent]],
+        *,
+        delay: float = 0.0,
+        delays: tuple[float, ...] | None = None,
+    ) -> None:
+        super().__init__(delay=delay)
+        self._scripts = tuple(tuple(script) for script in scripts)
+        self._delays = delays
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        cancellation.raise_if_cancelled()
+        index = min(len(self.requests) - 1, len(self._scripts) - 1)
+        for event in self._scripts[index]:
+            delay = self._delays[index] if self._delays is not None else self._delay
+            if delay:
+                try:
+                    await asyncio.wait_for(cancellation.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    cancellation.raise_if_cancelled()
+            cancellation.raise_if_cancelled()
+            yield event
+
+
+class _ProviderFailureThenSuccess(_ScriptedProvider):
+    def __init__(
+        self,
+        error: NetworkError | RateLimitError,
+        success: Iterable[ProviderEvent],
+    ) -> None:
+        super().__init__((tuple(success),))
+        self._error = error
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        if not self.requests:
+            self.requests.append(request)
+            cancellation.raise_if_cancelled()
+            raise self._error
+        async for event in super().stream(request, cancellation=cancellation):
+            yield event
+
+
+def _completed(
+    text: str = "done",
+    *parts: object,
+    finish_reason: FinishReason = FinishReason.STOP,
+) -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
-            message=Message("assistant", (TextPart(text),)),
+            message=Message("assistant", (TextPart(text), *parts)),
             usage=Usage(),
-            finish_reason=FinishReason.STOP,
+            finish_reason=finish_reason,
         )
     )
 
@@ -144,6 +225,74 @@ def test_double_escape_state_is_time_bound() -> None:
     assert esc.consume(10.5) is True
     esc.arm(10.0)
     assert esc.consume(11.1) is False
+
+
+def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
+    request = UserInputRequest(
+        (
+            UserQuestion(
+                "single",
+                "Mode",
+                "Choose a mode",
+                QuestionKind.SINGLE_SELECT,
+                (
+                    QuestionOption("fast", "Fast mode"),
+                    QuestionOption("safe", "Safe mode"),
+                ),
+            ),
+            UserQuestion(
+                "multi",
+                "Targets",
+                "Choose targets",
+                QuestionKind.MULTI_SELECT,
+                (
+                    QuestionOption("api", "API"),
+                    QuestionOption("ui", "UI"),
+                ),
+            ),
+            UserQuestion(
+                "other",
+                "Owner",
+                "Who owns it?",
+                QuestionKind.SINGLE_SELECT,
+                (
+                    QuestionOption("team", "The team"),
+                    QuestionOption("me", "The user"),
+                ),
+                allow_other=True,
+            ),
+        )
+    )
+    pause = PauseRequest(
+        "pause",
+        "run",
+        "turn",
+        PauseKind.USER_INPUT_REQUIRED,
+        PauseReason.USER_INPUT_REQUIRED,
+        1,
+        "now",
+        "call",
+        request,
+    )
+    state = TuiInteractionState()
+    state.open_pause(pause)
+    assert state.mode is InteractionMode.QUESTIONS
+
+    assert state.submit_current() is True
+    assert state.answers["single"] == ["fast"]
+    state.move(1)
+    assert state.toggle_option() is True
+    state.move(1)
+    assert state.toggle_option() is True
+    assert state.submit_current() is True
+    assert state.answers["multi"] == ["api", "ui"]
+    state.choose_other()
+    state.set_draft("a partner")
+    assert state.submit_current() is True
+    assert state.mode is InteractionMode.REVIEW
+    response = state.user_input_response()
+    assert response is not None
+    assert response.answers["other"] == ["a partner"]
 
 
 def test_markdown_stream_waits_for_real_fence_closure() -> None:
@@ -462,6 +611,482 @@ def test_candidate_window_tracks_selected_visible_item() -> None:
     assert _window_start(0, 15, 8) == 0
     assert _window_start(8, 15, 8) <= 8 < _window_start(8, 15, 8) + 8
     assert _window_start(14, 15, 8) == 7
+
+
+@pytest.mark.asyncio
+async def test_tui_double_escape_pauses_and_resume_keeps_the_turn_alive() -> None:
+    provider = _ScriptedProvider(
+        ((_completed("回答"),), (_completed("回答"),)),
+        delays=(5.0, 0.0),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(lambda: tui._active_handle is not None and bool(provider.requests))
+        pipe.send_text("\x1b\x1b")
+        await _wait_until(
+            lambda: tui._active_handle is not None
+            and tui._active_handle.pending_pause is not None,
+            attempts=500,
+        )
+        await _wait_until(lambda: tui.activity == "paused")
+        assert tui._active_handle is not None
+        assert not tui._active_handle.cancelled()
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui._generation_task is None, attempts=500)
+        assert tui._active_handle is None
+        assert provider.requests
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_tui_pause_cancel_cleans_turn_without_saved_state() -> None:
+    provider = _ScriptedProvider(
+        ((_completed("不会完成"),), (_completed("不会完成"),)),
+        delays=(5.0, 0.0),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(lambda: tui._active_handle is not None and bool(provider.requests))
+        pipe.send_text("\x1b\x1b")
+        await _wait_until(
+            lambda: tui._active_handle is not None
+            and tui._active_handle.pending_pause is not None,
+            attempts=500,
+        )
+        await _wait_until(lambda: tui.activity == "paused")
+        tui.interaction.move(1)
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui._generation_task is None, attempts=500)
+        assert tui._active_handle is None
+        assert len(provider.requests) == 1
+        assert "保存" not in output.getvalue()
+        assert not tui._background_tasks
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_tui_pause_question_panel_submits_through_application_turn() -> None:
+    call = ToolCallPart(
+        "ask-1",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "Value",
+                    "question": "What value should be used?",
+                    "kind": "text",
+                }
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        (
+            (_completed("need input", call, finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed("已完成"),),
+        )
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(
+            lambda: tui._active_handle is not None
+            and tui._active_handle.pending_pause is not None
+        )
+        await _wait_until(lambda: tui.activity == "paused")
+        pipe.send_text("答案\r")
+        await _wait_until(lambda: tui.interaction.is_review)
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui._generation_task is None)
+        assert "已完成" in output.getvalue()
+        assert len(provider.requests) == 2
+        assert any(
+            "答案" in getattr(part, "content", "")
+            for part in provider.requests[1].messages[-1].parts
+        )
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_real_tui_question_back_restores_buffer_and_draft_without_resuming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCallPart(
+        "ask-text",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "First",
+                    "question": "First answer?",
+                    "kind": "text",
+                },
+                {
+                    "question_id": "q2",
+                    "header": "Second",
+                    "question": "Second answer?",
+                    "kind": "text",
+                },
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        (
+            (_completed("need answers", call, finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed("answers accepted"),),
+        )
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    resume_calls: list[object] = []
+    original_resume = TurnHandle.resume
+
+    def record_resume(handle: TurnHandle, response: object) -> bool:
+        resume_calls.append(response)
+        return original_resume(handle, response)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(TurnHandle, "resume", record_resume)
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(lambda: tui.interaction.mode is InteractionMode.QUESTIONS)
+        pipe.send_text("answer-one\r")
+        await _wait_until(lambda: tui.interaction.question_index == 1)
+        pipe.send_text("answer-two\r")
+        await _wait_until(lambda: tui.interaction.is_review)
+        assert provider.requests and len(provider.requests) == 1
+
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x1b[27u")
+        await _wait_until(
+            lambda: tui.interaction.mode is InteractionMode.QUESTIONS
+            and tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "q2"
+            and tui.buffer.text == "answer-two"
+        )
+        assert tui.buffer.cursor_position == len("answer-two")
+        assert tui.interaction.draft == "answer-two"
+        assert tui.interaction.answers["q2"] == ["answer-two"]
+        assert resume_calls == []
+
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui.interaction.is_review)
+        assert tui.interaction.answers["q2"] == ["answer-two"]
+        assert len(provider.requests) == 1
+        assert resume_calls == []
+
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x1b[27u")
+        await _wait_until(lambda: tui.buffer.text == "answer-two")
+        tui.buffer.set_document(
+            Document("answer-new", len("answer-new")),
+            bypass_readonly=True,
+        )
+        pipe.send_text("\r")
+        await _wait_until(lambda: tui.interaction.is_review)
+        assert tui.interaction.answers["q2"] == ["answer-new"]
+        assert len(provider.requests) == 1
+        assert resume_calls == []
+
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._generation_task is None
+            and tui._active_handle is None
+            and not tui._background_tasks
+        )
+        assert len(provider.requests) == 2
+        assert len(resume_calls) == 1
+        assert type(resume_calls[0]).__name__ == "UserInputResponse"
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_real_tui_question_back_restores_other_and_selection_state() -> None:
+    call = ToolCallPart(
+        "ask-options",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "text",
+                    "header": "Text",
+                    "question": "Describe it.",
+                    "kind": "text",
+                },
+                {
+                    "question_id": "single",
+                    "header": "Mode",
+                    "question": "Choose one.",
+                    "kind": "single_select",
+                    "options": [
+                        {"label": "fast", "description": "Fast"},
+                        {"label": "safe", "description": "Safe"},
+                    ],
+                },
+                {
+                    "question_id": "multi",
+                    "header": "Targets",
+                    "question": "Choose many.",
+                    "kind": "multi_select",
+                    "options": [
+                        {"label": "api", "description": "API"},
+                        {"label": "ui", "description": "UI"},
+                    ],
+                },
+                {
+                    "question_id": "other",
+                    "header": "Owner",
+                    "question": "Who owns it?",
+                    "kind": "single_select",
+                    "options": [
+                        {"label": "team", "description": "The team"},
+                        {"label": "me", "description": "The user"},
+                    ],
+                    "allow_other": True,
+                },
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        ((_completed("need options", call, finish_reason=FinishReason.TOOL_CALLS),),)
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    tui, pipe_state, task, _output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(lambda: tui.interaction.mode is InteractionMode.QUESTIONS)
+        pipe.send_text("description\r")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "single"
+        )
+
+        tui.interaction.move(1)
+        tui.interaction.toggle_option()
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "multi"
+        )
+        tui.interaction.toggle_option()
+        tui.interaction.move(1)
+        tui.interaction.toggle_option()
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "other"
+        )
+
+        tui.interaction.move(2)
+        tui.interaction.toggle_option()
+        pipe.send_text("custom-owner\r")
+        await _wait_until(lambda: tui.interaction.is_review)
+
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x1b[27u")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "other"
+            and tui.interaction.other_mode
+            and tui.buffer.text == "custom-owner"
+        )
+        assert tui.buffer.cursor_position == len("custom-owner")
+
+        pipe.send_text("\x1b[D")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "multi"
+        )
+        assert tui.interaction.selected_options == {0, 1}
+        assert tui.buffer.text == ""
+
+        pipe.send_text("\x1b[D")
+        await _wait_until(
+            lambda: tui.interaction.current_question is not None
+            and tui.interaction.current_question.question_id == "single"
+        )
+        assert tui.interaction.selected_options == {1}
+        assert tui.buffer.text == ""
+        assert len(provider.requests) == 1
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [NetworkError("network"), RateLimitError("rate")])
+async def test_tui_provider_retry_pilot_uses_one_turn_and_cleans_up(
+    error: NetworkError | RateLimitError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ProviderFailureThenSuccess(error, (_completed("retry succeeded"),))
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    started_prompts: list[str] = []
+    original_start_turn = AgentRun.start_turn
+    resume_calls: list[object] = []
+
+    def record_start(run: AgentRun, prompt: str):  # type: ignore[no-untyped-def]
+        started_prompts.append(prompt)
+        return original_start_turn(run, prompt)
+
+    original_resume = TurnHandle.resume
+
+    def record_resume(handle: TurnHandle, response: object) -> bool:
+        resume_calls.append(response)
+        return original_resume(handle, response)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(AgentRun, "start_turn", record_start)
+    monkeypatch.setattr(TurnHandle, "resume", record_resume)
+    tui, pipe_state, task, output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(
+            lambda: tui.interaction.mode is InteractionMode.PAUSE_ACTION
+            and len(provider.requests) == 1
+        )
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._generation_task is None
+            and tui._active_handle is None
+            and tui.interaction.mode is InteractionMode.CLOSED
+            and not tui._background_tasks
+        )
+        assert len(started_prompts) == 1
+        assert len(provider.requests) == 2
+        assert len(resume_calls) == 1
+        assert isinstance(resume_calls[0], RetryProviderResponse)
+        assert "retry succeeded" in output.getvalue()
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+
+
+@pytest.mark.asyncio
+async def test_tui_provider_cancel_pilot_stops_retry_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ProviderFailureThenSuccess(
+        NetworkError("network"),
+        (_completed("must not run"),),
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    started_prompts: list[str] = []
+    original_start_turn = AgentRun.start_turn
+    resume_calls: list[object] = []
+    cancel_calls = 0
+
+    def record_start(run: AgentRun, prompt: str):  # type: ignore[no-untyped-def]
+        started_prompts.append(prompt)
+        return original_start_turn(run, prompt)
+
+    original_resume = TurnHandle.resume
+    original_cancel = TurnHandle.cancel
+
+    def record_resume(handle: TurnHandle, response: object) -> bool:
+        resume_calls.append(response)
+        return original_resume(handle, response)  # type: ignore[arg-type]
+
+    def record_cancel(handle: TurnHandle) -> bool:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return original_cancel(handle)
+
+    monkeypatch.setattr(AgentRun, "start_turn", record_start)
+    monkeypatch.setattr(TurnHandle, "resume", record_resume)
+    monkeypatch.setattr(TurnHandle, "cancel", record_cancel)
+    tui, pipe_state, task, output = await _start_tui(application)
+    _context, pipe = pipe_state  # type: ignore[misc]
+    try:
+        pipe.send_text("hello\r")
+        await _wait_until(
+            lambda: tui.interaction.mode is InteractionMode.PAUSE_ACTION
+            and len(provider.requests) == 1
+        )
+        tui.interaction.move(1)
+        pipe.send_text("\r")
+        await _wait_until(
+            lambda: tui._generation_task is None
+            and tui._active_handle is None
+            and tui.interaction.mode is InteractionMode.CLOSED
+            and not tui._background_tasks
+        )
+        assert len(started_prompts) == 1
+        assert len(provider.requests) == 1
+        assert resume_calls == []
+        assert cancel_calls == 1
+        assert "保存" not in output.getvalue()
+        assert "retry succeeded" not in output.getvalue()
+    finally:
+        await _stop_tui(tui, pipe_state, task)
 
 
 def test_transient_height_budget_fits_small_terminal() -> None:

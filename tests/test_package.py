@@ -65,6 +65,7 @@ def test_core_exposes_the_single_tool_contract() -> None:
 
 def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
     from uthcode.core import (
+        AgentExecutionSegment,
         AgentEvent,
         AgentLoop,
         AgentLoopConfig,
@@ -75,12 +76,73 @@ def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
     )
 
     assert AgentEvent is not None
+    assert AgentExecutionSegment is not None
     assert AgentLoop is not None
     assert AgentLoopConfig is not None
     assert AgentTurnExecution is not None
     assert RunSnapshot is not None
     assert RunState is not None
     assert TurnResult is not None
+
+
+def test_core_exposes_interaction_contract_without_internal_coordination_types() -> None:
+    import uthcode.core as core
+    from uthcode.core import (
+        ASK_USER_TOOL_DEFINITION,
+        PauseKind,
+        PauseReason,
+        PauseRequest,
+        PauseResponse,
+        QuestionKind,
+        QuestionOption,
+        RetryProviderResponse,
+        ResumeTurnResponse,
+        TurnPaused,
+        TurnPausing,
+        TurnResumed,
+        UserInputRequest,
+        UserInputResponse,
+        UserInputRequested,
+        UserQuestion,
+    )
+
+    assert all(
+        value is not None
+        for value in (
+            ASK_USER_TOOL_DEFINITION,
+            PauseKind,
+            PauseReason,
+            PauseRequest,
+            PauseResponse,
+            QuestionKind,
+            QuestionOption,
+            RetryProviderResponse,
+            ResumeTurnResponse,
+            TurnPausing,
+            UserInputRequested,
+            TurnPaused,
+            TurnResumed,
+            UserInputRequest,
+            UserInputResponse,
+            UserQuestion,
+        )
+    )
+    forbidden = {
+        "_TurnContinuation",
+        "Continuation",
+        "pause_waiter",
+        "checkpoint",
+        "session",
+        "storage",
+        "journal",
+        "recovery",
+    }
+    assert forbidden.isdisjoint(core.__all__)
+    from uthcode.core.agent import AgentTurnExecution
+
+    assert not hasattr(AgentTurnExecution, "pending_pause")
+    assert not hasattr(AgentTurnExecution, "pause")
+    assert not hasattr(AgentTurnExecution, "resume")
 
 
 def test_application_exposes_core_tool_values_without_integration_runtime_types() -> None:
@@ -96,6 +158,10 @@ def test_application_exposes_core_tool_values_without_integration_runtime_types(
         ToolResultPart,
         TurnHandle,
         TurnResult,
+        PauseKind,
+        PauseRequest,
+        ResumeTurnResponse,
+        UserInputResponse,
     )
 
     assert AgentEvent is not None
@@ -108,6 +174,10 @@ def test_application_exposes_core_tool_values_without_integration_runtime_types(
     assert ToolResultPart is not None
     assert TurnHandle is not None
     assert TurnResult is not None
+    assert PauseKind is not None
+    assert PauseRequest is not None
+    assert ResumeTurnResponse is not None
+    assert UserInputResponse is not None
     assert "ToolRegistry" not in application.__all__
     assert "ToolExecutor" not in application.__all__
     assert "RunState" not in application.__all__

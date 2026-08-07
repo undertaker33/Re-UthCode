@@ -16,6 +16,7 @@ from uthcode.core.provider import (
     ToolResultPart,
 )
 from uthcode.core.agent import AgentLoop
+from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
 
 
@@ -149,7 +150,10 @@ class ApplicationToolService:
         workdir: str | PathLike[str] | Path | None = None,
         secret_env_names: Sequence[str] = (),
     ) -> None:
-        self._registry = ToolRegistry(tuple(tools))
+        tool_values = tuple(tools)
+        if any(tool.definition.name == ASK_USER_TOOL_DEFINITION.name for tool in tool_values):
+            raise ValueError("AskUserQuestion is reserved for the Application Agent path")
+        self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)
         self._redactor = _SecretRedactor(secret_env_names)
         self._workdir = (
@@ -175,6 +179,8 @@ class ApplicationToolService:
             cancellation = CancellationToken()
         elif not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
+        if any(call.name == ASK_USER_TOOL_DEFINITION.name for call in calls):
+            raise ValueError("AskUserQuestion is not available through manual Tool execution")
         return await self._executor.execute_batch(
             tuple(calls),
             cancellation=cancellation,

@@ -1,13 +1,14 @@
-"""Core Agent policy, immutable state, and the explicit sequential Loop."""
+"""Core Agent policy, immutable state, and explicit execution segments."""
 
 from __future__ import annotations
 
-import asyncio
+from asyncio import CancelledError, sleep
 import inspect
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 
 from .agent_events import (
@@ -24,6 +25,9 @@ from .agent_events import (
     ToolFinished,
     ToolStarted,
     TerminationReason,
+    TurnPausing,
+    UserInputRequested,
+    TurnPaused,
     TurnCancelled,
     TurnCompleted,
     TurnFailed,
@@ -38,8 +42,10 @@ from .provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    NetworkError,
     ProviderError,
     ProviderPort,
+    RateLimitError,
     ReasoningDelta as ProviderReasoningDelta,
     ReasoningPart,
     TextDelta,
@@ -50,7 +56,31 @@ from .provider import (
     Usage,
     validated_provider_stream,
 )
+from .interaction import (
+    ASK_USER_TOOL_DEFINITION,
+    PauseKind,
+    PauseReason,
+    PauseRequest,
+    PauseResponse,
+    RetryProviderResponse,
+    ResumeTurnResponse,
+    UserInputRequest,
+    UserInputResponse,
+)
 from .tool import ToolExecutor, ToolRegistry
+
+
+AgentEventSink = Callable[[AgentEvent], None]
+
+
+class _SegmentEventBuffer(list[AgentEvent]):
+    """Temporary event buffer that emits only during one Core segment call."""
+
+    __slots__ = ("sink",)
+
+    def __init__(self, sink: AgentEventSink | None) -> None:
+        super().__init__()
+        self.sink = sink
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -83,6 +113,10 @@ def _encode(value: object) -> object:
 
 class AgentLoopConfigError(ValueError):
     """Invalid Agent policy configuration."""
+
+
+class _ResponseRejected(ValueError):
+    """A response did not match the current continuation facts."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,9 +452,6 @@ RequestPreparer = Callable[
 ToolCallDescriber = Callable[[ToolCallPart], str]
 
 
-_END = object()
-
-
 def _message_text(message: Message) -> str:
     return "".join(part.text for part in message.parts if isinstance(part, TextPart))
 
@@ -489,6 +520,102 @@ def _controlled_tool_result(call: ToolCallPart, reason: str) -> ToolResultPart:
     )
 
 
+class ExecutionBoundary(str, Enum):
+    PAUSED = "paused"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True, slots=True)
+class _TurnContinuation:
+    """Business facts needed to invoke the next Core segment."""
+
+    stage: str
+    iteration: int
+    provider_retry_pending: bool
+    assistant_tool_message: Message | None
+    tool_calls: tuple[ToolCallPart, ...]
+    completed_tool_results: tuple[ToolResultPart, ...]
+    next_tool_index: int
+    pending_pause: PauseRequest | None
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"provider", "tool_batch"}:
+            raise ValueError("continuation stage is invalid")
+        if isinstance(self.iteration, bool) or not isinstance(self.iteration, int) or self.iteration <= 0:
+            raise ValueError("continuation iteration is invalid")
+        if not isinstance(self.provider_retry_pending, bool):
+            raise TypeError("provider_retry_pending must be a boolean")
+        if self.assistant_tool_message is not None:
+            if not isinstance(self.assistant_tool_message, Message):
+                raise TypeError("assistant_tool_message must be Message or None")
+            if self.assistant_tool_message.role != "assistant":
+                raise ValueError("assistant_tool_message must have assistant role")
+        if not isinstance(self.tool_calls, tuple) or not all(
+            isinstance(call, ToolCallPart) for call in self.tool_calls
+        ):
+            raise TypeError("tool_calls must contain ToolCallPart values")
+        if not isinstance(self.completed_tool_results, tuple) or not all(
+            isinstance(result, ToolResultPart) for result in self.completed_tool_results
+        ):
+            raise TypeError("completed_tool_results must contain ToolResultPart values")
+        if isinstance(self.next_tool_index, bool) or not isinstance(self.next_tool_index, int):
+            raise TypeError("next_tool_index must be an integer")
+        if not 0 <= self.next_tool_index <= len(self.tool_calls):
+            raise ValueError("next_tool_index is outside tool_calls")
+        if len(self.completed_tool_results) != self.next_tool_index:
+            raise ValueError("completed_tool_results must match next_tool_index")
+        if self.stage == "tool_batch" and self.assistant_tool_message is None:
+            raise ValueError("tool_batch continuation requires assistant_tool_message")
+        if self.pending_pause is not None and not isinstance(self.pending_pause, PauseRequest):
+            raise TypeError("pending_pause must be PauseRequest or None")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionSegment:
+    """The complete result of one Core execution segment."""
+
+    events: tuple[AgentEvent, ...]
+    state: RunState
+    boundary: ExecutionBoundary
+    continuation: object | None = None
+    result: TurnResult | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.events, tuple) or not all(
+            isinstance(event, AgentEvent) for event in self.events
+        ):
+            raise TypeError("events must contain AgentEvent values")
+        if not isinstance(self.state, RunState):
+            raise TypeError("state must be RunState")
+        boundary = self.boundary
+        if not isinstance(boundary, ExecutionBoundary):
+            try:
+                boundary = ExecutionBoundary(boundary)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("unknown execution boundary") from exc
+            object.__setattr__(self, "boundary", boundary)
+        if boundary is ExecutionBoundary.PAUSED:
+            if not isinstance(self.continuation, _TurnContinuation):
+                raise TypeError("paused segment requires a Core continuation")
+            if self.continuation.pending_pause is None:
+                raise ValueError("paused segment requires pending pause facts")
+            if self.result is not None:
+                raise ValueError("paused segment cannot contain a terminal result")
+        else:
+            if self.continuation is not None:
+                raise ValueError("terminal segment cannot contain continuation facts")
+            if not isinstance(self.result, TurnResult):
+                raise TypeError("terminal segment requires a terminal result")
+
+    @property
+    def paused(self) -> bool:
+        return self.boundary is ExecutionBoundary.PAUSED
+
+    @property
+    def terminal(self) -> bool:
+        return self.boundary is ExecutionBoundary.TERMINAL
+
+
 class AgentLoop:
     """The single Provider-independent, sequential ReAct loop."""
 
@@ -534,6 +661,7 @@ class AgentLoop:
         *,
         turn_id: str | None = None,
         cancellation: CancellationToken | None = None,
+        tool_definitions: Sequence[ToolDefinition] | None = None,
     ) -> AgentTurnExecution:
         if not isinstance(state, RunState):
             raise TypeError("state must be RunState")
@@ -545,34 +673,42 @@ class AgentLoop:
             cancellation = CancellationToken()
         if not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be CancellationToken")
+        if tool_definitions is None:
+            definitions = self._tool_registry.definitions()
+        else:
+            if isinstance(tool_definitions, (str, bytes, bytearray)):
+                raise TypeError("tool_definitions must be a sequence")
+            definitions = tuple(tool_definitions)
+            if not all(isinstance(definition, ToolDefinition) for definition in definitions):
+                raise TypeError("tool_definitions must contain ToolDefinition values")
+            names = [definition.name for definition in definitions]
+            if len(set(names)) != len(names):
+                raise ValueError("tool_definitions must have unique names")
         turn_state = state.new_turn(turn_id, user_input)
         return AgentTurnExecution(
             loop=self,
             state=turn_state,
-            tool_definitions=self._tool_registry.definitions(),
+            tool_definitions=definitions,
             cancellation=cancellation,
         )
 
 
 class AgentTurnExecution:
-    """One lazily started execution with a single event producer."""
+    """One Core turn advanced explicitly from boundary to boundary."""
 
     __slots__ = (
         "_loop",
         "_state",
         "_tool_definitions",
         "_cancellation",
-        "_events_claimed",
-        "_queue",
-        "_task",
-        "_result_future",
-        "_result_value",
-        "_terminal_emitted",
-        "_completion_listeners",
-        "_completion_notified",
+        "_terminal_result",
+        "_started",
+        "_user_message_id",
         "_batch_number",
-        "_reasoning_segment",
-        "_reasoning_open",
+        "_batch_id",
+        "_batch_control_reason",
+        "_active_segment_signal",
+        "_continuation",
     )
 
     def __init__(
@@ -587,17 +723,14 @@ class AgentTurnExecution:
         self._state = state
         self._tool_definitions = tuple(tool_definitions)
         self._cancellation = cancellation
-        self._events_claimed = False
-        self._queue: asyncio.Queue[object] | None = None
-        self._task: asyncio.Task[None] | None = None
-        self._result_future: asyncio.Future[TurnResult] | None = None
-        self._result_value: TurnResult | None = None
-        self._terminal_emitted = False
-        self._completion_listeners: list[Callable[[TurnResult], object]] = []
-        self._completion_notified = False
+        self._terminal_result: TurnResult | None = None
+        self._started = False
+        self._user_message_id = uuid.uuid4().hex
         self._batch_number = 0
-        self._reasoning_segment = 0
-        self._reasoning_open = False
+        self._batch_id: str | None = None
+        self._batch_control_reason: str | None = None
+        self._active_segment_signal: CancellationToken | None = None
+        self._continuation: _TurnContinuation | None = None
 
     @property
     def state(self) -> RunState:
@@ -611,298 +744,521 @@ class AgentTurnExecution:
         return RunSnapshot.from_state(self._state)
 
     def cancel(self) -> bool:
-        return self._cancellation.cancel()
+        """Mark this turn cancelled and interrupt only the active attempt."""
+
+        if self._terminal_result is not None:
+            return False
+        changed = self._cancellation.cancel()
+        if self._active_segment_signal is not None:
+            self._active_segment_signal.cancel()
+        return changed
 
     def cancelled(self) -> bool:
         return self._cancellation.cancelled
 
-    def start(self) -> None:
-        """Start the single Core producer in the current event loop."""
+    def fail_internal(self, *, event_sink: AgentEventSink | None = None) -> AgentExecutionSegment:
+        """Close an execution after an Application driver failure.
 
-        self._ensure_started()
-
-    def add_completion_listener(
-        self,
-        listener: Callable[[TurnResult], object],
-    ) -> None:
-        """Notify one synchronous listener when this Turn reaches a terminal.
-
-        Registration itself is synchronous so Application can attach the
-        listener during ``start_turn()``.  If the terminal already exists, the
-        listener is invoked immediately; otherwise it is called exactly once
-        by the Core producer.  Listener failures are isolated from the Agent
-        Loop and never become user-visible diagnostics.
+        The driver uses this only when its call to ``run_segment`` itself
+        fails unexpectedly.  The failure remains a Core terminal fact and
+        exposes no exception details through the event or result payload.
         """
 
-        if not callable(listener):
-            raise TypeError("listener must be callable")
-        if self._completion_notified:
-            result = self._result_value
-            if result is not None:
-                self._invoke_completion_listener(listener, result)
-            return
-        self._completion_listeners.append(listener)
+        if self._terminal_result is not None:
+            return self._terminal_segment(())
+        events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
+        return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
 
-    async def run(self) -> TurnResult:
-        return await self.result()
+    def cancelled_segment(self, *, event_sink: AgentEventSink | None = None) -> AgentExecutionSegment:
+        """Return the cancellation terminal used when a driver task is cancelled."""
 
-    async def result(self) -> TurnResult:
-        self._ensure_started()
-        assert self._result_future is not None
-        return await asyncio.shield(self._result_future)
+        if self._terminal_result is not None:
+            return self._terminal_segment(())
+        self._cancellation.cancel()
+        events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
+        return self._cancel_segment(events)
 
-    async def events(self) -> AsyncIterator[AgentEvent]:
-        if self._events_claimed:
-            raise RuntimeError("AgentTurnExecution.events() can only be consumed once")
-        self._events_claimed = True
-        self._ensure_started()
-        assert self._queue is not None
-        while True:
-            item = await self._queue.get()
-            if item is _END:
-                assert self._result_future is not None
-                if self._result_future.cancelled():
-                    raise asyncio.CancelledError
-                if self._result_future.exception() is not None:
-                    raise self._result_future.exception()  # type: ignore[misc]
-                return
-            if not isinstance(item, AgentEvent):
-                raise RuntimeError("Agent execution produced an invalid event")
-            yield item
+    async def run_segment(
+        self,
+        *,
+        pause_signal: CancellationToken,
+        response: PauseResponse | None = None,
+        event_sink: AgentEventSink | None = None,
+    ) -> AgentExecutionSegment:
+        """Run until a paused or terminal boundary, then return all facts.
 
-    def _ensure_started(self) -> None:
-        if self._task is not None:
-            return
-        loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue()
-        self._result_future = loop.create_future()
-        self._task = loop.create_task(self._produce())
+        A segment never waits for a response.  After this coroutine returns,
+        the Core retains only immutable business state and continuation facts.
+        """
 
-    async def _produce(self) -> None:
-        assert self._queue is not None
-        assert self._result_future is not None
+        if not isinstance(pause_signal, CancellationToken):
+            raise TypeError("pause_signal must be CancellationToken")
+        if self._terminal_result is not None:
+            if response is not None:
+                raise ValueError("terminal execution does not accept a response")
+            return self._terminal_segment(())
+
+        events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
         try:
-            result = await self._execute()
-        except asyncio.CancelledError:
-            if not self._terminal_emitted:
-                self._cancellation.cancel()
-                result = await self._cancel_turn()
-            else:
-                if not self._result_future.done():
-                    self._result_future.cancel()
-                await self._queue.put(_END)
-                return
-        except Exception:
-            if self._terminal_emitted:
-                if not self._result_future.done():
-                    self._result_future.cancel()
-                await self._queue.put(_END)
-                return
-            result = await self._fail_turn(TerminationReason.INTERNAL_ERROR)
-        self._result_value = result
-        self._notify_completion(result)
-        if not self._result_future.done():
-            self._result_future.set_result(result)
-        await self._queue.put(_END)
+            if not self._started:
+                user_message = self._state.messages[-1]
+                self._append(
+                    events,
+                    TurnStarted(
+                        self._state.run_id,
+                        self._state.turn_id,
+                        self._user_message_id,
+                        user_message,
+                    ),
+                )
+                self._started = True
 
-    async def _emit(self, event: AgentEvent) -> None:
-        assert self._queue is not None
-        await self._queue.put(event)
+            if self._cancellation.cancelled:
+                return self._cancel_segment(events)
+
+            if self._continuation is not None:
+                if self._continuation.pending_pause is None:
+                    if response is not None:
+                        raise _ResponseRejected("response does not match an active pause")
+                elif response is None:
+                    raise _ResponseRejected("a paused execution requires a typed response")
+                else:
+                    try:
+                        self._apply_response(response, events)
+                    except (TypeError, ValueError) as exc:
+                        raise _ResponseRejected(str(exc)) from exc
+            elif response is not None:
+                raise _ResponseRejected("response does not match an active pause")
+
+            while True:
+                if self._cancellation.cancelled:
+                    return self._cancel_segment(events)
+
+                continuation = self._continuation
+                if continuation is not None and continuation.stage == "tool_batch":
+                    batch_status = await self._run_tool_batch(events, pause_signal)
+                    if batch_status == "paused":
+                        return self._paused_segment(events)
+                    if batch_status == "cancelled":
+                        return self._cancel_segment(events)
+                    if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
+                        return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
+                    continue
+
+                if continuation is not None:
+                    iteration = continuation.iteration
+                else:
+                    iteration = self._state.iteration_count + 1
+                if iteration > self._loop.config.max_iterations:
+                    return self._fail_segment(events, TerminationReason.MAX_ITERATIONS)
+                if self._state.iteration_count < iteration:
+                    self._set_state(iteration_count=iteration)
+                    self._append(
+                        events,
+                        IterationStarted(self._state.run_id, self._state.turn_id, iteration),
+                    )
+
+                if self._cancellation.cancelled:
+                    return self._cancel_segment(events)
+                if pause_signal.cancelled:
+                    self._set_provider_continuation(iteration)
+                    return self._pause_user_segment(events, iteration)
+
+                try:
+                    request_value = self._loop._request_preparer(
+                        self._state.messages,
+                        self._tool_definitions,
+                    )
+                    request = (
+                        await request_value
+                        if inspect.isawaitable(request_value)
+                        else request_value
+                    )
+                    if not isinstance(request, GenerationRequest):
+                        raise TypeError("request_preparer must return GenerationRequest")
+                except Exception:
+                    return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+
+                # A preparer may yield after pause/cancel was requested.  This
+                # is the safe boundary before any Provider attempt exists.
+                if self._cancellation.cancelled:
+                    return self._cancel_segment(events)
+                if pause_signal.cancelled:
+                    self._set_provider_continuation(iteration)
+                    return self._pause_user_segment(events, iteration)
+
+                assistant_message_id = uuid.uuid4().hex
+                self._continuation = None
+                self._active_segment_signal = pause_signal
+                try:
+                    response_value = await self._consume_provider(
+                        request,
+                        iteration,
+                        assistant_message_id,
+                        pause_signal,
+                        events,
+                    )
+                except GenerationCancelled:
+                    if self._cancellation.cancelled:
+                        return self._cancel_segment(events)
+                    if pause_signal.cancelled:
+                        self._set_provider_continuation(iteration)
+                        return self._pause_user_segment(events, iteration)
+                    return self._cancel_segment(events)
+                except NetworkError:
+                    if self._cancellation.cancelled:
+                        return self._cancel_segment(events)
+                    if pause_signal.cancelled:
+                        self._set_provider_continuation(iteration)
+                        return self._pause_user_segment(events, iteration)
+                    self._set_provider_continuation(iteration, provider_retry_pending=True)
+                    return self._pause_provider_segment(events, iteration, PauseReason.NETWORK_ERROR)
+                except RateLimitError:
+                    if self._cancellation.cancelled:
+                        return self._cancel_segment(events)
+                    if pause_signal.cancelled:
+                        self._set_provider_continuation(iteration)
+                        return self._pause_user_segment(events, iteration)
+                    self._set_provider_continuation(iteration, provider_retry_pending=True)
+                    return self._pause_provider_segment(events, iteration, PauseReason.RATE_LIMITED)
+                except InvalidProviderResponseError:
+                    return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
+                except ProviderError:
+                    return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                except CancelledError:
+                    self._cancellation.cancel()
+                    return self._cancel_segment(events)
+                except Exception:
+                    return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+                finally:
+                    if self._active_segment_signal is pause_signal:
+                        self._active_segment_signal = None
+
+                if self._cancellation.cancelled:
+                    return self._cancel_segment(events)
+                if pause_signal.cancelled:
+                    self._set_provider_continuation(iteration)
+                    return self._pause_user_segment(events, iteration)
+
+                try:
+                    calls = _validate_response(response_value)
+                except InvalidProviderResponseError:
+                    return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
+
+                provider_response = response_value.response
+                self._set_state(usage=_add_usage(self._state.usage, provider_response.usage))
+                self._append(
+                    events,
+                    UsageUpdated(self._state.run_id, self._state.turn_id, iteration, self._state.usage),
+                )
+
+                finish_reason = provider_response.finish_reason
+                if finish_reason is FinishReason.ERROR:
+                    return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                if finish_reason is FinishReason.CANCELLED:
+                    return self._cancel_segment(events)
+                if finish_reason is FinishReason.UNKNOWN:
+                    return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
+
+                if finish_reason in {FinishReason.LENGTH, FinishReason.INCOMPLETE}:
+                    kind = AssistantMessageKind.INCOMPLETE
+                elif calls:
+                    kind = AssistantMessageKind.PROGRESS
+                else:
+                    kind = AssistantMessageKind.FINAL
+
+                self._set_state(messages=self._state.messages + (provider_response.message,))
+                self._append(
+                    events,
+                    AssistantMessageCompleted(
+                        self._state.run_id,
+                        self._state.turn_id,
+                        assistant_message_id,
+                        iteration,
+                        kind,
+                        _public_assistant_message(provider_response.message),
+                    ),
+                )
+
+                if self._cancellation.cancelled:
+                    if calls:
+                        self._begin_tool_batch(calls, iteration, provider_response.message, events)
+                        self._batch_control_reason = "Error: tool call cancelled"
+                        await self._run_tool_batch(events, pause_signal)
+                    return self._cancel_segment(events)
+
+                if kind is AssistantMessageKind.FINAL:
+                    return self._complete_segment(events, _message_text(provider_response.message))
+
+                if kind is AssistantMessageKind.INCOMPLETE:
+                    if calls:
+                        self._begin_tool_batch(calls, iteration, provider_response.message, events)
+                        self._batch_control_reason = (
+                            "Error: tool call not executed because provider response was incomplete"
+                        )
+                        batch_status = await self._run_tool_batch(events, pause_signal)
+                        if batch_status == "cancelled":
+                            return self._cancel_segment(events)
+                    return self._fail_segment(events, TerminationReason.MAX_OUTPUT_TOKENS)
+
+                if len(calls) > self._loop.config.max_tool_calls_per_iteration:
+                    self._begin_tool_batch(calls, iteration, provider_response.message, events)
+                    self._batch_control_reason = "Error: tool call limit exceeded"
+                    batch_status = await self._run_tool_batch(events, pause_signal)
+                    if batch_status == "cancelled":
+                        return self._cancel_segment(events)
+                    return self._fail_segment(events, TerminationReason.MAX_TOOL_CALLS)
+
+                self._begin_tool_batch(calls, iteration, provider_response.message, events)
+                batch_status = await self._run_tool_batch(events, pause_signal)
+                if batch_status == "paused":
+                    return self._paused_segment(events)
+                if batch_status == "cancelled":
+                    return self._cancel_segment(events)
+                if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
+                    return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
+        except CancelledError:
+            self._cancellation.cancel()
+            return self._cancel_segment(events)
+        except _ResponseRejected:
+            raise
+        except (TypeError, ValueError):
+            if self._terminal_result is None:
+                return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+            return self._terminal_segment(events)
+        except Exception:
+            if self._terminal_result is None:
+                return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+            return self._terminal_segment(events)
+
+    def _append(self, events: list[AgentEvent], event: AgentEvent) -> None:
+        events.append(event)
+        if isinstance(events, _SegmentEventBuffer) and events.sink is not None:
+            events.sink(event)
 
     def _set_state(self, **changes: object) -> None:
         self._state = replace(self._state, **changes)
 
-    async def _execute(self) -> TurnResult:
-        user_message = self._state.messages[-1]
-        user_message_id = uuid.uuid4().hex
-        await self._emit(
-            TurnStarted(
-                self._state.run_id,
-                self._state.turn_id,
-                user_message_id,
-                user_message,
-            )
+    def _set_provider_continuation(
+        self,
+        iteration: int,
+        *,
+        provider_retry_pending: bool = False,
+    ) -> None:
+        self._continuation = _TurnContinuation(
+            stage="provider",
+            iteration=iteration,
+            provider_retry_pending=provider_retry_pending,
+            assistant_tool_message=None,
+            tool_calls=(),
+            completed_tool_results=(),
+            next_tool_index=0,
+            pending_pause=None,
         )
 
-        while True:
-            if self._cancellation.cancelled:
-                return await self._cancel_turn()
-            if self._state.iteration_count >= self._loop.config.max_iterations:
-                return await self._fail_turn(TerminationReason.MAX_ITERATIONS)
+    def _make_pause(
+        self,
+        *,
+        iteration: int,
+        kind: PauseKind,
+        reason: PauseReason,
+        tool_call_id: str | None = None,
+        user_input_request: UserInputRequest | None = None,
+    ) -> PauseRequest:
+        return PauseRequest(
+            pause_id=uuid.uuid4().hex,
+            run_id=self._state.run_id,
+            turn_id=self._state.turn_id,
+            kind=kind,
+            reason=reason,
+            iteration=iteration,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            tool_call_id=tool_call_id,
+            user_input_request=user_input_request,
+        )
 
-            iteration = self._state.iteration_count + 1
-            self._set_state(iteration_count=iteration)
-            await self._emit(IterationStarted(self._state.run_id, self._state.turn_id, iteration))
+    def _pause_user_segment(self, events: list[AgentEvent], iteration: int) -> AgentExecutionSegment:
+        pause = self._make_pause(
+            iteration=iteration,
+            kind=PauseKind.USER_REQUESTED,
+            reason=PauseReason.USER_REQUESTED,
+        )
+        assert self._continuation is not None
+        self._continuation = replace(self._continuation, pending_pause=pause)
+        self._append(
+            events,
+            TurnPausing(
+                self._state.run_id,
+                self._state.turn_id,
+                pause.pause_id,
+                pause.kind,
+                pause.reason,
+                pause.iteration,
+            ),
+        )
+        self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
+        return self._paused_segment(events)
 
-            try:
-                request_value = self._loop._request_preparer(
-                    self._state.messages,
-                    self._tool_definitions,
-                )
-                request = await request_value if inspect.isawaitable(request_value) else request_value
-                if not isinstance(request, GenerationRequest):
-                    raise TypeError("request_preparer must return GenerationRequest")
-            except Exception:
-                return await self._fail_turn(TerminationReason.INTERNAL_ERROR)
+    def _pause_provider_segment(
+        self,
+        events: list[AgentEvent],
+        iteration: int,
+        reason: PauseReason,
+    ) -> AgentExecutionSegment:
+        pause = self._make_pause(
+            iteration=iteration,
+            kind=PauseKind.PROVIDER_UNAVAILABLE,
+            reason=reason,
+        )
+        assert self._continuation is not None
+        self._continuation = replace(self._continuation, pending_pause=pause)
+        self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
+        return self._paused_segment(events)
 
-            assistant_message_id = uuid.uuid4().hex
-            try:
-                response = await self._consume_provider(
-                    request,
-                    iteration,
-                    assistant_message_id,
-                )
-            except GenerationCancelled:
-                return await self._cancel_turn()
-            except asyncio.CancelledError:
-                if self._cancellation.cancelled:
-                    return await self._cancel_turn()
-                raise
-            except InvalidProviderResponseError:
-                return await self._fail_turn(TerminationReason.INVALID_PROVIDER_RESPONSE)
-            except ProviderError:
-                return await self._fail_turn(TerminationReason.PROVIDER_ERROR)
-            except Exception:
-                return await self._fail_turn(TerminationReason.INTERNAL_ERROR)
+    def _pause_input_segment(
+        self,
+        events: list[AgentEvent],
+        iteration: int,
+        call: ToolCallPart,
+        request: UserInputRequest,
+    ) -> AgentExecutionSegment:
+        pause = self._make_pause(
+            iteration=iteration,
+            kind=PauseKind.USER_INPUT_REQUIRED,
+            reason=PauseReason.USER_INPUT_REQUIRED,
+            tool_call_id=call.tool_call_id,
+            user_input_request=request,
+        )
+        assert self._continuation is not None
+        self._continuation = replace(self._continuation, pending_pause=pause)
+        self._append(
+            events,
+            UserInputRequested(
+                self._state.run_id,
+                self._state.turn_id,
+                pause.pause_id,
+                call.tool_call_id,
+                request,
+            ),
+        )
+        self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
+        return self._paused_segment(events)
 
-            if self._cancellation.cancelled:
-                return await self._cancel_turn()
-            try:
-                calls = _validate_response(response)
-            except InvalidProviderResponseError:
-                return await self._fail_turn(TerminationReason.INVALID_PROVIDER_RESPONSE)
-            provider_response = response.response
-            self._set_state(usage=_add_usage(self._state.usage, provider_response.usage))
-            await self._emit(UsageUpdated(self._state.run_id, self._state.turn_id, iteration, self._state.usage))
-
-            finish_reason = provider_response.finish_reason
-            if finish_reason is FinishReason.ERROR:
-                return await self._fail_turn(TerminationReason.PROVIDER_ERROR)
-            if finish_reason is FinishReason.CANCELLED:
-                return await self._cancel_turn()
-            if finish_reason is FinishReason.UNKNOWN:
-                return await self._fail_turn(TerminationReason.INVALID_PROVIDER_RESPONSE)
-
-            if finish_reason in {FinishReason.LENGTH, FinishReason.INCOMPLETE}:
-                kind = AssistantMessageKind.INCOMPLETE
-            elif calls:
-                kind = AssistantMessageKind.PROGRESS
-            else:
-                kind = AssistantMessageKind.FINAL
-
-            self._set_state(messages=self._state.messages + (provider_response.message,))
-            await self._emit(
-                AssistantMessageCompleted(
+    def _apply_response(self, response: PauseResponse, events: list[AgentEvent]) -> None:
+        continuation = self._continuation
+        if continuation is None or continuation.pending_pause is None:
+            raise ValueError("response does not match an active pause")
+        pause = continuation.pending_pause
+        pause.validate_response(response)
+        if isinstance(response, UserInputResponse):
+            if continuation.stage != "tool_batch":
+                raise ValueError("user input response requires a Tool continuation")
+            index = continuation.next_tool_index
+            call = continuation.tool_calls[index]
+            request = pause.user_input_request
+            if request is None:
+                raise ValueError("user input pause has no request")
+            result = ToolResultPart(
+                tool_call_id=call.tool_call_id,
+                content=request.answers_to_json(response.answers),
+                is_error=False,
+            )
+            self._continuation = replace(
+                continuation,
+                completed_tool_results=continuation.completed_tool_results + (result,),
+                next_tool_index=index + 1,
+                pending_pause=None,
+            )
+            batch_id = self._require_batch_id()
+            self._append(
+                events,
+                ToolFinished(
                     self._state.run_id,
                     self._state.turn_id,
-                    assistant_message_id,
-                    iteration,
-                    kind,
-                    _public_assistant_message(provider_response.message),
-                )
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    self._safe_command(call, known=True),
+                    "finished",
+                    False,
+                ),
             )
-
-            if self._cancellation.cancelled:
-                if calls:
-                    await self._finish_tool_batch(calls, iteration)
-                return await self._cancel_turn()
-
-            if kind is AssistantMessageKind.FINAL:
-                return await self._complete_turn(_message_text(provider_response.message))
-
-            if kind is AssistantMessageKind.INCOMPLETE:
-                if calls:
-                    await self._finish_tool_batch(
-                        calls,
-                        iteration,
-                        control_reason="Error: tool call not executed because provider response was incomplete",
-                    )
-                if self._cancellation.cancelled:
-                    return await self._cancel_turn()
-                return await self._fail_turn(TerminationReason.MAX_OUTPUT_TOKENS)
-
-            if len(calls) > self._loop.config.max_tool_calls_per_iteration:
-                await self._finish_tool_batch(
-                    calls,
-                    iteration,
-                    control_reason="Error: tool call limit exceeded",
-                )
-                if self._cancellation.cancelled:
-                    return await self._cancel_turn()
-                return await self._fail_turn(TerminationReason.MAX_TOOL_CALLS)
-
-            batch_status = await self._finish_tool_batch(calls, iteration)
-            if self._cancellation.cancelled:
-                return await self._cancel_turn()
-            if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
-                return await self._fail_turn(TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
-            if batch_status == "cancelled":
-                return await self._cancel_turn()
+            return
+        self._continuation = replace(continuation, pending_pause=None)
 
     async def _consume_provider(
         self,
         request: GenerationRequest,
         iteration: int,
         message_id: str,
+        pause_signal: CancellationToken,
+        events: list[AgentEvent],
     ) -> GenerationCompleted:
         response: GenerationCompleted | None = None
-        self._reasoning_segment = 0
+        reasoning_segment = 0
+        reasoning_open = False
 
-        async def close_reasoning() -> None:
-            if self._reasoning_open:
-                await self._emit(
+        def close_reasoning() -> None:
+            nonlocal reasoning_open
+            if reasoning_open:
+                self._append(
+                    events,
                     ReasoningFinished(
                         self._state.run_id,
                         self._state.turn_id,
                         message_id,
                         iteration,
-                        self._reasoning_segment,
-                    )
+                        reasoning_segment,
+                    ),
                 )
-                self._reasoning_open = False
+                reasoning_open = False
 
         try:
             async for event in validated_provider_stream(
                 self._loop._provider,
                 request,
-                cancellation=self._cancellation,
+                cancellation=pause_signal,
             ):
                 if isinstance(event, ProviderReasoningDelta):
                     if not event.text:
                         continue
-                    if not self._reasoning_open:
-                        self._reasoning_segment += 1
-                        self._reasoning_open = True
-                        await self._emit(
+                    if not reasoning_open:
+                        reasoning_segment += 1
+                        reasoning_open = True
+                        self._append(
+                            events,
                             ReasoningStarted(
                                 self._state.run_id,
                                 self._state.turn_id,
                                 message_id,
                                 iteration,
-                                self._reasoning_segment,
-                            )
+                                reasoning_segment,
+                            ),
                         )
-                    await self._emit(
+                    self._append(
+                        events,
                         AgentReasoningDelta(
                             self._state.run_id,
                             self._state.turn_id,
                             message_id,
                             iteration,
                             event.text,
-                        )
+                        ),
                     )
                     continue
 
-                await close_reasoning()
+                close_reasoning()
                 if isinstance(event, TextDelta) and event.text:
-                    await self._emit(
+                    self._append(
+                        events,
                         AssistantMessageDelta(
                             self._state.run_id,
                             self._state.turn_id,
                             message_id,
                             iteration,
                             event.text,
-                        )
+                        ),
                     )
                 if isinstance(event, GenerationCompleted):
                     if self._cancellation.cancelled:
@@ -910,22 +1266,63 @@ class AgentTurnExecution:
                     response = event
                     break
         except BaseException:
-            await close_reasoning()
+            close_reasoning()
             raise
 
         if response is None:
             raise InvalidProviderResponseError("Provider stream ended without a terminal response")
         return response
 
+    def _begin_tool_batch(
+        self,
+        calls: tuple[ToolCallPart, ...],
+        iteration: int,
+        assistant_message: Message,
+        events: list[AgentEvent],
+    ) -> None:
+        self._batch_number += 1
+        self._batch_id = f"batch-{self._batch_number}"
+        self._batch_control_reason = None
+        self._set_state(tool_call_count=self._state.tool_call_count + len(calls))
+        self._append(
+            events,
+            ToolBatchStarted(
+                self._state.run_id,
+                self._state.turn_id,
+                iteration,
+                self._batch_id,
+                tuple(call.tool_call_id for call in calls),
+            ),
+        )
+        self._continuation = _TurnContinuation(
+            stage="tool_batch",
+            iteration=iteration,
+            provider_retry_pending=False,
+            assistant_tool_message=assistant_message,
+            tool_calls=calls,
+            completed_tool_results=(),
+            next_tool_index=0,
+            pending_pause=None,
+        )
+
+    def _require_batch_id(self) -> str:
+        if self._batch_id is None:
+            raise RuntimeError("Tool batch is not active")
+        return self._batch_id
+
+    def _ask_enabled(self) -> bool:
+        return any(definition.name == ASK_USER_TOOL_DEFINITION.name for definition in self._tool_definitions)
+
     def _safe_command(self, call: ToolCallPart, *, known: bool) -> str:
         if not known:
             return "<unknown tool>"
-        describer = self._loop._tool_call_describer
-        if describer is None:
+        if call.name == ASK_USER_TOOL_DEFINITION.name:
+            command = call.name
+        elif self._loop._tool_call_describer is None:
             command = call.name
         else:
             try:
-                command = describer(call)
+                command = self._loop._tool_call_describer(call)
             except Exception:
                 command = "<tool summary unavailable>"
         if not isinstance(command, str) or not command:
@@ -934,33 +1331,19 @@ class AgentTurnExecution:
             command = command[:239] + "…"
         return command
 
-    async def _finish_tool_batch(
+    def _append_cancelled_call(
         self,
-        calls: tuple[ToolCallPart, ...],
-        iteration: int,
+        events: list[AgentEvent],
+        call: ToolCallPart,
         *,
-        control_reason: str | None = None,
-    ) -> str:
-        self._batch_number += 1
-        batch_id = f"batch-{self._batch_number}"
-        call_ids = tuple(call.tool_call_id for call in calls)
-        self._set_state(tool_call_count=self._state.tool_call_count + len(calls))
-        await self._emit(
-            ToolBatchStarted(
-                self._state.run_id,
-                self._state.turn_id,
-                iteration,
-                batch_id,
-                call_ids,
-            )
-        )
-
-        results: list[ToolResultPart] = []
-        batch_status = "finished"
-        for call in calls:
-            known = self._loop._tool_registry.get(call.name) is not None
-            command = self._safe_command(call, known=known)
-            await self._emit(
+        started: bool,
+        iteration: int,
+    ) -> ToolResultPart:
+        batch_id = self._require_batch_id()
+        known = call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+        if not started:
+            self._append(
+                events,
                 ToolStarted(
                     self._state.run_id,
                     self._state.turn_id,
@@ -968,18 +1351,133 @@ class AgentTurnExecution:
                     batch_id,
                     call.tool_call_id,
                     call.name,
-                    command,
+                    self._safe_command(call, known=known),
+                ),
+            )
+        result = _controlled_tool_result(call, "Error: tool call cancelled")
+        self._append(
+            events,
+            ToolFinished(
+                self._state.run_id,
+                self._state.turn_id,
+                iteration,
+                batch_id,
+                call.tool_call_id,
+                call.name,
+                self._safe_command(call, known=known),
+                "cancelled",
+                True,
+            ),
+        )
+        return result
+
+    def _cancel_remaining_tools(self, events: list[AgentEvent]) -> None:
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            return
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        pending_input = (
+            continuation.pending_pause is not None
+            and continuation.pending_pause.kind is PauseKind.USER_INPUT_REQUIRED
+        )
+        if pending_input and index < len(continuation.tool_calls):
+            results.append(
+                self._append_cancelled_call(
+                    events,
+                    continuation.tool_calls[index],
+                    started=True,
+                    iteration=continuation.iteration,
                 )
             )
+            index += 1
+        while index < len(continuation.tool_calls):
+            results.append(
+                self._append_cancelled_call(
+                    events,
+                    continuation.tool_calls[index],
+                    started=False,
+                    iteration=continuation.iteration,
+                )
+            )
+            index += 1
+        self._continuation = replace(
+            continuation,
+            completed_tool_results=tuple(results),
+            next_tool_index=index,
+            pending_pause=None,
+        )
+        self._close_tool_batch(events, status="cancelled")
 
-            controlled_status = False
+    async def _run_tool_batch(
+        self,
+        events: list[AgentEvent],
+        pause_signal: CancellationToken,
+    ) -> str:
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            raise RuntimeError("Tool batch continuation is missing")
+
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        control_reason = self._batch_control_reason
+        while index < len(continuation.tool_calls):
+            continuation = self._continuation
+            assert continuation is not None
+            if self._cancellation.cancelled:
+                self._cancel_remaining_tools(events)
+                return "cancelled"
+            if control_reason is None and pause_signal.cancelled:
+                self._continuation = replace(continuation, pending_pause=None)
+                self._pause_user_segment(events, continuation.iteration)
+                return "paused"
+
+            call = continuation.tool_calls[index]
+            known = (
+                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or self._loop._tool_registry.get(call.name) is not None
+            command = self._safe_command(call, known=known)
+            batch_id = self._require_batch_id()
+            self._append(
+                events,
+                ToolStarted(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                ),
+            )
+
+            controlled = False
+            status = "finished"
             if self._cancellation.cancelled:
                 result = _controlled_tool_result(call, "Error: tool call cancelled")
-                controlled_status = True
-                batch_status = "cancelled"
+                controlled = True
+                status = "cancelled"
             elif control_reason is not None:
                 result = _controlled_tool_result(call, control_reason)
-                controlled_status = True
+                controlled = True
+                status = "failed"
+            elif call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled():
+                self._set_state(consecutive_unknown_tools=0)
+                try:
+                    request = UserInputRequest.from_dict(call.arguments)
+                except (TypeError, ValueError, KeyError):
+                    result = _controlled_tool_result(call, "Error: invalid AskUserQuestion arguments")
+                    controlled = True
+                    status = "failed"
+                else:
+                    self._continuation = replace(
+                        continuation,
+                        completed_tool_results=tuple(results),
+                        next_tool_index=index,
+                        pending_pause=None,
+                    )
+                    self._pause_input_segment(events, continuation.iteration, call, request)
+                    return "paused"
             else:
                 if known:
                     self._set_state(consecutive_unknown_tools=0)
@@ -993,89 +1491,122 @@ class AgentTurnExecution:
                         cancellation=self._cancellation,
                     )
                     if not isinstance(result, ToolResultPart) or result.tool_call_id != call.tool_call_id:
-                        result = _controlled_tool_result(call, "Error: tool execution returned an invalid result")
-                except (GenerationCancelled, asyncio.CancelledError):
+                        result = _controlled_tool_result(
+                            call,
+                            "Error: tool execution returned an invalid result",
+                        )
+                        controlled = True
+                        status = "failed"
+                except (GenerationCancelled, CancelledError):
                     self._cancellation.cancel()
                     result = _controlled_tool_result(call, "Error: tool call cancelled")
-                    controlled_status = True
-                    batch_status = "cancelled" if self._cancellation.cancelled else "finished"
+                    controlled = True
+                    status = "cancelled"
                 except Exception:
                     result = _controlled_tool_result(call, "Error: tool execution failed")
+                    controlled = True
+                    status = "failed"
 
-            if result.is_error and not controlled_status:
-                batch_status = "finished"
-            if self._cancellation.cancelled and len(results) < len(calls) - 1:
-                batch_status = "cancelled"
-            if controlled_status and self._cancellation.cancelled:
-                batch_status = "cancelled"
-            status = "cancelled" if controlled_status and self._cancellation.cancelled else (
-                "failed" if result.is_error else "finished"
-            )
-            if control_reason is not None:
-                status = "failed"
-                batch_status = "failed"
+            if not controlled:
+                status = "failed" if result.is_error else "finished"
             results.append(result)
-            await self._emit(
+            self._append(
+                events,
                 ToolFinished(
                     self._state.run_id,
                     self._state.turn_id,
-                    iteration,
+                    continuation.iteration,
                     batch_id,
                     call.tool_call_id,
                     call.name,
                     command,
                     status,
                     result.is_error,
-                )
+                ),
             )
+            index += 1
+            self._continuation = replace(
+                continuation,
+                completed_tool_results=tuple(results),
+                next_tool_index=index,
+                pending_pause=None,
+            )
+            await sleep(0)
+            if self._cancellation.cancelled:
+                self._cancel_remaining_tools(events)
+                return "cancelled"
+            if control_reason is None and pause_signal.cancelled:
+                continuation = self._continuation
+                assert continuation is not None
+                if index < len(continuation.tool_calls):
+                    self._pause_user_segment(events, continuation.iteration)
+                    return "paused"
 
-        self._set_state(
-            messages=self._state.messages + (Message(role="tool", parts=tuple(results)),)
-        )
-        if self._cancellation.cancelled and control_reason is None:
-            batch_status = "cancelled"
-        await self._emit(
+        continuation = self._continuation
+        assert continuation is not None
+        self._close_tool_batch(events, status="failed" if control_reason is not None else "finished")
+        if control_reason is None and pause_signal.cancelled and self._terminal_result is None:
+            next_iteration = self._state.iteration_count + 1
+            if next_iteration > self._loop.config.max_iterations:
+                return "finished"
+            self._set_provider_continuation(next_iteration)
+            self._pause_user_segment(events, next_iteration)
+            return "paused"
+        return "finished"
+
+    def _close_tool_batch(self, events: list[AgentEvent], *, status: str) -> None:
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            return
+        results = continuation.completed_tool_results
+        self._set_state(messages=self._state.messages + (Message(role="tool", parts=results),))
+        self._append(
+            events,
             ToolBatchFinished(
                 self._state.run_id,
                 self._state.turn_id,
-                iteration,
-                batch_id,
-                call_ids,
-                batch_status,
-            )
+                continuation.iteration,
+                self._require_batch_id(),
+                tuple(call.tool_call_id for call in continuation.tool_calls),
+                status,
+            ),
         )
-        return batch_status
+        self._continuation = None
+        self._batch_id = None
+        self._batch_control_reason = None
 
-    async def _complete_turn(self, final_text: str) -> TurnResult:
-        return await self._terminal_result(
-            RunStatus.COMPLETED,
-            TerminationReason.FINAL_ANSWER,
-            final_text,
-        )
+    def _complete_segment(self, events: list[AgentEvent], final_text: str) -> AgentExecutionSegment:
+        self._set_terminal(RunStatus.COMPLETED, TerminationReason.FINAL_ANSWER, final_text)
+        self._append(events, TurnCompleted(self._state.run_id, self._state.turn_id, final_text))
+        return self._terminal_segment(events)
 
-    async def _fail_turn(self, reason: TerminationReason) -> TurnResult:
-        return await self._terminal_result(RunStatus.FAILED, reason, None)
+    def _fail_segment(
+        self,
+        events: list[AgentEvent],
+        reason: TerminationReason,
+    ) -> AgentExecutionSegment:
+        self._set_terminal(RunStatus.FAILED, reason, None)
+        self._append(events, TurnFailed(self._state.run_id, self._state.turn_id, reason))
+        return self._terminal_segment(events)
 
-    async def _cancel_turn(self) -> TurnResult:
-        return await self._terminal_result(
-            RunStatus.CANCELLED,
-            TerminationReason.USER_CANCELLED,
-            None,
-        )
+    def _cancel_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
+        self._cancellation.cancel()
+        if self._continuation is not None and self._continuation.stage == "tool_batch":
+            self._cancel_remaining_tools(events)
+        self._set_terminal(RunStatus.CANCELLED, TerminationReason.USER_CANCELLED, None)
+        self._append(events, TurnCancelled(self._state.run_id, self._state.turn_id))
+        return self._terminal_segment(events)
 
-    async def _terminal_result(
+    def _set_terminal(
         self,
         status: RunStatus,
         reason: TerminationReason,
         final_text: str | None,
-    ) -> TurnResult:
-        if self._terminal_emitted:
-            if self._result_value is None:
-                raise RuntimeError("Agent Turn already terminated without a result")
-            return self._result_value
-        self._terminal_emitted = True
+    ) -> None:
+        if self._terminal_result is not None:
+            return
         self._set_state(status=status, termination_reason=reason)
-        result = TurnResult(
+        self._terminal_result = TurnResult(
             run_id=self._state.run_id,
             turn_id=self._state.turn_id,
             status=status,
@@ -1085,44 +1616,39 @@ class AgentTurnExecution:
             iteration_count=self._state.iteration_count,
             tool_call_count=self._state.tool_call_count,
         )
-        self._result_value = result
-        self._notify_completion(result)
-        if status is RunStatus.COMPLETED:
-            await self._emit(TurnCompleted(self._state.run_id, self._state.turn_id, final_text or ""))
-        elif status is RunStatus.CANCELLED:
-            await self._emit(TurnCancelled(self._state.run_id, self._state.turn_id))
-        else:
-            await self._emit(TurnFailed(self._state.run_id, self._state.turn_id, reason))
-        return result
+        self._continuation = None
+        self._batch_id = None
+        self._batch_control_reason = None
 
-    def _notify_completion(self, result: TurnResult) -> None:
-        if self._completion_notified:
-            return
-        self._completion_notified = True
-        listeners = tuple(self._completion_listeners)
-        self._completion_listeners.clear()
-        for listener in listeners:
-            self._invoke_completion_listener(listener, result)
+    def _paused_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
+        if self._continuation is None or self._continuation.pending_pause is None:
+            raise RuntimeError("paused segment has no continuation facts")
+        return AgentExecutionSegment(
+            events=tuple(events),
+            state=self._state,
+            boundary=ExecutionBoundary.PAUSED,
+            continuation=self._continuation,
+        )
 
-    @staticmethod
-    def _invoke_completion_listener(
-        listener: Callable[[TurnResult], object],
-        result: TurnResult,
-    ) -> None:
-        try:
-            listener(result)
-        except Exception:
-            # Completion is a Core fact.  A consumer callback must not change
-            # terminal semantics or expose an exception from this boundary.
-            return
+    def _terminal_segment(self, events: tuple[AgentEvent, ...] | list[AgentEvent]) -> AgentExecutionSegment:
+        if self._terminal_result is None:
+            raise RuntimeError("terminal segment has no terminal result")
+        return AgentExecutionSegment(
+            events=tuple(events),
+            state=self._state,
+            boundary=ExecutionBoundary.TERMINAL,
+            result=self._terminal_result,
+        )
 
 
 __all__ = [
+    "AgentExecutionSegment",
     "AgentLoop",
     "AgentLoopConfig",
     "AgentLoopConfigError",
     "AgentTurnExecution",
     "AssistantMessageKind",
+    "ExecutionBoundary",
     "RunSnapshot",
     "RunState",
     "RunStatus",

@@ -27,6 +27,7 @@ TUI 使用终端主缓冲区和原生 scrollback。已经完成的用户消息�
 src/uthcode/interfaces/tui/
 ├── app.py         # prompt_toolkit Application、按键、命令和 Turn 生命周期
 ├── completion.py  # Slash Command 候选状态
+├── interaction.py  # 暂停菜单、问题导航、答案草稿与复核
 ├── picker.py      # 模型候选状态
 ├── rendering.py   # Application 事件投影与 Markdown 流式边界
 ├── state.py       # 双 Esc 状态与 Unicode grapheme 计算
@@ -122,8 +123,8 @@ Markdown 的标题、列表、引用、表格、链接和代码由 Rich 渲染�
 | `Backspace` | 按 Unicode grapheme 删除光标前一个字符；空输入无动作 |
 | `Delete` | 删除光标后的字符 |
 | `Tab` | 补全当前 Slash Command |
-| `Esc` | 关闭候选或模型选择并恢复草稿；普通输入无动作 |
-| 连续两次 `Esc` | 生成期间取消当前请求 |
+| `Esc` | 由最上层候选、模型选择或问答层优先消费；根页面普通输入无动作 |
+| 连续两次 `Esc` | 对话根页面生成期间请求 cooperative pause；不是取消 |
 | `Ctrl+C` | 退出 UthCode |
 
 只有 `Ctrl+C` 和 `/quit` 会退出。输入解析异常会显示可恢复错误并恢复终端状态，不会被静默转换成退出。
@@ -135,6 +136,14 @@ Windows 直接读取带修饰键的原生 Unicode 控制台事件，从而在 Wi
 Slash Command 使用 Application 的正式 Completion 数据源。候选随草稿实时过滤，字符输入、Backspace 和左右编辑继续作用于同一份草稿。上下键只在当前可见窗口中移动，`Tab` 补全，`Enter` 执行，`Esc` 关闭。
 
 `/model` 打开模型候选时保存原草稿；按 `Esc` 后关闭选择器并恢复原对话输入。命令定义、参数提示和模型目录都来自 Application，TUI 不维护副本。
+
+## 暂停、恢复与问答
+
+暂停只属于当前进程、当前内存 Run 的活动 Turn。对话根页面连续按两次 `Esc` 后，状态栏先显示 `pausing…`，到达安全边界后显示 `paused` 并打开临时动作层。动作层提供 `Resume` 或 `Cancel current turn`；网络/限流暂停提供 `Retry` 或 `Cancel current turn`。暂停期间仍保留原 `TurnHandle`，不会启动第二个 Turn，也不会产生第二个 `TurnStarted`。
+
+模型调用 `AskUserQuestion` 时，TUI 打开临时问题面板。面板支持文本、单选、多选和 `Other`，可用方向键导航、返回上一题、查看答案汇总并在确认后一次性提交。提交只调用 Application 公共 `TurnHandle.resume(...)`，问题答案和 pending pause 不在 TUI 形成第二份权威状态；答案正文也不会写入工具活动或永久系统消息。
+
+`Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，不提供跨进程恢复。
 
 ## 启动、`/clear` 与退出
 

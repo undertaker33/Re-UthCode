@@ -52,6 +52,7 @@ from uthcode.application import (
 )
 
 from .completion import CompletionMenuItem, CompletionMenuState
+from .interaction import InteractionMode, TuiInteractionState
 from .picker import ModelPickerState
 from .rendering import AgentEventRenderer, MarkdownStream, RenderBatch
 from .state import EscArmState, previous_grapheme_length
@@ -107,6 +108,7 @@ class UthCodeTUI:
         self.dispatcher = CommandDispatcher(self.registry, application)
         self.completion = CompletionMenuState()
         self.picker = ModelPickerState()
+        self.interaction = TuiInteractionState()
         self.buffer = Buffer(
             multiline=True,
             on_text_changed=lambda _buffer: self._on_buffer_changed(),
@@ -170,6 +172,10 @@ class UthCodeTUI:
             input=input_device,
             output=terminal_output,
         )
+        # Escape is also the prefix of modified terminal sequences.  Keep the
+        # ambiguity window short enough for a standalone picker/menu Escape to
+        # feel immediate while still allowing an Escape/Escape pause gesture.
+        self.ui.timeoutlen = 0.15
 
     def run(self) -> int:
         return asyncio.run(self.run_async())
@@ -333,6 +339,8 @@ class UthCodeTUI:
         ]
 
     def _candidate_fragments(self) -> StyleAndTextTuples:
+        if self.interaction.open:
+            return list(self.interaction.render_lines())
         if self.completion.open:
             items = self.completion.candidates
             selected = self.completion.selected_index
@@ -368,7 +376,9 @@ class UthCodeTUI:
         @bindings.add(Keys.ControlM, eager=True)
         def _submit(event: object) -> None:
             del event
-            if self.completion.open:
+            if self.interaction.open:
+                self._submit_interaction()
+            elif self.completion.open:
                 self._execute_selected_command()
             elif self.picker.open:
                 self._select_picker_model()
@@ -382,8 +392,65 @@ class UthCodeTUI:
         @bindings.add(Keys.Escape, Keys.ControlJ, eager=True)
         def _newline(event: object) -> None:
             del event
-            if not menu_open():
+            if self.interaction.open:
+                if not self.interaction.is_select:
+                    self.buffer.insert_text("\n")
+            elif not menu_open():
                 self.buffer.insert_text("\n")
+
+        interaction_open = Condition(lambda: self.interaction.open)
+
+        @bindings.add(Keys.Up, filter=interaction_open, eager=True)
+        def _interaction_up(event: object) -> None:
+            del event
+            self.interaction.move(-1)
+            self._invalidate()
+
+        @bindings.add(Keys.Down, filter=interaction_open, eager=True)
+        def _interaction_down(event: object) -> None:
+            del event
+            self.interaction.move(1)
+            self._invalidate()
+
+        @bindings.add(Keys.Left, filter=interaction_open, eager=True)
+        def _interaction_left(event: object) -> None:
+            del event
+            if self.interaction.previous_question():
+                self._sync_interaction_buffer()
+            self._invalidate()
+
+        @bindings.add(Keys.Right, filter=interaction_open, eager=True)
+        def _interaction_right(event: object) -> None:
+            del event
+            if self.interaction.mode is InteractionMode.QUESTIONS:
+                self._submit_interaction()
+
+        @bindings.add(
+            " ",
+            filter=Condition(lambda: self.interaction.open and self.interaction.is_select),
+            eager=True,
+        )
+        def _interaction_space(event: object) -> None:
+            del event
+            self.interaction.toggle_option()
+            self._invalidate()
+
+        @bindings.add(
+            Keys.Escape,
+            Keys.Escape,
+            filter=Condition(
+                lambda: self._active_handle is not None
+                and not self._active_handle.paused
+                and not self.completion.open
+                and not self.picker.open
+                and not self.interaction.open
+            ),
+            eager=True,
+        )
+        def _double_escape(event: object) -> None:
+            del event
+            self._esc.arm(time.monotonic())
+            self._handle_generation_escape()
 
         @bindings.add(Keys.Backspace, eager=True)
         @bindings.add(Keys.ControlH, eager=True)
@@ -412,16 +479,25 @@ class UthCodeTUI:
             if self.completion.open:
                 self._complete_command()
 
-        @bindings.add(Keys.Escape, eager=True)
+        # Keep the single Escape binding non-eager so the root-level
+        # Escape/Escape sequence can be recognized as one cooperative pause
+        # gesture without stealing the first key from the sequence matcher.
+        @bindings.add(Keys.Escape)
         def _escape(event: object) -> None:
             del event
             if self.completion.open:
                 self.completion.close()
+                self._reset_interaction_context()
             elif self.picker.open:
                 self.picker.close()
                 if self._picker_draft is not None:
                     self.buffer.set_document(self._picker_draft, bypass_readonly=True)
                 self._picker_draft = None
+                self._reset_interaction_context()
+            elif self.interaction.open:
+                self._handle_interaction_escape()
+            elif self._active_handle is not None and self._active_handle.paused:
+                self._open_pending_interaction()
             elif self._active_handle is not None:
                 self._handle_generation_escape()
 
@@ -435,7 +511,9 @@ class UthCodeTUI:
 
     def _on_buffer_changed(self) -> None:
         text = self.buffer.text
-        if not self.picker.open and text.lstrip().startswith("/"):
+        if self.interaction.open:
+            self.completion.close()
+        elif not self.picker.open and text.lstrip().startswith("/"):
             self.completion.replace(self._application_completion(text))
         else:
             self.completion.close()
@@ -443,6 +521,9 @@ class UthCodeTUI:
 
     async def _handle_submission(self, text: str) -> None:
         self.completion.close()
+        if self.interaction.open:
+            self._submit_interaction()
+            return
         if text.lstrip().startswith("/"):
             invocation = self.parser.parse(text)
             if invocation.is_bare_slash:
@@ -499,6 +580,7 @@ class UthCodeTUI:
 
     def _start_generation(self, prompt: str) -> None:
         self._reset_stream_projection()
+        self.interaction.close()
         handle = self._run.start_turn(prompt)
         self._active_handle = handle
         self._esc.clear()
@@ -515,6 +597,25 @@ class UthCodeTUI:
                 async for event in handle.events():
                     if not isinstance(event, AgentEvent):
                         raise RuntimeError("Application returned an invalid AgentEvent")
+                    if event.event_type == "turn_pausing":
+                        self.activity = "pausing…"
+                        self._invalidate()
+                        continue
+                    if event.event_type == "turn_paused":
+                        pause = getattr(event, "pause", None)
+                        if pause is not None:
+                            self.interaction.open_pause(pause)
+                            self._esc.clear()
+                            self.activity = "paused"
+                            self.buffer.set_document(Document("", 0), bypass_readonly=True)
+                            self._invalidate()
+                        continue
+                    if event.event_type == "turn_resumed":
+                        self.interaction.close()
+                        self._esc.clear()
+                        self.activity = "generating"
+                        self._invalidate()
+                        continue
                     batch = renderer.push(event)
                     if batch is not None:
                         await self._apply_batch(batch)
@@ -547,6 +648,7 @@ class UthCodeTUI:
         finally:
             if self._active_handle is handle:
                 self._active_handle = None
+            self.interaction.close()
             self._generation_task = None
             self._esc.clear()
             self._invalidate()
@@ -563,6 +665,8 @@ class UthCodeTUI:
 
     async def _apply_batch(self, batch: RenderBatch) -> None:
         self._sync_renderer_width()
+        if batch.activity is not None:
+            self.activity = batch.activity
         writes: list[str] = []
         for _message_id, text in batch.users:
             writes.append(self._renderer.user_message(text))
@@ -663,12 +767,104 @@ class UthCodeTUI:
         now = time.monotonic()
         if self._esc.consume(now):
             assert self._active_handle is not None
-            self._active_handle.cancel()
-            self.activity = "cancelling"
+            if self._active_handle.pause():
+                self.activity = "pausing…"
+            else:
+                self.activity = "generating"
         else:
             self._esc.arm(now)
-            self.activity = "再次按 Esc 取消当前生成"
+            self.activity = "再次按 Esc 暂停当前生成"
         self._invalidate()
+
+    def _open_pending_interaction(self) -> None:
+        handle = self._active_handle
+        pause = handle.pending_pause if handle is not None else None
+        if pause is None:
+            return
+        self.interaction.open_pause(pause)
+        self._esc.clear()
+        self._invalidate()
+
+    def _reset_interaction_context(self) -> None:
+        self._esc.clear()
+        self._invalidate()
+
+    def _sync_interaction_buffer(self) -> None:
+        question = self.interaction.current_question
+        value = ""
+        if question is not None and (
+            question.kind.value == "text" or self.interaction.other_mode
+        ):
+            value = self.interaction.draft
+        self.buffer.set_document(
+            Document(value, len(value)),
+            bypass_readonly=True,
+        )
+
+    def _handle_interaction_escape(self) -> None:
+        if (
+            self.interaction.mode is InteractionMode.QUESTIONS
+            and self.interaction.other_mode
+        ):
+            self.interaction.other_mode = False
+            self.interaction.draft = ""
+            self._sync_interaction_buffer()
+        elif self.interaction.previous_question():
+            self._sync_interaction_buffer()
+        else:
+            # Esc only closes the temporary layer.  It never submits an empty
+            # answer and never cancels a pending Turn.
+            self.interaction.close()
+            self.activity = "paused"
+            self.buffer.set_document(Document("", 0), bypass_readonly=True)
+        self._reset_interaction_context()
+
+    def _submit_interaction(self) -> None:
+        handle = self._active_handle
+        if handle is None or not self.interaction.open:
+            return
+        if self.interaction.mode is InteractionMode.PAUSE_ACTION:
+            action = self.interaction.confirm_action()
+            if action is None:
+                return
+            if action.value == "cancel":
+                handle.cancel()
+                self.interaction.close()
+                self.activity = "cancelling"
+            else:
+                response = self.interaction.response_for_action()
+                if response is not None and handle.resume(response):
+                    self.interaction.close()
+                    self.activity = "resuming"
+            self._reset_interaction_context()
+            return
+
+        if self.interaction.mode is InteractionMode.REVIEW:
+            response = self.interaction.user_input_response()
+            if response is not None and handle.resume(response):
+                self.interaction.close()
+                self.buffer.set_document(Document("", 0), bypass_readonly=True)
+                self.activity = "resuming"
+                self._reset_interaction_context()
+            return
+
+        question = self.interaction.current_question
+        if question is None:
+            return
+        typed = self.buffer.text.strip()
+        if question.kind.value != "text" and typed:
+            if typed in self.interaction.current_options:
+                self.interaction.selected_options = {
+                    self.interaction.current_options.index(typed)
+                }
+            elif question.allow_other:
+                self.interaction.choose_other()
+                self.interaction.set_draft(typed)
+        else:
+            self.interaction.set_draft(self.buffer.text)
+        if self.interaction.submit_current():
+            self.buffer.set_document(Document("", 0), bypass_readonly=True)
+            self._invalidate()
 
     def _complete_command(self) -> None:
         selected = self.completion.selected
@@ -746,7 +942,7 @@ class UthCodeTUI:
 
     def _has_candidates(self) -> bool:
         return (
-            self.completion.open or self.picker.open
+            self.completion.open or self.picker.open or self.interaction.open
         ) and self._candidate_height() > 0
 
     def _pending_text(self) -> str:
@@ -784,7 +980,7 @@ class UthCodeTUI:
         _columns, rows = self._terminal_size()
         candidate_height = (
             self._candidate_height()
-            if self.completion.open or self.picker.open
+            if self.completion.open or self.picker.open or self.interaction.open
             else 0
         )
         occupied = self._composer_height() + candidate_height + 2
@@ -803,6 +999,10 @@ class UthCodeTUI:
                 "candidate.selected": (
                     f"bold {PALETTE.input_background} bg:{PALETTE.accent}"
                 ),
+                "interaction.title": f"bold {PALETTE.accent} bg:{PALETTE.user_background}",
+                "interaction.question": f"{PALETTE.text} bg:{PALETTE.user_background}",
+                "interaction.hint": f"{PALETTE.muted} bg:{PALETTE.user_background}",
+                "interaction.option": f"{PALETTE.text} bg:{PALETTE.user_background}",
                 "separator": PALETTE.muted,
             }
         )

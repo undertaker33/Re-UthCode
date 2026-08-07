@@ -28,6 +28,7 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.core.tool import ToolExecutionResult
+from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.integrations.providers.fake import FakeProvider
 
 
@@ -248,3 +249,24 @@ async def test_headless_fake_provider_manual_tool_round_trip_uses_same_context(t
     assert provider.recorded_requests[1].messages[-1] == tool_message
     assert provider.recorded_requests[0].system_prompt == provider.recorded_requests[1].system_prompt
     assert application.runtime_context.workdir == tmp_path.resolve()
+
+
+def test_application_rejects_reserved_ask_user_tool_from_normal_registry() -> None:
+    class ReservedTool:
+        definition = ASK_USER_TOOL_DEFINITION
+
+        async def execute(self, arguments, *, cancellation):
+            del arguments, cancellation
+            return ToolExecutionResult("must not execute")
+
+    with pytest.raises(ValueError, match="reserved"):
+        create_application(_configuration(), tools=(ReservedTool(),))
+
+
+@pytest.mark.asyncio
+async def test_manual_tool_api_rejects_application_control_tool() -> None:
+    application = create_application(_configuration())
+    with pytest.raises(ValueError, match="manual Tool execution"):
+        await application.execute_tool_calls(
+            (ToolCallPart("ask-1", ASK_USER_TOOL_DEFINITION.name, {"questions": []}),)
+        )

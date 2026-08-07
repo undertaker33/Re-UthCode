@@ -18,6 +18,19 @@ from .bootstrap import (
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
 from .runtime_context import ApplicationRuntimeContext
 from .runs import AgentRun, TurnHandle
+from uthcode.core.interaction import (
+    PauseKind,
+    PauseReason,
+    PauseRequest,
+    PauseResponse,
+    QuestionKind,
+    QuestionOption,
+    RetryProviderResponse,
+    ResumeTurnResponse,
+    UserInputRequest,
+    UserInputResponse,
+    UserQuestion,
+)
 from uthcode.core import (
     AgentEvent,
     CancellationToken,
@@ -113,8 +126,16 @@ __all__ = [
     "ProviderIdentity",
     "ProviderResponse",
     "ProviderProfile",
+    "PauseKind",
+    "PauseReason",
+    "PauseRequest",
+    "PauseResponse",
+    "QuestionKind",
+    "QuestionOption",
     "QuitInterface",
     "ReasoningDelta",
+    "RetryProviderResponse",
+    "ResumeTurnResponse",
     "RunSnapshot",
     "RunStatus",
     "TextDelta",
@@ -126,6 +147,9 @@ __all__ = [
     "TurnHandle",
     "TurnResult",
     "Usage",
+    "UserInputRequest",
+    "UserInputResponse",
+    "UserQuestion",
     "UthCodeApplication",
     "UiAction",
     "complete_commands",

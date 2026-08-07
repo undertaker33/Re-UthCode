@@ -81,7 +81,7 @@ class RichTerminalRenderer:
             Text.from_markup(
                 f"[bold]{_escape(model_ref)}[/bold]\n"
                 f"{_escape(cwd)}\n"
-                "Enter 发送 · Shift+Enter / Ctrl+J 换行 · Ctrl+C 退出",
+                "Enter 发送 · Shift+Enter / Ctrl+J 换行 · 生成中连续 Esc 暂停 · Ctrl+C 退出",
                 justify="center",
             ),
         )

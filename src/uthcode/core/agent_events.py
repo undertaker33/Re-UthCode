@@ -14,6 +14,12 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, ClassVar, TypeAlias
 
+from .interaction import (
+    PauseKind,
+    PauseReason,
+    PauseRequest,
+    UserInputRequest,
+)
 from .provider import (
     JsonPayload,
     Message,
@@ -73,6 +79,8 @@ def _json_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (Message, Usage)):
+        return value.to_dict()
+    if isinstance(value, (PauseRequest, UserInputRequest)):
         return value.to_dict()
     if isinstance(value, JsonPayload):
         return {key: _json_value(item) for key, item in value.items()}
@@ -262,6 +270,108 @@ class UsageUpdated(AgentEvent):
             raise TypeError("usage must be Usage")
 
 
+@dataclass(frozen=True, slots=True)
+class TurnPausing(AgentEvent):
+    event_type: ClassVar[str] = "turn_pausing"
+    pause_id: str
+    kind: PauseKind
+    reason: PauseReason
+    iteration: int
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_text(self.pause_id, "pause_id")
+        kind = self.kind
+        if not isinstance(kind, PauseKind):
+            try:
+                kind = PauseKind(kind)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown pause kind: {self.kind!r}") from exc
+            object.__setattr__(self, "kind", kind)
+        reason = self.reason
+        if not isinstance(reason, PauseReason):
+            try:
+                reason = PauseReason(reason)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown pause reason: {self.reason!r}") from exc
+            object.__setattr__(self, "reason", reason)
+        PauseRequest(
+            pause_id=self.pause_id,
+            run_id=self.run_id,
+            turn_id=self.turn_id,
+            kind=kind,
+            reason=reason,
+            iteration=self.iteration,
+            created_at="event",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UserInputRequested(AgentEvent):
+    event_type: ClassVar[str] = "user_input_requested"
+    pause_id: str
+    tool_call_id: str
+    request: UserInputRequest
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_text(self.pause_id, "pause_id")
+        _require_text(self.tool_call_id, "tool_call_id")
+        if not isinstance(self.request, UserInputRequest):
+            raise TypeError("request must be UserInputRequest")
+
+    @property
+    def user_input_request(self) -> UserInputRequest:
+        return self.request
+
+
+@dataclass(frozen=True, slots=True)
+class TurnPaused(AgentEvent):
+    event_type: ClassVar[str] = "turn_paused"
+    pause: PauseRequest
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        if not isinstance(self.pause, PauseRequest):
+            raise TypeError("pause must be PauseRequest")
+        if self.pause.run_id != self.run_id or self.pause.turn_id != self.turn_id:
+            raise ValueError("pause IDs must match TurnPaused IDs")
+
+    @property
+    def pause_request(self) -> PauseRequest:
+        return self.pause
+
+    @property
+    def pause_id(self) -> str:
+        return self.pause.pause_id
+
+    @property
+    def kind(self) -> PauseKind:
+        return self.pause.kind
+
+    @property
+    def reason(self) -> PauseReason:
+        return self.pause.reason
+
+
+@dataclass(frozen=True, slots=True)
+class TurnResumed(AgentEvent):
+    event_type: ClassVar[str] = "turn_resumed"
+    pause_id: str
+    kind: PauseKind
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_text(self.pause_id, "pause_id")
+        kind = self.kind
+        if not isinstance(kind, PauseKind):
+            try:
+                kind = PauseKind(kind)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown pause kind: {self.kind!r}") from exc
+            object.__setattr__(self, "kind", kind)
+
+
 def _validate_tool_ids(value: object) -> tuple[str, ...]:
     values = _as_tuple(value, "tool_call_ids")
     result: list[str] = []
@@ -409,6 +519,10 @@ AgentEventValue: TypeAlias = (
     | AssistantMessageDelta
     | AssistantMessageCompleted
     | UsageUpdated
+    | TurnPausing
+    | UserInputRequested
+    | TurnPaused
+    | TurnResumed
     | ToolBatchStarted
     | ToolStarted
     | ToolFinished
@@ -430,6 +544,10 @@ _EVENT_TYPES: dict[str, type[AgentEvent]] = {
         AssistantMessageDelta,
         AssistantMessageCompleted,
         UsageUpdated,
+        TurnPausing,
+        UserInputRequested,
+        TurnPaused,
+        TurnResumed,
         ToolBatchStarted,
         ToolStarted,
         ToolFinished,
@@ -526,6 +644,40 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             turn_id,
             _required(payload, "iteration"),  # type: ignore[arg-type]
             Usage.from_dict(_required(payload, "usage")),
+        )
+    if event_type == TurnPausing.event_type:
+        _expect_keys(payload, {"type", "run_id", "turn_id", "pause_id", "kind", "reason", "iteration"})
+        return TurnPausing(
+            run_id,
+            turn_id,
+            _required(payload, "pause_id"),  # type: ignore[arg-type]
+            _required(payload, "kind"),  # type: ignore[arg-type]
+            _required(payload, "reason"),  # type: ignore[arg-type]
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+        )
+    if event_type == UserInputRequested.event_type:
+        _expect_keys(payload, {"type", "run_id", "turn_id", "pause_id", "tool_call_id", "request"})
+        return UserInputRequested(
+            run_id,
+            turn_id,
+            _required(payload, "pause_id"),  # type: ignore[arg-type]
+            _required(payload, "tool_call_id"),  # type: ignore[arg-type]
+            UserInputRequest.from_dict(_required(payload, "request")),  # type: ignore[arg-type]
+        )
+    if event_type == TurnPaused.event_type:
+        _expect_keys(payload, {"type", "run_id", "turn_id", "pause"})
+        return TurnPaused(
+            run_id,
+            turn_id,
+            PauseRequest.from_dict(_required(payload, "pause")),  # type: ignore[arg-type]
+        )
+    if event_type == TurnResumed.event_type:
+        _expect_keys(payload, {"type", "run_id", "turn_id", "pause_id", "kind"})
+        return TurnResumed(
+            run_id,
+            turn_id,
+            _required(payload, "pause_id"),  # type: ignore[arg-type]
+            _required(payload, "kind"),  # type: ignore[arg-type]
         )
     if event_type == ToolBatchStarted.event_type:
         _expect_keys(payload, {"type", "run_id", "turn_id", "iteration", "batch_id", "tool_call_ids"})
@@ -625,6 +777,10 @@ __all__ = [
     "TurnStarted",
     "TerminationReason",
     "UsageUpdated",
+    "TurnPausing",
+    "UserInputRequested",
+    "TurnPaused",
+    "TurnResumed",
     "agent_event_from_dict",
     "agent_event_from_json",
 ]

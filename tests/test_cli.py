@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterable
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from uthcode.application import (
     create_application,
     TextDelta,
     TextPart,
+    TurnHandle,
     UthCodeApplication,
     Usage,
 )
@@ -29,7 +31,8 @@ from uthcode.core.provider import (
     GenerationCancelled,
     GenerationRequest,
     NetworkError,
-    ProviderEvent,
+    ProviderError,
+    RateLimitError,
     ReasoningPart,
     ReasoningDelta,
     ToolCallPart,
@@ -105,6 +108,34 @@ class _CancelledProvider(FakeProvider):
         del request, cancellation
         raise GenerationCancelled()
         yield  # pragma: no cover
+
+
+class _TerminalLessTurn:
+    def events(self):  # type: ignore[no-untyped-def]
+        async def stream():  # type: ignore[no-untyped-def]
+            yield SimpleNamespace(event_type="turn_started")
+
+        return stream()
+
+    def cancel(self) -> bool:
+        return True
+
+
+class _TerminalLessRun:
+    def __init__(self) -> None:
+        self.turn = _TerminalLessTurn()
+
+    def start_turn(self, prompt: str) -> _TerminalLessTurn:
+        del prompt
+        return self.turn
+
+
+class _TerminalLessApplication:
+    def __init__(self) -> None:
+        self.run = _TerminalLessRun()
+
+    def create_run(self) -> _TerminalLessRun:
+        return self.run
 
 
 class _SecretTool:
@@ -276,6 +307,102 @@ def test_exec_projects_tool_activity_without_tool_result_or_arguments() -> None:
     assert secret not in stdout + stderr
     assert "ToolResult" not in stdout + stderr
     assert provider.requests[1].messages[-1].parts[0].content == secret
+
+
+def test_exec_cancels_turn_when_agent_pauses_for_user_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel_calls = 0
+    original_cancel = TurnHandle.cancel
+
+    def record_cancel(handle: TurnHandle) -> bool:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return original_cancel(handle)
+
+    monkeypatch.setattr(TurnHandle, "cancel", record_cancel)
+    call = ToolCallPart(
+        "ask-1",
+        "AskUserQuestion",
+        {
+            "questions": [
+                {
+                    "question_id": "q1",
+                    "header": "Choice",
+                    "question": "Which value should be used?",
+                    "kind": "text",
+                }
+            ]
+        },
+    )
+    provider = _ScriptedProvider(
+        ((_completed("need input", call, finish_reason=FinishReason.TOOL_CALLS),),)
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=Path.cwd()),
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 1
+    assert stdout == ""
+    assert "generation requires interactive input" in stderr
+    assert "TurnPaused" not in stderr
+    assert "turn ended without a terminal event" not in stderr
+    assert "provider error" not in stderr
+    assert cancel_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "diagnostic"),
+    [
+        (NetworkError("network-secret"), "provider temporarily unavailable"),
+        (RateLimitError("rate-secret"), "provider temporarily unavailable"),
+    ],
+)
+def test_exec_cancels_turn_when_provider_pauses(
+    error: ProviderError,
+    diagnostic: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel_calls = 0
+    original_cancel = TurnHandle.cancel
+
+    def record_cancel(handle: TurnHandle) -> bool:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return original_cancel(handle)
+
+    monkeypatch.setattr(TurnHandle, "cancel", record_cancel)
+    application = UthCodeApplication(
+        FakeProvider(events=(), error=error),  # type: ignore[arg-type]
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], application)
+
+    assert result == 1
+    assert stdout == ""
+    assert diagnostic in stderr
+    assert "network-secret" not in stderr
+    assert "rate-secret" not in stderr
+    assert "turn ended without a terminal event" not in stderr
+    assert "provider error" not in stderr
+    assert cancel_calls == 1
+
+
+def test_exec_keeps_missing_terminal_diagnostic_for_non_pause_stream() -> None:
+    application = _TerminalLessApplication()
+
+    result, stdout, stderr = _injected_main(
+        ["exec", "hello"],
+        application,  # type: ignore[arg-type]
+    )
+
+    assert result == 1
+    assert stdout == ""
+    assert stderr == "provider error: turn ended without a terminal event\n"
 
 
 @pytest.mark.parametrize("arguments", [["exec", "hello"], []])
