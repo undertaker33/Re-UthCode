@@ -6,16 +6,20 @@ import pytest
 from jsonschema.exceptions import SchemaError
 
 from uthcode.core.tool import (
+    PreparedToolCall,
     Tool,
     ToolExecutionResult,
     ToolExecutor,
     ToolRegistry,
+    ToolPreparation,
 )
+from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import (
     CancellationToken,
     JsonPayload,
     ToolCallPart,
     ToolDefinition,
+    ToolResultPart,
 )
 
 
@@ -102,6 +106,43 @@ class MutableDefinitionTool:
         del cancellation
         self.executed.append(arguments)
         return ToolExecutionResult("executed")
+
+
+@dataclass
+class PreflightTool(FakeTool):
+    preflight_started: list[str] = field(default_factory=list)
+
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        self.preflight_started.append(str(arguments["value"]))
+        return ToolPreparation(
+            action=PermissionAction(
+                tool=self.name,
+                action="test",
+                effect=Effect.WRITE,
+                resource=f"project/{arguments['value']}",
+                scope=ResourceScope.INSIDE,
+            ),
+            execution_arguments=arguments,
+        )
+
+
+@dataclass
+class SpyPermissionEvaluator:
+    evaluated: list[PermissionAction] = field(default_factory=list)
+
+    def evaluate(self, action: PermissionAction) -> None:
+        self.evaluated.append(action)
+
+
+def _prepare_then_evaluate(
+    executor: ToolExecutor,
+    call: ToolCallPart,
+    evaluator: SpyPermissionEvaluator,
+) -> PreparedToolCall | ToolResultPart:
+    prepared = executor.prepare_call(call)
+    if isinstance(prepared, PreparedToolCall):
+        evaluator.evaluate(prepared.action)
+    return prepared
 
 
 def _call(call_id: str, name: str, value: str = "input") -> ToolCallPart:
@@ -236,6 +277,81 @@ async def test_executor_keeps_fifo_and_normalizes_unknown_invalid_and_exception(
     assert "RuntimeError" not in results[2].content
     assert successful.started == ["four"]
     assert failing.started == ["three"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_call_validates_once_and_execute_prepared_does_not_preflight_again() -> None:
+    tool = PreflightTool("prepared")
+    executor = ToolExecutor(ToolRegistry((tool,)))
+    prepared = executor.prepare_call(_call("prepared-1", "prepared", "one"))
+
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.effect is Effect.WRITE
+    assert prepared.action.resource == "project/one"
+    assert prepared.execution_arguments["value"] == "one"
+    assert tool.preflight_started == ["one"]
+
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.tool_call_id == "prepared-1"
+    assert result.is_error is False
+    assert tool.preflight_started == ["one"]
+    assert tool.started == ["one"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_invalid_and_cancelled_calls_do_not_enter_action_preflight() -> None:
+    tool = PreflightTool("prepared")
+    executor = ToolExecutor(ToolRegistry((tool,)))
+    token = CancellationToken()
+    token.cancel()
+
+    results = await executor.execute_batch(
+        (
+            ToolCallPart("unknown", "missing", {"value": "unknown"}),
+            ToolCallPart("invalid", "prepared", {}),
+            ToolCallPart("cancelled", "prepared", {"value": "cancelled"}),
+        ),
+        cancellation=token,
+    )
+
+    assert all(result.is_error for result in results)
+    assert tool.preflight_started == []
+
+
+def test_permission_gate_only_evaluates_prepared_calls() -> None:
+    tool = PreflightTool("prepared")
+    executor = ToolExecutor(ToolRegistry((tool,)))
+    evaluator = SpyPermissionEvaluator()
+
+    unknown = _prepare_then_evaluate(
+        executor,
+        ToolCallPart("unknown", "missing", {"value": "unknown"}),
+        evaluator,
+    )
+    invalid = _prepare_then_evaluate(
+        executor,
+        ToolCallPart("invalid", "prepared", {}),
+        evaluator,
+    )
+
+    assert isinstance(unknown, ToolResultPart)
+    assert unknown.is_error is True
+    assert "unknown tool" in unknown.content
+    assert isinstance(invalid, ToolResultPart)
+    assert invalid.is_error is True
+    assert "invalid arguments" in invalid.content
+    assert evaluator.evaluated == []
+
+    valid = _prepare_then_evaluate(
+        executor,
+        _call("valid", "prepared", "value"),
+        evaluator,
+    )
+
+    assert isinstance(valid, PreparedToolCall)
+    assert evaluator.evaluated == [valid.action]
+    assert len(evaluator.evaluated) == 1
 
 
 @pytest.mark.asyncio

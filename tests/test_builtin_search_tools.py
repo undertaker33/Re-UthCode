@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from uthcode.core import CancellationToken, ToolCallPart, ToolExecutor, ToolRegistry
+from uthcode.core import (
+    CancellationToken,
+    PreparedToolCall,
+    ToolCallPart,
+    ToolExecutor,
+    ToolRegistry,
+)
+from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.tools.search_tools import GlobTool, GrepTool
 from uthcode.integrations.tools.workspace import WorkspacePathResolver
 
@@ -26,6 +33,20 @@ async def test_glob_returns_only_sorted_workspace_files(tmp_path: Path) -> None:
 
     assert result.is_error is False
     assert result.content == "a.py\nb.py\npkg/c.py"
+
+
+def test_search_tools_preflight_produces_read_actions(tmp_path: Path) -> None:
+    resolver, glob, grep = _search_tools(tmp_path)
+
+    glob_action = glob.preflight({"pattern": "**/*.py"}).action  # type: ignore[arg-type]
+    grep_action = grep.preflight({"pattern": "needle", "path": "."}).action  # type: ignore[arg-type]
+
+    assert (glob_action.effect, glob_action.scope) == (Effect.READ, ResourceScope.INSIDE)
+    assert (grep_action.effect, grep_action.scope) == (Effect.READ, ResourceScope.INSIDE)
+    assert glob_action.action == "glob"
+    assert grep_action.action == "grep"
+    assert glob_action.resource == grep_action.resource == "."
+    assert resolver.root == tmp_path.resolve()
 
 
 @pytest.mark.asyncio
@@ -112,6 +133,138 @@ async def test_search_skips_external_file_and_directory_symlinks(tmp_path: Path)
 
     assert glob_result.content == "No files matched the pattern."
     assert grep_result.content == "No matches found."
+
+
+@pytest.mark.asyncio
+async def test_prepared_glob_binds_file_symlink_targets(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    inside = workspace / "inside.txt"
+    inside.write_text("inside marker\n", encoding="utf-8")
+    outside.write_text("outside marker\n", encoding="utf-8")
+    alias = workspace / "alias.txt"
+    try:
+        alias.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    registry = ToolRegistry((GlobTool(resolver),))
+    executor = ToolExecutor(registry)
+    prepared = executor.prepare_call(
+        ToolCallPart("glob-link", "Glob", {"pattern": "**/*.txt", "path": "."}),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.resource == "."
+
+    alias.unlink()
+    alias.symlink_to(outside)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert result.content == "inside.txt"
+    assert "outside.txt" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_prepared_grep_binds_file_symlink_targets(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    inside = workspace / "inside.txt"
+    inside.write_text("inside marker\n", encoding="utf-8")
+    outside.write_text("outside marker\n", encoding="utf-8")
+    alias = workspace / "alias.txt"
+    try:
+        alias.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    registry = ToolRegistry((GrepTool(resolver),))
+    executor = ToolExecutor(registry)
+    prepared = executor.prepare_call(
+        ToolCallPart("grep-link", "Grep", {"pattern": "marker", "path": "."}),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+
+    alias.unlink()
+    alias.symlink_to(outside)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert "inside.txt:1:inside marker" in result.content
+    assert "outside marker" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_prepared_grep_binds_directory_symlink_target(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    original = tmp_path / "original-outside"
+    replacement = tmp_path / "replacement-outside"
+    workspace.mkdir()
+    original.mkdir()
+    replacement.mkdir()
+    (original / "original.txt").write_text("original marker\n", encoding="utf-8")
+    (replacement / "replacement.txt").write_text("replacement marker\n", encoding="utf-8")
+    alias = workspace / "alias-dir"
+    try:
+        alias.symlink_to(original, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks not available in this environment")
+
+    resolver = WorkspacePathResolver(workspace)
+    registry = ToolRegistry((GrepTool(resolver),))
+    executor = ToolExecutor(registry)
+    prepared = executor.prepare_call(
+        ToolCallPart("grep-dir-link", "Grep", {"pattern": "marker", "path": "alias-dir"}),
+        cancellation=CancellationToken(),
+    )
+    assert isinstance(prepared, PreparedToolCall)
+    assert prepared.action.resource == original.resolve().as_posix()
+    assert prepared.action.scope is ResourceScope.OUTSIDE
+
+    alias.unlink()
+    alias.symlink_to(replacement, target_is_directory=True)
+    result = await executor.execute_prepared(prepared, cancellation=CancellationToken())
+
+    assert result.is_error is False
+    assert "original.txt:1:original marker" in result.content
+    assert "replacement marker" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_search_can_read_an_outside_directory_after_scope_classification(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "outside.txt").write_text("outside needle\n", encoding="utf-8")
+    resolver, glob, grep = _search_tools(workspace)
+
+    glob_action = glob.preflight({"pattern": "**/*.txt", "path": str(outside)}).action  # type: ignore[arg-type]
+    grep_action = grep.preflight({"pattern": "needle", "path": str(outside)}).action  # type: ignore[arg-type]
+    assert glob_action.scope is ResourceScope.OUTSIDE
+    assert grep_action.scope is ResourceScope.OUTSIDE
+
+    glob_result = await glob.execute(
+        {"pattern": "**/*.txt", "path": str(outside)},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+    grep_result = await grep.execute(
+        {"pattern": "needle", "path": str(outside)},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+    assert glob_result.is_error is False
+    assert "outside.txt" in glob_result.content
+    assert grep_result.is_error is False
+    assert "outside.txt:1:outside needle" in grep_result.content
+    assert resolver.scope_of(outside) is ResourceScope.OUTSIDE
 
 
 @pytest.mark.asyncio

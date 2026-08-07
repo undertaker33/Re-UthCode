@@ -8,6 +8,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from uthcode.core.permission import ResourceScope
+
 
 class WorkspacePathError(ValueError):
     """Raised when a path cannot be safely resolved inside the workspace."""
@@ -18,7 +20,7 @@ _CHANGED = "Error: file has been modified since last read. Read it again before 
 
 
 class WorkspacePathResolver:
-    """Resolve existing and new paths without allowing workspace escape."""
+    """Resolve paths and report physical scope without enforcing policy."""
 
     def __init__(self, workdir: str | os.PathLike[str] | Path) -> None:
         raw_workdir = os.fspath(workdir)
@@ -51,7 +53,6 @@ class WorkspacePathResolver:
         """
 
         candidate = self.lexical_path(path)
-        self._require_within(candidate)
 
         try:
             if candidate.exists() or candidate.is_symlink():
@@ -61,8 +62,28 @@ class WorkspacePathResolver:
         except (OSError, RuntimeError) as exc:
             raise WorkspacePathError("Error: path cannot be resolved") from exc
 
-        self._require_within(resolved)
         return resolved
+
+    def resolve_with_scope(
+        self,
+        path: str | os.PathLike[str] | Path,
+    ) -> tuple[Path, ResourceScope]:
+        """Resolve a physical path and return its inside/outside fact."""
+
+        resolved = self.resolve(path)
+        return resolved, self.scope_of(resolved)
+
+    def scope_of(self, path: str | os.PathLike[str] | Path) -> ResourceScope:
+        """Classify a path using the final physical target, including new paths."""
+
+        candidate = self.lexical_path(path)
+        try:
+            physical = candidate.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise WorkspacePathError("Error: path cannot be resolved") from exc
+        if self._is_within(physical):
+            return ResourceScope.INSIDE
+        return ResourceScope.OUTSIDE
 
     def display(self, path: str | os.PathLike[str] | Path) -> str:
         """Return a stable workspace-relative POSIX display path."""
@@ -71,21 +92,30 @@ class WorkspacePathResolver:
         try:
             relative = candidate.relative_to(self._root)
         except ValueError:
-            return str(candidate)
+            return candidate.as_posix()
         return relative.as_posix() or "."
 
-    def validate_candidate(self, path: str | os.PathLike[str] | Path) -> Path | None:
-        """Return a safe candidate's physical path, otherwise ``None``.
+    def validate_candidate(
+        self,
+        path: str | os.PathLike[str] | Path,
+        *,
+        allow_outside: bool = False,
+    ) -> Path | None:
+        """Return a candidate's physical path, otherwise ``None``.
 
-        Search tools use this for every file returned by their walker.  A
-        candidate must pass both the lexical and physical workspace checks.
+        Search tools use this for every file returned by their walker.  The
+        default keeps an inside search from following an external file link;
+        an explicitly outside search may opt into its already-classified
+        physical scope.
         """
 
         try:
             lexical = self.lexical_path(path)
-            self._require_within(lexical)
-            resolved = Path(path).resolve(strict=True)
-            self._require_within(resolved)
+            if not allow_outside and not self._is_within(lexical):
+                return None
+            resolved = lexical.resolve(strict=True)
+            if not allow_outside and not self._is_within(resolved):
+                return None
             return resolved
         except (OSError, RuntimeError, WorkspacePathError):
             return None
@@ -94,7 +124,8 @@ class WorkspacePathResolver:
         """Return whether a path contains a directory symlink component."""
 
         lexical = self.lexical_path(path)
-        self._require_within(lexical)
+        if not self._is_within(lexical):
+            return False
         current = self._root
         for part in lexical.relative_to(self._root).parts:
             current /= part
@@ -118,11 +149,12 @@ class WorkspacePathResolver:
         resolved_parent = parent.resolve(strict=True)
         return resolved_parent.joinpath(*missing_parts)
 
-    def _require_within(self, path: Path) -> None:
+    def _is_within(self, path: Path) -> bool:
         try:
             path.relative_to(self._root)
-        except ValueError as exc:
-            raise WorkspacePathError("Error: path is outside the workspace") from exc
+        except ValueError:
+            return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)

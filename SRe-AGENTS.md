@@ -89,11 +89,11 @@
 
 - 权限模式为 default、auto、full_access。
 - full_access 是用户明确启用的完全应用层访问模式。
-- full_access 下跳过 Project/Local/User 规则、普通危险动作检查和人工审批。
+- full_access 下跳过普通 Policy 与 Strategy，但 Guard Allow/Ask/Deny 仍有效；Guard Ask/Deny 不被绕过。
 - full_access 仍受 Tool 注册、参数校验、操作系统当前用户权限、第三方权限和普通执行错误约束。
 - Permission Approval 不等于 OS Sandbox。
 - 项目配置不得静默启用 full_access。
-- 支持 Allow、Deny、Ask，以及精确动作、有界类似动作和持久 exact 决定。
+- 支持 Allow、Deny、Ask，以及精确动作、有界资源范围和当前 AgentRun 内的 Session Grant；不自动写入持久决定。
 - Permission Ask 必须能够暂停；拒绝后 Agent Loop 可以继续。
 
 ## 12. 配置
