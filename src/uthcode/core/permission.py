@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import ntpath
+import posixpath
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -125,6 +127,61 @@ class PermissionAction:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
 
+def _normalized_resource_path(resource: str) -> str:
+    normalized = resource.replace("\\", "/")
+    if re.match(r"^(?:[A-Za-z]:/|//)", normalized):
+        return ntpath.normpath(normalized).replace("\\", "/")
+    return posixpath.normpath(normalized)
+
+
+def _is_path_like_resource(resource: str) -> bool:
+    normalized = resource.replace("\\", "/")
+    return normalized.startswith("/") or re.match(
+        r"^(?:[A-Za-z]:/|//)", normalized
+    ) is not None
+
+
+def _resource_path_key(resource: str) -> str:
+    """Normalize physical path-like resources without importing filesystem APIs."""
+
+    normalized = _normalized_resource_path(resource)
+    if re.match(r"^(?:[A-Za-z]:/|//)", normalized):
+        return ntpath.normcase(ntpath.normpath(normalized)).replace("\\", "/")
+    return posixpath.normpath(normalized)
+
+
+def _is_filesystem_root_resource(resource: str) -> bool:
+    normalized = _normalized_resource_path(resource)
+    if normalized == "/":
+        return True
+
+    drive, tail = ntpath.splitdrive(normalized)
+    drive = drive.replace("\\", "/")
+    tail = tail.replace("\\", "/")
+    if re.fullmatch(r"[A-Za-z]:", drive):
+        return tail in {"", "/"}
+    if drive.startswith("//"):
+        share_parts = [part for part in drive[2:].split("/") if part]
+        return len(share_parts) == 2 and tail in {"", "/"}
+    return False
+
+
+def _resources_equal(expected: str, actual: str) -> bool:
+    if _is_path_like_resource(expected) and _is_path_like_resource(actual):
+        return _resource_path_key(expected) == _resource_path_key(actual)
+    return expected == actual
+
+
+def _resource_prefix_matches(prefix: str, resource: str) -> bool:
+    if _is_filesystem_root_resource(prefix):
+        return False
+    prefix_key = _resource_path_key(prefix).rstrip("/")
+    resource_key = _resource_path_key(resource)
+    if not prefix_key:
+        return False
+    return resource_key == prefix_key or resource_key.startswith(prefix_key + "/")
+
+
 @dataclass(frozen=True, slots=True)
 class Rule:
     """One immutable Guard or Policy matcher.
@@ -210,9 +267,8 @@ class Rule:
         if action.resource is None:
             return False
         if not self.resource_prefix:
-            return self.resource == action.resource
-        prefix = self.resource.rstrip("/")
-        return action.resource == prefix or action.resource.startswith(prefix + "/")
+            return _resources_equal(self.resource, action.resource)
+        return _resource_prefix_matches(self.resource, action.resource)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -294,9 +350,8 @@ class SessionGrant:
         ):
             return False
         if not self.resource_prefix:
-            return self.resource == action.resource
-        prefix = self.resource.rstrip("/")
-        return action.resource == prefix or action.resource.startswith(prefix + "/")
+            return _resources_equal(self.resource, action.resource)
+        return _resource_prefix_matches(self.resource, action.resource)
 
     def to_dict(self) -> dict[str, object]:
         return {

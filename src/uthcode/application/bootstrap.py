@@ -15,6 +15,7 @@ from uthcode.integrations.config.loader import (
     load_config_data,
 )
 from uthcode.integrations.tools.factory import create_default_tools
+from uthcode.integrations.permissions import load_permission_rules
 from uthcode.core.tool import Tool
 
 from .configuration import (
@@ -154,6 +155,9 @@ def create_application(
             tool_values,
             workdir=runtime_context.workdir,
             secret_env_names=secret_env_names,
+        ),
+        permission_rules_loader=(
+            lambda: load_permission_rules(cwd=runtime_context.workdir)
         ),
     )
 

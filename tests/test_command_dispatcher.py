@@ -10,8 +10,11 @@ from uthcode.application import (
     CommandRegistry,
     EffectiveConfig,
     ModelSelected,
+    OpenPermissionPicker,
     OpenModelPicker,
     OutcomeStatus,
+    PermissionMode,
+    PermissionModeSelected,
     ProviderKind,
     ProviderProfile,
     QuitInterface,
@@ -185,6 +188,21 @@ def test_builtin_registry_contains_one_model_canonical_and_real_ui_actions() -> 
     assert registry.resolve("models") is registry.resolve("model")
     assert registry.resolve("m") is registry.resolve("model")
     assert all(command.canonical != "models" for command in registry.list_commands())
+
+
+def test_permission_command_uses_the_same_registry_and_returns_session_action() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+
+    picker = dispatcher.dispatch_text("/permission")
+    assert picker is not None and isinstance(picker.ui_action, OpenPermissionPicker)
+
+    selected = dispatcher.dispatch_text("/permission full_access")
+    assert selected is not None and isinstance(selected.ui_action, PermissionModeSelected)
+    assert selected.ui_action.mode is PermissionMode.FULL_ACCESS
+    assert selected.ui_action.warning is not None
+
+    assert registry.resolve("permission") is not None
 
 
 @pytest.mark.parametrize(

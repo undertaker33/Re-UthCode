@@ -10,6 +10,7 @@ from uthcode.core import (
     ToolCallPart,
     ToolExecutor,
     ToolRegistry,
+    ToolResultPart,
 )
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.tools.search_tools import GlobTool, GrepTool
@@ -19,6 +20,28 @@ from uthcode.integrations.tools.workspace import WorkspacePathResolver
 def _search_tools(root: Path):
     resolver = WorkspacePathResolver(root)
     return resolver, GlobTool(resolver), GrepTool(resolver)
+
+
+async def _execute_prepared_calls(
+    executor: ToolExecutor,
+    calls: tuple[ToolCallPart, ...],
+    *,
+    cancellation: CancellationToken,
+) -> tuple[ToolResultPart, ...]:
+    results: list[ToolResultPart] = []
+    for call in calls:
+        prepared = executor.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            results.append(prepared)
+        else:
+            assert isinstance(prepared, PreparedToolCall)
+            results.append(
+                await executor.execute_prepared(
+                    prepared,
+                    cancellation=cancellation,
+                )
+            )
+    return tuple(results)
 
 
 @pytest.mark.asyncio
@@ -277,7 +300,8 @@ async def test_search_order_is_stable_and_output_truncates_in_core(tmp_path: Pat
     registry = ToolRegistry((GrepTool(resolver),))
     executor = ToolExecutor(registry)
 
-    truncated = await executor.execute_batch(
+    truncated = await _execute_prepared_calls(
+        executor,
         (ToolCallPart("grep-1", "Grep", {"pattern": "needle"}),),
         cancellation=CancellationToken(),
     )
@@ -292,7 +316,8 @@ async def test_large_search_output_is_truncated_by_core_executor(tmp_path: Path)
     registry = ToolRegistry((GrepTool(WorkspacePathResolver(tmp_path)),))
     executor = ToolExecutor(registry)
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls(
+        executor,
         (ToolCallPart("large-grep", "Grep", {"pattern": "x+"}),),
         cancellation=CancellationToken(),
     )

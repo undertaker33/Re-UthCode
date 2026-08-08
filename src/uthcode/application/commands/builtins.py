@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from uthcode.core.permission import PermissionMode
+
 from .dispatcher import CommandContext, CommandExecutionError
 from .models import (
     ArgumentSpec,
@@ -12,13 +14,19 @@ from .models import (
     CommandDefinition,
     CommandKind,
     ModelSelected,
+    OpenPermissionPicker,
     OpenModelPicker,
+    PermissionModeSelected,
     QuitInterface,
 )
 from .registry import CommandRegistry
 
 
 _MODEL_SWITCH_FAILURE = "模型切换失败"
+_FULL_ACCESS_WARNING = (
+    "高风险提示：full_access 仅跳过普通 Policy/Strategy，Guard 仍然生效；"
+    "当前 Run 的普通 Tool 将减少人工确认。"
+)
 
 
 def _help_text(context: CommandContext) -> str:
@@ -87,6 +95,28 @@ def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
     return ModelSelected(model_ref)
 
 
+def _permission(context: CommandContext) -> OpenPermissionPicker | PermissionModeSelected:
+    if not context.invocation.args:
+        return OpenPermissionPicker()
+    try:
+        mode = PermissionMode(context.invocation.args[0])
+    except (TypeError, ValueError):
+        raise CommandExecutionError(
+            "未知权限模式；可选：default、auto、full_access"
+        ) from None
+
+    setter = getattr(context.application, "set_permission_mode", None)
+    if callable(setter):
+        try:
+            setter(mode)
+        except Exception:
+            raise CommandExecutionError("当前 Application 不支持权限模式切换") from None
+    return PermissionModeSelected(
+        mode,
+        warning=_FULL_ACCESS_WARNING if mode is PermissionMode.FULL_ACCESS else None,
+    )
+
+
 def _status(context: CommandContext) -> str:
     application = context.application
     if application is None:
@@ -147,6 +177,20 @@ def create_builtin_registry() -> CommandRegistry:
                 ),
             ),
             handler=_model,
+        ),
+        CommandDefinition(
+            canonical="permission",
+            description="查看或切换当前 Run 权限模式",
+            kind=CommandKind.LOCAL_UI,
+            arguments=(
+                ArgumentSpec(
+                    "mode",
+                    required=False,
+                    description="Permission mode",
+                    choices=tuple(mode.value for mode in PermissionMode),
+                ),
+            ),
+            handler=_permission,
         ),
         CommandDefinition(
             canonical="status",

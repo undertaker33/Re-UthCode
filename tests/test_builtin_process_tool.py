@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from uthcode.core import CancellationToken, ToolCallPart, ToolExecutor, ToolRegistry
+from uthcode.core import (
+    CancellationToken,
+    PreparedToolCall,
+    ToolCallPart,
+    ToolExecutor,
+    ToolRegistry,
+    ToolResultPart,
+)
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.tools.process_tools import BashTool, classify_bash_command
 
@@ -22,6 +29,28 @@ def _python_command(source: str) -> str:
     if sys.platform == "win32":
         return subprocess.list2cmdline(values)
     return " ".join(shlex.quote(value) for value in values)
+
+
+async def _execute_prepared_calls(
+    executor: ToolExecutor,
+    calls: tuple[ToolCallPart, ...],
+    *,
+    cancellation: CancellationToken,
+) -> tuple[ToolResultPart, ...]:
+    results: list[ToolResultPart] = []
+    for call in calls:
+        prepared = executor.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            results.append(prepared)
+        else:
+            assert isinstance(prepared, PreparedToolCall)
+            results.append(
+                await executor.execute_prepared(
+                    prepared,
+                    cancellation=cancellation,
+                )
+            )
+    return tuple(results)
 
 
 def _delayed_descendant_command(marker: Path) -> str:
@@ -106,7 +135,9 @@ def test_bash_preflight_uses_trusted_classifier_and_safe_scope(tmp_path: Path) -
     assert action.effect is Effect.READ
     assert action.scope is ResourceScope.INSIDE
     assert action.action == "execute"
-    assert action.resource == "git status"
+    assert action.resource is not None
+    assert "__uthcode_bash_action__:other" in action.resource
+    assert action.resource.endswith("git status")
 
 
 @pytest.mark.asyncio
@@ -255,7 +286,8 @@ async def test_bash_schema_rejects_timeout_outside_one_to_six_hundred(tmp_path: 
     registry = ToolRegistry((BashTool(tmp_path),))
     executor = ToolExecutor(registry)
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls(
+        executor,
         (
             ToolCallPart("too-small", "Bash", {"command": "", "timeout_seconds": 0}),
             ToolCallPart("too-large", "Bash", {"command": "", "timeout_seconds": 601}),
@@ -272,7 +304,8 @@ async def test_bash_output_is_truncated_by_core_executor(tmp_path: Path) -> None
     registry = ToolRegistry((BashTool(tmp_path),))
     executor = ToolExecutor(registry)
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls(
+        executor,
         (
             ToolCallPart(
                 "large-output",

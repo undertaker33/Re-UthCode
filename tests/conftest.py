@@ -11,6 +11,18 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolate_user_home(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep permission/config lifecycle files inside the test sandbox."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOMEDRIVE", home.drive)
+    monkeypatch.setenv("HOMEPATH", str(home)[len(home.drive):])
+
+
+@pytest.fixture(autouse=True)
 def preserve_live_environment() -> Any:
     """Restore live-test environment values between tests without printing them."""
 

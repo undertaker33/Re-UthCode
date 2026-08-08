@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ntpath
+import posixpath
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
@@ -18,9 +21,18 @@ from uthcode.core.agent_events import AgentEvent, TurnPaused, TurnResumed
 from uthcode.core.interaction import (
     PauseRequest,
     PauseResponse,
+    PermissionApprovalResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
     UserInputResponse,
+)
+from uthcode.core.permission import (
+    PermissionAction,
+    PermissionDecision,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+    SessionGrant,
 )
 from uthcode.core.provider import CancellationToken
 
@@ -30,6 +42,7 @@ if TYPE_CHECKING:
 
 _END = object()
 _CANCELLED = object()
+_OUTSIDE_DIRECTORY_GRANT_TOOLS = frozenset({"ReadFile", "WriteFile", "EditFile"})
 
 
 def _new_identifier(value: str | None, field_name: str) -> str:
@@ -42,15 +55,131 @@ def _new_identifier(value: str | None, field_name: str) -> str:
     return value
 
 
+def _normalized_resource_path(resource: str) -> str:
+    normalized = resource.replace("\\", "/")
+    if re.match(r"^(?:[A-Za-z]:/|//)", normalized):
+        return ntpath.normpath(normalized).replace("\\", "/")
+    return posixpath.normpath(normalized)
+
+
+def _is_filesystem_root(resource: str) -> bool:
+    """Recognize POSIX, drive, and UNC share roots without string prefixes."""
+
+    normalized = _normalized_resource_path(resource)
+    if normalized == "/":
+        return True
+
+    drive, tail = ntpath.splitdrive(normalized)
+    drive = drive.replace("\\", "/")
+    tail = tail.replace("\\", "/")
+    if re.fullmatch(r"[A-Za-z]:", drive):
+        return tail in {"", "/"}
+    if drive.startswith("//"):
+        share_parts = [part for part in drive[2:].split("/") if part]
+        return len(share_parts) == 2 and tail in {"", "/"}
+    return False
+
+
+def _outside_parent_resource(action: PermissionAction) -> str | None:
+    if (
+        action.scope is not ResourceScope.OUTSIDE
+        or action.tool not in _OUTSIDE_DIRECTORY_GRANT_TOOLS
+        or action.resource is None
+    ):
+        return None
+    resource = _normalized_resource_path(action.resource)
+    if re.match(r"^(?:[A-Za-z]:/|//)", resource):
+        parent = ntpath.dirname(resource).replace("\\", "/")
+    else:
+        parent = posixpath.dirname(resource)
+    parent = _normalized_resource_path(parent)
+    if not parent or parent == resource or _is_filesystem_root(parent):
+        return None
+    return parent
+
+
 class AgentRun:
     """One private, in-memory conversation with at most one active Turn."""
 
-    __slots__ = ("_application", "_state", "_active_turn")
+    __slots__ = (
+        "_application",
+        "_state",
+        "_active_turn",
+        "_permission_evaluator",
+        "_permission_mode",
+        "_session_grants",
+    )
 
-    def __init__(self, application: UthCodeApplication, *, run_id: str | None) -> None:
+    def __init__(
+        self,
+        application: UthCodeApplication,
+        *,
+        run_id: str | None,
+        permission_evaluator: PermissionEvaluator | None = None,
+    ) -> None:
+        if permission_evaluator is not None and not isinstance(
+            permission_evaluator, PermissionEvaluator
+        ):
+            raise TypeError("permission_evaluator must be PermissionEvaluator or None")
         self._application = application
         self._state = RunState.initial(_new_identifier(run_id, "run_id"))
         self._active_turn: TurnHandle | None = None
+        self._permission_evaluator = permission_evaluator or PermissionEvaluator()
+        self._permission_mode = PermissionMode.DEFAULT
+        self._session_grants: list[SessionGrant] = []
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        """Return the current user-selected mode for this AgentRun."""
+
+        return self._permission_mode
+
+    @property
+    def session_grants(self) -> tuple[SessionGrant, ...]:
+        """Return an immutable view of this Run's in-memory grants."""
+
+        return tuple(self._session_grants)
+
+    def set_permission_mode(self, mode: PermissionMode | str) -> PermissionMode:
+        """Change only this Run's permission strategy mode."""
+
+        if not isinstance(mode, PermissionMode):
+            try:
+                mode = PermissionMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown permission mode: {mode!r}") from exc
+        self._permission_mode = mode
+        return mode
+
+    def _resolve_permission(self, action: PermissionAction) -> PermissionDecision:
+        return self._permission_evaluator.evaluate(
+            action,
+            mode=self._permission_mode,
+            session_grants=self._session_grants,
+        )
+
+    def _store_session_grant(self, action: PermissionAction) -> None:
+        if not isinstance(action, PermissionAction) or action.resource is None:
+            return
+        resource = _outside_parent_resource(action)
+        resource_prefix = resource is not None
+        grant_resource = resource
+        if (
+            grant_resource is None
+            and action.scope is ResourceScope.OUTSIDE
+            and action.tool in _OUTSIDE_DIRECTORY_GRANT_TOOLS
+        ):
+            grant_resource = _normalized_resource_path(action.resource)
+        grant = SessionGrant(
+            tool=action.tool,
+            action=action.action,
+            effect=action.effect,
+            resource=grant_resource or action.resource,
+            scope=action.scope,
+            resource_prefix=resource_prefix,
+        )
+        if grant not in self._session_grants:
+            self._session_grants.append(grant)
 
     def start_turn(self, user_input: str) -> TurnHandle:
         """Synchronously reserve the Run and return a lazily driven Turn."""
@@ -69,6 +198,8 @@ class AgentRun:
             user_input,
             turn_id=turn_id,
             cancellation=cancellation,
+            permission_resolver=self._resolve_permission,
+            session_grant_sink=self._store_session_grant,
         )
         self._state = execution.state
         driver = _TurnDriver(self, execution)
@@ -249,7 +380,12 @@ class _TurnDriver:
                         continue
                     if not isinstance(
                         response_value,
-                        (RetryProviderResponse, ResumeTurnResponse, UserInputResponse),
+                        (
+                            RetryProviderResponse,
+                            ResumeTurnResponse,
+                            UserInputResponse,
+                            PermissionApprovalResponse,
+                        ),
                     ):
                         raise RuntimeError("Application waiter returned an invalid response")
                     response = response_value

@@ -31,7 +31,7 @@ def test_root_completion_returns_all_visible_commands_and_help_last() -> None:
     candidates = CompletionEngine(registry).complete("/")
     names = [candidate.canonical for candidate in candidates]
 
-    assert len(names) == 15
+    assert len(names) == 16
     assert len(names) == len(set(names))
     assert names[-1] == "help"
     assert names.count("help") == 1
@@ -95,6 +95,17 @@ def test_model_candidates_are_read_from_application_model_catalog() -> None:
     engine = CompletionEngine(registry, application)
 
     assert engine.argument_candidates("/model ") == ("alpha/ref", "beta/ref")
+
+
+def test_permission_candidates_are_registry_backed_and_static() -> None:
+    registry = create_builtin_registry()
+    engine = CompletionEngine(registry)
+
+    assert engine.argument_candidates("/permission ") == (
+        "default",
+        "auto",
+        "full_access",
+    )
 
 
 def test_completion_candidates_follow_registry_changes_without_a_second_list() -> None:

@@ -13,7 +13,14 @@ from uthcode.core.tool import (
     ToolRegistry,
     ToolPreparation,
 )
-from uthcode.core.permission import Effect, PermissionAction, ResourceScope
+from uthcode.core.permission import (
+    Decision,
+    Effect,
+    PermissionAction,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+)
 from uthcode.core.provider import (
     CancellationToken,
     JsonPayload,
@@ -145,6 +152,29 @@ def _prepare_then_evaluate(
     return prepared
 
 
+async def _execute_prepared_calls_for_test(
+    executor: ToolExecutor,
+    calls: tuple[ToolCallPart, ...],
+    *,
+    cancellation: CancellationToken,
+) -> tuple[ToolResultPart, ...]:
+    """Exercise the prepared boundary with an explicit test evaluator gate."""
+
+    evaluator = PermissionEvaluator()
+    results: list[ToolResultPart] = []
+    for call in calls:
+        prepared = executor.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            results.append(prepared)
+            continue
+        decision = evaluator.evaluate(prepared.action, mode=PermissionMode.FULL_ACCESS)
+        assert decision.decision is Decision.ALLOW
+        results.append(
+            await executor.execute_prepared(prepared, cancellation=cancellation)
+        )
+    return tuple(results)
+
+
 def _call(call_id: str, name: str, value: str = "input") -> ToolCallPart:
     return ToolCallPart(call_id, name, {"value": value})
 
@@ -207,7 +237,8 @@ async def test_registry_snapshot_controls_execution_after_tool_definition_drifts
     tool.property_name = "after_value"
     executor = ToolExecutor(registry)
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls_for_test(
+        executor,
         (
             ToolCallPart("call-before", "before", {"before_value": "ok"}),
             ToolCallPart("call-after", "after", {"after_value": "wrong-name"}),
@@ -268,7 +299,7 @@ async def test_executor_keeps_fifo_and_normalizes_unknown_invalid_and_exception(
         _call("call-success", "success", "four"),
     )
 
-    results = await executor.execute_batch(calls, cancellation=CancellationToken())
+    results = await _execute_prepared_calls_for_test(executor, calls, cancellation=CancellationToken())
 
     assert [result.tool_call_id for result in results] == [call.tool_call_id for call in calls]
     assert [result.is_error for result in results] == [True, True, True, False]
@@ -306,7 +337,8 @@ async def test_unknown_invalid_and_cancelled_calls_do_not_enter_action_preflight
     token = CancellationToken()
     token.cancel()
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls_for_test(
+        executor,
         (
             ToolCallPart("unknown", "missing", {"value": "unknown"}),
             ToolCallPart("invalid", "prepared", {}),
@@ -367,7 +399,7 @@ async def test_executor_cancellation_never_starts_later_calls_and_returns_all_re
     )
     token = CancellationToken()
 
-    results = await executor.execute_batch(calls, cancellation=token)
+    results = await _execute_prepared_calls_for_test(executor, calls, cancellation=token)
 
     assert [result.tool_call_id for result in results] == ["call-1", "call-2", "call-3"]
     assert results[0].is_error is False
@@ -388,7 +420,8 @@ async def test_executor_pre_cancel_does_not_start_any_tool() -> None:
     token = CancellationToken()
     token.cancel()
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls_for_test(
+        executor,
         (_call("call-1", "first"), _call("call-2", "second")),
         cancellation=token,
     )
@@ -406,7 +439,8 @@ async def test_executor_truncates_success_and_error_results_once() -> None:
     error = OutputTool("error", long_output, is_error=True)
     executor = ToolExecutor(ToolRegistry((success, error)))
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls_for_test(
+        executor,
         (
             ToolCallPart("call-success", "success"),
             ToolCallPart("call-error", "error"),

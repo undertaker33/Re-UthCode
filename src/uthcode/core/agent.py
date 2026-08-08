@@ -62,15 +62,21 @@ from .interaction import (
     PauseReason,
     PauseRequest,
     PauseResponse,
+    PermissionApprovalChoice,
+    PermissionApprovalRequest,
+    PermissionApprovalResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
     UserInputRequest,
     UserInputResponse,
 )
-from .tool import ToolExecutor, ToolRegistry
+from .permission import Decision, PermissionAction, PermissionDecision
+from .tool import PreparedToolCall, ToolExecutor, ToolRegistry
 
 
 AgentEventSink = Callable[[AgentEvent], None]
+PermissionResolver = Callable[[PermissionAction], PermissionDecision]
+SessionGrantSink = Callable[[PermissionAction], None]
 
 
 class _SegmentEventBuffer(list[AgentEvent]):
@@ -628,6 +634,8 @@ class AgentLoop:
         *,
         config: AgentLoopConfig | None = None,
         tool_call_describer: ToolCallDescriber | None = None,
+        permission_resolver: PermissionResolver | None = None,
+        session_grant_sink: SessionGrantSink | None = None,
     ) -> None:
         if not isinstance(provider, ProviderPort):
             raise TypeError("provider must implement ProviderPort")
@@ -643,12 +651,18 @@ class AgentLoop:
             raise TypeError("config must be AgentLoopConfig")
         if tool_call_describer is not None and not callable(tool_call_describer):
             raise TypeError("tool_call_describer must be callable or None")
+        if permission_resolver is not None and not callable(permission_resolver):
+            raise TypeError("permission_resolver must be callable or None")
+        if session_grant_sink is not None and not callable(session_grant_sink):
+            raise TypeError("session_grant_sink must be callable or None")
         self._provider = provider
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
         self._request_preparer = request_preparer
         self._config = config
         self._tool_call_describer = tool_call_describer
+        self._permission_resolver = permission_resolver
+        self._session_grant_sink = session_grant_sink
 
     @property
     def config(self) -> AgentLoopConfig:
@@ -673,6 +687,10 @@ class AgentLoop:
             cancellation = CancellationToken()
         if not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be CancellationToken")
+        if self._tool_registry.list_tools() and self._permission_resolver is None:
+            raise RuntimeError(
+                "permission resolver is required before starting an ordinary Tool turn"
+            )
         if tool_definitions is None:
             definitions = self._tool_registry.definitions()
         else:
@@ -690,6 +708,8 @@ class AgentLoop:
             state=turn_state,
             tool_definitions=definitions,
             cancellation=cancellation,
+            permission_resolver=self._permission_resolver,
+            session_grant_sink=self._session_grant_sink,
         )
 
 
@@ -709,6 +729,10 @@ class AgentTurnExecution:
         "_batch_control_reason",
         "_active_segment_signal",
         "_continuation",
+        "_permission_resolver",
+        "_session_grant_sink",
+        "_pending_prepared_call",
+        "_pending_permission_choice",
     )
 
     def __init__(
@@ -718,6 +742,8 @@ class AgentTurnExecution:
         state: RunState,
         tool_definitions: tuple[ToolDefinition, ...],
         cancellation: CancellationToken,
+        permission_resolver: PermissionResolver | None = None,
+        session_grant_sink: SessionGrantSink | None = None,
     ) -> None:
         self._loop = loop
         self._state = state
@@ -731,6 +757,10 @@ class AgentTurnExecution:
         self._batch_control_reason: str | None = None
         self._active_segment_signal: CancellationToken | None = None
         self._continuation: _TurnContinuation | None = None
+        self._permission_resolver = permission_resolver
+        self._session_grant_sink = session_grant_sink
+        self._pending_prepared_call: PreparedToolCall | None = None
+        self._pending_permission_choice: PermissionApprovalChoice | None = None
 
     @property
     def state(self) -> RunState:
@@ -1064,6 +1094,7 @@ class AgentTurnExecution:
         reason: PauseReason,
         tool_call_id: str | None = None,
         user_input_request: UserInputRequest | None = None,
+        permission_request: PermissionApprovalRequest | None = None,
     ) -> PauseRequest:
         return PauseRequest(
             pause_id=uuid.uuid4().hex,
@@ -1075,6 +1106,7 @@ class AgentTurnExecution:
             created_at=datetime.now(timezone.utc).isoformat(),
             tool_call_id=tool_call_id,
             user_input_request=user_input_request,
+            permission_request=permission_request,
         )
 
     def _pause_user_segment(self, events: list[AgentEvent], iteration: int) -> AgentExecutionSegment:
@@ -1144,6 +1176,32 @@ class AgentTurnExecution:
         self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
         return self._paused_segment(events)
 
+    def _pause_permission_segment(
+        self,
+        events: list[AgentEvent],
+        iteration: int,
+        call: ToolCallPart,
+        decision: PermissionDecision,
+    ) -> AgentExecutionSegment:
+        permission_request = PermissionApprovalRequest.from_decision(
+            decision,
+            permission_id=uuid.uuid4().hex,
+            run_id=self._state.run_id,
+            turn_id=self._state.turn_id,
+            tool_call_id=call.tool_call_id,
+        )
+        pause = self._make_pause(
+            iteration=iteration,
+            kind=PauseKind.PERMISSION_REQUIRED,
+            reason=PauseReason.PERMISSION_REQUIRED,
+            tool_call_id=call.tool_call_id,
+            permission_request=permission_request,
+        )
+        assert self._continuation is not None
+        self._continuation = replace(self._continuation, pending_pause=pause)
+        self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
+        return self._paused_segment(events)
+
     def _apply_response(self, response: PauseResponse, events: list[AgentEvent]) -> None:
         continuation = self._continuation
         if continuation is None or continuation.pending_pause is None:
@@ -1184,6 +1242,14 @@ class AgentTurnExecution:
                     False,
                 ),
             )
+            return
+        if isinstance(response, PermissionApprovalResponse):
+            if continuation.stage != "tool_batch":
+                raise ValueError("permission response requires a Tool continuation")
+            if self._pending_prepared_call is None:
+                raise ValueError("permission response has no prepared Tool call")
+            self._pending_permission_choice = response.choice
+            self._continuation = replace(continuation, pending_pause=None)
             return
         self._continuation = replace(continuation, pending_pause=None)
 
@@ -1283,6 +1349,8 @@ class AgentTurnExecution:
         self._batch_number += 1
         self._batch_id = f"batch-{self._batch_number}"
         self._batch_control_reason = None
+        self._pending_prepared_call = None
+        self._pending_permission_choice = None
         self._set_state(tool_call_count=self._state.tool_call_count + len(calls))
         self._append(
             events,
@@ -1340,7 +1408,9 @@ class AgentTurnExecution:
         iteration: int,
     ) -> ToolResultPart:
         batch_id = self._require_batch_id()
-        known = call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+        known = (
+            call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+        ) or self._loop._tool_registry.get(call.name) is not None
         if not started:
             self._append(
                 events,
@@ -1379,8 +1449,14 @@ class AgentTurnExecution:
         index = continuation.next_tool_index
         pending_input = (
             continuation.pending_pause is not None
-            and continuation.pending_pause.kind is PauseKind.USER_INPUT_REQUIRED
+            and continuation.pending_pause.kind
+            in {PauseKind.USER_INPUT_REQUIRED, PauseKind.PERMISSION_REQUIRED}
         )
+        pending_prepared = self._pending_prepared_call is not None
+        if pending_prepared:
+            pending_input = True
+        self._pending_prepared_call = None
+        self._pending_permission_choice = None
         if pending_input and index < len(continuation.tool_calls):
             results.append(
                 self._append_cancelled_call(
@@ -1408,6 +1484,42 @@ class AgentTurnExecution:
             pending_pause=None,
         )
         self._close_tool_batch(events, status="cancelled")
+
+    async def _execute_prepared(
+        self,
+        prepared: PreparedToolCall,
+    ) -> tuple[ToolResultPart, bool, str]:
+        """Execute exactly one already-prepared call and normalize failures."""
+
+        call = prepared.call
+        try:
+            result = await self._loop._tool_executor.execute_prepared(
+                prepared,
+                cancellation=self._cancellation,
+            )
+            if not isinstance(result, ToolResultPart) or result.tool_call_id != call.tool_call_id:
+                return (
+                    _controlled_tool_result(
+                        call,
+                        "Error: tool execution returned an invalid result",
+                    ),
+                    True,
+                    "failed",
+                )
+        except (GenerationCancelled, CancelledError):
+            self._cancellation.cancel()
+            return (
+                _controlled_tool_result(call, "Error: tool call cancelled"),
+                True,
+                "cancelled",
+            )
+        except Exception:
+            return (
+                _controlled_tool_result(call, "Error: tool execution failed"),
+                True,
+                "failed",
+            )
+        return result, False, "failed" if result.is_error else "finished"
 
     async def _run_tool_batch(
         self,
@@ -1438,74 +1550,134 @@ class AgentTurnExecution:
             ) or self._loop._tool_registry.get(call.name) is not None
             command = self._safe_command(call, known=known)
             batch_id = self._require_batch_id()
-            self._append(
-                events,
-                ToolStarted(
-                    self._state.run_id,
-                    self._state.turn_id,
-                    continuation.iteration,
-                    batch_id,
-                    call.tool_call_id,
-                    call.name,
-                    command,
-                ),
-            )
-
-            controlled = False
-            status = "finished"
-            if self._cancellation.cancelled:
-                result = _controlled_tool_result(call, "Error: tool call cancelled")
-                controlled = True
-                status = "cancelled"
-            elif control_reason is not None:
-                result = _controlled_tool_result(call, control_reason)
+            resumed_prepared = self._pending_prepared_call
+            if resumed_prepared is not None and resumed_prepared.call.tool_call_id != call.tool_call_id:
+                self._pending_prepared_call = None
+                self._pending_permission_choice = None
+                result = _controlled_tool_result(call, "Error: permission continuation mismatch")
                 controlled = True
                 status = "failed"
-            elif call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled():
-                self._set_state(consecutive_unknown_tools=0)
-                try:
-                    request = UserInputRequest.from_dict(call.arguments)
-                except (TypeError, ValueError, KeyError):
-                    result = _controlled_tool_result(call, "Error: invalid AskUserQuestion arguments")
-                    controlled = True
-                    status = "failed"
-                else:
-                    self._continuation = replace(
-                        continuation,
-                        completed_tool_results=tuple(results),
-                        next_tool_index=index,
-                        pending_pause=None,
-                    )
-                    self._pause_input_segment(events, continuation.iteration, call, request)
-                    return "paused"
             else:
-                if known:
-                    self._set_state(consecutive_unknown_tools=0)
-                else:
-                    self._set_state(
-                        consecutive_unknown_tools=self._state.consecutive_unknown_tools + 1
+                if resumed_prepared is None:
+                    self._append(
+                        events,
+                        ToolStarted(
+                            self._state.run_id,
+                            self._state.turn_id,
+                            continuation.iteration,
+                            batch_id,
+                            call.tool_call_id,
+                            call.name,
+                            command,
+                        ),
                     )
-                try:
-                    result = await self._loop._tool_executor.execute_call(
-                        call,
-                        cancellation=self._cancellation,
-                    )
-                    if not isinstance(result, ToolResultPart) or result.tool_call_id != call.tool_call_id:
-                        result = _controlled_tool_result(
-                            call,
-                            "Error: tool execution returned an invalid result",
-                        )
-                        controlled = True
-                        status = "failed"
-                except (GenerationCancelled, CancelledError):
-                    self._cancellation.cancel()
+
+                controlled = False
+                status = "finished"
+                if self._cancellation.cancelled:
                     result = _controlled_tool_result(call, "Error: tool call cancelled")
                     controlled = True
                     status = "cancelled"
-                except Exception:
-                    result = _controlled_tool_result(call, "Error: tool execution failed")
+                elif control_reason is not None:
+                    result = _controlled_tool_result(call, control_reason)
                     controlled = True
                     status = "failed"
+                elif call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled():
+                    self._set_state(consecutive_unknown_tools=0)
+                    try:
+                        request = UserInputRequest.from_dict(call.arguments)
+                    except (TypeError, ValueError, KeyError):
+                        result = _controlled_tool_result(call, "Error: invalid AskUserQuestion arguments")
+                        controlled = True
+                        status = "failed"
+                    else:
+                        self._continuation = replace(
+                            continuation,
+                            completed_tool_results=tuple(results),
+                            next_tool_index=index,
+                            pending_pause=None,
+                        )
+                        self._pause_input_segment(events, continuation.iteration, call, request)
+                        return "paused"
+                elif resumed_prepared is not None:
+                    choice = self._pending_permission_choice
+                    self._pending_prepared_call = None
+                    self._pending_permission_choice = None
+                    if choice is None:
+                        result = _controlled_tool_result(call, "Error: permission response missing")
+                        controlled = True
+                        status = "failed"
+                    elif choice is PermissionApprovalChoice.REJECT:
+                        result = _controlled_tool_result(call, "Error: permission rejected")
+                        controlled = True
+                        status = "failed"
+                    else:
+                        result, controlled, status = await self._execute_prepared(resumed_prepared)
+                        if (
+                            choice is PermissionApprovalChoice.SESSION
+                            and not result.is_error
+                            and not self._cancellation.cancelled
+                            and self._session_grant_sink is not None
+                        ):
+                            try:
+                                self._session_grant_sink(resumed_prepared.action)
+                            except Exception:
+                                # The current approved call remains the
+                                # authoritative result; a failed in-memory
+                                # grant must not trigger a second execution.
+                                pass
+                else:
+                    if known:
+                        self._set_state(consecutive_unknown_tools=0)
+                    else:
+                        self._set_state(
+                            consecutive_unknown_tools=self._state.consecutive_unknown_tools + 1
+                        )
+                    prepared_or_result = self._loop._tool_executor.prepare_call(
+                        call,
+                        cancellation=self._cancellation,
+                    )
+                    if isinstance(prepared_or_result, ToolResultPart):
+                        result = prepared_or_result
+                        controlled = True
+                        status = "failed" if result.is_error else "finished"
+                    elif self._permission_resolver is None:
+                        raise RuntimeError(
+                            "permission resolver is required before executing an ordinary Tool"
+                        )
+                    else:
+                        try:
+                            decision = self._permission_resolver(prepared_or_result.action)
+                        except Exception:
+                            result = _controlled_tool_result(call, "Error: permission check failed")
+                            controlled = True
+                            status = "failed"
+                        else:
+                            if not isinstance(decision, PermissionDecision) or decision.action != prepared_or_result.action:
+                                result = _controlled_tool_result(call, "Error: permission check failed")
+                                controlled = True
+                                status = "failed"
+                            elif decision.decision is Decision.ALLOW:
+                                result, controlled, status = await self._execute_prepared(prepared_or_result)
+                            elif decision.decision is Decision.DENY:
+                                result = _controlled_tool_result(call, "Error: permission denied")
+                                controlled = True
+                                status = "failed"
+                            else:
+                                self._pending_prepared_call = prepared_or_result
+                                self._continuation = replace(
+                                    continuation,
+                                    completed_tool_results=tuple(results),
+                                    next_tool_index=index,
+                                    pending_pause=None,
+                                )
+                                self._pause_permission_segment(
+                                    events,
+                                    continuation.iteration,
+                                    call,
+                                    decision,
+                                )
+                                return "paused"
 
             if not controlled:
                 status = "failed" if result.is_error else "finished"
@@ -1574,6 +1746,8 @@ class AgentTurnExecution:
         self._continuation = None
         self._batch_id = None
         self._batch_control_reason = None
+        self._pending_prepared_call = None
+        self._pending_permission_choice = None
 
     def _complete_segment(self, events: list[AgentEvent], final_text: str) -> AgentExecutionSegment:
         self._set_terminal(RunStatus.COMPLETED, TerminationReason.FINAL_ANSWER, final_text)
@@ -1619,6 +1793,8 @@ class AgentTurnExecution:
         self._continuation = None
         self._batch_id = None
         self._batch_control_reason = None
+        self._pending_prepared_call = None
+        self._pending_permission_choice = None
 
     def _paused_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
         if self._continuation is None or self._continuation.pending_pause is None:

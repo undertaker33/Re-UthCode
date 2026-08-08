@@ -9,14 +9,14 @@ from os import PathLike
 from pathlib import Path, PureWindowsPath
 
 from uthcode.core.provider import (
-    CancellationToken,
     ProviderPort,
     ToolCallPart,
     ToolDefinition,
-    ToolResultPart,
 )
 from uthcode.core.agent import AgentLoop
+from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
+from uthcode.core.permission import PermissionAction, PermissionDecision
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
 
 
@@ -167,25 +167,6 @@ class ApplicationToolService:
 
         return self._registry.definitions()
 
-    async def execute_calls(
-        self,
-        calls: Sequence[ToolCallPart],
-        *,
-        cancellation: CancellationToken | None = None,
-    ) -> tuple[ToolResultPart, ...]:
-        """Execute one batch with a caller token or a fresh local token."""
-
-        if cancellation is None:
-            cancellation = CancellationToken()
-        elif not isinstance(cancellation, CancellationToken):
-            raise TypeError("cancellation must be a CancellationToken or None")
-        if any(call.name == ASK_USER_TOOL_DEFINITION.name for call in calls):
-            raise ValueError("AskUserQuestion is not available through manual Tool execution")
-        return await self._executor.execute_batch(
-            tuple(calls),
-            cancellation=cancellation,
-        )
-
     def describe_tool_call(self, call: ToolCallPart) -> str:
         """Return a bounded, display-safe summary for one registered call.
 
@@ -204,14 +185,15 @@ class ApplicationToolService:
 
             arguments = call.arguments
             if call.name == "Bash":
-                command = self._redactor.redact(_safe_command(arguments.get("command")))
+                command = safe_bash_command_summary(_safe_command(arguments.get("command")))
+                command = self._redactor.redact(command)
                 summary = f"Bash {command}"
             elif call.name in {"ReadFile", "WriteFile", "EditFile"}:
                 path = self._redactor.redact(
                     _safe_text(arguments.get("path"), "<path unavailable>")
                 )
                 summary = f"{call.name} {_safe_path(path, self._workdir)}"
-            elif call.name in {"Glob", "Grep"}:
+            elif call.name == "Glob":
                 pattern = self._redactor.redact(
                     _safe_text(arguments.get("pattern"), "<pattern unavailable>")
                 )
@@ -219,8 +201,17 @@ class ApplicationToolService:
                     _safe_text(arguments.get("path", "."), ".")
                 )
                 scope = _safe_path(scope_value, self._workdir)
-                summary = f"{call.name} pattern={pattern} path={scope}"
-                if call.name == "Grep" and arguments.get("include") not in (None, ""):
+                summary = f"Glob pattern={pattern} path={scope}"
+            elif call.name == "Grep":
+                scope_value = self._redactor.redact(
+                    _safe_text(arguments.get("path", "."), ".")
+                )
+                scope = _safe_path(scope_value, self._workdir)
+                # A search pattern is caller-supplied content and may itself
+                # be a secret read from a sensitive file.  Keep it out of
+                # ToolStarted/Pause summaries altogether.
+                summary = f"Grep path={scope}"
+                if arguments.get("include") not in (None, ""):
                     include = self._redactor.redact(
                         _safe_text(arguments.get("include"), "<include unavailable>")
                     )
@@ -238,6 +229,9 @@ class ApplicationToolService:
         self,
         provider: ProviderPort,
         request_preparer: Callable[..., object],
+        *,
+        permission_resolver: Callable[[PermissionAction], PermissionDecision],
+        session_grant_sink: Callable[[PermissionAction], None] | None = None,
     ) -> AgentLoop:
         """Build a Core Loop over this service's one Registry/Executor.
 
@@ -252,6 +246,8 @@ class ApplicationToolService:
             self._executor,
             request_preparer,
             tool_call_describer=self.describe_tool_call,
+            permission_resolver=permission_resolver,
+            session_grant_sink=session_grant_sink,
         )
 
 

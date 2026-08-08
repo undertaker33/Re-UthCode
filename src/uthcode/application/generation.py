@@ -6,7 +6,13 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from uthcode.core.agent import AgentLoop, AgentTurnExecution, RunState
+from uthcode.core.agent import (
+    AgentLoop,
+    AgentTurnExecution,
+    PermissionResolver,
+    RunState,
+    SessionGrantSink,
+)
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.provider import (
     CancellationToken,
@@ -20,6 +26,7 @@ from uthcode.core.provider import (
     validated_provider_stream,
 )
 from uthcode.core.prompt import SystemPromptContext, build_system_prompt
+from uthcode.core.permission import PermissionEvaluator, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .runtime_context import ApplicationRuntimeContext
@@ -28,6 +35,7 @@ from .tools import ApplicationToolService
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
+PermissionRulesLoader = Callable[[], RuleSet]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +121,7 @@ class UthCodeApplication:
         model_writer: ModelWriter | None = None,
         runtime_context: ApplicationRuntimeContext | None = None,
         tool_service: ApplicationToolService | None = None,
+        permission_rules_loader: PermissionRulesLoader | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -127,7 +136,10 @@ class UthCodeApplication:
             tool_service = ApplicationToolService(())
         if not isinstance(tool_service, ApplicationToolService):
             raise TypeError("tool_service must be an ApplicationToolService")
+        if permission_rules_loader is not None and not callable(permission_rules_loader):
+            raise TypeError("permission_rules_loader must be callable or None")
         self._tool_service = tool_service
+        self._permission_rules_loader = permission_rules_loader
         self._current_model_ref = (
             configuration.model if configuration is not None else provider.identity.model
         )
@@ -176,7 +188,21 @@ class UthCodeApplication:
 
         from .runs import AgentRun
 
-        return AgentRun(self, run_id=run_id)
+        return AgentRun(
+            self,
+            run_id=run_id,
+            permission_evaluator=self._permission_evaluator_for_run(),
+        )
+
+    def _permission_evaluator_for_run(self) -> PermissionEvaluator:
+        """Load exactly one immutable permission snapshot for a new Run."""
+
+        if self._permission_rules_loader is None:
+            return PermissionEvaluator()
+        rules = self._permission_rules_loader()
+        if not isinstance(rules, RuleSet):
+            raise TypeError("permission_rules_loader must return a RuleSet")
+        return PermissionEvaluator(rules)
 
     async def execute_tool_calls(
         self,
@@ -184,11 +210,17 @@ class UthCodeApplication:
         *,
         cancellation: CancellationToken | None = None,
     ) -> tuple[ToolResultPart, ...]:
-        """Execute a caller-provided ToolCall batch through the Application."""
+        """Reject the manual Tool path at the Application boundary.
 
-        return await self._tool_service.execute_calls(
-            calls,
-            cancellation=cancellation,
+        Ordinary Tool execution needs a Run-local mode, RuleSet snapshot and
+        T06 pause/resume channel.  This API has none of those contracts, so
+        accepting a call here would create a permission bypass.  Callers must
+        use ``create_run().start_turn()`` instead.
+        """
+
+        del calls, cancellation
+        raise ValueError(
+            "manual Tool execution is disabled; use AgentRun.start_turn"
         )
 
     def status(self) -> ApplicationStatus:
@@ -252,6 +284,8 @@ class UthCodeApplication:
         *,
         turn_id: str,
         cancellation: CancellationToken,
+        permission_resolver: PermissionResolver,
+        session_grant_sink: SessionGrantSink,
     ) -> AgentTurnExecution:
         """Start a Core Turn with Application-owned snapshots.
 
@@ -277,7 +311,12 @@ class UthCodeApplication:
                 model_ref=model_ref,
             )
 
-        loop = self._tool_service._create_agent_loop(provider, prepare)
+        loop = self._tool_service._create_agent_loop(
+            provider,
+            prepare,
+            permission_resolver=permission_resolver,
+            session_grant_sink=session_grant_sink,
+        )
         execution = loop.start_turn(
             state,
             user_input,
