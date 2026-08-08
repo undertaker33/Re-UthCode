@@ -43,7 +43,10 @@ from uthcode.application import (
     CommandParser,
     CompletionEngine,
     ModelSelected,
+    OpenPermissionPicker,
     OpenModelPicker,
+    PermissionMode,
+    PermissionModeSelected,
     ProviderError,
     QuitInterface,
     TurnHandle,
@@ -53,7 +56,7 @@ from uthcode.application import (
 
 from .completion import CompletionMenuItem, CompletionMenuState
 from .interaction import InteractionMode, TuiInteractionState
-from .picker import ModelPickerState
+from .picker import ModelPickerState, PermissionPickerState
 from .rendering import AgentEventRenderer, MarkdownStream, RenderBatch
 from .state import EscArmState, previous_grapheme_length
 from .terminal import (
@@ -108,6 +111,7 @@ class UthCodeTUI:
         self.dispatcher = CommandDispatcher(self.registry, application)
         self.completion = CompletionMenuState()
         self.picker = ModelPickerState()
+        self.permission_picker = PermissionPickerState()
         self.interaction = TuiInteractionState()
         self.buffer = Buffer(
             multiline=True,
@@ -325,6 +329,7 @@ class UthCodeTUI:
             (
                 "class:status",
                 f" {self.activity} | {self.application.current_model_ref} | "
+                f"permission: {self._run.permission_mode.value} | "
                 f"{self.application.runtime_context.workdir} ",
             )
         ]
@@ -355,6 +360,17 @@ class UthCodeTUI:
                 style = "class:candidate.selected" if index == selected else "class:candidate"
                 rows.append((style, f"{marker} {items[index].display}\n"))
             return rows
+        if self.permission_picker.open:
+            rows = []
+            for index, mode in enumerate(self.permission_picker.modes):
+                marker = "›" if index == self.permission_picker.selected_index else " "
+                current = " · current" if mode is self.permission_picker.current_mode else ""
+                style = "class:candidate.selected" if index == self.permission_picker.selected_index else "class:candidate"
+                rows.append((style, f"{marker} {mode.value}{current}\n"))
+            warning = self.permission_picker.warning
+            if warning is not None:
+                rows.append(("class:interaction.hint", f"{warning}\n"))
+            return rows
         items = self.picker.models
         selected = self.picker.selected_index
         height = self._candidate_height()
@@ -374,7 +390,8 @@ class UthCodeTUI:
         bindings = KeyBindings()
         completion_open = Condition(lambda: self.completion.open)
         picker_open = Condition(lambda: self.picker.open)
-        menu_open = completion_open | picker_open
+        permission_picker_open = Condition(lambda: self.permission_picker.open)
+        menu_open = completion_open | picker_open | permission_picker_open
 
         @bindings.add(Keys.ControlM, eager=True)
         def _submit(event: object) -> None:
@@ -385,6 +402,8 @@ class UthCodeTUI:
                 self._execute_selected_command()
             elif self.picker.open:
                 self._select_picker_model()
+            elif self.permission_picker.open:
+                self._select_permission_mode()
             else:
                 text = self.buffer.text
                 if text.strip():
@@ -446,6 +465,7 @@ class UthCodeTUI:
                 and not self._active_handle.paused
                 and not self.completion.open
                 and not self.picker.open
+                and not self.permission_picker.open
                 and not self.interaction.open
             ),
             eager=True,
@@ -459,7 +479,7 @@ class UthCodeTUI:
         @bindings.add(Keys.ControlH, eager=True)
         def _backspace(event: object) -> None:
             del event
-            if self.picker.open:
+            if self.picker.open or self.permission_picker.open:
                 return
             before = self.buffer.text[: self.buffer.cursor_position]
             count = previous_grapheme_length(before)
@@ -469,12 +489,22 @@ class UthCodeTUI:
         @bindings.add(Keys.Up, filter=menu_open, eager=True)
         def _menu_up(event: object) -> None:
             del event
-            (self.completion if self.completion.open else self.picker).move(-1)
+            if self.completion.open:
+                self.completion.move(-1)
+            elif self.permission_picker.open:
+                self.permission_picker.move(-1)
+            else:
+                self.picker.move(-1)
 
         @bindings.add(Keys.Down, filter=menu_open, eager=True)
         def _menu_down(event: object) -> None:
             del event
-            (self.completion if self.completion.open else self.picker).move(1)
+            if self.completion.open:
+                self.completion.move(1)
+            elif self.permission_picker.open:
+                self.permission_picker.move(1)
+            else:
+                self.picker.move(1)
 
         @bindings.add(Keys.Tab, eager=True)
         def _tab(event: object) -> None:
@@ -497,6 +527,9 @@ class UthCodeTUI:
                     self.buffer.set_document(self._picker_draft, bypass_readonly=True)
                 self._picker_draft = None
                 self._reset_interaction_context()
+            elif self.permission_picker.open:
+                self.permission_picker.close()
+                self._reset_interaction_context()
             elif self.interaction.open:
                 self._handle_interaction_escape()
             elif self._active_handle is not None and self._active_handle.paused:
@@ -516,7 +549,11 @@ class UthCodeTUI:
         text = self.buffer.text
         if self.interaction.open:
             self.completion.close()
-        elif not self.picker.open and text.lstrip().startswith("/"):
+        elif (
+            not self.picker.open
+            and not self.permission_picker.open
+            and text.lstrip().startswith("/")
+        ):
             self.completion.replace(self._application_completion(text))
         else:
             self.completion.close()
@@ -568,11 +605,18 @@ class UthCodeTUI:
                 tuple(self.application.model_catalog()),
                 self.application.current_model_ref,
             )
+        elif isinstance(action, OpenPermissionPicker):
+            self.permission_picker.replace(self._run.permission_mode)
         elif isinstance(action, QuitInterface):
             self._closing = True
             self.ui.exit()
         elif isinstance(action, ModelSelected):
             self.activity = f"model: {action.model_ref}"
+        elif isinstance(action, PermissionModeSelected):
+            self._run.set_permission_mode(action.mode)
+            self.activity = f"permission: {action.mode.value}"
+            if action.warning is not None:
+                await self._emit(self._renderer.system(action.warning))
         prompt = outcome.prompt
         if prompt:
             if self._active_handle is None:
@@ -874,6 +918,14 @@ class UthCodeTUI:
             self._reset_interaction_context()
             return
 
+        if self.interaction.mode is InteractionMode.PERMISSION:
+            response = self.interaction.permission_response()
+            if response is not None and handle.resume(response):
+                self.interaction.close()
+                self.activity = "resuming"
+                self._reset_interaction_context()
+            return
+
         if self.interaction.mode is InteractionMode.REVIEW:
             response = self.interaction.user_input_response()
             if response is not None and handle.resume(response):
@@ -926,6 +978,16 @@ class UthCodeTUI:
                 self._handle_submission(f"/model {model.model_ref}")
             )
 
+    def _select_permission_mode(self) -> None:
+        mode = self.permission_picker.selected
+        warning = self.permission_picker.warning
+        self.permission_picker.close()
+        self._run.set_permission_mode(mode)
+        self.activity = f"permission: {mode.value}"
+        if warning is not None:
+            self._spawn(self._emit(self._renderer.system(warning)))
+        self._reset_interaction_context()
+
     async def _clear_viewport(self) -> None:
         self._reset_stream_projection()
         self._sync_renderer_width()
@@ -977,7 +1039,10 @@ class UthCodeTUI:
 
     def _has_candidates(self) -> bool:
         return (
-            self.completion.open or self.picker.open or self.interaction.open
+            self.completion.open
+            or self.picker.open
+            or self.permission_picker.open
+            or self.interaction.open
         ) and self._candidate_height() > 0
 
     def _pending_text(self) -> str:
@@ -1015,7 +1080,12 @@ class UthCodeTUI:
         _columns, rows = self._terminal_size()
         candidate_height = (
             self._candidate_height()
-            if self.completion.open or self.picker.open or self.interaction.open
+            if (
+                self.completion.open
+                or self.picker.open
+                or self.permission_picker.open
+                or self.interaction.open
+            )
             else 0
         )
         occupied = self._composer_height() + candidate_height + 2

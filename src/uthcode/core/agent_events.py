@@ -18,6 +18,8 @@ from .interaction import (
     PauseKind,
     PauseReason,
     PauseRequest,
+    PermissionApprovalRequest,
+    PermissionApprovalResponse,
     UserInputRequest,
 )
 from .provider import (
@@ -80,7 +82,15 @@ def _json_value(value: object) -> object:
         return value.value
     if isinstance(value, (Message, Usage)):
         return value.to_dict()
-    if isinstance(value, (PauseRequest, UserInputRequest)):
+    if isinstance(
+        value,
+        (
+            PauseRequest,
+            PermissionApprovalRequest,
+            PermissionApprovalResponse,
+            UserInputRequest,
+        ),
+    ):
         return value.to_dict()
     if isinstance(value, JsonPayload):
         return {key: _json_value(item) for key, item in value.items()}

@@ -13,6 +13,8 @@ from enum import Enum
 from uthcode.application import (
     PauseKind,
     PauseRequest,
+    PermissionApprovalChoice,
+    PermissionApprovalResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
     UserInputResponse,
@@ -23,6 +25,7 @@ from uthcode.application import (
 class InteractionMode(str, Enum):
     CLOSED = "closed"
     PAUSE_ACTION = "pause_action"
+    PERMISSION = "permission"
     QUESTIONS = "questions"
     REVIEW = "review"
 
@@ -76,6 +79,18 @@ class TuiInteractionState:
         return ()
 
     @property
+    def permission_choices(self) -> tuple[PermissionApprovalChoice, ...]:
+        request = self.pause.permission_request if self.pause is not None else None
+        return request.choices if request is not None else ()
+
+    @property
+    def selected_permission_choice(self) -> PermissionApprovalChoice | None:
+        choices = self.permission_choices
+        if not choices:
+            return None
+        return choices[self.action_index % len(choices)]
+
+    @property
     def selected_action(self) -> PauseAction | None:
         actions = self.actions
         if not actions:
@@ -100,12 +115,20 @@ class TuiInteractionState:
     def is_review(self) -> bool:
         return self.mode is InteractionMode.REVIEW
 
+    @property
+    def is_permission(self) -> bool:
+        return self.mode is InteractionMode.PERMISSION
+
     def open_pause(self, pause: PauseRequest) -> None:
         self._reset(pause)
         self.mode = (
             InteractionMode.QUESTIONS
             if pause.kind is PauseKind.USER_INPUT_REQUIRED
-            else InteractionMode.PAUSE_ACTION
+            else (
+                InteractionMode.PERMISSION
+                if pause.kind is PauseKind.PERMISSION_REQUIRED
+                else InteractionMode.PAUSE_ACTION
+            )
         )
 
     def close(self) -> None:
@@ -116,6 +139,11 @@ class TuiInteractionState:
             actions = self.actions
             if actions:
                 self.action_index = (self.action_index + delta) % len(actions)
+            return
+        if self.mode is InteractionMode.PERMISSION:
+            choices = self.permission_choices
+            if choices:
+                self.action_index = (self.action_index + delta) % len(choices)
             return
         if self.mode is not InteractionMode.QUESTIONS or not self.is_select:
             return
@@ -215,6 +243,20 @@ class TuiInteractionState:
             return None
         return self.selected_action
 
+    def permission_response(self) -> PermissionApprovalResponse | None:
+        choice = self.selected_permission_choice
+        pause = self.pause
+        request = pause.permission_request if pause is not None else None
+        if pause is None or request is None or choice is None:
+            return None
+        return PermissionApprovalResponse(
+            pause_id=pause.pause_id,
+            run_id=pause.run_id,
+            turn_id=pause.turn_id,
+            permission_id=request.permission_id,
+            choice=choice,
+        )
+
     def response_for_action(self):  # type: ignore[no-untyped-def]
         action = self.confirm_action()
         pause = self.pause
@@ -249,6 +291,42 @@ class TuiInteractionState:
             for index, action in enumerate(self.actions):
                 marker = "›" if index == self.action_index else " "
                 lines.append(("class:interaction.option", f"{marker} {action.value}\n"))
+            return tuple(lines)
+        if self.mode is InteractionMode.PERMISSION:
+            request = pause.permission_request
+            if request is None:
+                return ()
+            lines = [
+                ("class:interaction.title", "需要权限确认\n"),
+                (
+                    "class:interaction.question",
+                    f"{request.tool} · {request.action} · {request.effect.value}\n",
+                ),
+                (
+                    "class:interaction.question",
+                    f"resource: {request.resource or '<unknown>'}\n",
+                ),
+                (
+                    "class:interaction.question",
+                    f"reason: {request.reason} · mode: {request.mode.value}"
+                    + (" · Guard" if request.guard else " · ordinary")
+                    + "\n",
+                ),
+                ("class:interaction.hint", "↑/↓ 选择 · Enter 确认 · Esc 返回\n"),
+            ]
+            labels = {
+                PermissionApprovalChoice.ONCE: "Allow once",
+                PermissionApprovalChoice.SESSION: "Allow for session",
+                PermissionApprovalChoice.REJECT: "Reject",
+            }
+            for index, choice in enumerate(request.choices):
+                marker = "›" if index == self.action_index else " "
+                lines.append(
+                    (
+                        "class:interaction.option",
+                        f"{marker} {labels[choice]}\n",
+                    )
+                )
             return tuple(lines)
         if self.mode is InteractionMode.REVIEW:
             lines = [

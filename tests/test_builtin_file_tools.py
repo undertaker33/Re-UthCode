@@ -11,6 +11,7 @@ from uthcode.core import (
     ToolCallPart,
     ToolExecutor,
     ToolRegistry,
+    ToolResultPart,
 )
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.tools.file_tools import (
@@ -29,6 +30,28 @@ def _tools(root: Path):
     resolver = WorkspacePathResolver(root)
     tracker = FileReadTracker()
     return resolver, tracker, ReadFileTool(resolver, tracker), WriteFileTool(resolver, tracker), EditFileTool(resolver, tracker)
+
+
+async def _execute_prepared_calls(
+    executor: ToolExecutor,
+    calls: tuple[ToolCallPart, ...],
+    *,
+    cancellation: CancellationToken,
+) -> tuple[ToolResultPart, ...]:
+    results: list[ToolResultPart] = []
+    for call in calls:
+        prepared = executor.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            results.append(prepared)
+        else:
+            assert isinstance(prepared, PreparedToolCall)
+            results.append(
+                await executor.execute_prepared(
+                    prepared,
+                    cancellation=cancellation,
+                )
+            )
+    return tuple(results)
 
 
 def test_workspace_resolver_resolves_outside_scope_and_rejects_null(
@@ -464,7 +487,8 @@ async def test_file_output_is_truncated_only_by_core_executor(tmp_path: Path) ->
     registry = ToolRegistry((ReadFileTool(resolver, tracker),))
     executor = ToolExecutor(registry)
 
-    results = await executor.execute_batch(
+    results = await _execute_prepared_calls(
+        executor,
         (ToolCallPart("read-1", "ReadFile", {"path": "large.txt"}),),
         cancellation=CancellationToken(),
     )

@@ -19,6 +19,9 @@ from uthcode.core.interaction import (
     PauseKind,
     PauseReason,
     PauseRequest,
+    PermissionApprovalChoice,
+    PermissionApprovalRequest,
+    PermissionApprovalResponse,
     QuestionKind,
     QuestionOption,
     RetryProviderResponse,
@@ -27,6 +30,16 @@ from uthcode.core.interaction import (
     UserInputResponse,
     UserQuestion,
     pause_response_from_json,
+)
+from uthcode.core.permission import (
+    Effect,
+    PermissionAction,
+    PermissionEvaluator,
+    ResourceScope,
+    Rule,
+    RuleKind,
+    RuleSet,
+    Decision,
 )
 
 
@@ -82,12 +95,14 @@ def test_enums_and_pause_combinations_are_fixed() -> None:
         "user_requested",
         "user_input_required",
         "provider_unavailable",
+        "permission_required",
     ]
     assert [item.value for item in PauseReason] == [
         "user_requested",
         "user_input_required",
         "network_error",
         "rate_limited",
+        "permission_required",
     ]
 
     PauseRequest(
@@ -224,6 +239,132 @@ def test_other_and_response_type_matching() -> None:
     ):
         assert json.loads(response.to_json())["type"] == response_type
         assert pause_response_from_json(response.to_json()) == response
+
+
+def test_permission_approval_protocol_is_strict_and_redacted() -> None:
+    action = PermissionAction(
+        "WriteFile",
+        "write",
+        Effect.WRITE,
+        "C:/workspace/note.txt",
+        ResourceScope.INSIDE,
+    )
+    decision = PermissionEvaluator().evaluate(action)
+    request = PermissionApprovalRequest.from_decision(
+        decision,
+        permission_id="permission-1",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+    )
+    assert request.choices == (
+        PermissionApprovalChoice.ONCE,
+        PermissionApprovalChoice.SESSION,
+        PermissionApprovalChoice.REJECT,
+    )
+    payload = request.to_dict()
+    assert PermissionApprovalRequest.from_json(request.to_json()) == request
+    assert "secret-value" not in json.dumps(payload)
+
+    pause = PauseRequest(
+        "pause-1",
+        "run-1",
+        "turn-1",
+        PauseKind.PERMISSION_REQUIRED,
+        PauseReason.PERMISSION_REQUIRED,
+        1,
+        "now",
+        tool_call_id="call-1",
+        permission_request=request,
+    )
+    response = PermissionApprovalResponse(
+        pause.pause_id,
+        pause.run_id,
+        pause.turn_id,
+        request.permission_id,
+        PermissionApprovalChoice.ONCE,
+    )
+    assert pause.validate_response(response) is None
+    assert pause_response_from_json(response.to_json()) == response
+    with pytest.raises(ValueError):
+        pause.validate_response(
+            PermissionApprovalResponse(
+                pause.pause_id,
+                pause.run_id,
+                pause.turn_id,
+                "stale-permission",
+                PermissionApprovalChoice.ONCE,
+            )
+        )
+
+    guard_decision = PermissionEvaluator(
+        RuleSet(
+            (
+                Rule(
+                    kind=RuleKind.GUARD,
+                    decision=Decision.ASK,
+                    tool="WriteFile",
+                    source="guard",
+                ),
+            )
+        )
+    ).evaluate(action)
+    guard_request = PermissionApprovalRequest.from_decision(
+        guard_decision,
+        permission_id="permission-guard",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+    )
+    assert guard_request.choices == (
+        PermissionApprovalChoice.ONCE,
+        PermissionApprovalChoice.REJECT,
+    )
+
+
+def test_permission_pause_and_response_decoders_reject_missing_and_extra_fields() -> None:
+    action = PermissionAction(
+        "WriteFile",
+        "write",
+        Effect.WRITE,
+        "note.txt",
+        ResourceScope.INSIDE,
+    )
+    request = PermissionApprovalRequest.from_decision(
+        PermissionEvaluator().evaluate(action),
+        permission_id="permission-1",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+    )
+    pause = PauseRequest(
+        "pause-1",
+        "run-1",
+        "turn-1",
+        PauseKind.PERMISSION_REQUIRED,
+        PauseReason.PERMISSION_REQUIRED,
+        1,
+        "now",
+        tool_call_id="call-1",
+        permission_request=request,
+    ).to_dict()
+    response = PermissionApprovalResponse(
+        "pause-1",
+        "run-1",
+        "turn-1",
+        "permission-1",
+        PermissionApprovalChoice.REJECT,
+    ).to_dict()
+    for decoder, payload, required in (
+        (PauseRequest.from_dict, pause, "permission_request"),
+        (PermissionApprovalResponse.from_dict, response, "choice"),
+    ):
+        missing = dict(payload)
+        del missing[required]
+        with pytest.raises((TypeError, ValueError, KeyError)):
+            decoder(missing)
+        with pytest.raises((TypeError, ValueError, KeyError)):
+            decoder({**payload, "unexpected": True})
 
 
 def test_ask_user_definition_is_strict_and_json_schema_valid() -> None:

@@ -21,7 +21,10 @@ from uthcode.application import (
     PauseKind,
     PauseReason,
     PauseRequest,
+    PermissionApprovalChoice,
+    PermissionApprovalRequest,
     ProviderResponse,
+    PermissionMode,
     QuestionOption,
     QuestionKind,
     RetryProviderResponse,
@@ -43,6 +46,7 @@ from uthcode.core.provider import (
     ProviderEvent,
     RateLimitError,
 )
+from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.interfaces.tui.app import (
     UthCodeTUI,
@@ -342,6 +346,49 @@ def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
     assert response.answers["other"] == ["a partner"]
 
 
+def test_tui_interaction_state_renders_permission_choices_without_secret_payload() -> None:
+    request = PermissionApprovalRequest(
+        permission_id="permission-1",
+        run_id="run",
+        turn_id="turn",
+        tool_call_id="call",
+        tool="WriteFile",
+        action="write",
+        effect=Effect.WRITE,
+        resource="safe.txt",
+        scope=ResourceScope.INSIDE,
+        reason="mode_fallback",
+        mode=PermissionMode.DEFAULT,
+        choices=(
+            PermissionApprovalChoice.ONCE,
+            PermissionApprovalChoice.SESSION,
+            PermissionApprovalChoice.REJECT,
+        ),
+        guard=False,
+    )
+    pause = PauseRequest(
+        pause_id="pause",
+        run_id="run",
+        turn_id="turn",
+        kind=PauseKind.PERMISSION_REQUIRED,
+        reason=PauseReason.PERMISSION_REQUIRED,
+        iteration=1,
+        created_at="now",
+        tool_call_id="call",
+        permission_request=request,
+    )
+    state = TuiInteractionState()
+    state.open_pause(pause)
+    assert state.mode is InteractionMode.PERMISSION
+    assert state.permission_choices == request.choices
+    assert "Allow for session" in "".join(text for _style, text in state.render_lines())
+    assert "secret" not in "".join(text for _style, text in state.render_lines())
+    state.move(1)
+    response = state.permission_response()
+    assert response is not None
+    assert response.choice is PermissionApprovalChoice.SESSION
+
+
 def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None:
     question = UserQuestion(
         "mode",
@@ -463,6 +510,32 @@ def test_composer_prompt_is_separate_from_ime_buffer_cursor() -> None:
     assert isinstance(composer, VSplit)
     assert len(composer.children) == 2
     assert composer.children[1].content is tui._buffer_control
+
+
+@pytest.mark.asyncio
+async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    outcome = tui.dispatcher.dispatch_text("/permission")
+    assert outcome is not None
+    await tui._apply_command_outcome("/permission", outcome)
+    assert tui.permission_picker.open is True
+    assert tui._run.permission_mode is PermissionMode.DEFAULT
+
+    tui.permission_picker.move(1)
+    tui._select_permission_mode()
+    assert tui._run.permission_mode is PermissionMode.AUTO
+    assert tui.application.create_run().permission_mode is PermissionMode.DEFAULT
+
+    outcome = tui.dispatcher.dispatch_text("/permission")
+    assert outcome is not None
+    await tui._apply_command_outcome("/permission", outcome)
+    tui.permission_picker.move(1)
+    assert tui.permission_picker.selected is PermissionMode.FULL_ACCESS
+    tui._select_permission_mode()
+    await asyncio.sleep(0)
+    assert tui._run.permission_mode is PermissionMode.FULL_ACCESS
+    assert "高风险提示" in output.getvalue()
 
 
 @pytest.mark.asyncio

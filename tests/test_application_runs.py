@@ -575,7 +575,7 @@ def test_tool_descriptions_are_bounded_and_do_not_echo_write_content_or_unknown_
     assert read_summary == "ReadFile note.txt"
     assert edit_summary == "EditFile note.txt"
     assert secret not in bash_summary
-    assert grep_summary == "Grep pattern=needle path=src"
+    assert grep_summary == "Grep path=src"
     assert unknown_summary == "<unknown tool>"
     assert len(long_summary) == 240
     assert long_summary.endswith("…")

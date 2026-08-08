@@ -174,17 +174,6 @@ class ToolExecutor:
         self._registry = registry
         self._max_result_chars = max_result_chars
 
-    async def execute_call(
-        self,
-        call: ToolCallPart,
-        *,
-        cancellation: CancellationToken,
-    ) -> ToolResultPart:
-        prepared = self.prepare_call(call, cancellation=cancellation)
-        if isinstance(prepared, ToolResultPart):
-            return prepared
-        return await self.execute_prepared(prepared, cancellation=cancellation)
-
     def prepare_call(
         self,
         call: ToolCallPart,
@@ -272,24 +261,6 @@ class ToolExecutor:
             content=self._truncate(result.content),
             is_error=result.is_error,
         )
-
-    async def execute_batch(
-        self,
-        calls: Sequence[ToolCallPart],
-        *,
-        cancellation: CancellationToken,
-    ) -> tuple[ToolResultPart, ...]:
-        call_values = tuple(calls)
-        for call in call_values:
-            _require_tool_call(call)
-
-        results: list[ToolResultPart] = []
-        for call in call_values:
-            if cancellation.cancelled:
-                results.append(self._cancelled(call))
-                continue
-            results.append(await self.execute_call(call, cancellation=cancellation))
-        return tuple(results)
 
     def _cancelled(self, call: ToolCallPart) -> ToolResultPart:
         return self._error(call, "Error: tool call cancelled")

@@ -11,6 +11,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 
+from uthcode.core.permission import PermissionMode
+
 
 class CommandKind(str, Enum):
     """The three command semantics understood by the Application layer."""
@@ -196,6 +198,25 @@ class OpenModelPicker(UiAction):
 
 
 @dataclass(frozen=True, slots=True)
+class OpenPermissionPicker(UiAction):
+    """Request that the active interface show the current Run mode picker."""
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionModeSelected(UiAction):
+    """Report a user-selected permission mode to an interface."""
+
+    mode: PermissionMode
+    warning: str | None = None
+
+    def __post_init__(self) -> None:
+        mode = self.mode
+        if not isinstance(mode, PermissionMode):
+            mode = PermissionMode(mode)
+            object.__setattr__(self, "mode", mode)
+
+
+@dataclass(frozen=True, slots=True)
 class QuitInterface(UiAction):
     """Request that the active interface exit."""
 
@@ -288,8 +309,10 @@ __all__ = [
     "CompletionCandidate",
     "InvocationStatus",
     "ModelSelected",
+    "OpenPermissionPicker",
     "OpenModelPicker",
     "OutcomeStatus",
+    "PermissionModeSelected",
     "QuitInterface",
     "UiAction",
 ]

@@ -50,6 +50,8 @@ class PermissionConfigurationError(ValueError):
 
 
 BASH_GUARD_FACT_MARKER = "__uthcode_guard_fact__"
+BASH_ACTION_FACT_MARKER = "__uthcode_bash_action__"
+BASH_SENSITIVE_TARGET_MARKER = "__uthcode_bash_sensitive_target__"
 
 
 _SENSITIVE_RESOURCE_REGEX = (
@@ -67,6 +69,11 @@ _SENSITIVE_RESOURCE_REGEX = (
     r")"
 )
 _SENSITIVE_RESOURCE_PATTERN = re.compile(_SENSITIVE_RESOURCE_REGEX)
+_BASH_SENSITIVE_RESOURCE_REGEX = (
+    rf"(?i)\[{re.escape(BASH_ACTION_FACT_MARKER)}:"
+    rf"(?:content-read|content-search|write|mixed|unknown)\]"
+    rf"\s*\[{re.escape(BASH_SENSITIVE_TARGET_MARKER)}\]"
+)
 
 
 def is_sensitive_resource(resource: str) -> bool:
@@ -149,9 +156,20 @@ def default_guard_rules() -> tuple[Rule, ...]:
             ("WriteFile", "write"),
             ("EditFile", "edit"),
             ("Grep", "grep"),
-            ("Bash", "execute"),
         )
     ]
+    rules.append(
+        Rule(
+            kind=RuleKind.GUARD,
+            decision=Decision.ASK,
+            source="default",
+            priority=0,
+            rule_id="default-sensitive-Bash",
+            tool="Bash",
+            action="execute",
+            resource_regex=_BASH_SENSITIVE_RESOURCE_REGEX,
+        )
+    )
     rules.extend(
         Rule(
             kind=RuleKind.GUARD,
@@ -536,7 +554,9 @@ def load_permission_rules(
 
 
 __all__ = [
+    "BASH_ACTION_FACT_MARKER",
     "BASH_GUARD_FACT_MARKER",
+    "BASH_SENSITIVE_TARGET_MARKER",
     "PERMISSIONS_USER_TEMPLATE",
     "PROJECT_PERMISSION_PLACEHOLDER",
     "PermissionConfigurationError",

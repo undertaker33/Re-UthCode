@@ -14,6 +14,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, TypeAlias
 
+from .permission import (
+    Decision,
+    Effect,
+    PermissionAction,
+    PermissionDecision,
+    PermissionMode,
+    ResourceScope,
+    RuleKind,
+)
 from .provider import JsonPayload, ToolDefinition
 
 
@@ -74,7 +83,17 @@ def _coerce_enum(enum_type: type[Enum], value: object, field_name: str) -> Enum:
 def _json_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, (QuestionOption, UserQuestion, UserInputRequest, PauseRequest)):
+    if isinstance(
+        value,
+        (
+            QuestionOption,
+            UserQuestion,
+            UserInputRequest,
+            PermissionApprovalRequest,
+            PermissionApprovalResponse,
+            PauseRequest,
+        ),
+    ):
         return value.to_dict()
     if isinstance(value, JsonPayload):
         return {key: _json_value(item) for key, item in value.items()}
@@ -106,6 +125,7 @@ class PauseKind(str, Enum):
     USER_REQUESTED = "user_requested"
     USER_INPUT_REQUIRED = "user_input_required"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PERMISSION_REQUIRED = "permission_required"
 
 
 class PauseReason(str, Enum):
@@ -113,6 +133,7 @@ class PauseReason(str, Enum):
     USER_INPUT_REQUIRED = "user_input_required"
     NETWORK_ERROR = "network_error"
     RATE_LIMITED = "rate_limited"
+    PERMISSION_REQUIRED = "permission_required"
 
 
 class QuestionKind(str, Enum):
@@ -318,6 +339,179 @@ def _normalize_answers(
     return JsonPayload(normalized)
 
 
+class PermissionApprovalChoice(str, Enum):
+    """The only responses a Permission Approval can accept."""
+
+    ONCE = "once"
+    SESSION = "session"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionApprovalRequest(_JsonModel):
+    """A display-safe request to approve one prepared Tool call."""
+
+    permission_id: str
+    run_id: str
+    turn_id: str
+    tool_call_id: str
+    tool: str
+    action: str
+    effect: Effect
+    resource: str | None
+    scope: ResourceScope
+    reason: str
+    mode: PermissionMode
+    choices: tuple[PermissionApprovalChoice, ...]
+    guard: bool
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "permission_id",
+            "run_id",
+            "turn_id",
+            "tool_call_id",
+            "tool",
+            "action",
+            "reason",
+        ):
+            _require_text(getattr(self, field_name), field_name)
+        if self.resource is not None:
+            _require_text(self.resource, "resource")
+        effect = _coerce_enum(Effect, self.effect, "effect")
+        object.__setattr__(self, "effect", effect)
+        scope = _coerce_enum(ResourceScope, self.scope, "resource scope")
+        object.__setattr__(self, "scope", scope)
+        mode = _coerce_enum(PermissionMode, self.mode, "permission mode")
+        object.__setattr__(self, "mode", mode)
+        choices = tuple(_coerce_enum(PermissionApprovalChoice, choice, "permission choice") for choice in _as_tuple(self.choices, "choices"))
+        if self.guard:
+            if choices != (
+                PermissionApprovalChoice.ONCE,
+                PermissionApprovalChoice.REJECT,
+            ):
+                raise ValueError("Guard approval choices must be once and reject")
+        elif choices != (
+            PermissionApprovalChoice.ONCE,
+            PermissionApprovalChoice.SESSION,
+            PermissionApprovalChoice.REJECT,
+        ):
+            raise ValueError("ordinary approval choices must be once, session and reject")
+        if len(set(choices)) != len(choices):
+            raise ValueError("permission choices must be unique")
+        object.__setattr__(self, "choices", choices)
+        if not isinstance(self.guard, bool):
+            raise TypeError("guard must be a boolean")
+
+    @classmethod
+    def from_decision(
+        cls,
+        decision: PermissionDecision,
+        *,
+        permission_id: str,
+        run_id: str,
+        turn_id: str,
+        tool_call_id: str,
+    ) -> PermissionApprovalRequest:
+        if not isinstance(decision, PermissionDecision):
+            raise TypeError("decision must be PermissionDecision")
+        if decision.decision is not Decision.ASK:
+            raise ValueError("Permission Approval requires an Ask decision")
+        guard = decision.matched_rule_kind is RuleKind.GUARD
+        choices = (
+            (
+                PermissionApprovalChoice.ONCE,
+                PermissionApprovalChoice.REJECT,
+            )
+            if guard
+            else (
+                PermissionApprovalChoice.ONCE,
+                PermissionApprovalChoice.SESSION,
+                PermissionApprovalChoice.REJECT,
+            )
+        )
+        action = decision.action
+        return cls(
+            permission_id=permission_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+            tool=action.tool,
+            action=action.action,
+            effect=action.effect,
+            resource=action.resource,
+            scope=action.scope,
+            reason=decision.reason.value,
+            mode=decision.mode,
+            choices=choices,
+            guard=guard,
+        )
+
+    @property
+    def is_guard(self) -> bool:
+        return self.guard
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "permission_id": self.permission_id,
+            "run_id": self.run_id,
+            "turn_id": self.turn_id,
+            "tool_call_id": self.tool_call_id,
+            "tool": self.tool,
+            "action": self.action,
+            "effect": self.effect.value,
+            "resource": self.resource,
+            "scope": self.scope.value,
+            "reason": self.reason,
+            "mode": self.mode.value,
+            "choices": [choice.value for choice in self.choices],
+            "guard": self.guard,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PermissionApprovalRequest:
+        payload = _as_mapping(value, "permission_approval_request")
+        _expect_keys(
+            payload,
+            {
+                "permission_id",
+                "run_id",
+                "turn_id",
+                "tool_call_id",
+                "tool",
+                "action",
+                "effect",
+                "resource",
+                "scope",
+                "reason",
+                "mode",
+                "choices",
+                "guard",
+            },
+        )
+        return cls(
+            permission_id=_required(payload, "permission_id"),  # type: ignore[arg-type]
+            run_id=_required(payload, "run_id"),  # type: ignore[arg-type]
+            turn_id=_required(payload, "turn_id"),  # type: ignore[arg-type]
+            tool_call_id=_required(payload, "tool_call_id"),  # type: ignore[arg-type]
+            tool=_required(payload, "tool"),  # type: ignore[arg-type]
+            action=_required(payload, "action"),  # type: ignore[arg-type]
+            effect=_required(payload, "effect"),
+            resource=payload.get("resource"),  # type: ignore[arg-type]
+            scope=_required(payload, "scope"),  # type: ignore[arg-type]
+            reason=_required(payload, "reason"),  # type: ignore[arg-type]
+            mode=_required(payload, "mode"),  # type: ignore[arg-type]
+            choices=tuple(
+                _as_tuple(_required(payload, "choices"), "choices")
+            ),
+            guard=_required(payload, "guard"),  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> PermissionApprovalRequest:
+        return cls.from_dict(_json_object(value, "PermissionApprovalRequest"))
+
+
 @dataclass(frozen=True, slots=True)
 class PauseRequest(_JsonModel):
     pause_id: str
@@ -329,6 +523,7 @@ class PauseRequest(_JsonModel):
     created_at: str
     tool_call_id: str | None = None
     user_input_request: UserInputRequest | None = None
+    permission_request: PermissionApprovalRequest | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("pause_id", "run_id", "turn_id", "created_at"):
@@ -345,6 +540,7 @@ class PauseRequest(_JsonModel):
                 PauseReason.NETWORK_ERROR,
                 PauseReason.RATE_LIMITED,
             },
+            PauseKind.PERMISSION_REQUIRED: {PauseReason.PERMISSION_REQUIRED},
         }
         if reason not in valid_reason[kind]:
             raise ValueError(f"pause kind {kind.value} does not allow reason {reason.value}")
@@ -355,11 +551,34 @@ class PauseRequest(_JsonModel):
             self.user_input_request, UserInputRequest
         ):
             raise TypeError("user_input_request must be UserInputRequest or None")
+        if self.permission_request is not None and not isinstance(
+            self.permission_request, PermissionApprovalRequest
+        ):
+            raise TypeError(
+                "permission_request must be PermissionApprovalRequest or None"
+            )
         if kind is PauseKind.USER_INPUT_REQUIRED:
             if self.tool_call_id is None or self.user_input_request is None:
                 raise ValueError("user_input_required pause requires tool_call_id and questions")
-        elif self.tool_call_id is not None or self.user_input_request is not None:
-            raise ValueError("tool input fields are only valid for user_input_required")
+            if self.permission_request is not None:
+                raise ValueError("user input pause must not contain permission request")
+        elif kind is PauseKind.PERMISSION_REQUIRED:
+            if self.tool_call_id is None or self.permission_request is None:
+                raise ValueError("permission pause requires tool_call_id and approval request")
+            if self.user_input_request is not None:
+                raise ValueError("permission pause must not contain user input request")
+            if (
+                self.permission_request.run_id != self.run_id
+                or self.permission_request.turn_id != self.turn_id
+                or self.permission_request.tool_call_id != self.tool_call_id
+            ):
+                raise ValueError("permission request IDs must match the pause")
+        elif (
+            self.tool_call_id is not None
+            or self.user_input_request is not None
+            or self.permission_request is not None
+        ):
+            raise ValueError("tool input fields are only valid for interactive tool pauses")
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -374,6 +593,9 @@ class PauseRequest(_JsonModel):
         if self.kind is PauseKind.USER_INPUT_REQUIRED:
             payload["tool_call_id"] = self.tool_call_id
             payload["user_input_request"] = self.user_input_request.to_dict()  # type: ignore[union-attr]
+        elif self.kind is PauseKind.PERMISSION_REQUIRED:
+            payload["tool_call_id"] = self.tool_call_id
+            payload["permission_request"] = self.permission_request.to_dict()  # type: ignore[union-attr]
         return payload
 
     @classmethod
@@ -387,10 +609,19 @@ class PauseRequest(_JsonModel):
             user_input_request = UserInputRequest.from_dict(
                 _required(payload, "user_input_request")  # type: ignore[arg-type]
             )
+            permission_request = None
+        elif kind is PauseKind.PERMISSION_REQUIRED:
+            _expect_keys(payload, base | {"tool_call_id", "permission_request"})
+            tool_call_id = _required(payload, "tool_call_id")  # type: ignore[assignment]
+            permission_request = PermissionApprovalRequest.from_dict(
+                _required(payload, "permission_request")  # type: ignore[arg-type]
+            )
+            user_input_request = None
         else:
             _expect_keys(payload, base)
             tool_call_id = None
             user_input_request = None
+            permission_request = None
         return cls(
             pause_id=_required(payload, "pause_id"),  # type: ignore[arg-type]
             run_id=_required(payload, "run_id"),  # type: ignore[arg-type]
@@ -401,6 +632,7 @@ class PauseRequest(_JsonModel):
             created_at=_required(payload, "created_at"),  # type: ignore[arg-type]
             tool_call_id=tool_call_id,  # type: ignore[arg-type]
             user_input_request=user_input_request,
+            permission_request=permission_request,
         )
 
     @classmethod
@@ -419,6 +651,11 @@ class PauseRequest(_JsonModel):
                 raise ValueError("response does not match the pending tool call")
             assert self.user_input_request is not None
             self.user_input_request.validate_answers(response.answers)
+        elif isinstance(response, PermissionApprovalResponse):
+            if response.permission_id != self.permission_request.permission_id:  # type: ignore[union-attr]
+                raise ValueError("response does not match the pending permission request")
+            if response.choice not in self.permission_request.choices:  # type: ignore[union-attr]
+                raise ValueError("response choice is not available for the pending permission")
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +753,54 @@ class UserInputResponse(_PauseResponse):
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionApprovalResponse(_PauseResponse):
+    """A typed response to one Permission Approval pause."""
+
+    response_type: ClassVar[str] = "permission_approval"
+    pause_kind: ClassVar[PauseKind] = PauseKind.PERMISSION_REQUIRED
+
+    permission_id: str
+    choice: PermissionApprovalChoice
+
+    def __post_init__(self) -> None:
+        _PauseResponse.__post_init__(self)
+        _require_text(self.permission_id, "permission_id")
+        object.__setattr__(
+            self,
+            "choice",
+            _coerce_enum(PermissionApprovalChoice, self.choice, "permission choice"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            **_PauseResponse.to_dict(self),
+            "permission_id": self.permission_id,
+            "choice": self.choice.value,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PermissionApprovalResponse:
+        payload = _as_mapping(value, "permission approval response")
+        _expect_keys(
+            payload,
+            {"type", "pause_id", "run_id", "turn_id", "permission_id", "choice"},
+        )
+        if payload["type"] != cls.response_type:
+            raise ValueError("response type is not permission_approval")
+        return cls(
+            _required(payload, "pause_id"),  # type: ignore[arg-type]
+            _required(payload, "run_id"),  # type: ignore[arg-type]
+            _required(payload, "turn_id"),  # type: ignore[arg-type]
+            _required(payload, "permission_id"),  # type: ignore[arg-type]
+            _required(payload, "choice"),  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> PermissionApprovalResponse:
+        return cls.from_dict(_json_object(value, "PermissionApprovalResponse"))
+
+
+@dataclass(frozen=True, slots=True)
 class RetryProviderResponse(_PauseResponse):
     response_type: ClassVar[str] = "retry_provider"
     pause_kind: ClassVar[PauseKind] = PauseKind.PROVIDER_UNAVAILABLE
@@ -537,7 +822,12 @@ class RetryProviderResponse(_PauseResponse):
         return cls.from_dict(_json_object(value, "RetryProviderResponse"))
 
 
-PauseResponse: TypeAlias = ResumeTurnResponse | UserInputResponse | RetryProviderResponse
+PauseResponse: TypeAlias = (
+    ResumeTurnResponse
+    | UserInputResponse
+    | RetryProviderResponse
+    | PermissionApprovalResponse
+)
 
 
 def pause_response_from_dict(value: Mapping[str, object]) -> PauseResponse:
@@ -549,6 +839,8 @@ def pause_response_from_dict(value: Mapping[str, object]) -> PauseResponse:
         return UserInputResponse.from_dict(payload)
     if response_type == RetryProviderResponse.response_type:
         return RetryProviderResponse.from_dict(payload)
+    if response_type == PermissionApprovalResponse.response_type:
+        return PermissionApprovalResponse.from_dict(payload)
     raise ValueError(f"unknown pause response type: {response_type!r}")
 
 
@@ -644,6 +936,9 @@ __all__ = [
     "PauseReason",
     "PauseRequest",
     "PauseResponse",
+    "PermissionApprovalChoice",
+    "PermissionApprovalRequest",
+    "PermissionApprovalResponse",
     "QuestionKind",
     "QuestionOption",
     "RetryProviderResponse",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from uthcode.application import ModelProfile
+from uthcode.application import ModelProfile, PermissionMode
 
 
 @dataclass(slots=True)
@@ -45,4 +45,41 @@ class ModelPickerState:
         self.open = False
 
 
-__all__ = ["ModelPickerState"]
+@dataclass(slots=True)
+class PermissionPickerState:
+    """Temporary picker state; the authoritative mode remains on AgentRun."""
+
+    modes: tuple[PermissionMode, ...] = tuple(PermissionMode)
+    current_mode: PermissionMode = PermissionMode.DEFAULT
+    selected_index: int = 0
+    open: bool = False
+
+    @property
+    def selected(self) -> PermissionMode:
+        return self.modes[self.selected_index]
+
+    @property
+    def warning(self) -> str | None:
+        if self.selected is PermissionMode.FULL_ACCESS:
+            return (
+                "高风险提示：full_access 仅跳过普通 Policy/Strategy，"
+                "Guard 仍然生效。"
+            )
+        return None
+
+    def replace(self, current_mode: PermissionMode) -> None:
+        if not isinstance(current_mode, PermissionMode):
+            current_mode = PermissionMode(current_mode)
+        self.current_mode = current_mode
+        self.selected_index = self.modes.index(current_mode)
+        self.open = True
+
+    def move(self, delta: int) -> None:
+        if self.modes:
+            self.selected_index = (self.selected_index + delta) % len(self.modes)
+
+    def close(self) -> None:
+        self.open = False
+
+
+__all__ = ["ModelPickerState", "PermissionPickerState"]

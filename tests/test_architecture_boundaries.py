@@ -106,6 +106,7 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                 {
                     "uthcode.integrations.config.data",
                     "uthcode.integrations.config.loader",
+                    "uthcode.integrations.permissions",
                     "uthcode.integrations.providers.factory",
                     "uthcode.integrations.tools.factory",
                 }
@@ -353,7 +354,8 @@ def test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path() -> None
     application_tools = (SRC / "application" / "tools.py").read_text(encoding="utf-8")
     generation = (SRC / "application" / "generation.py").read_text(encoding="utf-8")
     assert "AskUserQuestion is reserved for the Application Agent path" in application_tools
-    assert "AskUserQuestion is not available through manual Tool execution" in application_tools
+    assert "manual Tool execution is disabled" in generation
+    assert "async def execute_calls" not in application_tools
     assert "ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)" in generation
 
 

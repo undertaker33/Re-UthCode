@@ -27,9 +27,16 @@ from uthcode.core.provider import (
     ToolCallCompleted,
     Usage,
 )
-from uthcode.core.tool import ToolExecutionResult
+from uthcode.core.permission import Decision, PermissionEvaluator, PermissionMode
+from uthcode.core.tool import (
+    PreparedToolCall,
+    ToolExecutionResult,
+    ToolExecutor,
+    ToolRegistry,
+)
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.integrations.providers.fake import FakeProvider
+from uthcode.integrations.tools.factory import create_default_tools
 
 
 def _configuration() -> EffectiveConfig:
@@ -70,6 +77,34 @@ def _request(
         or (Message("user", (TextPart("read the note"),)),),
         tools=tools,
     )
+
+
+async def _execute_prepared_calls(
+    executor: ToolExecutor,
+    calls: tuple[ToolCallPart, ...],
+    *,
+    cancellation: CancellationToken,
+) -> tuple[ToolResultPart, ...]:
+    evaluator = PermissionEvaluator()
+    results: list[ToolResultPart] = []
+    for call in calls:
+        prepared = executor.prepare_call(call, cancellation=cancellation)
+        if isinstance(prepared, ToolResultPart):
+            results.append(prepared)
+            continue
+        assert isinstance(prepared, PreparedToolCall)
+        decision = evaluator.evaluate(
+            prepared.action,
+            mode=PermissionMode.FULL_ACCESS,
+        )
+        assert decision.decision is Decision.ALLOW
+        results.append(
+            await executor.execute_prepared(
+                prepared,
+                cancellation=cancellation,
+            )
+        )
+    return tuple(results)
 
 
 class _TwoTurnFakeProvider(FakeProvider):
@@ -131,33 +166,41 @@ async def test_default_file_tools_share_state_but_applications_are_isolated(tmp_
     context = _context(tmp_path)
     first = create_application(_configuration(), runtime_context=context)
     second = create_application(_configuration(), runtime_context=_context(tmp_path))
+    first_tools = ToolExecutor(ToolRegistry(create_default_tools(tmp_path)))
+    second_tools = ToolExecutor(ToolRegistry(create_default_tools(tmp_path)))
 
-    read = await first.execute_tool_calls(
-        (ToolCallPart("read-1", "ReadFile", {"path": "note.txt"}),)
+    read = await _execute_prepared_calls(
+        first_tools,
+        (ToolCallPart("read-1", "ReadFile", {"path": "note.txt"}),),
+        cancellation=CancellationToken(),
     )
     assert read == (ToolResultPart("read-1", "1\tbefore"),)
 
-    isolated_write = await second.execute_tool_calls(
+    isolated_write = await _execute_prepared_calls(
+        second_tools,
         (
             ToolCallPart(
                 "write-1",
                 "WriteFile",
                 {"path": "note.txt", "content": "wrong\n"},
             ),
-        )
+        ),
+        cancellation=CancellationToken(),
     )
     assert isolated_write[0].is_error is True
     assert "has not been read" in isolated_write[0].content
     assert note.read_text(encoding="utf-8") == "before\n"
 
-    shared_edit = await first.execute_tool_calls(
+    shared_edit = await _execute_prepared_calls(
+        first_tools,
         (
             ToolCallPart(
                 "edit-1",
                 "EditFile",
                 {"path": "note.txt", "old_string": "before", "new_string": "after"},
             ),
-        )
+        ),
+        cancellation=CancellationToken(),
     )
     assert shared_edit[0].is_error is False
     assert note.read_text(encoding="utf-8") == "after\n"
@@ -191,8 +234,11 @@ async def test_explicit_tools_replace_defaults_and_use_application_core_results(
     application = create_application(_configuration(), tools=(fake_tool,))
 
     assert [definition.name for definition in application.tool_definitions()] == ["Echo"]
-    results = await application.execute_tool_calls(
-        (ToolCallPart("echo-1", "Echo", {"value": "hello"}),)
+    service = ToolExecutor(ToolRegistry((fake_tool,)))
+    results = await _execute_prepared_calls(
+        service,
+        (ToolCallPart("echo-1", "Echo", {"value": "hello"}),),
+        cancellation=CancellationToken(),
     )
 
     assert results == (ToolResultPart("echo-1", "hello"),)
@@ -233,26 +279,9 @@ async def test_headless_fake_provider_manual_tool_round_trip_uses_same_context(t
         observed_call.name,
         observed_call.arguments,
     )
-    results = await application.execute_tool_calls((call,))
+    with pytest.raises(ValueError, match="manual Tool execution is disabled"):
+        await application.execute_tool_calls((call,))
     assert len(provider.recorded_requests) == 1
-    assert results[0].tool_call_id == "provider-call-1"
-    assert results[0].content == "1\tfrom the fake workdir"
-
-    assistant_message = Message("assistant", (call,))
-    tool_message = Message("tool", (results[0],))
-    second_request = _request(
-        (Message("user", (TextPart("read the note"),)), assistant_message, tool_message),
-        tools=definitions,
-    )
-    second_events = [
-        event async for event in application.stream_generation(second_request)
-    ]
-
-    assert isinstance(second_events[-1], GenerationCompleted)
-    assert len(provider.recorded_requests) == 2
-    assert provider.recorded_requests[1].tools == definitions
-    assert provider.recorded_requests[1].messages[-1] == tool_message
-    assert provider.recorded_requests[0].system_prompt == provider.recorded_requests[1].system_prompt
     assert application.runtime_context.workdir == tmp_path.resolve()
 
 

@@ -281,7 +281,9 @@ def test_exec_projects_incomplete_message_to_stderr_and_fails() -> None:
     assert "max_output_tokens" in stderr
 
 
-def test_exec_projects_tool_activity_without_tool_result_or_arguments() -> None:
+def test_exec_cancels_permission_pause_without_auto_approval_or_secret_leak(
+    tmp_path: Path,
+) -> None:
     secret = "CLI-TOOL-RESULT-SECRET"
     call = ToolCallPart("call-1", "Reveal", {"value": secret})
     provider = _ScriptedProvider(
@@ -293,23 +295,27 @@ def test_exec_projects_tool_activity_without_tool_result_or_arguments() -> None:
     application = create_application(
         _config(),
         provider_builder=lambda _provider, _model: provider,
-        runtime_context=ApplicationRuntimeContext.from_system(workdir=Path.cwd()),
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path / "cli-workdir"
+        ),
         tools=(_SecretTool(),),
     )
 
     result, stdout, stderr = _injected_main(["exec", "hello"], application)
 
-    assert result == 0
-    assert stdout == "final answer\n"
+    assert result == 1
+    assert stdout == ""
     assert "working" in stderr
     assert "tool running: Reveal (Reveal)" in stderr
-    assert "tool finished: Reveal (Reveal)" in stderr
+    assert "tool cancelled: Reveal (Reveal)" in stderr
+    assert "permission approval required" in stderr
     assert secret not in stdout + stderr
     assert "ToolResult" not in stdout + stderr
-    assert provider.requests[1].messages[-1].parts[0].content == secret
+    assert len(provider.requests) == 1
 
 
 def test_exec_cancels_turn_when_agent_pauses(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cancel_calls = 0
@@ -341,7 +347,9 @@ def test_exec_cancels_turn_when_agent_pauses(
     application = create_application(
         _config(),
         provider_builder=lambda _provider, _model: provider,
-        runtime_context=ApplicationRuntimeContext.from_system(workdir=Path.cwd()),
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path / "cli-workdir"
+        ),
     )
 
     result, stdout, stderr = _injected_main(["exec", "hello"], application)

@@ -75,6 +75,7 @@ from uthcode.core.provider import (
     ToolResultPart,
     Usage,
 )
+from uthcode.core.permission import PermissionEvaluator, PermissionMode
 from uthcode.core.tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
 
 
@@ -215,6 +216,8 @@ def _loop(
     def describe(call: ToolCallPart) -> str:
         return descriptions.get(call.name, call.name)
 
+    evaluator = PermissionEvaluator()
+
     return AgentLoop(
         provider,
         registry,
@@ -222,6 +225,10 @@ def _loop(
         prepare,
         config=config,
         tool_call_describer=describe,
+        permission_resolver=lambda action: evaluator.evaluate(
+            action,
+            mode=PermissionMode.FULL_ACCESS,
+        ),
     )
 
 

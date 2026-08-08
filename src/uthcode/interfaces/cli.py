@@ -191,6 +191,8 @@ def _pause_diagnostic(event: AgentEvent) -> str:
         return "generation requires interactive input"
     if kind == PauseKind.PROVIDER_UNAVAILABLE.value:
         return "provider temporarily unavailable"
+    if kind == PauseKind.PERMISSION_REQUIRED.value:
+        return "permission approval required; non-interactive execution was cancelled"
     return "generation paused and cannot continue non-interactively"
 
 

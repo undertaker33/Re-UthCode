@@ -18,7 +18,13 @@ from typing import Any
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
 from uthcode.core.tool import ToolExecutionResult, ToolPreparation
-from uthcode.integrations.permissions import BASH_GUARD_FACT_MARKER
+from uthcode.core.command_security import safe_bash_command_summary
+from uthcode.integrations.permissions import (
+    BASH_ACTION_FACT_MARKER,
+    BASH_GUARD_FACT_MARKER,
+    BASH_SENSITIVE_TARGET_MARKER,
+    is_sensitive_resource,
+)
 
 
 _CANCELLED = "Error: command cancelled"
@@ -349,6 +355,11 @@ _READ_COMMANDS = frozenset(
         "echo",
         "file",
         "find",
+        "findstr",
+        "format-list",
+        "get-acl",
+        "get-childitem",
+        "get-itemproperty",
         "head",
         "less",
         "ls",
@@ -356,6 +367,7 @@ _READ_COMMANDS = frozenset(
         "pwd",
         "rg",
         "sed",
+        "select-string",
         "stat",
         "tail",
         "type",
@@ -364,6 +376,14 @@ _READ_COMMANDS = frozenset(
         "where",
         "which",
         "whoami",
+        "grep",
+        "egrep",
+        "fgrep",
+        "get-content",
+        "get-filehash",
+        "get-item",
+        "resolve-path",
+        "test-path",
     }
 )
 _WRITE_COMMANDS = frozenset(
@@ -380,7 +400,12 @@ _WRITE_COMMANDS = frozenset(
         "pip install",
         "ren",
         "rename",
+        "add-content",
+        "copy-item",
+        "move-item",
+        "out-file",
         "sed -i",
+        "set-content",
         "tee",
         "touch",
     }
@@ -511,18 +536,68 @@ _EFFECT_RANK = {
     Effect.DESTRUCTIVE: 4,
     Effect.EXTERNAL: 5,
 }
-_COMMAND_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:[A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|authorization)"
-    r"[A-Za-z0-9_-]*)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+_BASH_CONTENT_READ_COMMANDS = frozenset(
+    {
+        "cat",
+        "get-content",
+        "head",
+        "less",
+        "more",
+        "sed",
+        "tail",
+        "type",
+        "wc",
+        "get-filehash",
+    }
 )
-_COMMAND_SECRET_OPTION = re.compile(
-    r"(?i)(\b(?:--?|/)?[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|authorization)"
-    r"[A-Za-z0-9_-]*\s+)(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+_BASH_CONTENT_SEARCH_COMMANDS = frozenset(
+    {
+        "egrep",
+        "fgrep",
+        "findstr",
+        "grep",
+        "rg",
+        "select-string",
+    }
 )
-_BEARER_SECRET = re.compile(r"(?i)\bBearer\s+[^\s;&|]+")
-_BARE_API_KEY = re.compile(r"(?i)\bsk-[A-Za-z0-9][A-Za-z0-9_.:/-]*")
-
-
+_BASH_METADATA_COMMANDS = frozenset(
+    {
+        "dir",
+        "file",
+        "find",
+        "format-list",
+        "get-acl",
+        "get-childitem",
+        "get-item",
+        "get-itemproperty",
+        "ls",
+        "resolve-path",
+        "stat",
+        "test-path",
+    }
+)
+_BASH_DATA_COMMANDS = frozenset(
+    {
+        "echo",
+        "format-list",
+        "format-table",
+        "foreach-object",
+        "out-string",
+        "printf",
+        "print",
+        "write-host",
+        "write-output",
+    }
+)
+_BASH_OPAQUE_NESTED_EXECUTION = re.compile(
+    r"(?ix)(?:"
+    r"(?<![A-Za-z0-9_-])-exec(?:dir)?(?![A-Za-z0-9_-])"
+    r"|(?<![A-Za-z0-9_-])xargs(?![A-Za-z0-9_-])"
+    r"|(?<![A-Za-z0-9_-])(?:sh|bash|zsh|pwsh|powershell)(?:\.exe)?"
+    r"\s+-(?:c|command)\b"
+    r"|(?<![A-Za-z0-9_-])cmd(?:\.exe)?\s+/c\b"
+    r")"
+)
 def _scan_bash_command(
     command: str,
 ) -> tuple[tuple[tuple[str, str | None], ...], bool]:
@@ -667,6 +742,97 @@ def _segment_program(segment: str) -> tuple[str, list[str]]:
         return "", []
     program = tokens[0].strip('"\'').replace("\\", "/").rsplit("/", 1)[-1].lower()
     return program, tokens[1:]
+
+
+def _redirection_targets(segment: str) -> tuple[tuple[str, str], ...]:
+    """Return shell input/output redirection targets from one segment."""
+
+    tokens = _segment_tokens(segment)
+    targets: list[tuple[str, str]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"<", ">", ">>"}:
+            if index + 1 < len(tokens):
+                direction = "input" if token == "<" else "output"
+                targets.append((direction, tokens[index + 1]))
+                index += 2
+                continue
+        match = re.match(r"^(?P<operator>\d*(?:>>?|<|&>|>&))(?P<target>.+)$", token)
+        if match is not None:
+            operator = match.group("operator")
+            if operator.startswith("<"):
+                index += 1
+                continue
+            targets.append(("output", match.group("target")))
+        index += 1
+    return tuple(targets)
+
+
+def _sensitive_arguments(arguments: list[str]) -> bool:
+    return any(
+        is_sensitive_resource(argument)
+        or is_sensitive_resource(argument.strip("\"'{}\\;|&"))
+        for argument in arguments
+    )
+
+
+def _segment_sensitive_target(
+    segment: str,
+    program: str,
+    arguments: list[str],
+    effect: Effect,
+) -> bool:
+    """Associate sensitive paths only with the segment that can open them."""
+
+    redirections = _redirection_targets(segment)
+    if any(
+        direction == "input" and is_sensitive_resource(target)
+        for direction, target in redirections
+    ):
+        return True
+    if any(
+        direction == "output" and is_sensitive_resource(target)
+        for direction, target in redirections
+    ):
+        return True
+
+    if program in _BASH_CONTENT_READ_COMMANDS:
+        return _sensitive_arguments(arguments)
+    if program in _BASH_CONTENT_SEARCH_COMMANDS:
+        return _sensitive_arguments(arguments)
+    if program in _BASH_METADATA_COMMANDS or program in _BASH_DATA_COMMANDS:
+        return False
+    if effect in {Effect.WRITE, Effect.DESTRUCTIVE, Effect.UNKNOWN}:
+        return _sensitive_arguments(arguments)
+    return False
+
+
+def _nested_sensitive_content_target(command: str) -> bool:
+    """Find sensitive operands attached to nested content readers."""
+
+    names = sorted(
+        _BASH_CONTENT_READ_COMMANDS | _BASH_CONTENT_SEARCH_COMMANDS,
+        key=len,
+        reverse=True,
+    )
+    pattern = re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])(?:"
+        + "|".join(re.escape(name) for name in names)
+        + r")(?![A-Za-z0-9_-])"
+    )
+    for match in pattern.finditer(command):
+        tail = re.split(r"[|;&\n\r]", command[match.end() :], maxsplit=1)[0]
+        if _sensitive_arguments(_segment_tokens(tail)):
+            return True
+        prefix = command[: match.start()]
+        if (
+            re.search(r"(?i)(?:-exec(?:dir)?|xargs|foreach-object)", prefix)
+            and re.search(r"(?:\$_|\{\})", tail)
+            and is_sensitive_resource(prefix)
+        ):
+            return True
+    return False
 
 
 def _effective_program(program: str, arguments: list[str]) -> str:
@@ -1093,21 +1259,95 @@ def _has_option_value(argument: str, options: tuple[str, ...]) -> bool:
     return any(argument == option or argument.startswith(option + "=") for option in options)
 
 
-def _safe_command_summary(command: str) -> str:
-    summary = " ".join(command.strip().split())
-    summary = re.sub(
-        re.escape(BASH_GUARD_FACT_MARKER),
-        "<redacted>",
-        summary,
-        flags=re.IGNORECASE,
+def _nested_content_read(command: str) -> bool:
+    nested_execution = _scan_bash_command(command)[1] or (
+        _BASH_OPAQUE_NESTED_EXECUTION.search(command) is not None
     )
-    summary = _COMMAND_SECRET_ASSIGNMENT.sub(r"\1<redacted>", summary)
-    summary = _COMMAND_SECRET_OPTION.sub(r"\1<redacted>", summary)
-    summary = _BEARER_SECRET.sub("Bearer <redacted>", summary)
-    summary = _BARE_API_KEY.sub("<redacted>", summary)
-    if len(summary) > 240:
-        return summary[:239] + "…"
-    return summary
+    if not nested_execution:
+        return False
+    names = sorted(_BASH_CONTENT_READ_COMMANDS | _BASH_CONTENT_SEARCH_COMMANDS, key=len, reverse=True)
+    pattern = r"(?i)(?<![A-Za-z0-9_-])(?:" + "|".join(re.escape(name) for name in names) + r")(?![A-Za-z0-9_-])"
+    return re.search(pattern, command) is not None
+
+
+def _bash_operation_kind(command: str) -> str:
+    """Classify trusted Bash facts for sensitive-resource Guard matching."""
+
+    segments, nested_execution = _scan_bash_command(command)
+    nested_execution = nested_execution or (
+        _BASH_OPAQUE_NESTED_EXECUTION.search(command) is not None
+    )
+    content_read = False
+    content_search = False
+    writes = False
+    unknown = False
+    metadata = False
+    for segment, _connector in segments:
+        program, _arguments = _segment_program(segment)
+        if program in _BASH_CONTENT_SEARCH_COMMANDS:
+            content_search = True
+        elif program in _BASH_CONTENT_READ_COMMANDS:
+            content_read = True
+        elif program in _BASH_METADATA_COMMANDS:
+            metadata = True
+
+        effect = _classify_bash_segment(segment)
+        if effect in {Effect.WRITE, Effect.DESTRUCTIVE}:
+            writes = True
+        elif effect is Effect.UNKNOWN:
+            unknown = True
+
+    if nested_execution:
+        if _nested_content_read(command):
+            content_read = True
+        else:
+            unknown = True
+
+    if content_read or content_search:
+        if writes:
+            return "mixed"
+        if content_search and not content_read:
+            return "content-search"
+        return "content-read"
+    if writes:
+        return "write"
+    if unknown:
+        return "unknown"
+    if metadata:
+        return "metadata"
+    return "other"
+
+
+def _bash_sensitive_operation_target(command: str) -> bool:
+    """Return a sensitive-target fact associated with an executable segment."""
+
+    segments, nested_execution = _scan_bash_command(command)
+    for segment, _connector in segments:
+        program, arguments = _segment_program(segment)
+        if _segment_sensitive_target(
+            segment,
+            program,
+            arguments,
+            _classify_bash_segment(segment),
+        ):
+            return True
+
+    if nested_execution or _BASH_OPAQUE_NESTED_EXECUTION.search(command) is not None:
+        return _nested_sensitive_content_target(command)
+    return False
+
+
+def _bash_action_summary(command: str) -> str:
+    operation_kind = _bash_operation_kind(command)
+    target_fact = (
+        f" [{BASH_SENSITIVE_TARGET_MARKER}]"
+        if _bash_sensitive_operation_target(command)
+        else ""
+    )
+    return (
+        f"Bash [{BASH_ACTION_FACT_MARKER}:{operation_kind}]"
+        f"{target_fact} {safe_bash_command_summary(command)}"
+    )
 
 
 class BashTool:
@@ -1147,7 +1387,7 @@ class BashTool:
         command = _text(arguments, "command")
         effect = classify_bash_command(command)
         scope = ResourceScope.INSIDE if effect is Effect.READ else ResourceScope.UNKNOWN
-        summary = _safe_command_summary(command)
+        summary = _bash_action_summary(command)
         facts = _bash_guard_facts(command)
         if facts:
             summary = f"{summary} [{BASH_GUARD_FACT_MARKER}:{','.join(facts)}]"
@@ -1390,4 +1630,4 @@ def _error(message: str) -> ToolExecutionResult:
     return ToolExecutionResult(message, is_error=True)
 
 
-__all__ = ["BashTool", "classify_bash_command"]
+__all__ = ["BashTool", "classify_bash_command", "safe_bash_command_summary"]
