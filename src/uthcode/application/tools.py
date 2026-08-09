@@ -15,7 +15,9 @@ from uthcode.core.provider import (
 )
 from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
+from uthcode.core.hooks import create_default_runtime_hooks
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
+from uthcode.core.planning import TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
 
@@ -141,7 +143,13 @@ def _replace_bounded_value(value: str, secret: str) -> str:
 class ApplicationToolService:
     """Hide Registry and Executor details behind the Application boundary."""
 
-    __slots__ = ("_executor", "_redactor", "_registry", "_workdir")
+    __slots__ = (
+        "_executor",
+        "_redactor",
+        "_registry",
+        "_runtime_hooks",
+        "_workdir",
+    )
 
     def __init__(
         self,
@@ -151,10 +159,18 @@ class ApplicationToolService:
         secret_env_names: Sequence[str] = (),
     ) -> None:
         tool_values = tuple(tools)
-        if any(tool.definition.name == ASK_USER_TOOL_DEFINITION.name for tool in tool_values):
-            raise ValueError("AskUserQuestion is reserved for the Application Agent path")
+        reserved_names = {
+            ASK_USER_TOOL_DEFINITION.name,
+            TODO_WRITE_TOOL_DEFINITION.name,
+        }
+        if any(tool.definition.name in reserved_names for tool in tool_values):
+            raise ValueError(
+                "AskUserQuestion is reserved for the Application Agent path; "
+                "TodoWrite is reserved for the Core Agent path"
+            )
         self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)
+        self._runtime_hooks = create_default_runtime_hooks()
         self._redactor = _SecretRedactor(secret_env_names)
         self._workdir = (
             Path(workdir).expanduser().resolve(strict=False)
@@ -245,6 +261,7 @@ class ApplicationToolService:
             self._registry,
             self._executor,
             request_preparer,
+            runtime_hooks=self._runtime_hooks,
             tool_call_describer=self.describe_tool_call,
             permission_resolver=permission_resolver,
             session_grant_sink=session_grant_sink,

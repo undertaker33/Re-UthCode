@@ -14,6 +14,7 @@ from uthcode.core.agent import (
     SessionGrantSink,
 )
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
+from uthcode.core.planning import BehaviorMode, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.provider import (
     CancellationToken,
     GenerationRequest,
@@ -25,7 +26,11 @@ from uthcode.core.provider import (
     ToolResultPart,
     validated_provider_stream,
 )
-from uthcode.core.prompt import SystemPromptContext, build_system_prompt
+from uthcode.core.prompt import (
+    RuntimePromptContext,
+    SystemPromptContext,
+    build_system_prompt,
+)
 from uthcode.core.permission import PermissionEvaluator, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
@@ -284,6 +289,7 @@ class UthCodeApplication:
         *,
         turn_id: str,
         cancellation: CancellationToken,
+        behavior_mode: BehaviorMode,
         permission_resolver: PermissionResolver,
         session_grant_sink: SessionGrantSink,
     ) -> AgentTurnExecution:
@@ -299,16 +305,19 @@ class UthCodeApplication:
         model_ref = self._current_model_ref
         ordinary_tool_definitions = self._tool_service.definitions()
         tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
+        tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
 
         def prepare(
             messages: tuple[Message, ...],
-            _definitions: tuple[ToolDefinition, ...],
+            visible_definitions: tuple[ToolDefinition, ...],
+            runtime_context: RuntimePromptContext,
         ) -> GenerationRequest:
-            request = GenerationRequest(messages=messages, tools=tool_definitions)
+            request = GenerationRequest(messages=messages, tools=visible_definitions)
             return self._prepare_request(
                 request,
                 provider,
                 model_ref=model_ref,
+                runtime_context=runtime_context,
             )
 
         loop = self._tool_service._create_agent_loop(
@@ -322,6 +331,7 @@ class UthCodeApplication:
             user_input,
             turn_id=turn_id,
             cancellation=cancellation,
+            behavior_mode=behavior_mode,
             tool_definitions=tool_definitions,
         )
         if execution.state.messages[-1].role != "user":  # pragma: no cover
@@ -334,6 +344,7 @@ class UthCodeApplication:
         provider: ProviderPort,
         *,
         model_ref: str | None = None,
+        runtime_context: RuntimePromptContext | None = None,
     ) -> GenerationRequest:
         if not isinstance(request, GenerationRequest):
             raise TypeError("request must be GenerationRequest")
@@ -357,7 +368,14 @@ class UthCodeApplication:
             provider_protocol=identity.protocol,
             remote_model_id=identity.model,
         )
-        system_prompt = build_system_prompt(prompt_context)
+        system_prompt = (
+            build_system_prompt(prompt_context)
+            if runtime_context is None
+            else build_system_prompt(
+                prompt_context,
+                runtime_context=runtime_context,
+            )
+        )
         return replace(request, system_prompt=system_prompt)
 
     async def stream_generation(

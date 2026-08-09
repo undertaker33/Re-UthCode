@@ -16,7 +16,10 @@ from .agent_events import (
     AssistantMessageCompleted,
     AssistantMessageDelta,
     AssistantMessageKind,
+    BehaviorModeChanged,
+    CompletionBlocked,
     IterationStarted,
+    PlanProposed,
     ReasoningDelta as AgentReasoningDelta,
     ReasoningFinished,
     ReasoningStarted,
@@ -24,6 +27,7 @@ from .agent_events import (
     ToolBatchStarted,
     ToolFinished,
     ToolStarted,
+    TaskStateChanged,
     TerminationReason,
     TurnPausing,
     UserInputRequested,
@@ -33,6 +37,17 @@ from .agent_events import (
     TurnFailed,
     TurnStarted,
     UsageUpdated,
+    UserSteeringApplied,
+    UserSteeringRequested,
+)
+from .hooks import (
+    BeforeCompletionBlock,
+    BeforeCompletionContinue,
+    BeforeCompletionContext,
+    BeforeCompletionRequestPause,
+    BeforeToolExecutionContext,
+    BeforeToolExecutionReject,
+    RuntimeHookSet,
 )
 from .provider import (
     CancellationToken,
@@ -62,21 +77,41 @@ from .interaction import (
     PauseReason,
     PauseRequest,
     PauseResponse,
+    PlanReviewChoice,
+    PlanReviewRequest,
+    PlanReviewResponse,
     PermissionApprovalChoice,
     PermissionApprovalRequest,
     PermissionApprovalResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
+    SteeringRequest,
     UserInputRequest,
     UserInputResponse,
 )
 from .permission import Decision, PermissionAction, PermissionDecision
-from .tool import PreparedToolCall, ToolExecutor, ToolRegistry
+from .planning import (
+    BehaviorMode,
+    PlanState,
+    RuntimeFeedback,
+    RuntimeFeedbackKind,
+    TODO_WRITE_TOOL_DEFINITION,
+    TaskState,
+    parse_todo_write_arguments,
+)
+from .prompt import RuntimePromptContext
+from .tool import PreparedToolCall, ToolExecutor, ToolPlanningAccess, ToolRegistry
 
 
 AgentEventSink = Callable[[AgentEvent], None]
 PermissionResolver = Callable[[PermissionAction], PermissionDecision]
 SessionGrantSink = Callable[[PermissionAction], None]
+
+
+_STEERING_FEEDBACK_TEXT = (
+    "用户已更新当前任务要求；在继续执行前重新审查当前目标、已批准 Plan 与 "
+    "TaskState，按需更新执行计划。"
+)
 
 
 class _SegmentEventBuffer(list[AgentEvent]):
@@ -164,6 +199,10 @@ class RunState:
     tool_call_count: int = 0
     consecutive_unknown_tools: int = 0
     usage: Usage = Usage()
+    behavior_mode: BehaviorMode = BehaviorMode.DEFAULT
+    task_state: TaskState = TaskState()
+    plan_state: PlanState | None = None
+    runtime_feedback: RuntimeFeedback | None = None
     status: RunStatus = RunStatus.RUNNING
     termination_reason: TerminationReason | None = None
 
@@ -184,6 +223,22 @@ class RunState:
             _require_non_negative_int(getattr(self, field_name), field_name)
         if not isinstance(self.usage, Usage):
             raise TypeError("usage must be Usage")
+        mode = self.behavior_mode
+        if not isinstance(mode, BehaviorMode):
+            try:
+                mode = BehaviorMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown behavior mode: {self.behavior_mode!r}") from exc
+            object.__setattr__(self, "behavior_mode", mode)
+        if not isinstance(self.task_state, TaskState):
+            raise TypeError("task_state must be TaskState")
+        if self.plan_state is not None and not isinstance(self.plan_state, PlanState):
+            raise TypeError("plan_state must be PlanState or None")
+        if self.runtime_feedback is not None and not isinstance(
+            self.runtime_feedback,
+            RuntimeFeedback,
+        ):
+            raise TypeError("runtime_feedback must be RuntimeFeedback or None")
         status = self.status
         if not isinstance(status, RunStatus):
             try:
@@ -208,20 +263,37 @@ class RunState:
             raise ValueError("cancelled state must use user_cancelled")
 
     @classmethod
-    def initial(cls, run_id: str, *, turn_id: str = "initial") -> RunState:
-        return cls(run_id=run_id, turn_id=turn_id)
+    def initial(
+        cls,
+        run_id: str,
+        *,
+        turn_id: str = "initial",
+        behavior_mode: BehaviorMode = BehaviorMode.DEFAULT,
+    ) -> RunState:
+        return cls(run_id=run_id, turn_id=turn_id, behavior_mode=behavior_mode)
 
-    def new_turn(self, turn_id: str, user_input: str) -> RunState:
+    def new_turn(
+        self,
+        turn_id: str,
+        user_input: str,
+        *,
+        behavior_mode: BehaviorMode | None = None,
+    ) -> RunState:
         """Create the next immutable Turn while retaining the conversation."""
 
         _require_text(turn_id, "turn_id")
         if not isinstance(user_input, str) or not user_input.strip():
             raise ValueError("user_input must be a non-empty string")
         user_message = Message(role="user", parts=(TextPart(user_input),))
+        next_mode = self.behavior_mode if behavior_mode is None else behavior_mode
         return RunState(
             run_id=self.run_id,
             turn_id=turn_id,
             messages=self.messages + (user_message,),
+            behavior_mode=next_mode,
+            task_state=TaskState(),
+            plan_state=None,
+            runtime_feedback=None,
             status=RunStatus.RUNNING,
         )
 
@@ -234,6 +306,14 @@ class RunState:
             "tool_call_count": self.tool_call_count,
             "consecutive_unknown_tools": self.consecutive_unknown_tools,
             "usage": self.usage.to_dict(),
+            "behavior_mode": self.behavior_mode.value,
+            "task_state": self.task_state.to_dict(),
+            "plan_state": self.plan_state.to_dict() if self.plan_state is not None else None,
+            "runtime_feedback": (
+                self.runtime_feedback.to_dict()
+                if self.runtime_feedback is not None
+                else None
+            ),
             "status": self.status.value,
             "termination_reason": (
                 self.termination_reason.value if self.termination_reason is not None else None
@@ -255,6 +335,18 @@ class RunState:
             tool_call_count=value.get("tool_call_count", 0),  # type: ignore[arg-type]
             consecutive_unknown_tools=value.get("consecutive_unknown_tools", 0),  # type: ignore[arg-type]
             usage=Usage.from_dict(value.get("usage", {})),  # type: ignore[arg-type]
+            behavior_mode=value.get("behavior_mode", BehaviorMode.DEFAULT),  # type: ignore[arg-type]
+            task_state=TaskState.from_dict(value.get("task_state", {"items": []})),  # type: ignore[arg-type]
+            plan_state=(
+                PlanState.from_dict(value["plan_state"])  # type: ignore[arg-type]
+                if value.get("plan_state") is not None
+                else None
+            ),
+            runtime_feedback=(
+                RuntimeFeedback.from_dict(value["runtime_feedback"])  # type: ignore[arg-type]
+                if value.get("runtime_feedback") is not None
+                else None
+            ),
             status=value.get("status", RunStatus.RUNNING),  # type: ignore[arg-type]
             termination_reason=value.get("termination_reason"),  # type: ignore[arg-type]
         )
@@ -277,6 +369,7 @@ class RunSnapshot:
     tool_call_count: int
     consecutive_unknown_tools: int
     usage: Usage
+    behavior_mode: BehaviorMode
     status: RunStatus
     termination_reason: TerminationReason | None
 
@@ -288,6 +381,13 @@ class RunSnapshot:
         _require_non_negative_int(self.consecutive_unknown_tools, "consecutive_unknown_tools")
         if not isinstance(self.usage, Usage):
             raise TypeError("usage must be Usage")
+        mode = self.behavior_mode
+        if not isinstance(mode, BehaviorMode):
+            try:
+                mode = BehaviorMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown behavior mode: {self.behavior_mode!r}") from exc
+            object.__setattr__(self, "behavior_mode", mode)
         status = self.status
         if not isinstance(status, RunStatus):
             try:
@@ -322,6 +422,7 @@ class RunSnapshot:
             tool_call_count=state.tool_call_count,
             consecutive_unknown_tools=state.consecutive_unknown_tools,
             usage=state.usage,
+            behavior_mode=state.behavior_mode,
             status=state.status,
             termination_reason=state.termination_reason,
         )
@@ -334,6 +435,7 @@ class RunSnapshot:
             "tool_call_count": self.tool_call_count,
             "consecutive_unknown_tools": self.consecutive_unknown_tools,
             "usage": self.usage.to_dict(),
+            "behavior_mode": self.behavior_mode.value,
             "status": self.status.value,
             "termination_reason": (
                 self.termination_reason.value if self.termination_reason is not None else None
@@ -354,6 +456,7 @@ class RunSnapshot:
             tool_call_count=value.get("tool_call_count", 0),  # type: ignore[arg-type]
             consecutive_unknown_tools=value.get("consecutive_unknown_tools", 0),  # type: ignore[arg-type]
             usage=Usage.from_dict(value.get("usage", {})),  # type: ignore[arg-type]
+            behavior_mode=value.get("behavior_mode", BehaviorMode.DEFAULT),  # type: ignore[arg-type]
             status=value.get("status", RunStatus.RUNNING),  # type: ignore[arg-type]
             termination_reason=value.get("termination_reason"),  # type: ignore[arg-type]
         )
@@ -452,7 +555,11 @@ class TurnResult:
 
 
 RequestPreparer = Callable[
-    [tuple[Message, ...], tuple[ToolDefinition, ...]],
+    [
+        tuple[Message, ...],
+        tuple[ToolDefinition, ...],
+        RuntimePromptContext,
+    ],
     GenerationRequest | Awaitable[GenerationRequest],
 ]
 ToolCallDescriber = Callable[[ToolCallPart], str]
@@ -633,6 +740,7 @@ class AgentLoop:
         request_preparer: RequestPreparer,
         *,
         config: AgentLoopConfig | None = None,
+        runtime_hooks: RuntimeHookSet | None = None,
         tool_call_describer: ToolCallDescriber | None = None,
         permission_resolver: PermissionResolver | None = None,
         session_grant_sink: SessionGrantSink | None = None,
@@ -649,6 +757,10 @@ class AgentLoop:
             config = AgentLoopConfig()
         if not isinstance(config, AgentLoopConfig):
             raise TypeError("config must be AgentLoopConfig")
+        if runtime_hooks is None:
+            runtime_hooks = RuntimeHookSet()
+        if not isinstance(runtime_hooks, RuntimeHookSet):
+            raise TypeError("runtime_hooks must be RuntimeHookSet")
         if tool_call_describer is not None and not callable(tool_call_describer):
             raise TypeError("tool_call_describer must be callable or None")
         if permission_resolver is not None and not callable(permission_resolver):
@@ -660,6 +772,7 @@ class AgentLoop:
         self._tool_executor = tool_executor
         self._request_preparer = request_preparer
         self._config = config
+        self._runtime_hooks = runtime_hooks
         self._tool_call_describer = tool_call_describer
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
@@ -675,6 +788,7 @@ class AgentLoop:
         *,
         turn_id: str | None = None,
         cancellation: CancellationToken | None = None,
+        behavior_mode: BehaviorMode | None = None,
         tool_definitions: Sequence[ToolDefinition] | None = None,
     ) -> AgentTurnExecution:
         if not isinstance(state, RunState):
@@ -702,7 +816,18 @@ class AgentLoop:
             names = [definition.name for definition in definitions]
             if len(set(names)) != len(names):
                 raise ValueError("tool_definitions must have unique names")
-        turn_state = state.new_turn(turn_id, user_input)
+        if behavior_mode is None:
+            behavior_mode = state.behavior_mode
+        elif not isinstance(behavior_mode, BehaviorMode):
+            try:
+                behavior_mode = BehaviorMode(behavior_mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown behavior mode: {behavior_mode!r}") from exc
+        turn_state = state.new_turn(
+            turn_id,
+            user_input,
+            behavior_mode=behavior_mode,
+        )
         return AgentTurnExecution(
             loop=self,
             state=turn_state,
@@ -728,11 +853,15 @@ class AgentTurnExecution:
         "_batch_id",
         "_batch_control_reason",
         "_active_segment_signal",
+        "_active_pause_signal",
+        "_active_event_buffer",
         "_continuation",
         "_permission_resolver",
         "_session_grant_sink",
         "_pending_prepared_call",
         "_pending_permission_choice",
+        "_pending_steering",
+        "_steering_requested_emitted",
     )
 
     def __init__(
@@ -756,11 +885,15 @@ class AgentTurnExecution:
         self._batch_id: str | None = None
         self._batch_control_reason: str | None = None
         self._active_segment_signal: CancellationToken | None = None
+        self._active_pause_signal: CancellationToken | None = None
+        self._active_event_buffer: list[AgentEvent] | None = None
         self._continuation: _TurnContinuation | None = None
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
         self._pending_prepared_call: PreparedToolCall | None = None
         self._pending_permission_choice: PermissionApprovalChoice | None = None
+        self._pending_steering: SteeringRequest | None = None
+        self._steering_requested_emitted = False
 
     @property
     def state(self) -> RunState:
@@ -773,12 +906,65 @@ class AgentTurnExecution:
     def snapshot(self) -> RunSnapshot:
         return RunSnapshot.from_state(self._state)
 
+    @property
+    def pending_steering(self) -> SteeringRequest | None:
+        return self._pending_steering
+
+    def request_steering(self, request: SteeringRequest) -> bool:
+        """Queue one immutable same-Turn user update at the next safe boundary."""
+
+        if not isinstance(request, SteeringRequest):
+            raise TypeError("request must be a SteeringRequest")
+        if request.run_id != self._state.run_id or request.turn_id != self._state.turn_id:
+            raise ValueError("steering request IDs do not match the active Turn")
+        if (
+            self._terminal_result is not None
+            or self._state.status is not RunStatus.RUNNING
+            or self._cancellation.cancelled
+        ):
+            return False
+        continuation = self._continuation
+        if continuation is not None and continuation.pending_pause is not None:
+            return False
+        if self._pending_steering is not None:
+            return False
+        self._pending_steering = request
+        self._steering_requested_emitted = False
+        if self._active_event_buffer is not None:
+            self._emit_steering_requested(self._active_event_buffer)
+        if self._active_segment_signal is not None:
+            self._active_segment_signal.cancel()
+        return True
+
+    def interrupt_for_pause(self) -> None:
+        """Interrupt the active attempt so a requested safe pause can surface."""
+
+        if self._active_pause_signal is not None:
+            self._active_pause_signal.cancel()
+        if self._active_segment_signal is not None:
+            self._active_segment_signal.cancel()
+
+    def _visible_tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        """Return this iteration's mode-filtered view of the captured universe."""
+
+        if self._state.behavior_mode is BehaviorMode.DEFAULT:
+            return self._tool_definitions
+        return tuple(
+            definition
+            for definition in self._tool_definitions
+            if definition.name == ASK_USER_TOOL_DEFINITION.name
+            or self._loop._tool_registry.planning_access_for(definition.name)
+            is ToolPlanningAccess.READ_ONLY
+        )
+
     def cancel(self) -> bool:
         """Mark this turn cancelled and interrupt only the active attempt."""
 
         if self._terminal_result is not None:
             return False
         changed = self._cancellation.cancel()
+        self._pending_steering = None
+        self._steering_requested_emitted = False
         if self._active_segment_signal is not None:
             self._active_segment_signal.cancel()
         return changed
@@ -829,6 +1015,8 @@ class AgentTurnExecution:
             return self._terminal_segment(())
 
         events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
+        self._active_event_buffer = events
+        self._active_pause_signal = pause_signal
         try:
             if not self._started:
                 user_message = self._state.messages[-1]
@@ -864,6 +1052,16 @@ class AgentTurnExecution:
                 if self._cancellation.cancelled:
                     return self._cancel_segment(events)
 
+                if (
+                    self._pending_steering is not None
+                    and (
+                        self._continuation is None
+                        or self._continuation.stage != "tool_batch"
+                    )
+                ):
+                    self._apply_pending_steering(events)
+                    continue
+
                 continuation = self._continuation
                 if continuation is not None and continuation.stage == "tool_batch":
                     batch_status = await self._run_tool_batch(events, pause_signal)
@@ -895,9 +1093,16 @@ class AgentTurnExecution:
                     return self._pause_user_segment(events, iteration)
 
                 try:
+                    runtime_context = RuntimePromptContext(
+                        behavior_mode=self._state.behavior_mode,
+                        task_state=self._state.task_state,
+                        plan_state=self._state.plan_state,
+                        one_shot_feedback=self._state.runtime_feedback,
+                    )
                     request_value = self._loop._request_preparer(
                         self._state.messages,
-                        self._tool_definitions,
+                        self._visible_tool_definitions(),
+                        runtime_context,
                     )
                     request = (
                         await request_value
@@ -906,6 +1111,8 @@ class AgentTurnExecution:
                     )
                     if not isinstance(request, GenerationRequest):
                         raise TypeError("request_preparer must return GenerationRequest")
+                    if self._state.runtime_feedback is not None:
+                        self._set_state(runtime_feedback=None)
                 except Exception:
                     return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
 
@@ -913,6 +1120,9 @@ class AgentTurnExecution:
                 # is the safe boundary before any Provider attempt exists.
                 if self._cancellation.cancelled:
                     return self._cancel_segment(events)
+                if self._pending_steering is not None:
+                    self._apply_pending_steering(events)
+                    continue
                 if pause_signal.cancelled:
                     self._set_provider_continuation(iteration)
                     return self._pause_user_segment(events, iteration)
@@ -921,16 +1131,24 @@ class AgentTurnExecution:
                 self._continuation = None
                 self._active_segment_signal = pause_signal
                 try:
-                    response_value = await self._consume_provider(
+                    response_value, buffered_text_deltas = await self._consume_provider(
                         request,
                         iteration,
                         assistant_message_id,
                         pause_signal,
                         events,
+                        buffer_assistant_text=(
+                            self._state.behavior_mode is BehaviorMode.PLAN
+                            or self._state.task_state.has_unfinished
+                        ),
                     )
                 except GenerationCancelled:
                     if self._cancellation.cancelled:
                         return self._cancel_segment(events)
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
                     if pause_signal.cancelled:
                         self._set_provider_continuation(iteration)
                         return self._pause_user_segment(events, iteration)
@@ -938,6 +1156,10 @@ class AgentTurnExecution:
                 except NetworkError:
                     if self._cancellation.cancelled:
                         return self._cancel_segment(events)
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
                     if pause_signal.cancelled:
                         self._set_provider_continuation(iteration)
                         return self._pause_user_segment(events, iteration)
@@ -946,14 +1168,26 @@ class AgentTurnExecution:
                 except RateLimitError:
                     if self._cancellation.cancelled:
                         return self._cancel_segment(events)
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
                     if pause_signal.cancelled:
                         self._set_provider_continuation(iteration)
                         return self._pause_user_segment(events, iteration)
                     self._set_provider_continuation(iteration, provider_retry_pending=True)
                     return self._pause_provider_segment(events, iteration, PauseReason.RATE_LIMITED)
                 except InvalidProviderResponseError:
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
                     return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
                 except ProviderError:
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
                     return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
                 except CancelledError:
                     self._cancellation.cancel()
@@ -966,6 +1200,11 @@ class AgentTurnExecution:
 
                 if self._cancellation.cancelled:
                     return self._cancel_segment(events)
+                if self._pending_steering is not None:
+                    self._record_usage(events, iteration, response_value.response.usage)
+                    self._apply_pending_steering(events)
+                    pause_signal = self._renew_pause_signal_after_steering()
+                    continue
                 if pause_signal.cancelled:
                     self._set_provider_continuation(iteration)
                     return self._pause_user_segment(events, iteration)
@@ -976,11 +1215,7 @@ class AgentTurnExecution:
                     return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
 
                 provider_response = response_value.response
-                self._set_state(usage=_add_usage(self._state.usage, provider_response.usage))
-                self._append(
-                    events,
-                    UsageUpdated(self._state.run_id, self._state.turn_id, iteration, self._state.usage),
-                )
+                self._record_usage(events, iteration, provider_response.usage)
 
                 finish_reason = provider_response.finish_reason
                 if finish_reason is FinishReason.ERROR:
@@ -997,6 +1232,76 @@ class AgentTurnExecution:
                 else:
                     kind = AssistantMessageKind.FINAL
 
+                if kind is AssistantMessageKind.FINAL:
+                    candidate_text = _message_text(provider_response.message)
+                    completion_result = self._loop._runtime_hooks.run_before_completion(
+                        BeforeCompletionContext(
+                            self._state.run_id,
+                            self._state.turn_id,
+                            self._state.behavior_mode,
+                            candidate_text,
+                            self._state.task_state,
+                            self._state.plan_state,
+                        )
+                    )
+                    if isinstance(completion_result, BeforeCompletionRequestPause):
+                        request = completion_result.request
+                        expected_revision = (
+                            1
+                            if self._state.plan_state is None
+                            else self._state.plan_state.revision + 1
+                        )
+                        if request.revision != expected_revision:
+                            raise ValueError("Plan completion hook returned a stale revision")
+                        plan_state = PlanState(request.revision, request.plan_text)
+                        self._set_state(plan_state=plan_state)
+                        self._append(
+                            events,
+                            PlanProposed(
+                                self._state.run_id,
+                                self._state.turn_id,
+                                iteration,
+                                plan_state.revision,
+                                plan_state.text,
+                            ),
+                        )
+                        self._set_provider_continuation(iteration + 1)
+                        return self._pause_plan_review_segment(
+                            events,
+                            iteration,
+                            request,
+                        )
+                    if isinstance(completion_result, BeforeCompletionBlock):
+                        if not self._state.task_state.has_unfinished:
+                            raise ValueError(
+                                "completion hook blocked without unfinished tasks"
+                            )
+                        self._set_state(runtime_feedback=completion_result.feedback)
+                        self._append(
+                            events,
+                            CompletionBlocked(
+                                self._state.run_id,
+                                self._state.turn_id,
+                                iteration,
+                                self._state.task_state.unfinished_count,
+                            ),
+                        )
+                        self._continuation = None
+                        continue
+                    if not isinstance(completion_result, BeforeCompletionContinue):
+                        raise TypeError("completion hook returned an invalid result")
+
+                for delta_text in buffered_text_deltas:
+                    self._append(
+                        events,
+                        AssistantMessageDelta(
+                            self._state.run_id,
+                            self._state.turn_id,
+                            assistant_message_id,
+                            iteration,
+                            delta_text,
+                        ),
+                    )
                 self._set_state(messages=self._state.messages + (provider_response.message,))
                 self._append(
                     events,
@@ -1060,6 +1365,10 @@ class AgentTurnExecution:
             if self._terminal_result is None:
                 return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
             return self._terminal_segment(events)
+        finally:
+            if self._active_event_buffer is events:
+                self._active_event_buffer = None
+            self._active_pause_signal = None
 
     def _append(self, events: list[AgentEvent], event: AgentEvent) -> None:
         events.append(event)
@@ -1068,6 +1377,73 @@ class AgentTurnExecution:
 
     def _set_state(self, **changes: object) -> None:
         self._state = replace(self._state, **changes)
+
+    def _emit_steering_requested(self, events: list[AgentEvent]) -> None:
+        request = self._pending_steering
+        if request is None or self._steering_requested_emitted:
+            return
+        self._append(
+            events,
+            UserSteeringRequested(
+                self._state.run_id,
+                self._state.turn_id,
+                request.steering_id,
+            ),
+        )
+        self._steering_requested_emitted = True
+
+    def _apply_pending_steering(self, events: list[AgentEvent]) -> bool:
+        if self._cancellation.cancelled:
+            self._pending_steering = None
+            self._steering_requested_emitted = False
+            return False
+        request = self._pending_steering
+        if request is None:
+            return False
+        self._emit_steering_requested(events)
+        self._set_state(
+            messages=self._state.messages
+            + (Message(role="user", parts=(TextPart(request.text),)),),
+            runtime_feedback=RuntimeFeedback(
+                RuntimeFeedbackKind.USER_STEERING,
+                _STEERING_FEEDBACK_TEXT,
+            ),
+        )
+        self._append(
+            events,
+            UserSteeringApplied(
+                self._state.run_id,
+                self._state.turn_id,
+                request.steering_id,
+            ),
+        )
+        self._pending_steering = None
+        self._steering_requested_emitted = False
+        self._continuation = None
+        return True
+
+    def _record_usage(
+        self,
+        events: list[AgentEvent],
+        iteration: int,
+        usage: Usage,
+    ) -> None:
+        self._set_state(usage=_add_usage(self._state.usage, usage))
+        self._append(
+            events,
+            UsageUpdated(
+                self._state.run_id,
+                self._state.turn_id,
+                iteration,
+                self._state.usage,
+            ),
+        )
+
+    def _renew_pause_signal_after_steering(self) -> CancellationToken:
+        self._active_segment_signal = None
+        signal = CancellationToken()
+        self._active_pause_signal = signal
+        return signal
 
     def _set_provider_continuation(
         self,
@@ -1095,6 +1471,7 @@ class AgentTurnExecution:
         tool_call_id: str | None = None,
         user_input_request: UserInputRequest | None = None,
         permission_request: PermissionApprovalRequest | None = None,
+        plan_review_request: PlanReviewRequest | None = None,
     ) -> PauseRequest:
         return PauseRequest(
             pause_id=uuid.uuid4().hex,
@@ -1107,6 +1484,7 @@ class AgentTurnExecution:
             tool_call_id=tool_call_id,
             user_input_request=user_input_request,
             permission_request=permission_request,
+            plan_review_request=plan_review_request,
         )
 
     def _pause_user_segment(self, events: list[AgentEvent], iteration: int) -> AgentExecutionSegment:
@@ -1202,6 +1580,24 @@ class AgentTurnExecution:
         self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
         return self._paused_segment(events)
 
+    def _pause_plan_review_segment(
+        self,
+        events: list[AgentEvent],
+        iteration: int,
+        request: PlanReviewRequest,
+    ) -> AgentExecutionSegment:
+        pause = self._make_pause(
+            iteration=iteration,
+            kind=PauseKind.PLAN_REVIEW_REQUIRED,
+            reason=PauseReason.PLAN_REVIEW_REQUIRED,
+            plan_review_request=request,
+        )
+        if self._continuation is None:
+            raise RuntimeError("Plan review pause has no Provider continuation")
+        self._continuation = replace(self._continuation, pending_pause=pause)
+        self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
+        return self._paused_segment(events)
+
     def _apply_response(self, response: PauseResponse, events: list[AgentEvent]) -> None:
         continuation = self._continuation
         if continuation is None or continuation.pending_pause is None:
@@ -1251,6 +1647,41 @@ class AgentTurnExecution:
             self._pending_permission_choice = response.choice
             self._continuation = replace(continuation, pending_pause=None)
             return
+        if isinstance(response, PlanReviewResponse):
+            if continuation.stage != "provider":
+                raise ValueError("Plan review response requires a Provider continuation")
+            plan_state = self._state.plan_state
+            if plan_state is None or plan_state.revision != response.revision:
+                raise ValueError("response does not match the authoritative Plan revision")
+            if response.choice is PlanReviewChoice.REVISE:
+                assert response.feedback is not None
+                feedback = RuntimeFeedback(
+                    RuntimeFeedbackKind.PLAN_REVISION,
+                    response.feedback,
+                )
+                self._set_state(
+                    messages=self._state.messages
+                    + (Message(role="user", parts=(TextPart(response.feedback),)),),
+                    runtime_feedback=feedback,
+                )
+            else:
+                previous_mode = self._state.behavior_mode
+                self._set_state(
+                    behavior_mode=BehaviorMode.DEFAULT,
+                    plan_state=replace(plan_state, approved=True),
+                )
+                if previous_mode is not BehaviorMode.DEFAULT:
+                    self._append(
+                        events,
+                        BehaviorModeChanged(
+                            self._state.run_id,
+                            self._state.turn_id,
+                            previous_mode,
+                            BehaviorMode.DEFAULT,
+                        ),
+                    )
+            self._continuation = replace(continuation, pending_pause=None)
+            return
         self._continuation = replace(continuation, pending_pause=None)
 
     async def _consume_provider(
@@ -1260,8 +1691,11 @@ class AgentTurnExecution:
         message_id: str,
         pause_signal: CancellationToken,
         events: list[AgentEvent],
-    ) -> GenerationCompleted:
+        *,
+        buffer_assistant_text: bool,
+    ) -> tuple[GenerationCompleted, tuple[str, ...]]:
         response: GenerationCompleted | None = None
+        buffered_text_deltas: list[str] = []
         reasoning_segment = 0
         reasoning_open = False
 
@@ -1316,16 +1750,19 @@ class AgentTurnExecution:
 
                 close_reasoning()
                 if isinstance(event, TextDelta) and event.text:
-                    self._append(
-                        events,
-                        AssistantMessageDelta(
-                            self._state.run_id,
-                            self._state.turn_id,
-                            message_id,
-                            iteration,
-                            event.text,
-                        ),
-                    )
+                    if buffer_assistant_text:
+                        buffered_text_deltas.append(event.text)
+                    else:
+                        self._append(
+                            events,
+                            AssistantMessageDelta(
+                                self._state.run_id,
+                                self._state.turn_id,
+                                message_id,
+                                iteration,
+                                event.text,
+                            ),
+                        )
                 if isinstance(event, GenerationCompleted):
                     if self._cancellation.cancelled:
                         raise GenerationCancelled()
@@ -1337,7 +1774,7 @@ class AgentTurnExecution:
 
         if response is None:
             raise InvalidProviderResponseError("Provider stream ended without a terminal response")
-        return response
+        return response, tuple(buffered_text_deltas)
 
     def _begin_tool_batch(
         self,
@@ -1381,10 +1818,16 @@ class AgentTurnExecution:
     def _ask_enabled(self) -> bool:
         return any(definition.name == ASK_USER_TOOL_DEFINITION.name for definition in self._tool_definitions)
 
+    def _todo_enabled(self) -> bool:
+        return any(definition.name == TODO_WRITE_TOOL_DEFINITION.name for definition in self._tool_definitions)
+
     def _safe_command(self, call: ToolCallPart, *, known: bool) -> str:
         if not known:
             return "<unknown tool>"
-        if call.name == ASK_USER_TOOL_DEFINITION.name:
+        if call.name in {
+            ASK_USER_TOOL_DEFINITION.name,
+            TODO_WRITE_TOOL_DEFINITION.name,
+        }:
             command = call.name
         elif self._loop._tool_call_describer is None:
             command = call.name
@@ -1410,6 +1853,8 @@ class AgentTurnExecution:
         batch_id = self._require_batch_id()
         known = (
             call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+        ) or (
+            call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
         ) or self._loop._tool_registry.get(call.name) is not None
         if not started:
             self._append(
@@ -1521,6 +1966,63 @@ class AgentTurnExecution:
             )
         return result, False, "failed" if result.is_error else "finished"
 
+    def _close_stale_tools_for_steering(self, events: list[AgentEvent]) -> None:
+        """Close every not-yet-started call without executing stale side effects."""
+
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            raise RuntimeError("Steering has no active Tool batch")
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        batch_id = self._require_batch_id()
+        while index < len(continuation.tool_calls):
+            call = continuation.tool_calls[index]
+            known = (
+                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or (
+                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or self._loop._tool_registry.get(call.name) is not None
+            command = self._safe_command(call, known=known)
+            self._append(
+                events,
+                ToolStarted(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                ),
+            )
+            result = _controlled_tool_result(
+                call,
+                "Error: tool call skipped after user steering",
+            )
+            results.append(result)
+            self._append(
+                events,
+                ToolFinished(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                    "skipped",
+                    True,
+                ),
+            )
+            index += 1
+        self._continuation = replace(
+            continuation,
+            completed_tool_results=tuple(results),
+            next_tool_index=index,
+            pending_pause=None,
+        )
+        self._close_tool_batch(events, status="steered")
+
     async def _run_tool_batch(
         self,
         events: list[AgentEvent],
@@ -1539,6 +2041,10 @@ class AgentTurnExecution:
             if self._cancellation.cancelled:
                 self._cancel_remaining_tools(events)
                 return "cancelled"
+            if control_reason is None and self._pending_steering is not None:
+                self._close_stale_tools_for_steering(events)
+                self._apply_pending_steering(events)
+                return "steered"
             if control_reason is None and pause_signal.cancelled:
                 self._continuation = replace(continuation, pending_pause=None)
                 self._pause_user_segment(events, continuation.iteration)
@@ -1547,6 +2053,8 @@ class AgentTurnExecution:
             call = continuation.tool_calls[index]
             known = (
                 call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or (
+                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
             ) or self._loop._tool_registry.get(call.name) is not None
             command = self._safe_command(call, known=known)
             batch_id = self._require_batch_id()
@@ -1599,6 +2107,41 @@ class AgentTurnExecution:
                         )
                         self._pause_input_segment(events, continuation.iteration, call, request)
                         return "paused"
+                elif call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled():
+                    self._set_state(consecutive_unknown_tools=0)
+                    if self._state.behavior_mode is BehaviorMode.PLAN:
+                        result = _controlled_tool_result(
+                            call,
+                            "Error: TodoWrite is unavailable in PLAN mode",
+                        )
+                        controlled = True
+                        status = "failed"
+                    else:
+                        try:
+                            task_state = parse_todo_write_arguments(call.arguments)
+                        except (TypeError, ValueError, KeyError):
+                            result = _controlled_tool_result(
+                                call,
+                                "Error: invalid TodoWrite arguments",
+                            )
+                            controlled = True
+                            status = "failed"
+                        else:
+                            self._set_state(task_state=task_state)
+                            self._append(
+                                events,
+                                TaskStateChanged(
+                                    self._state.run_id,
+                                    self._state.turn_id,
+                                    continuation.iteration,
+                                    task_state,
+                                ),
+                            )
+                            result = ToolResultPart(
+                                call.tool_call_id,
+                                task_state.to_json(),
+                                False,
+                            )
                 elif resumed_prepared is not None:
                     choice = self._pending_permission_choice
                     self._pending_prepared_call = None
@@ -1641,43 +2184,69 @@ class AgentTurnExecution:
                         result = prepared_or_result
                         controlled = True
                         status = "failed" if result.is_error else "finished"
-                    elif self._permission_resolver is None:
-                        raise RuntimeError(
-                            "permission resolver is required before executing an ordinary Tool"
-                        )
                     else:
-                        try:
-                            decision = self._permission_resolver(prepared_or_result.action)
-                        except Exception:
-                            result = _controlled_tool_result(call, "Error: permission check failed")
+                        hook_result = self._loop._runtime_hooks.run_before_tool_execution(
+                            BeforeToolExecutionContext(
+                                self._state.run_id,
+                                self._state.turn_id,
+                                self._state.behavior_mode,
+                                prepared_or_result,
+                            )
+                        )
+                        if isinstance(hook_result, BeforeToolExecutionReject):
+                            result = _controlled_tool_result(call, hook_result.error_text)
                             controlled = True
                             status = "failed"
                         else:
-                            if not isinstance(decision, PermissionDecision) or decision.action != prepared_or_result.action:
+                            if self._permission_resolver is None:
+                                raise RuntimeError(
+                                    "permission resolver is required before executing an ordinary Tool"
+                                )
+                            try:
+                                decision = self._permission_resolver(
+                                    prepared_or_result.action
+                                )
+                            except Exception:
                                 result = _controlled_tool_result(call, "Error: permission check failed")
                                 controlled = True
                                 status = "failed"
-                            elif decision.decision is Decision.ALLOW:
-                                result, controlled, status = await self._execute_prepared(prepared_or_result)
-                            elif decision.decision is Decision.DENY:
-                                result = _controlled_tool_result(call, "Error: permission denied")
-                                controlled = True
-                                status = "failed"
                             else:
-                                self._pending_prepared_call = prepared_or_result
-                                self._continuation = replace(
-                                    continuation,
-                                    completed_tool_results=tuple(results),
-                                    next_tool_index=index,
-                                    pending_pause=None,
-                                )
-                                self._pause_permission_segment(
-                                    events,
-                                    continuation.iteration,
-                                    call,
-                                    decision,
-                                )
-                                return "paused"
+                                if (
+                                    not isinstance(decision, PermissionDecision)
+                                    or decision.action != prepared_or_result.action
+                                ):
+                                    result = _controlled_tool_result(
+                                        call,
+                                        "Error: permission check failed",
+                                    )
+                                    controlled = True
+                                    status = "failed"
+                                elif decision.decision is Decision.ALLOW:
+                                    result, controlled, status = await self._execute_prepared(
+                                        prepared_or_result
+                                    )
+                                elif decision.decision is Decision.DENY:
+                                    result = _controlled_tool_result(
+                                        call,
+                                        "Error: permission denied",
+                                    )
+                                    controlled = True
+                                    status = "failed"
+                                else:
+                                    self._pending_prepared_call = prepared_or_result
+                                    self._continuation = replace(
+                                        continuation,
+                                        completed_tool_results=tuple(results),
+                                        next_tool_index=index,
+                                        pending_pause=None,
+                                    )
+                                    self._pause_permission_segment(
+                                        events,
+                                        continuation.iteration,
+                                        call,
+                                        decision,
+                                    )
+                                    return "paused"
 
             if not controlled:
                 status = "failed" if result.is_error else "finished"
@@ -1707,6 +2276,10 @@ class AgentTurnExecution:
             if self._cancellation.cancelled:
                 self._cancel_remaining_tools(events)
                 return "cancelled"
+            if control_reason is None and self._pending_steering is not None:
+                self._close_stale_tools_for_steering(events)
+                self._apply_pending_steering(events)
+                return "steered"
             if control_reason is None and pause_signal.cancelled:
                 continuation = self._continuation
                 assert continuation is not None
@@ -1765,6 +2338,8 @@ class AgentTurnExecution:
 
     def _cancel_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
         self._cancellation.cancel()
+        self._pending_steering = None
+        self._steering_requested_emitted = False
         if self._continuation is not None and self._continuation.stage == "tool_batch":
             self._cancel_remaining_tools(events)
         self._set_terminal(RunStatus.CANCELLED, TerminationReason.USER_CANCELLED, None)
@@ -1795,6 +2370,8 @@ class AgentTurnExecution:
         self._batch_control_reason = None
         self._pending_prepared_call = None
         self._pending_permission_choice = None
+        self._pending_steering = None
+        self._steering_requested_emitted = False
 
     def _paused_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
         if self._continuation is None or self._continuation.pending_pause is None:
