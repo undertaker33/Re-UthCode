@@ -289,8 +289,27 @@ def test_plan_review_request_response_and_revision_validation_are_strict() -> No
     assert pause.validate_response(revise) is None
     assert PauseRequest.from_json(pause.to_json()) == pause
     assert PlanReviewRequest.from_json(request.to_json()) == request
+    assert PlanReviewResponse.from_dict(approve.to_dict()) == approve
+    assert PlanReviewResponse.from_json(revise.to_json()) == revise
     assert pause_response_from_json(approve.to_json()) == approve
     assert pause_response_from_json(revise.to_json()) == revise
+    assert approve.to_dict() == {
+        "type": "plan_review",
+        "pause_id": "pause-plan",
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "revision": 2,
+        "choice": "approve",
+    }
+    assert revise.to_dict() == {
+        "type": "plan_review",
+        "pause_id": "pause-plan",
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "revision": 2,
+        "choice": "revise",
+        "feedback": "Keep the public API unchanged.",
+    }
     assert pause.to_dict()["plan_review_request"] == request.to_dict()
 
     for response in (
@@ -320,6 +339,66 @@ def test_plan_review_request_response_and_revision_validation_are_strict() -> No
             PlanReviewChoice.APPROVE,
             "unexpected feedback",
         )
+
+
+@pytest.mark.parametrize("feedback", (None, "unexpected feedback"))
+def test_plan_review_approve_json_rejects_any_feedback_field(
+    feedback: object,
+) -> None:
+    payload = {
+        "type": "plan_review",
+        "pause_id": "pause-plan",
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "revision": 2,
+        "choice": "approve",
+        "feedback": feedback,
+    }
+
+    with pytest.raises(ValueError):
+        PlanReviewResponse.from_dict(payload)
+    with pytest.raises(ValueError):
+        pause_response_from_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "type": "plan_review",
+            "pause_id": "pause-plan",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "revision": 2,
+            "choice": "revise",
+        },
+        {
+            "type": "plan_review",
+            "pause_id": "pause-plan",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "revision": 2,
+            "choice": "revise",
+            "feedback": None,
+        },
+        {
+            "type": "plan_review",
+            "pause_id": "pause-plan",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "revision": 2,
+            "choice": "revise",
+            "feedback": " ",
+        },
+    ),
+)
+def test_plan_review_revise_json_requires_nonempty_feedback(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        PlanReviewResponse.from_dict(payload)
+    with pytest.raises((TypeError, ValueError)):
+        pause_response_from_json(json.dumps(payload))
 
 
 def test_steering_request_is_immutable_json_safe_and_not_a_pause() -> None:

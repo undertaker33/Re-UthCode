@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import warnings
 from dataclasses import FrozenInstanceError, dataclass
 
 import pytest
@@ -94,6 +96,13 @@ def test_plan_tool_policy_allows_default_and_plan_read_only() -> None:
         plan_tool_policy(_tool_context(BehaviorMode.PLAN, Effect.READ)),
         BeforeToolExecutionContinue,
     )
+
+
+def test_runtime_hook_reason_enum_is_exact() -> None:
+    assert [item.value for item in RuntimeHookReason] == [
+        "plan_read_only",
+        "unfinished_tasks",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -207,6 +216,73 @@ def test_hook_exceptions_propagate_for_the_caller_to_fail_closed() -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         hooks.run_before_tool_execution(_tool_context(BehaviorMode.PLAN, Effect.READ))
+
+
+async def _async_tool_hook(
+    context: BeforeToolExecutionContext,
+) -> BeforeToolExecutionContinue:
+    del context
+    return BeforeToolExecutionContinue()
+
+
+class _AsyncCompletionHook:
+    async def __call__(
+        self,
+        context: BeforeCompletionContext,
+    ) -> BeforeCompletionContinue:
+        del context
+        return BeforeCompletionContinue()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"before_tool_execution": (_async_tool_hook,)},
+        {"before_completion": (_AsyncCompletionHook(),)},
+    ),
+)
+def test_hook_set_rejects_async_functions_and_async_callable_objects_at_construction(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(TypeError, match="synchronous"):
+        RuntimeHookSet(**kwargs)  # type: ignore[arg-type]
+
+
+def test_hook_set_closes_awaitables_returned_by_sync_looking_hooks() -> None:
+    async def tool_result() -> BeforeToolExecutionContinue:
+        return BeforeToolExecutionContinue()
+
+    async def completion_result() -> BeforeCompletionContinue:
+        return BeforeCompletionContinue()
+
+    def deceptive_tool_hook(
+        context: BeforeToolExecutionContext,
+    ) -> object:
+        del context
+        return tool_result()
+
+    def deceptive_completion_hook(
+        context: BeforeCompletionContext,
+    ) -> object:
+        del context
+        return completion_result()
+
+    tool_hooks = RuntimeHookSet(before_tool_execution=(deceptive_tool_hook,))
+    completion_hooks = RuntimeHookSet(before_completion=(deceptive_completion_hook,))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(TypeError, match="returned an awaitable"):
+            tool_hooks.run_before_tool_execution(
+                _tool_context(BehaviorMode.PLAN, Effect.READ)
+            )
+        with pytest.raises(TypeError, match="returned an awaitable"):
+            completion_hooks.run_before_completion(
+                _completion_context(BehaviorMode.DEFAULT)
+            )
+        gc.collect()
+
+    assert not [item for item in caught if issubclass(item.category, RuntimeWarning)]
 
 
 def test_hook_contract_values_are_frozen_and_strictly_typed() -> None:

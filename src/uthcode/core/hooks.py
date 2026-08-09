@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -38,7 +39,6 @@ def _coerce_behavior_mode(value: object) -> BehaviorMode:
 
 class RuntimeHookReason(str, Enum):
     PLAN_READ_ONLY = "plan_read_only"
-    PLAN_REVIEW = "plan_review"
     UNFINISHED_TASKS = "unfinished_tasks"
 
 
@@ -169,7 +169,29 @@ def _hook_tuple(value: object, field_name: str) -> tuple[Callable[..., object], 
     hooks = tuple(value)
     if not all(callable(hook) for hook in hooks):
         raise TypeError(f"{field_name} must contain only callables")
+    if any(_is_async_callable(hook) for hook in hooks):
+        raise TypeError(f"{field_name} must contain only synchronous callables")
     return hooks
+
+
+def _is_async_callable(value: Callable[..., object]) -> bool:
+    return inspect.iscoroutinefunction(value) or inspect.iscoroutinefunction(
+        getattr(value, "__call__", None)
+    )
+
+
+def _call_sync_hook(
+    hook: Callable[[object], object],
+    context: object,
+    field_name: str,
+) -> object:
+    result = hook(context)
+    if inspect.isawaitable(result):
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()
+        raise TypeError(f"{field_name} hook returned an awaitable")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +218,7 @@ class RuntimeHookSet:
         if not isinstance(context, BeforeToolExecutionContext):
             raise TypeError("context must be BeforeToolExecutionContext")
         for hook in self.before_tool_execution:
-            result = hook(context)
+            result = _call_sync_hook(hook, context, "before_tool_execution")
             if not isinstance(
                 result,
                 (BeforeToolExecutionContinue, BeforeToolExecutionReject),
@@ -213,7 +235,7 @@ class RuntimeHookSet:
         if not isinstance(context, BeforeCompletionContext):
             raise TypeError("context must be BeforeCompletionContext")
         for hook in self.before_completion:
-            result = hook(context)
+            result = _call_sync_hook(hook, context, "before_completion")
             if not isinstance(
                 result,
                 (

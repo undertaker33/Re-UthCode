@@ -84,3 +84,29 @@
 - 未增加兼容别名、废弃入口、旧结构适配器、第二 Runtime、Plan→Todo 编译器、complexity detector、Hook package/plugin/global registry 或未使用 Hook point。
 - Planning metadata 只存在于 Core Tool contract，Provider `ToolDefinition` 未变化；Steering 未进入 PauseKind；Hook 文件无 asyncio、Provider/Tool 执行和 RunState 持有。
 - 未归档工作包、未修改远端、未 push/merge/rebase/cherry-pick/reset，也未操作其他 worktree。
+
+## 7. 返工第 1 轮
+
+### 返工原因
+
+- 独立审查发现 `PlanReviewResponse` 对 APPROVE/REVISE 的 JSON 字段集合不够严格；APPROVE 错误输出并接受 `feedback: null`。
+- `RuntimeHookSet` 只检查 `callable`，没有在构造期拒绝 async function/async callable，也没有安全处理“同步外观、返回 awaitable”的 Hook，可产生未关闭 coroutine 警告。
+- `RuntimeHookReason.PLAN_REVIEW` 没有任何当前生产或测试调用方，违反不保留无用占位合同的原则。
+
+### 实际修改
+
+- `PlanReviewResponse.to_dict()` 现在仅为 REVISE 输出 `feedback`；解码先解析 `choice`，再按 choice 严格校验字段集合。省略 `feedback` 的 APPROVE 合法，携带任何 `feedback`（包括 null）的 APPROVE 拒绝；REVISE 必须携带非空文本。
+- `RuntimeHookSet` 构造时同时检查 function 和 callable object 的异步实现并稳定拒绝。运行时若同步 Hook 返回 awaitable，先关闭可关闭结果，再以 `TypeError` fail-closed，不遗留 `RuntimeWarning`。
+- 删除无调用方的 `RuntimeHookReason.PLAN_REVIEW`；精确枚举合同仅保留 `plan_read_only` 与 `unfinished_tasks`，没有增加重复 reason 映射。
+- 仅修改 `core/interaction.py`、`core/hooks.py` 及对应两个测试文件；未改动冻结 Prompt/Spec/Tasks/Checklist 文字，既有 Checklist 勾选项的验收命令已重跑且仍成立。
+
+### 重新验证
+
+- 测试先行红测：`6 failed, 65 passed`，并复现 `coroutine ... was never awaited` `RuntimeWarning`；六个失败与三项审查意见一一对应。
+- reviewer 复现集在 `-W error::RuntimeWarning` 下为 `71 passed in 1.69s`。
+- Checklist Task 1/2 定向组：Planning `23 passed`；Interaction/Event `77 passed`；Tool/builtin `102 passed`；Hook/Prompt `26 passed`；Architecture `23 passed`。
+- W01 受影响定向集合：`251 passed in 16.72s`。
+- 最终全量回归：`786 passed, 3 skipped in 47.31s`；Package smoke 为 `8 passed in 1.46s`。
+- `compileall -q src tests` 退出码为 0；`pip check` 输出 `No broken requirements found.`；`git diff --check` 无 whitespace error。
+- 原 Checklist 两条否定性扫描仍为 0 条匹配；新增精确扫描确认不再存在闲置 `RuntimeHookReason.PLAN_REVIEW`。
+- Checklist 与追加后的本 Feedback 共 2 个文件通过 UTF-8 guard，无乱码、替换字符或 Markdown 围栏失衡。

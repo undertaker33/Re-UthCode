@@ -934,37 +934,45 @@ class PlanReviewResponse(_PauseResponse):
             raise ValueError("approve response must not contain feedback")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             **_PauseResponse.to_dict(self),
             "revision": self.revision,
             "choice": self.choice.value,
-            "feedback": self.feedback,
         }
+        if self.choice is PlanReviewChoice.REVISE:
+            payload["feedback"] = self.feedback
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> PlanReviewResponse:
         payload = _as_mapping(value, "plan review response")
-        _expect_keys(
-            payload,
-            {
-                "type",
-                "pause_id",
-                "run_id",
-                "turn_id",
-                "revision",
-                "choice",
-                "feedback",
-            },
-        )
-        if payload["type"] != cls.response_type:
+        if _required(payload, "type") != cls.response_type:
             raise ValueError("response type is not plan_review")
+        choice = _coerce_enum(
+            PlanReviewChoice,
+            _required(payload, "choice"),
+            "plan review choice",
+        )
+        expected = {
+            "type",
+            "pause_id",
+            "run_id",
+            "turn_id",
+            "revision",
+            "choice",
+        }
+        if choice is PlanReviewChoice.REVISE:
+            expected.add("feedback")
+        _expect_keys(payload, expected)
         return cls(
             _required(payload, "pause_id"),  # type: ignore[arg-type]
             _required(payload, "run_id"),  # type: ignore[arg-type]
             _required(payload, "turn_id"),  # type: ignore[arg-type]
             _required(payload, "revision"),  # type: ignore[arg-type]
-            _required(payload, "choice"),  # type: ignore[arg-type]
-            payload.get("feedback"),  # type: ignore[arg-type]
+            choice,  # type: ignore[arg-type]
+            _required(payload, "feedback")
+            if choice is PlanReviewChoice.REVISE
+            else None,  # type: ignore[arg-type]
         )
 
     @classmethod
