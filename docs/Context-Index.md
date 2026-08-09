@@ -78,7 +78,9 @@ status_values:
 
 ### `not_implemented`
 
-- 无。当前 `docs/work/` 中不存在未实现或部分实施的任务包。
+| Task | 任务包 | 当前路径 | 当前证据 |
+| --- | --- | --- | --- |
+| T08 | 任务规划与执行控制 | `docs/work/T08-任务规划与执行控制/` | 正式工作包已生成；Checklist 尚未完成且尚无 Worker Feedback；当前源码仍无 BehaviorMode、PlanState、TaskState 与 Runtime Hook |
 
 ## 跨层最短链路
 
