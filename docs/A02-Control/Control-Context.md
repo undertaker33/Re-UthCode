@@ -1,0 +1,126 @@
+# A02 Control（控制层）
+
+```text
+layer: A02-Control
+context_file: docs/A02-Control/Control-Context.md
+owns: permission + approval + cooperative pause/resume + ask-user + cancellation
+current_shape: application-controlled boundaries over one Core Turn
+explicit_absence: OS sandbox + hook runtime
+```
+
+## 当前结论
+
+- `[FACT]` 已实现三段权限决策：`Guard -> Policy -> Strategy`，并支持 Run-local `SessionGrant`。
+- `[FACT]` 已实现 `default`、`auto`、`full_access` 三种 Run-local 权限模式。
+- `[FACT]` 已实现四类暂停：用户请求、询问用户、Provider 暂时不可用、权限审批。
+- `[FACT]` 暂停/恢复保持同一个 `AgentTurnExecution`、同一个 `TurnHandle` 和同一个事件流，不创建替代 Turn。
+- `[FACT]` 取消优先于待处理的恢复或审批响应；取消幂等。
+- `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。
+- `[ABSENT]` 当前没有 OS Sandbox、Hook 注册/执行链、Hook 阻断或 Hook 生命周期。
+
+## 权威源码索引
+
+| 主题 | 文件 | 关键符号/检索词 |
+| --- | --- | --- |
+| 权限领域模型 | `src/uthcode/core/permission.py` | `PermissionMode`, `Effect`, `ResourceScope`, `Decision`, `PermissionAction`, `Rule`, `RuleSet`, `SessionGrant`, `PermissionEvaluator` |
+| 暂停与响应协议 | `src/uthcode/core/interaction.py` | `PauseKind`, `PauseReason`, `PauseRequest`, `PauseResponse`, `UserInputRequest`, `PermissionApprovalRequest` |
+| 控制事件 | `src/uthcode/core/agent_events.py` | `TurnPausing`, `TurnPaused`, `TurnResumed`, `UserInputRequested` |
+| Runtime 控制点 | `src/uthcode/core/agent.py` | `run_segment`, `_run_tool_batch`, `_pause_*_segment`, `_apply_response`, `cancel` |
+| Application 协调 | `src/uthcode/application/runs.py` | `AgentRun`, `_TurnDriver`, `TurnHandle.pause/resume/cancel`, `pending_pause` |
+| 权限文件与默认 Guard | `src/uthcode/integrations/permissions.py` | `load_permission_rules`, `default_guard_rules`, `discover_permission_paths` |
+| Tool Action preflight | `src/uthcode/integrations/tools/` | `PermissionAction`, `Effect`, `ResourceScope`, `classify_bash_command` |
+| 安全摘要 | `src/uthcode/core/command_security.py`, `src/uthcode/application/tools.py` | `safe_bash_command_summary`, `_SecretRedactor` |
+| TUI 控制投影 | `src/uthcode/interfaces/tui/interaction.py`, `app.py` | `TuiInteractionState`, `open_pause`, `TurnHandle.resume` |
+
+## 权限决策顺序
+
+```text
+Tool.prepare_call
+  -> PreparedToolCall(action=PermissionAction)
+  -> PermissionEvaluator.evaluate(action, run.mode, run.session_grants)
+     1. 选择最高来源优先级的匹配 Guard
+        DENY -> deny
+        ASK  -> ask
+        ALLOW -> 记录 guard_allowed，继续
+     2. mode == full_access
+        -> 跳过普通 Policy 与 Strategy
+        -> 仍不能绕过 Guard ASK/DENY
+     3. 选择匹配 Policy
+        -> policy 的 ALLOW/ASK/DENY 是终态
+     4. Strategy fallback
+        default: inside+read=ALLOW，其余=ASK
+        auto: inside+(read|write)=ALLOW，其余=ASK
+     5. 仅 Strategy ASK 可被精确 SessionGrant 替换为 ALLOW
+```
+
+## 权限数据边界
+
+- `PermissionAction` 只能由可信 Tool preflight 产生，维度为 `tool/action/effect/resource/scope`。
+- `Effect` 固定为 `read/write/destructive/external/unknown`；`ResourceScope` 固定为 `inside/outside/unknown`。
+- 权限规则文件与普通 `config.toml` 分离：用户级 `~/.uthcode/permissions.toml`，项目级 `<scope>/.uthcode/permissions.toml`。
+- `load_permission_rules` 在 `AgentRun` 创建时加载一次不可变 `RuleSet`；运行中修改文件不热加载。
+- 来源优先级：内置默认 Guard < 用户规则 < 从 Git 根到 cwd 的项目规则；同来源同优先级按 `DENY > ASK > ALLOW`。
+- 默认 Guard 对敏感凭据路径和高置信危险 Bash 行为要求 ASK；`full_access` 也不能绕过。
+- `SESSION` 审批只写入当前内存 `AgentRun`，按动作维度与有界资源匹配；不写持久规则。
+- Guard 触发的审批不提供 `SESSION` 选项；普通 Strategy ASK 可提供 `ONCE/SESSION/REJECT`。
+
+## 暂停状态机
+
+```text
+running segment
+  -> USER_REQUESTED:
+       pause_signal 中断 Provider attempt 或在 Tool 安全边界等待当前 Tool 结束
+       response = ResumeTurnResponse
+  -> USER_INPUT_REQUIRED:
+       AskUserQuestion -> UserInputRequest -> UserInputResponse
+  -> PROVIDER_UNAVAILABLE:
+       NetworkError/RateLimitError -> RetryProviderResponse
+       重试同一 iteration，不提交失败 attempt 的 partial message/usage
+  -> PERMISSION_REQUIRED:
+       PreparedToolCall 保留但不执行 -> PermissionApprovalResponse
+       ONCE/SESSION 执行一次；REJECT 生成受控 Tool error
+
+任意 pending pause
+  -> cancel
+  -> cancellation wins
+  -> 原 ToolCall ID 全部闭合
+  -> TurnCancelled
+```
+
+## 控制不变量
+
+- Core segment 到 `PAUSED` 或 `TERMINAL` 边界即返回；Core 内不保存 asyncio waiter、queue、task。
+- `_TurnDriver` 独占 asyncio task、事件 queue、响应 waiter；Interface 只使用 `TurnHandle`。
+- `PauseRequest` 与响应必须严格匹配 `pause_id/run_id/turn_id`；工具型暂停还必须匹配 `tool_call_id`，权限暂停还匹配 `permission_id`。
+- `AskUserQuestion` 支持 1—4 个问题，类型为 text/single-select/multi-select；答案在恢复前完整校验。
+- 用户主动暂停是 cooperative pause，不等于取消；Provider attempt 可被暂停信号打断，正在执行的普通 Tool 不因暂停被强杀。
+- `Bash` 取消会尝试终止进程树，但执行仍使用当前 OS 用户权限；不得描述为沙箱。
+- 未知错误对外转为稳定、无内部异常正文的失败事件/结果。
+
+## 不属于当前控制层
+
+- `[ABSENT]` OS 级文件、网络、系统调用 Sandbox。
+- `[ABSENT]` Hook 生命周期、before/after tool hook、事件 hook、阻断链。
+- `[ABSENT]` 跨进程 pending pause 恢复；进程退出后控制状态丢失。
+- `[ABSENT]` 持久化 permission decision；只有显式规则文件与 Run-local SessionGrant。
+
+## 修改路由
+
+```text
+权限矩阵/Rule 匹配         -> core/permission.py
+权限文件发现/解析/默认 Guard -> integrations/permissions.py
+具体 Tool effect/scope/action -> integrations/tools/*.py
+暂停协议/AskUser 数据       -> core/interaction.py
+暂停产生与 Tool 审批接入    -> core/agent.py
+等待、恢复、取消竞态        -> application/runs.py
+TUI 问答/审批交互           -> interfaces/tui/interaction.py + app.py
+Hook                        -> 当前不存在；先按新需求设计，不增加旧入口兼容层
+```
+
+## 最小验证索引
+
+```powershell
+conda activate re-uthcode
+python -m pytest tests/test_permission.py tests/test_permission_rules.py tests/test_permission_integration.py tests/test_agent_interaction.py tests/test_application_runs.py -q
+python -m pytest tests/test_permission_delivery.py tests/test_builtin_process_tool.py -q
+```

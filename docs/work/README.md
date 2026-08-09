@@ -4,9 +4,9 @@
 
 ## 1. 目录职责
 
-`docs/work/` 只存放仍活跃的正式工作包。
+`docs/work/` 是工作包根目录：直接子目录 `TXX-*` 只存放仍活跃的正式工作包，`docs/work/archive/` 存放用户已归档的完成工作包。
 
-工作包完成后，必须等待用户确认并由用户手动移动至 `docs/archive/work/`。Agent 不得自行归档。
+工作包完成后，必须等待用户确认并由用户手动移动至 `docs/work/archive/`。Agent 不得自行归档。
 
 收到需求文件 `TXX-xxxx.md` 后：
 
@@ -16,6 +16,7 @@
 4. 找出影响范围、架构、行为或验收方式的待确认项；
 5. 为每个待确认项提供可选方案、影响和推荐方案；
 6. 用户完成全部决策后，生成正式工作包。
+7. 同步维护 `docs/Context-Index.md` 的 `current-status`，再结束任务包拆分。
 
 ```text
 docs/work/TXX-xxxx/
@@ -32,6 +33,19 @@ docs/work/TXX-xxxx/
 ```
 
 `TXX-xxxx` 必须与原始需求文件名一致。同一 Worker 的 Prompt 与 Feedback 必须使用相同的 `WXX-xxxx`。
+
+### 1.1 Context 索引维护
+
+每次创建或重新拆分任务包时，拆分 Agent 必须重新盘点 `docs/work/` 的直接 `TXX-*` 子目录与 `docs/work/archive/`，并维护 `docs/Context-Index.md` 的 `current-status` 全量清单，不得只追加当前 Task。
+
+- 新建、未开始或部分实施的任务包标记为 `not_implemented`；
+- 只有当前源码已有实现、Checklist 全部完成且 Feedback 已记录，才标记为 `implemented_unarchived`；
+- 只有目录已经由用户移动到 `docs/work/archive/`，才标记为 `archived`；
+- 同步更新 `status_snapshot`、任务包路径和验收证据摘要；
+- 工作包存在不等于已经实现，Feedback 存在也不等于 Checklist 已完成；必须同时核对目录、Checklist、Feedback 与当前源码；
+- `current-status` 是工作包外部索引，不属于冻结的 Spec、Tasks、Prompt 或 Checklist；维护索引不授权 Agent 移动/归档工作包或修改冻结内容。
+
+未完成上述同步时，任务包拆分不算交付完成。
 
 ## 2. Spec
 
