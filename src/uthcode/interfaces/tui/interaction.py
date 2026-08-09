@@ -13,6 +13,8 @@ from enum import Enum
 from uthcode.application import (
     PauseKind,
     PauseRequest,
+    PlanReviewChoice,
+    PlanReviewResponse,
     PermissionApprovalChoice,
     PermissionApprovalResponse,
     RetryProviderResponse,
@@ -28,11 +30,19 @@ class InteractionMode(str, Enum):
     PERMISSION = "permission"
     QUESTIONS = "questions"
     REVIEW = "review"
+    PLAN_REVIEW = "plan_review"
+    PLAN_REVISION = "plan_revision"
 
 
 class PauseAction(str, Enum):
     RESUME = "resume"
     RETRY = "retry"
+    CANCEL = "cancel"
+
+
+class PlanReviewAction(str, Enum):
+    APPROVE = "approve"
+    REVISE = "revise"
     CANCEL = "cancel"
 
 
@@ -79,6 +89,23 @@ class TuiInteractionState:
         return ()
 
     @property
+    def plan_review_actions(self) -> tuple[PlanReviewAction, ...]:
+        if self.pause is None or self.pause.kind is not PauseKind.PLAN_REVIEW_REQUIRED:
+            return ()
+        return (
+            PlanReviewAction.APPROVE,
+            PlanReviewAction.REVISE,
+            PlanReviewAction.CANCEL,
+        )
+
+    @property
+    def selected_plan_review_action(self) -> PlanReviewAction | None:
+        actions = self.plan_review_actions
+        if not actions:
+            return None
+        return actions[self.action_index % len(actions)]
+
+    @property
     def permission_choices(self) -> tuple[PermissionApprovalChoice, ...]:
         request = self.pause.permission_request if self.pause is not None else None
         return request.choices if request is not None else ()
@@ -122,12 +149,16 @@ class TuiInteractionState:
     def open_pause(self, pause: PauseRequest) -> None:
         self._reset(pause)
         self.mode = (
-            InteractionMode.QUESTIONS
-            if pause.kind is PauseKind.USER_INPUT_REQUIRED
+            InteractionMode.PLAN_REVIEW
+            if pause.kind is PauseKind.PLAN_REVIEW_REQUIRED
             else (
-                InteractionMode.PERMISSION
-                if pause.kind is PauseKind.PERMISSION_REQUIRED
-                else InteractionMode.PAUSE_ACTION
+                InteractionMode.QUESTIONS
+                if pause.kind is PauseKind.USER_INPUT_REQUIRED
+                else (
+                    InteractionMode.PERMISSION
+                    if pause.kind is PauseKind.PERMISSION_REQUIRED
+                    else InteractionMode.PAUSE_ACTION
+                )
             )
         )
 
@@ -135,6 +166,11 @@ class TuiInteractionState:
         self._reset(None)
 
     def move(self, delta: int) -> None:
+        if self.mode is InteractionMode.PLAN_REVIEW:
+            actions = self.plan_review_actions
+            if actions:
+                self.action_index = (self.action_index + delta) % len(actions)
+            return
         if self.mode is InteractionMode.PAUSE_ACTION:
             actions = self.actions
             if actions:
@@ -257,6 +293,45 @@ class TuiInteractionState:
             choice=choice,
         )
 
+    def begin_plan_revision(self) -> bool:
+        if (
+            self.mode is not InteractionMode.PLAN_REVIEW
+            or self.selected_plan_review_action is not PlanReviewAction.REVISE
+        ):
+            return False
+        self.mode = InteractionMode.PLAN_REVISION
+        self.draft = ""
+        return True
+
+    def plan_review_response(self) -> PlanReviewResponse | None:
+        pause = self.pause
+        request = pause.plan_review_request if pause is not None else None
+        if pause is None or request is None:
+            return None
+        if self.mode is InteractionMode.PLAN_REVIEW:
+            if self.selected_plan_review_action is not PlanReviewAction.APPROVE:
+                return None
+            return PlanReviewResponse(
+                pause.pause_id,
+                pause.run_id,
+                pause.turn_id,
+                request.revision,
+                PlanReviewChoice.APPROVE,
+            )
+        if self.mode is InteractionMode.PLAN_REVISION:
+            feedback = self.draft.strip()
+            if not feedback:
+                return None
+            return PlanReviewResponse(
+                pause.pause_id,
+                pause.run_id,
+                pause.turn_id,
+                request.revision,
+                PlanReviewChoice.REVISE,
+                feedback,
+            )
+        return None
+
     def response_for_action(self):  # type: ignore[no-untyped-def]
         action = self.confirm_action()
         pause = self.pause
@@ -283,6 +358,45 @@ class TuiInteractionState:
         pause = self.pause
         if not self.open or pause is None:
             return ()
+        if self.mode is InteractionMode.PLAN_REVIEW:
+            request = pause.plan_review_request
+            if request is None:
+                return ()
+            lines: list[tuple[str, str]] = [
+                ("class:interaction.plan.title", f"Review Plan v{request.revision}\n"),
+                (
+                    "class:interaction.hint",
+                    "↑/↓ 选择 · Enter 确认 · Esc 暂时关闭\n",
+                ),
+            ]
+            labels = {
+                PlanReviewAction.APPROVE: "Approve and execute",
+                PlanReviewAction.REVISE: "Revise plan",
+                PlanReviewAction.CANCEL: "Cancel",
+            }
+            for index, action in enumerate(self.plan_review_actions):
+                marker = "›" if index == self.action_index else " "
+                lines.append(
+                    (
+                        "class:interaction.option",
+                        f"{marker} {labels[action]}\n",
+                    )
+                )
+            return tuple(lines)
+        if self.mode is InteractionMode.PLAN_REVISION:
+            request = pause.plan_review_request
+            if request is None:
+                return ()
+            return (
+                (
+                    "class:interaction.plan.title",
+                    f"Revise Plan v{request.revision}\n",
+                ),
+                (
+                    "class:interaction.hint",
+                    "输入修改点后按 Enter · Esc 返回 Review\n",
+                ),
+            )
         if self.mode is InteractionMode.PAUSE_ACTION:
             lines: list[tuple[str, str]] = [
                 ("class:interaction.title", "已暂停：选择下一步\n"),
@@ -426,5 +540,6 @@ class TuiInteractionState:
 __all__ = [
     "InteractionMode",
     "PauseAction",
+    "PlanReviewAction",
     "TuiInteractionState",
 ]

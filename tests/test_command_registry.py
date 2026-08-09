@@ -7,6 +7,7 @@ from uthcode.application.commands import (
     CommandDefinition,
     CommandKind,
     CommandRegistry,
+    create_builtin_registry,
 )
 
 
@@ -113,3 +114,20 @@ def test_definition_exposes_implementation_status_and_generated_usage() -> None:
 
     assert definition.implemented is False
     assert definition.usage_text == "/future"
+
+
+def test_builtin_registry_has_only_final_behavior_mode_command_names() -> None:
+    registry = create_builtin_registry()
+    plan = registry.resolve("plan")
+    execute = registry.resolve("do")
+
+    assert plan is not None and plan.implemented
+    assert execute is not None and execute.implemented
+    assert registry.resolve("build") is execute
+    assert registry.resolve("p") is None
+    assert "p" not in plan.aliases
+    assert execute.aliases == ("build",)
+    assert all(
+        definition.canonical != "build"
+        for definition in registry.list_commands()
+    )

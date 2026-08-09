@@ -10,10 +10,15 @@ from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.document import Document
 from prompt_toolkit.layout import VSplit
 from prompt_toolkit.output import DummyOutput
+from rich.text import Text
 
 from uthcode.application import (
     AgentRun,
     ApplicationRuntimeContext,
+    BehaviorMode,
+    BehaviorModeChanged,
+    BehaviorModeSelected,
+    CompletionBlocked,
     GenerationCompleted,
     GenerationRequest,
     Message,
@@ -21,6 +26,10 @@ from uthcode.application import (
     PauseKind,
     PauseReason,
     PauseRequest,
+    PlanProposed,
+    PlanReviewChoice,
+    PlanReviewRequest,
+    PlanReviewResponse,
     PermissionApprovalChoice,
     PermissionApprovalRequest,
     ProviderResponse,
@@ -31,11 +40,17 @@ from uthcode.application import (
     RunStatus,
     TextDelta,
     TextPart,
+    TaskItem,
+    TaskState,
+    TaskStateChanged,
+    TaskStatus,
     TurnHandle,
     ToolCallPart,
     ToolResultPart,
     Usage,
     UthCodeApplication,
+    UserSteeringApplied,
+    UserSteeringRequested,
     UserInputRequest,
     UserQuestion,
 )
@@ -54,12 +69,18 @@ from uthcode.interfaces.tui.app import (
     _tail_for_preview,
     _window_start,
 )
-from uthcode.interfaces.tui.interaction import InteractionMode, TuiInteractionState
+from uthcode.interfaces.tui.interaction import (
+    InteractionMode,
+    PlanReviewAction,
+    TuiInteractionState,
+)
 from uthcode.interfaces.tui.rendering import (
     AgentEventRenderer,
     MarkdownStream,
+    PlanUpdate,
     RenderBatch,
     TextUpdate,
+    TaskStateUpdate,
     ToolUpdate,
 )
 from uthcode.interfaces.tui.state import EscArmState, previous_grapheme_length
@@ -67,6 +88,7 @@ from uthcode.interfaces.tui.terminal import (
     CLEAR_VIEWPORT,
     KITTY_KEYBOARD_OFF,
     KITTY_KEYBOARD_ON,
+    PALETTE,
     RichTerminalRenderer,
     SYNCHRONIZED_OUTPUT_OFF,
     SYNCHRONIZED_OUTPUT_ON,
@@ -154,6 +176,74 @@ class _ProviderFailureThenSuccess(_ScriptedProvider):
             raise self._error
         async for event in super().stream(request, cancellation=cancellation):
             yield event
+
+
+class _FakeModeRun:
+    def __init__(self, mode: BehaviorMode = BehaviorMode.DEFAULT) -> None:
+        self.behavior_mode = mode
+        self.permission_mode = PermissionMode.DEFAULT
+        self.selected: list[BehaviorMode] = []
+
+    def set_behavior_mode(self, mode: BehaviorMode) -> None:
+        self.selected.append(mode)
+        self.behavior_mode = mode
+
+
+class _FakeSteeringHandle:
+    def __init__(self, *, accepted: bool = True, pending_pause: object | None = None) -> None:
+        self.accepted = accepted
+        self.pending_pause = pending_pause
+        self.paused = pending_pause is not None
+        self.steer_calls: list[str] = []
+        self.resume_calls: list[object] = []
+        self.cancel_calls = 0
+
+    def steer(self, text: str) -> bool:
+        self.steer_calls.append(text)
+        return self.accepted
+
+    def resume(self, response: object) -> bool:
+        self.resume_calls.append(response)
+        return True
+
+    def cancel(self) -> bool:
+        self.cancel_calls += 1
+        return True
+
+
+def _install_expected_w02_run_contract() -> None:
+    """Supply W03-only fakes without shadowing W02 after branch integration."""
+
+    if not hasattr(AgentRun, "behavior_mode"):
+        setattr(
+            AgentRun,
+            "behavior_mode",
+            property(lambda _run: BehaviorMode.DEFAULT),
+        )
+    if not hasattr(AgentRun, "set_behavior_mode"):
+        setattr(
+            AgentRun,
+            "set_behavior_mode",
+            lambda _run, mode: BehaviorMode(mode),
+        )
+    if not hasattr(TurnHandle, "steer"):
+        setattr(TurnHandle, "steer", lambda _handle, _text: False)
+
+
+_install_expected_w02_run_contract()
+
+
+def _plan_review_pause(revision: int = 1) -> PauseRequest:
+    return PauseRequest(
+        pause_id="plan-pause",
+        run_id="run",
+        turn_id="turn",
+        kind=PauseKind.PLAN_REVIEW_REQUIRED,
+        reason=PauseReason.PLAN_REVIEW_REQUIRED,
+        iteration=2,
+        created_at="now",
+        plan_review_request=PlanReviewRequest(revision, f"Plan {revision}"),
+    )
 
 
 def _completed(
@@ -389,6 +479,48 @@ def test_tui_interaction_state_renders_permission_choices_without_secret_payload
     assert response.choice is PermissionApprovalChoice.SESSION
 
 
+def test_tui_plan_review_state_approves_or_collects_revision_without_owning_plan_state() -> None:
+    pause = _plan_review_pause(3)
+    state = TuiInteractionState()
+    state.open_pause(pause)
+
+    assert state.mode is InteractionMode.PLAN_REVIEW
+    assert state.plan_review_actions == (
+        PlanReviewAction.APPROVE,
+        PlanReviewAction.REVISE,
+        PlanReviewAction.CANCEL,
+    )
+    assert state.selected_plan_review_action is PlanReviewAction.APPROVE
+    rendered = "".join(text for _style, text in state.render_lines())
+    assert "Plan v3" in rendered
+    assert "Approve and execute" in rendered
+    approve = state.plan_review_response()
+    assert approve == PlanReviewResponse(
+        "plan-pause",
+        "run",
+        "turn",
+        3,
+        PlanReviewChoice.APPROVE,
+    )
+
+    state.open_pause(pause)
+    state.move(1)
+    assert state.selected_plan_review_action is PlanReviewAction.REVISE
+    assert state.begin_plan_revision() is True
+    assert state.mode is InteractionMode.PLAN_REVISION
+    state.set_draft("保留 public API")
+    revise = state.plan_review_response()
+    assert revise == PlanReviewResponse(
+        "plan-pause",
+        "run",
+        "turn",
+        3,
+        PlanReviewChoice.REVISE,
+        "保留 public API",
+    )
+    assert not hasattr(state, "plan_state")
+
+
 def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None:
     question = UserQuestion(
         "mode",
@@ -455,6 +587,94 @@ def test_markdown_stream_commits_paragraphs_and_force_flushes_tail() -> None:
     assert stream.append("第一段\n\n") == ("第一段\n\n",)
     assert stream.append("- one\n- two") == ()
     assert stream.force() == "- one\n- two"
+
+
+def test_t08_events_project_plan_task_mode_steering_and_completion_control() -> None:
+    renderer = AgentEventRenderer(clock=lambda: 10.0)
+    plan = renderer.push(
+        PlanProposed("run", "turn", 1, 2, "# 完整 Plan v2")
+    )
+    assert plan is not None
+    assert plan.plans == (PlanUpdate(2, "# 完整 Plan v2"),)
+
+    task_state = TaskState(
+        (
+            TaskItem("探索", TaskStatus.COMPLETED),
+            TaskItem("实现", TaskStatus.IN_PROGRESS),
+            TaskItem("验证", TaskStatus.PENDING),
+        )
+    )
+    tasks = renderer.push(TaskStateChanged("run", "turn", 2, task_state))
+    assert tasks is not None
+    assert tasks.task_states == (
+        TaskStateUpdate(
+            (
+                ("completed", "探索"),
+                ("in_progress", "实现"),
+                ("pending", "验证"),
+            )
+        ),
+    )
+
+    requested = renderer.push(UserSteeringRequested("run", "turn", "steer-1"))
+    applied = renderer.push(UserSteeringApplied("run", "turn", "steer-1"))
+    blocked = renderer.push(CompletionBlocked("run", "turn", 3, 2))
+    mode = renderer.push(
+        BehaviorModeChanged(
+            "run",
+            "turn",
+            BehaviorMode.PLAN,
+            BehaviorMode.DEFAULT,
+        )
+    )
+
+    assert requested is not None and requested.activity == "steering…"
+    assert applied is not None and applied.activity == "updating task…"
+    assert requested.users == () and applied.users == ()
+    assert blocked is not None
+    assert blocked.activity == "continuing · 2 unfinished tasks"
+    assert blocked.text == () and blocked.final_text is None
+    assert mode is not None and mode.activity == "mode: default"
+
+
+@pytest.mark.asyncio
+async def test_plan_revisions_and_task_state_append_as_distinct_permanent_blocks() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            plans=(
+                PlanUpdate(1, "# 方案一"),
+                PlanUpdate(2, "# 完整替代方案二"),
+            ),
+            task_states=(
+                TaskStateUpdate(
+                    (
+                        ("completed", "探索"),
+                        ("in_progress", "实现"),
+                        ("pending", "验证"),
+                    )
+                ),
+            ),
+        )
+    )
+
+    rendered = output.getvalue()
+    plain = Text.from_ansi(rendered).plain
+    assert rendered.count("UthCode · Plan v1") == 1
+    assert rendered.count("UthCode · Plan v2") == 1
+    assert "方案一" in rendered and "完整替代方案二" in rendered
+    assert "✓ 探索" in plain
+    assert "› 实现" in plain
+    assert "○ 验证" in plain
+    assert PALETTE.plan_background != PALETTE.user_background
+    assert PALETTE.plan_accent != PALETTE.muted
+    plan_rgb = tuple(
+        int(PALETTE.plan_background[index : index + 2], 16)
+        for index in (1, 3, 5)
+    )
+    assert f"48;2;{plan_rgb[0]};{plan_rgb[1]};{plan_rgb[2]}m" in rendered
 
 
 def test_renderer_restores_roles_surfaces_markdown_and_code_colours() -> None:
@@ -536,6 +756,162 @@ async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access()
     await asyncio.sleep(0)
     assert tui._run.permission_mode is PermissionMode.FULL_ACCESS
     assert "高风险提示" in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_behavior_mode_action_updates_idle_run_separator_and_status_dimensions() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    run = _FakeModeRun()
+    tui._run = run  # type: ignore[assignment]
+
+    plan = tui.dispatcher.dispatch_text("/plan")
+    assert plan is not None and plan.ui_action == BehaviorModeSelected(BehaviorMode.PLAN)
+    await tui._apply_command_outcome("/plan", plan)
+
+    assert run.selected == [BehaviorMode.PLAN]
+    assert tui._separator_fragments()[0][0] == "class:separator.plan"
+    status = "".join(text for _style, text in tui._status_fragments())
+    assert "mode: plan" in status
+    assert "permission: default" in status
+
+    execute = tui.dispatcher.dispatch_text("/do")
+    assert execute is not None
+    await tui._apply_command_outcome("/do", execute)
+    assert run.selected == [BehaviorMode.PLAN, BehaviorMode.DEFAULT]
+    assert tui._separator_fragments()[0][0] == "class:separator"
+
+
+@pytest.mark.asyncio
+async def test_behavior_mode_action_does_not_switch_an_active_turn() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    run = _FakeModeRun()
+    tui._run = run  # type: ignore[assignment]
+    tui._active_handle = _FakeSteeringHandle()  # type: ignore[assignment]
+
+    plan = tui.dispatcher.dispatch_text("/plan")
+    assert plan is not None
+    await tui._apply_command_outcome("/plan", plan)
+
+    assert run.selected == []
+    assert run.behavior_mode is BehaviorMode.DEFAULT
+    assert "生成进行中不能切换行为模式" in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_active_turn_text_steers_and_appends_user_message_exactly_once() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    handle = _FakeSteeringHandle()
+    tui._active_handle = handle  # type: ignore[assignment]
+
+    await tui._handle_submission("和 2")
+    requested = AgentEventRenderer(clock=lambda: 10.0).push(
+        UserSteeringRequested("run", "turn", "steer-1")
+    )
+    applied = AgentEventRenderer(clock=lambda: 10.0).push(
+        UserSteeringApplied("run", "turn", "steer-1")
+    )
+    assert requested is not None and applied is not None
+    await tui._apply_batch(requested)
+    await tui._apply_batch(applied)
+
+    assert handle.steer_calls == ["和 2"]
+    assert output.getvalue().count("和 2") == 1
+    assert tui.activity == "updating task…"
+
+
+@pytest.mark.asyncio
+async def test_pending_typed_interaction_prevents_plain_text_steering() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    handle = _FakeSteeringHandle(pending_pause=object())
+    tui._active_handle = handle  # type: ignore[assignment]
+
+    await tui._handle_submission("不能旁路")
+
+    assert handle.steer_calls == []
+    assert "先完成当前交互" in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        InteractionMode.PAUSE_ACTION,
+        InteractionMode.PERMISSION,
+        InteractionMode.QUESTIONS,
+        InteractionMode.PLAN_REVIEW,
+    ),
+)
+@pytest.mark.asyncio
+async def test_open_typed_interaction_consumes_submit_before_steering(
+    mode: InteractionMode,
+) -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    handle = _FakeSteeringHandle(pending_pause=object())
+    tui._active_handle = handle  # type: ignore[assignment]
+    tui.interaction.mode = mode
+
+    await tui._handle_submission("typed input")
+
+    assert handle.steer_calls == []
+
+
+def test_plan_approve_mode_change_restores_default_separator_immediately() -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    run = _FakeModeRun(BehaviorMode.PLAN)
+    tui._run = run  # type: ignore[assignment]
+    assert tui._separator_fragments()[0][0] == "class:separator.plan"
+
+    run.behavior_mode = BehaviorMode.DEFAULT
+    batch = AgentEventRenderer(clock=lambda: 10.0).push(
+        BehaviorModeChanged(
+            "run",
+            "turn",
+            BehaviorMode.PLAN,
+            BehaviorMode.DEFAULT,
+        )
+    )
+    assert batch is not None
+
+    assert tui._separator_fragments()[0][0] == "class:separator"
+
+
+def test_tui_submits_plan_approve_and_revision_through_existing_resume_api() -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    handle = _FakeSteeringHandle(pending_pause=_plan_review_pause(4))
+    tui._active_handle = handle  # type: ignore[assignment]
+    tui.interaction.open_pause(handle.pending_pause)  # type: ignore[arg-type]
+
+    tui._submit_interaction()
+
+    assert handle.resume_calls == [
+        PlanReviewResponse(
+            "plan-pause",
+            "run",
+            "turn",
+            4,
+            PlanReviewChoice.APPROVE,
+        )
+    ]
+    assert tui.interaction.mode is InteractionMode.CLOSED
+
+    handle.pending_pause = _plan_review_pause(5)
+    tui.interaction.open_pause(handle.pending_pause)
+    tui.interaction.move(1)
+    tui._submit_interaction()
+    assert tui.interaction.mode is InteractionMode.PLAN_REVISION
+    tui.buffer.set_document(Document("缩小范围", len("缩小范围")), bypass_readonly=True)
+    tui._submit_interaction()
+    assert handle.resume_calls[-1] == PlanReviewResponse(
+        "plan-pause",
+        "run",
+        "turn",
+        5,
+        PlanReviewChoice.REVISE,
+        "缩小范围",
+    )
 
 
 @pytest.mark.asyncio

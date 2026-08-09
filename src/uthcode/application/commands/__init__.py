@@ -5,6 +5,7 @@ from .completion import CompletionEngine, complete_commands
 from .dispatcher import CommandContext, CommandDispatcher, CommandExecutionError
 from .models import (
     ArgumentSpec,
+    BehaviorModeSelected,
     CandidateProvider,
     ClearTranscript,
     CommandAvailability,
@@ -28,6 +29,7 @@ from .registry import CommandRegistry
 
 __all__ = [
     "ArgumentSpec",
+    "BehaviorModeSelected",
     "CandidateProvider",
     "ClearTranscript",
     "CommandAvailability",

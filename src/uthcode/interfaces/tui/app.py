@@ -35,6 +35,8 @@ from prompt_toolkit.utils import get_cwidth
 from uthcode.application import (
     AgentEvent,
     AgentRun,
+    BehaviorMode,
+    BehaviorModeSelected,
     ClearTranscript,
     CommandDefinition,
     CommandDispatcher,
@@ -55,7 +57,7 @@ from uthcode.application import (
 )
 
 from .completion import CompletionMenuItem, CompletionMenuState
-from .interaction import InteractionMode, TuiInteractionState
+from .interaction import InteractionMode, PlanReviewAction, TuiInteractionState
 from .picker import ModelPickerState, PermissionPickerState
 from .rendering import AgentEventRenderer, MarkdownStream, RenderBatch
 from .state import EscArmState, previous_grapheme_length
@@ -322,13 +324,19 @@ class UthCodeTUI:
 
     def _separator_fragments(self) -> StyleAndTextTuples:
         columns, _rows = self._terminal_size()
-        return [("class:separator", "─" * columns)]
+        style = (
+            "class:separator.plan"
+            if self._run.behavior_mode is BehaviorMode.PLAN
+            else "class:separator"
+        )
+        return [(style, "─" * columns)]
 
     def _status_fragments(self) -> StyleAndTextTuples:
         return [
             (
                 "class:status",
                 f" {self.activity} | {self.application.current_model_ref} | "
+                f"mode: {self._run.behavior_mode.value} | "
                 f"permission: {self._run.permission_mode.value} | "
                 f"{self.application.runtime_context.workdir} ",
             )
@@ -577,7 +585,17 @@ class UthCodeTUI:
                 await self._apply_command_outcome(text, outcome)
             return
         if self._active_handle is not None:
-            await self._show_error("生成进行中，请等待当前请求结束")
+            if self._active_handle.pending_pause is not None:
+                await self._show_error("请先完成当前交互，再更新任务要求")
+                return
+            accepted = self._active_handle.steer(text)  # type: ignore[attr-defined]
+            if not accepted:
+                await self._show_error("当前请求暂不能接收任务更新")
+                return
+            self._sync_renderer_width()
+            await self._emit(self._renderer.user_message(text))
+            self.activity = "steering…"
+            self._invalidate()
             return
         self._start_generation(text)
 
@@ -617,6 +635,12 @@ class UthCodeTUI:
             self.activity = f"permission: {action.mode.value}"
             if action.warning is not None:
                 await self._emit(self._renderer.system(action.warning))
+        elif isinstance(action, BehaviorModeSelected):
+            if self._active_handle is not None:
+                await self._show_error("生成进行中不能切换行为模式")
+            else:
+                self._run.set_behavior_mode(action.mode)  # type: ignore[attr-defined]
+                self.activity = f"mode: {action.mode.value}"
         prompt = outcome.prompt
         if prompt:
             if self._active_handle is None:
@@ -750,6 +774,12 @@ class UthCodeTUI:
         writes: list[str] = []
         for _message_id, text in batch.users:
             writes.append(self._renderer.user_message(text))
+        for update in batch.plans:
+            writes.append(
+                self._renderer.plan_message(update.text, revision=update.revision)
+            )
+        for update in batch.task_states:
+            writes.append(self._renderer.task_state(update.items))
         for update in batch.text:
             projection = self._streams.setdefault(
                 update.block_id,
@@ -872,7 +902,9 @@ class UthCodeTUI:
     def _sync_interaction_buffer(self) -> None:
         question = self.interaction.current_question
         value = ""
-        if question is not None and (
+        if self.interaction.mode is InteractionMode.PLAN_REVISION:
+            value = self.interaction.draft
+        elif question is not None and (
             question.kind.value == "text" or self.interaction.other_mode
         ):
             value = self.interaction.draft
@@ -882,7 +914,11 @@ class UthCodeTUI:
         )
 
     def _handle_interaction_escape(self) -> None:
-        if (
+        if self.interaction.mode is InteractionMode.PLAN_REVISION:
+            self.interaction.mode = InteractionMode.PLAN_REVIEW
+            self.interaction.set_draft("")
+            self.buffer.set_document(Document("", 0), bypass_readonly=True)
+        elif (
             self.interaction.mode is InteractionMode.QUESTIONS
             and self.interaction.other_mode
         ):
@@ -901,6 +937,33 @@ class UthCodeTUI:
     def _submit_interaction(self) -> None:
         handle = self._active_handle
         if handle is None or not self.interaction.open:
+            return
+        if self.interaction.mode is InteractionMode.PLAN_REVIEW:
+            action = self.interaction.selected_plan_review_action
+            if action is PlanReviewAction.CANCEL:
+                handle.cancel()
+                self.interaction.close()
+                self.activity = "cancelling"
+            elif action is PlanReviewAction.REVISE:
+                if self.interaction.begin_plan_revision():
+                    self.buffer.set_document(Document("", 0), bypass_readonly=True)
+                    self.activity = "revising plan"
+            else:
+                response = self.interaction.plan_review_response()
+                if response is not None and handle.resume(response):
+                    self.interaction.close()
+                    self.activity = "resuming"
+            self._reset_interaction_context()
+            return
+
+        if self.interaction.mode is InteractionMode.PLAN_REVISION:
+            self.interaction.set_draft(self.buffer.text)
+            response = self.interaction.plan_review_response()
+            if response is not None and handle.resume(response):
+                self.interaction.close()
+                self.buffer.set_document(Document("", 0), bypass_readonly=True)
+                self.activity = "resuming"
+                self._reset_interaction_context()
             return
         if self.interaction.mode is InteractionMode.PAUSE_ACTION:
             action = self.interaction.confirm_action()
@@ -1109,6 +1172,10 @@ class UthCodeTUI:
                 "interaction.hint": f"{PALETTE.muted} bg:{PALETTE.user_background}",
                 "interaction.option": f"{PALETTE.text} bg:{PALETTE.user_background}",
                 "separator": PALETTE.muted,
+                "separator.plan": f"bold {PALETTE.plan_accent}",
+                "interaction.plan.title": (
+                    f"bold {PALETTE.plan_accent} bg:{PALETTE.plan_background}"
+                ),
             }
         )
 

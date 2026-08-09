@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from uthcode.application import (
+    BehaviorMode,
+    BehaviorModeSelected,
     ClearTranscript,
     CommandDefinition,
     CommandDispatcher,
@@ -205,18 +207,49 @@ def test_permission_command_uses_the_same_registry_and_returns_session_action() 
     assert registry.resolve("permission") is not None
 
 
+def test_behavior_mode_commands_return_interface_neutral_actions_and_build_is_alias() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+
+    plan = dispatcher.dispatch_text("/plan")
+    execute = dispatcher.dispatch_text("/do")
+    build = dispatcher.dispatch_text("/build")
+
+    assert plan is not None and plan.status is OutcomeStatus.SUCCESS
+    assert plan.ui_action == BehaviorModeSelected(BehaviorMode.PLAN)
+    assert execute is not None and execute.ui_action == BehaviorModeSelected(
+        BehaviorMode.DEFAULT
+    )
+    assert build is not None and build.ui_action == BehaviorModeSelected(
+        BehaviorMode.DEFAULT
+    )
+    assert build.invocation is not None
+    assert build.invocation.canonical == "do"
+    assert build.invocation.alias == "build"
+    assert plan.prompt is None and execute.prompt is None and build.prompt is None
+
+
+@pytest.mark.parametrize("text", ["/plan extra", "/do extra", "/build extra"])
+def test_behavior_mode_commands_reject_arguments_without_producing_prompt(
+    text: str,
+) -> None:
+    outcome = CommandDispatcher(create_builtin_registry()).dispatch_text(text)
+
+    assert outcome is not None
+    assert outcome.status is OutcomeStatus.USAGE_ERROR
+    assert outcome.prompt is None
+
+
 @pytest.mark.parametrize(
     "canonical",
     [
         "config",
         "compact",
-        "plan",
         "new",
         "resume",
         "login",
         "memory",
         "dream",
-        "do",
         "review",
     ],
 )
@@ -250,6 +283,23 @@ def test_help_is_generated_from_the_same_registry_for_total_and_single_help() ->
     assert single is not None and single.output is not None
     assert "/custom" in single.output
     assert "custom description" in single.output
+
+
+def test_builtin_help_reports_final_behavior_commands_and_only_build_alias() -> None:
+    dispatcher = CommandDispatcher(create_builtin_registry())
+
+    total = dispatcher.dispatch_text("/help")
+    plan = dispatcher.dispatch_text("/help plan")
+    execute = dispatcher.dispatch_text("/help do")
+
+    assert total is not None and total.output is not None
+    assert plan is not None and plan.output is not None
+    assert execute is not None and execute.output is not None
+    assert "/plan — 进入规划模式 [已实现]" in total.output
+    assert "/do — 进入默认执行模式 [已实现]；别名：/build" in total.output
+    assert "别名：/p" not in total.output
+    assert "[未实现]" not in plan.output
+    assert "[未实现]" not in execute.output
 
 
 def test_model_command_switches_application_and_returns_structured_action() -> None:

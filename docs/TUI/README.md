@@ -65,6 +65,8 @@ Application(
 )
 ```
 
+普通文本的入口由当前 `AgentRun` 生命周期决定：idle 时调用 `start_turn`；active 且没有 typed interaction 时调用同一 `TurnHandle.steer(text)`。AskUser、Permission、Provider Retry 与 Plan Review 任一交互 pending 时，输入始终先归当前交互层，不能旁路成 Steering 或第二个 Turn。
+
 Windows 使用 prompt_toolkit 的原生 `KEY_EVENT_RECORD` Unicode 输入路径，并对 `Shift+Enter` 做一处修饰键映射。这样既不把 IME 提交拆成单字节，也不要求 Windows Terminal 支持 Kitty 键盘协议；模型或工具进程修改控制台代码页后，输入仍以 Unicode 进入 `Buffer`。粘贴由 prompt_toolkit 处理并原样保留多行文本。
 
 Composer 的提示符和 `BufferControl` 使用两个并排的持久 Window。禁止在 `DynamicContainer` 回调中重新创建焦点 Window：屏幕光标坐标以 Window 实例为键，实例变化会使 Renderer 回退到 `(0, 0)`，从而让中文 IME 预编辑锚到最左侧。提示符保留左侧内边距，硬件光标始终属于同一个 Buffer Window。
@@ -105,6 +107,7 @@ Composer 的提示符和 `BufferControl` 使用两个并排的持久 Window。�
 | 正文 | `#E0E0E0` |
 | fenced code block | `#121212` 背景与语法高亮；未单独配色的 token 回退为 `#E0E0E0` |
 | inline code | `#FEA62B` |
+| PLAN separator 与 Plan block | `plan_accent` 主色、`plan_background` 局部背景；与默认 separator、用户消息背景可区分 |
 | 工具竖线 | `#9A9A9A` |
 | 工具成功圆点与状态 | `#4EBF71` |
 | 工具失败、拒绝或错误圆点与状态 | `#B93C5B` |
@@ -135,13 +138,27 @@ Windows 直接读取带修饰键的原生 Unicode 控制台事件，从而在 Wi
 
 Slash Command 使用 Application 的正式 Completion 数据源。候选随草稿实时过滤，字符输入、Backspace 和左右编辑继续作用于同一份草稿。上下键只在当前可见窗口中移动，`Tab` 补全，`Enter` 执行，`Esc` 关闭。
 
+Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 和旧 Prompt `/do` 不再存在。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
+
 `/model` 打开模型候选时保存原草稿；按 `Esc` 后关闭选择器并恢复原对话输入。命令定义、参数提示和模型目录都来自 Application，TUI 不维护副本。
+
+## Behavior Mode、Plan、Todo 与 Steering
+
+输入框上方 separator 是 Behavior Mode 主视觉：`DEFAULT` 使用原有 muted 色，`PLAN` 使用专用 `plan_accent`。状态栏分别显示 `mode: default|plan` 与 `permission: default|auto|full_access`，不把两个维度合并。Plan 批准后 Application 将同一 active Turn 切回 `DEFAULT`，TUI 从 Run 公共属性读取结果并立即恢复默认 separator。
+
+`PlanProposed` 每个 revision 都作为新的完整 Markdown block 追加到主缓冲区，抬头为 `UthCode · Plan vN`，背景使用 `plan_background`；新 revision 不覆盖旧 Plan 或其它 scrollback。Plan Review 临时层提供 `Approve and execute`、`Revise plan`、`Cancel`：批准与修订都通过现有 `TurnHandle.resume(...)` 提交 typed response，界面只保存当前选择和修订草稿，不拥有 `PlanState`。
+
+`TaskStateChanged` 只投影事件携带的完整 replace-all 状态，使用 `✓ completed`、`› in_progress`、`○ pending` 的紧凑 checklist；TUI 不维护 Todo authority。`CompletionBlocked` 只更新继续执行状态，不显示已被 Core 丢弃的 candidate final。
+
+active Turn 接受 Steering 后，用户文本立即作为一条新的 user record 追加一次，活动状态显示 `steering…` / `updating task…`；`UserSteeringRequested` 与 `UserSteeringApplied` 不再次携带或渲染正文，也不增加第二个 Turn 分隔。
 
 ## 暂停、恢复与问答
 
 暂停只属于当前进程、当前内存 Run 的活动 Turn。对话根页面连续按两次 `Esc` 后，状态栏先显示 `pausing…`，到达安全边界后显示 `paused` 并打开临时动作层。动作层提供 `Resume` 或 `Cancel current turn`；网络/限流暂停提供 `Retry` 或 `Cancel current turn`。暂停期间仍保留原 `TurnHandle`，不会启动第二个 Turn，也不会产生第二个 `TurnStarted`。
 
 模型调用 `AskUserQuestion` 时，TUI 打开临时问题面板。面板支持文本、单选、多选和 `Other`，可用方向键导航、返回上一题、查看答案汇总并在确认后一次性提交。提交只调用 Application 公共 `TurnHandle.resume(...)`，问题答案和 pending pause 不在 TUI 形成第二份权威状态；答案正文也不会写入工具活动或永久系统消息。
+
+Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resume 通道。选择修订时只收集非空修改点并提交精确 revision response；选择批准后同一 handle 恢复，TUI 不自行改写 Run/Plan/Task 状态。选择 Cancel 仍走当前 Turn 的既有取消收口。
 
 `Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，不提供跨进程恢复。
 
@@ -176,6 +193,7 @@ Slash Command 使用 Application 的正式 Completion 数据源。候选随草�
 ```powershell
 conda activate re-uthcode
 python -m pytest tests/test_tui.py tests/test_architecture_boundaries.py -q
+python -m pytest tests/test_command_dispatcher.py tests/test_command_registry.py tests/test_command_completion.py tests/test_tui.py -q
 python -m pytest -q
 python -m compileall -q src tests
 python -m pip check
@@ -195,3 +213,7 @@ Windows Terminal 人工验收：
 8. 生成期间上翻、选择和复制旧文本，调整窗口大小，确认生成继续且历史不重写。
 9. 检查用户和 Agent 角色样式、Rich Markdown、代码块背景及工具终态颜色。
 10. 执行 `/clear` 后向上滚动，确认旧记录仍存在且对话上下文保留。
+11. idle 时依次执行 `/plan`、`/do` 与 `/build`，确认 separator/status 切换，且 `/build` 等价于 `/do`。
+12. 在 PLAN 中完成 Plan v1、修订后的完整 Plan v2 与批准，确认两个 Plan block 都保留，批准后 separator 立即恢复默认色。
+13. 观察 Todo replace-all 更新，确认三种符号与 Core 状态一致，CompletionBlocked 不显示候选完成正文。
+14. active Turn 输入新增要求，确认用户文本只显示一次、原 Turn 继续；在 AskUser、Permission、Retry 或 Plan Review pending 时确认输入不能旁路成 Steering。
