@@ -572,6 +572,12 @@ class UthCodeTUI:
         if self.interaction.open:
             self._submit_interaction()
             return
+        if (
+            self._active_handle is not None
+            and self._active_handle.pending_pause is not None
+        ):
+            self._open_pending_interaction()
+            return
         if text.lstrip().startswith("/"):
             invocation = self.parser.parse(text)
             if invocation.is_bare_slash:
@@ -585,9 +591,6 @@ class UthCodeTUI:
                 await self._apply_command_outcome(text, outcome)
             return
         if self._active_handle is not None:
-            if self._active_handle.pending_pause is not None:
-                await self._show_error("请先完成当前交互，再更新任务要求")
-                return
             accepted = self._active_handle.steer(text)  # type: ignore[attr-defined]
             if not accepted:
                 await self._show_error("当前请求暂不能接收任务更新")

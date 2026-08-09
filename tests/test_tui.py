@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
@@ -189,6 +191,30 @@ class _FakeModeRun:
         self.behavior_mode = mode
 
 
+class _FakeRunProxy:
+    """Test-local W02 run contract without mutating production classes."""
+
+    def __init__(self, run: AgentRun) -> None:
+        self._run = run
+        self.behavior_mode = BehaviorMode.DEFAULT
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        return self._run.permission_mode
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        self._run.set_permission_mode(mode)
+
+    def set_behavior_mode(self, mode: BehaviorMode) -> None:
+        self.behavior_mode = mode
+
+    def start_turn(self, prompt: str) -> TurnHandle:
+        return self._run.start_turn(prompt)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._run, name)
+
+
 class _FakeSteeringHandle:
     def __init__(self, *, accepted: bool = True, pending_pause: object | None = None) -> None:
         self.accepted = accepted
@@ -211,28 +237,6 @@ class _FakeSteeringHandle:
         return True
 
 
-def _install_expected_w02_run_contract() -> None:
-    """Supply W03-only fakes without shadowing W02 after branch integration."""
-
-    if not hasattr(AgentRun, "behavior_mode"):
-        setattr(
-            AgentRun,
-            "behavior_mode",
-            property(lambda _run: BehaviorMode.DEFAULT),
-        )
-    if not hasattr(AgentRun, "set_behavior_mode"):
-        setattr(
-            AgentRun,
-            "set_behavior_mode",
-            lambda _run, mode: BehaviorMode(mode),
-        )
-    if not hasattr(TurnHandle, "steer"):
-        setattr(TurnHandle, "steer", lambda _handle, _text: False)
-
-
-_install_expected_w02_run_contract()
-
-
 def _plan_review_pause(revision: int = 1) -> PauseRequest:
     return PauseRequest(
         pause_id="plan-pause",
@@ -243,6 +247,74 @@ def _plan_review_pause(revision: int = 1) -> PauseRequest:
         iteration=2,
         created_at="now",
         plan_review_request=PlanReviewRequest(revision, f"Plan {revision}"),
+    )
+
+
+def _ask_user_pause() -> PauseRequest:
+    return PauseRequest(
+        pause_id="ask-pause",
+        run_id="run",
+        turn_id="turn",
+        kind=PauseKind.USER_INPUT_REQUIRED,
+        reason=PauseReason.USER_INPUT_REQUIRED,
+        iteration=2,
+        created_at="now",
+        tool_call_id="ask-call",
+        user_input_request=UserInputRequest(
+            (
+                UserQuestion(
+                    "goal",
+                    "Goal",
+                    "What should change?",
+                    QuestionKind.TEXT,
+                ),
+            )
+        ),
+    )
+
+
+def _permission_pause() -> PauseRequest:
+    request = PermissionApprovalRequest(
+        permission_id="permission-1",
+        run_id="run",
+        turn_id="turn",
+        tool_call_id="write-call",
+        tool="WriteFile",
+        action="write",
+        effect=Effect.WRITE,
+        resource="safe.txt",
+        scope=ResourceScope.INSIDE,
+        reason="mode_fallback",
+        mode=PermissionMode.DEFAULT,
+        choices=(
+            PermissionApprovalChoice.ONCE,
+            PermissionApprovalChoice.SESSION,
+            PermissionApprovalChoice.REJECT,
+        ),
+        guard=False,
+    )
+    return PauseRequest(
+        pause_id="permission-pause",
+        run_id="run",
+        turn_id="turn",
+        kind=PauseKind.PERMISSION_REQUIRED,
+        reason=PauseReason.PERMISSION_REQUIRED,
+        iteration=2,
+        created_at="now",
+        tool_call_id="write-call",
+        permission_request=request,
+    )
+
+
+def _retry_pause() -> PauseRequest:
+    return PauseRequest(
+        pause_id="retry-pause",
+        run_id="run",
+        turn_id="turn",
+        kind=PauseKind.PROVIDER_UNAVAILABLE,
+        reason=PauseReason.NETWORK_ERROR,
+        iteration=2,
+        created_at="now",
     )
 
 
@@ -292,6 +364,7 @@ async def _start_tui(
         input_device=pipe,
         terminal_output=output,
     )
+    tui._run = _FakeRunProxy(tui._run)  # type: ignore[assignment]
     task = asyncio.create_task(tui.run_async())
     await _wait_until(lambda: tui.ui.is_running)
     return tui, (pipe_context, pipe), task, output
@@ -824,15 +897,57 @@ async def test_active_turn_text_steers_and_appends_user_message_exactly_once() -
 
 @pytest.mark.asyncio
 async def test_pending_typed_interaction_prevents_plain_text_steering() -> None:
-    output = RecordingOutput()
-    tui = UthCodeTUI(_application(), terminal_output=output)
-    handle = _FakeSteeringHandle(pending_pause=object())
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    pause = _ask_user_pause()
+    handle = _FakeSteeringHandle(pending_pause=pause)
     tui._active_handle = handle  # type: ignore[assignment]
 
     await tui._handle_submission("不能旁路")
 
     assert handle.steer_calls == []
-    assert "先完成当前交互" in output.getvalue()
+    assert tui.interaction.pause is pause
+    assert tui.interaction.mode is InteractionMode.QUESTIONS
+
+
+@pytest.mark.parametrize(
+    ("pause", "slash", "expected_mode"),
+    (
+        (_plan_review_pause(), "/plan", InteractionMode.PLAN_REVIEW),
+        (_ask_user_pause(), "/clear", InteractionMode.QUESTIONS),
+        (_permission_pause(), "/permission auto", InteractionMode.PERMISSION),
+        (_retry_pause(), "/quit", InteractionMode.PAUSE_ACTION),
+    ),
+)
+@pytest.mark.asyncio
+async def test_closed_pending_typed_pause_reopens_before_any_slash_dispatch(
+    pause: PauseRequest,
+    slash: str,
+    expected_mode: InteractionMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    handle = _FakeSteeringHandle(pending_pause=pause)
+    tui._active_handle = handle  # type: ignore[assignment]
+    tui.interaction.open_pause(pause)
+    tui._handle_interaction_escape()
+    assert tui.interaction.mode is InteractionMode.CLOSED
+
+    dispatch_calls: list[object] = []
+
+    def record_dispatch(invocation: object) -> None:
+        dispatch_calls.append(invocation)
+
+    monkeypatch.setattr(tui.dispatcher, "dispatch", record_dispatch)
+
+    await tui._handle_submission(slash)
+
+    assert dispatch_calls == []
+    assert tui.interaction.pause is pause
+    assert tui.interaction.mode is expected_mode
+    assert handle.steer_calls == []
+    assert handle.resume_calls == []
+    assert handle.cancel_calls == 0
+    assert tui._closing is False
 
 
 @pytest.mark.parametrize(
@@ -856,6 +971,43 @@ async def test_open_typed_interaction_consumes_submit_before_steering(
     await tui._handle_submission("typed input")
 
     assert handle.steer_calls == []
+
+
+def test_loading_w03_tui_tests_does_not_mutate_production_run_class_attributes() -> None:
+    test_path = Path(__file__).resolve()
+    repo_root = test_path.parents[1]
+    src_path = repo_root / "src"
+    script = f"""
+import runpy
+from uthcode.application import AgentRun, TurnHandle
+
+before = (frozenset(vars(AgentRun)), frozenset(vars(TurnHandle)))
+runpy.run_path({str(test_path)!r}, run_name="w03_tui_test_contract_probe")
+after = (frozenset(vars(AgentRun)), frozenset(vars(TurnHandle)))
+if before != after:
+    raise AssertionError(
+        "production class attributes changed while loading W03 tests: "
+        f"AgentRun added={{sorted(after[0] - before[0])}}, "
+        f"TurnHandle added={{sorted(after[1] - before[1])}}"
+    )
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value
+        for value in (str(src_path), environment.get("PYTHONPATH", ""))
+        if value
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_plan_approve_mode_change_restores_default_separator_immediately() -> None:

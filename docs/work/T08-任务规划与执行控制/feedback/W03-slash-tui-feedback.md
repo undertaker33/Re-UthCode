@@ -72,3 +72,30 @@ visible typed interaction
 - 未增加第三种 Build mode、旧 `/p`、旧 Prompt `/do`、第二 command registry、Interface-owned Run/Plan/Task state、第二 Turn/Runtime 或 W02 placeholder Runtime。
 - 未回写 scrollback，未进入 alternate screen，未启用鼠标，未发送 `CSI 3J`；永久内容仍按一个 RenderBatch 一次提交。
 - 未 push、rebase、普通 merge、reset、操作远端或清理任何 worktree/分支。
+
+## 8. 返工第 1 轮
+
+### 8.1 审查问题与修复
+
+- 审查发现：临时 typed interaction 被 Esc 关闭后，`_handle_submission(...)` 会先分发 Slash；因此 active Turn 仍有 Plan Review、AskUser、Permission 或 Provider Retry pause 时，`/clear`、`/permission`、`/quit` 等命令可能先产生副作用。
+- 已把 active handle 的 `pending_pause` 判定移到 Slash dispatch、Steering 与 idle `start_turn` 之前。发现 pending pause 时只调用既有 `_open_pending_interaction()` 恢复临时交互层并立即返回，不解析或分发本次 Slash。
+- 已彻底删除 `tests/test_tui.py` 模块加载阶段对真实 `AgentRun`、`TurnHandle` 的条件性 `setattr`。W03 分支测试改用测试本地 `_FakeRunProxy`、`_FakeModeRun` 与 `_FakeSteeringHandle` 注入，不修改生产类。
+- 本节取代第 6 节中“成员缺失时安装最小 fake 合同”的旧说明；旧记录按返工规则保留，不再代表当前实现。
+
+### 8.2 测试先行与复验
+
+- 当前源码导入路径确认：`D:\project\Re-UthCode-T08-W03\src\uthcode\__init__.py`。
+- 红测：四类 closed pending typed pause 均先进入 Slash dispatch，隔离进程也检测到加载 W03 测试后生产类新增属性，共 `5 failed`。
+- 修复后 reviewer 复现集合：`6 passed, 65 deselected in 2.06s`；覆盖 Plan Review + `/plan`、AskUser + `/clear`、Permission + `/permission auto`、Retry + `/quit`，并验证 dispatcher、Steering、resume、cancel、quit 均无副作用。
+- 完整 `tests/test_tui.py`：`71 passed in 7.92s`。
+- Task 8/9 精确 command + TUI 集合：`120 passed in 8.40s`。
+- Architecture + package：`31 passed in 5.07s`。
+- 全量回归：`809 passed, 3 skipped in 44.09s`。
+- `compileall -q src tests` 退出码为 0；`pip check` 为 `No broken requirements found.`；`git diff --check` 无 whitespace error。
+- 负向扫描确认没有模块导入期生产类补丁，也没有 Interface 对 `core` 或 `integrations` 的直接导入。
+
+### 8.3 Checklist 与接线边界
+
+- Task 8、Task 9 的既有勾选继续由上述新证据支持；未修改冻结 Spec、Tasks、Prompt 或 Checklist 文字。
+- 未读取或合并 W02 未完成实现。测试本地代理只表达 W03 所需预期合同；真实 `AgentRun.behavior_mode`、mode setter 与 `TurnHandle.steer(text)` 仍由 W04 在合并分支接线并端到端复验。
+- Windows Terminal 人工复核项保持不变；本轮未新增生产兼容层、命令入口或跨层状态所有权。
