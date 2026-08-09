@@ -13,6 +13,7 @@ from uthcode.core import (
     ToolResultPart,
 )
 from uthcode.core.permission import Effect, ResourceScope
+from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
 from uthcode.integrations.tools.search_tools import GlobTool, GrepTool
 from uthcode.integrations.tools.workspace import WorkspacePathResolver
 
@@ -70,6 +71,19 @@ def test_search_tools_preflight_produces_read_actions(tmp_path: Path) -> None:
     assert grep_action.action == "grep"
     assert glob_action.resource == grep_action.resource == "."
     assert resolver.root == tmp_path.resolve()
+
+
+def test_search_tools_are_explicitly_plan_visible_without_wire_metadata(
+    tmp_path: Path,
+) -> None:
+    _, glob, grep = _search_tools(tmp_path)
+
+    assert isinstance(glob, ToolPlanningMetadata)
+    assert isinstance(grep, ToolPlanningMetadata)
+    assert glob.planning_access is ToolPlanningAccess.READ_ONLY
+    assert grep.planning_access is ToolPlanningAccess.READ_ONLY
+    assert "planning_access" not in glob.definition.to_dict()
+    assert "planning_access" not in grep.definition.to_dict()
 
 
 @pytest.mark.asyncio

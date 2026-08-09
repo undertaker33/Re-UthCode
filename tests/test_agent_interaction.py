@@ -19,6 +19,9 @@ from uthcode.core.interaction import (
     PauseKind,
     PauseReason,
     PauseRequest,
+    PlanReviewChoice,
+    PlanReviewRequest,
+    PlanReviewResponse,
     PermissionApprovalChoice,
     PermissionApprovalRequest,
     PermissionApprovalResponse,
@@ -26,6 +29,7 @@ from uthcode.core.interaction import (
     QuestionOption,
     RetryProviderResponse,
     ResumeTurnResponse,
+    SteeringRequest,
     UserInputRequest,
     UserInputResponse,
     UserQuestion,
@@ -96,6 +100,7 @@ def test_enums_and_pause_combinations_are_fixed() -> None:
         "user_input_required",
         "provider_unavailable",
         "permission_required",
+        "plan_review_required",
     ]
     assert [item.value for item in PauseReason] == [
         "user_requested",
@@ -103,6 +108,7 @@ def test_enums_and_pause_combinations_are_fixed() -> None:
         "network_error",
         "rate_limited",
         "permission_required",
+        "plan_review_required",
     ]
 
     PauseRequest(
@@ -236,9 +242,109 @@ def test_other_and_response_type_matching() -> None:
         (ResumeTurnResponse("pause", "run", "turn"), "resume_turn"),
         (RetryProviderResponse("pause", "run", "turn"), "retry_provider"),
         (UserInputResponse("pause", "run", "turn", "call", {"q": ["a"]}), "user_input"),
+        (
+            PlanReviewResponse(
+                "pause",
+                "run",
+                "turn",
+                1,
+                PlanReviewChoice.APPROVE,
+            ),
+            "plan_review",
+        ),
     ):
         assert json.loads(response.to_json())["type"] == response_type
         assert pause_response_from_json(response.to_json()) == response
+
+
+def test_plan_review_request_response_and_revision_validation_are_strict() -> None:
+    request = PlanReviewRequest(2, "Complete replacement plan")
+    pause = PauseRequest(
+        "pause-plan",
+        "run-1",
+        "turn-1",
+        PauseKind.PLAN_REVIEW_REQUIRED,
+        PauseReason.PLAN_REVIEW_REQUIRED,
+        3,
+        "now",
+        plan_review_request=request,
+    )
+    approve = PlanReviewResponse(
+        "pause-plan",
+        "run-1",
+        "turn-1",
+        2,
+        PlanReviewChoice.APPROVE,
+    )
+    revise = PlanReviewResponse(
+        "pause-plan",
+        "run-1",
+        "turn-1",
+        2,
+        PlanReviewChoice.REVISE,
+        "Keep the public API unchanged.",
+    )
+
+    assert pause.validate_response(approve) is None
+    assert pause.validate_response(revise) is None
+    assert PauseRequest.from_json(pause.to_json()) == pause
+    assert PlanReviewRequest.from_json(request.to_json()) == request
+    assert pause_response_from_json(approve.to_json()) == approve
+    assert pause_response_from_json(revise.to_json()) == revise
+    assert pause.to_dict()["plan_review_request"] == request.to_dict()
+
+    for response in (
+        PlanReviewResponse("wrong", "run-1", "turn-1", 2, PlanReviewChoice.APPROVE),
+        PlanReviewResponse("pause-plan", "wrong", "turn-1", 2, PlanReviewChoice.APPROVE),
+        PlanReviewResponse("pause-plan", "run-1", "wrong", 2, PlanReviewChoice.APPROVE),
+        PlanReviewResponse("pause-plan", "run-1", "turn-1", 1, PlanReviewChoice.APPROVE),
+    ):
+        with pytest.raises(ValueError):
+            pause.validate_response(response)
+
+    with pytest.raises(ValueError):
+        PlanReviewResponse(
+            "pause-plan",
+            "run-1",
+            "turn-1",
+            2,
+            PlanReviewChoice.REVISE,
+            " ",
+        )
+    with pytest.raises(ValueError):
+        PlanReviewResponse(
+            "pause-plan",
+            "run-1",
+            "turn-1",
+            2,
+            PlanReviewChoice.APPROVE,
+            "unexpected feedback",
+        )
+
+
+def test_steering_request_is_immutable_json_safe_and_not_a_pause() -> None:
+    request = SteeringRequest(
+        steering_id="steer-1",
+        run_id="run-1",
+        turn_id="turn-1",
+        text="Also update the tests.",
+    )
+
+    assert SteeringRequest.from_json(request.to_json()) == request
+    assert request.to_dict() == {
+        "steering_id": "steer-1",
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "text": "Also update the tests.",
+    }
+    assert not isinstance(request, PauseRequest)
+    assert "steer" not in {item.value for item in PauseKind}
+    with pytest.raises(FrozenInstanceError):
+        request.text = "changed"  # type: ignore[misc]
+    with pytest.raises((TypeError, ValueError)):
+        SteeringRequest("steer-1", "run-1", "turn-1", " ")
+    with pytest.raises((TypeError, ValueError, KeyError)):
+        SteeringRequest.from_dict({**request.to_dict(), "unexpected": True})
 
 
 def test_permission_approval_protocol_is_strict_and_redacted() -> None:

@@ -18,6 +18,7 @@ from uthcode.core import (
     ToolResultPart,
 )
 from uthcode.core.permission import Effect, ResourceScope
+from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
 from uthcode.integrations.tools.process_tools import BashTool, classify_bash_command
 
 
@@ -138,6 +139,16 @@ def test_bash_preflight_uses_trusted_classifier_and_safe_scope(tmp_path: Path) -
     assert action.resource is not None
     assert "__uthcode_bash_action__:other" in action.resource
     assert action.resource.endswith("git status")
+
+
+def test_bash_is_plan_visible_but_keeps_access_out_of_provider_schema(
+    tmp_path: Path,
+) -> None:
+    tool = BashTool(tmp_path)
+
+    assert isinstance(tool, ToolPlanningMetadata)
+    assert tool.planning_access is ToolPlanningAccess.READ_ONLY
+    assert "planning_access" not in tool.definition.to_dict()
 
 
 @pytest.mark.asyncio

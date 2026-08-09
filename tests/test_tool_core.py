@@ -10,6 +10,8 @@ from uthcode.core.tool import (
     Tool,
     ToolExecutionResult,
     ToolExecutor,
+    ToolPlanningAccess,
+    ToolPlanningMetadata,
     ToolRegistry,
     ToolPreparation,
 )
@@ -134,6 +136,15 @@ class PreflightTool(FakeTool):
 
 
 @dataclass
+class PlanningAwareFakeTool(FakeTool):
+    access: ToolPlanningAccess = ToolPlanningAccess.READ_ONLY
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return self.access
+
+
+@dataclass
 class SpyPermissionEvaluator:
     evaluated: list[PermissionAction] = field(default_factory=list)
 
@@ -193,6 +204,41 @@ def test_registry_validates_schemas_and_preserves_definition_order() -> None:
     assert isinstance(registry.list_tools(), tuple)
     assert registry.get("first") is first
     assert registry.get("missing") is None
+
+
+def test_registry_snapshots_explicit_planning_access_and_fails_closed_by_default() -> None:
+    hidden_by_default = FakeTool("undeclared")
+    visible = PlanningAwareFakeTool("visible")
+    explicit_hidden = PlanningAwareFakeTool("hidden", access=ToolPlanningAccess.HIDDEN)
+    registry = ToolRegistry((hidden_by_default, visible, explicit_hidden))
+
+    assert isinstance(visible, ToolPlanningMetadata)
+    assert not isinstance(hidden_by_default, ToolPlanningMetadata)
+    assert registry.planning_access_for("undeclared") is ToolPlanningAccess.HIDDEN
+    assert registry.planning_access_for("visible") is ToolPlanningAccess.READ_ONLY
+    assert registry.planning_access_for("hidden") is ToolPlanningAccess.HIDDEN
+    assert registry.planning_access_for("missing") is None
+    assert tuple(item.name for item in registry.plan_definitions()) == ("visible",)
+    assert tuple(item.name for item in registry.definitions()) == (
+        "undeclared",
+        "visible",
+        "hidden",
+    )
+    assert all("planning_access" not in item.to_dict() for item in registry.definitions())
+
+    visible.access = ToolPlanningAccess.HIDDEN
+    assert registry.planning_access_for("visible") is ToolPlanningAccess.READ_ONLY
+    assert tuple(item.name for item in registry.plan_definitions()) == ("visible",)
+
+
+def test_registry_rejects_invalid_declared_planning_access() -> None:
+    class InvalidPlanningTool(FakeTool):
+        @property
+        def planning_access(self) -> str:
+            return "read_only"
+
+    with pytest.raises(TypeError, match="planning_access"):
+        ToolRegistry((InvalidPlanningTool("invalid"),))
 
 
 def test_registry_rejects_duplicate_names_and_invalid_json_schema() -> None:
