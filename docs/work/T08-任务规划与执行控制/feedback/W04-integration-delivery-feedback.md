@@ -111,3 +111,28 @@ W04 独立验收指出原正式 E2E 只验证了文件副作用和部分公开�
 - `git diff --check`：退出码 0，无 whitespace error。
 - UTF-8 guard：本轮改动的 6 个 Markdown 文件全部 `OK`，无 replacement character、mojibake 或 fence 不平衡。
 - 负向扫描：无旧 `/p`/Prompt `/do`/第三 Build mode、重复 Runtime/规划职责、动态 Hook registry、Interface Core/Integration 反向依赖或 Interface-owned Plan/Task state；`AgentLoop` 与 `AgentTurnExecution` 定义各 1 个。
+
+## 11. 返工第 2 轮
+
+### 原因
+
+独立 reviewer 发现 `_run_formal_application_e2e()` 与正式成功测试各自保留完整 workspace、十轮 Provider script、Application/Run/Turn 组装和事件 driver，形成约 300 行双轨 fixture，增加成功路径与故障反例漂移风险。
+
+### 实际修改
+
+- 删除正式成功测试中的重复 workspace、Provider script、Application/Run/Turn 组装和事件 driver；成功测试现在唯一调用 `_run_formal_application_e2e(tmp_path)`。
+- verify-read 故障反例继续调用同一个 runner，仅通过 `fail_verify_read=True` 注入第二次 ReadFile 的 `is_error=True` 结果，并由同一严格 Tool evidence validator 证明主 E2E 验收失败。
+- 保留成功路径全部严格断言：8 个 ToolResult 的顺序/唯一闭合/正文/`is_error`，5 个 ToolBatch 的 ID 集合/状态，`plan-read`/`verify-read`，gate/stale-write，文件副作用，Plan/Todo/Steering/reset 和唯一 terminal。
+- 未创建第二套 helper/fixture，未降低断言强度；仅修改 `tests/test_t08_e2e.py` 与本 Feedback 追加章节。
+
+### 重新验证结果
+
+- W04 E2E：`5 passed`。
+- architecture/package：`32 passed`。
+- T04–T08 定向回归：`788 passed, 3 skipped`。
+- 全量 pytest：`847 passed, 3 skipped`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：退出码 0。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`。
+- `git diff --check`：退出码 0，无 whitespace error。
+- UTF-8 guard：W04 Feedback 共 1 个改动 Markdown 文件，结果 `OK`；无 replacement character、mojibake 或 fence 不平衡。
+- 负向扫描：无旧 Slash 入口、重复 Runtime/规划职责、动态 Hook registry、Interface 越界依赖；`AgentLoop` 与 `AgentTurnExecution` 定义各 1 个。
