@@ -944,6 +944,24 @@ class AgentTurnExecution:
         if self._active_segment_signal is not None:
             self._active_segment_signal.cancel()
 
+    def apply_plan_approval(
+        self,
+        response: PlanReviewResponse,
+        *,
+        event_sink: AgentEventSink | None = None,
+    ) -> tuple[AgentEvent, ...]:
+        """Apply one validated approval before Application publishes resume."""
+
+        if not isinstance(response, PlanReviewResponse):
+            raise TypeError("response must be a PlanReviewResponse")
+        if response.choice is not PlanReviewChoice.APPROVE:
+            raise ValueError("response must approve the current Plan")
+        if self._terminal_result is not None or self._cancellation.cancelled:
+            raise ValueError("cancelled or terminal execution cannot approve a Plan")
+        events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
+        self._apply_response(response, events)
+        return tuple(events)
+
     def _visible_tool_definitions(self) -> tuple[ToolDefinition, ...]:
         """Return this iteration's mode-filtered view of the captured universe."""
 
@@ -1069,6 +1087,8 @@ class AgentTurnExecution:
                         return self._paused_segment(events)
                     if batch_status == "cancelled":
                         return self._cancel_segment(events)
+                    if batch_status == "internal_error":
+                        return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
                     if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
                         return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
                     continue
@@ -1350,6 +1370,8 @@ class AgentTurnExecution:
                     return self._paused_segment(events)
                 if batch_status == "cancelled":
                     return self._cancel_segment(events)
+                if batch_status == "internal_error":
+                    return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
                 if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
                     return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
         except CancelledError:
@@ -1930,6 +1952,66 @@ class AgentTurnExecution:
         )
         self._close_tool_batch(events, status="cancelled")
 
+    def _fail_remaining_tools_after_hook(
+        self,
+        events: list[AgentEvent],
+        *,
+        reason: str,
+    ) -> None:
+        """Close the current and untouched original calls after a Hook crash."""
+
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            raise RuntimeError("Hook failure has no active Tool batch")
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        batch_id = self._require_batch_id()
+        while index < len(continuation.tool_calls):
+            call = continuation.tool_calls[index]
+            known = (
+                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or (
+                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or self._loop._tool_registry.get(call.name) is not None
+            command = self._safe_command(call, known=known)
+            if index != continuation.next_tool_index:
+                self._append(
+                    events,
+                    ToolStarted(
+                        self._state.run_id,
+                        self._state.turn_id,
+                        continuation.iteration,
+                        batch_id,
+                        call.tool_call_id,
+                        call.name,
+                        command,
+                    ),
+                )
+            result = _controlled_tool_result(call, reason)
+            results.append(result)
+            self._append(
+                events,
+                ToolFinished(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                    "failed",
+                    True,
+                ),
+            )
+            index += 1
+        self._continuation = replace(
+            continuation,
+            completed_tool_results=tuple(results),
+            next_tool_index=index,
+            pending_pause=None,
+        )
+        self._close_tool_batch(events, status="failed")
+
     async def _execute_prepared(
         self,
         prepared: PreparedToolCall,
@@ -2185,14 +2267,21 @@ class AgentTurnExecution:
                         controlled = True
                         status = "failed" if result.is_error else "finished"
                     else:
-                        hook_result = self._loop._runtime_hooks.run_before_tool_execution(
-                            BeforeToolExecutionContext(
-                                self._state.run_id,
-                                self._state.turn_id,
-                                self._state.behavior_mode,
-                                prepared_or_result,
+                        try:
+                            hook_result = self._loop._runtime_hooks.run_before_tool_execution(
+                                BeforeToolExecutionContext(
+                                    self._state.run_id,
+                                    self._state.turn_id,
+                                    self._state.behavior_mode,
+                                    prepared_or_result,
+                                )
                             )
-                        )
+                        except Exception:
+                            self._fail_remaining_tools_after_hook(
+                                events,
+                                reason="Error: pre-tool hook failed",
+                            )
+                            return "internal_error"
                         if isinstance(hook_result, BeforeToolExecutionReject):
                             result = _controlled_tool_result(call, hook_result.error_text)
                             controlled = True

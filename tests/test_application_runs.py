@@ -39,6 +39,7 @@ from uthcode.core.agent_events import (
     ToolStarted,
     TurnCancelled,
     TurnCompleted,
+    TurnFailed,
     TurnPaused,
     TurnResumed,
     TurnPausing,
@@ -49,6 +50,7 @@ from uthcode.core.agent_events import (
     TurnStarted,
 )
 from uthcode.core.agent import AgentTurnExecution
+from uthcode.core.hooks import RuntimeHookSet
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
@@ -62,6 +64,13 @@ from uthcode.core.interaction import (
     UserQuestion,
 )
 from uthcode.core.planning import BehaviorMode, TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.permission import (
+    Effect,
+    PermissionAction,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+)
 from uthcode.core.provider import (
     CancellationToken,
     FinishReason,
@@ -77,12 +86,14 @@ from uthcode.core.provider import (
     TextDelta,
     TextPart,
     ToolCallPart,
+    ToolDefinition,
     ToolResultPart,
     Usage,
 )
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.application.tools import ApplicationToolService
+from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
 
 
 def _response(
@@ -184,6 +195,92 @@ class _FailThenProvider:
             raise self.failure
         cancellation.raise_if_cancelled()
         yield self.response
+
+
+class _SteeringRaceProvider:
+    def __init__(self, first_outcome: str) -> None:
+        self.identity = ProviderIdentity("fake", "steering-race", "fake-model")
+        self.first_outcome = first_outcome
+        self.requests: list[GenerationRequest] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            self.entered.set()
+            yield ProviderReasoningDelta("partial")
+            await self.release.wait()
+            if self.first_outcome == "cancelled":
+                cancellation.raise_if_cancelled()
+            elif self.first_outcome == "error":
+                raise NetworkError("synthetic steering race")
+            else:
+                yield _response(TextPart("stale completion"))
+            return
+        cancellation.raise_if_cancelled()
+        yield _response(TextPart("updated answer"))
+
+
+class _ApplicationGateTool:
+    def __init__(self, name: str = "Work", *, gated: bool = False) -> None:
+        self._name = name
+        self.gated = gated
+        self.trace: list[str] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    def definition(self):
+        return ToolDefinition(
+            self._name,
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
+
+    def preflight(self, arguments) -> ToolPreparation:
+        self.trace.append(f"preflight:{arguments['value']}")
+        return ToolPreparation(
+            PermissionAction(
+                tool=self._name,
+                action="execute",
+                effect=Effect.READ,
+                resource="workspace/item",
+                scope=ResourceScope.INSIDE,
+            ),
+            arguments,
+        )
+
+    async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+        cancellation.raise_if_cancelled()
+        self.trace.append(f"execute:{arguments['value']}")
+        self.entered.set()
+        if self.gated:
+            await self.release.wait()
+        return ToolExecutionResult(str(arguments["value"]))
+
+
+class _RecordingPermissionEvaluator(PermissionEvaluator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[PermissionAction] = []
+
+    def evaluate(self, action, mode=PermissionMode.DEFAULT, session_grants=()):
+        self.calls.append(action)
+        return super().evaluate(action, mode=mode, session_grants=session_grants)
 
 
 async def _collect(handle: TurnHandle) -> list[AgentEvent]:
@@ -1757,3 +1854,221 @@ async def test_t08_steering_preserves_task_state_until_model_explicitly_rewrites
     steering_prompt = provider.requests[2].system_prompt or ""
     assert "[in_progress] old goal" in steering_prompt
     assert "一次性运行反馈类型：user_steering" in steering_prompt
+
+
+@pytest.mark.asyncio
+async def test_t08_application_hook_exception_closes_all_call_ids_before_turn_failure() -> None:
+    tool = _ApplicationGateTool()
+    service = ApplicationToolService((tool,))
+    hook_calls: list[str] = []
+
+    def explode(context):
+        hook_calls.append(context.prepared_call.call.tool_call_id)
+        raise RuntimeError("synthetic pre-tool hook failure")
+
+    service._runtime_hooks = RuntimeHookSet(before_tool_execution=(explode,))
+    calls = (
+        ToolCallPart("hook-1", "Work", {"value": "one"}),
+        ToolCallPart("hook-2", "Work", {"value": "two"}),
+    )
+    provider = _ScriptedProvider(
+        ((_response(*calls, finish_reason=FinishReason.TOOL_CALLS),),)
+    )
+    application = UthCodeApplication(provider, tool_service=service)
+    evaluator = _RecordingPermissionEvaluator()
+    run = AgentRun(application, run_id="hook-failure", permission_evaluator=evaluator)
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    handle = run.start_turn("run both")
+
+    events = await _collect(handle)
+    result = await handle.result()
+
+    assert result.status is RunStatus.FAILED
+    assert result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert hook_calls == ["hook-1"]
+    assert tool.trace == ["preflight:one"]
+    assert evaluator.calls == []
+    assert [event.tool_call_id for event in events if isinstance(event, ToolStarted)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.status for event in events if isinstance(event, ToolFinished)] == [
+        "failed",
+        "failed",
+    ]
+    batches = [event for event in events if isinstance(event, ToolBatchFinished)]
+    assert len(batches) == 1
+    assert batches[0].tool_call_ids == ("hook-1", "hook-2")
+    assert batches[0].status == "failed"
+    assert sum(isinstance(event, TurnFailed) for event in events) == 1
+    assert not any(isinstance(event, TurnCompleted) for event in events)
+    messages = handle._driver.execution.state.messages
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+    assert [part.tool_call_id for part in messages[-1].parts] == ["hook-1", "hook-2"]
+    assert all(part.is_error for part in messages[-1].parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_outcome", ["cancelled", "error", "completed"])
+async def test_t08_steering_pending_makes_provider_pause_rejection_truthful(
+    first_outcome: str,
+) -> None:
+    provider = _SteeringRaceProvider(first_outcome)
+    run = UthCodeApplication(provider).create_run(run_id=f"steer-{first_outcome}")
+    handle = run.start_turn("initial goal")
+    events_task = asyncio.create_task(_collect(handle))
+    await provider.entered.wait()
+
+    assert handle.steer("updated goal") is True
+    assert handle.pause() is False
+    provider.release.set()
+
+    events = await asyncio.wait_for(events_task, timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "updated answer"
+    assert len(provider.requests) == 2
+    assert provider.requests[1].messages[-1].parts == (TextPart("updated goal"),)
+    assert sum(isinstance(event, UserSteeringApplied) for event in events) == 1
+    assert not any(isinstance(event, TurnPaused) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_t08_steering_pending_makes_tool_boundary_pause_rejection_truthful() -> None:
+    tool = _ApplicationGateTool(gated=True)
+    service = ApplicationToolService((tool,))
+    calls = (
+        ToolCallPart("tool-1", "Work", {"value": "one"}),
+        ToolCallPart("tool-2", "Work", {"value": "two"}),
+    )
+    provider = _ScriptedProvider(
+        (
+            (_response(*calls, finish_reason=FinishReason.TOOL_CALLS),),
+            (_response(TextPart("updated answer")),),
+        )
+    )
+    run = UthCodeApplication(provider, tool_service=service).create_run(run_id="tool-steer")
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    handle = run.start_turn("initial goal")
+    events_task = asyncio.create_task(_collect(handle))
+    await tool.entered.wait()
+
+    assert handle.steer("skip stale remainder") is True
+    assert handle.pause() is False
+    tool.release.set()
+
+    events = await asyncio.wait_for(events_task, timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+    assert result.status is RunStatus.COMPLETED
+    assert tool.trace == ["preflight:one", "execute:one"]
+    finished = [event for event in events if isinstance(event, ToolFinished)]
+    assert [event.tool_call_id for event in finished] == ["tool-1", "tool-2"]
+    assert [event.status for event in finished] == ["finished", "skipped"]
+    assert [event.status for event in events if isinstance(event, ToolBatchFinished)] == [
+        "steered"
+    ]
+    assert not any(isinstance(event, TurnPaused) for event in events)
+
+
+def test_t08_idle_behavior_mode_is_run_local_without_runstate_replacement() -> None:
+    run = UthCodeApplication(FakeProvider(events=())).create_run(run_id="local-mode")
+    initial_state = run._state
+    initial_payload = initial_state.to_dict()
+
+    assert run.set_behavior_mode(BehaviorMode.PLAN) is BehaviorMode.PLAN
+
+    assert run._state is initial_state
+    assert run._state.to_dict() == initial_payload
+    assert run.behavior_mode is BehaviorMode.PLAN
+    assert run.snapshot().behavior_mode is BehaviorMode.PLAN
+
+
+@pytest.mark.asyncio
+async def test_t08_plan_approve_applies_default_before_resumed_is_public(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_response(TextPart("Plan v1")),),
+            (_response(TextPart("implemented")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+    )
+    run = application.create_run(run_id="approve-order")
+    run.set_behavior_mode(BehaviorMode.PLAN)
+    handle = run.start_turn("plan then implement")
+    events_task = asyncio.create_task(_collect(handle))
+    for _ in range(100):
+        if handle.pending_pause is not None:
+            break
+        await asyncio.sleep(0)
+    pending = handle.pending_pause
+    assert pending is not None and pending.plan_review_request is not None
+
+    assert handle.resume(
+        PlanReviewResponse(
+            pending.pause_id,
+            pending.run_id,
+            pending.turn_id,
+            pending.plan_review_request.revision,
+            PlanReviewChoice.APPROVE,
+        )
+    ) is True
+    assert run.behavior_mode is BehaviorMode.DEFAULT
+    assert handle._driver.execution.state.plan_state is not None
+    assert handle._driver.execution.state.plan_state.approved
+
+    events = await asyncio.wait_for(events_task, timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+    assert result.status is RunStatus.COMPLETED
+    event_types = [event.event_type for event in events]
+    assert event_types.index("behavior_mode_changed") < event_types.index("turn_resumed")
+    assert event_types.count("turn_resumed") == 1
+
+
+@pytest.mark.asyncio
+async def test_t08_plan_approve_then_cancel_is_cancel_wins_without_resumed(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(((_response(TextPart("Plan v1")),),))
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+    )
+    run = application.create_run(run_id="approve-cancel")
+    run.set_behavior_mode(BehaviorMode.PLAN)
+    handle = run.start_turn("plan")
+    events_task = asyncio.create_task(_collect(handle))
+    for _ in range(100):
+        if handle.pending_pause is not None:
+            break
+        await asyncio.sleep(0)
+    pending = handle.pending_pause
+    assert pending is not None and pending.plan_review_request is not None
+
+    assert handle.resume(
+        PlanReviewResponse(
+            pending.pause_id,
+            pending.run_id,
+            pending.turn_id,
+            pending.plan_review_request.revision,
+            PlanReviewChoice.APPROVE,
+        )
+    ) is True
+    assert run.behavior_mode is BehaviorMode.DEFAULT
+    assert handle.cancel() is True
+
+    events = await asyncio.wait_for(events_task, timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+    assert result.status is RunStatus.CANCELLED
+    assert not any(isinstance(event, TurnResumed) for event in events)
+    assert sum(isinstance(event, TurnCancelled) for event in events) == 1

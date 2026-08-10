@@ -1646,3 +1646,71 @@ async def test_t08_todo_empty_replace_explicitly_clears_completion_gate() -> Non
     assert result.status is RunStatus.COMPLETED and result.final_text == "done"
     states = [event.task_state for event in events if isinstance(event, TaskStateChanged)]
     assert len(states) == 2 and states[0].has_unfinished and states[1].is_empty
+
+
+@pytest.mark.asyncio
+async def test_t08_pre_tool_hook_exception_closes_original_batch_without_side_effects() -> None:
+    trace: list[str] = []
+    tool = PolicyTool("Work", Effect.WRITE, ToolPlanningAccess.HIDDEN, trace)
+    registry = ToolRegistry((tool,))
+    calls = (
+        ToolCallPart("hook-1", "Work", {"value": "one"}),
+        ToolCallPart("hook-2", "Work", {"value": "two"}),
+    )
+    provider = ScriptedProvider(
+        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]]
+    )
+    hook_calls: list[str] = []
+    permission_calls: list[PermissionAction] = []
+
+    def explode(context):
+        hook_calls.append(context.prepared_call.call.tool_call_id)
+        raise RuntimeError("synthetic pre-tool hook failure")
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=RuntimeHookSet(before_tool_execution=(explode,)),
+        permission_resolver=lambda action: permission_calls.append(action),
+    )
+    execution = _start(loop)
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.FAILED
+    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert hook_calls == ["hook-1"]
+    assert trace == ["preflight"]
+    assert permission_calls == []
+    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolStarted)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolFinished)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.status for event in segment.events if isinstance(event, ToolFinished)] == [
+        "failed",
+        "failed",
+    ]
+    batches = [event for event in segment.events if isinstance(event, ToolBatchFinished)]
+    assert len(batches) == 1
+    assert batches[0].tool_call_ids == ("hook-1", "hook-2")
+    assert batches[0].status == "failed"
+    assert sum(isinstance(event, TurnFailed) for event in segment.events) == 1
+    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+    assert [message.role for message in execution.state.messages] == ["user", "assistant", "tool"]
+    tool_results = execution.state.messages[-1].parts
+    assert [part.tool_call_id for part in tool_results] == ["hook-1", "hook-2"]
+    assert [part.content for part in tool_results] == [
+        "Error: pre-tool hook failed",
+        "Error: pre-tool hook failed",
+    ]
+    assert all(part.is_error for part in tool_results)

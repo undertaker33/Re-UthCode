@@ -75,3 +75,31 @@
 - 未修改 `planning.py`、`hooks.py`、`interaction.py`、`agent_events.py`、`prompt.py`、`tool.py` 等 W01 冻结合同文件。
 - 未增加旧 API 适配器、别名、双轨行为、第二 planning/runtime loop、Todo Manager、complexity detector、Plan→Todo compiler、动态 Hook registry 或 Interface-owned 状态。
 - 未 push、普通 merge、rebase、reset、cherry-pick、远端修改、分支删除或 worktree 操作；仅执行授权的 W01 fast-forward 与后续窄范围本地提交。
+
+## 返工第 1 轮
+
+### 返工原因
+
+首轮独立审查发现四处执行控制边界不够严格：pre-tool Hook 异常没有闭合原始 Tool batch；Provider generation 中 Steering 与紧随其后的 pause 会出现 `pause() == True` 但暂停信号被更新后继续运行；idle mode 通过替换 `RunState` 保存；Plan APPROVE 的 `TurnResumed` 早于 Core 应用批准状态。
+
+### 实际修改
+
+- pre-tool Hook 异常现在 fail-closed：当前及剩余原始 ToolCall ID 均写入 `Error: pre-tool hook failed` 的受控结果，发布配对的 `ToolStarted` / `ToolFinished(status="failed")`，以唯一 `ToolBatchFinished(status="failed")` 闭合 tool message 后，再以唯一 `TurnFailed(INTERNAL_ERROR)` 终止。异常后不进入 Permission，不执行当前或剩余 Tool。
+- Steering 与 pause 采用审查允许的明确拒绝语义：Core 尚有 pending Steering 时，Application `pause()` 返回 `False`，不会声称已接受一个可能被 Steering signal renewal 吞掉的请求；Steering 应用后 pending 清空，后续 pause 仍可正常请求。
+- `AgentRun` 新增 Run-local idle behavior mode 字段。`set_behavior_mode()` 只修改该字段，不替换或直接改写 `RunState`；start Turn 时把 idle mode 快照给 Core，active 期间读取 Core mode，终态再把 Core 最终 mode 同步回 idle 字段。idle `RunSnapshot` 只做安全投影，不改写业务状态。
+- Plan APPROVE 由 Core 在 `TurnHandle.resume()` 返回前同步校验并应用 approved Plan 与 `PLAN → DEFAULT`，先发布 `BehaviorModeChanged`，Application driver 随后才发布唯一 `TurnResumed`。若批准后立即 cancel，取消仍赢得 terminal，且不发布 `TurnResumed`。
+
+### 重新验证
+
+- reviewer 反例先行为 `9 failed`；最终修复后同一集合为 `9 passed in 1.10s`。
+- Runtime / Application / Permission 热点回归：`140 passed in 24.20s`。
+- T04～T07 / Permission 扩展回归：`409 passed in 20.91s`。
+- architecture / package：`31 passed in 6.14s`。
+- 最终全量回归：`818 passed, 3 skipped in 67.19s`；`uthcode.__file__` 为 `D:\project\Re-UthCode-T08-W02\src\uthcode\__init__.py`。
+- 新增回归精确覆盖 Hook exception 的 call ID、事件、tool message、Permission/execute 副作用；Provider cancelled/error/completed 三种 Steering 竞态；Tool safe boundary；idle mode 不替换 `RunState`；APPROVE 的即时 DEFAULT、事件顺序、exactly-one resume 与 cancel wins。
+
+### 范围与风险
+
+- 返工只修改 `src/uthcode/core/agent.py`、`src/uthcode/application/runs.py`、对应 Core/Application 测试及本 Feedback；Checklist 证据仍成立，未修改其文字或勾选状态。
+- 未修改 W01 冻结合同、Slash、TUI、CLI、Spec、Tasks、Prompt 或 Checklist；未启动 W04。
+- 首轮记录的 DEFAULT streaming delta 风险未改变；本轮没有新增阻断项，等待原 reviewer 复验。
