@@ -17,44 +17,44 @@
 
 ## Task 3 — Behavior Mode 与 Dynamic Tool View
 
-- [ ] 在 `D:\project\Re-UthCode-T08-W02` 执行 `git merge-base --is-ancestor T08-W01-core-contracts HEAD`，退出码为 0；当前分支为 `T08-W02-runtime-application`。
-- [ ] 执行 T08 mode/tool-view 定向测试，断言 PLAN request 的 Tool 名称严格为 `ReadFile, Glob, Grep, Bash, AskUserQuestion`，DEFAULT 额外包含 `WriteFile, EditFile, TodoWrite`。
-- [ ] 执行 pre-tool 顺序测试，证明 trusted preflight 后先调用 Hook、再调用 Permission、最后执行；PLAN 非 READ 不进入 Permission/execute。
-- [ ] 执行 full_access、隐藏 Write/Edit、PLAN TodoWrite、未知工具与非法参数测试，确认每个原始 call ID 恰好一个受控 ToolResult。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_loop.py tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py`，全部通过。
+- [x] 在 `D:\project\Re-UthCode-T08-W02` 执行 `git merge-base --is-ancestor T08-W01-core-contracts HEAD`，退出码为 0；当前分支为 `T08-W02-runtime-application`。
+- [x] 执行 T08 mode/tool-view 定向测试，断言 PLAN request 的 Tool 名称严格为 `ReadFile, Glob, Grep, Bash, AskUserQuestion`，DEFAULT 额外包含 `WriteFile, EditFile, TodoWrite`。
+- [x] 执行 pre-tool 顺序测试，证明 trusted preflight 后先调用 Hook、再调用 Permission、最后执行；PLAN 非 READ 不进入 Permission/execute。
+- [x] 执行 full_access、隐藏 Write/Edit、PLAN TodoWrite、未知工具与非法参数测试，确认每个原始 call ID 恰好一个受控 ToolResult。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_loop.py tests/test_application.py tests/test_application_runtime.py tests/test_application_tools.py`，全部通过。
 
 ## Task 4 — Plan Proposal / Review / Approve
 
-- [ ] 执行 Plan v1 → REVISE → Plan v2 → APPROVE 测试，前后 `run_id`、`turn_id` 与同一 `TurnHandle` 均不变。
-- [ ] 捕获事件与 RunState，确认两个 Plan candidate 都没有 ordinary assistant commit、`AssistantMessageCompleted(FINAL)` 或 `TurnCompleted`，但 usage 已计入。
-- [ ] 执行 stale/wrong pause ID、run ID、turn ID、revision、空 revision feedback 测试，全部稳定拒绝且状态不变。
-- [ ] 执行 approve 测试，确认立即出现 PLAN→DEFAULT 状态变化，下一 request 使用完整 Tool View，且无需 `/do`。
-- [ ] 执行 proposal/review/approve 与 cancel race 测试，确认只产生一次 `TurnCancelled`，无后续 Tool 副作用或 `TurnCompleted`。
+- [x] 执行 Plan v1 → REVISE → Plan v2 → APPROVE 测试，前后 `run_id`、`turn_id` 与同一 `TurnHandle` 均不变。
+- [x] 捕获事件与 RunState，确认两个 Plan candidate 都没有 ordinary assistant commit、`AssistantMessageCompleted(FINAL)` 或 `TurnCompleted`，但 usage 已计入。
+- [x] 执行 stale/wrong pause ID、run ID、turn ID、revision、空 revision feedback 测试，全部稳定拒绝且状态不变。
+- [x] 执行 approve 测试，确认立即出现 PLAN→DEFAULT 状态变化，下一 request 使用完整 Tool View，且无需 `/do`。
+- [x] 执行 proposal/review/approve 与 cancel race 测试，确认只产生一次 `TurnCancelled`，无后续 Tool 副作用或 `TurnCompleted`。
 
 ## Task 5 — Todo / Execution Planning / Completion Control
 
-- [ ] 执行 TodoWrite control-path 测试，确认它不进入普通 Registry、Permission 或手工 Tool API，且合法/非法调用都闭合原 call ID。
-- [ ] 执行 TaskState 暂停恢复、Plan approve 后建立、replace-all 重规划、显式清空和新 Turn reset 测试，状态与实际执行事实一致。
-- [ ] 执行 unfinished Todo candidate final 测试，确认 usage 增加、`CompletionBlocked` 出现，candidate text 不进入 messages、普通 assistant 事件或 TUI final。
-- [ ] 执行全部 completed 与 `todos=[]` 两种完成测试，分别只产生一次 `TurnCompleted`。
-- [ ] 执行连续 completion block 与 `max_iterations`、Hook exception 测试，确认受现有硬上限控制且异常 fail Turn。
+- [x] 执行 TodoWrite control-path 测试，确认它不进入普通 Registry、Permission 或手工 Tool API，且合法/非法调用都闭合原 call ID。
+- [x] 执行 TaskState 暂停恢复、Plan approve 后建立、replace-all 重规划、显式清空和新 Turn reset 测试，状态与实际执行事实一致。
+- [x] 执行 unfinished Todo candidate final 测试，确认 usage 增加、`CompletionBlocked` 出现，candidate text 不进入 messages、普通 assistant 事件或 TUI final。
+- [x] 执行全部 completed 与 `todos=[]` 两种完成测试，分别只产生一次 `TurnCompleted`。
+- [x] 执行连续 completion block 与 `max_iterations`、Hook exception 测试，确认受现有硬上限控制且异常 fail Turn。
 
 ## Task 6 — User Steering
 
-- [ ] 执行 Provider generation 中 Steering 测试，确认 partial attempt 未提交，Steering 是同一 Turn 的真实 user Message，下一 request 同时看到原目标和更新目标。
-- [ ] 执行 Tool batch 中 Steering 测试，确认当前 Tool 完成，剩余 stale Tool 未启动、每个 call ID 有受控结果且 batch 正常闭合。
-- [ ] 执行 TaskState 测试，确认 Steering 不自动改写 Todo，模型可在下一 iteration 保持、更新或整体重写。
-- [ ] 执行 PLAN generation Steering、重复 pending Steering、terminal 后 Steering 和 typed pause pending Steering 测试，结果符合各自边界。
-- [ ] 执行 Cancel > Steering > candidate completion 竞态测试，确认取消 exactly once、无残留 pending request、无副作用和完成事件。
+- [x] 执行 Provider generation 中 Steering 测试，确认 partial attempt 未提交，Steering 是同一 Turn 的真实 user Message，下一 request 同时看到原目标和更新目标。
+- [x] 执行 Tool batch 中 Steering 测试，确认当前 Tool 完成，剩余 stale Tool 未启动、每个 call ID 有受控结果且 batch 正常闭合。
+- [x] 执行 TaskState 测试，确认 Steering 不自动改写 Todo，模型可在下一 iteration 保持、更新或整体重写。
+- [x] 执行 PLAN generation Steering、重复 pending Steering、terminal 后 Steering 和 typed pause pending Steering 测试，结果符合各自边界。
+- [x] 执行 Cancel > Steering > candidate completion 竞态测试，确认取消 exactly once、无残留 pending request、无副作用和完成事件。
 
 ## Task 7 — Application Run Mode 与 Steering Control
 
-- [ ] 执行 `AgentRun` mode 测试，确认新 Run 为 DEFAULT，idle 切模幂等，active Turn 外部切模稳定拒绝，PermissionMode 不变化。
-- [ ] 执行 Plan approve mode sync 和 Turn 结束测试，确认 TUI 可立即读到 DEFAULT，下一 Turn 继承最终 mode但重置 Task/Plan/feedback。
-- [ ] 执行 `TurnHandle.steer` 非空、active-only、single-pending、typed-pause 互斥和 terminal rejection 测试。
-- [ ] 执行 driver 资源清理测试，确认 terminal/cancel/failure 后无残留 asyncio task、queue waiter、pause signal 或 steering coordination。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_loop.py tests/test_application_runs.py tests/test_application_runtime.py tests/test_application_tools.py`，全部通过。
-- [ ] 检查 W02 Feedback，确认记录 request capture、Hook 位置、Plan/Task/Steering 状态流、竞态测试及未决风险。
+- [x] 执行 `AgentRun` mode 测试，确认新 Run 为 DEFAULT，idle 切模幂等，active Turn 外部切模稳定拒绝，PermissionMode 不变化。
+- [x] 执行 Plan approve mode sync 和 Turn 结束测试，确认 TUI 可立即读到 DEFAULT，下一 Turn 继承最终 mode但重置 Task/Plan/feedback。
+- [x] 执行 `TurnHandle.steer` 非空、active-only、single-pending、typed-pause 互斥和 terminal rejection 测试。
+- [x] 执行 driver 资源清理测试，确认 terminal/cancel/failure 后无残留 asyncio task、queue waiter、pause signal 或 steering coordination。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_loop.py tests/test_application_runs.py tests/test_application_runtime.py tests/test_application_tools.py`，全部通过。
+- [x] 检查 W02 Feedback，确认记录 request capture、Hook 位置、Plan/Task/Steering 状态流、竞态测试及未决风险。
 
 ## Task 8 — Slash Command 产品入口
 

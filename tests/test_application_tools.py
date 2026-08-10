@@ -35,6 +35,7 @@ from uthcode.core.tool import (
     ToolRegistry,
 )
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
+from uthcode.core.planning import TODO_WRITE_TOOL_DEFINITION
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools.factory import create_default_tools
 
@@ -285,9 +286,17 @@ async def test_headless_fake_provider_manual_tool_round_trip_uses_same_context(t
     assert application.runtime_context.workdir == tmp_path.resolve()
 
 
-def test_application_rejects_reserved_ask_user_tool_from_normal_registry() -> None:
+@pytest.mark.parametrize(
+    "definition",
+    (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+)
+def test_application_rejects_reserved_control_tool_from_normal_registry(
+    definition: ToolDefinition,
+) -> None:
     class ReservedTool:
-        definition = ASK_USER_TOOL_DEFINITION
+        @property
+        def definition(self) -> ToolDefinition:
+            return definition
 
         async def execute(self, arguments, *, cancellation):
             del arguments, cancellation

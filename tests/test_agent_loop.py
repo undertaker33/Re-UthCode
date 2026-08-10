@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import pytest
@@ -14,6 +14,7 @@ from uthcode.core.agent import (
     AgentLoopConfig,
     AssistantMessageKind,
     ExecutionBoundary,
+    RunSnapshot,
     RunState,
     RunStatus,
     TerminationReason,
@@ -21,7 +22,11 @@ from uthcode.core.agent import (
 from uthcode.core.agent_events import (
     AssistantMessageCompleted,
     AssistantMessageDelta,
+    BehaviorModeChanged,
+    CompletionBlocked,
     IterationStarted,
+    PlanProposed,
+    TaskStateChanged,
     ReasoningDelta,
     ReasoningFinished,
     ReasoningStarted,
@@ -37,14 +42,25 @@ from uthcode.core.agent_events import (
     TurnResumed,
     TurnStarted,
     UsageUpdated,
+    UserSteeringApplied,
+    UserSteeringRequested,
     UserInputRequested,
     agent_event_from_json,
+)
+from uthcode.core.hooks import (
+    BeforeToolExecutionContinue,
+    RuntimeHookSet,
+    create_default_runtime_hooks,
+    plan_tool_policy,
 )
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
+    PlanReviewChoice,
+    PlanReviewResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
+    SteeringRequest,
     QuestionKind,
     UserInputRequest,
     UserInputResponse,
@@ -75,8 +91,29 @@ from uthcode.core.provider import (
     ToolResultPart,
     Usage,
 )
-from uthcode.core.permission import PermissionEvaluator, PermissionMode
-from uthcode.core.tool import Tool, ToolExecutionResult, ToolExecutor, ToolRegistry
+from uthcode.core.permission import (
+    Effect,
+    PermissionAction,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+)
+from uthcode.core.planning import (
+    BehaviorMode,
+    TODO_WRITE_TOOL_DEFINITION,
+    TaskItem,
+    TaskState,
+    TaskStatus,
+)
+from uthcode.core.prompt import RuntimePromptContext
+from uthcode.core.tool import (
+    Tool,
+    ToolExecutionResult,
+    ToolExecutor,
+    ToolPlanningAccess,
+    ToolPreparation,
+    ToolRegistry,
+)
 
 
 def _response(
@@ -177,6 +214,44 @@ class PauseAwareTool:
         return ToolExecutionResult(str(arguments["value"]))
 
 
+@dataclass
+class PolicyTool:
+    name: str
+    effect: Effect
+    planning_access: ToolPlanningAccess
+    trace: list[str] = field(default_factory=list)
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            self.name,
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+    def preflight(self, arguments) -> ToolPreparation:
+        self.trace.append("preflight")
+        return ToolPreparation(
+            PermissionAction(
+                tool=self.name,
+                action="execute",
+                effect=self.effect,
+                resource="workspace/item",
+                scope=ResourceScope.INSIDE,
+            ),
+            arguments,
+        )
+
+    async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+        cancellation.raise_if_cancelled()
+        self.trace.append("execute")
+        return ToolExecutionResult(str(arguments["value"]))
+
+
 class PausableProvider:
     def __init__(self, response: GenerationCompleted) -> None:
         self.identity = ProviderIdentity("fake", "pause", "fake-model")
@@ -210,7 +285,11 @@ def _loop(
     executor = ToolExecutor(registry)
     descriptions = descriptions or {}
 
-    def prepare(messages: tuple[Message, ...], definitions: tuple[ToolDefinition, ...]) -> GenerationRequest:
+    def prepare(
+        messages: tuple[Message, ...],
+        definitions: tuple[ToolDefinition, ...],
+        _runtime_context: RuntimePromptContext,
+    ) -> GenerationRequest:
         return GenerationRequest(messages=messages, tools=definitions)
 
     def describe(call: ToolCallPart) -> str:
@@ -319,7 +398,7 @@ async def test_async_request_preparer_pause_returns_boundary_before_provider() -
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def prepare(messages, definitions):
+    async def prepare(messages, definitions, _runtime_context):
         entered.set()
         await release.wait()
         return GenerationRequest(messages=messages, tools=definitions)
@@ -372,7 +451,7 @@ async def test_async_request_preparer_cancel_wins_without_provider_call() -> Non
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def prepare(messages, definitions):
+    async def prepare(messages, definitions, _runtime_context):
         entered.set()
         await release.wait()
         return GenerationRequest(messages=messages, tools=definitions)
@@ -401,7 +480,7 @@ async def test_async_request_preparer_cancel_wins_without_provider_call() -> Non
 async def test_async_request_preparer_failure_remains_internal_failure() -> None:
     provider = ScriptedProvider([[_response(TextPart("must not run"))]])
 
-    async def prepare(messages, definitions):
+    async def prepare(messages, definitions, _runtime_context):
         del messages, definitions
         raise RuntimeError("preparer failed")
 
@@ -878,3 +957,760 @@ async def test_terminal_cancel_has_one_terminal_and_no_events_after_boundary() -
     assert after_cancel.events == ()
     assert after_cancel.result is first.result
     assert sum(isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled)) for event in first.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_t08_behavior_mode_and_runtime_facts_are_authoritative_and_reset_per_turn() -> None:
+    task_state = TaskState((TaskItem("inspect", TaskStatus.IN_PROGRESS),))
+    state = RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN)
+    state = replace(state, task_state=task_state)
+
+    assert state.behavior_mode is BehaviorMode.PLAN
+    assert state.task_state == task_state
+    assert RunState.from_json(state.to_json()) == state
+    assert "task_state" not in RunSnapshot.from_state(state).to_dict()
+    assert "plan_state" not in RunSnapshot.from_state(state).to_dict()
+
+    next_turn = state.new_turn(
+        "turn-2",
+        "continue",
+        behavior_mode=BehaviorMode.DEFAULT,
+    )
+
+    assert next_turn.behavior_mode is BehaviorMode.DEFAULT
+    assert next_turn.task_state.is_empty
+    assert next_turn.plan_state is None
+    assert next_turn.runtime_feedback is None
+
+
+@pytest.mark.asyncio
+async def test_t08_dynamic_tool_view_uses_mode_and_structured_runtime_context() -> None:
+    read = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY)
+    write = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.HIDDEN)
+    registry = ToolRegistry((read, write))
+    provider = ScriptedProvider([[_response(TextPart("done"))]])
+    captured: list[tuple[tuple[str, ...], RuntimePromptContext]] = []
+
+    def prepare(messages, definitions, runtime_context):
+        captured.append((tuple(item.name for item in definitions), runtime_context))
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        prepare,
+        runtime_hooks=RuntimeHookSet(),
+        permission_resolver=lambda action: PermissionEvaluator().evaluate(
+            action,
+            mode=PermissionMode.FULL_ACCESS,
+        ),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=registry.definitions()
+        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.result is not None and segment.result.status is RunStatus.COMPLETED
+    assert captured[0][0] == ("Read", "AskUserQuestion")
+    assert captured[0][1].behavior_mode is BehaviorMode.PLAN
+    assert captured[0][1].task_state.is_empty
+
+
+@pytest.mark.asyncio
+async def test_t08_pre_tool_order_is_preflight_hook_permission_execute() -> None:
+    trace: list[str] = []
+    tool = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY, trace)
+    registry = ToolRegistry((tool,))
+    call = ToolCallPart("call-1", "Read", {"value": "ok"})
+    provider = ScriptedProvider(
+        [[_response(call, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]]
+    )
+
+    def hook(_context):
+        trace.append("hook")
+        return BeforeToolExecutionContinue()
+
+    def permission(action):
+        trace.append("permission")
+        return PermissionEvaluator().evaluate(action, mode=PermissionMode.FULL_ACCESS)
+
+    def prepare(messages, definitions, runtime_context):
+        assert isinstance(runtime_context, RuntimePromptContext)
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        prepare,
+        runtime_hooks=RuntimeHookSet(before_tool_execution=(hook,)),
+        permission_resolver=permission,
+    )
+    events, result, _ = await _drive(_start(loop))
+
+    assert result.status is RunStatus.COMPLETED
+    assert trace == ["preflight", "hook", "permission", "execute"]
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
+        "call-1"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_t08_plan_non_read_and_todo_calls_fail_closed_before_permission() -> None:
+    trace: list[str] = []
+    write = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.HIDDEN, trace)
+    registry = ToolRegistry((write,))
+    calls = (
+        ToolCallPart("write-1", "Write", {"value": "blocked"}),
+        ToolCallPart(
+            "todo-1",
+            "TodoWrite",
+            {"todos": [{"content": "blocked", "status": "pending"}]},
+        ),
+    )
+    provider = ScriptedProvider(
+        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]]
+    )
+    permission_calls: list[PermissionAction] = []
+
+    def permission(action):
+        permission_calls.append(action)
+        return PermissionEvaluator().evaluate(action, mode=PermissionMode.FULL_ACCESS)
+
+    def prepare(messages, definitions, runtime_context):
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        prepare,
+        runtime_hooks=RuntimeHookSet(before_tool_execution=(plan_tool_policy,)),
+        permission_resolver=permission,
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=registry.definitions()
+        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+
+    events, result, _ = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED
+    assert trace == ["preflight"]
+    assert permission_calls == []
+    assert provider.requests[1].messages[-1].parts == (
+        ToolResultPart("write-1", "Error: PLAN mode allows only trusted read actions", True),
+        ToolResultPart("todo-1", "Error: TodoWrite is unavailable in PLAN mode", True),
+    )
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
+        "write-1",
+        "todo-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_only_final() -> None:
+    read = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY)
+    write = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.HIDDEN)
+    registry = ToolRegistry((read, write))
+    provider = ScriptedProvider(
+        [
+            [TextDelta("plan stream v1"), _response(TextPart("Plan v1"), usage=Usage(1, 2))],
+            [TextDelta("plan stream v2"), _response(TextPart("Plan v2"), usage=Usage(3, 4))],
+            [_response(TextPart("implemented"), usage=Usage(5, 6))],
+        ]
+    )
+    captured: list[tuple[tuple[str, ...], RuntimePromptContext]] = []
+
+    def prepare(messages, definitions, runtime_context):
+        captured.append((tuple(item.name for item in definitions), runtime_context))
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    evaluator = PermissionEvaluator()
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        prepare,
+        runtime_hooks=create_default_runtime_hooks(),
+        permission_resolver=lambda action: evaluator.evaluate(
+            action,
+            mode=PermissionMode.FULL_ACCESS,
+        ),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "make a plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=registry.definitions()
+        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+
+    first = await execution.run_segment(pause_signal=CancellationToken())
+    assert first.paused
+    assert first.continuation is not None
+    pause_v1 = first.continuation.pending_pause
+    assert pause_v1 is not None and pause_v1.kind is PauseKind.PLAN_REVIEW_REQUIRED
+    assert execution.state.usage == Usage(1, 2)
+    assert execution.state.plan_state is not None
+    assert execution.state.plan_state.to_dict() == {
+        "revision": 1,
+        "text": "Plan v1",
+        "approved": False,
+    }
+    assert [message.role for message in execution.state.messages] == ["user"]
+    assert not any(
+        isinstance(event, (AssistantMessageDelta, AssistantMessageCompleted, TurnCompleted))
+        for event in first.events
+    )
+    assert [(event.revision, event.plan_text) for event in first.events if isinstance(event, PlanProposed)] == [
+        (1, "Plan v1")
+    ]
+
+    with pytest.raises(ValueError, match="Plan revision"):
+        await execution.run_segment(
+            pause_signal=CancellationToken(),
+            response=PlanReviewResponse(
+                pause_v1.pause_id,
+                pause_v1.run_id,
+                pause_v1.turn_id,
+                2,
+                PlanReviewChoice.REVISE,
+                "replace it",
+            ),
+        )
+    assert execution.state.plan_state.revision == 1
+
+    second = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=PlanReviewResponse(
+            pause_v1.pause_id,
+            pause_v1.run_id,
+            pause_v1.turn_id,
+            1,
+            PlanReviewChoice.REVISE,
+            "cover tests too",
+        ),
+    )
+    assert second.paused and second.continuation is not None
+    pause_v2 = second.continuation.pending_pause
+    assert pause_v2 is not None and pause_v2.plan_review_request is not None
+    assert pause_v2.plan_review_request.revision == 2
+    assert execution.state.plan_state is not None
+    assert execution.state.plan_state.text == "Plan v2"
+    assert [message.role for message in execution.state.messages] == ["user", "user"]
+    assert execution.state.messages[-1].parts == (TextPart("cover tests too"),)
+    assert not any(
+        isinstance(event, (AssistantMessageDelta, AssistantMessageCompleted, TurnCompleted))
+        for event in second.events
+    )
+
+    third = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=PlanReviewResponse(
+            pause_v2.pause_id,
+            pause_v2.run_id,
+            pause_v2.turn_id,
+            2,
+            PlanReviewChoice.APPROVE,
+        ),
+    )
+
+    assert third.terminal and third.result is not None
+    assert third.result.status is RunStatus.COMPLETED
+    assert third.result.run_id == "run-1" and third.result.turn_id == "turn-1"
+    assert third.result.final_text == "implemented"
+    assert execution.state.usage == Usage(9, 12)
+    assert execution.state.behavior_mode is BehaviorMode.DEFAULT
+    assert execution.state.plan_state is not None and execution.state.plan_state.approved
+    assert [message.role for message in execution.state.messages] == ["user", "user", "assistant"]
+    assert [item.behavior_mode for item in third.events if isinstance(item, BehaviorModeChanged)] == [
+        BehaviorMode.DEFAULT
+    ]
+    assert [item[0] for item in captured] == [
+        ("Read", "AskUserQuestion"),
+        ("Read", "AskUserQuestion"),
+        ("Read", "Write", "AskUserQuestion", "TodoWrite"),
+    ]
+    assert captured[1][1].one_shot_feedback is not None
+    assert captured[1][1].one_shot_feedback.text == "cover tests too"
+    assert captured[2][1].plan_state is not None and captured[2][1].plan_state.approved
+
+
+@pytest.mark.asyncio
+async def test_t08_todo_replace_all_blocks_candidate_until_tasks_are_completed() -> None:
+    registry = ToolRegistry()
+    pending_payload = {
+        "todos": [
+            {"content": "inspect", "status": "completed"},
+            {"content": "implement", "status": "in_progress"},
+            {"content": "verify", "status": "pending"},
+        ]
+    }
+    completed_payload = {
+        "todos": [
+            {"content": "inspect", "status": "completed"},
+            {"content": "implement", "status": "completed"},
+            {"content": "verify", "status": "completed"},
+        ]
+    }
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart("todo-1", "TodoWrite", pending_payload),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    usage=Usage(1, 1),
+                )
+            ],
+            [TextDelta("discarded candidate"), _response(TextPart("premature"), usage=Usage(2, 2))],
+            [
+                _response(
+                    ToolCallPart("todo-2", "TodoWrite", completed_payload),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    usage=Usage(3, 3),
+                )
+            ],
+            [_response(TextPart("done"), usage=Usage(4, 4))],
+        ]
+    )
+    captured: list[RuntimePromptContext] = []
+    permission_calls: list[PermissionAction] = []
+
+    def prepare(messages, definitions, runtime_context):
+        captured.append(runtime_context)
+        return GenerationRequest(messages=messages, tools=definitions)
+
+    def permission(action):
+        permission_calls.append(action)
+        return PermissionEvaluator().evaluate(action, mode=PermissionMode.FULL_ACCESS)
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        prepare,
+        runtime_hooks=create_default_runtime_hooks(),
+        permission_resolver=permission,
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "implement",
+        turn_id="turn-1",
+        tool_definitions=(ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "done"
+    assert result.usage == Usage(10, 10)
+    assert permission_calls == []
+    task_events = [event for event in events if isinstance(event, TaskStateChanged)]
+    assert [event.task_state.items[1].status for event in task_events] == [
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.COMPLETED,
+    ]
+    blocked = [event for event in events if isinstance(event, CompletionBlocked)]
+    assert [event.unfinished_count for event in blocked] == [2]
+    assert sum(isinstance(event, TurnCompleted) for event in events) == 1
+    completed_messages = [
+        event for event in events if isinstance(event, AssistantMessageCompleted)
+    ]
+    assert [event.kind for event in completed_messages] == [
+        AssistantMessageKind.PROGRESS,
+        AssistantMessageKind.PROGRESS,
+        AssistantMessageKind.FINAL,
+    ]
+    assert completed_messages[-1].message.parts == (TextPart("done"),)
+    assert not any(
+        isinstance(event, AssistantMessageDelta) and event.text == "discarded candidate"
+        for event in events
+    )
+    assert all(
+        TextPart("premature") not in message.parts
+        for message in execution.state.messages
+    )
+    assert captured[1].task_state.has_unfinished
+    assert captured[2].one_shot_feedback is not None
+    assert captured[2].one_shot_feedback.kind.value == "completion_blocked"
+    assert captured[3].one_shot_feedback is None
+    assert not captured[3].task_state.has_unfinished
+
+
+@pytest.mark.asyncio
+async def test_t08_invalid_todo_is_controlled_and_does_not_change_task_state() -> None:
+    registry = ToolRegistry()
+    invalid_payload = {
+        "todos": [
+            {"content": "one", "status": "in_progress"},
+            {"content": "two", "status": "in_progress"},
+        ]
+    }
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart("todo-invalid", "TodoWrite", invalid_payload),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(TextPart("done"))],
+        ]
+    )
+    permission_calls: list[PermissionAction] = []
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=create_default_runtime_hooks(),
+        permission_resolver=lambda action: permission_calls.append(action),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "implement",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION,),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED
+    assert execution.state.task_state.is_empty
+    assert permission_calls == []
+    assert not any(isinstance(event, TaskStateChanged) for event in events)
+    assert provider.requests[1].messages[-1].parts == (
+        ToolResultPart(
+            "todo-invalid",
+            "Error: invalid TodoWrite arguments",
+            True,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_t08_provider_steering_discards_attempt_and_applies_real_user_fact() -> None:
+    provider = PausableProvider(_response(TextPart("updated answer"), usage=Usage(2, 3)))
+    execution = _start(_loop(provider))
+    run_task = asyncio.create_task(
+        execution.run_segment(pause_signal=CancellationToken())
+    )
+    await provider.entered.wait()
+    request = SteeringRequest("steer-1", "run-1", "turn-1", "also verify tests")
+
+    assert execution.request_steering(request) is True
+    assert execution.request_steering(
+        SteeringRequest("steer-2", "run-1", "turn-1", "duplicate")
+    ) is False
+    with pytest.raises(ValueError, match="IDs"):
+        execution.request_steering(
+            SteeringRequest("stale", "wrong-run", "turn-1", "stale")
+        )
+    provider.release.set()
+    segment = await asyncio.wait_for(run_task, timeout=1)
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.COMPLETED
+    assert segment.result.final_text == "updated answer"
+    assert len(provider.requests) == 2
+    assert [message.role for message in provider.requests[1].messages] == ["user", "user"]
+    assert provider.requests[1].messages[-1].parts == (TextPart("also verify tests"),)
+    requested = [event for event in segment.events if isinstance(event, UserSteeringRequested)]
+    applied = [event for event in segment.events if isinstance(event, UserSteeringApplied)]
+    assert [event.steering_id for event in requested] == ["steer-1"]
+    assert [event.steering_id for event in applied] == ["steer-1"]
+    assert sum(isinstance(event, AssistantMessageCompleted) for event in segment.events) == 1
+    assert execution.pending_steering is None
+
+
+@pytest.mark.asyncio
+async def test_t08_tool_batch_steering_finishes_current_and_closes_stale_call_ids() -> None:
+    tool = PauseAwareTool("Work")
+    calls = tuple(
+        ToolCallPart(f"call-{index}", "Work", {"value": str(index)})
+        for index in range(1, 4)
+    )
+    provider = ScriptedProvider(
+        [
+            [_response(*calls, finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("updated answer"))],
+        ]
+    )
+    execution = _start(_loop(provider, (tool,)))
+    run_task = asyncio.create_task(
+        execution.run_segment(pause_signal=CancellationToken())
+    )
+    await tool.entered.wait()
+
+    assert execution.request_steering(
+        SteeringRequest("steer-tools", "run-1", "turn-1", "skip stale writes")
+    ) is True
+    tool.release.set()
+    segment = await asyncio.wait_for(run_task, timeout=1)
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.COMPLETED
+    assert tool.started == ["1"]
+    assert len(provider.requests) == 2
+    tool_results = provider.requests[1].messages[-2].parts
+    assert [part.tool_call_id for part in tool_results] == ["call-1", "call-2", "call-3"]
+    assert [part.is_error for part in tool_results] == [False, True, True]
+    assert [part.content for part in tool_results[1:]] == [
+        "Error: tool call skipped after user steering",
+        "Error: tool call skipped after user steering",
+    ]
+    assert provider.requests[1].messages[-1].role == "user"
+    assert provider.requests[1].messages[-1].parts == (TextPart("skip stale writes"),)
+    finished = [event for event in segment.events if isinstance(event, ToolFinished)]
+    assert [event.status for event in finished] == ["finished", "skipped", "skipped"]
+    batches = [event for event in segment.events if isinstance(event, ToolBatchFinished)]
+    assert [event.status for event in batches] == ["steered"]
+
+
+@pytest.mark.asyncio
+async def test_t08_cancel_wins_over_pending_tool_steering() -> None:
+    tool = PauseAwareTool("Work")
+    calls = (
+        ToolCallPart("call-1", "Work", {"value": "1"}),
+        ToolCallPart("call-2", "Work", {"value": "2"}),
+    )
+    provider = ScriptedProvider(
+        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]]
+    )
+    execution = _start(_loop(provider, (tool,)))
+    run_task = asyncio.create_task(
+        execution.run_segment(pause_signal=CancellationToken())
+    )
+    await tool.entered.wait()
+    assert execution.request_steering(
+        SteeringRequest("steer-cancel", "run-1", "turn-1", "change goal")
+    ) is True
+    assert execution.cancel() is True
+    tool.release.set()
+
+    segment = await asyncio.wait_for(run_task, timeout=1)
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.CANCELLED
+    assert tool.started == ["1"]
+    assert not any(isinstance(event, UserSteeringApplied) for event in segment.events)
+    assert sum(isinstance(event, TurnCancelled) for event in segment.events) == 1
+    assert execution.pending_steering is None
+
+
+@pytest.mark.asyncio
+async def test_t08_completion_hook_exception_fails_closed_after_usage_without_candidate_commit() -> None:
+    provider = ScriptedProvider(
+        [[TextDelta("hidden"), _response(TextPart("candidate"), usage=Usage(2, 3))]]
+    )
+    registry = ToolRegistry()
+
+    def explode(_context):
+        raise RuntimeError("synthetic hook failure")
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=RuntimeHookSet(before_completion=(explode,)),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+    )
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.FAILED
+    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert segment.result.usage == Usage(2, 3)
+    assert [message.role for message in execution.state.messages] == ["user"]
+    assert not any(
+        isinstance(event, (AssistantMessageCompleted, TurnCompleted))
+        for event in segment.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_iterations() -> None:
+    pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart("todo-1", "TodoWrite", pending),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(TextPart("premature one"), usage=Usage(1, 1))],
+            [_response(TextPart("premature two"), usage=Usage(2, 2))],
+        ]
+    )
+    registry = ToolRegistry()
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        config=AgentLoopConfig(max_iterations=3),
+        runtime_hooks=create_default_runtime_hooks(),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION,),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.FAILED
+    assert result.termination_reason is TerminationReason.MAX_ITERATIONS
+    assert result.usage == Usage(3, 3)
+    assert len([event for event in events if isinstance(event, CompletionBlocked)]) == 2
+    assert not any(isinstance(event, TurnCompleted) for event in events)
+    assert all(
+        TextPart("premature one") not in message.parts
+        and TextPart("premature two") not in message.parts
+        for message in execution.state.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_t08_todo_empty_replace_explicitly_clears_completion_gate() -> None:
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart(
+                        "todo-pending",
+                        "TodoWrite",
+                        {"todos": [{"content": "verify", "status": "pending"}]},
+                    ),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [
+                _response(
+                    ToolCallPart("todo-clear", "TodoWrite", {"todos": []}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(TextPart("done"))],
+        ]
+    )
+    registry = ToolRegistry()
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=create_default_runtime_hooks(),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION,),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED and result.final_text == "done"
+    states = [event.task_state for event in events if isinstance(event, TaskStateChanged)]
+    assert len(states) == 2 and states[0].has_unfinished and states[1].is_empty
+
+
+@pytest.mark.asyncio
+async def test_t08_pre_tool_hook_exception_closes_original_batch_without_side_effects() -> None:
+    trace: list[str] = []
+    tool = PolicyTool("Work", Effect.WRITE, ToolPlanningAccess.HIDDEN, trace)
+    registry = ToolRegistry((tool,))
+    calls = (
+        ToolCallPart("hook-1", "Work", {"value": "one"}),
+        ToolCallPart("hook-2", "Work", {"value": "two"}),
+    )
+    provider = ScriptedProvider(
+        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]]
+    )
+    hook_calls: list[str] = []
+    permission_calls: list[PermissionAction] = []
+
+    def explode(context):
+        hook_calls.append(context.prepared_call.call.tool_call_id)
+        raise RuntimeError("synthetic pre-tool hook failure")
+
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, _runtime: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=RuntimeHookSet(before_tool_execution=(explode,)),
+        permission_resolver=lambda action: permission_calls.append(action),
+    )
+    execution = _start(loop)
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.FAILED
+    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert hook_calls == ["hook-1"]
+    assert trace == ["preflight"]
+    assert permission_calls == []
+    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolStarted)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolFinished)] == [
+        "hook-1",
+        "hook-2",
+    ]
+    assert [event.status for event in segment.events if isinstance(event, ToolFinished)] == [
+        "failed",
+        "failed",
+    ]
+    batches = [event for event in segment.events if isinstance(event, ToolBatchFinished)]
+    assert len(batches) == 1
+    assert batches[0].tool_call_ids == ("hook-1", "hook-2")
+    assert batches[0].status == "failed"
+    assert sum(isinstance(event, TurnFailed) for event in segment.events) == 1
+    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+    assert [message.role for message in execution.state.messages] == ["user", "assistant", "tool"]
+    tool_results = execution.state.messages[-1].parts
+    assert [part.tool_call_id for part in tool_results] == ["hook-1", "hook-2"]
+    assert [part.content for part in tool_results] == [
+        "Error: pre-tool hook failed",
+        "Error: pre-tool hook failed",
+    ]
+    assert all(part.is_error for part in tool_results)

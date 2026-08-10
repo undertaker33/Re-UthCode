@@ -22,8 +22,11 @@ from uthcode.core.interaction import (
     PauseRequest,
     PauseResponse,
     PermissionApprovalResponse,
+    PlanReviewChoice,
+    PlanReviewResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
+    SteeringRequest,
     UserInputResponse,
 )
 from uthcode.core.permission import (
@@ -34,6 +37,7 @@ from uthcode.core.permission import (
     ResourceScope,
     SessionGrant,
 )
+from uthcode.core.planning import BehaviorMode
 from uthcode.core.provider import CancellationToken
 
 if TYPE_CHECKING:
@@ -42,6 +46,7 @@ if TYPE_CHECKING:
 
 _END = object()
 _CANCELLED = object()
+_APPLIED = object()
 _OUTSIDE_DIRECTORY_GRANT_TOOLS = frozenset({"ReadFile", "WriteFile", "EditFile"})
 
 
@@ -108,6 +113,7 @@ class AgentRun:
         "_permission_evaluator",
         "_permission_mode",
         "_session_grants",
+        "_behavior_mode",
     )
 
     def __init__(
@@ -127,12 +133,34 @@ class AgentRun:
         self._permission_evaluator = permission_evaluator or PermissionEvaluator()
         self._permission_mode = PermissionMode.DEFAULT
         self._session_grants: list[SessionGrant] = []
+        self._behavior_mode = BehaviorMode.DEFAULT
 
     @property
     def permission_mode(self) -> PermissionMode:
         """Return the current user-selected mode for this AgentRun."""
 
         return self._permission_mode
+
+    @property
+    def behavior_mode(self) -> BehaviorMode:
+        """Return the Core-authoritative behavior mode for this Run."""
+
+        if self._active_turn is not None:
+            return self._active_turn._driver.execution.state.behavior_mode
+        return self._behavior_mode
+
+    def set_behavior_mode(self, mode: BehaviorMode | str) -> BehaviorMode:
+        """Select the next Turn's behavior without changing Permission."""
+
+        if self._active_turn is not None:
+            raise RuntimeError("behavior mode cannot change during an active Turn")
+        if not isinstance(mode, BehaviorMode):
+            try:
+                mode = BehaviorMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown behavior mode: {mode!r}") from exc
+        self._behavior_mode = mode
+        return mode
 
     @property
     def session_grants(self) -> tuple[SessionGrant, ...]:
@@ -198,6 +226,7 @@ class AgentRun:
             user_input,
             turn_id=turn_id,
             cancellation=cancellation,
+            behavior_mode=self._behavior_mode,
             permission_resolver=self._resolve_permission,
             session_grant_sink=self._store_session_grant,
         )
@@ -213,12 +242,24 @@ class AgentRun:
 
         if self._active_turn is not None:
             return self._active_turn._snapshot()
-        return RunSnapshot.from_state(self._state)
+        state_snapshot = RunSnapshot.from_state(self._state)
+        return RunSnapshot(
+            run_id=state_snapshot.run_id,
+            turn_id=state_snapshot.turn_id,
+            iteration_count=state_snapshot.iteration_count,
+            tool_call_count=state_snapshot.tool_call_count,
+            consecutive_unknown_tools=state_snapshot.consecutive_unknown_tools,
+            usage=state_snapshot.usage,
+            behavior_mode=self._behavior_mode,
+            status=state_snapshot.status,
+            termination_reason=state_snapshot.termination_reason,
+        )
 
     def _complete_turn(self, handle: TurnHandle) -> None:
         if self._active_turn is not handle:
             return
         self._state = handle._driver.execution.state
+        self._behavior_mode = self._state.behavior_mode
         self._active_turn = None
 
 
@@ -284,12 +325,15 @@ class _TurnDriver:
     def request_pause(self) -> bool:
         if self._result_value is not None or self.execution.state.status is not RunStatus.RUNNING:
             return False
+        if self.execution.pending_steering is not None:
+            return False
         if self._pending_pause is not None or self._pause_requested:
             return False
         self._pause_requested = True
         self.ensure_started_if_possible()
         if self._segment_signal is not None:
             self._segment_signal.cancel()
+        self.execution.interrupt_for_pause()
         return True
 
     def request_cancel(self) -> bool:
@@ -307,6 +351,24 @@ class _TurnDriver:
             waiter.set_result(_CANCELLED)
         self.ensure_started_if_possible()
         return True
+
+    def request_steering(self, text: str) -> bool:
+        if self._result_value is not None or self.execution.state.status is not RunStatus.RUNNING:
+            return False
+        if (
+            self._pending_pause is not None
+            or self._response_waiter is not None
+            or self._pause_requested
+        ):
+            return False
+        self.ensure_started_if_possible()
+        request = SteeringRequest(
+            uuid.uuid4().hex,
+            self.execution.state.run_id,
+            self.execution.state.turn_id,
+            text,
+        )
+        return self.execution.request_steering(request)
 
     def ensure_started_if_possible(self) -> None:
         try:
@@ -378,17 +440,21 @@ class _TurnDriver:
                     if response_value is _CANCELLED or self.execution.cancelled():
                         response = None
                         continue
-                    if not isinstance(
+                    if response_value is _APPLIED:
+                        response = None
+                    elif not isinstance(
                         response_value,
                         (
                             RetryProviderResponse,
                             ResumeTurnResponse,
                             UserInputResponse,
                             PermissionApprovalResponse,
+                            PlanReviewResponse,
                         ),
                     ):
                         raise RuntimeError("Application waiter returned an invalid response")
-                    response = response_value
+                    else:
+                        response = response_value
                     await asyncio.sleep(0)
                     if self.execution.cancelled():
                         response = None
@@ -515,13 +581,32 @@ class TurnHandle:
         waiter = self._driver._response_waiter
         if waiter is None or waiter.done():
             return False
-        waiter.set_result(response)
+        if (
+            isinstance(response, PlanReviewResponse)
+            and response.choice is PlanReviewChoice.APPROVE
+        ):
+            self._driver.execution.apply_plan_approval(
+                response,
+                event_sink=self._driver._emit_event,
+            )
+            waiter.set_result(_APPLIED)
+        else:
+            waiter.set_result(response)
         return True
 
     def cancel(self) -> bool:
         """Cancel the Turn; cancellation wins over a pending response."""
 
         return self._driver.request_cancel()
+
+    def steer(self, text: str) -> bool:
+        """Update this active Turn's user goal at a safe Core boundary."""
+
+        if not isinstance(text, str):
+            raise TypeError("steering text must be a string")
+        if not text.strip():
+            raise ValueError("steering text must be non-empty")
+        return self._driver.request_steering(text)
 
     def cancelled(self) -> bool:
         return self._driver.execution.cancelled()
