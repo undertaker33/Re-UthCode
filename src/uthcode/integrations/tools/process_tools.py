@@ -17,7 +17,7 @@ from typing import Any
 
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
-from uthcode.core.tool import ToolExecutionResult, ToolPreparation
+from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.integrations.permissions import (
     BASH_ACTION_FACT_MARKER,
@@ -1382,6 +1382,10 @@ class BashTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
 
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         command = _text(arguments, "command")

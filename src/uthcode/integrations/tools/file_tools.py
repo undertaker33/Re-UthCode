@@ -7,7 +7,7 @@ from pathlib import Path
 
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
-from uthcode.core.tool import ToolExecutionResult, ToolPreparation
+from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
 
 from .workspace import FileReadTracker, WorkspacePathError, WorkspacePathResolver
 
@@ -40,6 +40,10 @@ class ReadFileTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
 
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))
@@ -122,6 +126,10 @@ class WriteFileTool:
     def definition(self) -> ToolDefinition:
         return self._definition
 
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.HIDDEN
+
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))
         return ToolPreparation(
@@ -197,6 +205,10 @@ class EditFileTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.HIDDEN
 
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         path, scope = self._resolver.resolve_with_scope(_text(arguments, "path"))

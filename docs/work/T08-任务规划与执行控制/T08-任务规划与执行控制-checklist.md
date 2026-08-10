@@ -2,18 +2,18 @@
 
 ## Task 1 — Planning Domain、Tool 可见性与控制协议
 
-- [ ] 在 `D:\project\Re-UthCode-T08-W01` 执行 `git branch --show-current`，输出为 `T08-W01-core-contracts`。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_planning.py`，合法、非法、清空、replace-all、顺序和至多一个 `in_progress` 用例全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_interaction.py tests/test_agent_events.py`，Plan Review、Steering 与六类新增事件的严格 JSON round-trip 全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_tool_core.py tests/test_builtin_file_tools.py tests/test_builtin_search_tools.py tests/test_builtin_process_tool.py`，全部内置普通 Tool 都有明确规划可见性且 Provider schema 不包含该内部元数据。
-- [ ] 执行 `rg -n "PauseKind.*STEER|Steering.*PauseKind|ToolDefinition.*plan" src/uthcode/core src/uthcode/integrations`，确认没有把 Steering 建成 PauseKind，也没有把规划元数据写入 Provider wire definition。
+- [x] 在 `D:\project\Re-UthCode-T08-W01` 执行 `git branch --show-current`，输出为 `T08-W01-core-contracts`。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_planning.py`，合法、非法、清空、replace-all、顺序和至多一个 `in_progress` 用例全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_agent_interaction.py tests/test_agent_events.py`，Plan Review、Steering 与六类新增事件的严格 JSON round-trip 全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_tool_core.py tests/test_builtin_file_tools.py tests/test_builtin_search_tools.py tests/test_builtin_process_tool.py`，全部内置普通 Tool 都有明确规划可见性且 Provider schema 不包含该内部元数据。
+- [x] 执行 `rg -n "PauseKind.*STEER|Steering.*PauseKind|ToolDefinition.*plan" src/uthcode/core src/uthcode/integrations`，确认没有把 Steering 建成 PauseKind，也没有把规划元数据写入 Provider wire definition。
 
 ## Task 2 — Runtime Hook 与 Runtime Prompt Facts
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_runtime_hooks.py tests/test_system_prompt.py`，两类 Hook 结果、固定顺序、异常输入和 PLAN/DEFAULT Prompt facts 全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_architecture_boundaries.py`，只放行 `core/hooks.py`，并继续拒绝 Hook package、动态 registry、Integration/Interface 依赖。
-- [ ] 执行 `rg -n "async def|create_task|ToolExecutor|ProviderPort|RunState" src/uthcode/core/hooks.py`，确认 Hook 不异步调度、不执行 Tool/Provider、不直接持有或写 RunState。
-- [ ] 检查 W01 Feedback，确认列出 Behavior/Task/Plan、Tool access、Hook、Prompt、Plan Review、Steering 和事件的冻结公共合同及定向测试结果。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_runtime_hooks.py tests/test_system_prompt.py`，两类 Hook 结果、固定顺序、异常输入和 PLAN/DEFAULT Prompt facts 全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_architecture_boundaries.py`，只放行 `core/hooks.py`，并继续拒绝 Hook package、动态 registry、Integration/Interface 依赖。
+- [x] 执行 `rg -n "async def|create_task|ToolExecutor|ProviderPort|RunState" src/uthcode/core/hooks.py`，确认 Hook 不异步调度、不执行 Tool/Provider、不直接持有或写 RunState。
+- [x] 检查 W01 Feedback，确认列出 Behavior/Task/Plan、Tool access、Hook、Prompt、Plan Review、Steering 和事件的冻结公共合同及定向测试结果。
 
 ## Task 3 — Behavior Mode 与 Dynamic Tool View
 
