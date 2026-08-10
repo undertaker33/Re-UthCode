@@ -122,3 +122,17 @@ def test_completion_candidates_follow_registry_changes_without_a_second_list() -
 
     assert "custom" in [candidate.canonical for candidate in candidates]
     assert candidates[-1].canonical == "help"
+
+
+def test_behavior_mode_help_and_completion_come_from_the_final_registry_entries() -> None:
+    registry = create_builtin_registry()
+    engine = CompletionEngine(registry)
+
+    plan = next(candidate for candidate in engine.complete("/plan") if candidate.canonical == "plan")
+    build = next(candidate for candidate in engine.complete("/build") if candidate.canonical == "do")
+
+    assert plan.implemented
+    assert plan.usage == "/plan"
+    assert build.implemented
+    assert build.matched_alias == "build"
+    assert build.usage == "/do"

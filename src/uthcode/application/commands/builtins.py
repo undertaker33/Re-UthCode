@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from uthcode.core.permission import PermissionMode
+from uthcode.core.planning import BehaviorMode
 
 from .dispatcher import CommandContext, CommandExecutionError
 from .models import (
     ArgumentSpec,
+    BehaviorModeSelected,
     ClearTranscript,
     CommandAvailability,
     CommandDefinition,
@@ -117,6 +119,15 @@ def _permission(context: CommandContext) -> OpenPermissionPicker | PermissionMod
     )
 
 
+def _select_behavior_mode(
+    mode: BehaviorMode,
+) -> Callable[[CommandContext], BehaviorModeSelected]:
+    def _handler(_context: CommandContext) -> BehaviorModeSelected:
+        return BehaviorModeSelected(mode)
+
+    return _handler
+
+
 def _status(context: CommandContext) -> str:
     application = context.application
     if application is None:
@@ -221,10 +232,9 @@ def create_builtin_registry() -> CommandRegistry:
         ),
         CommandDefinition(
             canonical="plan",
-            aliases=("p",),
-            description="管理任务计划",
+            description="进入规划模式",
             kind=CommandKind.LOCAL_UI,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
+            handler=_select_behavior_mode(BehaviorMode.PLAN),
         ),
         CommandDefinition(
             canonical="new",
@@ -258,9 +268,10 @@ def create_builtin_registry() -> CommandRegistry:
         ),
         CommandDefinition(
             canonical="do",
-            description="执行目标 Prompt",
-            kind=CommandKind.PROMPT,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
+            aliases=("build",),
+            description="进入默认执行模式",
+            kind=CommandKind.LOCAL_UI,
+            handler=_select_behavior_mode(BehaviorMode.DEFAULT),
         ),
         CommandDefinition(
             canonical="review",

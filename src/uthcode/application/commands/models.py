@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from uthcode.core.permission import PermissionMode
+from uthcode.core.planning import BehaviorMode
 
 
 class CommandKind(str, Enum):
@@ -217,6 +218,19 @@ class PermissionModeSelected(UiAction):
 
 
 @dataclass(frozen=True, slots=True)
+class BehaviorModeSelected(UiAction):
+    """Request that an idle AgentRun select its next Turn behavior mode."""
+
+    mode: BehaviorMode
+
+    def __post_init__(self) -> None:
+        mode = self.mode
+        if not isinstance(mode, BehaviorMode):
+            mode = BehaviorMode(mode)
+            object.__setattr__(self, "mode", mode)
+
+
+@dataclass(frozen=True, slots=True)
 class QuitInterface(UiAction):
     """Request that the active interface exit."""
 
@@ -298,6 +312,7 @@ class CompletionCandidate:
 
 __all__ = [
     "ArgumentSpec",
+    "BehaviorModeSelected",
     "CandidateProvider",
     "ClearTranscript",
     "CommandAvailability",

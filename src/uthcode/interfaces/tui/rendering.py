@@ -30,8 +30,21 @@ class ToolUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanUpdate:
+    revision: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStateUpdate:
+    items: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RenderBatch:
     users: tuple[tuple[str, str], ...] = ()
+    plans: tuple[PlanUpdate, ...] = ()
+    task_states: tuple[TaskStateUpdate, ...] = ()
     text: tuple[TextUpdate, ...] = ()
     tools: tuple[ToolUpdate, ...] = ()
     terminal: str | None = None
@@ -40,7 +53,15 @@ class RenderBatch:
 
     @property
     def has_updates(self) -> bool:
-        return bool(self.users or self.text or self.tools or self.terminal or self.activity)
+        return bool(
+            self.users
+            or self.plans
+            or self.task_states
+            or self.text
+            or self.tools
+            or self.terminal
+            or self.activity
+        )
 
 
 @dataclass(slots=True)
@@ -139,6 +160,11 @@ def _text_value(event: AgentEvent, name: str, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _enum_value(value: object) -> str:
+    enum_value = getattr(value, "value", value)
+    return enum_value if isinstance(enum_value, str) else ""
+
+
 class AgentEventRenderer:
     """Batch display-safe public events without retaining tool results."""
 
@@ -183,6 +209,45 @@ class AgentEventRenderer:
             buffer = self._buffers.setdefault(key, _TextBuffer("assistant"))
             buffer.completed = _message_text(getattr(event, "message", None))
             return self.flush()
+        if event_type == "plan_proposed":
+            batch = self.flush()
+            return replace(
+                batch,
+                plans=batch.plans
+                + (
+                    PlanUpdate(
+                        int(getattr(event, "revision")),
+                        _text_value(event, "plan_text"),
+                    ),
+                ),
+            )
+        if event_type == "task_state_changed":
+            batch = self.flush()
+            task_state = getattr(event, "task_state")
+            items = tuple(
+                (
+                    _enum_value(getattr(item, "status", "")),
+                    str(getattr(item, "content", "")),
+                )
+                for item in getattr(task_state, "items", ())
+            )
+            return replace(
+                batch,
+                task_states=batch.task_states + (TaskStateUpdate(items),),
+            )
+        if event_type == "behavior_mode_changed":
+            mode = _enum_value(getattr(event, "behavior_mode", ""))
+            return replace(self.flush(), activity=f"mode: {mode}")
+        if event_type == "user_steering_requested":
+            return replace(self.flush(), activity="steering…")
+        if event_type == "user_steering_applied":
+            return replace(self.flush(), activity="updating task…")
+        if event_type == "completion_blocked":
+            count = int(getattr(event, "unfinished_count"))
+            return replace(
+                self.flush(),
+                activity=f"continuing · {count} unfinished tasks",
+            )
         if event_type in {"tool_started", "tool_finished"}:
             batch = self.flush()
             status = (
@@ -243,7 +308,9 @@ class AgentEventRenderer:
 __all__ = [
     "AgentEventRenderer",
     "MarkdownStream",
+    "PlanUpdate",
     "RenderBatch",
+    "TaskStateUpdate",
     "TextUpdate",
     "ToolUpdate",
 ]

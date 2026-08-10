@@ -58,20 +58,20 @@
 
 ## Task 8 — Slash Command 产品入口
 
-- [ ] 在 `D:\project\Re-UthCode-T08-W03` 执行 `git merge-base --is-ancestor T08-W01-core-contracts HEAD`，退出码为 0；当前分支为 `T08-W03-slash-tui`。
-- [ ] 执行 command dispatcher/registry/completion 测试，确认 `/plan` 选择 PLAN、`/do` 选择 DEFAULT、`/build` 解析为 `/do` alias，三者均已实现且无参数。
-- [ ] 执行 `/plan extra`、`/do extra`、`/build extra` 测试，全部返回 usage error，不产生 Prompt。
-- [ ] 执行 `rg -n -e "aliases=.*p" -e "canonical=.*build" -e "CommandKind\.PROMPT" src/uthcode/application/commands/builtins.py`，人工核对无旧 `/p`、无第三个 canonical Build mode、`/do` 不再是 Prompt 命令。
-- [ ] 执行 `/help` 与 completion 快照测试，确认最终命令、alias、说明和实现状态只来自同一 Registry。
+- [x] 在 `D:\project\Re-UthCode-T08-W03` 执行 `git merge-base --is-ancestor T08-W01-core-contracts HEAD`，退出码为 0；当前分支为 `T08-W03-slash-tui`。
+- [x] 执行 command dispatcher/registry/completion 测试，确认 `/plan` 选择 PLAN、`/do` 选择 DEFAULT、`/build` 解析为 `/do` alias，三者均已实现且无参数。
+- [x] 执行 `/plan extra`、`/do extra`、`/build extra` 测试，全部返回 usage error，不产生 Prompt。
+- [x] 执行 `rg -n -e "aliases=.*p" -e "canonical=.*build" -e "CommandKind\.PROMPT" src/uthcode/application/commands/builtins.py`，人工核对无旧 `/p`、无第三个 canonical Build mode、`/do` 不再是 Prompt 命令。
+- [x] 执行 `/help` 与 completion 快照测试，确认最终命令、alias、说明和实现状态只来自同一 Registry。
 
 ## Task 9 — TUI Plan / Todo / Steering 产品闭环
 
-- [ ] 执行 TUI 输入测试，确认 idle 普通文本 start Turn，active 且无 typed interaction 时 steer，Plan Review/AskUser/Permission/Retry pending 时普通输入不能旁路。
-- [ ] 执行 mode UI 测试，确认 DEFAULT 与 PLAN separator 不同，status 同时显示 behavior mode 与 permission mode，approve 后立即恢复默认色。
-- [ ] 执行 Plan rendering 测试，确认 `UthCode · Plan v1`、完整替代 `Plan v2` 分别 append，均使用 plan background 且不覆盖旧 scrollback。
-- [ ] 执行 Plan Review picker/revision、TaskState checklist、Steering user message exactly-once 与 CompletionBlocked 不显示 candidate final 的测试。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_command_dispatcher.py tests/test_command_registry.py tests/test_command_completion.py tests/test_tui.py`，全部通过。
-- [ ] 执行 UTF-8 guard 检查 `docs/TUI/README.md`，结果为 `OK`；检查 W03 Feedback 已记录命令/TUI 结果和跨层待集成边界。
+- [x] 执行 TUI 输入测试，确认 idle 普通文本 start Turn，active 且无 typed interaction 时 steer，Plan Review/AskUser/Permission/Retry pending 时普通输入不能旁路。
+- [x] 执行 mode UI 测试，确认 DEFAULT 与 PLAN separator 不同，status 同时显示 behavior mode 与 permission mode，approve 后立即恢复默认色。
+- [x] 执行 Plan rendering 测试，确认 `UthCode · Plan v1`、完整替代 `Plan v2` 分别 append，均使用 plan background 且不覆盖旧 scrollback。
+- [x] 执行 Plan Review picker/revision、TaskState checklist、Steering user message exactly-once 与 CompletionBlocked 不显示 candidate final 的测试。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_command_dispatcher.py tests/test_command_registry.py tests/test_command_completion.py tests/test_tui.py`，全部通过。
+- [x] 执行 UTF-8 guard 检查 `docs/TUI/README.md`，结果为 `OK`；检查 W03 Feedback 已记录命令/TUI 结果和跨层待集成边界。
 
 ## Task 10 [接入主流程] — 正式 Composition 与分支整合
 
