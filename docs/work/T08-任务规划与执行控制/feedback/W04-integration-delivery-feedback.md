@@ -85,3 +85,29 @@ create_application
 - 已删除 `T08-W01-core-contracts`、`T08-W02-runtime-application`、`T08-W03-slash-tui`；删除安全，因为对应 tip 已合入最终 T08。
 - 最终 `git worktree list` 仅显示 `D:\project\Re-UthCode`；本地分支仅保留 `main`、`T05-ReAct与AgentLoop`、`T08-任务规划与执行控制`；`origin` URL 未改变。
 - 本次 W04 未启动 T08 包级审查，保留任务上下文供独立 W04 reviewer 反馈后继续返工。
+
+## 10. 返工第 1 轮
+
+### 原因
+
+W04 独立验收指出原正式 E2E 只验证了文件副作用和部分公开事件，未充分证明后续 Provider request 中的 `role=tool` 消息、`ToolResultPart` 的正文/错误标记/顺序及每个原始 call ID 的唯一闭合；同时 A01–A04 Context 与当前 Hook、Plan、Todo、Steering、`/plan`、`/do` 实现事实不一致。
+
+### 实际修改
+
+- `tests/test_t08_e2e.py` 新增正式 ToolResult 证据收集：只读取每个后续 Provider request 相对前一 request 新增的 `role=tool` 消息，严格断言 8 个原始 call ID 各出现一次、ToolResult 的 `is_error`/正文/顺序、`plan-read` 与 `verify-read` 成功及 `verify-read` 正文为 `1\tseed + steered`。
+- E2E 新增每个 `ToolBatchFinished` 的 call ID 顺序/集合、batch status、ToolFinished 状态与唯一错误断言；`gate` 与 `stale-write` 均闭合，只有 `stale-write` 为错误且没有文件副作用。
+- E2E 新增故障反例：测试专用 ReadFile wrapper 让真实 `verify-read` 返回 `is_error=True`，严格主流程证据校验随之失败，防止错误结果被误判为成功。
+- 同步 `docs/Context-Index.md` 与 A01–A04 Context：固定 `RuntimeHookSet`、PlanState/TaskState、同一 Turn Steering、`/plan`/`/do` 标为当前事实；动态 Hook registry/plugin、持久 Session/Memory、Context Compiler、Subagent/Multi-Agent 等真实未实现边界继续保留。
+- 未修改冻结的 T08 原始需求、Spec、Tasks、Prompt 或 Checklist；未启动 T08 包级审查。
+
+### 重新验证结果
+
+- W04 E2E：`5 passed`。
+- architecture/package：`32 passed`。
+- T04–T08 定向回归（工具、ReAct、交互、权限、规划/Hook、命令/TUI、W04 E2E）：`788 passed, 3 skipped`。
+- 全量 pytest：`847 passed, 3 skipped`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：退出码 0。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`。
+- `git diff --check`：退出码 0，无 whitespace error。
+- UTF-8 guard：本轮改动的 6 个 Markdown 文件全部 `OK`，无 replacement character、mojibake 或 fence 不平衡。
+- 负向扫描：无旧 `/p`/Prompt `/do`/第三 Build mode、重复 Runtime/规划职责、动态 Hook registry、Interface Core/Integration 反向依赖或 Interface-owned Plan/Task state；`AgentLoop` 与 `AgentTurnExecution` 定义各 1 个。

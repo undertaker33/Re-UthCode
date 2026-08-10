@@ -5,7 +5,7 @@ layer: A03-State
 context_file: docs/A03-State/State-Context.md
 owns: current in-memory Run/Turn facts + conversation + events + safe projections
 current_shape: immutable Core state with Application-owned lifecycle
-explicit_absence: persistent session + memory + todo/plan + context compiler
+explicit_absence: persistent session + memory + context compiler
 ```
 
 ## 当前结论
@@ -15,7 +15,9 @@ explicit_absence: persistent session + memory + todo/plan + context compiler
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；这只说明可序列化，不表示已经持久化。
-- `[ABSENT]` 当前没有 Session Store、Journal Store、Memory、Todo/Plan、任务进度模型、Context Compiler 或压缩。
+- `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
+- `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
+- `[ABSENT]` 当前没有 Session Store、Journal Store、持久 Memory、Context Compiler 或结构化压缩。
 
 ## 权威源码索引
 
@@ -41,6 +43,9 @@ explicit_absence: persistent session + memory + todo/plan + context compiler
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |
+| behavior mode | `RunState` / `AgentRun` idle selection | 当前 Turn；批准 Plan 后切回 DEFAULT，下一 Turn 继承最终 mode | `BehaviorModeChanged`, `Run.behavior_mode` |
+| PlanState / TaskState | `RunState` | 当前 Turn；Plan revision/approval 与 Todo replace-all | `PlanProposed`, `TaskStateChanged`, prompt facts |
+| runtime feedback / Steering | `RunState` | 一次性反馈；Steering 为同一 Turn 的 user message | `UserSteeringRequested`, `UserSteeringApplied` |
 | 暂停 continuation | `AgentTurnExecution._TurnContinuation` | 当前 Turn 的暂停边界 | 仅通过 `PauseRequest` 投影必要事实 |
 | asyncio task/queue/waiter | `application.runs._TurnDriver` | 当前活动 Turn | 不进入 Core/JSON 状态 |
 | UI 草稿/候选/渲染尾部 | Interface | 当前界面/当前 Turn | 非业务权威状态 |
@@ -58,6 +63,10 @@ RunState:
   usage
   status = running | completed | failed | cancelled
   termination_reason
+  behavior_mode
+  task_state
+  plan_state?
+  runtime_feedback?
 
 RunSnapshot:
   RunState - messages
@@ -123,6 +132,7 @@ implemented context:
   ApplicationRuntimeContext = workdir + platform + current_date
   Prompt context            = runtime facts + selected model/provider identity
   Conversation context      = RunState.messages
+  Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
 not implemented context:
@@ -131,6 +141,7 @@ not implemented context:
   structured compaction
   retrieval context
   persistent session history
+  persistent Memory
 ```
 
 ## 状态不变量
@@ -153,7 +164,8 @@ Run/Turn 权威字段与终态 -> core/agent.py
 Run 生命周期/并发独占    -> application/runs.py
 环境事实                -> application/runtime_context.py
 配置事实                -> application/configuration.py + integrations/config/
-Memory/Todo/Plan         -> 当前不存在；必须按新需求建立，不复用 UI 投影状态
+Memory                    -> 当前不存在持久 Memory；出现需求时先定义存储边界
+Todo/Plan/Steering        -> core/planning.py + core/agent.py + application/runs.py；不复用 UI 投影状态
 ```
 
 ## 最小验证索引

@@ -13,6 +13,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
+- `[FACT]` `create_application -> create_run -> start_turn` 组合一个固定 `RuntimeHookSet`、Plan/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
@@ -120,21 +121,22 @@ implemented:
   /permission [default|auto|full_access]
   /status
   /quit
+  /plan
+  /do
+  /build (alias of /do)
 
 declared_but_not_implemented:
   /config
   /compact
-  /plan
   /new
   /resume
   /login
   /memory
   /dream
-  /do
   /review
 ```
 
-命令注册表中存在未实现命令只用于明确返回 `NOT_IMPLEMENTED`；不得据此推断相应 Context、Plan、Memory、Session 或 Prompt 编排已存在。
+命令注册表中保留的未实现命令只返回 `NOT_IMPLEMENTED`；`/plan` 与 `/do` 已由同一 Registry 选择 Behavior Mode，`/build` 只是 `/do` alias。Plan/Task/Steering 状态仍由 Core/Application 权威链路持有，不由命令或 TUI 复制。
 
 ## 编排不变量
 

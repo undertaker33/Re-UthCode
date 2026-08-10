@@ -5,7 +5,7 @@ layer: A02-Control
 context_file: docs/A02-Control/Control-Context.md
 owns: permission + approval + cooperative pause/resume + ask-user + cancellation
 current_shape: application-controlled boundaries over one Core Turn
-explicit_absence: OS sandbox + hook runtime
+explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 ```
 
 ## 当前结论
@@ -15,8 +15,10 @@ explicit_absence: OS sandbox + hook runtime
 - `[FACT]` 已实现四类暂停：用户请求、询问用户、Provider 暂时不可用、权限审批。
 - `[FACT]` 暂停/恢复保持同一个 `AgentTurnExecution`、同一个 `TurnHandle` 和同一个事件流，不创建替代 Turn。
 - `[FACT]` 取消优先于待处理的恢复或审批响应；取消幂等。
+- `[FACT]` 固定 `RuntimeHookSet` 在 trusted preflight 与 Permission 之间执行 PLAN 只读 Hook，并在 usage accounting 后执行 Plan Review/unfinished-task completion Hook。
+- `[FACT]` Plan Review 使用现有 typed pause/resume，TodoWrite 与同一 Turn Steering 使用同一 Core execution 边界；不创建第二个控制 Runtime。
 - `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。
-- `[ABSENT]` 当前没有 OS Sandbox、Hook 注册/执行链、Hook 阻断或 Hook 生命周期。
+- `[ABSENT]` 当前没有 OS Sandbox、动态 Hook registry、第三方 Hook plugin 生命周期或可热插拔 Hook。
 
 ## 权威源码索引
 
@@ -100,7 +102,8 @@ running segment
 ## 不属于当前控制层
 
 - `[ABSENT]` OS 级文件、网络、系统调用 Sandbox。
-- `[ABSENT]` Hook 生命周期、before/after tool hook、事件 hook、阻断链。
+- `[FACT]` 固定 `RuntimeHookSet` 已实现 before-tool 与 before-completion 两个 Hook 点及其阻断结果。
+- `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、after-tool/事件 Hook 扩展链。
 - `[ABSENT]` 跨进程 pending pause 恢复；进程退出后控制状态丢失。
 - `[ABSENT]` 持久化 permission decision；只有显式规则文件与 Run-local SessionGrant。
 
@@ -114,7 +117,7 @@ running segment
 暂停产生与 Tool 审批接入    -> core/agent.py
 等待、恢复、取消竞态        -> application/runs.py
 TUI 问答/审批交互           -> interfaces/tui/interaction.py + app.py
-Hook                        -> 当前不存在；先按新需求设计，不增加旧入口兼容层
+Hook                        -> core/hooks.py + application/tools.py；只允许固定 HookSet，不增加动态 registry 或旧入口兼容层
 ```
 
 ## 最小验证索引
