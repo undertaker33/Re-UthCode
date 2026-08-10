@@ -186,6 +186,40 @@ def test_application_exposes_core_tool_values_without_integration_runtime_types(
     assert not hasattr(application, "RunState")
 
 
+def test_t08_public_exports_expose_mode_and_control_projection_only() -> None:
+    import uthcode.application as application
+    import uthcode.core as core
+
+    from uthcode.application import BehaviorMode, BehaviorModeSelected, create_application
+    from uthcode.core import (
+        CompletionBlocked,
+        PlanProposed,
+        RuntimeHookSet,
+        TaskState,
+        TaskStateChanged,
+        UserSteeringApplied,
+    )
+
+    assert all(
+        value is not None
+        for value in (
+            BehaviorMode,
+            BehaviorModeSelected,
+            CompletionBlocked,
+            PlanProposed,
+            RuntimeHookSet,
+            TaskState,
+            TaskStateChanged,
+            UserSteeringApplied,
+            create_application,
+        )
+    )
+    assert "RuntimeHookSet" not in application.__all__
+    assert "ToolRegistry" not in application.__all__
+    assert "AgentLoop" not in application.__all__
+    assert "RuntimeHookSet" in core.__all__
+
+
 def _restart_process_environment(home: Path) -> dict[str, str]:
     source_root = str(Path(__file__).parents[1] / "src")
     environment = os.environ.copy()

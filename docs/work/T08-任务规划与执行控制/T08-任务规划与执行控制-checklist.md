@@ -75,31 +75,31 @@
 
 ## Task 10 [接入主流程] — 正式 Composition 与分支整合
 
-- [ ] 在 `D:\project\Re-UthCode` 执行 `git branch --show-current`，输出为 `T08-任务规划与执行控制`；W01、W02、W03 各自工作树均已提交且 Feedback 存在。
-- [ ] 按 W01 → W02 → W03 顺序创建本地 merge commit；逐个执行 `git merge-base --is-ancestor <worker-branch> HEAD`，退出码均为 0。
-- [ ] 执行正式 composition 测试，确认 `create_application → create_run → start_turn` 使用唯一 HookSet、Tool universe、AgentLoop、Permission 链和 Application driver。
-- [ ] 执行调用顺序测试，确认 pre-tool Hook 位于 preflight 与 Permission 之间，completion Hook 位于 usage accounting 与 authoritative assistant commit 之间。
-- [ ] 执行 Headless 测试，确认无 TUI 也能 Plan Review、Steering、Todo、Completion Block；Interface 未导入 Core internal Hook 或 Integration。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_architecture_boundaries.py tests/test_package.py`，全部通过。
+- [x] 在 `D:\project\Re-UthCode` 执行 `git branch --show-current`，输出为 `T08-任务规划与执行控制`；W01、W02、W03 各自工作树均已提交且 Feedback 存在。
+- [x] 按 W01 → W02 → W03 顺序创建本地 merge commit；逐个执行 `git merge-base --is-ancestor <worker-branch> HEAD`，退出码均为 0。
+- [x] 执行正式 composition 测试，确认 `create_application → create_run → start_turn` 使用唯一 HookSet、Tool universe、AgentLoop、Permission 链和 Application driver。
+- [x] 执行调用顺序测试，确认 pre-tool Hook 位于 preflight 与 Permission 之间，completion Hook 位于 usage accounting 与 authoritative assistant commit 之间。
+- [x] 执行 Headless 测试，确认无 TUI 也能 Plan Review、Steering、Todo、Completion Block；Interface 未导入 Core internal Hook 或 Integration。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_architecture_boundaries.py tests/test_package.py`，全部通过。
 
 ## Task 11 [端到端验证] — Plan + Execution Planning + Steering
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_t08_e2e.py`，正式 Application + Fake Provider + 真实 builtin Tool + 临时 workspace 的核心 E2E 全部通过。
-- [ ] E2E request capture 证明首个 PLAN view、approve 后 full view、TodoWrite、真实 user Steering message 和一次性反馈按顺序出现。
-- [ ] E2E 文件证据证明 PLAN 阶段无写入，DEFAULT 阶段真实 Read/Write/Edit/验证发生，stale Tool 未执行。
-- [ ] E2E 事件证据证明 Plan v1/revise/v2/approve 同 Turn、CompletionBlocked 后继续、最终 exactly one `TurnCompleted`、无额外 terminal。
-- [ ] 执行 PLAN + full_access、敏感只读 Permission Ask、Plan Review pending Steering rejection、stale response 和 Cancel race 额外场景，全部通过。
-- [ ] 启动下一 Turn，断言 TaskState、PlanState 和 one-shot feedback 已重置，Run 的最终 BehaviorMode 与 conversation 保留规则符合 Spec。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_t08_e2e.py`，正式 Application + Fake Provider + 真实 builtin Tool + 临时 workspace 的核心 E2E 全部通过。
+- [x] E2E request capture 证明首个 PLAN view、approve 后 full view、TodoWrite、真实 user Steering message 和一次性反馈按顺序出现。
+- [x] E2E 文件证据证明 PLAN 阶段无写入，DEFAULT 阶段真实 Read/Write/Edit/验证发生，stale Tool 未执行。
+- [x] E2E 事件证据证明 Plan v1/revise/v2/approve 同 Turn、CompletionBlocked 后继续、最终 exactly one `TurnCompleted`、无额外 terminal。
+- [x] 执行 PLAN + full_access、敏感只读 Permission Ask、Plan Review pending Steering rejection、stale response 和 Cancel race 额外场景，全部通过。
+- [x] 启动下一 Turn，断言 TaskState、PlanState 和 one-shot feedback 已重置，Run 的最终 BehaviorMode 与 conversation 保留规则符合 Spec。
 
 ## Task 12 [遗留负担清理] — 单 Runtime 收口与 Worktree 回收
 
-- [ ] 执行否定性扫描，确认无旧 `/p`、旧 Prompt `/do`、第三 Build mode、第二 AgentLoop/planning loop、Todo Manager、Plan→Todo compiler、complexity detector、动态 Hook registry 和 Interface-owned Plan/Task state。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，全量测试全部通过，除既有环境门禁外无新增 skip/xfail。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`，退出码为 0。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
-- [ ] 执行 `git diff --check`，退出码为 0 且无 whitespace error。
-- [ ] 对 T08 工作包、`docs/Context-Index.md` 与 `docs/TUI/README.md` 执行 UTF-8 guard，全部输出 `OK`，无 replacement character、mojibake 或 fence 不平衡。
-- [ ] Checklist 12 个 Task 全部完成，W01～W04 四份 Feedback 齐全；`docs/Context-Index.md` 将 T08 标记为 `implemented_unarchived`，工作包未被 Agent 归档。
-- [ ] 对 W01、W02、W03 tip 逐一执行祖先验证为 0 后，以精确绝对路径移除三个 worktree，再用 `git branch -d` 删除三个本地短期分支。
-- [ ] 最终 `git worktree list` 只显示 `D:\project\Re-UthCode`；本地保留 `main`、`T05-ReAct与AgentLoop`、`T08-任务规划与执行控制`，远端引用未改变。
-- [ ] 最终工作树干净，W04 Feedback 记录合并顺序、冲突处理、测试结果、删除项、worktree 回收和未决风险。
+- [x] 执行否定性扫描，确认无旧 `/p`、旧 Prompt `/do`、第三 Build mode、第二 AgentLoop/planning loop、Todo Manager、Plan→Todo compiler、complexity detector、动态 Hook registry 和 Interface-owned Plan/Task state。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，全量测试全部通过，除既有环境门禁外无新增 skip/xfail。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`，退出码为 0。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，输出 `No broken requirements found.`。
+- [x] 执行 `git diff --check`，退出码为 0 且无 whitespace error。
+- [x] 对 T08 工作包、`docs/Context-Index.md` 与 `docs/TUI/README.md` 执行 UTF-8 guard，全部输出 `OK`，无 replacement character、mojibake 或 fence 不平衡。
+- [x] Checklist 12 个 Task 全部完成，W01～W04 四份 Feedback 齐全；`docs/Context-Index.md` 将 T08 标记为 `implemented_unarchived`，工作包未被 Agent 归档。
+- [x] 对 W01、W02、W03 tip 逐一执行祖先验证为 0 后，以精确绝对路径移除三个 worktree，再用 `git branch -d` 删除三个本地短期分支。
+- [x] 最终 `git worktree list` 只显示 `D:\project\Re-UthCode`；本地保留 `main`、`T05-ReAct与AgentLoop`、`T08-任务规划与执行控制`，远端引用未改变。
+- [x] 最终工作树干净，W04 Feedback 记录合并顺序、冲突处理、测试结果、删除项、worktree 回收和未决风险。

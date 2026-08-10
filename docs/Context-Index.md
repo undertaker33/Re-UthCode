@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-09
+snapshot_date: 2026-08-10
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -50,7 +50,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-09
+status_snapshot: 2026-08-10
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -75,12 +75,13 @@ status_values:
 | T05 | ReAct 与 Agent Loop | `docs/work/T05-ReAct与AgentLoop/` | Checklist `91/91`；4 份 Feedback；`src/uthcode/core/agent.py` 与 `src/uthcode/application/runs.py` 已接入 |
 | T06 | 暂停恢复与询问用户 | `docs/work/T06-暂停恢复与询问用户/` | Checklist `42/42`；3 份 Feedback；`src/uthcode/core/interaction.py` 与暂停恢复链已接入 |
 | T07 | 三层权限系统 | `docs/work/T07-三层权限系统/` | Checklist `56/56`；4 份 Feedback；`src/uthcode/core/permission.py` 与 `src/uthcode/integrations/permissions.py` 已接入 |
+| T08 | 任务规划与执行控制 | `docs/work/T08-任务规划与执行控制/` | Checklist `全部完成`；4 份 Worker Feedback；`create_application → create_run → start_turn` 正式链、Plan/Task/Steering/Hook 与 T08 E2E 已接入 |
 
 ### `not_implemented`
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T08 | 任务规划与执行控制 | `docs/work/T08-任务规划与执行控制/` | 正式工作包已生成；Checklist 尚未完成且尚无 Worker Feedback；当前源码仍无 BehaviorMode、PlanState、TaskState 与 Runtime Hook |
+| — | — | — | 当前没有未实施的活跃工作包 |
 
 ## 跨层最短链路
 
