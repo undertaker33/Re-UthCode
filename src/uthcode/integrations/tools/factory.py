@@ -6,7 +6,7 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
-from uthcode.core.tool import Tool
+from uthcode.core.tool import Tool, ToolPlanningMetadata
 
 from .file_tools import EditFileTool, ReadFileTool, WriteFileTool
 from .process_tools import BashTool
@@ -35,6 +35,8 @@ def create_default_tools(
         GrepTool(resolver),
         BashTool(resolver.root),
     )
+    if not all(isinstance(tool, ToolPlanningMetadata) for tool in tools):
+        raise TypeError("all built-in tools must declare planning_access")
     return tuple(tools)
 
 

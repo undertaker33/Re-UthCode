@@ -31,6 +31,7 @@ from .provider import (
     ToolResultPart,
     Usage,
 )
+from .planning import BehaviorMode, TaskState
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -81,6 +82,8 @@ def _json_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (Message, Usage)):
+        return value.to_dict()
+    if isinstance(value, TaskState):
         return value.to_dict()
     if isinstance(
         value,
@@ -281,6 +284,85 @@ class UsageUpdated(AgentEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class BehaviorModeChanged(AgentEvent):
+    event_type: ClassVar[str] = "behavior_mode_changed"
+    previous_mode: BehaviorMode
+    behavior_mode: BehaviorMode
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        for field_name in ("previous_mode", "behavior_mode"):
+            value = getattr(self, field_name)
+            if not isinstance(value, BehaviorMode):
+                try:
+                    value = BehaviorMode(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"unknown behavior mode: {value!r}") from exc
+                object.__setattr__(self, field_name, value)
+        if self.previous_mode is self.behavior_mode:
+            raise ValueError("BehaviorModeChanged requires an actual mode change")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStateChanged(AgentEvent):
+    event_type: ClassVar[str] = "task_state_changed"
+    iteration: int
+    task_state: TaskState
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_positive_int(self.iteration, "iteration")
+        if not isinstance(self.task_state, TaskState):
+            raise TypeError("task_state must be a TaskState")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanProposed(AgentEvent):
+    event_type: ClassVar[str] = "plan_proposed"
+    iteration: int
+    revision: int
+    plan_text: str
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_positive_int(self.iteration, "iteration")
+        _require_positive_int(self.revision, "revision")
+        _require_text(self.plan_text, "plan_text")
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionBlocked(AgentEvent):
+    event_type: ClassVar[str] = "completion_blocked"
+    iteration: int
+    unfinished_count: int
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_positive_int(self.iteration, "iteration")
+        _require_positive_int(self.unfinished_count, "unfinished_count")
+
+
+@dataclass(frozen=True, slots=True)
+class UserSteeringRequested(AgentEvent):
+    event_type: ClassVar[str] = "user_steering_requested"
+    steering_id: str
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_text(self.steering_id, "steering_id")
+
+
+@dataclass(frozen=True, slots=True)
+class UserSteeringApplied(AgentEvent):
+    event_type: ClassVar[str] = "user_steering_applied"
+    steering_id: str
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_text(self.steering_id, "steering_id")
+
+
+@dataclass(frozen=True, slots=True)
 class TurnPausing(AgentEvent):
     event_type: ClassVar[str] = "turn_pausing"
     pause_id: str
@@ -305,15 +387,21 @@ class TurnPausing(AgentEvent):
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"unknown pause reason: {self.reason!r}") from exc
             object.__setattr__(self, "reason", reason)
-        PauseRequest(
-            pause_id=self.pause_id,
-            run_id=self.run_id,
-            turn_id=self.turn_id,
-            kind=kind,
-            reason=reason,
-            iteration=self.iteration,
-            created_at="event",
-        )
+        _require_positive_int(self.iteration, "iteration")
+        valid_reasons = {
+            PauseKind.USER_REQUESTED: {PauseReason.USER_REQUESTED},
+            PauseKind.USER_INPUT_REQUIRED: {PauseReason.USER_INPUT_REQUIRED},
+            PauseKind.PROVIDER_UNAVAILABLE: {
+                PauseReason.NETWORK_ERROR,
+                PauseReason.RATE_LIMITED,
+            },
+            PauseKind.PERMISSION_REQUIRED: {PauseReason.PERMISSION_REQUIRED},
+            PauseKind.PLAN_REVIEW_REQUIRED: {PauseReason.PLAN_REVIEW_REQUIRED},
+        }
+        if reason not in valid_reasons[kind]:
+            raise ValueError(
+                f"pause kind {kind.value} does not allow reason {reason.value}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +617,12 @@ AgentEventValue: TypeAlias = (
     | AssistantMessageDelta
     | AssistantMessageCompleted
     | UsageUpdated
+    | BehaviorModeChanged
+    | TaskStateChanged
+    | PlanProposed
+    | CompletionBlocked
+    | UserSteeringRequested
+    | UserSteeringApplied
     | TurnPausing
     | UserInputRequested
     | TurnPaused
@@ -554,6 +648,12 @@ _EVENT_TYPES: dict[str, type[AgentEvent]] = {
         AssistantMessageDelta,
         AssistantMessageCompleted,
         UsageUpdated,
+        BehaviorModeChanged,
+        TaskStateChanged,
+        PlanProposed,
+        CompletionBlocked,
+        UserSteeringRequested,
+        UserSteeringApplied,
         TurnPausing,
         UserInputRequested,
         TurnPaused,
@@ -654,6 +754,84 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             turn_id,
             _required(payload, "iteration"),  # type: ignore[arg-type]
             Usage.from_dict(_required(payload, "usage")),
+        )
+    if event_type == BehaviorModeChanged.event_type:
+        _expect_keys(
+            payload,
+            {"type", "run_id", "turn_id", "previous_mode", "behavior_mode"},
+        )
+        return BehaviorModeChanged(
+            run_id,
+            turn_id,
+            _required(payload, "previous_mode"),  # type: ignore[arg-type]
+            _required(payload, "behavior_mode"),  # type: ignore[arg-type]
+        )
+    if event_type == TaskStateChanged.event_type:
+        _expect_keys(
+            payload,
+            {"type", "run_id", "turn_id", "iteration", "task_state"},
+        )
+        return TaskStateChanged(
+            run_id,
+            turn_id,
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+            TaskState.from_dict(_required(payload, "task_state")),  # type: ignore[arg-type]
+        )
+    if event_type == PlanProposed.event_type:
+        _expect_keys(
+            payload,
+            {
+                "type",
+                "run_id",
+                "turn_id",
+                "iteration",
+                "revision",
+                "plan_text",
+            },
+        )
+        return PlanProposed(
+            run_id,
+            turn_id,
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+            _required(payload, "revision"),  # type: ignore[arg-type]
+            _required(payload, "plan_text"),  # type: ignore[arg-type]
+        )
+    if event_type == CompletionBlocked.event_type:
+        _expect_keys(
+            payload,
+            {
+                "type",
+                "run_id",
+                "turn_id",
+                "iteration",
+                "unfinished_count",
+            },
+        )
+        return CompletionBlocked(
+            run_id,
+            turn_id,
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+            _required(payload, "unfinished_count"),  # type: ignore[arg-type]
+        )
+    if event_type == UserSteeringRequested.event_type:
+        _expect_keys(
+            payload,
+            {"type", "run_id", "turn_id", "steering_id"},
+        )
+        return UserSteeringRequested(
+            run_id,
+            turn_id,
+            _required(payload, "steering_id"),  # type: ignore[arg-type]
+        )
+    if event_type == UserSteeringApplied.event_type:
+        _expect_keys(
+            payload,
+            {"type", "run_id", "turn_id", "steering_id"},
+        )
+        return UserSteeringApplied(
+            run_id,
+            turn_id,
+            _required(payload, "steering_id"),  # type: ignore[arg-type]
         )
     if event_type == TurnPausing.event_type:
         _expect_keys(payload, {"type", "run_id", "turn_id", "pause_id", "kind", "reason", "iteration"})
@@ -773,7 +951,10 @@ __all__ = [
     "AssistantMessageKind",
     "AssistantMessageCompleted",
     "AssistantMessageDelta",
+    "BehaviorModeChanged",
+    "CompletionBlocked",
     "IterationStarted",
+    "PlanProposed",
     "ReasoningDelta",
     "ReasoningFinished",
     "ReasoningStarted",
@@ -781,12 +962,15 @@ __all__ = [
     "ToolBatchStarted",
     "ToolFinished",
     "ToolStarted",
+    "TaskStateChanged",
     "TurnCancelled",
     "TurnCompleted",
     "TurnFailed",
     "TurnStarted",
     "TerminationReason",
     "UsageUpdated",
+    "UserSteeringApplied",
+    "UserSteeringRequested",
     "TurnPausing",
     "UserInputRequested",
     "TurnPaused",

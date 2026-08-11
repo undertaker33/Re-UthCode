@@ -14,11 +14,13 @@ from uthcode.core import (
     ToolResultPart,
 )
 from uthcode.core.permission import Effect, ResourceScope
+from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
 from uthcode.integrations.tools.file_tools import (
     EditFileTool,
     ReadFileTool,
     WriteFileTool,
 )
+from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.tools.workspace import (
     FileReadTracker,
     WorkspacePathError,
@@ -128,6 +130,37 @@ def test_file_tools_preflight_produces_trusted_effect_and_ignores_pseudo_effect(
     assert (write_action.effect, write_action.scope) == (Effect.WRITE, ResourceScope.INSIDE)
     assert (edit_action.effect, edit_action.scope) == (Effect.WRITE, ResourceScope.INSIDE)
     assert read_action.resource == write_action.resource == edit_action.resource == "note.txt"
+
+
+def test_file_tools_declare_planning_access_without_provider_wire_metadata(
+    tmp_path: Path,
+) -> None:
+    _, _, read, write, edit = _tools(tmp_path)
+
+    assert all(isinstance(tool, ToolPlanningMetadata) for tool in (read, write, edit))
+    assert read.planning_access is ToolPlanningAccess.READ_ONLY
+    assert write.planning_access is ToolPlanningAccess.HIDDEN
+    assert edit.planning_access is ToolPlanningAccess.HIDDEN
+    assert all(
+        "planning_access" not in tool.definition.to_dict()
+        for tool in (read, write, edit)
+    )
+
+
+def test_default_tool_factory_returns_only_explicit_planning_metadata(
+    tmp_path: Path,
+) -> None:
+    tools = create_default_tools(tmp_path)
+
+    assert tuple(tool.definition.name for tool in tools) == (
+        "ReadFile",
+        "WriteFile",
+        "EditFile",
+        "Glob",
+        "Grep",
+        "Bash",
+    )
+    assert all(isinstance(tool, ToolPlanningMetadata) for tool in tools)
 
 
 def test_tracker_requires_read_and_detects_content_change_with_restored_mtime(

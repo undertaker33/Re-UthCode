@@ -89,9 +89,12 @@ def _json_value(value: object) -> object:
             QuestionOption,
             UserQuestion,
             UserInputRequest,
+            PlanReviewRequest,
+            PlanReviewResponse,
             PermissionApprovalRequest,
             PermissionApprovalResponse,
             PauseRequest,
+            SteeringRequest,
         ),
     ):
         return value.to_dict()
@@ -126,6 +129,7 @@ class PauseKind(str, Enum):
     USER_INPUT_REQUIRED = "user_input_required"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PERMISSION_REQUIRED = "permission_required"
+    PLAN_REVIEW_REQUIRED = "plan_review_required"
 
 
 class PauseReason(str, Enum):
@@ -134,6 +138,7 @@ class PauseReason(str, Enum):
     NETWORK_ERROR = "network_error"
     RATE_LIMITED = "rate_limited"
     PERMISSION_REQUIRED = "permission_required"
+    PLAN_REVIEW_REQUIRED = "plan_review_required"
 
 
 class QuestionKind(str, Enum):
@@ -339,6 +344,76 @@ def _normalize_answers(
     return JsonPayload(normalized)
 
 
+class PlanReviewChoice(str, Enum):
+    APPROVE = "approve"
+    REVISE = "revise"
+
+
+@dataclass(frozen=True, slots=True)
+class PlanReviewRequest(_JsonModel):
+    """The complete Plan revision awaiting typed user review."""
+
+    revision: int
+    plan_text: str
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.revision, "revision")
+        _require_text(self.plan_text, "plan_text")
+
+    def to_dict(self) -> dict[str, object]:
+        return {"revision": self.revision, "plan_text": self.plan_text}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PlanReviewRequest:
+        payload = _as_mapping(value, "plan review request")
+        _expect_keys(payload, {"revision", "plan_text"})
+        return cls(
+            _required(payload, "revision"),  # type: ignore[arg-type]
+            _required(payload, "plan_text"),  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> PlanReviewRequest:
+        return cls.from_dict(_json_object(value, "PlanReviewRequest"))
+
+
+@dataclass(frozen=True, slots=True)
+class SteeringRequest(_JsonModel):
+    """A same-Turn user-goal update, separate from the pause protocol."""
+
+    steering_id: str
+    run_id: str
+    turn_id: str
+    text: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("steering_id", "run_id", "turn_id", "text"):
+            _require_text(getattr(self, field_name), field_name)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "steering_id": self.steering_id,
+            "run_id": self.run_id,
+            "turn_id": self.turn_id,
+            "text": self.text,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> SteeringRequest:
+        payload = _as_mapping(value, "steering request")
+        _expect_keys(payload, {"steering_id", "run_id", "turn_id", "text"})
+        return cls(
+            _required(payload, "steering_id"),  # type: ignore[arg-type]
+            _required(payload, "run_id"),  # type: ignore[arg-type]
+            _required(payload, "turn_id"),  # type: ignore[arg-type]
+            _required(payload, "text"),  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> SteeringRequest:
+        return cls.from_dict(_json_object(value, "SteeringRequest"))
+
+
 class PermissionApprovalChoice(str, Enum):
     """The only responses a Permission Approval can accept."""
 
@@ -524,6 +599,7 @@ class PauseRequest(_JsonModel):
     tool_call_id: str | None = None
     user_input_request: UserInputRequest | None = None
     permission_request: PermissionApprovalRequest | None = None
+    plan_review_request: PlanReviewRequest | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("pause_id", "run_id", "turn_id", "created_at"):
@@ -541,6 +617,7 @@ class PauseRequest(_JsonModel):
                 PauseReason.RATE_LIMITED,
             },
             PauseKind.PERMISSION_REQUIRED: {PauseReason.PERMISSION_REQUIRED},
+            PauseKind.PLAN_REVIEW_REQUIRED: {PauseReason.PLAN_REVIEW_REQUIRED},
         }
         if reason not in valid_reason[kind]:
             raise ValueError(f"pause kind {kind.value} does not allow reason {reason.value}")
@@ -557,26 +634,44 @@ class PauseRequest(_JsonModel):
             raise TypeError(
                 "permission_request must be PermissionApprovalRequest or None"
             )
+        if self.plan_review_request is not None and not isinstance(
+            self.plan_review_request, PlanReviewRequest
+        ):
+            raise TypeError("plan_review_request must be PlanReviewRequest or None")
         if kind is PauseKind.USER_INPUT_REQUIRED:
             if self.tool_call_id is None or self.user_input_request is None:
                 raise ValueError("user_input_required pause requires tool_call_id and questions")
             if self.permission_request is not None:
                 raise ValueError("user input pause must not contain permission request")
+            if self.plan_review_request is not None:
+                raise ValueError("user input pause must not contain plan review request")
         elif kind is PauseKind.PERMISSION_REQUIRED:
             if self.tool_call_id is None or self.permission_request is None:
                 raise ValueError("permission pause requires tool_call_id and approval request")
             if self.user_input_request is not None:
                 raise ValueError("permission pause must not contain user input request")
+            if self.plan_review_request is not None:
+                raise ValueError("permission pause must not contain plan review request")
             if (
                 self.permission_request.run_id != self.run_id
                 or self.permission_request.turn_id != self.turn_id
                 or self.permission_request.tool_call_id != self.tool_call_id
             ):
                 raise ValueError("permission request IDs must match the pause")
+        elif kind is PauseKind.PLAN_REVIEW_REQUIRED:
+            if self.plan_review_request is None:
+                raise ValueError("plan review pause requires plan_review_request")
+            if (
+                self.tool_call_id is not None
+                or self.user_input_request is not None
+                or self.permission_request is not None
+            ):
+                raise ValueError("plan review pause must not contain tool input fields")
         elif (
             self.tool_call_id is not None
             or self.user_input_request is not None
             or self.permission_request is not None
+            or self.plan_review_request is not None
         ):
             raise ValueError("tool input fields are only valid for interactive tool pauses")
 
@@ -596,6 +691,8 @@ class PauseRequest(_JsonModel):
         elif self.kind is PauseKind.PERMISSION_REQUIRED:
             payload["tool_call_id"] = self.tool_call_id
             payload["permission_request"] = self.permission_request.to_dict()  # type: ignore[union-attr]
+        elif self.kind is PauseKind.PLAN_REVIEW_REQUIRED:
+            payload["plan_review_request"] = self.plan_review_request.to_dict()  # type: ignore[union-attr]
         return payload
 
     @classmethod
@@ -610,6 +707,7 @@ class PauseRequest(_JsonModel):
                 _required(payload, "user_input_request")  # type: ignore[arg-type]
             )
             permission_request = None
+            plan_review_request = None
         elif kind is PauseKind.PERMISSION_REQUIRED:
             _expect_keys(payload, base | {"tool_call_id", "permission_request"})
             tool_call_id = _required(payload, "tool_call_id")  # type: ignore[assignment]
@@ -617,11 +715,21 @@ class PauseRequest(_JsonModel):
                 _required(payload, "permission_request")  # type: ignore[arg-type]
             )
             user_input_request = None
+            plan_review_request = None
+        elif kind is PauseKind.PLAN_REVIEW_REQUIRED:
+            _expect_keys(payload, base | {"plan_review_request"})
+            tool_call_id = None
+            user_input_request = None
+            permission_request = None
+            plan_review_request = PlanReviewRequest.from_dict(
+                _required(payload, "plan_review_request")  # type: ignore[arg-type]
+            )
         else:
             _expect_keys(payload, base)
             tool_call_id = None
             user_input_request = None
             permission_request = None
+            plan_review_request = None
         return cls(
             pause_id=_required(payload, "pause_id"),  # type: ignore[arg-type]
             run_id=_required(payload, "run_id"),  # type: ignore[arg-type]
@@ -633,6 +741,7 @@ class PauseRequest(_JsonModel):
             tool_call_id=tool_call_id,  # type: ignore[arg-type]
             user_input_request=user_input_request,
             permission_request=permission_request,
+            plan_review_request=plan_review_request,
         )
 
     @classmethod
@@ -656,6 +765,9 @@ class PauseRequest(_JsonModel):
                 raise ValueError("response does not match the pending permission request")
             if response.choice not in self.permission_request.choices:  # type: ignore[union-attr]
                 raise ValueError("response choice is not available for the pending permission")
+        elif isinstance(response, PlanReviewResponse):
+            if response.revision != self.plan_review_request.revision:  # type: ignore[union-attr]
+                raise ValueError("response does not match the pending Plan revision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -801,6 +913,74 @@ class PermissionApprovalResponse(_PauseResponse):
 
 
 @dataclass(frozen=True, slots=True)
+class PlanReviewResponse(_PauseResponse):
+    """A typed decision for one exact Plan revision."""
+
+    response_type: ClassVar[str] = "plan_review"
+    pause_kind: ClassVar[PauseKind] = PauseKind.PLAN_REVIEW_REQUIRED
+
+    revision: int
+    choice: PlanReviewChoice
+    feedback: str | None = None
+
+    def __post_init__(self) -> None:
+        _PauseResponse.__post_init__(self)
+        _require_positive_int(self.revision, "revision")
+        choice = _coerce_enum(PlanReviewChoice, self.choice, "plan review choice")
+        object.__setattr__(self, "choice", choice)
+        if choice is PlanReviewChoice.REVISE:
+            _require_text(self.feedback, "feedback")
+        elif self.feedback is not None:
+            raise ValueError("approve response must not contain feedback")
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            **_PauseResponse.to_dict(self),
+            "revision": self.revision,
+            "choice": self.choice.value,
+        }
+        if self.choice is PlanReviewChoice.REVISE:
+            payload["feedback"] = self.feedback
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PlanReviewResponse:
+        payload = _as_mapping(value, "plan review response")
+        if _required(payload, "type") != cls.response_type:
+            raise ValueError("response type is not plan_review")
+        choice = _coerce_enum(
+            PlanReviewChoice,
+            _required(payload, "choice"),
+            "plan review choice",
+        )
+        expected = {
+            "type",
+            "pause_id",
+            "run_id",
+            "turn_id",
+            "revision",
+            "choice",
+        }
+        if choice is PlanReviewChoice.REVISE:
+            expected.add("feedback")
+        _expect_keys(payload, expected)
+        return cls(
+            _required(payload, "pause_id"),  # type: ignore[arg-type]
+            _required(payload, "run_id"),  # type: ignore[arg-type]
+            _required(payload, "turn_id"),  # type: ignore[arg-type]
+            _required(payload, "revision"),  # type: ignore[arg-type]
+            choice,  # type: ignore[arg-type]
+            _required(payload, "feedback")
+            if choice is PlanReviewChoice.REVISE
+            else None,  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> PlanReviewResponse:
+        return cls.from_dict(_json_object(value, "PlanReviewResponse"))
+
+
+@dataclass(frozen=True, slots=True)
 class RetryProviderResponse(_PauseResponse):
     response_type: ClassVar[str] = "retry_provider"
     pause_kind: ClassVar[PauseKind] = PauseKind.PROVIDER_UNAVAILABLE
@@ -827,6 +1007,7 @@ PauseResponse: TypeAlias = (
     | UserInputResponse
     | RetryProviderResponse
     | PermissionApprovalResponse
+    | PlanReviewResponse
 )
 
 
@@ -841,6 +1022,8 @@ def pause_response_from_dict(value: Mapping[str, object]) -> PauseResponse:
         return RetryProviderResponse.from_dict(payload)
     if response_type == PermissionApprovalResponse.response_type:
         return PermissionApprovalResponse.from_dict(payload)
+    if response_type == PlanReviewResponse.response_type:
+        return PlanReviewResponse.from_dict(payload)
     raise ValueError(f"unknown pause response type: {response_type!r}")
 
 
@@ -936,6 +1119,9 @@ __all__ = [
     "PauseReason",
     "PauseRequest",
     "PauseResponse",
+    "PlanReviewChoice",
+    "PlanReviewRequest",
+    "PlanReviewResponse",
     "PermissionApprovalChoice",
     "PermissionApprovalRequest",
     "PermissionApprovalResponse",
@@ -943,6 +1129,7 @@ __all__ = [
     "QuestionOption",
     "RetryProviderResponse",
     "ResumeTurnResponse",
+    "SteeringRequest",
     "UserInputRequest",
     "UserInputResponse",
     "UserQuestion",

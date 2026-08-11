@@ -10,7 +10,10 @@ from uthcode.core.agent_events import (
     AgentEvent,
     AssistantMessageCompleted,
     AssistantMessageDelta,
+    BehaviorModeChanged,
+    CompletionBlocked,
     IterationStarted,
+    PlanProposed,
     ReasoningDelta,
     ReasoningFinished,
     ReasoningStarted,
@@ -18,14 +21,18 @@ from uthcode.core.agent_events import (
     ToolBatchStarted,
     ToolFinished,
     ToolStarted,
+    TaskStateChanged,
     TurnCancelled,
     TurnCompleted,
     TurnFailed,
     TurnStarted,
     UsageUpdated,
+    UserSteeringApplied,
+    UserSteeringRequested,
     agent_event_from_dict,
     agent_event_from_json,
 )
+from uthcode.core.planning import BehaviorMode, TaskItem, TaskState, TaskStatus
 from uthcode.core.provider import Message, NativeItem, TextPart, ToolCallPart, ToolResultPart, Usage
 
 
@@ -51,6 +58,22 @@ def _events() -> tuple[AgentEvent, ...]:
             Message(role="assistant", parts=(TextPart("answer"),)),
         ),
         UsageUpdated("run-1", "turn-1", 1, Usage(input_tokens=2, output_tokens=3)),
+        BehaviorModeChanged(
+            "run-1",
+            "turn-1",
+            BehaviorMode.PLAN,
+            BehaviorMode.DEFAULT,
+        ),
+        TaskStateChanged(
+            "run-1",
+            "turn-1",
+            1,
+            TaskState((TaskItem("verify", TaskStatus.IN_PROGRESS),)),
+        ),
+        PlanProposed("run-1", "turn-1", 1, 2, "Complete replacement plan"),
+        CompletionBlocked("run-1", "turn-1", 1, 2),
+        UserSteeringRequested("run-1", "turn-1", "steer-1"),
+        UserSteeringApplied("run-1", "turn-1", "steer-1"),
         ToolBatchStarted("run-1", "turn-1", 1, "batch-1", ("call-1",)),
         ToolStarted("run-1", "turn-1", 1, "batch-1", "call-1", "read_file", "read path"),
         ToolFinished(
@@ -115,6 +138,56 @@ def test_tool_finished_exposes_only_safe_fields() -> None:
     assert "content" not in payload
     assert "result" not in payload
     assert "arguments" not in payload
+
+
+def test_t08_events_are_strict_display_safe_and_carry_required_projection() -> None:
+    task_state = TaskState(
+        (
+            TaskItem("implement", TaskStatus.IN_PROGRESS),
+            TaskItem("test", TaskStatus.PENDING),
+        )
+    )
+    events = (
+        BehaviorModeChanged("run", "turn", BehaviorMode.PLAN, BehaviorMode.DEFAULT),
+        TaskStateChanged("run", "turn", 3, task_state),
+        PlanProposed("run", "turn", 3, 4, "Full Plan v4"),
+        CompletionBlocked("run", "turn", 3, 2),
+        UserSteeringRequested("run", "turn", "steer-secret-free"),
+        UserSteeringApplied("run", "turn", "steer-secret-free"),
+    )
+
+    for event in events:
+        payload = event.to_dict()
+        assert agent_event_from_dict(payload) == event
+        assert agent_event_from_json(event.to_json()) == event
+        assert "raw_payload" not in payload
+        assert "arguments" not in payload
+        assert "candidate_text" not in payload
+        with pytest.raises((TypeError, ValueError, KeyError)):
+            agent_event_from_dict({**payload, "unexpected": True})
+
+    assert events[1].to_dict()["task_state"] == task_state.to_dict()
+    assert events[2].to_dict()["revision"] == 4
+    assert events[2].to_dict()["plan_text"] == "Full Plan v4"
+    assert "text" not in events[4].to_dict()
+    assert "text" not in events[5].to_dict()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: BehaviorModeChanged("run", "turn", BehaviorMode.PLAN, BehaviorMode.PLAN),
+        lambda: TaskStateChanged("run", "turn", 0, TaskState()),
+        lambda: PlanProposed("run", "turn", 1, 0, "plan"),
+        lambda: PlanProposed("run", "turn", 1, 1, ""),
+        lambda: CompletionBlocked("run", "turn", 1, 0),
+        lambda: UserSteeringRequested("run", "turn", ""),
+        lambda: UserSteeringApplied("run", "turn", ""),
+    ),
+)
+def test_t08_events_reject_invalid_values(factory) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        factory()
 
 
 @pytest.mark.parametrize(

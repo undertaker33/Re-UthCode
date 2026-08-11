@@ -14,6 +14,8 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
 - `[FACT]` 默认工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`。
 - `[FACT]` `AskUserQuestion` 是 Core 特殊工具协议：随 Turn 暴露给 Provider，但不进入普通 `ToolRegistry` 执行路径。
+- `[FACT]` `RuntimeHookSet` 为 Agent Loop 提供固定的 `before_tool_execution` 与 `before_completion` 两个生命周期点：前者执行 PLAN 只读策略，后者执行 Plan Review 与 unfinished-task completion block。
+- `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
 
@@ -44,13 +46,19 @@ AgentRun.start_turn(user_input)
      -> validated_provider_stream
         -> reasoning/text delta 转 AgentEvent
         -> 验证唯一终态与完整 ProviderResponse
-     -> 无 ToolCall + final: TurnCompleted
+     -> candidate final:
+        -> usage accounting
+        -> before_completion Hook
+           -> PLAN: PlanProposed -> PLAN_REVIEW_REQUIRED
+           -> unfinished TaskState: completion block + one-shot feedback
+           -> accepted completion: TurnCompleted
      -> 有 ToolCall: ToolBatchStarted
         -> 对每个 ToolCall 严格 FIFO:
            ToolStarted
-           -> ToolExecutor.prepare_call（名称、JSON Schema、preflight）
+           -> trusted preflight
+           -> before_tool Hook
            -> Control 层 PermissionDecision
-           -> execute_prepared 或受控错误 ToolResultPart
+           -> execute 或受控错误 ToolResultPart
            -> ToolFinished
         -> 将全部原始 call_id 对应结果组成一个 role=tool Message
         -> ToolBatchFinished
@@ -92,7 +100,7 @@ tool:
 
 - `[ABSENT]` 并行 Tool Batch、DAG、通用工作流引擎。
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
-- `[ABSENT]` Hook、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断已实现。
+- `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
 - `[DEFER]` 完整 Context Compiler、Context Budget、压缩和持久 Memory；当前 Provider 请求直接使用 Run 内消息历史。
 
 ## 修改路由

@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-09
+snapshot_date: 2026-08-10
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -42,15 +42,15 @@ path_migration:
 
 | 层级 | 目录 | 图中职责 | 当前代码事实 | 首选任务关键词 |
 | --- | --- | --- | --- | --- |
-| 执行 | [`A01-AgentRuntime/AgentRuntime-Context.md`](A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop | 已有单 Agent、显式串行 ReAct Runtime | Provider、Prompt、Tool、模型流、Agent Loop、工具调用 |
-| 控制 | [`A02-Control/Control-Context.md`](A02-Control/Control-Context.md) | 权限、Sandbox、Hook、Ask User、暂停恢复 | 已有权限、Ask User、暂停恢复、取消；无 OS Sandbox、无 Hook | Permission、审批、安全边界、暂停、恢复、询问用户、取消 |
-| 状态 | [`A03-State/State-Context.md`](A03-State/State-Context.md) | Context、Memory、Todo/Plan、任务进度 | 已有进程内 Run/Turn、消息、事件、快照；无持久 Session、Memory、Todo/Plan | RunState、Turn、Event、Context、Snapshot、Usage、历史 |
-| 编排 | [`A04-Orchestration/Orchestration-Context.md`](A04-Orchestration/Orchestration-Context.md) | Subagent、任务拆分、Multi-Agent | 已有单 Agent 应用编排和 CLI/TUI 适配；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、并发 Agent |
+| 执行 | [`A01-AgentRuntime/AgentRuntime-Context.md`](A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定 Runtime Hook | 已有单 Agent、显式串行 ReAct Runtime、固定 `RuntimeHookSet` | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、Hook 边界 |
+| 控制 | [`A02-Control/Control-Context.md`](A02-Control/Control-Context.md) | 权限、Sandbox、Hook、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定 Hook 执行位；无 OS Sandbox、动态 Hook registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
+| 状态 | [`A03-State/State-Context.md`](A03-State/State-Context.md) | Context、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、BehaviorMode、PlanState、TaskState；无持久 Session、Memory、Context Compiler | RunState、Turn、Event、Context、Snapshot、Usage、Plan/Task、历史 |
+| 编排 | [`A04-Orchestration/Orchestration-Context.md`](A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配及 `/plan`、`/do`；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Plan/Task、Steering |
 
 ## current-status
 
 ```text
-status_snapshot: 2026-08-09
+status_snapshot: 2026-08-10
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -75,10 +75,13 @@ status_values:
 | T05 | ReAct 与 Agent Loop | `docs/work/T05-ReAct与AgentLoop/` | Checklist `91/91`；4 份 Feedback；`src/uthcode/core/agent.py` 与 `src/uthcode/application/runs.py` 已接入 |
 | T06 | 暂停恢复与询问用户 | `docs/work/T06-暂停恢复与询问用户/` | Checklist `42/42`；3 份 Feedback；`src/uthcode/core/interaction.py` 与暂停恢复链已接入 |
 | T07 | 三层权限系统 | `docs/work/T07-三层权限系统/` | Checklist `56/56`；4 份 Feedback；`src/uthcode/core/permission.py` 与 `src/uthcode/integrations/permissions.py` 已接入 |
+| T08 | 任务规划与执行控制 | `docs/work/T08-任务规划与执行控制/` | Checklist `全部完成`；4 份 Worker Feedback；`create_application → create_run → start_turn` 正式链、Plan/Task/Steering/Hook 与 T08 E2E 已接入 |
 
 ### `not_implemented`
 
-- 无。当前 `docs/work/` 中不存在未实现或部分实施的任务包。
+| Task | 任务包 | 当前路径 | 当前证据 |
+| --- | --- | --- | --- |
+| — | — | — | 当前没有未实施的活跃工作包 |
 
 ## 跨层最短链路
 
@@ -100,5 +103,6 @@ interfaces/cli.py 或 interfaces/tui/app.py
 - `[ABSENT]` LangGraph、LangChain Agent、图/DAG/工作流 DSL。
 - `[ABSENT]` OS Sandbox；`Bash` 是当前用户权限下的未沙箱化进程执行。
 - `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩。
-- `[ABSENT]` Hook、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
+- `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与完成前 Plan Review/unfinished-task 阻断；不提供动态注册。
+- `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。

@@ -28,6 +28,8 @@ class Palette:
     accent: str = "#FEA62B"
     user_background: str = "#242F38"
     input_background: str = "#1E1E1E"
+    plan_accent: str = "#78A9FF"
+    plan_background: str = "#17233A"
     code_background: str = "#121212"
     text: str = "#E0E0E0"
     muted: str = "#9A9A9A"
@@ -121,6 +123,46 @@ class RichTerminalRenderer:
             background=None,
             bar=self.palette.success,
             trailing_blank=trailing_blank,
+        )
+
+    def plan_message(self, markdown: str, *, revision: int) -> str:
+        content = Markdown(
+            _protect_nested_markdown_fences(markdown),
+            code_theme=UthCodeCodeStyle,
+        )
+        return self._role_block(
+            role=f"UthCode · Plan v{revision}",
+            content=content,
+            background=self.palette.plan_background,
+            bar=self.palette.plan_accent,
+        )
+
+    def task_state(self, items: tuple[tuple[str, str], ...]) -> str:
+        markers = {
+            "completed": "✓",
+            "in_progress": "›",
+            "pending": "○",
+        }
+        content = Text()
+        if not items:
+            content.append("○ no active tasks", style=self.palette.muted)
+        for index, (status, text) in enumerate(items):
+            if index:
+                content.append("\n")
+            colour = (
+                self.palette.success
+                if status == "completed"
+                else self.palette.plan_accent
+                if status == "in_progress"
+                else self.palette.muted
+            )
+            content.append(f"{markers.get(status, '○')} ", style=f"bold {colour}")
+            content.append(text, style=self.palette.text)
+        return self._role_block(
+            role="Tasks",
+            content=content,
+            background=None,
+            bar=self.palette.plan_accent,
         )
 
     def tool(self, *, status: str, name: str, command: str) -> str:

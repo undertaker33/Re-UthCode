@@ -952,7 +952,10 @@ def test_agent_loop_hard_fails_before_tool_execution_without_permission_resolver
         provider,
         registry,
         executor,
-        lambda messages, definitions: GenerationRequest(messages=messages, tools=definitions),
+        lambda messages, definitions, _runtime_context: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
     )
     with pytest.raises(RuntimeError, match="permission"):
         loop.start_turn(RunState.initial("missing-permission"), "run ordinary tool")

@@ -242,7 +242,6 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         "storage",
         "journal",
         "sandbox",
-        "hooks",
         "skills",
         "mcp",
         "agents",
@@ -254,6 +253,41 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         if path.name != "__pycache__"
     }
     assert not forbidden_names.intersection(actual)
+    hook_paths = {
+        path.relative_to(SRC).as_posix()
+        for path in SRC.rglob("*")
+        if path.name in {"hooks", "hooks.py"}
+    }
+    assert hook_paths == {"core/hooks.py"}
+
+
+def test_t08_core_contracts_stay_pure_and_hooks_have_only_two_sync_points() -> None:
+    planning_path = SRC / "core" / "planning.py"
+    hooks_path = SRC / "core" / "hooks.py"
+    assert planning_path.is_file()
+    assert hooks_path.is_file()
+
+    for source_path in (planning_path, hooks_path):
+        imports = _imports(source_path)
+        assert not any(
+            value.startswith("uthcode.application")
+            or value.startswith("uthcode.integrations")
+            or value.startswith("uthcode.interfaces")
+            for value in imports
+        ), source_path
+
+    hooks_source = hooks_path.read_text(encoding="utf-8")
+    hooks_tree = ast.parse(hooks_source)
+    assert not any(isinstance(node, (ast.AsyncFunctionDef, ast.Await)) for node in ast.walk(hooks_tree))
+    assert "before_tool_execution" in hooks_source
+    assert "before_completion" in hooks_source
+    assert "after_tool" not in hooks_source
+    assert "after_completion" not in hooks_source
+    assert "create_task" not in hooks_source
+    assert "ToolExecutor" not in hooks_source
+    assert "ProviderPort" not in hooks_source
+    assert "RunState" not in hooks_source
+    assert "registry" not in hooks_source.lower()
 
 
 def test_interfaces_only_depend_on_application_and_their_ui_toolkit() -> None:

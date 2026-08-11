@@ -11,7 +11,7 @@ from pathlib import Path, PureWindowsPath
 
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
-from uthcode.core.tool import ToolExecutionResult, ToolPreparation
+from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
 from uthcode.integrations.permissions import is_sensitive_resource
 
 from .workspace import WorkspacePathError, WorkspacePathResolver
@@ -47,6 +47,10 @@ class GlobTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
 
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         _relative_pattern(_text(arguments, "pattern"), "pattern")
@@ -134,6 +138,10 @@ class GrepTool:
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
 
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         re.compile(_text(arguments, "pattern"))

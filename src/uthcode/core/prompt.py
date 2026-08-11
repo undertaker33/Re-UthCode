@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+from .planning import BehaviorMode, PlanState, RuntimeFeedback, TaskState
+
 
 def _require_text(value: object, field_name: str) -> str:
     if not isinstance(value, str):
@@ -47,6 +49,34 @@ class SystemPromptContext:
             _require_text(getattr(self, field_name), field_name)
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimePromptContext:
+    """Only the current structured facts needed by runtime prompt semantics."""
+
+    behavior_mode: BehaviorMode = BehaviorMode.DEFAULT
+    task_state: TaskState = TaskState()
+    plan_state: PlanState | None = None
+    one_shot_feedback: RuntimeFeedback | None = None
+
+    def __post_init__(self) -> None:
+        mode = self.behavior_mode
+        if not isinstance(mode, BehaviorMode):
+            try:
+                mode = BehaviorMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown behavior mode: {self.behavior_mode!r}") from exc
+            object.__setattr__(self, "behavior_mode", mode)
+        if not isinstance(self.task_state, TaskState):
+            raise TypeError("task_state must be a TaskState")
+        if self.plan_state is not None and not isinstance(self.plan_state, PlanState):
+            raise TypeError("plan_state must be a PlanState or None")
+        if self.one_shot_feedback is not None and not isinstance(
+            self.one_shot_feedback,
+            RuntimeFeedback,
+        ):
+            raise TypeError("one_shot_feedback must be a RuntimeFeedback or None")
+
+
 def _escape_runtime_value(value: str) -> str:
     """Render a runtime value without allowing it to create Markdown structure."""
 
@@ -78,11 +108,76 @@ def _render_sections(sections: Sequence[PromptSection]) -> str:
     return "\n\n".join(rendered).rstrip()
 
 
-def build_system_prompt(context: SystemPromptContext) -> str:
-    """Build the fixed five-section System Prompt for one explicit context."""
+def build_runtime_prompt_section(context: RuntimePromptContext) -> PromptSection:
+    """Render Behavior, Task, Plan, and one-shot facts without fake messages."""
+
+    if not isinstance(context, RuntimePromptContext):
+        raise TypeError("context must be a RuntimePromptContext")
+
+    if context.behavior_mode is BehaviorMode.PLAN:
+        lines = [
+            "- 当前行为模式：PLAN（规划模式）。",
+            "- 只研究、澄清和设计；不得实施修改。可使用当前可见的只读工具探索事实，必要时使用 AskUserQuestion。",
+            "- final 必须是一份完整、可独立审阅的自然语言 Plan；用户要求 REVISE 后必须给出完整替代版。",
+            "- 不使用 Todo 表代替自然语言 Plan。",
+        ]
+    else:
+        lines = [
+            "- 当前行为模式：DEFAULT（实施模式）。",
+            "- 简单任务无需强制创建 Todo；需要持续跟踪多步骤工作时使用 TodoWrite。",
+            "- TaskState 是当前执行事实，应随真实进度更新；新事实或用户 Steering 可能要求整体重写。",
+            "- 存在已批准 Plan 时以其为当前实施依据；实质改变批准范围前使用 AskUserQuestion。",
+            "- 已知工作未完成时不得声明任务完成。",
+        ]
+
+    if context.task_state.is_empty:
+        lines.append("- 当前 TaskState：空。")
+    else:
+        lines.append("- 当前 TaskState（保持顺序）：")
+        lines.extend(
+            f"  - [{item.status.value}] {_escape_runtime_value(item.content)}"
+            for item in context.task_state.items
+        )
+
+    if context.plan_state is None:
+        lines.append("- 当前 PlanState：空。")
+    else:
+        approval = "approved" if context.plan_state.approved else "awaiting_review"
+        lines.extend(
+            (
+                f"- 当前 PlanState：revision={context.plan_state.revision}, {approval}。",
+                f"- Plan 正文：{_escape_runtime_value(context.plan_state.text)}",
+            )
+        )
+
+    if context.one_shot_feedback is not None:
+        lines.extend(
+            (
+                f"- 一次性运行反馈类型：{context.one_shot_feedback.kind.value}。",
+                f"- 一次性运行反馈：{_escape_runtime_value(context.one_shot_feedback.text)}",
+            )
+        )
+
+    return PromptSection(
+        name="当前行为与执行状态",
+        priority=40,
+        content="\n".join(lines),
+    )
+
+
+def build_system_prompt(
+    context: SystemPromptContext,
+    *,
+    runtime_context: RuntimePromptContext | None = None,
+) -> str:
+    """Build the fixed prompt plus one structured runtime-facts section."""
 
     if not isinstance(context, SystemPromptContext):
         raise TypeError("context must be a SystemPromptContext")
+    if runtime_context is None:
+        runtime_context = RuntimePromptContext()
+    if not isinstance(runtime_context, RuntimePromptContext):
+        raise TypeError("runtime_context must be a RuntimePromptContext or None")
 
     sections = (
         PromptSection(
@@ -118,6 +213,7 @@ def build_system_prompt(context: SystemPromptContext) -> str:
                 "不声称已经读取文件、修改代码、运行命令或执行测试。"
             ),
         ),
+        build_runtime_prompt_section(runtime_context),
         PromptSection(
             name="当前运行环境",
             priority=100,
@@ -135,4 +231,10 @@ def build_system_prompt(context: SystemPromptContext) -> str:
     return _render_sections(sections)
 
 
-__all__ = ["PromptSection", "SystemPromptContext", "build_system_prompt"]
+__all__ = [
+    "PromptSection",
+    "RuntimePromptContext",
+    "SystemPromptContext",
+    "build_runtime_prompt_section",
+    "build_system_prompt",
+]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from jsonschema import Draft202012Validator
@@ -59,6 +60,22 @@ class Tool(Protocol):
         *,
         cancellation: CancellationToken,
     ) -> ToolExecutionResult:
+        ...
+
+
+class ToolPlanningAccess(str, Enum):
+    """Whether an ordinary Tool may appear in the PLAN provider view."""
+
+    HIDDEN = "hidden"
+    READ_ONLY = "read_only"
+
+
+@runtime_checkable
+class ToolPlanningMetadata(Protocol):
+    """Optional Core-only metadata; undeclared Tools stay hidden in PLAN."""
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
         ...
 
 
@@ -118,6 +135,7 @@ class ToolRegistry:
     def __init__(self, tools: Sequence[Tool] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
         self._definitions: dict[str, ToolDefinition] = {}
+        self._planning_access: dict[str, ToolPlanningAccess] = {}
         self._validators: dict[str, Draft202012Validator] = {}
         if tools is not None:
             for tool in tools:
@@ -141,8 +159,10 @@ class ToolRegistry:
             raise ValueError(f"invalid JSON Schema for tool: {name}") from None
 
         validator = Draft202012Validator(schema)
+        planning_access = _planning_access_for(tool)
         self._tools[name] = tool
         self._definitions[name] = definition
+        self._planning_access[name] = planning_access
         self._validators[name] = validator
 
     def get(self, name: str) -> Tool | None:
@@ -153,6 +173,18 @@ class ToolRegistry:
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(self._definitions.values())
+
+    def planning_access_for(self, name: str) -> ToolPlanningAccess | None:
+        return self._planning_access.get(name)
+
+    def plan_definitions(self) -> tuple[ToolDefinition, ...]:
+        """Return the stable PLAN-visible subset without changing wire schemas."""
+
+        return tuple(
+            definition
+            for name, definition in self._definitions.items()
+            if self._planning_access[name] is ToolPlanningAccess.READ_ONLY
+        )
 
     def _validator_for(self, name: str) -> Draft202012Validator | None:
         return self._validators.get(name)
@@ -306,6 +338,15 @@ def _preflight_tool(tool: Tool, call: ToolCallPart) -> ToolPreparation:
     return preparation
 
 
+def _planning_access_for(tool: Tool) -> ToolPlanningAccess:
+    if not isinstance(tool, ToolPlanningMetadata):
+        return ToolPlanningAccess.HIDDEN
+    access = tool.planning_access
+    if not isinstance(access, ToolPlanningAccess):
+        raise TypeError("tool planning_access must be a ToolPlanningAccess")
+    return access
+
+
 def _to_json_data(value: object) -> object:
     """Convert immutable Core JSON values to ordinary data for jsonschema."""
 
@@ -333,6 +374,8 @@ __all__ = [
     "Tool",
     "ToolExecutionResult",
     "ToolExecutor",
+    "ToolPlanningAccess",
+    "ToolPlanningMetadata",
     "ToolPreflight",
     "ToolPreparation",
     "ToolRegistry",
