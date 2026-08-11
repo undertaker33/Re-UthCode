@@ -15,7 +15,7 @@ from uthcode.core.provider import (
 )
 from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
-from uthcode.core.hooks import create_default_runtime_hooks
+from uthcode.core.hooks import RuntimeHookSet
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.planning import TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
@@ -170,7 +170,9 @@ class ApplicationToolService:
             )
         self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)
-        self._runtime_hooks = create_default_runtime_hooks()
+        # AgentLoop owns mandatory control hooks; this slot contains only
+        # optional Application-composed hooks.
+        self._runtime_hooks = RuntimeHookSet()
         self._redactor = _SecretRedactor(secret_env_names)
         self._workdir = (
             Path(workdir).expanduser().resolve(strict=False)

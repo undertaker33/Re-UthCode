@@ -136,3 +136,56 @@ W04 独立验收指出原正式 E2E 只验证了文件副作用和部分公开�
 - `git diff --check`：退出码 0，无 whitespace error。
 - UTF-8 guard：W04 Feedback 共 1 个改动 Markdown 文件，结果 `OK`；无 replacement character、mojibake 或 fence 不平衡。
 - 负向扫描：无旧 Slash 入口、重复 Runtime/规划职责、动态 Hook registry、Interface 越界依赖；`AgentLoop` 与 `AgentTurnExecution` 定义各 1 个。
+
+## 包级返工第 1 轮
+
+### 包级审查的四项原因
+
+1. `AgentLoop` 在 omitted、显式空和 custom-only `RuntimeHookSet` 下可能没有强制 PLAN 只读与 completion Hook，`PLAN + WRITE + FULL_ACCESS` 可执行工具并普通完成。
+2. one-shot completion、steering、revision feedback 在 async request preparer 返回后过早清除；被 pause、cancel 或 steering 丢弃的 prepared request 仍会消费 feedback。
+3. Application 对 Plan Review REVISE 先发布 `TurnResumed`，Core 的真实 user Message 与 revision feedback 在下一 segment 才应用；APPROVE/REVISE 未走统一的 Core response application path。
+4. A01、A02、A04 当前事实未同步实际的 Tool/候选 final 路径、五类 typed pause/Plan Review 转移与输入优先级、`start_turn`/`steer` 编排边界。
+
+### 红测证据
+
+- 先加入 omitted/empty/custom-only HookSet、PLAN candidate final、PLAN WRITE fail-closed、async preparer 下 completion/steering/revision feedback、cancel 竞态以及 Application `TurnResumed` 精确时点断言。
+- 旧顺序下 Application 断言在消费 `TurnResumed` 时失败：`state.runtime_feedback is None`；这直接证明 REVISE feedback 尚未在恢复事件发布前保持。
+- 强制 completion Hook 接入后，原有显式 PLAN tool-only Hook 测试继续把 candidate final 断言为普通完成；已修正为 `PLAN_REVIEW_REQUIRED`，删除该反向固化。
+
+### 实际实现选择
+
+- `AgentLoop` 通过 `compose_runtime_hooks()` 固定先组合 `plan_tool_policy`、`plan_completion_hook`、`task_completion_hook`，再按调用者给定顺序执行可选 Hook；内建 Hook 去重，避免 Application 与 Core 重复执行。Application 默认只提供空的可选 `RuntimeHookSet`。
+- feedback 清除点从 request preparer 返回后移动到 cancel、steering、pause 边界之后、真实 Provider attempt 之前，因此被丢弃的 prepared request 不消费 feedback，首个真实 attempt 只携带一次。
+- Core 增加统一 `apply_pause_response()`；`TurnHandle.resume()` 对 APPROVE、REVISE 及其他 typed response 都先调用 Core 应用路径，再由 driver 发布唯一 `TurnResumed`。恢复事件发布后让出一次调度机会，保持消费者可观察到恢复时的权威状态。
+- 仅同步 A01/A02/A04 当前事实；未修改冻结的 T08 原始需求、Spec、Tasks、Prompt 或 Checklist，也未新增 Context-Index 变更。
+
+### 修改文件
+
+- `src/uthcode/core/agent.py`
+- `src/uthcode/core/hooks.py`
+- `src/uthcode/core/__init__.py`
+- `src/uthcode/application/tools.py`
+- `src/uthcode/application/runs.py`
+- `tests/test_agent_loop.py`
+- `tests/test_application_runs.py`
+- `docs/A01-AgentRuntime/AgentRuntime-Context.md`
+- `docs/A02-Control/Control-Context.md`
+- `docs/A04-Orchestration/Orchestration-Context.md`
+- 本文件（仅追加本章节）
+
+### 定向及全量测试
+
+- 四项独立反例与新增生命周期回归：`tests/test_agent_loop.py`、`tests/test_application_runs.py`、`tests/test_runtime_hooks.py` 定向集合通过；包括 omitted/empty/custom-only HookSet、Tool 不执行/权限 resolver 不调用/单一受控 ToolResult、candidate final Plan Review、completion/steering/revision feedback pause/cancel/steering 边界和一次性消费。
+- T08 Task 1–12 相关定向集合：`339 passed`。
+- Runtime Hook、AgentLoop、Application Run、Permission、TUI、architecture/package 与正式 T08 E2E：`114 passed`（运行时核心集合）；扩大 T04–T08 回归：`608 passed`。
+- 全量：`conda run --no-capture-output -n re-uthcode python -m pytest -q`，`857 passed, 3 skipped`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：通过。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`。
+- T08 正式 E2E 单独复验：`5 passed`。
+- 所有 Python 验证显式设置 `PYTHONPATH=D:\project\Re-UthCode\src`；实际 `uthcode.__file__` 为 `D:\project\Re-UthCode\src\uthcode\__init__.py`。
+
+### UTF-8 guard、未完成项与风险
+
+- 本轮追加后已执行 `uth-utf8-guard`：18 个受管 Markdown 文件全部 `OK`，检查 UTF-8、BOM、replacement character、mojibake 与 Markdown fence 均通过。
+- 未引入动态 Hook registry、第二 Runtime、Manager/Scheduler、兼容层、第二 AgentLoop 或第二 RunState authority；仍保留动态 registry、持久 Session/Memory、Subagent/Multi-Agent、第二 Runtime/Scheduler、Context Compression 等未实现边界。
+- 当前未发现与四项 findings 相关的未完成实现；原有 Windows Terminal 人工色差、键盘与 scrollback 风险仍需人工验收，不由本轮自动化替代。

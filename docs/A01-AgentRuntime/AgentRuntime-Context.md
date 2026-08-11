@@ -46,13 +46,19 @@ AgentRun.start_turn(user_input)
      -> validated_provider_stream
         -> reasoning/text delta 转 AgentEvent
         -> 验证唯一终态与完整 ProviderResponse
-     -> 无 ToolCall + final: TurnCompleted
+     -> candidate final:
+        -> usage accounting
+        -> before_completion Hook
+           -> PLAN: PlanProposed -> PLAN_REVIEW_REQUIRED
+           -> unfinished TaskState: completion block + one-shot feedback
+           -> accepted completion: TurnCompleted
      -> 有 ToolCall: ToolBatchStarted
         -> 对每个 ToolCall 严格 FIFO:
            ToolStarted
-           -> ToolExecutor.prepare_call（名称、JSON Schema、preflight）
+           -> trusted preflight
+           -> before_tool Hook
            -> Control 层 PermissionDecision
-           -> execute_prepared 或受控错误 ToolResultPart
+           -> execute 或受控错误 ToolResultPart
            -> ToolFinished
         -> 将全部原始 call_id 对应结果组成一个 role=tool Message
         -> ToolBatchFinished

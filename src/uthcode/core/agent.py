@@ -48,6 +48,7 @@ from .hooks import (
     BeforeToolExecutionContext,
     BeforeToolExecutionReject,
     RuntimeHookSet,
+    compose_runtime_hooks,
 )
 from .provider import (
     CancellationToken,
@@ -757,10 +758,9 @@ class AgentLoop:
             config = AgentLoopConfig()
         if not isinstance(config, AgentLoopConfig):
             raise TypeError("config must be AgentLoopConfig")
-        if runtime_hooks is None:
-            runtime_hooks = RuntimeHookSet()
         if not isinstance(runtime_hooks, RuntimeHookSet):
-            raise TypeError("runtime_hooks must be RuntimeHookSet")
+            if runtime_hooks is not None:
+                raise TypeError("runtime_hooks must be RuntimeHookSet or None")
         if tool_call_describer is not None and not callable(tool_call_describer):
             raise TypeError("tool_call_describer must be callable or None")
         if permission_resolver is not None and not callable(permission_resolver):
@@ -772,7 +772,7 @@ class AgentLoop:
         self._tool_executor = tool_executor
         self._request_preparer = request_preparer
         self._config = config
-        self._runtime_hooks = runtime_hooks
+        self._runtime_hooks = compose_runtime_hooks(runtime_hooks)
         self._tool_call_describer = tool_call_describer
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
@@ -944,20 +944,27 @@ class AgentTurnExecution:
         if self._active_segment_signal is not None:
             self._active_segment_signal.cancel()
 
-    def apply_plan_approval(
+    def apply_pause_response(
         self,
-        response: PlanReviewResponse,
+        response: PauseResponse,
         *,
         event_sink: AgentEventSink | None = None,
     ) -> tuple[AgentEvent, ...]:
-        """Apply one validated approval before Application publishes resume."""
+        """Apply one typed response before Application publishes resume."""
 
-        if not isinstance(response, PlanReviewResponse):
-            raise TypeError("response must be a PlanReviewResponse")
-        if response.choice is not PlanReviewChoice.APPROVE:
-            raise ValueError("response must approve the current Plan")
+        if not isinstance(
+            response,
+            (
+                RetryProviderResponse,
+                ResumeTurnResponse,
+                UserInputResponse,
+                PermissionApprovalResponse,
+                PlanReviewResponse,
+            ),
+        ):
+            raise TypeError("response must be a typed PauseResponse")
         if self._terminal_result is not None or self._cancellation.cancelled:
-            raise ValueError("cancelled or terminal execution cannot approve a Plan")
+            raise ValueError("cancelled or terminal execution cannot apply a response")
         events: list[AgentEvent] = _SegmentEventBuffer(event_sink)
         self._apply_response(response, events)
         return tuple(events)
@@ -1131,8 +1138,6 @@ class AgentTurnExecution:
                     )
                     if not isinstance(request, GenerationRequest):
                         raise TypeError("request_preparer must return GenerationRequest")
-                    if self._state.runtime_feedback is not None:
-                        self._set_state(runtime_feedback=None)
                 except Exception:
                     return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
 
@@ -1147,6 +1152,11 @@ class AgentTurnExecution:
                     self._set_provider_continuation(iteration)
                     return self._pause_user_segment(events, iteration)
 
+                # One-shot feedback belongs to the first real Provider
+                # attempt. Prepared requests discarded at this boundary do
+                # not consume it.
+                if self._state.runtime_feedback is not None:
+                    self._set_state(runtime_feedback=None)
                 assistant_message_id = uuid.uuid4().hex
                 self._continuation = None
                 self._active_segment_signal = pause_signal

@@ -22,7 +22,6 @@ from uthcode.core.interaction import (
     PauseRequest,
     PauseResponse,
     PermissionApprovalResponse,
-    PlanReviewChoice,
     PlanReviewResponse,
     RetryProviderResponse,
     ResumeTurnResponse,
@@ -467,6 +466,7 @@ class _TurnDriver:
                             pending.kind,
                         )
                     )
+                    await asyncio.sleep(0)
                     continue
 
                 if not segment.terminal:
@@ -581,17 +581,11 @@ class TurnHandle:
         waiter = self._driver._response_waiter
         if waiter is None or waiter.done():
             return False
-        if (
-            isinstance(response, PlanReviewResponse)
-            and response.choice is PlanReviewChoice.APPROVE
-        ):
-            self._driver.execution.apply_plan_approval(
-                response,
-                event_sink=self._driver._emit_event,
-            )
-            waiter.set_result(_APPLIED)
-        else:
-            waiter.set_result(response)
+        self._driver.execution.apply_pause_response(
+            response,
+            event_sink=self._driver._emit_event,
+        )
+        waiter.set_result(_APPLIED)
         return True
 
     def cancel(self) -> bool:

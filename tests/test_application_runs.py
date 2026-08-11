@@ -63,7 +63,7 @@ from uthcode.core.interaction import (
     UserInputResponse,
     UserQuestion,
 )
-from uthcode.core.planning import BehaviorMode, TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.planning import BehaviorMode, RuntimeFeedbackKind, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import (
     Effect,
     PermissionAction,
@@ -1327,7 +1327,26 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
     run = application.create_run(run_id="plan-run")
     run.set_behavior_mode(BehaviorMode.PLAN)
     handle = run.start_turn("plan then implement")
-    events_task = asyncio.create_task(_collect(handle))
+    resumed_states: list[object] = []
+
+    async def collect_with_resume_assertions() -> list[AgentEvent]:
+        events: list[AgentEvent] = []
+        async for event in handle.events():
+            events.append(event)
+            if isinstance(event, TurnResumed):
+                state = handle._driver.execution.state
+                if not resumed_states:
+                    assert state.messages[-1].role == "user"
+                    assert state.messages[-1].parts == (TextPart("include verification"),)
+                    assert state.runtime_feedback is not None
+                    assert state.runtime_feedback.kind is RuntimeFeedbackKind.PLAN_REVISION
+                else:
+                    assert state.behavior_mode is BehaviorMode.DEFAULT
+                    assert state.plan_state is not None and state.plan_state.approved
+                resumed_states.append(state)
+        return events
+
+    events_task = asyncio.create_task(collect_with_resume_assertions())
 
     for _ in range(100):
         if handle.pending_pause is not None:
@@ -1388,6 +1407,7 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
     assert [event.revision for event in events if isinstance(event, PlanProposed)] == [1, 2]
     assert sum(isinstance(event, TurnPaused) for event in events) == 2
     assert sum(isinstance(event, TurnResumed) for event in events) == 2
+    assert len(resumed_states) == 2
     assert sum(isinstance(event, TurnStarted) for event in events) == 1
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
     assert sum(isinstance(event, AssistantMessageCompleted) for event in events) == 1

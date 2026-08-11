@@ -300,6 +300,30 @@ def create_default_runtime_hooks() -> RuntimeHookSet:
     )
 
 
+def compose_runtime_hooks(custom_hooks: RuntimeHookSet | None) -> RuntimeHookSet:
+    """Compose mandatory Core hooks before the caller's fixed custom order."""
+
+    if custom_hooks is None:
+        custom_hooks = RuntimeHookSet()
+    if not isinstance(custom_hooks, RuntimeHookSet):
+        raise TypeError("custom_hooks must be RuntimeHookSet or None")
+    mandatory = create_default_runtime_hooks()
+    return RuntimeHookSet(
+        before_tool_execution=mandatory.before_tool_execution
+        + tuple(
+            hook
+            for hook in custom_hooks.before_tool_execution
+            if hook not in mandatory.before_tool_execution
+        ),
+        before_completion=mandatory.before_completion
+        + tuple(
+            hook
+            for hook in custom_hooks.before_completion
+            if hook not in mandatory.before_completion
+        ),
+    )
+
+
 __all__ = [
     "BeforeCompletionBlock",
     "BeforeCompletionContext",
@@ -314,6 +338,7 @@ __all__ = [
     "BeforeToolExecutionResult",
     "RuntimeHookReason",
     "RuntimeHookSet",
+    "compose_runtime_hooks",
     "create_default_runtime_hooks",
     "plan_completion_hook",
     "plan_tool_policy",

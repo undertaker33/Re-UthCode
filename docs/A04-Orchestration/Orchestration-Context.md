@@ -13,7 +13,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
-- `[FACT]` `create_application -> create_run -> start_turn` 组合一个固定 `RuntimeHookSet`、Plan/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver。
+- `[FACT]` `create_application -> create_run -> start_turn` 组合一个固定 `RuntimeHookSet`、Plan/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；AgentLoop 始终先组合强制 Hook，再按固定顺序运行可选 Hook。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
@@ -60,14 +60,11 @@ python -m uthcode / uthcode
 ```text
 Interface
   -> application.create_run()
-  -> run.start_turn(prompt)
-  -> TurnHandle
-     -> events(): 单消费者增量流
-     -> pause(): 请求 cooperative pause
-     -> pending_pause
-     -> resume(typed response)
-     -> cancel()
-     -> result(): 可重复等待终态
+  -> idle: run.start_turn(prompt)
+  -> active ordinary input: TurnHandle.steer(text)
+  -> typed interaction pending: TurnHandle.resume(typed response) / cancel()
+  -> TurnHandle.events(): 单消费者增量流
+  -> TurnHandle.result(): 可重复等待终态
 ```
 
 ### TUI
@@ -76,9 +73,10 @@ Interface
 interfaces/tui/app.py
   owns one AgentRun for process lifetime
   slash input -> CommandParser -> CommandDispatcher -> CommandOutcome/UiAction
-  ordinary input -> same AgentRun.start_turn
+  idle ordinary input -> same AgentRun.start_turn
+  active Turn ordinary input -> same TurnHandle.steer
+  typed interaction -> same TurnHandle.resume/cancel; typed interaction 优先于 Steering
   AgentEvent -> rendering/interaction projection
-  pending pause -> same TurnHandle.resume/cancel
 ```
 
 - TUI 是 prompt_toolkit 主缓冲区适配器；详细界面约束见 `docs/TUI/README.md`。
