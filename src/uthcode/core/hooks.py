@@ -313,13 +313,19 @@ def compose_runtime_hooks(custom_hooks: RuntimeHookSet | None) -> RuntimeHookSet
         + tuple(
             hook
             for hook in custom_hooks.before_tool_execution
-            if hook not in mandatory.before_tool_execution
+            if not any(
+                hook is mandatory_hook
+                for mandatory_hook in mandatory.before_tool_execution
+            )
         ),
         before_completion=mandatory.before_completion
         + tuple(
             hook
             for hook in custom_hooks.before_completion
-            if hook not in mandatory.before_completion
+            if not any(
+                hook is mandatory_hook
+                for mandatory_hook in mandatory.before_completion
+            )
         ),
     )
 

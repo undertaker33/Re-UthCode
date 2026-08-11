@@ -189,3 +189,40 @@ W04 独立验收指出原正式 E2E 只验证了文件副作用和部分公开�
 - 本轮追加后已执行 `uth-utf8-guard`：18 个受管 Markdown 文件全部 `OK`，检查 UTF-8、BOM、replacement character、mojibake 与 Markdown fence 均通过。
 - 未引入动态 Hook registry、第二 Runtime、Manager/Scheduler、兼容层、第二 AgentLoop 或第二 RunState authority；仍保留动态 registry、持久 Session/Memory、Subagent/Multi-Agent、第二 Runtime/Scheduler、Context Compression 等未实现边界。
 - 当前未发现与四项 findings 相关的未完成实现；原有 Windows Terminal 人工色差、键盘与 scrollback 风险仍需人工验收，不由本轮自动化替代。
+
+## 包级返工第 2 轮
+
+### 原因
+
+包级复验新增一个 P2：`compose_runtime_hooks()` 使用 `hook not in mandatory_hooks` 去重，`in/not in` 会调用 callable 的 `__eq__`，破坏任意合法同步 callable 的保留语义。`__eq__` 返回 `True` 时自定义 Hook 被误判为 mandatory Hook 并静默删除；`__eq__` 抛异常时 RuntimeHookSet 虽可构造，但 compose 和 AgentLoop 构造会意外失败。
+
+### 红测复现
+
+- 新增 `__eq__` 恒返回 `True` 的 callable object 测试后，旧实现的组合长度为 1 而非 2，自定义 Hook 未保留。
+- 新增 `__eq__` 抛 `RuntimeError` 的 callable object + AgentLoop 构造测试，旧实现会在组合阶段触发相等性判断；同一测试还断言 Hook 必须正常执行一次且不得传播相等性异常。
+- 新增精确 mandatory 函数重复传入测试，固定 mandatory 顺序并验证不产生重复；原有 omitted、empty、custom-only、PLAN fail-closed、DEFAULT 与自定义顺序测试继续作为回归基线。
+
+### 实际实现选择
+
+- `compose_runtime_hooks()` 的两个 Hook stage 均改为 `any(hook is mandatory_hook for mandatory_hook in mandatory_hooks)` 身份判断。
+- 不调用自定义 Hook 的 `__eq__`，不按名称、包装函数、模块或启发式等价判断；mandatory Hook 仍固定在前，自定义 Hook 保持原顺序，精确 mandatory 函数不重复。
+- 未增加 registry、兼容层或第二套 composition，未修改其他生产路径。
+
+### 修改文件
+
+- `src/uthcode/core/hooks.py`
+- `tests/test_runtime_hooks.py`
+- 本文件（仅追加本章节）
+
+### 验证结果
+
+- 新增 equality 反例：`3 passed`。
+- Runtime Hook、AgentLoop、Application Run 回归：`112 passed`；其中包含上一轮 omitted/empty/custom-only 与 PLAN fail-closed 反例。
+- T08 E2E：`5 passed`。
+- Task 1–12 定向集合：`342 passed`。
+- architecture/package：`32 passed`。
+- T04–T08 回归：`611 passed`。
+- 全量 pytest：`860 passed, 3 skipped`。
+- `python -m compileall -q src tests`：退出码 0。
+- `python -m pip check`：`No broken requirements found.`。
+- import 路径明确为 `D:\project\Re-UthCode\src\uthcode\__init__.py`，`sys.path` 包含 `D:\project\Re-UthCode\src`。

@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, dataclass
 
 import pytest
 
+from uthcode.core.agent import AgentLoop, RunState, RunStatus
 from uthcode.core.hooks import (
     BeforeCompletionBlock,
     BeforeCompletionContext,
@@ -16,6 +17,7 @@ from uthcode.core.hooks import (
     BeforeToolExecutionReject,
     RuntimeHookReason,
     RuntimeHookSet,
+    compose_runtime_hooks,
     create_default_runtime_hooks,
     plan_completion_hook,
     plan_tool_policy,
@@ -31,8 +33,19 @@ from uthcode.core.planning import (
     TaskState,
     TaskStatus,
 )
-from uthcode.core.provider import CancellationToken, JsonPayload, ToolCallPart, ToolDefinition
-from uthcode.core.tool import PreparedToolCall, ToolExecutionResult
+from uthcode.core.provider import (
+    CancellationToken,
+    GenerationCompleted,
+    GenerationRequest,
+    JsonPayload,
+    Message,
+    ProviderIdentity,
+    ProviderResponse,
+    TextPart,
+    ToolCallPart,
+    ToolDefinition,
+)
+from uthcode.core.tool import PreparedToolCall, ToolExecutionResult, ToolExecutor, ToolRegistry
 
 
 @dataclass
@@ -84,6 +97,104 @@ def _completion_context(
         "Candidate final",
         task_state,
         plan_state,
+    )
+
+
+class _EqualitySensitiveHook:
+    def __init__(self, result: object, *, raises: bool = False) -> None:
+        self.result = result
+        self.raises = raises
+        self.calls = 0
+        self.equality_calls = 0
+
+    def __call__(self, context: object) -> object:
+        del context
+        self.calls += 1
+        return self.result
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        self.equality_calls += 1
+        if self.raises:
+            raise RuntimeError("hook equality must not be inspected")
+        return True
+
+
+class _OneShotFinalProvider:
+    @property
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity("fake", "hook-test", "fake-model")
+
+    async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken):
+        del request, cancellation
+        yield GenerationCompleted(
+            ProviderResponse(Message("assistant", (TextPart("done"),)))
+        )
+
+
+def test_compose_runtime_hooks_uses_identity_for_custom_hook_retention() -> None:
+    custom = _EqualitySensitiveHook(BeforeToolExecutionContinue())
+
+    composed = compose_runtime_hooks(
+        RuntimeHookSet(before_tool_execution=(custom,))
+    )
+
+    assert len(composed.before_tool_execution) == 2
+    assert composed.before_tool_execution[0] is plan_tool_policy
+    assert composed.before_tool_execution[1] is custom
+    assert isinstance(
+        composed.run_before_tool_execution(_tool_context(BehaviorMode.DEFAULT, Effect.READ)),
+        BeforeToolExecutionContinue,
+    )
+    assert custom.calls == 1
+    assert custom.equality_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_compose_runtime_hooks_does_not_inspect_raising_hook_equality() -> None:
+    custom = _EqualitySensitiveHook(BeforeCompletionContinue(), raises=True)
+    registry = ToolRegistry()
+    loop = AgentLoop(
+        _OneShotFinalProvider(),
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, runtime_context: GenerationRequest(
+            messages=messages,
+            tools=definitions,
+        ),
+        runtime_hooks=RuntimeHookSet(before_completion=(custom,)),
+    )
+
+    execution = loop.start_turn(RunState.initial("run-1"), "work", turn_id="turn-1")
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.COMPLETED
+    assert custom.calls == 1
+    assert custom.equality_calls == 0
+
+
+def test_compose_runtime_hooks_deduplicates_exact_mandatory_functions() -> None:
+    mandatory = create_default_runtime_hooks()
+    composed = compose_runtime_hooks(mandatory)
+
+    assert len(composed.before_tool_execution) == len(mandatory.before_tool_execution)
+    assert len(composed.before_completion) == len(mandatory.before_completion)
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            composed.before_tool_execution,
+            mandatory.before_tool_execution,
+            strict=True,
+        )
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            composed.before_completion,
+            mandatory.before_completion,
+            strict=True,
+        )
     )
 
 
