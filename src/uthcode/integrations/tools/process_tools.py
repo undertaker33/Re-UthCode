@@ -15,7 +15,12 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
-from uthcode.core.permission import Effect, PermissionAction, ResourceScope
+from uthcode.core.permission import (
+    CircuitBreaker,
+    Effect,
+    PermissionAction,
+    ResourceScope,
+)
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
 from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
 from uthcode.core.command_security import safe_bash_command_summary
@@ -614,6 +619,7 @@ def _scan_bash_command(
     escaped = False
     arithmetic_depth = 0
     arithmetic_escaped = False
+    group_depth = 0
     nested_execution = False
     index = 0
     while index < len(normalized):
@@ -678,9 +684,16 @@ def _scan_bash_command(
             nested_execution = True
             index += 1
             continue
-        if character == "(" or (
-            character == "{"
-            and (
+        if character == "(":
+            group_depth += 1
+            index += 1
+            continue
+        if character == ")" and group_depth:
+            group_depth -= 1
+            index += 1
+            continue
+        if character == "{" and (
+            (
                 index == 0
                 or normalized[index - 1].isspace()
                 or normalized[index - 1] in ";|&)"
@@ -699,7 +712,10 @@ def _scan_bash_command(
             width = 2
         elif character in {";", "|", "\n", "\r"} or (
             character == "&"
-            and (index == 0 or normalized[index - 1] not in "<>")
+            and (
+                index == 0
+                or normalized[index - 1] not in "<>"
+            )
             and (index + 1 == len(normalized) or normalized[index + 1] != ">")
         ):
             connector = character
@@ -707,7 +723,7 @@ def _scan_bash_command(
             if character == "\r" and normalized.startswith("\r\n", index):
                 connector = "\n"
                 width = 2
-        if connector is not None:
+        if connector is not None and group_depth == 0:
             segment = normalized[start:index].strip()
             if segment:
                 segments.append((segment, connector_before))
@@ -728,6 +744,7 @@ def _split_bash_segments(command: str) -> tuple[tuple[str, str | None], ...]:
 
 
 def _segment_tokens(segment: str) -> list[str]:
+    segment = _unwrap_command_group(segment)
     try:
         return shlex.split(segment, posix=os.name != "nt")
     except ValueError:
@@ -744,6 +761,72 @@ def _segment_program(segment: str) -> tuple[str, list[str]]:
     return program, tokens[1:]
 
 
+def _unwrap_command_group(segment: str) -> str:
+    """Remove balanced CMD grouping parentheses around a visible segment."""
+
+    value = segment.strip()
+    while value.startswith("("):
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        closing: int | None = None
+        for index, character in enumerate(value):
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\" and quote != "'":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+        if closing is None:
+            break
+        remainder = value[closing + 1 :].strip()
+        if remainder:
+            value = f"{value[1:closing].strip()} {remainder}"
+        else:
+            value = value[1:closing].strip()
+    return value.rstrip(")").strip()
+
+
+def _outer_command_group(segment: str) -> str | None:
+    """Return the content when one balanced group encloses the whole segment."""
+
+    value = segment.strip()
+    if not value.startswith("("):
+        return None
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote != "'":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return value[1:index] if not value[index + 1 :].strip() else None
+    return None
+
+
 def _redirection_targets(segment: str) -> tuple[tuple[str, str], ...]:
     """Return shell input/output redirection targets from one segment."""
 
@@ -758,6 +841,18 @@ def _redirection_targets(segment: str) -> tuple[tuple[str, str], ...]:
                 targets.append((direction, tokens[index + 1]))
                 index += 2
                 continue
+        standalone = re.match(r"^(?P<operator>\d*(?:>>?|<|&>|>&))$", token)
+        if standalone is not None and index + 1 < len(tokens):
+            operator = standalone.group("operator")
+            direction = "input" if operator.endswith("<") else "output"
+            targets.append((direction, tokens[index + 1]))
+            index += 2
+            continue
+        descriptor_copy = re.match(r"^\d*>&(?P<target>\d+)$", token)
+        if descriptor_copy is not None:
+            targets.append(("output", f"&{descriptor_copy.group('target')}"))
+            index += 1
+            continue
         match = re.match(r"^(?P<operator>\d*(?:>>?|<|&>|>&))(?P<target>.+)$", token)
         if match is not None:
             operator = match.group("operator")
@@ -767,6 +862,29 @@ def _redirection_targets(segment: str) -> tuple[tuple[str, str], ...]:
             targets.append(("output", match.group("target")))
         index += 1
     return tuple(targets)
+
+
+def _redirection_effect(segment: str) -> Effect | None:
+    """Return the effect added by shell redirections in one segment."""
+
+    redirections = _redirection_targets(segment)
+    if not redirections:
+        tokens = _segment_tokens(segment)
+        malformed = any(
+            re.fullmatch(r"\d*(?:>>?|<|&>|>&)", token) is not None
+            for token in tokens
+        )
+        return Effect.UNKNOWN if malformed else None
+    for direction, target in redirections:
+        if direction != "output":
+            continue
+        normalized = target.strip("\"'").replace("\\", "/").lower()
+        if re.fullmatch(r"&\d+", normalized):
+            continue
+        if normalized in {"nul", "nul:", "/dev/null"}:
+            continue
+        return Effect.WRITE
+    return None
 
 
 def _sensitive_arguments(arguments: list[str]) -> bool:
@@ -1015,6 +1133,197 @@ def _bash_guard_facts(command: str) -> tuple[str, ...]:
     return tuple(facts)
 
 
+def _nested_command_payloads(command: str) -> tuple[str, ...]:
+    """Extract executable payloads from the supported opaque wrappers."""
+
+    payloads: list[str] = []
+    for segment, _ in _scan_bash_command(command)[0]:
+        program, arguments = _segment_program(segment)
+        options = {
+            "sh": {"-c"},
+            "bash": {"-c"},
+            "zsh": {"-c"},
+            "cmd": {"/c"},
+            "cmd.exe": {"/c"},
+            "pwsh": {"-c", "-command"},
+            "pwsh.exe": {"-c", "-command"},
+            "powershell": {"-c", "-command"},
+            "powershell.exe": {"-c", "-command"},
+        }.get(program)
+        if options:
+            for index, argument in enumerate(arguments):
+                if argument.strip('"\'').lower() in options and index + 1 < len(arguments):
+                    payload = _remove_matching_outer_quotes(
+                        " ".join(arguments[index + 1 :]).strip()
+                    )
+                    if payload:
+                        payloads.append(payload)
+                    break
+
+    index = 0
+    quote: str | None = None
+    escaped = False
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if character == "'":
+            quote = None if quote == "'" else ("'" if quote is None else quote)
+            index += 1
+            continue
+        if character == '"':
+            quote = None if quote == '"' else ('"' if quote is None else quote)
+            index += 1
+            continue
+        if quote == "'":
+            index += 1
+            continue
+        if command.startswith("$(", index) and not command.startswith("$((", index):
+            depth = 1
+            cursor = index + 2
+            inner_quote: str | None = None
+            inner_escaped = False
+            while cursor < len(command) and depth:
+                inner_character = command[cursor]
+                if inner_quote is not None:
+                    if inner_escaped:
+                        inner_escaped = False
+                    elif inner_character == "\\" and inner_quote != "'":
+                        inner_escaped = True
+                    elif inner_character == inner_quote:
+                        inner_quote = None
+                elif inner_character in {"'", '"'}:
+                    inner_quote = inner_character
+                elif command.startswith("$(", cursor):
+                    depth += 1
+                    cursor += 1
+                elif inner_character == ")":
+                    depth -= 1
+                    if depth == 0:
+                        payloads.append(command[index + 2 : cursor])
+                        index = cursor
+                        break
+                cursor += 1
+        elif character == "`":
+            closing = command.find("`", index + 1)
+            if closing != -1:
+                payloads.append(command[index + 1 : closing])
+                index = closing
+        index += 1
+    return tuple(payloads)
+
+
+def _remove_matching_outer_quotes(value: str) -> str:
+    """Remove one matching quote pair without consuming nested quote tails."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        quote = value[0]
+        return value[1:-1].replace(f"\\{quote}", quote)
+    return value
+
+
+def _normalized_delete_target(value: str) -> str:
+    return value.strip('"\'').replace("\\", "/").rstrip("/") or "/"
+
+
+def _bash_circuit_breakers(
+    command: str,
+    *,
+    _depth: int = 0,
+) -> tuple[CircuitBreaker, ...]:
+    """Return only catastrophic, structurally parsed Bash execution facts."""
+
+    breakers: list[CircuitBreaker] = []
+
+    def add(value: CircuitBreaker) -> None:
+        if value not in breakers:
+            breakers.append(value)
+
+    if _depth > 4:
+        return ()
+    home_candidates = {
+        str(Path.home()).replace("\\", "/").rstrip("/").lower(),
+        "~",
+        "$home",
+        "${home}",
+        "%userprofile%",
+        "$env:userprofile",
+    }
+    parsed: list[tuple[str, list[str], str | None, str]] = []
+    for segment, connector in _scan_bash_command(command)[0]:
+        program, arguments = _segment_program(segment)
+        parsed.append((program, arguments, connector, segment))
+        effective = _effective_program(program, arguments)
+        effective_arguments = (
+            arguments[1:] if program in {"sudo", "doas"} and arguments else arguments
+        )
+
+        if effective in {"rm", "rmdir", "rd", "remove-item"}:
+            recursive = any(
+                value.strip('"\'').lower() in {"-r", "-rf", "-fr", "--recursive", "/s"}
+                or re.fullmatch(r"-[^-]*r[^-]*", value.strip('"\''), re.IGNORECASE)
+                for value in effective_arguments
+            )
+            targets = [
+                _normalized_delete_target(value)
+                for value in effective_arguments
+                if not value.strip('"\'').startswith("-")
+                and value.strip('"\'').lower() not in {"/s", "/q"}
+            ]
+            if recursive:
+                for target in targets:
+                    lowered = target.lower()
+                    if target == "/" or re.fullmatch(r"[A-Za-z]:", target) or re.fullmatch(
+                        r"//[^/]+/[^/]+", target
+                    ):
+                        add(CircuitBreaker.FILESYSTEM_ROOT_DELETE)
+                    if lowered in home_candidates:
+                        add(CircuitBreaker.HOME_DELETE)
+
+        if effective.startswith("mkfs") or effective in {
+            "wipefs",
+            "fdisk",
+            "parted",
+            "format",
+            "clear-disk",
+            "format-volume",
+        }:
+            add(CircuitBreaker.DISK_OR_VOLUME_DAMAGE)
+        if effective == "diskpart" and any(
+            value.strip('"\'').lower() in {"clean", "clean all"}
+            for value in effective_arguments
+        ):
+            add(CircuitBreaker.DISK_OR_VOLUME_DAMAGE)
+        if effective == "dd" and any(
+            re.match(r"(?i)^of\s*=\s*[\"']?/dev/", value.strip('"\''))
+            for value in effective_arguments
+        ):
+            add(CircuitBreaker.RAW_DEVICE_WRITE)
+        if _has_unquoted_device_redirection(segment):
+            add(CircuitBreaker.RAW_DEVICE_WRITE)
+
+    for index, (program, arguments, connector, _) in enumerate(parsed):
+        if program != "diskpart" or connector != "|" or index == 0:
+            continue
+        previous_program, previous_arguments, _, _ = parsed[index - 1]
+        if previous_program in {"echo", "write-output", "printf"} and any(
+            value.strip('"\'').lower() in {"clean", "clean all"}
+            for value in previous_arguments
+        ):
+            add(CircuitBreaker.DISK_OR_VOLUME_DAMAGE)
+
+    for payload in _nested_command_payloads(command):
+        for breaker in _bash_circuit_breakers(payload, _depth=_depth + 1):
+            add(breaker)
+    return tuple(breakers)
+
+
 def classify_bash_command(command: str) -> Effect:
     """Classify obvious shell effects without claiming complete parsing.
 
@@ -1034,8 +1343,13 @@ def classify_bash_command(command: str) -> Effect:
 
 
 def _classify_bash_segment(segment: str) -> Effect:
-    if re.search(r"(?<![<>])[<>]{1,2}(?![=])", segment):
-        return Effect.WRITE
+    outer_group = _outer_command_group(segment)
+    if outer_group is not None:
+        return classify_bash_command(outer_group)
+    segment = _unwrap_command_group(segment)
+    redirection_effect = _redirection_effect(segment)
+    if redirection_effect is not None:
+        return redirection_effect
     if any(marker in segment for marker in ("$(`", "$(", "`", "\n")):
         return Effect.UNKNOWN
     try:
@@ -1086,6 +1400,8 @@ def _classify_bash_segment(segment: str) -> Effect:
 
 def _static_navigation_target(program: str, arguments: list[str]) -> str | None:
     values = [argument.strip('"\'') for argument in arguments]
+    if program in {"cd", "chdir"} and values and values[0].lower() == "/d":
+        values = values[1:]
     if program == "set-location" and len(values) == 2 and values[0].lower() in {
         "-path",
         "-literalpath",
@@ -1451,6 +1767,7 @@ class BashTool:
                 effect=effect,
                 resource=summary,
                 scope=scope,
+                circuit_breakers=_bash_circuit_breakers(command),
             ),
             execution_arguments=arguments,
         )

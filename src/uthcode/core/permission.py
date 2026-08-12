@@ -52,6 +52,23 @@ class RuleKind(str, Enum):
     POLICY = "policy"
 
 
+class RuleAuthority(str, Enum):
+    """Whether a Rule is configured, built in, or a mandatory breaker."""
+
+    CONFIGURED = "configured"
+    BUILTIN = "builtin"
+    CIRCUIT_BREAKER = "circuit_breaker"
+
+
+class CircuitBreaker(str, Enum):
+    """Trusted catastrophic facts that always require one-shot approval."""
+
+    FILESYSTEM_ROOT_DELETE = "filesystem_root_delete"
+    HOME_DELETE = "home_delete"
+    DISK_OR_VOLUME_DAMAGE = "disk_or_volume_damage"
+    RAW_DEVICE_WRITE = "raw_device_write"
+
+
 class DecisionReason(str, Enum):
     """Stable facts explaining which part of the evaluation produced a result."""
 
@@ -94,6 +111,7 @@ class PermissionAction:
     effect: Effect
     resource: str | None = None
     scope: ResourceScope = ResourceScope.UNKNOWN
+    circuit_breakers: tuple[CircuitBreaker, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tool", _text(self.tool, "tool"))
@@ -113,6 +131,13 @@ class PermissionAction:
             "scope",
             _enum_value(self.scope, ResourceScope, "scope"),
         )
+        breakers = tuple(
+            _enum_value(value, CircuitBreaker, "circuit_breakers")
+            for value in self.circuit_breakers
+        )
+        if len(set(breakers)) != len(breakers):
+            raise ValueError("circuit_breakers must not contain duplicates")
+        object.__setattr__(self, "circuit_breakers", breakers)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -121,6 +146,7 @@ class PermissionAction:
             "effect": self.effect.value,
             "resource": self.resource,
             "scope": self.scope.value,
+            "circuit_breakers": tuple(value.value for value in self.circuit_breakers),
         }
 
     def to_json(self) -> str:
@@ -203,6 +229,8 @@ class Rule:
     scope: ResourceScope | None = None
     resource_prefix: bool = False
     resource_regex: str | None = None
+    authority: RuleAuthority = RuleAuthority.CONFIGURED
+    circuit_breaker: CircuitBreaker | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _enum_value(self.kind, RuleKind, "kind"))
@@ -212,6 +240,17 @@ class Rule:
             _enum_value(self.decision, Decision, "decision"),
         )
         object.__setattr__(self, "source", _text(self.source, "source"))
+        object.__setattr__(
+            self,
+            "authority",
+            _enum_value(self.authority, RuleAuthority, "authority"),
+        )
+        if self.circuit_breaker is not None:
+            object.__setattr__(
+                self,
+                "circuit_breaker",
+                _enum_value(self.circuit_breaker, CircuitBreaker, "circuit_breaker"),
+            )
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
         object.__setattr__(self, "rule_id", _optional_text(self.rule_id, "rule_id"))
@@ -243,8 +282,20 @@ class Rule:
             raise ValueError("resource and resource_regex are mutually exclusive")
         if self.resource_regex is not None and self.resource_prefix:
             raise ValueError("resource_prefix cannot be used with resource_regex")
+        if self.authority is RuleAuthority.CIRCUIT_BREAKER:
+            if self.kind is not RuleKind.GUARD or self.decision is not Decision.ASK:
+                raise ValueError("circuit-breaker rules must be Guard ASK rules")
+            if self.circuit_breaker is None:
+                raise ValueError("circuit-breaker authority requires a trusted fact")
+        elif self.circuit_breaker is not None:
+            raise ValueError("only circuit-breaker rules may match circuit-breaker facts")
 
     def matches(self, action: PermissionAction) -> bool:
+        if (
+            self.circuit_breaker is not None
+            and self.circuit_breaker not in action.circuit_breakers
+        ):
+            return False
         if self.tool is not None and self.tool != action.tool:
             return False
         if self.action is not None and self.action != action.action:
@@ -284,6 +335,10 @@ class Rule:
             "scope": self.scope.value if self.scope is not None else None,
             "resource_prefix": self.resource_prefix,
             "resource_regex": self.resource_regex,
+            "authority": self.authority.value,
+            "circuit_breaker": (
+                self.circuit_breaker.value if self.circuit_breaker is not None else None
+            ),
         }
 
 
@@ -467,7 +522,39 @@ class PermissionEvaluator:
         if not all(isinstance(grant, SessionGrant) for grant in grants):
             raise TypeError("session_grants must contain SessionGrant values")
 
-        guard = self._select(RuleKind.GUARD, action)
+        breaker = self._select(
+            RuleKind.GUARD,
+            action,
+            authority=RuleAuthority.CIRCUIT_BREAKER,
+        )
+        configured_guard = self._select(
+            RuleKind.GUARD,
+            action,
+            authority=RuleAuthority.CONFIGURED,
+        )
+        if breaker is not None:
+            if configured_guard is not None and configured_guard.decision is Decision.DENY:
+                return self._from_rule(
+                    Decision.DENY,
+                    DecisionReason.GUARD_MATCH,
+                    action,
+                    mode,
+                    configured_guard,
+                    guard_allowed=False,
+                )
+            return self._from_rule(
+                Decision.ASK,
+                DecisionReason.GUARD_MATCH,
+                action,
+                mode,
+                breaker,
+                guard_allowed=False,
+            )
+
+        if mode is PermissionMode.FULL_ACCESS:
+            guard = configured_guard
+        else:
+            guard = self._select(RuleKind.GUARD, action, exclude_circuit_breaker=True)
         if guard is not None:
             if guard.decision is Decision.DENY:
                 return self._from_rule(
@@ -525,8 +612,25 @@ class PermissionEvaluator:
             )
         return self._fallback(action, mode, strategy, guard_allowed=guard_allowed)
 
-    def _select(self, kind: RuleKind, action: PermissionAction) -> Rule | None:
-        matches = [rule for rule in self._rules.rules if rule.kind is kind and rule.matches(action)]
+    def _select(
+        self,
+        kind: RuleKind,
+        action: PermissionAction,
+        *,
+        authority: RuleAuthority | None = None,
+        exclude_circuit_breaker: bool = False,
+    ) -> Rule | None:
+        matches = [
+            rule
+            for rule in self._rules.rules
+            if rule.kind is kind
+            and (authority is None or rule.authority is authority)
+            and (
+                not exclude_circuit_breaker
+                or rule.authority is not RuleAuthority.CIRCUIT_BREAKER
+            )
+            and rule.matches(action)
+        ]
         if not matches:
             return None
 
@@ -610,6 +714,7 @@ def evaluate_permission(
 
 
 __all__ = [
+    "CircuitBreaker",
     "Decision",
     "DecisionReason",
     "Effect",
@@ -619,6 +724,7 @@ __all__ = [
     "PermissionMode",
     "ResourceScope",
     "Rule",
+    "RuleAuthority",
     "RuleKind",
     "RuleSet",
     "SessionGrant",

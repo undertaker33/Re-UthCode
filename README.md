@@ -228,8 +228,9 @@ UthCode 会合并用户配置和项目配置：
 - `Bash` 使用当前操作系统用户的权限执行，是**未沙箱化的进程执行**。
 - 当前版本没有 OS Sandbox；Permission Approval 只是应用层授权，不能替代操作系统隔离。
 - 项目配置不能设置 `default_permission_mode`；该安全默认值只允许由用户配置保存为 `default` 或 `auto`。
-- 普通 Tool 依次经过可信参数预检、固定 Runtime Hook、Guard/Policy/Strategy 权限判断，再执行。高置信危险 Bash 行为在 `full_access` 下仍需确认。
-- Bash 只对可确定的命令和目录范围自动分类；无法确认的 effect/scope 会保守请求授权。
+- 普通 Tool 依次经过可信参数预检、固定 Runtime Hook、唯一 Permission evaluator，再执行。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但用户/项目显式 Guard ASK/DENY 仍生效。
+- 根目录/Home 递归删除、磁盘/卷破坏和裸设备写入属于灾难性 circuit breaker，三种模式均只允许单次批准或拒绝；普通允许规则不能覆盖它。
+- Bash 只对可确定的命令和目录范围自动分类；`cd /d <literal>` 与可见 CMD 括号命令组可参与静态分类，其他不确定语法保持保守。在 `default`/`auto` 下仍按普通 Guard/Policy/Strategy 保护。
 - 工具仍受操作系统权限、工作目录与物理路径检查、参数校验和第三方服务权限约束。
 - 工具活动只显示经过脱敏和截断的摘要，不显示写入正文、工具返回的原始内容、API Key、token、配置秘密或未知参数。
 - 当前对话只保存在内存中；退出后不会提供会话恢复、Memory 或持久化历史。
@@ -260,7 +261,7 @@ UthCode 会合并用户配置和项目配置：
 
 ## 当前状态
 
-UthCode 目前处于早期版本，核心对话、工具调用、CLI 和 TUI 已可离线测试。Permission、OS Sandbox、持久 Session、Memory、Diff Viewer、MCP、Skill 和 Multi-Agent 尚未提供。
+UthCode 目前处于早期版本，核心对话、工具调用、Permission、CLI 和 TUI 已可离线测试。OS Sandbox、持久 Session、Memory、Diff Viewer、MCP、Skill 和 Multi-Agent 尚未提供。
 
 ## License
 

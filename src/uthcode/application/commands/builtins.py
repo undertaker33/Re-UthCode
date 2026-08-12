@@ -26,7 +26,8 @@ from .registry import CommandRegistry
 
 _MODEL_SWITCH_FAILURE = "模型切换失败"
 _FULL_ACCESS_WARNING = (
-    "高风险提示：full_access 仅跳过普通 Policy/Strategy，Guard 仍然生效；"
+    "高风险提示：full_access 跳过内置普通 Guard、Policy 和 Strategy；"
+    "显式 Guard 与灾难性断路器仍然生效；"
     "当前 Run 的普通 Tool 将减少人工确认。"
 )
 

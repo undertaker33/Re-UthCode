@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from uthcode.core.permission import (
+    CircuitBreaker,
     Decision,
     DecisionReason,
     Effect,
@@ -14,6 +15,7 @@ from uthcode.core.permission import (
     PermissionMode,
     ResourceScope,
     Rule,
+    RuleAuthority,
     RuleKind,
     RuleSet,
     SessionGrant,
@@ -129,6 +131,63 @@ def test_guard_decisions_apply_in_all_modes_and_guard_allow_continues() -> None:
     assert ordinary.reason is DecisionReason.POLICY_MATCH
     assert full_access.decision is Decision.ALLOW
     assert full_access.reason is DecisionReason.GUARD_MATCH
+
+
+def test_full_access_skips_builtin_guard_but_keeps_configured_guard() -> None:
+    action = _action(effect=Effect.UNKNOWN)
+    builtin = _rule(
+        kind=RuleKind.GUARD,
+        decision=Decision.ASK,
+        source="default",
+        priority=0,
+        authority=RuleAuthority.BUILTIN,
+    )
+    configured_ask = _rule(kind=RuleKind.GUARD, decision=Decision.ASK)
+    configured_deny = _rule(kind=RuleKind.GUARD, decision=Decision.DENY)
+
+    assert PermissionEvaluator(RuleSet((builtin,))).evaluate(
+        action, mode=PermissionMode.FULL_ACCESS
+    ).decision is Decision.ALLOW
+    assert PermissionEvaluator(RuleSet((builtin, configured_ask))).evaluate(
+        action, mode=PermissionMode.FULL_ACCESS
+    ).decision is Decision.ASK
+    assert PermissionEvaluator(RuleSet((builtin, configured_deny))).evaluate(
+        action, mode=PermissionMode.FULL_ACCESS
+    ).decision is Decision.DENY
+
+
+@pytest.mark.parametrize("mode", list(PermissionMode))
+def test_circuit_breaker_is_mandatory_ask_unless_configured_deny(
+    mode: PermissionMode,
+) -> None:
+    action = PermissionAction(
+        tool="Bash",
+        action="execute",
+        effect=Effect.DESTRUCTIVE,
+        resource="Bash rm -rf /",
+        scope=ResourceScope.UNKNOWN,
+        circuit_breakers=(CircuitBreaker.FILESYSTEM_ROOT_DELETE,),
+    )
+    breaker = _rule(
+        kind=RuleKind.GUARD,
+        decision=Decision.ASK,
+        source="default",
+        priority=0,
+        authority=RuleAuthority.CIRCUIT_BREAKER,
+        circuit_breaker=CircuitBreaker.FILESYSTEM_ROOT_DELETE,
+    )
+    ordinary_allow = _rule(kind=RuleKind.GUARD, decision=Decision.ALLOW)
+    configured_deny = _rule(kind=RuleKind.GUARD, decision=Decision.DENY)
+
+    result = PermissionEvaluator(RuleSet((breaker, ordinary_allow))).evaluate(
+        action, mode=mode
+    )
+    denied = PermissionEvaluator(RuleSet((breaker, configured_deny))).evaluate(
+        action, mode=mode
+    )
+    assert result.decision is Decision.ASK
+    assert result.matched_rule_id == "rule-1"
+    assert denied.decision is Decision.DENY
 
 
 def test_source_precedence_is_separate_from_same_source_strictness() -> None:

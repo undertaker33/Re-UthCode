@@ -55,7 +55,7 @@ interfaces -> application -> core
 - Tool Batch 严格 FIFO；每个 `ToolCall` 必须得到对应 `ToolResult`。单个 Tool 被拒绝或发生普通错误时，应形成受控结果，不直接使整个 Run 崩溃。
 - Agent Loop 是 `RunState` 的唯一写入者；Tool、Provider、Permission、Storage 和 Interface 只能返回结果、事件或控制响应。
 - `Bash` 是当前 OS 用户权限下的 unsandboxed process execution，不得描述为 Sandbox。
-- Permission 固定支持 `default`、`auto`、`full_access`。`full_access` 仍不能绕过 Guard Ask/Deny、工具注册、参数校验、OS 权限和第三方权限；项目配置不得静默启用它。
+- Permission 固定支持 `default`、`auto`、`full_access`。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但仍受用户/项目显式 Guard ASK/DENY 和灾难性 circuit breaker 约束；工具注册、参数校验、OS 权限和第三方权限始终有效，项目配置不得静默启用 `full_access`。
 - Permission Approval 是应用层授权，不是 OS Sandbox。Session Grant 只属于当前 `AgentRun`，不得自动持久化。
 - API key 真实值只从环境变量读取，不得写入配置、事件、日志、Journal 或 Snapshot。Permission 动作规则与普通 `config.toml` 分离。
 

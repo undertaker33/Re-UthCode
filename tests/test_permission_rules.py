@@ -204,6 +204,27 @@ def test_invalid_permission_sources_fail_loudly(
         load_permission_rules(cwd=workdir, home=home)
 
 
+@pytest.mark.parametrize("field", ["authority", "circuit_breaker"])
+def test_permission_files_cannot_declare_trusted_rule_fields(
+    tmp_path: Path, field: str
+) -> None:
+    home = tmp_path / "home"
+    _write_user_permission(
+        home,
+        f'''[guard]
+[[guard.rules]]
+decision = "allow"
+tool = "Bash"
+{field} = "circuit_breaker"
+''',
+    )
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    with pytest.raises(PermissionConfigurationError, match="unsupported rule field"):
+        load_permission_rules(cwd=workdir, home=home)
+
+
 def test_rule_snapshot_does_not_hot_reload(tmp_path: Path) -> None:
     home = tmp_path / "home"
     workdir = tmp_path / "workdir"
@@ -370,11 +391,12 @@ def test_default_bash_guard_asks_for_high_confidence_dangerous_commands(
     from uthcode.integrations.tools.process_tools import BashTool
 
     action = BashTool(Path.cwd()).preflight({"command": command}).action  # type: ignore[arg-type]
-    result = PermissionEvaluator(RuleSet(default_guard_rules())).evaluate(
-        action, mode=PermissionMode.FULL_ACCESS
+    evaluator = PermissionEvaluator(RuleSet(default_guard_rules()))
+    assert evaluator.evaluate(action, mode=PermissionMode.DEFAULT).decision is Decision.ASK
+    full_access = evaluator.evaluate(action, mode=PermissionMode.FULL_ACCESS)
+    assert full_access.decision is (
+        Decision.ASK if action.circuit_breakers else Decision.ALLOW
     )
-    assert result.decision is Decision.ASK
-    assert result.matched_rule_kind is RuleKind.GUARD
 
 
 @pytest.mark.parametrize("command", ["rm -f note.txt", "kill -9 42", "rm -rf build/"])
@@ -401,7 +423,7 @@ def test_default_bash_guard_does_not_match_required_negative_examples(
         "echo ok && kill -9 1",
     ],
 )
-def test_default_bash_guard_checks_each_composite_segment_even_in_full_access(
+def test_full_access_only_keeps_circuit_breakers_from_composite_segments(
     tmp_path: Path,
     command: str,
 ) -> None:
@@ -413,8 +435,9 @@ def test_default_bash_guard_checks_each_composite_segment_even_in_full_access(
         mode=PermissionMode.FULL_ACCESS,
     )
 
-    assert result.decision is Decision.ASK
-    assert result.matched_rule_kind is RuleKind.GUARD
+    assert result.decision is (
+        Decision.ASK if action.circuit_breakers else Decision.ALLOW
+    )
 
 
 @pytest.mark.parametrize(
@@ -476,7 +499,7 @@ def test_default_bash_guard_checks_supported_windows_composite_segments(
         'echo "`rm -rf /`"',
     ],
 )
-def test_default_bash_guard_conservatively_checks_nested_and_background_execution(
+def test_full_access_only_keeps_visible_circuit_breakers_in_nested_commands(
     tmp_path: Path,
     command: str,
 ) -> None:
@@ -488,8 +511,9 @@ def test_default_bash_guard_conservatively_checks_nested_and_background_executio
         mode=PermissionMode.FULL_ACCESS,
     )
 
-    assert result.decision is Decision.ASK
-    assert result.matched_rule_kind is RuleKind.GUARD
+    assert result.decision is (
+        Decision.ASK if action.circuit_breakers else Decision.ALLOW
+    )
 
 
 @pytest.mark.parametrize(
@@ -552,7 +576,7 @@ def test_default_bash_guard_does_not_treat_arithmetic_expansion_as_execution(
         'echo "$((1 + $(rm -rf /)))"',
     ],
 )
-def test_default_bash_guard_checks_command_substitution_inside_arithmetic(
+def test_circuit_breaker_checks_command_substitution_inside_arithmetic(
     tmp_path: Path,
     command: str,
 ) -> None:
@@ -564,5 +588,6 @@ def test_default_bash_guard_checks_command_substitution_inside_arithmetic(
         mode=PermissionMode.FULL_ACCESS,
     )
 
+    assert action.circuit_breakers
     assert result.decision is Decision.ASK
     assert result.matched_rule_kind is RuleKind.GUARD

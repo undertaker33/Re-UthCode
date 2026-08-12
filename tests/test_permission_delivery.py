@@ -486,10 +486,11 @@ async def test_formal_mode_matrix_and_session_grant_stay_on_the_same_evaluator(
     (workspace / ".env").write_text("guard-content\n", encoding="utf-8")
     guard_run = _application(workspace, guard_provider).create_run()
     assert guard_run.set_permission_mode(PermissionMode.FULL_ACCESS) is PermissionMode.FULL_ACCESS
-    guard_events = await _collect_turn(guard_run.start_turn("guarded read"), lambda event: PermissionApprovalChoice.REJECT)
-    guard_pause = next(event for event in guard_events if isinstance(event, TurnPaused))
-    assert guard_pause.pause.permission_request is not None
-    assert guard_pause.pause.permission_request.guard is True
+    guard_events = await _collect_turn(
+        guard_run.start_turn("guarded read"),
+        lambda event: PermissionApprovalChoice.REJECT,
+    )
+    assert sum(isinstance(event, TurnPaused) for event in guard_events) == 0
 
 
 @pytest.mark.parametrize(
@@ -720,15 +721,15 @@ def test_bash_sensitive_guard_distinguishes_metadata_from_content(
 ) -> None:
     tool = BashTool(tmp_path)
     preparation = tool.preflight({"command": command})
-    decision = PermissionEvaluator(RuleSet(default_guard_rules())).evaluate(
+    evaluator = PermissionEvaluator(RuleSet(default_guard_rules()))
+    ordinary = evaluator.evaluate(preparation.action, mode=PermissionMode.DEFAULT)
+    full_access = evaluator.evaluate(
         preparation.action,
         mode=PermissionMode.FULL_ACCESS,
     )
-    assert (decision.reason.value == "guard_match") is expected_guard
-    if expected_guard:
-        assert decision.decision is Decision.ASK
-    else:
-        assert decision.decision is Decision.ALLOW
+    assert (ordinary.reason.value == "guard_match") is expected_guard
+    assert full_access.decision is Decision.ALLOW
+    assert full_access.reason.value == "mode_fallback"
 
 
 @pytest.mark.asyncio

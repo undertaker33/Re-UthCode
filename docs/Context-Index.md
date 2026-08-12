@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-12
+snapshot_date: 2026-08-13
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-12
+status_snapshot: 2026-08-13
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -78,7 +78,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| — | — | — | 当前没有已实施但未归档的活跃工作包 |
+| T07-1 | 权限分类与完全访问收口 | `docs/work/T07-1-权限分类与完全访问收口/` | 分类、权限矩阵、正式 Application E2E 与全量回归通过；Checklist 与 Feedback 已完成 |
 
 ### `not_implemented`
 
