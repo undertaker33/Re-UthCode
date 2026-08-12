@@ -90,50 +90,6 @@ _BASH_GUARD_REGEXES: tuple[tuple[str, str], ...] = (
         "default-bash-segment-guard-fact",
         rf"(?i)\[{re.escape(BASH_GUARD_FACT_MARKER)}:[a-z0-9-]+(?:,[a-z0-9-]+)*\]",
     ),
-    (
-        "default-bash-root-delete",
-        r"(?im)^\s*(?:(?:sudo|doas)\s+)?(?:rm|rmdir|rd|del|erase|remove-item)\s+"
-        r"(?:(?:-[A-Za-z]+|/[A-Za-z]+)\s+)*(?:/|~(?:[/\\].*)?|\.(?:[/\\]\*)?|\*)\s*$",
-    ),
-    (
-        "default-bash-windows-system-delete",
-        r"(?im)^\s*(?:remove-item|rd|rmdir|del|erase)\b.*"
-        r"[A-Za-z]:[/\\](?:Users|Windows|Program Files)(?:[/\\][^/\\]+)?[/\\]?\s*$",
-    ),
-    (
-        "default-bash-disk-format",
-        r"(?im)^\s*(?:mkfs(?:\.[A-Za-z0-9._-]+)?|wipefs|fdisk|parted|format)\b",
-    ),
-    (
-        "default-bash-windows-disk-operation",
-        r"(?im)^\s*(?:diskpart\b.*\bclean\b|clear-disk\b|format-volume\b)",
-    ),
-    (
-        "default-bash-raw-device-write",
-        r"(?im)^\s*dd\b.*\bof\s*=\s*/dev/",
-    ),
-    (
-        "default-bash-fork-bomb",
-        r"(?im)^\s*:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
-    ),
-    (
-        "default-bash-privilege-escalation",
-        r"(?im)^\s*(?:sudo|doas|su|runas)\b",
-    ),
-    (
-        "default-bash-recursive-extreme-permissions",
-        r"(?im)^\s*(?:chmod|chown)\b\s+(?:-[^\s]*R|--recursive)\b.*"
-        r"(?:\b777\b|(?:/|~)(?:[/\\].*)?)",
-    ),
-    (
-        "default-bash-remote-script-pipe",
-        r"(?im)^\s*(?:curl|wget)\b.*\|\s*(?:ba)?sh\b",
-    ),
-    (
-        "default-bash-critical-process-kill",
-        r"(?im)^\s*(?:kill|pkill|taskkill)\b.*(?:\s(?:-1|1)(?:\s|$)|"
-        r"/PID\s+1(?:\s|$)|-p\s*1(?:\s|$))",
-    ),
 )
 
 

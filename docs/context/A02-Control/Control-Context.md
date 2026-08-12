@@ -63,8 +63,10 @@ Tool.prepare_call
 - `load_permission_rules` 在 `AgentRun` 创建时加载一次不可变 `RuleSet`；运行中修改文件不热加载。
 - 来源优先级：内置默认 Guard < 用户规则 < 从 Git 根到 cwd 的项目规则；同来源同优先级按 `DENY > ASK > ALLOW`。
 - 默认 Guard 对敏感凭据路径和高置信危险 Bash 行为要求 ASK；`full_access` 也不能绕过。
-- `SESSION` 审批只写入当前内存 `AgentRun`，按动作维度与有界资源匹配；不写持久规则。
-- Guard 触发的审批不提供 `SESSION` 选项；普通 Strategy ASK 可提供 `ONCE/SESSION/REJECT`。
+- 高置信危险 Bash 事实由 Tool preflight 的段级解析器生成可信 `guard_fact`，默认 Guard 只匹配该 marker；不对展示摘要重复运行原始命令正则。
+- `SESSION` 审批只写入当前内存 `AgentRun`，按动作维度与有界资源匹配；不写持久规则。只有 Strategy fallback ASK 且 Action 含非空有界 resource 时才提供该选项。
+- Guard ASK、Policy ASK 和 resource-less ASK 只提供 `ONCE/REJECT`；Policy ALLOW/ASK/DENY 保持终态，Session Grant 不覆盖 Guard 或 Policy。
+- Bash 权限与活动摘要会脱敏带有 `KEY`/`AUTH` 独立段及既有 token/secret/password/credential 词汇的赋值；普通名称片段不得误判为秘密。
 
 ## 暂停状态机
 

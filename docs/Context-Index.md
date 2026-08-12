@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-10
+status_snapshot: 2026-08-12
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -67,16 +67,17 @@ status_values:
 | T01-2 | 移除 pydantic，改用原生 SDK | `docs/work/archive/T01-2-移除pydantic改用原生SDK/` |
 | T02 | Slash Command 与默认 TUI | `docs/work/archive/T02-SlashCommand与默认TUI/` |
 | T03 | System Prompt 设计 | `docs/work/archive/T03-SystemPrompt设计/` |
+| T04 | 工具系统 | `docs/work/archive/T04-工具系统/` |
+| T05 | ReAct 与 Agent Loop | `docs/work/archive/T05-ReAct与AgentLoop/` |
+| T06 | 暂停恢复与询问用户 | `docs/work/archive/T06-暂停恢复与询问用户/` |
+| T07 | 三层权限系统 | `docs/work/archive/T07-三层权限系统/` |
+| T08 | 任务规划与执行控制 | `docs/work/archive/T08-任务规划与执行控制/` |
 
 ### `implemented_unarchived`
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T04 | 工具系统 | `docs/work/T04-工具系统/` | Checklist `62/62`；4 份 Feedback；`src/uthcode/core/tool.py` 与 `src/uthcode/integrations/tools/` 已接入 |
-| T05 | ReAct 与 Agent Loop | `docs/work/T05-ReAct与AgentLoop/` | Checklist `91/91`；4 份 Feedback；`src/uthcode/core/agent.py` 与 `src/uthcode/application/runs.py` 已接入 |
-| T06 | 暂停恢复与询问用户 | `docs/work/T06-暂停恢复与询问用户/` | Checklist `42/42`；3 份 Feedback；`src/uthcode/core/interaction.py` 与暂停恢复链已接入 |
-| T07 | 三层权限系统 | `docs/work/T07-三层权限系统/` | Checklist `56/56`；4 份 Feedback；`src/uthcode/core/permission.py` 与 `src/uthcode/integrations/permissions.py` 已接入 |
-| T08 | 任务规划与执行控制 | `docs/work/T08-任务规划与执行控制/` | Checklist `全部完成`；4 份 Worker Feedback；`create_application → create_run → start_turn` 正式链、Plan/Task/Steering/Hook 与 T08 E2E 已接入 |
+| — | — | — | 当前没有已实施但未归档的活跃工作包 |
 
 ### `not_implemented`
 

@@ -451,6 +451,48 @@ def test_permission_approval_protocol_is_strict_and_redacted() -> None:
     assert PermissionApprovalRequest.from_json(request.to_json()) == request
     assert "secret-value" not in json.dumps(payload)
 
+
+def test_policy_and_resourceless_asks_do_not_offer_session() -> None:
+    policy_action = PermissionAction(
+        "WriteFile", "write", Effect.WRITE, "note.txt", ResourceScope.INSIDE
+    )
+    policy = Rule(
+        kind=RuleKind.POLICY,
+        decision=Decision.ASK,
+        source="project",
+        tool="WriteFile",
+        action="write",
+    )
+    policy_request = PermissionApprovalRequest.from_decision(
+        PermissionEvaluator(RuleSet((policy,))).evaluate(policy_action),
+        permission_id="permission-policy",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+    )
+    assert policy_request.choices == (
+        PermissionApprovalChoice.ONCE,
+        PermissionApprovalChoice.REJECT,
+    )
+
+    resource_less = PermissionAction(
+        "Custom", "execute", Effect.UNKNOWN, None, ResourceScope.UNKNOWN
+    )
+    resource_less_request = PermissionApprovalRequest.from_decision(
+        PermissionEvaluator().evaluate(resource_less),
+        permission_id="permission-custom",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-2",
+    )
+    assert resource_less_request.choices == (
+        PermissionApprovalChoice.ONCE,
+        PermissionApprovalChoice.REJECT,
+    )
+
+    request = policy_request
+    action = policy_action
+
     pause = PauseRequest(
         "pause-1",
         "run-1",

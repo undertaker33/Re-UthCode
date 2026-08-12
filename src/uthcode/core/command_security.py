@@ -6,6 +6,11 @@ import re
 
 
 _BASH_GUARD_FACT_MARKER = "__uthcode_guard_fact__"
+_SENSITIVE_ASSIGNMENT_NAME = (
+    r"(?:[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|authorization|credential)"
+    r"[A-Za-z0-9_-]*|(?:key|auth)|[A-Za-z0-9]+(?:[_-](?:key|auth))"
+    r"(?:[_-][A-Za-z0-9]+)*|(?:key|auth)(?:[_-][A-Za-z0-9]+)+)"
+)
 _COMMAND_URL_USERINFO = re.compile(
     r"(?i)(?P<scheme>\b[A-Za-z][A-Za-z0-9+.-]*://)(?P<userinfo>[^/\s@]+)@"
 )
@@ -22,8 +27,7 @@ _COMMAND_QUERY_SECRET = re.compile(
 _COMMAND_SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>\b(?!(?:Proxy-)?Authorization\s*[:=]\s*"
     r"(?:Bearer|Basic|Digest|NTLM)\s+)"
-    r"(?:[A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|"
-    r"passwd|authorization|credential)[A-Za-z0-9_-]*)\s*[:=]\s*)"
+    rf"{_SENSITIVE_ASSIGNMENT_NAME}\s*[:=]\s*)"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s;&|\"']+)"
 )
 _COMMAND_AUTH_OPTION = re.compile(

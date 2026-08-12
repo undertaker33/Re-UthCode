@@ -1053,6 +1053,13 @@ def _classify_bash_segment(segment: str) -> Effect:
     program = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
     arguments = tokens[1:]
 
+    if program in {"cd", "chdir", "set-location"}:
+        return (
+            Effect.READ
+            if _static_navigation_target(program, arguments) is not None
+            else Effect.UNKNOWN
+        )
+
     if program in {"git", "git.exe"}:
         return _classify_git_command(arguments)
 
@@ -1075,6 +1082,48 @@ def _classify_bash_segment(segment: str) -> Effect:
     if program in {"sudo", "su", "runas"}:
         return Effect.DESTRUCTIVE
     return Effect.UNKNOWN
+
+
+def _static_navigation_target(program: str, arguments: list[str]) -> str | None:
+    values = [argument.strip('"\'') for argument in arguments]
+    if program == "set-location" and len(values) == 2 and values[0].lower() in {
+        "-path",
+        "-literalpath",
+    }:
+        values = values[1:]
+    if len(values) != 1:
+        return None
+    target = values[0]
+    if not target or target == "-" or target.startswith("~"):
+        return None
+    if any(marker in target for marker in ("$", "%", "`", "*", "?", "[", "]", "{", "}")):
+        return None
+    return target
+
+
+def _bash_resource_scope(command: str, workdir: Path, effect: Effect) -> ResourceScope:
+    if effect is not Effect.READ:
+        return ResourceScope.UNKNOWN
+    current = workdir
+    for segment, connector_before in _split_bash_segments(command):
+        program, arguments = _segment_program(segment)
+        if program not in {"cd", "chdir", "set-location"}:
+            continue
+        if connector_before not in {None, "&&"}:
+            return ResourceScope.UNKNOWN
+        target = _static_navigation_target(program, arguments)
+        if target is None:
+            return ResourceScope.UNKNOWN
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = current / candidate
+        candidate = candidate.resolve(strict=False)
+        try:
+            candidate.relative_to(workdir)
+        except ValueError:
+            return ResourceScope.OUTSIDE
+        current = candidate
+    return ResourceScope.INSIDE
 
 
 def _classify_git_command(arguments: list[str]) -> Effect:
@@ -1390,7 +1439,7 @@ class BashTool:
     def preflight(self, arguments: JsonPayload) -> ToolPreparation:
         command = _text(arguments, "command")
         effect = classify_bash_command(command)
-        scope = ResourceScope.INSIDE if effect is Effect.READ else ResourceScope.UNKNOWN
+        scope = _bash_resource_scope(command, self._workdir, effect)
         summary = _bash_action_summary(command)
         facts = _bash_guard_facts(command)
         if facts:

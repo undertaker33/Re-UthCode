@@ -20,6 +20,7 @@ from uthcode.application import (
     UthCodeApplication,
     create_application,
 )
+from uthcode.application.tools import ApplicationToolService
 from uthcode.core.provider import (
     FinishReason,
     ProviderEvent,
@@ -304,6 +305,42 @@ def test_application_rejects_reserved_control_tool_from_normal_registry(
 
     with pytest.raises(ValueError, match="reserved"):
         create_application(_configuration(), tools=(ReservedTool(),))
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "KEY", "MY_KEY", "SSH_KEY", "PUBLIC-KEY", "MY_AUTH", "AUTH_TOKEN",
+        "API_KEY", "MY_TOKEN", "CLIENT_SECRET", "DB_PASSWORD", "MY_CREDENTIAL",
+    ],
+)
+def test_application_bash_summary_redacts_sensitive_assignments(
+    tmp_path, assignment: str
+) -> None:
+    secret = "application-secret-918273"
+    summary = ApplicationToolService(
+        create_default_tools(tmp_path), workdir=tmp_path
+    ).describe_tool_call(
+        ToolCallPart("bash", "Bash", {"command": f'$env:{assignment}="{secret}"'})
+    )
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    "assignment", ["MONKEY", "KEYNOTE", "HOCKEY_SCORE", "KEYBOARD_LAYOUT", "AUTHORS"]
+)
+def test_application_bash_summary_keeps_non_secret_name_fragments(
+    tmp_path, assignment: str
+) -> None:
+    value = "z9Q8v7P6n5M4"
+    summary = ApplicationToolService(
+        create_default_tools(tmp_path), workdir=tmp_path
+    ).describe_tool_call(
+        ToolCallPart("bash", "Bash", {"command": f'$env:{assignment}="{value}"'})
+    )
+    assert value in summary
+    assert "<redacted>" not in summary
 
 
 @pytest.mark.asyncio
