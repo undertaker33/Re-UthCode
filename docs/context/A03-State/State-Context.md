@@ -2,7 +2,7 @@
 
 ```text
 layer: A03-State
-context_file: docs/A03-State/State-Context.md
+context_file: docs/context/A03-State/State-Context.md
 owns: current in-memory Run/Turn facts + conversation + events + safe projections
 current_shape: immutable Core state with Application-owned lifecycle
 explicit_absence: persistent session + memory + context compiler

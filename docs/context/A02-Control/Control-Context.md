@@ -2,7 +2,7 @@
 
 ```text
 layer: A02-Control
-context_file: docs/A02-Control/Control-Context.md
+context_file: docs/context/A02-Control/Control-Context.md
 owns: permission + approval + cooperative pause/resume + ask-user + cancellation
 current_shape: application-controlled boundaries over one Core Turn
 explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle

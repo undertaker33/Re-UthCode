@@ -2,7 +2,7 @@
 
 ```text
 layer: A04-Orchestration
-context_file: docs/A04-Orchestration/Orchestration-Context.md
+context_file: docs/context/A04-Orchestration/Orchestration-Context.md
 owns: entrypoint composition + application use cases + interface adaptation
 current_shape: single-agent orchestration
 explicit_absence: subagent + task decomposition + multi-agent scheduler
@@ -79,7 +79,7 @@ interfaces/tui/app.py
   AgentEvent -> rendering/interaction projection
 ```
 
-- TUI 是 prompt_toolkit 主缓冲区适配器；详细界面约束见 `docs/TUI/README.md`。
+- TUI 是 prompt_toolkit 主缓冲区适配器；详细界面约束见 `docs/context/TUI/README.md`。
 - TUI 不拥有 RunState、Tool Registry、Permission Store 或 Provider。
 - `/clear` 只改变 Interface 投影；模型切换只影响下一 Turn。
 

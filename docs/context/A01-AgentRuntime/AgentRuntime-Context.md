@@ -2,7 +2,7 @@
 
 ```text
 layer: A01-AgentRuntime
-context_file: docs/A01-AgentRuntime/AgentRuntime-Context.md
+context_file: docs/context/A01-AgentRuntime/AgentRuntime-Context.md
 owns: Provider + SystemPrompt + Tool + ReAct AgentLoop
 current_shape: provider-independent single-agent sequential runtime
 does_not_own: permission strategy, persistence, UI, multi-agent scheduling

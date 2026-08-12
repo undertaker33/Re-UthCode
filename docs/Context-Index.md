@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-10
+snapshot_date: 2026-08-12
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -18,16 +18,17 @@ source_of_truth: src/ + tests/
 5. `docs/work/` 表达活跃需求或实施记录；存在工作包不等于对应能力已经进入源码。
 6. 四层是理解与检索视图，不是新的 Python 顶层包；源码仍遵守 `interfaces -> application -> core`，并由 `application` 组合 `integrations`。
 
-## docs 根目录路由
+## docs/context 路由
 
 | 路径 | 文档性质 | Agent 读取条件 |
 | --- | --- | --- |
 | `docs/Context-Index.md` | 全局上下文入口、目录路由、任务包状态快照 | 任意新开发窗口先读 |
-| `docs/A01-AgentRuntime/` | 执行层当前代码上下文 | Provider、Prompt、Tool、ReAct、Agent Loop 任务 |
-| `docs/A02-Control/` | 控制层当前代码上下文 | Permission、审批、暂停恢复、Ask User、取消、Sandbox、Hook 任务 |
-| `docs/A03-State/` | 状态层当前代码上下文 | Run/Turn、Event、Context、Memory、Todo/Plan、进度任务 |
-| `docs/A04-Orchestration/` | 编排层当前代码上下文 | Application、入口、CLI/TUI、Subagent、任务拆分、Multi-Agent 任务 |
-| `docs/TUI/` | 当前 TUI 的长期实现上下文；不是工作包 | 修改 TUI 交互、终端渲染、输入、滚动、暂停界面时读取 |
+| [`docs/OutstandingDebtList.md`](OutstandingDebtList.md) | 能力欠账清单；记录各 `TXX` 因后置能力未实现而刻意未继续设计或实施的部分 | 拆分或重新拆分工作包、任务命中欠账触发条件、准备回补后置能力时读取并按规则维护 |
+| `docs/context/A01-AgentRuntime/` | 执行层当前代码上下文 | Provider、Prompt、Tool、ReAct、Agent Loop 任务 |
+| `docs/context/A02-Control/` | 控制层当前代码上下文 | Permission、审批、暂停恢复、Ask User、取消、Sandbox、Hook 任务 |
+| `docs/context/A03-State/` | 状态层当前代码上下文 | Run/Turn、Event、Context、Memory、Todo/Plan、进度任务 |
+| `docs/context/A04-Orchestration/` | 编排层当前代码上下文 | Application、入口、CLI/TUI、Subagent、任务拆分、Multi-Agent 任务 |
+| `docs/context/TUI/` | 当前 TUI 的长期实现上下文；不是工作包 | 修改 TUI 交互、终端渲染、输入、滚动、暂停界面时读取 |
 | `docs/work/` | 工作包根目录；`README.md` 保存规则，直接子目录 `TXX-*` 保存活跃正式工作包 | 收到需求文件、拆分任务包或执行用户指定 Worker Prompt 时读取；先读 `docs/work/README.md` |
 | `docs/work/archive/` | 用户手动归档的已完成工作包；历史证据，不代表当前代码结构 | 当前事实不足、需要追溯已确认需求或历史验收证据时按需读取；禁止默认全量扫描 |
 
@@ -42,10 +43,10 @@ path_migration:
 
 | 层级 | 目录 | 图中职责 | 当前代码事实 | 首选任务关键词 |
 | --- | --- | --- | --- | --- |
-| 执行 | [`A01-AgentRuntime/AgentRuntime-Context.md`](A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定 Runtime Hook | 已有单 Agent、显式串行 ReAct Runtime、固定 `RuntimeHookSet` | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、Hook 边界 |
-| 控制 | [`A02-Control/Control-Context.md`](A02-Control/Control-Context.md) | 权限、Sandbox、Hook、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定 Hook 执行位；无 OS Sandbox、动态 Hook registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
-| 状态 | [`A03-State/State-Context.md`](A03-State/State-Context.md) | Context、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、BehaviorMode、PlanState、TaskState；无持久 Session、Memory、Context Compiler | RunState、Turn、Event、Context、Snapshot、Usage、Plan/Task、历史 |
-| 编排 | [`A04-Orchestration/Orchestration-Context.md`](A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配及 `/plan`、`/do`；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Plan/Task、Steering |
+| 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定 Runtime Hook | 已有单 Agent、显式串行 ReAct Runtime、固定 `RuntimeHookSet` | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、Hook 边界 |
+| 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Hook、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定 Hook 执行位；无 OS Sandbox、动态 Hook registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
+| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、BehaviorMode、PlanState、TaskState；无持久 Session、Memory、Context Compiler | RunState、Turn、Event、Context、Snapshot、Usage、Plan/Task、历史 |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配及 `/plan`、`/do`；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Plan/Task、Steering |
 
 ## current-status
 
