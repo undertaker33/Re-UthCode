@@ -14,7 +14,8 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
 - `[FACT]` 默认工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`。
 - `[FACT]` `AskUserQuestion` 是 Core 特殊工具协议：随 Turn 暴露给 Provider，但不进入普通 `ToolRegistry` 执行路径。
-- `[FACT]` `RuntimeHookSet` 为 Agent Loop 提供固定的 `before_tool_execution` 与 `before_completion` 两个生命周期点：前者执行 PLAN 只读策略，后者执行 Plan Review 与 unfinished-task completion block。
+- `[FACT]` `RuntimeHookSet` 为 Agent Loop 提供固定的 `before_tool_execution` 与 `before_completion` 两个生命周期点：前者执行 PLAN 只读策略，后者只执行 unfinished-task completion block；普通 PLAN final 正常完成。
+- `[FACT]` `ProposePlan` 是仅在 PLAN 可见的 Core 控制 Tool；必须独占 Provider ToolCall batch，合法调用创建/替换 `PlanState` 并进入 typed Plan Review，混合 batch 整批受控拒绝。
 - `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
@@ -50,7 +51,7 @@ AgentRun.start_turn(user_input)
      -> candidate final:
         -> usage accounting
         -> before_completion Hook
-           -> PLAN: PlanProposed -> PLAN_REVIEW_REQUIRED
+           -> ordinary PLAN final: normal completion
            -> unfinished TaskState: completion block + one-shot feedback
            -> accepted completion: TurnCompleted
      -> 有 ToolCall: ToolBatchStarted

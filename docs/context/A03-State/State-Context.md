@@ -39,7 +39,7 @@ explicit_absence: persistent session + memory + context compiler
 | `workdir/platform/date` | `ApplicationRuntimeContext` | Application | 只读属性 |
 | 当前 Provider/model ref | `UthCodeApplication` | Application；切换影响下一 Turn | `status`, model catalog |
 | Permission RuleSet | `PermissionEvaluator` | AgentRun 创建时快照 | 只暴露决策，不暴露可变规则 |
-| permission mode | `AgentRun` | 当前 Run | 只读属性 + `set_permission_mode` |
+| permission mode | `AgentRun` + `UthCodeApplication` | 当前 Run；安全默认值为用户配置偏好 | Run-local `set_permission_mode`；Application 默认仅允许 `default|auto` |
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |

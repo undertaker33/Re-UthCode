@@ -444,6 +444,40 @@ async def test_anthropic_same_identity_replays_native_history_and_other_identity
 
 
 @pytest.mark.asyncio
+async def test_anthropic_plan_revision_maps_tool_result_before_user_feedback() -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("make a plan"),)),
+            Message("assistant", (ToolCallPart("plan-1", "ProposePlan", {"plan": "v1"}),)),
+            Message("tool", (ToolResultPart("plan-1", '{"choice":"revise","revision":1}'),)),
+            Message("user", (TextPart("include verification"),)),
+        ),
+    )
+
+    messages = client.calls[-1]["messages"]
+    tool_use_index = next(
+        index
+        for index, message in enumerate(messages)
+        if any(block["type"] == "tool_use" for block in message["content"])
+    )
+    tool_result_index = next(
+        index
+        for index, message in enumerate(messages)
+        if any(block["type"] == "tool_result" for block in message["content"])
+    )
+    feedback_index = next(
+        index
+        for index, message in enumerate(messages)
+        if any(block.get("text") == "include verification" for block in message["content"])
+    )
+    assert tool_use_index < tool_result_index < feedback_index
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "events",
     [_events(include_stop=False), _events(include_tool=True)[:-2]],

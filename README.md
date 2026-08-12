@@ -147,7 +147,8 @@ uthcode --model my-provider/chat
 | `/model` | 打开模型选择器 |
 | `/model <model-ref>` | 切换下一次请求使用的模型 |
 | `/permission` | 打开当前 Run 的权限模式选择器 |
-| `/permission <default\|auto\|full_access>` | 切换当前 Run 的权限模式 |
+| `/permission default\|auto` | 修改当前 Run，并原子写入用户级下次启动默认值 |
+| `/permission full_access` | 仅修改当前 Run，不持久化 |
 | `/plan` | 将下一次 Turn 切换到 Plan Mode |
 | `/do` | 切换回默认执行模式 |
 | `/build` | `/do` 的别名 |
@@ -226,6 +227,7 @@ UthCode 会合并用户配置和项目配置：
 
 - `Bash` 使用当前操作系统用户的权限执行，是**未沙箱化的进程执行**。
 - 当前版本没有 OS Sandbox；Permission Approval 只是应用层授权，不能替代操作系统隔离。
+- 项目配置不能设置 `default_permission_mode`；该安全默认值只允许由用户配置保存为 `default` 或 `auto`。
 - 普通 Tool 依次经过可信参数预检、固定 Runtime Hook、Guard/Policy/Strategy 权限判断，再执行。高置信危险 Bash 行为在 `full_access` 下仍需确认。
 - Bash 只对可确定的命令和目录范围自动分类；无法确认的 effect/scope 会保守请求授权。
 - 工具仍受操作系统权限、工作目录与物理路径检查、参数校验和第三方服务权限约束。

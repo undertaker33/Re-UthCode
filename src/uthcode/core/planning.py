@@ -272,6 +272,29 @@ TODO_WRITE_TOOL_DEFINITION = ToolDefinition(
 )
 
 
+PROPOSE_PLAN_TOOL_DEFINITION = ToolDefinition(
+    name="ProposePlan",
+    description=(
+        "Submit a complete implementation plan for user review only when approval "
+        "should be followed by implementation in the same Turn."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"plan": {"type": "string", "minLength": 1}},
+        "required": ["plan"],
+        "additionalProperties": False,
+    },
+)
+
+
+def parse_propose_plan_arguments(arguments: Mapping[str, object]) -> str:
+    """Validate a ProposePlan payload and return its complete natural-language plan."""
+
+    payload = _as_mapping(arguments, "ProposePlan arguments")
+    _expect_keys(payload, {"plan"})
+    return _require_text(_required(payload, "plan"), "plan")
+
+
 def parse_todo_write_arguments(arguments: Mapping[str, object]) -> TaskState:
     """Validate a TodoWrite replace-all payload and return its immutable state."""
 
@@ -284,6 +307,7 @@ def parse_todo_write_arguments(arguments: Mapping[str, object]) -> TaskState:
 __all__ = [
     "BehaviorMode",
     "PlanState",
+    "PROPOSE_PLAN_TOOL_DEFINITION",
     "RuntimeFeedback",
     "RuntimeFeedbackKind",
     "TODO_WRITE_TOOL_DEFINITION",
@@ -291,4 +315,5 @@ __all__ = [
     "TaskState",
     "TaskStatus",
     "parse_todo_write_arguments",
+    "parse_propose_plan_arguments",
 ]

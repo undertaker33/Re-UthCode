@@ -121,6 +121,7 @@ class AgentRun:
         *,
         run_id: str | None,
         permission_evaluator: PermissionEvaluator | None = None,
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
     ) -> None:
         if permission_evaluator is not None and not isinstance(
             permission_evaluator, PermissionEvaluator
@@ -130,7 +131,9 @@ class AgentRun:
         self._state = RunState.initial(_new_identifier(run_id, "run_id"))
         self._active_turn: TurnHandle | None = None
         self._permission_evaluator = permission_evaluator or PermissionEvaluator()
-        self._permission_mode = PermissionMode.DEFAULT
+        if not isinstance(permission_mode, PermissionMode):
+            permission_mode = PermissionMode(permission_mode)
+        self._permission_mode = permission_mode
         self._session_grants: list[SessionGrant] = []
         self._behavior_mode = BehaviorMode.DEFAULT
 

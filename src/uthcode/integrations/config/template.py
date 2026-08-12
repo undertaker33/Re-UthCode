@@ -24,6 +24,7 @@ USER_CONFIG_TEMPLATE = """# UthCode user configuration
 # Every real Provider requires api_key_env. openai_compat also requires base_url.
 # The fake kind is only for explicit offline testing.
 #
+# default_permission_mode = \"default\" # allowed: default, auto
 # model = \"deepseek/chat\"
 #
 # [providers.deepseek]

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, TypeAlias
 
-from .interaction import PauseKind, PauseReason, PlanReviewRequest
 from .permission import Effect
 from .planning import (
     BehaviorMode,
@@ -138,23 +137,8 @@ class BeforeCompletionBlock:
                 raise ValueError(f"unknown hook reason: {self.reason!r}") from exc
 
 
-@dataclass(frozen=True, slots=True)
-class BeforeCompletionRequestPause:
-    kind: PauseKind
-    request: PlanReviewRequest
-    reason: PauseReason
-
-    def __post_init__(self) -> None:
-        if self.kind is not PauseKind.PLAN_REVIEW_REQUIRED:
-            raise ValueError("completion pause kind must be plan_review_required")
-        if not isinstance(self.request, PlanReviewRequest):
-            raise TypeError("request must be a PlanReviewRequest")
-        if self.reason is not PauseReason.PLAN_REVIEW_REQUIRED:
-            raise ValueError("completion pause reason must be plan_review_required")
-
-
 BeforeCompletionResult: TypeAlias = (
-    BeforeCompletionContinue | BeforeCompletionBlock | BeforeCompletionRequestPause
+    BeforeCompletionContinue | BeforeCompletionBlock
 )
 
 
@@ -241,7 +225,6 @@ class RuntimeHookSet:
                 (
                     BeforeCompletionContinue,
                     BeforeCompletionBlock,
-                    BeforeCompletionRequestPause,
                 ),
             ):
                 raise TypeError("before_completion hook returned an invalid result")
@@ -262,17 +245,6 @@ def plan_tool_policy(
             RuntimeHookReason.PLAN_READ_ONLY,
         )
     return BeforeToolExecutionContinue()
-
-
-def plan_completion_hook(context: BeforeCompletionContext) -> BeforeCompletionResult:
-    if context.behavior_mode is not BehaviorMode.PLAN:
-        return BeforeCompletionContinue()
-    revision = 1 if context.plan_state is None else context.plan_state.revision + 1
-    return BeforeCompletionRequestPause(
-        PauseKind.PLAN_REVIEW_REQUIRED,
-        PlanReviewRequest(revision, context.candidate_text),
-        PauseReason.PLAN_REVIEW_REQUIRED,
-    )
 
 
 def task_completion_hook(context: BeforeCompletionContext) -> BeforeCompletionResult:
@@ -296,7 +268,7 @@ def create_default_runtime_hooks() -> RuntimeHookSet:
 
     return RuntimeHookSet(
         before_tool_execution=(plan_tool_policy,),
-        before_completion=(plan_completion_hook, task_completion_hook),
+        before_completion=(task_completion_hook,),
     )
 
 
@@ -335,7 +307,6 @@ __all__ = [
     "BeforeCompletionContext",
     "BeforeCompletionContinue",
     "BeforeCompletionHook",
-    "BeforeCompletionRequestPause",
     "BeforeCompletionResult",
     "BeforeToolExecutionContext",
     "BeforeToolExecutionContinue",
@@ -346,7 +317,6 @@ __all__ = [
     "RuntimeHookSet",
     "compose_runtime_hooks",
     "create_default_runtime_hooks",
-    "plan_completion_hook",
     "plan_tool_policy",
     "task_completion_hook",
 ]

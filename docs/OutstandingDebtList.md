@@ -18,7 +18,6 @@
 | **T07 Permission** | Permission `ALLOW` 之后可以进一步受 OS 级执行隔离约束；Permission 不再承担其无法提供的安全边界 | OS Sandbox 开始实施，或出现不可信本地执行主体 |
 | **T08 Todo / Plan** | Todo / Plan 可以跨 Turn 延续，并定义何时继续使用、何时更新、何时失效，而不是每个新 Turn 直接重新开始 | Context Engineering 开始实施，能够明确跨 Turn 状态与上下文的关系 |
 | **T08 Todo / Plan** | Context Compaction 后仍能保留并恢复长期任务的有效 Todo / Plan 状态 | Structured Compaction 开始实施 |
-| **T08 Plan Mode / Plan Review** | 将 PLAN 的只读安全边界与“正式提交待审批实施 Plan”解耦：普通只读问答、文件定位、代码解释和调查结论可以正常完成；只有模型通过显式 Plan 提交协议表达实施意图时才创建或替换 `PlanState` 并进入 Plan Review。当前实现把任意 PLAN completion 都强制解释为 Plan proposal，尚无表达“只读回答但不申请实施”的控制协议 | 下一次修订 Plan Mode / Plan Review 产品语义时回补；届时需定义 Provider 无关的显式 Plan 提交协议，并保持 PLAN 只读 Hook、typed review、revision 校验及批准后同 Turn 切换到 DEFAULT 的现有控制边界 |
 | **T08 Runtime Hook** | 在现有两个固定 Hook Point 无法满足真实能力后，再扩充新的 Hook 生命周期点或配置能力 | 出现 Skill、MCP、Subagent 或其他**确实无法由现有 Hook 表达**的真实调用方 |
 
 ## 维护原则

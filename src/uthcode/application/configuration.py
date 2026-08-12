@@ -15,6 +15,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from uthcode.core.permission import PermissionMode
+
 
 class ConfigurationModelError(ValueError):
     """Raised when an Application configuration value is invalid."""
@@ -188,9 +190,19 @@ class EffectiveConfig:
     providers: Mapping[str, ProviderProfile]
     models: Mapping[str, ModelProfile]
     sources: tuple[ConfigSource, ...] = ()
+    default_permission_mode: PermissionMode = PermissionMode.DEFAULT
 
     def __post_init__(self) -> None:
         _require_text(self.model, "model")
+        mode = self.default_permission_mode
+        if not isinstance(mode, PermissionMode):
+            try:
+                mode = PermissionMode(mode)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationModelError("unknown default_permission_mode") from exc
+        if mode is PermissionMode.FULL_ACCESS:
+            raise ConfigurationModelError("default_permission_mode cannot be full_access")
+        object.__setattr__(self, "default_permission_mode", mode)
         if not isinstance(self.providers, Mapping):
             raise TypeError("providers must be a mapping")
         if not isinstance(self.models, Mapping):
@@ -274,7 +286,7 @@ class EffectiveConfig:
         if not isinstance(value, Mapping):
             raise TypeError("EffectiveConfig requires a mapping")
         unsupported = [
-            key for key in value if key not in {"model", "providers", "models"}
+            key for key in value if key not in {"model", "providers", "models", "default_permission_mode"}
         ]
         if unsupported:
             raise ConfigurationModelError(
@@ -288,6 +300,7 @@ class EffectiveConfig:
             providers=value.get("providers", {}),
             models=value.get("models", {}),
             sources=tuple(sources),
+            default_permission_mode=value.get("default_permission_mode", "default"),
         )
 
     @classmethod

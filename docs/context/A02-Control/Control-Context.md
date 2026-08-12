@@ -11,11 +11,11 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 ## 当前结论
 
 - `[FACT]` 已实现三段权限决策：`Guard -> Policy -> Strategy`，并支持 Run-local `SessionGrant`。
-- `[FACT]` 已实现 `default`、`auto`、`full_access` 三种 Run-local 权限模式。
+- `[FACT]` 已实现 `default`、`auto`、`full_access` 三种 Run-local 权限模式；用户配置可持久化安全默认值 `default|auto`，`full_access` 仍仅当前 Run 有效。
 - `[FACT]` 已实现五类 typed pause：`USER_REQUESTED`、`USER_INPUT_REQUIRED`、`PROVIDER_UNAVAILABLE`、`PERMISSION_REQUIRED`、`PLAN_REVIEW_REQUIRED`。
 - `[FACT]` 暂停/恢复保持同一个 `AgentTurnExecution`、同一个 `TurnHandle` 和同一个事件流，不创建替代 Turn。
 - `[FACT]` 取消优先于待处理的恢复或审批响应；取消幂等。
-- `[FACT]` 固定 `RuntimeHookSet` 在 trusted preflight 与 Permission 之间执行 PLAN 只读 Hook，并在 usage accounting 后执行 Plan Review/unfinished-task completion Hook。
+- `[FACT]` 固定 `RuntimeHookSet` 在 trusted preflight 与 Permission 之间执行 PLAN 只读 Hook，并在 usage accounting 后执行 unfinished-task completion Hook；Plan Review 只由合法 `ProposePlan` 控制 ToolCall 触发。
 - `[FACT]` Plan Review 使用现有 typed pause/resume，TodoWrite 与同一 Turn Steering 使用同一 Core execution 边界；不创建第二个控制 Runtime。
 - `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。
 - `[ABSENT]` 当前没有 OS Sandbox、动态 Hook registry、第三方 Hook plugin 生命周期或可热插拔 Hook。
@@ -84,9 +84,11 @@ running segment
        PreparedToolCall 保留但不执行 -> PermissionApprovalResponse
        ONCE/SESSION 执行一次；REJECT 生成受控 Tool error
   -> PLAN_REVIEW_REQUIRED:
-       candidate final -> PlanReviewRequest
+       ProposePlan ToolCall -> Core 创建 PlanState -> PlanReviewRequest
        APPROVE -> PlanState.approved + PLAN -> DEFAULT
-       REVISE -> Core 写入真实 role=user Message + one-shot revision feedback，保持 PLAN 后重新请求 Provider
+       REVISE -> ToolFinished -> role=tool Message -> ToolBatchFinished
+              -> 追加真实 role=user Message + one-shot revision feedback
+              -> 保持 PLAN，在同一 Turn 重新请求 Provider
        Cancel -> cancellation wins -> TurnCancelled
 
 任意 pending pause

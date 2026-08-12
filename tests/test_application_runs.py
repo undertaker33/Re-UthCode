@@ -28,6 +28,7 @@ from uthcode.application import (
 from uthcode.core.agent_events import (
     AssistantMessageDelta,
     AssistantMessageCompleted,
+    AssistantMessageKind,
     BehaviorModeChanged,
     CompletionBlocked,
     IterationStarted,
@@ -63,7 +64,12 @@ from uthcode.core.interaction import (
     UserInputResponse,
     UserQuestion,
 )
-from uthcode.core.planning import BehaviorMode, RuntimeFeedbackKind, TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.planning import (
+    BehaviorMode,
+    PROPOSE_PLAN_TOOL_DEFINITION,
+    RuntimeFeedbackKind,
+    TODO_WRITE_TOOL_DEFINITION,
+)
 from uthcode.core.permission import (
     Effect,
     PermissionAction,
@@ -1291,9 +1297,10 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
         "ReadFile",
         "Glob",
         "Grep",
-        "Bash",
-        "AskUserQuestion",
-    ]
+            "Bash",
+            "AskUserQuestion",
+            "ProposePlan",
+        ]
     assert [item.name for item in provider.requests[1].tools] == [
         "ReadFile",
         "WriteFile",
@@ -1314,8 +1321,8 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
 ) -> None:
     provider = _ScriptedProvider(
         (
-            (TextDelta("plan v1 delta"), _response(TextPart("Plan v1"), usage=Usage(1, 1))),
-            (TextDelta("plan v2 delta"), _response(TextPart("Plan v2"), usage=Usage(2, 2))),
+            (_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS, usage=Usage(1, 1)),),
+            (_response(ToolCallPart("plan-2", "ProposePlan", {"plan": "Plan v2"}), finish_reason=FinishReason.TOOL_CALLS, usage=Usage(2, 2)),),
             (_response(TextPart("implemented"), usage=Usage(3, 3)),),
         )
     )
@@ -1338,6 +1345,7 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
                 if not resumed_states:
                     assert state.messages[-1].role == "user"
                     assert state.messages[-1].parts == (TextPart("include verification"),)
+                    assert [message.role for message in state.messages[-2:]] == ["tool", "user"]
                     assert state.runtime_feedback is not None
                     assert state.runtime_feedback.kind is RuntimeFeedbackKind.PLAN_REVISION
                 else:
@@ -1410,7 +1418,11 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
     assert len(resumed_states) == 2
     assert sum(isinstance(event, TurnStarted) for event in events) == 1
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
-    assert sum(isinstance(event, AssistantMessageCompleted) for event in events) == 1
+    assert sum(
+        isinstance(event, AssistantMessageCompleted)
+        and event.kind is AssistantMessageKind.FINAL
+        for event in events
+    ) == 1
     assert not any(
         isinstance(event, AssistantMessageDelta) and "plan" in event.text
         for event in events
@@ -1432,7 +1444,7 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
 
 @pytest.mark.asyncio
 async def test_t08_application_cancel_wins_while_plan_review_is_pending(tmp_path: Path) -> None:
-    provider = _ScriptedProvider(((_response(TextPart("Plan v1")),),))
+    provider = _ScriptedProvider(((_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS),),))
     application = create_application(
         _config(),
         provider_builder=lambda _provider, _model: provider,
@@ -1576,7 +1588,12 @@ async def test_t08_application_steering_interrupts_provider_and_cleans_coordinat
 async def test_t08_application_plan_generation_accepts_steering_but_review_pause_does_not(
     tmp_path: Path,
 ) -> None:
-    provider = _StreamingGatedProvider(_response(TextPart("Plan after steering")))
+    provider = _StreamingGatedProvider(
+        _response(
+            ToolCallPart("plan-steered", "ProposePlan", {"plan": "Plan after steering"}),
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
+    )
     application = create_application(
         _config(),
         provider_builder=lambda _provider, _model: provider,
@@ -1608,6 +1625,7 @@ async def test_t08_application_plan_generation_accepts_steering_but_review_pause
         "Grep",
         "Bash",
         "AskUserQuestion",
+        "ProposePlan",
     ]
     assert "一次性运行反馈类型：user_steering" in (
         provider.requests[1].system_prompt or ""
@@ -1630,7 +1648,7 @@ async def test_t08_plan_approval_updates_active_run_and_next_turn_keeps_default_
     ask_request = UserInputRequest((question,))
     provider = _ScriptedProvider(
         (
-            (_response(TextPart("Plan v1")),),
+            (_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS),),
             (
                 _response(
                     ToolCallPart(
@@ -1726,7 +1744,7 @@ async def test_t08_approved_plan_todo_state_survives_typed_pause_then_resets_nex
     ask_request = UserInputRequest((question,))
     provider = _ScriptedProvider(
         (
-            (_response(TextPart("Plan v1")),),
+            (_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS),),
             (
                 _response(
                     ToolCallPart("todo-pending", "TodoWrite", pending_todo),
@@ -2013,7 +2031,7 @@ async def test_t08_plan_approve_applies_default_before_resumed_is_public(
 ) -> None:
     provider = _ScriptedProvider(
         (
-            (_response(TextPart("Plan v1")),),
+            (_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS),),
             (_response(TextPart("implemented")),),
         )
     )
@@ -2058,7 +2076,7 @@ async def test_t08_plan_approve_applies_default_before_resumed_is_public(
 async def test_t08_plan_approve_then_cancel_is_cancel_wins_without_resumed(
     tmp_path: Path,
 ) -> None:
-    provider = _ScriptedProvider(((_response(TextPart("Plan v1")),),))
+    provider = _ScriptedProvider(((_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS),),))
     application = create_application(
         _config(),
         provider_builder=lambda _provider, _model: provider,

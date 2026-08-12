@@ -9,14 +9,46 @@ from jsonschema import Draft202012Validator
 from uthcode.core.planning import (
     BehaviorMode,
     PlanState,
+    PROPOSE_PLAN_TOOL_DEFINITION,
     RuntimeFeedback,
     RuntimeFeedbackKind,
     TODO_WRITE_TOOL_DEFINITION,
     TaskItem,
     TaskState,
     TaskStatus,
+    parse_propose_plan_arguments,
     parse_todo_write_arguments,
 )
+
+
+def test_propose_plan_definition_is_strict_and_parser_accepts_only_non_empty_plan() -> None:
+    definition = PROPOSE_PLAN_TOOL_DEFINITION
+    schema = definition.to_dict()["parameters"]
+
+    assert definition.name == "ProposePlan"
+    assert definition.parameters["additionalProperties"] is False
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"plan": "Inspect, implement, and verify."})
+    assert not validator.is_valid({"plan": ""})
+    assert not validator.is_valid({"plan": "valid", "revision": 2})
+    assert parse_propose_plan_arguments({"plan": "  keep exact text  "}) == "  keep exact text  "
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {},
+        {"plan": "x", "unexpected": True},
+        {"plan": ""},
+        {"plan": "   "},
+        {"plan": None},
+        {"plan": 1},
+    ),
+)
+def test_propose_plan_parser_rejects_invalid_arguments(payload: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        parse_propose_plan_arguments(payload)  # type: ignore[arg-type]
 
 
 def test_planning_enums_are_exact_and_json_safe() -> None:

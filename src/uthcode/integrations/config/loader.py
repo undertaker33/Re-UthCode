@@ -47,7 +47,7 @@ class ConfigurationInitializationRequired(ConfigurationError):
         )
 
 
-_ROOT_FIELDS = frozenset({"model", "providers", "models"})
+_ROOT_FIELDS = frozenset({"model", "providers", "models", "default_permission_mode"})
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key_env"})
 _MODEL_FIELDS = frozenset({"provider", "model", "label", "max_output_tokens"})
 _SUPPORTED_PROVIDER_KINDS = frozenset(
@@ -262,6 +262,12 @@ def _check_fields(
 
 
 def _validate_root(mapping: Mapping[str, Any], *, path: Path, project: bool) -> None:
+    if project and "default_permission_mode" in mapping:
+        raise ConfigurationError(
+            "project configuration cannot define default_permission_mode",
+            path=path,
+            field="default_permission_mode",
+        )
     for key in mapping:
         if key in _ROOT_FIELDS:
             continue
@@ -489,6 +495,13 @@ def load_config_data(
     if not user_mapping:
         raise ConfigurationInitializationRequired(user_path)
     _validate_user_mapping(user_mapping, path=user_path)
+    default_permission_mode = user_mapping.get("default_permission_mode", "default")
+    if default_permission_mode not in {"default", "auto"}:
+        raise ConfigurationError(
+            "default_permission_mode must be default or auto",
+            path=user_path,
+            field="default_permission_mode",
+        )
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
     selected_ref = user_mapping.get("model")
@@ -517,6 +530,7 @@ def load_config_data(
         providers=providers,
         models=_model_profiles(models, path=user_path),
         sources=tuple(sources),
+        default_permission_mode=default_permission_mode,
     )
 
 

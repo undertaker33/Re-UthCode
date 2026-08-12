@@ -17,7 +17,7 @@ from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.hooks import RuntimeHookSet
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
-from uthcode.core.planning import TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.planning import PROPOSE_PLAN_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
 
@@ -164,11 +164,12 @@ class ApplicationToolService:
         reserved_names = {
             ASK_USER_TOOL_DEFINITION.name,
             TODO_WRITE_TOOL_DEFINITION.name,
+            PROPOSE_PLAN_TOOL_DEFINITION.name,
         }
         if any(tool.definition.name in reserved_names for tool in tool_values):
             raise ValueError(
                 "AskUserQuestion is reserved for the Application Agent path; "
-                "TodoWrite is reserved for the Core Agent path"
+                "TodoWrite and ProposePlan are reserved for the Core Agent path"
             )
         self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)

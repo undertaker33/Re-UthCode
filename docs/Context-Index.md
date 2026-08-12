@@ -72,6 +72,7 @@ status_values:
 | T06 | 暂停恢复与询问用户 | `docs/work/archive/T06-暂停恢复与询问用户/` |
 | T07 | 三层权限系统 | `docs/work/archive/T07-三层权限系统/` |
 | T08 | 任务规划与执行控制 | `docs/work/archive/T08-任务规划与执行控制/` |
+| T08-1 | 阶段一扫尾 | `docs/work/archive/T08-1-阶段一扫尾/` |
 
 ### `implemented_unarchived`
 
@@ -105,6 +106,6 @@ interfaces/cli.py 或 interfaces/tui/app.py
 - `[ABSENT]` LangGraph、LangChain Agent、图/DAG/工作流 DSL。
 - `[ABSENT]` OS Sandbox；`Bash` 是当前用户权限下的未沙箱化进程执行。
 - `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩。
-- `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与完成前 Plan Review/unfinished-task 阻断；不提供动态注册。
+- `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与 unfinished-task 完成阻断；普通 PLAN final 正常完成，正式 Plan Review 仅由 `ProposePlan` 控制 ToolCall 触发；不提供动态注册。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。

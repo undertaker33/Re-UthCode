@@ -341,6 +341,37 @@ async def test_chat_nullable_usage_is_normalized_and_history_uses_chat_shapes() 
 
 
 @pytest.mark.asyncio
+async def test_chat_plan_revision_maps_tool_message_before_user_feedback() -> None:
+    client = _OpenAICompatClient(_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("make a plan"),)),
+            Message("assistant", (ToolCallPart("plan-1", "ProposePlan", {"plan": "v1"}),)),
+            Message("tool", (ToolResultPart("plan-1", '{"choice":"revise","revision":1}'),)),
+            Message("user", (TextPart("include verification"),)),
+        ),
+    )
+
+    messages = client.calls[-1]["messages"]
+    tool_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "tool" and message.get("tool_call_id") == "plan-1"
+    )
+    feedback_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message == {"role": "user", "content": "include verification"}
+    )
+    assert tool_index < feedback_index
+
+
+@pytest.mark.asyncio
 async def test_chat_cross_identity_native_items_are_ignored_and_standard_parts_remain() -> None:
     client = _OpenAICompatClient(_chunks())
     provider = build_openai_compat_provider(

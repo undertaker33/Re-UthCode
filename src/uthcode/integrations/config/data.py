@@ -68,10 +68,13 @@ class LoadedConfigData:
     providers: Mapping[str, Mapping[str, object]]
     models: Mapping[str, Mapping[str, object]]
     sources: tuple[LoadedConfigSource, ...]
+    default_permission_mode: str = "default"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must be a non-empty string")
+        if self.default_permission_mode not in {"default", "auto"}:
+            raise ValueError("default_permission_mode must be default or auto")
         object.__setattr__(
             self,
             "providers",

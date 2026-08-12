@@ -207,6 +207,32 @@ def test_permission_command_uses_the_same_registry_and_returns_session_action() 
     assert registry.resolve("permission") is not None
 
 
+def test_permission_command_persists_safe_default_before_returning_run_action() -> None:
+    application, _writes = _application()
+    persisted: list[PermissionMode] = []
+    application._permission_writer = persisted.append
+    dispatcher = CommandDispatcher(create_builtin_registry(), application)
+
+    selected = dispatcher.dispatch_text("/permission auto")
+
+    assert selected is not None and selected.ui_action == PermissionModeSelected(PermissionMode.AUTO)
+    assert persisted == [PermissionMode.AUTO]
+    assert application.default_permission_mode is PermissionMode.AUTO
+    assert application.create_run().permission_mode is PermissionMode.AUTO
+
+
+def test_permission_command_write_failure_leaves_application_default_unchanged() -> None:
+    application, _writes = _application()
+    application._permission_writer = lambda _mode: (_ for _ in ()).throw(OSError("no"))
+    dispatcher = CommandDispatcher(create_builtin_registry(), application)
+
+    outcome = dispatcher.dispatch_text("/permission auto")
+
+    assert outcome is not None and outcome.status is OutcomeStatus.EXECUTION_ERROR
+    assert application.default_permission_mode is PermissionMode.DEFAULT
+    assert application.create_run().permission_mode is PermissionMode.DEFAULT
+
+
 def test_behavior_mode_commands_return_interface_neutral_actions_and_build_is_alias() -> None:
     registry = create_builtin_registry()
     dispatcher = CommandDispatcher(registry)

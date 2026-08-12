@@ -11,7 +11,6 @@ from uthcode.core.hooks import (
     BeforeCompletionBlock,
     BeforeCompletionContext,
     BeforeCompletionContinue,
-    BeforeCompletionRequestPause,
     BeforeToolExecutionContext,
     BeforeToolExecutionContinue,
     BeforeToolExecutionReject,
@@ -19,11 +18,9 @@ from uthcode.core.hooks import (
     RuntimeHookSet,
     compose_runtime_hooks,
     create_default_runtime_hooks,
-    plan_completion_hook,
     plan_tool_policy,
     task_completion_hook,
 )
-from uthcode.core.interaction import PauseKind, PauseReason, PlanReviewRequest
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.planning import (
     BehaviorMode,
@@ -229,14 +226,11 @@ def test_plan_tool_policy_rejects_every_non_read_effect(effect: Effect) -> None:
     assert "project/item" not in result.error_text
 
 
-def test_plan_completion_precedes_task_completion_in_default_hook_set() -> None:
+def test_default_hook_set_keeps_plan_read_only_and_only_task_completion_gate() -> None:
     hook_set = create_default_runtime_hooks()
 
     assert hook_set.before_tool_execution == (plan_tool_policy,)
-    assert hook_set.before_completion == (
-        plan_completion_hook,
-        task_completion_hook,
-    )
+    assert hook_set.before_completion == (task_completion_hook,)
 
     plan_result = hook_set.run_before_completion(
         _completion_context(
@@ -245,10 +239,7 @@ def test_plan_completion_precedes_task_completion_in_default_hook_set() -> None:
             plan_state=PlanState(1, "Old plan", False),
         )
     )
-    assert isinstance(plan_result, BeforeCompletionRequestPause)
-    assert plan_result.kind is PauseKind.PLAN_REVIEW_REQUIRED
-    assert plan_result.reason is PauseReason.PLAN_REVIEW_REQUIRED
-    assert plan_result.request == PlanReviewRequest(2, "Candidate final")
+    assert isinstance(plan_result, BeforeCompletionContinue)
 
 
 def test_task_completion_blocks_only_default_with_unfinished_items() -> None:

@@ -11,7 +11,47 @@ from uthcode.integrations.config.loader import (
     discover_config_paths,
     load_config_data,
 )
-from uthcode.integrations.config.writer import write_user_model
+from uthcode.integrations.config.writer import (
+    write_user_default_permission_mode,
+    write_user_model,
+)
+
+
+def test_user_permission_default_loads_writes_and_rejects_unsafe_values(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '# keep\ndefault_permission_mode = "auto"\nmodel = "local/ref"\n'
+        '[providers.local]\nkind = "fake"\n'
+        '[models."local/ref"]\nprovider = "local"\nmodel = "fake"\n',
+        encoding="utf-8",
+    )
+
+    assert load_config_data(cwd=tmp_path, home=home).default_permission_mode == "auto"
+    write_user_default_permission_mode(user, "default")
+    rendered = user.read_text(encoding="utf-8")
+    assert '# keep' in rendered
+    assert 'default_permission_mode = "default"' in rendered
+    with pytest.raises(ValueError):
+        write_user_default_permission_mode(user, "full_access")
+
+
+def test_project_permission_default_is_rejected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        'model = "local/ref"\n[providers.local]\nkind = "fake"\n'
+        '[models."local/ref"]\nprovider = "local"\nmodel = "fake"\n',
+        encoding="utf-8",
+    )
+    project = tmp_path / ".uthcode" / "config.toml"
+    project.parent.mkdir()
+    project.write_text('default_permission_mode = "auto"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="default_permission_mode"):
+        load_config_data(cwd=tmp_path, home=home)
 
 
 def _write_user_config(home: Path, *, model: str = "base/ref") -> Path:

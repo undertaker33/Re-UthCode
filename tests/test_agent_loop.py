@@ -101,6 +101,7 @@ from uthcode.core.permission import (
 )
 from uthcode.core.planning import (
     BehaviorMode,
+    PROPOSE_PLAN_TOOL_DEFINITION,
     TODO_WRITE_TOOL_DEFINITION,
     RuntimeFeedbackKind,
     TaskItem,
@@ -712,8 +713,8 @@ async def test_steering_feedback_survives_async_preparer_pause_until_real_provid
 async def test_plan_revision_feedback_survives_async_preparer_pause_until_real_provider_attempt() -> None:
     provider = ScriptedProvider(
         [
-            [_response(TextPart("Plan v1"))],
-            [_response(TextPart("Plan v2"))],
+            [_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(ToolCallPart("plan-2", "ProposePlan", {"plan": "Plan v2"}), finish_reason=FinishReason.TOOL_CALLS)],
             [_response(TextPart("implemented"))],
         ]
     )
@@ -741,6 +742,7 @@ async def test_plan_revision_feedback_survives_async_preparer_pause_until_real_p
         "make a plan",
         turn_id="turn-1",
         behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=(PROPOSE_PLAN_TOOL_DEFINITION,),
     )
     first = await execution.run_segment(pause_signal=CancellationToken())
     assert first.paused and first.continuation is not None
@@ -1344,12 +1346,9 @@ async def test_t08_dynamic_tool_view_uses_mode_and_structured_runtime_context() 
 
     segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    assert segment.paused
-    assert segment.continuation is not None
-    assert segment.continuation.pending_pause is not None
-    assert segment.continuation.pending_pause.kind is PauseKind.PLAN_REVIEW_REQUIRED
-    assert any(isinstance(event, PlanProposed) for event in segment.events)
-    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+    assert segment.terminal
+    assert not any(isinstance(event, PlanProposed) for event in segment.events)
+    assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
     assert captured[0][0] == ("Read", "AskUserQuestion")
     assert captured[0][1].behavior_mode is BehaviorMode.PLAN
     assert captured[0][1].task_state.is_empty
@@ -1415,10 +1414,7 @@ async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
 
     segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    assert segment.paused
-    assert segment.continuation is not None
-    assert segment.continuation.pending_pause is not None
-    assert segment.continuation.pending_pause.kind is PauseKind.PLAN_REVIEW_REQUIRED
+    assert segment.terminal
     tool_messages = [message for message in execution.state.messages if message.role == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0].parts == (
@@ -1427,12 +1423,12 @@ async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
     assert trace == ["preflight"]
     assert permission_calls == []
     assert custom_calls == []
-    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+    assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hook_shape", ("omitted", "empty", "custom_only"))
-async def test_t08_plan_candidate_final_is_review_for_every_public_hook_shape(
+async def test_t08_plan_ordinary_final_completes_for_every_public_hook_shape(
     hook_shape: str,
 ) -> None:
     provider = ScriptedProvider([[_response(TextPart("candidate"))]])
@@ -1467,13 +1463,11 @@ async def test_t08_plan_candidate_final_is_review_for_every_public_hook_shape(
 
     segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    assert segment.paused
-    assert segment.continuation is not None
-    assert segment.continuation.pending_pause is not None
-    assert segment.continuation.pending_pause.kind is PauseKind.PLAN_REVIEW_REQUIRED
-    assert any(isinstance(event, PlanProposed) for event in segment.events)
-    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
-    assert custom_calls == []
+    assert segment.terminal and segment.result is not None
+    assert segment.result.final_text == "candidate"
+    assert not any(isinstance(event, PlanProposed) for event in segment.events)
+    assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
+    assert custom_calls == (["custom"] if hook_shape == "custom_only" else [])
 
 
 @pytest.mark.asyncio
@@ -1559,10 +1553,7 @@ async def test_t08_plan_non_read_and_todo_calls_fail_closed_before_permission() 
 
     segment = await execution.run_segment(pause_signal=CancellationToken())
 
-    assert segment.paused
-    assert segment.continuation is not None
-    assert segment.continuation.pending_pause is not None
-    assert segment.continuation.pending_pause.kind is PauseKind.PLAN_REVIEW_REQUIRED
+    assert segment.terminal
     assert trace == ["preflight"]
     assert permission_calls == []
     assert provider.requests[1].messages[-1].parts == (
@@ -1576,14 +1567,53 @@ async def test_t08_plan_non_read_and_todo_calls_fail_closed_before_permission() 
 
 
 @pytest.mark.asyncio
+async def test_propose_plan_mixed_batch_rejects_every_call_without_side_effects() -> None:
+    trace: list[str] = []
+    read = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY, trace)
+    registry = ToolRegistry((read,))
+    provider = ScriptedProvider(
+        [
+            [_response(
+                ToolCallPart("plan-1", "ProposePlan", {"plan": "Do it"}),
+                ToolCallPart("read-1", "Read", {"value": "must not run"}),
+                finish_reason=FinishReason.TOOL_CALLS,
+            )],
+            [_response(TextPart("closed"))],
+        ]
+    )
+    loop = AgentLoop(
+        provider,
+        registry,
+        ToolExecutor(registry),
+        lambda messages, definitions, runtime_context: GenerationRequest(messages=messages, tools=definitions),
+        permission_resolver=lambda action: PermissionEvaluator().evaluate(action, mode=PermissionMode.FULL_ACCESS),
+    )
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=registry.definitions() + (PROPOSE_PLAN_TOOL_DEFINITION,),
+    )
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and execution.state.plan_state is None
+    assert trace == []
+    tool_message = [message for message in execution.state.messages if message.role == "tool"][0]
+    assert [part.tool_call_id for part in tool_message.parts] == ["plan-1", "read-1"]
+    assert all(part.is_error for part in tool_message.parts)
+
+
+@pytest.mark.asyncio
 async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_only_final() -> None:
     read = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY)
     write = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.HIDDEN)
     registry = ToolRegistry((read, write))
     provider = ScriptedProvider(
         [
-            [TextDelta("plan stream v1"), _response(TextPart("Plan v1"), usage=Usage(1, 2))],
-            [TextDelta("plan stream v2"), _response(TextPart("Plan v2"), usage=Usage(3, 4))],
+            [_response(ToolCallPart("plan-1", "ProposePlan", {"plan": "Plan v1"}), finish_reason=FinishReason.TOOL_CALLS, usage=Usage(1, 2))],
+            [_response(ToolCallPart("plan-2", "ProposePlan", {"plan": "Plan v2"}), finish_reason=FinishReason.TOOL_CALLS, usage=Usage(3, 4))],
             [_response(TextPart("implemented"), usage=Usage(5, 6))],
         ]
     )
@@ -1611,7 +1641,7 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
         turn_id="turn-1",
         behavior_mode=BehaviorMode.PLAN,
         tool_definitions=registry.definitions()
-        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION, PROPOSE_PLAN_TOOL_DEFINITION),
     )
 
     first = await execution.run_segment(pause_signal=CancellationToken())
@@ -1626,9 +1656,11 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
         "text": "Plan v1",
         "approved": False,
     }
-    assert [message.role for message in execution.state.messages] == ["user"]
+    assert [message.role for message in execution.state.messages] == ["user", "assistant"]
+    assert not any(isinstance(event, (AssistantMessageDelta, TurnCompleted)) for event in first.events)
     assert not any(
-        isinstance(event, (AssistantMessageDelta, AssistantMessageCompleted, TurnCompleted))
+        isinstance(event, AssistantMessageCompleted)
+        and event.kind is AssistantMessageKind.FINAL
         for event in first.events
     )
     assert [(event.revision, event.plan_text) for event in first.events if isinstance(event, PlanProposed)] == [
@@ -1666,10 +1698,36 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
     assert pause_v2.plan_review_request.revision == 2
     assert execution.state.plan_state is not None
     assert execution.state.plan_state.text == "Plan v2"
-    assert [message.role for message in execution.state.messages] == ["user", "user"]
-    assert execution.state.messages[-1].parts == (TextPart("cover tests too"),)
+    assert [message.role for message in execution.state.messages] == [
+        "user", "assistant", "tool", "user", "assistant"
+    ]
+    assert execution.state.messages[3].parts == (TextPart("cover tests too"),)
+    revise_results = [
+        part
+        for message in execution.state.messages
+        if message.role == "tool"
+        for part in message.parts
+        if isinstance(part, ToolResultPart) and part.tool_call_id == "plan-1"
+    ]
+    assert len(revise_results) == 1
+    tool_finished_index = next(
+        index
+        for index, event in enumerate(second.events)
+        if isinstance(event, ToolFinished) and event.tool_call_id == "plan-1"
+    )
+    batch_finished_index = next(
+        index for index, event in enumerate(second.events) if isinstance(event, ToolBatchFinished)
+    )
+    iteration_started_index = next(
+        index
+        for index, event in enumerate(second.events)
+        if isinstance(event, IterationStarted) and event.iteration == 2
+    )
+    assert tool_finished_index < batch_finished_index < iteration_started_index
+    assert not any(isinstance(event, (AssistantMessageDelta, TurnCompleted)) for event in second.events)
     assert not any(
-        isinstance(event, (AssistantMessageDelta, AssistantMessageCompleted, TurnCompleted))
+        isinstance(event, AssistantMessageCompleted)
+        and event.kind is AssistantMessageKind.FINAL
         for event in second.events
     )
 
@@ -1691,17 +1749,19 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
     assert execution.state.usage == Usage(9, 12)
     assert execution.state.behavior_mode is BehaviorMode.DEFAULT
     assert execution.state.plan_state is not None and execution.state.plan_state.approved
-    assert [message.role for message in execution.state.messages] == ["user", "user", "assistant"]
+    assert execution.state.messages[-1].role == "assistant"
     assert [item.behavior_mode for item in third.events if isinstance(item, BehaviorModeChanged)] == [
         BehaviorMode.DEFAULT
     ]
     assert [item[0] for item in captured] == [
-        ("Read", "AskUserQuestion"),
-        ("Read", "AskUserQuestion"),
+        ("Read", "AskUserQuestion", "ProposePlan"),
+        ("Read", "AskUserQuestion", "ProposePlan"),
         ("Read", "Write", "AskUserQuestion", "TodoWrite"),
     ]
     assert captured[1][1].one_shot_feedback is not None
     assert captured[1][1].one_shot_feedback.text == "cover tests too"
+    assert captured[1][1].behavior_mode is BehaviorMode.PLAN
+    assert captured[1][0][-1] == "ProposePlan"
     assert captured[2][1].plan_state is not None and captured[2][1].plan_state.approved
 
 

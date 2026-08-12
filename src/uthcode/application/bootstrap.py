@@ -112,11 +112,26 @@ def _default_writer(configuration: EffectiveConfig) -> ModelWriter | None:
     return write
 
 
+def _default_permission_writer(configuration: EffectiveConfig):
+    user_sources = tuple(
+        source for source in configuration.sources
+        if source.kind == "user" and source.path is not None
+    )
+    if not user_sources:
+        return None
+    path = user_sources[0].path
+    assert path is not None
+    writer_module = import_module("uthcode.integrations.config.writer")
+    writer = writer_module.write_user_default_permission_mode
+    return lambda mode: writer(path, mode.value)
+
+
 def create_application(
     config: EffectiveConfig,
     *,
     provider_builder: ProviderBuilder | None = None,
     model_writer: ModelWriter | None = None,
+    permission_writer=None,
     runtime_context: ApplicationRuntimeContext | None = None,
     tools: Sequence[Tool] | None = None,
 ) -> UthCodeApplication:
@@ -150,6 +165,7 @@ def create_application(
         configuration=config,
         provider_builder=builder,
         model_writer=writer,
+        permission_writer=(permission_writer if permission_writer is not None else _default_permission_writer(config)),
         runtime_context=runtime_context,
         tool_service=ApplicationToolService(
             tool_values,
@@ -170,6 +186,7 @@ def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
                 "model": data.model,
                 "providers": data.providers,
                 "models": data.models,
+                "default_permission_mode": data.default_permission_mode,
             },
             sources=sources,
         )

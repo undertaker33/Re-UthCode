@@ -118,7 +118,9 @@ def build_runtime_prompt_section(context: RuntimePromptContext) -> PromptSection
         lines = [
             "- 当前行为模式：PLAN（规划模式）。",
             "- 只研究、澄清和设计；不得实施修改。可使用当前可见的只读工具探索事实，必要时使用 AskUserQuestion。",
-            "- final 必须是一份完整、可独立审阅的自然语言 Plan；用户要求 REVISE 后必须给出完整替代版。",
+            "- 普通只读问答、调查、解释、定位或只交付 Plan 文本时使用普通 final 直接完成，不进入 Plan Review。",
+            "- 只有提交一份获批后要在同一 Turn 立即实施的完整方案时，才调用 ProposePlan；不得用普通 final 冒充正式提交。",
+            "- 用户要求 REVISE 后，ProposePlan 必须提交完整替代版；revision 由 Core 计算，不得自行指定。",
             "- 不使用 Todo 表代替自然语言 Plan。",
         ]
     else:
