@@ -159,6 +159,48 @@ class _VirtualOutsideWriteTool:
         return ToolExecutionResult("virtual write")
 
 
+class _ResourceLessTool:
+    definition = ToolDefinition(
+        "Custom",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    )
+
+    def __init__(self) -> None:
+        self.execute_count = 0
+
+    async def execute(self, arguments, *, cancellation):  # type: ignore[no-untyped-def]
+        del arguments, cancellation
+        self.execute_count += 1
+        return ToolExecutionResult("custom")
+
+
+@pytest.mark.asyncio
+async def test_formal_resourceless_tool_never_offers_session(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ScriptedProvider(
+        (
+            (_completed(ToolCallPart("custom-1", "Custom", {}), finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed(TextPart("done"), finish_reason=FinishReason.STOP),),
+        )
+    )
+    tool = _ResourceLessTool()
+    run = _application(workspace, provider, tools=(tool,)).create_run()
+    events = await _collect_turn(
+        run.start_turn("custom"), lambda event: PermissionApprovalChoice.ONCE
+    )
+    pause = next(event for event in events if isinstance(event, TurnPaused))
+    request = pause.pause.permission_request
+    assert request is not None
+    assert request.resource is None
+    assert request.choices == (
+        PermissionApprovalChoice.ONCE,
+        PermissionApprovalChoice.REJECT,
+    )
+    assert run.session_grants == ()
+    assert tool.execute_count == 1
+
+
 def _application(
     workdir: Path,
     provider: _ScriptedProvider,

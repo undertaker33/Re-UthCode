@@ -332,14 +332,16 @@ class UthCodeTUI:
         return [(style, "─" * columns)]
 
     def _status_fragments(self) -> StyleAndTextTuples:
+        permission_style = (
+            "class:status.warning"
+            if self._run.permission_mode is PermissionMode.FULL_ACCESS
+            else "class:status"
+        )
         return [
-            (
-                "class:status",
-                f" {self.activity} | {self.application.current_model_ref} | "
-                f"mode: {self._run.behavior_mode.value} | "
-                f"permission: {self._run.permission_mode.value} | "
-                f"{self.application.runtime_context.workdir} ",
-            )
+            ("class:status", f" {self.activity} | {self.application.current_model_ref} | "),
+            ("class:status", f"mode: {self._run.behavior_mode.value} | "),
+            (permission_style, f"permission: {self._run.permission_mode.value}"),
+            ("class:status", f" | {self.application.runtime_context.workdir} "),
         ]
 
     def _preview_fragments(self) -> StyleAndTextTuples:
@@ -1046,12 +1048,8 @@ class UthCodeTUI:
 
     def _select_permission_mode(self) -> None:
         mode = self.permission_picker.selected
-        warning = self.permission_picker.warning
         self.permission_picker.close()
-        self._run.set_permission_mode(mode)
-        self.activity = f"permission: {mode.value}"
-        if warning is not None:
-            self._spawn(self._emit(self._renderer.system(warning)))
+        self._spawn(self._handle_submission(f"/permission {mode.value}"))
         self._reset_interaction_context()
 
     async def _clear_viewport(self) -> None:
@@ -1163,6 +1161,7 @@ class UthCodeTUI:
                 "prompt": f"bold {PALETTE.accent}",
                 "composer": f"{PALETTE.text} bg:{PALETTE.input_background}",
                 "status": PALETTE.muted,
+                "status.warning": PALETTE.error,
                 "preview": f"{PALETTE.text} bg:{PALETTE.input_background}",
                 "preview.role": f"bold {PALETTE.success} bg:{PALETTE.input_background}",
                 "candidates": f"{PALETTE.text} bg:{PALETTE.user_background}",

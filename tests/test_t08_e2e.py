@@ -235,6 +235,8 @@ def _assert_formal_e2e_tool_evidence(
 
     expected_call_ids = [
         "plan-read",
+        "plan-v1",
+        "plan-v2",
         "todo-start",
         "gate",
         "stale-write",
@@ -246,6 +248,8 @@ def _assert_formal_e2e_tool_evidence(
     finished = [event for event in events if isinstance(event, ToolFinished)]
     assert [event.tool_call_id for event in finished] == expected_call_ids
     expected_finished_statuses = [
+        "finished",
+        "finished",
         "finished",
         "finished",
         "finished",
@@ -272,6 +276,8 @@ def _assert_formal_e2e_tool_evidence(
     assert len({part.tool_call_id for part in tool_results}) == len(expected_call_ids)
     assert [(part.tool_call_id, part.is_error, part.content) for part in tool_results] == [
         ("plan-read", False, "1\tseed"),
+        ("plan-v1", False, '{"choice": "revise", "revision": 1}'),
+        ("plan-v2", False, '{"choice": "approve", "revision": 2}'),
         (
             "todo-start",
             False,
@@ -300,6 +306,8 @@ def _assert_formal_e2e_tool_evidence(
     batches = [event for event in events if isinstance(event, ToolBatchFinished)]
     assert [(event.tool_call_ids, event.status) for event in batches] == [
         (("plan-read",), "finished"),
+        (("plan-v1",), "finished"),
+        (("plan-v2",), "finished"),
         (("todo-start",), "finished"),
         (("gate", "stale-write"), "steered"),
         (("write-result", "edit-notes"), "finished"),
@@ -355,8 +363,8 @@ async def _run_formal_application_e2e(
                     finish_reason=FinishReason.TOOL_CALLS,
                 ),
             ),
-            (_completed(TextPart("Plan v1: inspect and implement.")),),
-            (_completed(TextPart("Plan v2: preserve the public API and verify output.")),),
+            (_completed(_tool_call("plan-v1", "ProposePlan", {"plan": "Plan v1: inspect and implement."}), finish_reason=FinishReason.TOOL_CALLS),),
+            (_completed(_tool_call("plan-v2", "ProposePlan", {"plan": "Plan v2: preserve the public API and verify output."}), finish_reason=FinishReason.TOOL_CALLS),),
             (
                 _completed(
                     _tool_call(
@@ -509,6 +517,7 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
         "Grep",
         "Bash",
         "AskUserQuestion",
+        "ProposePlan",
     )
     assert _tool_names(provider, 3) == (
         "ReadFile",
@@ -632,7 +641,7 @@ async def test_t08_plan_full_access_rejects_hidden_write_before_permission(
                     finish_reason=FinishReason.TOOL_CALLS,
                 ),
             ),
-            (_completed(TextPart("read-only plan")),),
+            (_completed(_tool_call("plan-submit", "ProposePlan", {"plan": "read-only plan"}), finish_reason=FinishReason.TOOL_CALLS),),
         )
     )
     application = create_application(
@@ -661,6 +670,7 @@ async def test_t08_plan_full_access_rejects_hidden_write_before_permission(
         "Grep",
         "Bash",
         "AskUserQuestion",
+        "ProposePlan",
     )
     finished = [
         event
@@ -689,7 +699,7 @@ async def test_t08_sensitive_read_pause_and_typed_interaction_precedence(
                     finish_reason=FinishReason.TOOL_CALLS,
                 ),
             ),
-            (_completed(TextPart("guarded plan")),),
+            (_completed(_tool_call("plan-submit", "ProposePlan", {"plan": "guarded plan"}), finish_reason=FinishReason.TOOL_CALLS),),
         )
     )
     application = create_application(

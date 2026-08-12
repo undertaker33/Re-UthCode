@@ -4,6 +4,9 @@
 
 @docs/work/README.md
 
+当任务中出现需要用户拍板的产品、架构、范围或安全决策时，必须读取：
+@docs/rules/UserDecisionBoundary.md
+
 ## 项目说明
 
 - 正式项目名为 UthCode，Python 包名和 CLI 名称为 `uthcode`。

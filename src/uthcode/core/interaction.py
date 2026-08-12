@@ -16,6 +16,7 @@ from typing import Any, ClassVar, TypeAlias
 
 from .permission import (
     Decision,
+    DecisionReason,
     Effect,
     PermissionAction,
     PermissionDecision,
@@ -460,18 +461,21 @@ class PermissionApprovalRequest(_JsonModel):
         mode = _coerce_enum(PermissionMode, self.mode, "permission mode")
         object.__setattr__(self, "mode", mode)
         choices = tuple(_coerce_enum(PermissionApprovalChoice, choice, "permission choice") for choice in _as_tuple(self.choices, "choices"))
-        if self.guard:
-            if choices != (
-                PermissionApprovalChoice.ONCE,
-                PermissionApprovalChoice.REJECT,
-            ):
-                raise ValueError("Guard approval choices must be once and reject")
-        elif choices != (
+        session_eligible = (
+            not self.guard
+            and self.reason == DecisionReason.MODE_FALLBACK.value
+            and self.resource is not None
+        )
+        expected_choices = (
             PermissionApprovalChoice.ONCE,
             PermissionApprovalChoice.SESSION,
             PermissionApprovalChoice.REJECT,
-        ):
-            raise ValueError("ordinary approval choices must be once, session and reject")
+        ) if session_eligible else (
+            PermissionApprovalChoice.ONCE,
+            PermissionApprovalChoice.REJECT,
+        )
+        if choices != expected_choices:
+            raise ValueError("permission choices do not match the approval scope")
         if len(set(choices)) != len(choices):
             raise ValueError("permission choices must be unique")
         object.__setattr__(self, "choices", choices)
@@ -493,15 +497,19 @@ class PermissionApprovalRequest(_JsonModel):
         if decision.decision is not Decision.ASK:
             raise ValueError("Permission Approval requires an Ask decision")
         guard = decision.matched_rule_kind is RuleKind.GUARD
+        session_eligible = (
+            decision.reason is DecisionReason.MODE_FALLBACK
+            and decision.action.resource is not None
+        )
         choices = (
             (
                 PermissionApprovalChoice.ONCE,
+                PermissionApprovalChoice.SESSION,
                 PermissionApprovalChoice.REJECT,
             )
-            if guard
+            if session_eligible
             else (
                 PermissionApprovalChoice.ONCE,
-                PermissionApprovalChoice.SESSION,
                 PermissionApprovalChoice.REJECT,
             )
         )

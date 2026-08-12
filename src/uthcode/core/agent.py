@@ -44,7 +44,6 @@ from .hooks import (
     BeforeCompletionBlock,
     BeforeCompletionContinue,
     BeforeCompletionContext,
-    BeforeCompletionRequestPause,
     BeforeToolExecutionContext,
     BeforeToolExecutionReject,
     RuntimeHookSet,
@@ -94,10 +93,12 @@ from .permission import Decision, PermissionAction, PermissionDecision
 from .planning import (
     BehaviorMode,
     PlanState,
+    PROPOSE_PLAN_TOOL_DEFINITION,
     RuntimeFeedback,
     RuntimeFeedbackKind,
     TODO_WRITE_TOOL_DEFINITION,
     TaskState,
+    parse_propose_plan_arguments,
     parse_todo_write_arguments,
 )
 from .prompt import RuntimePromptContext
@@ -973,11 +974,18 @@ class AgentTurnExecution:
         """Return this iteration's mode-filtered view of the captured universe."""
 
         if self._state.behavior_mode is BehaviorMode.DEFAULT:
-            return self._tool_definitions
+            return tuple(
+                definition
+                for definition in self._tool_definitions
+                if definition.name != PROPOSE_PLAN_TOOL_DEFINITION.name
+            )
         return tuple(
             definition
             for definition in self._tool_definitions
-            if definition.name == ASK_USER_TOOL_DEFINITION.name
+            if definition.name in {
+                ASK_USER_TOOL_DEFINITION.name,
+                PROPOSE_PLAN_TOOL_DEFINITION.name,
+            }
             or self._loop._tool_registry.planning_access_for(definition.name)
             is ToolPlanningAccess.READ_ONLY
         )
@@ -1274,33 +1282,6 @@ class AgentTurnExecution:
                             self._state.plan_state,
                         )
                     )
-                    if isinstance(completion_result, BeforeCompletionRequestPause):
-                        request = completion_result.request
-                        expected_revision = (
-                            1
-                            if self._state.plan_state is None
-                            else self._state.plan_state.revision + 1
-                        )
-                        if request.revision != expected_revision:
-                            raise ValueError("Plan completion hook returned a stale revision")
-                        plan_state = PlanState(request.revision, request.plan_text)
-                        self._set_state(plan_state=plan_state)
-                        self._append(
-                            events,
-                            PlanProposed(
-                                self._state.run_id,
-                                self._state.turn_id,
-                                iteration,
-                                plan_state.revision,
-                                plan_state.text,
-                            ),
-                        )
-                        self._set_provider_continuation(iteration + 1)
-                        return self._pause_plan_review_segment(
-                            events,
-                            iteration,
-                            request,
-                        )
                     if isinstance(completion_result, BeforeCompletionBlock):
                         if not self._state.task_state.has_unfinished:
                             raise ValueError(
@@ -1493,7 +1474,6 @@ class AgentTurnExecution:
             next_tool_index=0,
             pending_pause=None,
         )
-
     def _make_pause(
         self,
         *,
@@ -1625,7 +1605,7 @@ class AgentTurnExecution:
             plan_review_request=request,
         )
         if self._continuation is None:
-            raise RuntimeError("Plan review pause has no Provider continuation")
+            raise RuntimeError("Plan review pause has no Tool continuation")
         self._continuation = replace(self._continuation, pending_pause=pause)
         self._append(events, TurnPaused(self._state.run_id, self._state.turn_id, pause))
         return self._paused_segment(events)
@@ -1680,8 +1660,14 @@ class AgentTurnExecution:
             self._continuation = replace(continuation, pending_pause=None)
             return
         if isinstance(response, PlanReviewResponse):
-            if continuation.stage != "provider":
-                raise ValueError("Plan review response requires a Provider continuation")
+            if continuation.stage != "tool_batch":
+                raise ValueError("Plan review response requires a Tool continuation")
+            index = continuation.next_tool_index
+            if index >= len(continuation.tool_calls):
+                raise ValueError("Plan review response has no ProposePlan call")
+            call = continuation.tool_calls[index]
+            if call.name != PROPOSE_PLAN_TOOL_DEFINITION.name:
+                raise ValueError("Plan review response does not match ProposePlan")
             plan_state = self._state.plan_state
             if plan_state is None or plan_state.revision != response.revision:
                 raise ValueError("response does not match the authoritative Plan revision")
@@ -1690,11 +1676,6 @@ class AgentTurnExecution:
                 feedback = RuntimeFeedback(
                     RuntimeFeedbackKind.PLAN_REVISION,
                     response.feedback,
-                )
-                self._set_state(
-                    messages=self._state.messages
-                    + (Message(role="user", parts=(TextPart(response.feedback),)),),
-                    runtime_feedback=feedback,
                 )
             else:
                 previous_mode = self._state.behavior_mode
@@ -1712,7 +1693,45 @@ class AgentTurnExecution:
                             BehaviorMode.DEFAULT,
                         ),
                     )
-            self._continuation = replace(continuation, pending_pause=None)
+            result = ToolResultPart(
+                call.tool_call_id,
+                json.dumps(
+                    {
+                        "choice": response.choice.value,
+                        "revision": plan_state.revision,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                False,
+            )
+            self._continuation = replace(
+                continuation,
+                completed_tool_results=continuation.completed_tool_results + (result,),
+                next_tool_index=index + 1,
+                pending_pause=None,
+            )
+            self._append(
+                events,
+                ToolFinished(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    self._require_batch_id(),
+                    call.tool_call_id,
+                    call.name,
+                    self._safe_command(call, known=True),
+                    "finished",
+                    False,
+                ),
+            )
+            if response.choice is PlanReviewChoice.REVISE:
+                self._close_tool_batch(events, status="finished")
+                self._set_state(
+                    messages=self._state.messages
+                    + (Message(role="user", parts=(TextPart(response.feedback),)),),
+                    runtime_feedback=feedback,
+                )
             return
         self._continuation = replace(continuation, pending_pause=None)
 
@@ -1841,6 +1860,13 @@ class AgentTurnExecution:
             next_tool_index=0,
             pending_pause=None,
         )
+        propose_count = sum(
+            call.name == PROPOSE_PLAN_TOOL_DEFINITION.name for call in calls
+        )
+        if propose_count and (len(calls) != 1 or propose_count != 1):
+            self._batch_control_reason = (
+                "Error: ProposePlan must be the only ToolCall in its response"
+            )
 
     def _require_batch_id(self) -> str:
         if self._batch_id is None:
@@ -1859,6 +1885,7 @@ class AgentTurnExecution:
         if call.name in {
             ASK_USER_TOOL_DEFINITION.name,
             TODO_WRITE_TOOL_DEFINITION.name,
+            PROPOSE_PLAN_TOOL_DEFINITION.name,
         }:
             command = call.name
         elif self._loop._tool_call_describer is None:
@@ -1982,6 +2009,8 @@ class AgentTurnExecution:
                 call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
             ) or (
                 call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or (
+                call.name == PROPOSE_PLAN_TOOL_DEFINITION.name
             ) or self._loop._tool_registry.get(call.name) is not None
             command = self._safe_command(call, known=known)
             if index != continuation.next_tool_index:
@@ -2073,6 +2102,8 @@ class AgentTurnExecution:
                 call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
             ) or (
                 call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or (
+                call.name == PROPOSE_PLAN_TOOL_DEFINITION.name
             ) or self._loop._tool_registry.get(call.name) is not None
             command = self._safe_command(call, known=known)
             self._append(
@@ -2147,6 +2178,8 @@ class AgentTurnExecution:
                 call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
             ) or (
                 call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or (
+                call.name == PROPOSE_PLAN_TOOL_DEFINITION.name
             ) or self._loop._tool_registry.get(call.name) is not None
             command = self._safe_command(call, known=known)
             batch_id = self._require_batch_id()
@@ -2234,6 +2267,58 @@ class AgentTurnExecution:
                                 task_state.to_json(),
                                 False,
                             )
+                elif call.name == PROPOSE_PLAN_TOOL_DEFINITION.name:
+                    self._set_state(consecutive_unknown_tools=0)
+                    if (
+                        self._state.behavior_mode is not BehaviorMode.PLAN
+                        or len(continuation.tool_calls) != 1
+                    ):
+                        result = _controlled_tool_result(
+                            call,
+                            "Error: ProposePlan requires PLAN mode and must be the only ToolCall",
+                        )
+                        controlled = True
+                        status = "failed"
+                    else:
+                        try:
+                            plan_text = parse_propose_plan_arguments(call.arguments)
+                        except (TypeError, ValueError, KeyError):
+                            result = _controlled_tool_result(
+                                call,
+                                "Error: invalid ProposePlan arguments",
+                            )
+                            controlled = True
+                            status = "failed"
+                        else:
+                            revision = (
+                                1
+                                if self._state.plan_state is None
+                                else self._state.plan_state.revision + 1
+                            )
+                            plan_state = PlanState(revision, plan_text)
+                            self._set_state(plan_state=plan_state)
+                            self._append(
+                                events,
+                                PlanProposed(
+                                    self._state.run_id,
+                                    self._state.turn_id,
+                                    continuation.iteration,
+                                    revision,
+                                    plan_text,
+                                ),
+                            )
+                            self._continuation = replace(
+                                continuation,
+                                completed_tool_results=tuple(results),
+                                next_tool_index=index,
+                                pending_pause=None,
+                            )
+                            self._pause_plan_review_segment(
+                                events,
+                                continuation.iteration,
+                                PlanReviewRequest(revision, plan_text),
+                            )
+                            return "paused"
                 elif resumed_prepared is not None:
                     choice = self._pending_permission_choice
                     self._pending_prepared_call = None

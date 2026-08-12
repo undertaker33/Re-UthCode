@@ -809,6 +809,7 @@ def test_composer_prompt_is_separate_from_ime_buffer_cursor() -> None:
 async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access() -> None:
     output = RecordingOutput()
     tui = UthCodeTUI(_application(), terminal_output=output)
+    tui.application._permission_writer = lambda _mode: None
     outcome = tui.dispatcher.dispatch_text("/permission")
     assert outcome is not None
     await tui._apply_command_outcome("/permission", outcome)
@@ -817,8 +818,9 @@ async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access()
 
     tui.permission_picker.move(1)
     tui._select_permission_mode()
+    await _wait_until(lambda: tui._run.permission_mode is PermissionMode.AUTO)
     assert tui._run.permission_mode is PermissionMode.AUTO
-    assert tui.application.create_run().permission_mode is PermissionMode.DEFAULT
+    assert tui.application.create_run().permission_mode is PermissionMode.AUTO
 
     outcome = tui.dispatcher.dispatch_text("/permission")
     assert outcome is not None
@@ -826,9 +828,27 @@ async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access()
     tui.permission_picker.move(1)
     assert tui.permission_picker.selected is PermissionMode.FULL_ACCESS
     tui._select_permission_mode()
-    await asyncio.sleep(0)
+    await _wait_until(lambda: tui._run.permission_mode is PermissionMode.FULL_ACCESS)
     assert tui._run.permission_mode is PermissionMode.FULL_ACCESS
     assert "高风险提示" in output.getvalue()
+
+
+def test_tui_status_warns_only_on_full_access_permission_fragment() -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+
+    default_fragments = tui._status_fragments()
+    assert all(style == "class:status" for style, _text in default_fragments)
+
+    tui._run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    fragments = tui._status_fragments()
+    warning = [(style, text) for style, text in fragments if "permission:" in text]
+    assert warning == [("class:status.warning", "permission: full_access")]
+    assert all(
+        style == "class:status"
+        for style, text in fragments
+        if "permission:" not in text
+    )
+    assert tui._style().get_attrs_for_style_str("class:status.warning").color == PALETTE.error.removeprefix("#")
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,8 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
-- `[FACT]` `create_application -> create_run -> start_turn` 组合一个固定 `RuntimeHookSet`、Plan/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；AgentLoop 始终先组合强制 Hook，再按固定顺序运行可选 Hook。
+- `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 `RuntimeHookSet`、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；AgentLoop 始终先组合强制 Hook，再按固定顺序运行可选 Hook。
+- `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。

@@ -14,7 +14,11 @@ from uthcode.core.agent import (
     SessionGrantSink,
 )
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
-from uthcode.core.planning import BehaviorMode, TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.planning import (
+    BehaviorMode,
+    PROPOSE_PLAN_TOOL_DEFINITION,
+    TODO_WRITE_TOOL_DEFINITION,
+)
 from uthcode.core.provider import (
     CancellationToken,
     GenerationRequest,
@@ -31,7 +35,7 @@ from uthcode.core.prompt import (
     SystemPromptContext,
     build_system_prompt,
 )
-from uthcode.core.permission import PermissionEvaluator, RuleSet
+from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .runtime_context import ApplicationRuntimeContext
@@ -40,6 +44,7 @@ from .tools import ApplicationToolService
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
+PermissionWriter = Callable[[PermissionMode], object]
 PermissionRulesLoader = Callable[[], RuleSet]
 
 
@@ -124,6 +129,7 @@ class UthCodeApplication:
         configuration: EffectiveConfig | None = None,
         provider_builder: ProviderBuilder | None = None,
         model_writer: ModelWriter | None = None,
+        permission_writer: PermissionWriter | None = None,
         runtime_context: ApplicationRuntimeContext | None = None,
         tool_service: ApplicationToolService | None = None,
         permission_rules_loader: PermissionRulesLoader | None = None,
@@ -132,6 +138,12 @@ class UthCodeApplication:
         self._configuration = configuration
         self._provider_builder = provider_builder
         self._model_writer = model_writer
+        self._permission_writer = permission_writer
+        self._default_permission_mode = (
+            configuration.default_permission_mode
+            if configuration is not None
+            else PermissionMode.DEFAULT
+        )
         if runtime_context is None:
             runtime_context = ApplicationRuntimeContext.from_system()
         if not isinstance(runtime_context, ApplicationRuntimeContext):
@@ -197,7 +209,23 @@ class UthCodeApplication:
             self,
             run_id=run_id,
             permission_evaluator=self._permission_evaluator_for_run(),
+            permission_mode=self._default_permission_mode,
         )
+
+    @property
+    def default_permission_mode(self) -> PermissionMode:
+        return self._default_permission_mode
+
+    def set_default_permission_mode(self, mode: PermissionMode | str) -> PermissionMode:
+        if not isinstance(mode, PermissionMode):
+            mode = PermissionMode(mode)
+        if mode is PermissionMode.FULL_ACCESS:
+            raise ValueError("full_access cannot be an Application default")
+        if self._permission_writer is None:
+            raise RuntimeError("permission selection has no user configuration writer")
+        self._permission_writer(mode)
+        self._default_permission_mode = mode
+        return mode
 
     def _permission_evaluator_for_run(self) -> PermissionEvaluator:
         """Load exactly one immutable permission snapshot for a new Run."""
@@ -306,6 +334,7 @@ class UthCodeApplication:
         ordinary_tool_definitions = self._tool_service.definitions()
         tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
         tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
+        tool_definitions += (PROPOSE_PLAN_TOOL_DEFINITION,)
 
         def prepare(
             messages: tuple[Message, ...],

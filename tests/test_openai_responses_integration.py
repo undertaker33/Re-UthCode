@@ -328,6 +328,36 @@ async def test_responses_request_shapes_tools_native_replay_and_cross_identity_f
 
 
 @pytest.mark.asyncio
+async def test_responses_plan_revision_maps_function_output_before_user_feedback() -> None:
+    client = _OpenAIClient(_item_events())
+    provider = build_openai_responses_provider("gpt-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("make a plan"),)),
+            Message("assistant", (ToolCallPart("plan-1", "ProposePlan", {"plan": "v1"}),)),
+            Message("tool", (ToolResultPart("plan-1", '{"choice":"revise","revision":1}'),)),
+            Message("user", (TextPart("include verification"),)),
+        ),
+    )
+
+    input_values = client.calls[-1]["input"]
+    output_index = next(
+        index
+        for index, item in enumerate(input_values)
+        if item.get("type") == "function_call_output" and item.get("call_id") == "plan-1"
+    )
+    feedback_index = next(
+        index
+        for index, item in enumerate(input_values)
+        if item.get("role") == "user"
+        and item.get("content") == [{"type": "input_text", "text": "include verification"}]
+    )
+    assert output_index < feedback_index
+
+
+@pytest.mark.asyncio
 async def test_responses_duplicate_frames_are_deduplicated_and_conflicts_rejected() -> None:
     client = _OpenAIClient(_item_events(duplicate=True))
     provider = build_openai_responses_provider("gpt-test", client=client)

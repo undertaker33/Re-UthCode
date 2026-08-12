@@ -151,7 +151,11 @@ def test_runtime_prompt_context_renders_distinct_plan_and_default_behavior() -> 
     assert "未完成" in default
     assert "PLAN" in plan
     assert "只读" in plan
-    assert "完整" in plan
+    assert "普通 final" in plan
+    assert "直接完成" in plan
+    assert "ProposePlan" in plan
+    assert "获批后" in plan
+    assert "同一 Turn" in plan
     assert "Todo 表" in plan
     assert "实施修改" in plan
 

@@ -17,7 +17,7 @@ from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.hooks import RuntimeHookSet
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
-from uthcode.core.planning import TODO_WRITE_TOOL_DEFINITION
+from uthcode.core.planning import PROPOSE_PLAN_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
 
@@ -27,22 +27,24 @@ _SUMMARY_UNAVAILABLE = "<tool summary unavailable>"
 _UNKNOWN_TOOL = "<unknown tool>"
 _REDACTED = "<redacted>"
 _NON_SECRET_AMBIENT_VALUES = frozenset({"0", "1"})
+_SENSITIVE_NAME = (
+    r"(?:[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|authorization|credential)"
+    r"[A-Za-z0-9_-]*|(?:key|auth)|[A-Za-z0-9]+(?:[_-](?:key|auth))"
+    r"(?:[_-][A-Za-z0-9]+)*|(?:key|auth)(?:[_-][A-Za-z0-9]+)+)"
+)
 _SENSITIVE_TOKEN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])"
-    r"(?:[A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|authorization)"
-    r"[A-Za-z0-9_-]*)"
+    rf"{_SENSITIVE_NAME}"
     r"(?![A-Za-z0-9_])"
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)(?P<prefix>(?:[A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|authorization)"
-    r"[A-Za-z0-9_-]*)\s*[:=]\s*)"
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9_-]){_SENSITIVE_NAME}\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
 )
 _SENSITIVE_OPTION_VALUE = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])"
     r"(?:--?|/)?[A-Za-z0-9_-]*"
-    r"(?:api[_-]?key|token|secret|password|passwd|authorization)"
-    r"[A-Za-z0-9_-]*[ \t]+)"
+    rf"{_SENSITIVE_NAME}[ \t]+)"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
 )
 _AUTHORIZATION_VALUE = re.compile(
@@ -162,11 +164,12 @@ class ApplicationToolService:
         reserved_names = {
             ASK_USER_TOOL_DEFINITION.name,
             TODO_WRITE_TOOL_DEFINITION.name,
+            PROPOSE_PLAN_TOOL_DEFINITION.name,
         }
         if any(tool.definition.name in reserved_names for tool in tool_values):
             raise ValueError(
                 "AskUserQuestion is reserved for the Application Agent path; "
-                "TodoWrite is reserved for the Core Agent path"
+                "TodoWrite and ProposePlan are reserved for the Core Agent path"
             )
         self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)

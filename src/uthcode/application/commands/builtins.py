@@ -107,8 +107,8 @@ def _permission(context: CommandContext) -> OpenPermissionPicker | PermissionMod
             "未知权限模式；可选：default、auto、full_access"
         ) from None
 
-    setter = getattr(context.application, "set_permission_mode", None)
-    if callable(setter):
+    setter = getattr(context.application, "set_default_permission_mode", None)
+    if mode is not PermissionMode.FULL_ACCESS and callable(setter):
         try:
             setter(mode)
         except Exception:
