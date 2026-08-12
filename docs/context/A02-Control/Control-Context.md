@@ -40,16 +40,18 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 Tool.prepare_call
   -> PreparedToolCall(action=PermissionAction)
   -> PermissionEvaluator.evaluate(action, run.mode, run.session_grants)
-     1. 选择最高来源优先级的匹配 Guard
+     1. 匹配可信 circuit breaker
+        用户/项目显式 Guard DENY -> DENY
+        否则 -> ASK（所有模式，仅 ONCE/REJECT）
+     2. 选择用户/项目显式 Guard
         DENY -> deny
         ASK  -> ask
         ALLOW -> 记录 guard_allowed，继续
-     2. mode == full_access
-        -> 跳过普通 Policy 与 Strategy
-        -> 仍不能绕过 Guard ASK/DENY
-     3. 选择匹配 Policy
+     3. mode == full_access
+        -> 跳过内置普通 Guard、普通 Policy 与 Strategy并 ALLOW
+     4. 选择内置普通 Guard，再选择匹配 Policy
         -> policy 的 ALLOW/ASK/DENY 是终态
-     4. Strategy fallback
+     5. Strategy fallback
         default: inside+read=ALLOW，其余=ASK
         auto: inside+(read|write)=ALLOW，其余=ASK
      5. 仅 Strategy ASK 可被精确 SessionGrant 替换为 ALLOW
@@ -61,9 +63,10 @@ Tool.prepare_call
 - `Effect` 固定为 `read/write/destructive/external/unknown`；`ResourceScope` 固定为 `inside/outside/unknown`。
 - 权限规则文件与普通 `config.toml` 分离：用户级 `~/.uthcode/permissions.toml`，项目级 `<scope>/.uthcode/permissions.toml`。
 - `load_permission_rules` 在 `AgentRun` 创建时加载一次不可变 `RuleSet`；运行中修改文件不热加载。
-- 来源优先级：内置默认 Guard < 用户规则 < 从 Git 根到 cwd 的项目规则；同来源同优先级按 `DENY > ASK > ALLOW`。
-- 默认 Guard 对敏感凭据路径和高置信危险 Bash 行为要求 ASK；`full_access` 也不能绕过。
-- 高置信危险 Bash 事实由 Tool preflight 的段级解析器生成可信 `guard_fact`，默认 Guard 只匹配该 marker；不对展示摘要重复运行原始命令正则。
+- 来源优先级：内置默认规则 < 用户规则 < 从 Git 根到 cwd 的项目规则；同来源同优先级按 `DENY > ASK > ALLOW`。规则的 builtin/configured/circuit-breaker 权威等级是 Core 结构属性，权限 TOML 不能声明。
+- 内置普通 Guard 在 `default`/`auto` 下保护敏感凭据路径和高置信危险 Bash 行为；`full_access` 跳过它。用户/项目显式 Guard ASK/DENY 在三种模式均为终态。
+- circuit breaker 只覆盖根目录/Home 递归删除、磁盘/卷破坏、裸设备写入。事实由 Bash Tool preflight 的段级解析器写入 `PermissionAction.circuit_breakers`，并对已支持的 `sh/bash/zsh -c`、`cmd /c`、PowerShell `-Command`、命令替换/反引号和 `clean | diskpart` 做有界递归检查；不从 rule ID、source 或展示摘要猜测。三种模式均 ASK，普通 ALLOW 不能覆盖，显式 DENY 可收紧。
+- 其他普通高风险事实（敏感读取、提权、远程脚本管道、fork bomb、关键进程、递归权限修改、嵌套执行、UNKNOWN 等）仍可在普通模式命中内置 Guard，但不属于 circuit breaker。
 - `SESSION` 审批只写入当前内存 `AgentRun`，按动作维度与有界资源匹配；不写持久规则。只有 Strategy fallback ASK 且 Action 含非空有界 resource 时才提供该选项。
 - Guard ASK、Policy ASK 和 resource-less ASK 只提供 `ONCE/REJECT`；Policy ALLOW/ASK/DENY 保持终态，Session Grant 不覆盖 Guard 或 Policy。
 - Bash 权限与活动摘要会脱敏带有 `KEY`/`AUTH` 独立段及既有 token/secret/password/credential 词汇的赋值；普通名称片段不得误判为秘密。

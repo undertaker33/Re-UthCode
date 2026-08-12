@@ -12,10 +12,12 @@ from typing import Any
 from tomlkit import parse
 
 from uthcode.core.permission import (
+    CircuitBreaker,
     Decision,
     Effect,
     ResourceScope,
     Rule,
+    RuleAuthority,
     RuleKind,
     RuleSet,
 )
@@ -106,6 +108,7 @@ def default_guard_rules() -> tuple[Rule, ...]:
             tool=tool,
             action=action,
             resource_regex=_SENSITIVE_RESOURCE_REGEX,
+            authority=RuleAuthority.BUILTIN,
         )
         for tool, action in (
             ("ReadFile", "read"),
@@ -124,6 +127,7 @@ def default_guard_rules() -> tuple[Rule, ...]:
             tool="Bash",
             action="execute",
             resource_regex=_BASH_SENSITIVE_RESOURCE_REGEX,
+            authority=RuleAuthority.BUILTIN,
         )
     )
     rules.extend(
@@ -136,26 +140,36 @@ def default_guard_rules() -> tuple[Rule, ...]:
             tool="Bash",
             action="execute",
             resource_regex=pattern,
+            authority=RuleAuthority.BUILTIN,
         )
         for rule_id, pattern in _BASH_GUARD_REGEXES
+    )
+    rules.extend(
+        Rule(
+            kind=RuleKind.GUARD,
+            decision=Decision.ASK,
+            source="default",
+            priority=0,
+            rule_id=f"default-circuit-breaker-{breaker.value}",
+            tool="Bash",
+            action="execute",
+            authority=RuleAuthority.CIRCUIT_BREAKER,
+            circuit_breaker=breaker,
+        )
+        for breaker in CircuitBreaker
     )
     return tuple(rules)
 
 
 PERMISSIONS_USER_TEMPLATE = f"""# UthCode permission rules for the current user
 #
-# Guard rules run in every permission mode. Policy rules are ignored only by
-# full_access. Edit this file manually; approvals never write persistent rules.
+# Guard rules written here run in every permission mode. Built-in ordinary
+# guards are skipped by full_access; catastrophic circuit breakers are not.
+# Policy rules are ignored only by full_access. Approvals never persist rules.
 # A resource_regex is matched against a normalized, display-safe action summary.
 
 [guard]
-
-[[guard.rules]]
-id = "default-sensitive-ReadFile"
-decision = "ask"
-tool = "ReadFile"
-action = "read"
-resource_regex = '{_SENSITIVE_RESOURCE_REGEX}'
+# Add explicit user Guard rules here when they must remain active in full_access.
 
 [policy]
 # Example:
