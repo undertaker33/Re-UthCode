@@ -30,6 +30,7 @@ uthcode
 
 ## 文档导航
 
+- [文档中心](docs/README.md)
 - [快速上手](docs/user-manual/getting-started.md)
 - [配置说明](docs/user-manual/configuration.md)
 - [命令参考](docs/user-manual/commands.md)

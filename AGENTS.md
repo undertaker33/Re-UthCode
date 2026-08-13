@@ -2,7 +2,7 @@
 
 拿到需求文件后，必须读取并遵守：
 
-@docs/work/README.md
+@docs/rules/WorkPackageRules.md
 
 当任务中出现需要用户拍板的产品、架构、范围或安全决策时，必须读取：
 @docs/rules/UserDecisionBoundary.md
@@ -16,8 +16,8 @@
 ## 开始工作前
 
 1. 使用 Conda 环境：`conda activate re-uthcode`。
-2. 先读 `docs/Context-Index.md`，按任务命中的层级读取最少必要的 `docs/context/**` 当前事实文档。
-3. 收到需求文件、拆分工作包或执行 Worker Prompt 时，必须完整读取并遵守 `docs/work/README.md`。
+2. 先读 `docs/README.md` 和 `docs/Context-Index.md`，按文档路由与任务命中的层级读取最少必要内容。
+3. 收到需求文件、拆分工作包或执行 Worker Prompt 时，必须完整读取并遵守 `docs/rules/WorkPackageRules.md`。
 4. 涉及尚未实现的后置能力或任务包中的“能力欠账”时，读取 `docs/OutstandingDebtList.md`；不得把一般 Out of Scope 或未来能力自动记为欠账。
 5. 参考仓库和归档工作包仅用于补充证据；当前事实以 `src/ + tests/` 为准。
 
@@ -77,7 +77,7 @@ interfaces -> application -> core
 
 ## 工作包与能力欠账
 
-- `docs/work/README.md` 是工作包生成、派发、实施、反馈、冻结和索引维护的完整规则；根文件不复制其细节。
+- `docs/rules/WorkPackageRules.md` 是工作包生成、派发、实施、反馈、冻结和索引维护的完整规则；根文件不复制其细节。
 - 工作包的“能力欠账”只记录：当前 `TXX` 因依赖尚未实现的后置能力而刻意未继续设计或实施的部分。
 - 拆分或重新拆分工作包时，必须核对该章节并维护 `docs/OutstandingDebtList.md`：新增真实欠账、更新已有来源或触发条件，并删除已在当前任务中回补且不再成立的条目。
 - 一般 Out of Scope、独立未来需求、当前实现缺陷和未确认设想都不是能力欠账；没有真实触发条件时，不为欠账预先设计方案。
@@ -87,7 +87,7 @@ interfaces -> application -> core
 ## 验证与交付
 
 - 使用与改动风险匹配的最小定向测试，再执行任务包要求的更大范围验证。
-- 进行包级验收时，必须同步维护所有与该包能力相关的文档，确保用户手册、核心设计、当前事实文档、索引和工作包记录与当前代码一致。
+- 进行包级验收时，必须按 `docs/README.md` 的维护映射同步所有与该包能力相关的文档，确保用户手册、核心设计、当前事实文档、索引和工作包记录与当前代码一致。
 - 修改架构边界时运行 `tests/test_architecture_boundaries.py`；修改公开行为时覆盖正常路径和关键失败路径。
 - 文档必须与当前代码事实一致，中文 Markdown 以 UTF-8 保存，并检查 replacement character、常见乱码和 Markdown fence 平衡。
 - 交付说明应列出实际改动、执行的命令及精确结果、未验证项、风险和遗留问题；不得把未运行的测试描述为通过。
@@ -97,7 +97,8 @@ interfaces -> application -> core
 ## 参考来源
 
 - 当前事实与验收：`src/`、`tests/`、`docs/Context-Index.md`
-- 工作包规则：`docs/work/README.md`
+- 文档路由与维护：`docs/README.md`
+- 工作包规则：`docs/rules/WorkPackageRules.md`
 - 能力欠账：`docs/OutstandingDebtList.md`
 - 历史设计参考：`D:\project\UthCode`、`D:\project\MewCode`
 - 外部参考：[OpenAI Codex](https://github.com/openai/codex)、[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)、[Claude Code](https://github.com/anthropics/claude-code)
