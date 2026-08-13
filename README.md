@@ -1,268 +1,44 @@
 # UthCode
 
-UthCode 是一个面向本地项目的 AI 编程助手。它可以在终端中持续对话、阅读和修改文件、搜索代码，并按需执行命令。
+## 项目定位
 
-当前版本提供两种使用方式：
+UthCode 是一个面向本地项目的 AI 编程助手。它既可以在终端中持续对话，也可以通过 `uthcode exec` 完成一次性任务。
 
-- **交互式终端界面（TUI）**：适合围绕同一个项目连续提问和操作。
-- **非交互命令（`uthcode exec`）**：适合脚本、自动化和一次性任务。
+## 核心能力
 
-支持 Anthropic、OpenAI Responses 和 OpenAI-compatible 三类模型服务，也提供仅用于离线体验和测试的 Fake Provider。
+- 阅读、搜索、创建和修改工作目录内的文件。
+- 通过 `Bash` 执行命令，并对工具操作进行权限判断和必要的用户确认。
+- 支持 Anthropic、OpenAI Responses 和 OpenAI-compatible 模型服务。
+- 在同一次运行中保留对话上下文，并支持暂停、恢复、取消和运行中补充指令。
+- 提供 Plan Mode、计划审阅和任务状态跟踪。
+- 同时提供交互式 TUI 与适合脚本调用的 `exec` 模式。
 
-## 功能概览
+## 快速开始
 
-- 在同一次使用过程中连续对话，后续问题会保留前文。
-- 自动使用文件读取、写入、编辑、文件匹配、内容搜索和 Bash 命令工具。
-- 展示思考进度、工具运行状态和最终回答，不展示工具返回的原始正文。
-- 支持暂停、恢复、取消、AskUser、权限审批和运行中 Steering。
-- 支持 Plan Mode、Plan Review、Todo 状态与完成前检查。
-- 支持在多个已配置模型之间切换；切换只影响下一次请求。
-- API Key 只从环境变量读取，不写入配置文件。
-- 项目配置与用户配置分层加载，项目配置不能重定向密钥来源或提升访问范围。
-
-## 运行要求
-
-- Python 3.12
-- Windows、macOS 或 Linux
-- 至少配置一个可用模型；也可以先使用 Fake Provider 离线体验
-
-## 安装
-
-克隆仓库后，在项目目录创建 Python 3.12 环境并安装：
+需要 Python 3.12。当前从源码安装：
 
 ```powershell
 conda create -n re-uthcode python=3.12 -y
 conda activate re-uthcode
 python -m pip install -e .
-```
-
-确认命令可用：
-
-```powershell
-uthcode --help
-```
-
-## 第一次配置
-
-UthCode 的用户配置文件位于：
-
-```text
-~/.uthcode/config.toml
-```
-
-第一次运行时，UthCode 会创建一份带注释的配置模板并停止。编辑模板、配置 Provider 和模型后，再次运行即可。
-
-### 离线体验
-
-下面的配置不需要 API Key，也不会访问网络：
-
-```toml
-model = "local/echo"
-
-[providers.local]
-kind = "fake"
-
-[models."local/echo"]
-provider = "local"
-model = "echo"
-label = "Offline Echo"
-```
-
-### 配置真实模型
-
-API Key 必须放在环境变量中，配置文件只记录环境变量名。
-
-OpenAI-compatible 示例：
-
-```toml
-model = "my-provider/chat"
-
-[providers.my-provider]
-kind = "openai_compat"
-base_url = "https://your-provider.example/v1"
-api_key_env = "MY_PROVIDER_API_KEY"
-
-[models."my-provider/chat"]
-provider = "my-provider"
-model = "your-model-id"
-label = "My Chat Model"
-max_output_tokens = 4096
-```
-
-在当前 PowerShell 终端设置密钥：
-
-```powershell
-$env:MY_PROVIDER_API_KEY = "your-api-key"
-```
-
-其他 Provider 的配置结构相同：
-
-| `kind` | 用途 | 必填项 |
-| --- | --- | --- |
-| `anthropic` | Anthropic Messages API | `api_key_env` |
-| `openai_responses` | OpenAI Responses API | `api_key_env` |
-| `openai_compat` | OpenAI-compatible 服务 | `api_key_env`、`base_url` |
-| `fake` | 离线体验和测试 | 无 |
-
-> 不要把真实 API Key 写入 `config.toml`、命令参数或项目文件。
-
-## 启动交互界面
-
-在需要操作的项目目录运行：
-
-```powershell
 uthcode
 ```
 
-也可以显式指定工作目录或模型：
+首次运行会创建 `~/.uthcode/config.toml`。完成模型配置后，再次运行 `uthcode` 即可；也可以先配置 Fake Provider 离线体验。
 
-```powershell
-uthcode --cwd C:\work\my-project
-uthcode --model my-provider/chat
-```
+> `Bash` 使用当前操作系统用户权限执行，不是 OS Sandbox。请先在受版本控制的项目中使用，并留意权限确认内容。
 
-### 基本操作
+## 文档导航
 
-- 输入问题后按 `Enter` 发送。
-- 按 `Shift+Enter` 插入换行；如果当前终端无法识别组合键，可用 `Ctrl+J`。
-- 使用方向键、`Home`、`End`、`Backspace` 和 `Delete` 编辑输入；多行粘贴会保留原有换行。
-- `Esc` 会关闭命令候选或模型选择并保留原草稿；普通输入时不会退出。生成期间连续按两次 `Esc` 会协作式暂停当前请求，随后可以恢复或取消。
-- 只有 `Ctrl+C` 和 `/quit` 会退出 UthCode。
-- 使用终端自带的滚动条向上查看完整会话。模型工作期间也可以滚动和选择文本，不会暂停或中断生成。
-- 复制回答或代码时，直接使用终端自带的文本选择和复制功能。
-- 同一次 TUI 使用一个连续对话；下一条普通输入会带上前文。
-- `/clear` 只清空当前视口并开始一个新视图，不会清除终端上方的滚动历史，也不会清除对话上下文。
-- 请求运行期间不能切换模型；没有待处理 typed interaction 时，新的普通输入会作为同一 Turn 的 Steering 提交。
+- [快速上手](docs/user-manual/getting-started.md)
+- [配置说明](docs/user-manual/configuration.md)
+- [命令参考](docs/user-manual/commands.md)
+- [可用 Tool](docs/Tools.md)
+- [核心设计](docs/core-design/README.md)
 
-启动时会清理当前视口并显示 UthCode 欢迎区，但不会清除终端的滚动历史。界面不会切换到全屏缓冲区，也不会接管鼠标或创建应用内滚动条。用户消息使用局部背景；Agent 消息使用终端原有背景，保留角色抬头和左侧竖线；Markdown 与带独立背景的代码块会按终端宽度渲染。工具记录使用灰色竖线：成功圆点为绿色，失败或拒绝圆点为红色，同时保留状态文字。
+## 开发与共享入口
 
-输入区固定在终端底部，上方有分隔线。默认显示三行，内容超过三行后按需增高，最多占用有限高度，避免挤占整屏。
-
-### 当前可用命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `/help` | 查看命令帮助 |
-| `/clear` | 清空当前视口并保留上方滚动历史 |
-| `/model` | 打开模型选择器 |
-| `/model <model-ref>` | 切换下一次请求使用的模型 |
-| `/permission` | 打开当前 Run 的权限模式选择器 |
-| `/permission default\|auto` | 修改当前 Run，并原子写入用户级下次启动默认值 |
-| `/permission full_access` | 仅修改当前 Run，不持久化 |
-| `/plan` | 将下一次 Turn 切换到 Plan Mode |
-| `/do` | 切换回默认执行模式 |
-| `/build` | `/do` 的别名 |
-| `/status` | 查看当前模型、Provider 和配置来源 |
-| `/quit` | 退出界面 |
-
-别名包括 `/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q` 和 `/exit`。
-
-界面中还会列出部分规划中的命令；这些命令会明确显示“功能未实现”，不会静默执行。
-
-## 执行一次性任务
-
-不启动交互界面，直接执行一条任务：
-
-```powershell
-uthcode exec "解释这个项目的目录结构"
-uthcode exec --cwd C:\work\my-project "检查测试失败的原因"
-uthcode exec --model my-provider/chat "总结当前目录"
-```
-
-也可以通过标准输入传递内容：
-
-```powershell
-"列出最值得优先处理的问题" | uthcode exec
-```
-
-`exec` 的输出规则适合脚本使用：
-
-- 最终回答只写入标准输出（stdout）。
-- reasoning、进度、工具状态、失败和取消信息写入标准错误（stderr）。
-- 以 `/` 开头的内容仍然作为普通提示词，不会被当作 TUI 命令。
-
-退出码：
-
-| 退出码 | 含义 |
-| --- | --- |
-| `0` | 成功 |
-| `1` | Provider 或生成失败 |
-| `2` | 参数或配置错误 |
-| `130` | 用户取消 |
-
-## 配置作用范围
-
-UthCode 会合并用户配置和项目配置：
-
-- 用户配置：`~/.uthcode/config.toml`
-- 项目配置：`<项目目录>/.uthcode/config.toml`
-
-在 Git 仓库中，项目配置会从仓库根目录向当前目录逐层发现；在非 Git 目录中，只读取当前目录的项目配置。
-
-项目配置可以选择用户已信任的模型并调整非敏感模型参数，但不能：
-
-- 定义或替换 Provider；
-- 修改服务端点；
-- 修改 API Key 的环境变量来源；
-- 静默提升为更宽泛的访问模式。
-
-## 内置工具
-
-当前默认工具包括：
-
-| 工具 | 用途 |
-| --- | --- |
-| `ReadFile` | 读取项目文件 |
-| `WriteFile` | 写入文件 |
-| `EditFile` | 精确编辑文件 |
-| `Glob` | 按文件名模式查找 |
-| `Grep` | 搜索文件内容 |
-| `Bash` | 在项目工作目录执行命令 |
-
-文件与搜索工具会限制在启动时确定的工作目录内，并检查路径穿越和符号链接边界。
-
-## 安全说明
-
-请在运行前了解以下边界：
-
-- `Bash` 使用当前操作系统用户的权限执行，是**未沙箱化的进程执行**。
-- 当前版本没有 OS Sandbox；Permission Approval 只是应用层授权，不能替代操作系统隔离。
-- 项目配置不能设置 `default_permission_mode`；该安全默认值只允许由用户配置保存为 `default` 或 `auto`。
-- 普通 Tool 依次经过可信参数预检、固定 Runtime Hook、唯一 Permission evaluator，再执行。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但用户/项目显式 Guard ASK/DENY 仍生效。
-- 根目录/Home 递归删除、磁盘/卷破坏和裸设备写入属于灾难性 circuit breaker，三种模式均只允许单次批准或拒绝；普通允许规则不能覆盖它。
-- Bash 只对可确定的命令和目录范围自动分类；`cd /d <literal>` 与可见 CMD 括号命令组可参与静态分类，其他不确定语法保持保守。在 `default`/`auto` 下仍按普通 Guard/Policy/Strategy 保护。
-- 工具仍受操作系统权限、工作目录与物理路径检查、参数校验和第三方服务权限约束。
-- 工具活动只显示经过脱敏和截断的摘要，不显示写入正文、工具返回的原始内容、API Key、token、配置秘密或未知参数。
-- 当前对话只保存在内存中；退出后不会提供会话恢复、Memory 或持久化历史。
-
-建议先在受版本控制的项目中使用，并在执行高影响任务前确认工作区状态。
-
-## 常见问题
-
-### 第一次运行后为什么直接退出？
-
-这是正常行为。UthCode 已创建 `~/.uthcode/config.toml` 模板。完成配置后重新运行即可。
-
-### 为什么提示缺少 API Key？
-
-确认 `api_key_env` 指向的环境变量已在启动 UthCode 的同一个终端中设置。配置文件中应保存环境变量名，而不是真实密钥。
-
-### `/clear` 会开始新对话吗？
-
-不会。它只清空当前视口并打印新视图分隔线。向上滚动仍可看到旧记录，后续输入也仍会保留之前的对话上下文。
-
-### 如何彻底开始一段新对话？
-
-当前版本没有持久 Session 或 `/new` 功能。退出并重新启动 TUI 即可创建新的内存对话。
-
-### 为什么不能在请求运行时切换模型？
-
-每次请求开始时都会固定 Provider 和模型，避免运行过程中发生不一致。当前请求结束后即可切换，下一次请求会使用新模型。
-
-## 当前状态
-
-UthCode 目前处于早期版本，核心对话、工具调用、Permission、CLI 和 TUI 已可离线测试。OS Sandbox、持久 Session、Memory、Diff Viewer、MCP、Skill 和 Multi-Agent 尚未提供。
-
-## License
-
-MIT
+- 开发环境使用仓库约定的 Conda 环境：`conda activate re-uthcode`。
+- 运行测试：`python -m pytest -q`。
+- 需要与项目成员共享模型选择或权限规则时，可提交项目内的 `.uthcode/config.toml` 与 `.uthcode/permissions.toml`；不要提交 API Key。
+- 了解当前实现边界可查看[核心设计索引](docs/core-design/README.md)。

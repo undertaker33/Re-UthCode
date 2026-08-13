@@ -87,9 +87,11 @@ interfaces -> application -> core
 ## 验证与交付
 
 - 使用与改动风险匹配的最小定向测试，再执行任务包要求的更大范围验证。
+- 进行包级验收时，必须同步维护所有与该包能力相关的文档，确保用户手册、核心设计、当前事实文档、索引和工作包记录与当前代码一致。
 - 修改架构边界时运行 `tests/test_architecture_boundaries.py`；修改公开行为时覆盖正常路径和关键失败路径。
 - 文档必须与当前代码事实一致，中文 Markdown 以 UTF-8 保存，并检查 replacement character、常见乱码和 Markdown fence 平衡。
 - 交付说明应列出实际改动、执行的命令及精确结果、未验证项、风险和遗留问题；不得把未运行的测试描述为通过。
+- 用户要求提交但只给出类似 `feat:` 的不完整 commit message 时，必须根据已确认的提交范围补全为语义完整、能够准确概括实际改动的 commit message，不得原样使用空泛前缀。
 - 未经用户明确要求，不执行 Git commit、push、merge、rebase、tag、release 或工作包归档。
 
 ## 参考来源

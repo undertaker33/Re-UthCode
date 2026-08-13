@@ -71,6 +71,7 @@ status_values:
 | T05 | ReAct 与 Agent Loop | `docs/work/archive/T05-ReAct与AgentLoop/` |
 | T06 | 暂停恢复与询问用户 | `docs/work/archive/T06-暂停恢复与询问用户/` |
 | T07 | 三层权限系统 | `docs/work/archive/T07-三层权限系统/` |
+| T07-1 | 权限分类与完全访问收口 | `docs/work/archive/T07-1-权限分类与完全访问收口/` |
 | T08 | 任务规划与执行控制 | `docs/work/archive/T08-任务规划与执行控制/` |
 | T08-1 | 阶段一扫尾 | `docs/work/archive/T08-1-阶段一扫尾/` |
 
@@ -78,7 +79,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T07-1 | 权限分类与完全访问收口 | `docs/work/T07-1-权限分类与完全访问收口/` | 分类、权限矩阵、正式 Application E2E 与全量回归通过；Checklist 与 Feedback 已完成 |
+| — | — | — | 当前没有已实施但尚未归档的工作包 |
 
 ### `not_implemented`
 
