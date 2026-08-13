@@ -1,0 +1,23 @@
+schema_version = 1
+task_id = "plan-only"
+task_version = "0.1.0"
+instruction_path = "instruction.md"
+fixture_path = "fixture"
+verifier_path = "verify.py"
+behavior_mode = "plan"
+timeout_seconds = 120
+attempts = 1
+required_evidence = [
+  { id = "entry", path = "src/entry.py", fact = "read-only entry" },
+  { id = "constraint", path = "docs/constraints.md", fact = "read-only constraint" },
+  { id = "tests", path = "tests/test_entry.py", fact = "read-only tests" },
+]
+interactions = [
+  { id = "review-plan", kind = "plan_review", response = { choice = "approve" } },
+]
+permission_rules = []
+
+[scoring]
+hard = 100
+partial = 50
+dimensions = ["correctness", "context", "exploration", "efficiency", "stability", "safety"]

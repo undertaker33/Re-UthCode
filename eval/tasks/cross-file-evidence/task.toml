@@ -1,0 +1,21 @@
+schema_version = 1
+task_id = "cross-file-evidence"
+task_version = "0.1.0"
+instruction_path = "instruction.md"
+fixture_path = "fixture"
+verifier_path = "verify.py"
+behavior_mode = "default"
+timeout_seconds = 120
+attempts = 1
+required_evidence = [
+  { id = "cli-entry", path = "src/cli.py", fact = "observable entry" },
+  { id = "application-mapping", path = "src/application.py", fact = "field mapping" },
+  { id = "domain-contract", path = "src/domain.py", fact = "domain result" },
+]
+interactions = []
+permission_rules = []
+
+[scoring]
+hard = 100
+partial = 50
+dimensions = ["correctness", "context", "exploration", "efficiency", "stability", "safety"]

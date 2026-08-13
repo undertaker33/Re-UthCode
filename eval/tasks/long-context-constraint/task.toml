@@ -1,0 +1,22 @@
+schema_version = 1
+task_id = "long-context-constraint"
+task_version = "0.1.0"
+instruction_path = "instruction.md"
+fixture_path = "fixture"
+verifier_path = "verify.py"
+behavior_mode = "default"
+timeout_seconds = 180
+attempts = 1
+required_evidence = [
+  { id = "public-api", path = "src/public_api.py", fact = "stable public signature" },
+  { id = "implementation", path = "src/implementation.py", fact = "behavior implementation" },
+  { id = "regression", path = "tests/test_public_api.py", fact = "regression test" },
+  { id = "constraint", path = "docs/early-constraint.md", fact = "early constraint" },
+]
+interactions = []
+permission_rules = []
+
+[scoring]
+hard = 100
+partial = 50
+dimensions = ["correctness", "context", "exploration", "efficiency", "stability", "safety"]
