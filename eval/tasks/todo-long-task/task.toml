@@ -1,0 +1,21 @@
+schema_version = 1
+task_id = "todo-long-task"
+task_version = "0.1.0"
+instruction_path = "instruction.md"
+fixture_path = "fixture"
+verifier_path = "verify.py"
+behavior_mode = "default"
+timeout_seconds = 180
+attempts = 1
+required_evidence = [
+  { id = "record-model", path = "src/model.py", fact = "data model" },
+  { id = "record-usecase", path = "src/usecase.py", fact = "use case" },
+  { id = "record-test", path = "tests/test_records.py", fact = "acceptance test" },
+]
+interactions = []
+permission_rules = []
+
+[scoring]
+hard = 100
+partial = 50
+dimensions = ["correctness", "context", "efficiency", "stability", "safety"]

@@ -19,6 +19,7 @@
 | **T08 Todo / Plan** | Todo / Plan 可以跨 Turn 延续，并定义何时继续使用、何时更新、何时失效，而不是每个新 Turn 直接重新开始 | Context Engineering 开始实施，能够明确跨 Turn 状态与上下文的关系 |
 | **T08 Todo / Plan** | Context Compaction 后仍能保留并恢复长期任务的有效 Todo / Plan 状态 | Structured Compaction 开始实施 |
 | **T08 Runtime Hook** | 在现有两个固定 Hook Point 无法满足真实能力后，再扩充新的 Hook 生命周期点或配置能力 | 出现 Skill、MCP、Subagent 或其他**确实无法由现有 Hook 表达**的真实调用方 |
+| **B01 私有测试集 v0** | 上下文有效性当前只能记录已有 evidence discovery、Usage 和 Tool 轨迹；无法计算压缩、Working Set 选择与淘汰、证据保留与恢复、Memory injection 命中等指标 | Context Compiler、Compaction、Working Set 或 Memory 任一能力开始实施并产生结构化运行事实时，在对应任务中接入 B01 的版本化 diagnostics |
 
 ## 维护原则
 
