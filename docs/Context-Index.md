@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 原始需求已移入同名目录，Spec/Tasks/Checklist 与 W01～W06 Prompt 已生成，尚未由用户显式派发任何 Worker Prompt |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已按 `685d85d8ad97c733151e3cd54655cf848343753a` 代码基线和历史冻结 AGENTS 语义完成任务包一致性返工；Spec/Tasks/Checklist 与 W01～W06 Prompt 已同步，尚未显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 
@@ -106,7 +106,7 @@ interfaces/cli.py 或 interfaces/tui/app.py
 
 - `[ABSENT]` LangGraph、LangChain Agent、图/DAG/工作流 DSL。
 - `[ABSENT]` OS Sandbox；`Bash` 是当前用户权限下的未沙箱化进程执行。
-- `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩。
+- `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩、Runtime AGENTS / Project Instructions Loader、统一模型输入限制解析。
 - `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与 unfinished-task 完成阻断；普通 PLAN final 正常完成，正式 Plan Review 仅由 `ProposePlan` 控制 ToolCall 触发；不提供动态注册。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。

@@ -1,130 +1,179 @@
 # T09 Prompt 与 Context Engineering Spec
 
-## 背景
+## 1. 背景与目标
 
-当前 UthCode 将公共 Coding Prompt 与运行时强制语义集中在 Core 代码中，并且把完整交互历史直接作为每次模型请求的 working history。长 Session 没有预算、投影或压缩边界；大型 Tool Result 在 Core 中被永久截断；`/compact`、`/new`、`/resume` 仍为占位命令。
+当前仓库已有进程内 Agent Runtime、Task/Plan、Pause/Resume 与 Provider/Tool 抽象，但没有 Runtime AGENTS Loader、持久 Session、统一 Context Compiler 或模型输入限制解析；公共 Prompt、完整 working history 和永久 Tool Result 截断也尚未收口。旧 UthCode 已冻结 AGENTS 产品语义，T09 按当前模块化单体恢复语义，不继承旧运行时结构。
 
-T09 在保持单 Agent Loop、Core 状态唯一写入者和 Provider-independent 边界不变的前提下，建立第一版可持久 Session 语义历史与 Context Engine。
+目标是建立 Canonical History → Projection → Context Compiler → Snapshot → Provider Integration 链路，以稳定权限前缀、真实模型限制、有界 Working Set/Compaction、single-writer Session 和可观测 Eval 支持长任务。
 
-## 目标
+## 2. Scope
 
-- 将可编辑公共 Coding Prompt 迁入 package asset，与 Core Runtime Contract 和动态事实分离。
-- 建立独立于 Run/Turn 的稳定 Session identity，支持当前项目范围的跨进程发现与继续新 Turn。
-- 以 append-only 语义历史保存原始 Interaction 与不可变 Projection，将非权威运行日志独立存放。
-- 建立固定 258K 窗口的 Provider-independent Context Compiler、Budget、Working Set 和诊断事实。
-- 实现手动、自动和单次 reactive overflow 的按需模型 Compaction，不引入后台 Context Worker。
-- 完整外置大型 Tool Result，只向模型提供有界 preview 与 Session 内 opaque ref，并支持分块重读。
-- 完成 `/compact`、`/new`、`/resume`、Session Picker 和 TUI Context usage 的产品闭环。
-- 向 B01 提供可比较的 Context diagnostics，保持概率性效果与 pytest 硬门禁分离。
+本 Spec 是任务书的可实施收口。只覆盖 Prompt Asset、Project Instructions、Canonical History、Projection、Model Limits、Context Compiler、Tool Result 外置、Compaction、Session persistence、Slash/TUI 与 Eval；不覆盖任务书列出的后置能力。
 
-## 能力清单
+## 3. 按 Task 划分的能力清单
 
-### Task 1 — Prompt Asset 与 Core Runtime Contract 分离
+1. Task 1：Prompt Asset、Context Source 与权限平面。
+2. Task 2：AGENTS / Project Instructions Loader。
+3. Task 3：Canonical History 与 Projection 基础。
+4. Task 4：Model Limits、Context Compiler 与确定性 Working Set。
+5. Task 5：Session Store、durable append 与 single writer。
+6. Task 6：大 Tool Result 外置与资源上限。
+7. Task 7：有界 Compaction 与 Runtime Request Composition。
+8. Task 8：Session Slash Commands 与 TUI Context Status。
+9. Task 9：Context Diagnostics 与 Eval。
+10. Task 10：[接入主流程] 正式 Context Composition 收口。
+11. Task 11：[端到端验证] Context / Session / Prefix。
+12. Task 12：[遗留负担清理] 单历史 / 单 Context Path 收口。
 
-提供唯一公共 Coding Prompt package asset；Core 继续权威维护 Behavior Mode、Plan/Task、Runtime Feedback、Tool 能力真实性和完成约束；动态 Runtime/Environment/Projection 事实稳定排在公共文本之后。
+## 4. Domain contracts
 
-### Task 2 — Semantic History / Projection Core Contract
+### 4.1 Semantic history
 
-定义 Provider-independent 的强类型 Session record envelope、Interaction 和 Compact Projection。原始 Interaction 不因预算或压缩被改写，Projection 只表达当前模型可见投影。
+- `HistoryEntry` 具有 session id、strict sequence、turn id、kind、payload、created_at、commit boundary。
+- `SemanticUnit` 是最小选择/压缩/恢复原子；ToolCall 与 ToolResult 必须闭合后成为一个 unit。
+- `CanonicalHistory` 仅 append；Projection 只引用覆盖的 sequence 范围与 revision。
+- 未完整提交的尾记录恢复时忽略，不伪造业务结果。
 
-### Task 3 — JSONL Session Files 与 Runtime Log
+### 4.2 Context blocks and authority
 
-为每个 Session 建立 durable append history、非语义权威 runtime log 和隔离的 Tool Result namespace；支持当前 project key 下的 Session 发现、排序和重建。
+每个 Source 产出统一 block：`source_kind`、`authority`、`stability`、`scope`、`provenance`、`content`、`estimated_tokens`、`semantic_unit_id`（若有）。Provider mapper 只能转换，不得提升 authority。
 
-### Task 4 — 大 Tool Result 外置与 ToolResultRead
+稳定指令前缀顺序：Public Prompt → Core Contract → 用户 AGENTS → 项目根 AGENTS → 稳定工具/协议定义。
 
-移除 Core 的永久数据截断语义。大结果先原子持久完整内容，再生成有界 working view；专用只读工具只能解析当前 Session 的 opaque ref。
+上下文平面顺序：Projection → retained raw history → scoped instruction delta → runtime delta → environment delta → current user turn。只有真实 Project Instruction / Core Runtime block 保留相应权限；Projection 始终是历史权限。
 
-### Task 5 — Context Compiler、Budget 与 Working Set
+### 4.3 Project instructions
 
-使用固定强类型 Source 编译确定性 Context Snapshot，在固定 258K 总窗口中扣除输出预留和安全余量，保护当前用户输入、Runtime State、active Projection 和未闭合 Tool 语义单元。
+`InstructionLoader` 契约：
 
-### Task 6 — 按需 Compactor 与 Projection Commit
+- session start 加载 user root 与 project root；路径访问惰性加载 project-root-to-target directory AGENTS；
+- 只识别整行 `@include("relative/path")` / `@include('relative/path')`；代码围栏和 inline code 忽略；
+- 引用相对当前文件，递归图最多 3 个额外文件；canonical physical identity 去重，Windows case-fold，循环/越界/超限/读取失败 fail closed；
+- user 图限制在 user config root，project/directory 图限制在 project root；
+- 返回有序、带 scope/source/reason 的 blocks 与显式 diagnostics；Application 维护 session instruction epoch 和已见 identity。
 
-实现 tool-free 单次模型压缩；支持 manual、安全请求边界的 auto 和最多一次 reactive overflow retry。只在 summary 完整有效时追加新 Projection。
+Integration 实现文件边界，Application 决定加载时机并生成 Source，Core 不读文件。
 
-### Task 7 — 跨 Turn Runtime State 与正式 Request Composition
+### 4.4 Model limits
 
-所有正式 Agent Turn 改为消费 Context Snapshot。已完成 Turn 收口 active Task/Plan；中断且仍有未完成任务时保留结构化状态供后续 Turn reconcile；Compaction 不改写该状态。
+统一 `ResolvedModelLimits` 至少含正整数 `max_input_tokens`、`max_output_tokens`、`source`、精确模型身份与 provenance。
 
-### Task 8 — `/compact`、`/new`、`/resume` 与 TUI 产品闭环
+解析优先级：可靠 Provider metadata → 精确 bundled metadata → 用户级 ModelProfile 显式值。项目配置只允许收紧有效限制，不能提高或替换可信物理上限。未知且无显式输入上限时，在发送前明确失败并给出可操作配置诊断。
 
-实现三个命令的 Application 语义。`/resume` 进入独立 Session Picker，仅列出当前项目 Session，按最后使用时间倒序、每页 10 条，并支持键盘选择、翻页、确认和取消。`/status` 与输入区环形指示器消费同一 Application usage projection。
-
-### Task 9 — B01 Context Diagnostics 与 Before/After Eval
-
-将压缩、Working Set、Evidence 保留/重新发现、大结果外置和实际 Provider usage 纳入受控诊断，支持同实验指纹的前后比较。
-
-### Task 10 — [接入主流程] 正式 Composition 收口
-
-打通 Bootstrap 到 Provider 的唯一 Session/Context/Tool 正式路径，删除全量消息直通和永久截断旧语义，保留不冒充 Agent Context 路径的低层单次 generation。
-
-### Task 11 — [端到端验证] Context / Compaction / Evidence
-
-从真实 Application 入口验证多 Turn、新建/恢复 Session、Picker、Context usage、大结果重读、多次 Projection、失败不破坏和 diagnostics 比较。
-
-### Task 12 — [遗留负担清理] 单历史 / 单 Context Path 收口
-
-清除被替代的截断、Prompt 硬编码、命令占位、双轨 Context 组装、不可达代码和误导文档，确认未引入后台 Worker、第二 Agent Loop、通用 Registry、SQLite checkpoint 或兼容层。
-
-## 非功能要求
-
-- 保持 `interfaces -> application -> core` 依赖方向，Application 仅在 composition root 组合 Integration。
-- Core 不读写文件系统，不依赖 Provider SDK、UI 或具体存储。
-- Agent Loop 仍为唯一自动 Loop 和 RunState 唯一写入者；Tool Batch 仍严格 FIFO 并闭合每个 ToolCall ID。
-- 持久写入具有可验证 durable/atomic 边界；unknown schema、中间损坏、伪造引用和跨 Session 访问 fail closed。
-- 不新增第三方运行时依赖，不将固定 Context 窗口暴露为模型或用户配置。
-- 测试必须注入临时 Session root，不得写入真实用户目录。
-- 诊断和日志不包含 API key、完整外置 Tool Result、Provider native payload 或未脱敏异常。
-
-## 设计骨架
+Provider capability resolver 是 Integration 的可选实现：Anthropic 可映射 Models API；OpenAI Models API 不作为 Context Window 来源；OpenAI-compatible 要求显式配置。当前不增加 Gemini Provider，只保留可映射独立 input/output limit 的通用 contract 测试。
 
 ```text
-Package Prompt Asset + Core Runtime Contract + Runtime/Environment Facts
-                                +
-Session append-only Interaction History + active Compact Projection
-                                |
-                                v
-                     Context Compiler / Budget
-                                |
-                                v
-                         Context Snapshot
-                                |
-                ToolDefinition + Provider request
-
-large Tool result -> atomic Session result file -> bounded preview/ref
-                                                   -> ToolResultRead
+POLICY_CAP = 258_000
+effective_input_limit = min(POLICY_CAP, limits.max_input_tokens)
 ```
 
-Session History 保存“发生过什么”；Projection 表达“当前怎么看”；Context Compiler 决定“本轮模型看到什么”；Runtime State 保存“当前执行事实”；Runtime Log 只保存诊断事实。
+`max_output_tokens` 独立验证；Provider 如只发布 combined window，由 resolver 依据真实协议和输出 reserve 归一化。overflow 是受控最后保护，不是 discovery。
 
-## 能力欠账
+## 5. Compiler algorithm
 
-| 来源 | 欠账需求 | 回补前置 / 触发条件 |
-| --- | --- | --- |
-| T09 Prompt / Context Engineering | `/resume` 只恢复最后一个已完整提交的安全边界并开始新 Turn；不恢复退出时仍 active/paused 的 Turn、Pending Tool、Permission、AskUser、Provider 请求或协程位置。 | 后续启动正式 Persistent Runtime Recovery，并回补 T05/T06 跨进程运行状态恢复时。 |
+1. 验证 resolved limits 与 Source contract。
+2. 构造稳定指令序列并计算规范化 fingerprint、token estimate、change reason；工具 schema 可单独 fingerprint。
+3. 放入 Protected Context：稳定指令、current user、未闭合 unit、必要协议。
+4. 加入当前 Projection。
+5. 从新到旧选择 recent complete semantic units，ref/preview 跟随 unit；无 relevance scorer。
+6. 在尾部加入 instruction/runtime/environment deltas。
+7. 若超过 effective limit，在合法 unit boundary 裁剪；需要时请求 Compaction 后重新编译一次。
+8. 产出不可变 Snapshot 和 selected/omitted reasons。
 
-## Out of Scope
+`ContextSnapshot` 至少记录：effective/policy/model limits、token estimate、selected/omitted block ids、Projection revision、instruction epoch、stable prefix estimated tokens/fingerprint/changed/reason、可选 tool schema fingerprint。
 
-- active/paused Turn、Pending Tool/Permission/AskUser 和 Tool side effect 的跨进程恢复或重放。
-- 跨项目全局 Session Browser、Fork、Worktree、Memory、Dream、Skill、MCP、Subagent 和 Multi-Agent。
-- 后台 Context Agent/Worker、Structured Notes、Scheduler、工作流框架或第二 Agent Runtime。
-- Provider-specific Prompt Overlay、cache-control、Context Window 和 retry policy。
-- 用户 Prompt 系统、向量数据库、通用 Artifact Store/GC、Context Source Registry 或 Projection DSL。
-- OS Sandbox、SQLite checkpoint 和旧 Re:UthCode 兼容层。
+仅 runtime delta 改变时，stable prefix fingerprint 必须保持不变；不得把动态 state 插入稳定前缀与 retained history 之间。
 
-## 验收标准
+## 6. Token estimation
 
-1. 所有正式 Agent Turn 由唯一 Context Compiler 产生预算内 Snapshot，不再无条件发送全部 Run 消息。
-2. Session identity 独立于 Run/Turn；同 Session 可跨 Turn、跨进程继续，只有 `/new` 创建新 Session。
-3. 语义历史 append-only；压缩只追加 Projection，既有 Interaction 和旧 Projection 不被改写或删除。
-4. Runtime Log 丢失不改变 Session 语义恢复；stream delta、UI lifecycle 和 ToolProgress 不进入语义历史。
-5. 大 Tool Result 完整持久且 hash 可核对，模型只收到有界 preview/ref；专用工具只能重读当前 Session 引用。
-6. Prompt asset、Core Contract、Runtime State、Environment Facts 和 ToolDefinition 各有唯一权威来源，不存在 Provider-specific 分支或 schema 手写副本。
-7. Context policy 固定使用 258K 总窗口，输出预留、安全余量、Tool schema 估算和受保护 Source 全部进入预算。
-8. manual/auto/reactive Compaction 均在安全边界执行；reactive retry 最多一次；失败、取消、ToolCall 或无效 summary 不改变 active Projection。
-9. `/compact`、`/new`、`/resume` 不再为占位；Session Picker 和 Context usage 展示符合已确认交互，Interface 不拥有 Session 业务真值。
-10. TaskState/PlanState 仍是 Core Runtime authority；Compaction 不以 summary 替代结构化状态，跨 Turn 规则有正常和中断路径测试。
-11. B01 可报告 Context diagnostics 并执行同指纹 before/after compare，概率性效果不作为 pytest 硬门禁。
-12. Headless 端到端链路、定向与全量 pytest、compileall、pip check、架构边界、UTF-8/fence 检查和 `git diff --check` 都留下精确结果。
-13. 相关用户手册、Tool 清单、Core Design、当前事实和索引与最终 `src/ + tests/` 一致，不把 Out of Scope 写成已实现。
+- estimator 是 provider-independent port；Provider-specific tokenizer 可由 Integration 注入，稳定 fallback 只用于估算，不充当模型限制发现。
+- 所有消息、工具 schema、结构开销和外置 preview 都计入；诊断显示 estimate，不声称等于 Provider billing。
+- effective input limit 不以 258K 或 overflow 回填未知物理限制。
+
+## 7. Tool Result persistence
+
+- `ToolResultPolicy` 包含基于证据确定的 inline threshold、preview limit、single-result hard cap、session quota、read page limit。
+- 外置写入先检查声明/流式累计大小与 session quota，使用同 Session 临时文件、fsync、atomic rename，再写 History ref。
+- 失败删除临时文件，产生受控 error result；没有 dangling ref。
+- ref 为不可猜路径语义的 opaque id，解析后验证 session ownership、hash/size，read 只接受 ref + bounded offset/limit。
+- 无通用路径读取，无跨 Session 读取，无 GC。
+
+## 8. Session store and locking
+
+### 8.1 Layout
+
+```text
+sessions/<session-id>/
+├─ metadata.json
+├─ history.jsonl
+├─ runtime.jsonl
+├─ writer.lock
+└─ tool-results/
+```
+
+metadata 和 record envelope 版本化；history append-only，active Projection 由最后一个合法 ProjectionRecord 推导，不维护可变 pointer 文件。`runtime.jsonl` 只保存非权威 lifecycle/diagnostics/Eval facts，删除它不改变语义恢复；stream delta、ToolProgress、UsageUpdated 与 UI lifecycle 不写入 history。写入 sequence 前持有 writer lock。实现使用进程持有的跨平台 OS advisory/exclusive lock（Windows/POSIX 适配），不是可残留的纯存在性锁；busy 明确失败。
+
+### 8.2 Commit and recovery
+
+- append 采用完整 JSONL record + flush/fsync；关联 metadata/projection 采用 temp + atomic replace。
+- 只恢复连续 strict sequence 和最后完整 commit boundary；损坏中段 fail closed，尾部不完整记录可诊断并忽略。
+- resume 先 lock，后读取/重建，再允许新 Turn append。
+- release 在 `/new`、Session close 或进程退出时发生。
+
+### 8.3 Runtime boundary
+
+Session store 不序列化 T08 内存 TaskState/PlanState checkpoint。跨进程恢复得到新 Run/Turn；同进程 continuation 继续由现有 Application 规则负责。
+
+## 9. Compaction
+
+`CompactionPolicy` 至少含 input budget、output reserve、summary hard cap、auto trigger threshold。每次请求使用 compactor 自身 resolved limits 与 policy cap；`prior projection + selected units` 必须在预算内。
+
+超大候选按完整 semantic units 形成按时间顺序的有界滚动批次，每批以先前 summary 作为输入并受 hard cap；不拆 ToolCall/ToolResult，不调用工具，不生成层级图。single-flight 保证每 Session 一次；失败保留旧 revision。
+
+Projection schema 至少保留目标/约束/决策/已做工作/未完成项/关键证据 ref/覆盖范围，明确其 authority=`history_projection`。
+
+## 10. Runtime and provider integration
+
+- Application 在每次 Provider request 前调用 Compiler，传入 resolved limits；RunState 仍是唯一写入者。
+- Provider mapper 保留 semantic order/authority，并将 ToolCall/ToolResult 转为合法协议形状。
+- Provider 返回 cache metrics 时继续映射现有 Usage 计数，并在 Context diagnostics 中记录 availability/provenance；现有 Usage 默认 0 可保留以避免破坏累计语义，但 Provider 不支持时必须报告 `not_available`，不能把默认 0 冒充 Provider 实测值。
+- overflow 归一为受控 error；最多触发一次预算重编译/压缩保护，仍失败则停止。
+
+## 11. Commands and UI
+
+- `/compact [focus]`：Application compaction use case。
+- `/new`：关闭旧 Session/lock，创建新 Session。
+- `/resume [id]`：获取 lock、恢复 History/Projection、创建新 Turn；busy/损坏显式失败。
+- `/status`：used/effective limit、258K cap、model limit source、projection revision、compact count、prefix/cache diagnostics。
+- TUI ring 使用 `used/effective_input_limit`；Headless 无 TUI 依赖。
+
+`project_key` 为规范物理 Git root；非 Git 目录使用规范物理 launch workdir。Picker 只显示同 project key Session，按 durable last_used_at 倒序，每页 10 条；上下选择、左右翻页、Enter 恢复、Esc 无副作用返回。条目显示 last-used time 与第一条 User Message 单行 bounded preview，不使用 mtime。至少 21 个候选覆盖分页。`/status` 与输入区 ring 使用 Application 同一 usage projection；草稿不计入、不可用显示 unavailable、窄终端不破坏输入。
+
+## 12. Diagnostics and Eval
+
+新增事件/快照 diagnostics：selected/omitted、externalized、compact start/end/fail、session busy/recovery、stable prefix fields、optional provider cache read/write tokens。不得记录秘密或完整敏感 Tool Result。
+
+Eval 以 baseline/candidate 报告比较 success、tokens、tool calls、compact count、rediscovery、repeated exploration、externalization、prefix stability 与可用 cache reuse；不以策略优劣作为 pytest 必须红绿。
+
+## 13. 非功能要求
+
+- 架构：Core provider-independent、无 filesystem/SDK/UI；Interface 只通过 Application。
+- 确定性：相同 Sources/limits/policy 产生相同 Snapshot/fingerprint/reasons。
+- 安全：秘密不进入 Prompt、History、Log、diagnostics；ref 不是路径读取接口；未知限制 fail closed。
+- 可靠性：append durable、single writer、partial-tail 可恢复、中段损坏硬失败；Tool 副作用未知时不重试。
+- 性能：稳定前缀尽量复用；动态 delta 不无意义打碎长历史；Compactor/Tool Result 均有硬上限。
+- 可移植性：Windows/POSIX 锁与路径身份语义有测试；不新增运行时第三方依赖。
+
+## 14. 能力欠账
+
+T09 后置：active/paused Runtime checkpoint；Task/Plan/Pending Tool/Permission/AskUser/Provider continuation 的跨进程恢复；久远证据 Retrieval/Memory；Artifact GC；高级层级压缩/后台 Context Agent；Skill/MCP/Subagent/Multi-Agent context。AGENTS、Model Limits、single writer、Compactor budget 和 Result quota 不属于欠账。
+
+## 15. Out of Scope
+
+不实施 Memory、长期记忆、Skill、MCP deferred loading、Subagent/Multi-Agent、Embedding/Vector DB、复杂 Artifact Store/GC、Provider-specific Prompt/Overlay、模型专用 Context policy、复杂 Progressive Compression Graph、后台上下文 Agent、OS Sandbox 或旧行为兼容层。
+
+## 16. 验收标准
+
+必须覆盖：prefix stability、authority non-escalation、small/large-window、unknown compatible model、完整 AGENTS frozen semantics、compactor overflow、concurrent resume、runtime recovery boundary、result hard cap/quota/ref isolation、strict sequence/durable append，以及 Provider mapper/Usage 可选 cache metrics。
+
+最终执行定向、架构和全量测试，并同步任务书指定文档。未运行项必须明确记录。

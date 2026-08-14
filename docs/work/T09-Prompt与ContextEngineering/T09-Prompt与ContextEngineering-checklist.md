@@ -1,75 +1,82 @@
 # T09 Prompt 与 Context Engineering Checklist
 
-## Task 1 — Prompt Asset 与 Core Runtime Contract 分离
+> 名称和顺序与 Tasks 完全一致；仅在有代码、测试和 Worker Feedback 证据后勾选。
 
-- [ ] 执行 `python -m pytest -q tests/test_system_prompt.py`，覆盖 asset 缺失/空文本、source/wheel package resource、确定顺序和 stable prefix，全部通过。
-- [ ] 检查 `coding_agent.md` 不含 BehaviorMode、Plan/Task、RuntimeFeedback 和 Tool schema，修改 asset 不能删除 Core Runtime Contract。
+## Task 1：Prompt Asset、Context Source 与权限平面
 
-## Task 2 — Semantic History / Projection Core Contract
+- [ ] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
+- [ ] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
+- [ ] 构造长历史只更新 TaskState，观察 stable-prefix fingerprint 不变，动态 delta 位于历史尾部附近。
 
-- [ ] 执行 `python -m pytest -q tests/test_history_contract.py`，覆盖九类 Interaction、Projection round-trip、unknown schema/kind、sequence/id/ref 和 boundary 失败路径，全部通过。
-- [ ] 构造 ToolCall/ToolResult 配对中间的 compact boundary，观察到受控拒绝且原 records 不变。
+## Task 2：AGENTS / Project Instructions Loader
 
-## Task 3 — JSONL Session Files 与 Runtime Log
+- [ ] 执行 `python -m pytest -q tests/test_project_instructions.py tests/test_architecture_boundaries.py`，全部通过。
+- [ ] 覆盖 user/root/directory scope、整行单双引号 `@include`、递归、3 个额外文件、第 4 个失败、物理去重、Windows case-fold、直接/间接循环、越界、代码围栏/行内代码忽略。
+- [ ] 从 Read/Edit 路径首次进入子目录，观察只追加新命中 instruction delta；Core/Interface 不直接读文件。
 
-- [ ] 执行 `python -m pytest -q tests/test_session_files.py`，覆盖 durable append、严格 sequence、尾部半写容错、中间损坏硬失败、unknown semantic kind 和 runtime log 非权威性，全部通过。
-- [ ] 用两个 project key 和超过 10 个 Session 验证候选只返回当前项目，按 durable `last_used_at DESC` 排序，并能读取首条 User Message preview。
-- [ ] 重建 Session service 后，观察到原 session id、完整 Interaction、最新合法 Projection 和 result namespace 保持，且测试只写入临时 root。
+## Task 3：Canonical History 与 Projection 基础
 
-## Task 4 — 大 Tool Result 外置与 ToolResultRead
+- [ ] 执行 `python -m pytest -q tests/test_history_contract.py`，覆盖 schema/kind/sequence/round-trip/unknown 值，全部通过。
+- [ ] 在 ToolCall/ToolResult 中间选择或 compact，观察受控拒绝且既有 records 字节不变。
+- [ ] 验证 Projection revision/previous link 不回写 History，Runtime Log/stream/UI facts 不进入语义历史。
 
-- [ ] 执行 `python -m pytest -q tests/test_tool_core.py tests/test_provider_contract.py tests/test_agent_loop.py tests/test_tool_result_persistence.py`，全部通过。
-- [ ] 在外置阈值上下分别执行 Tool；大结果持久文件 hash 与原文相同，模型 working view 只含确定 preview/ref/size，小结果保持 inline。
-- [ ] 对有效 range、伪造 ref、路径文本、跨 Session ref 和写入失败路径执行测试，观察到 fail closed，且 ToolCall ID、FIFO、is_error、Permission 与取消语义不变。
+## Task 4：Model Limits、Context Compiler 与确定性 Working Set
 
-## Task 5 — Context Compiler、Budget 与 Working Set
+- [ ] 执行 `python -m pytest -q tests/test_model_limits.py tests/test_context_compiler.py tests/test_configuration.py tests/test_config_loader_integration.py`，全部通过。
+- [ ] 验证 128K 模型使用不超过 128K、>258K 模型最多 258K，均在首个 Provider 请求前解析。
+- [ ] 未知 compatible model 无可靠 metadata/用户声明时前置失败；搜索实现确认无 model-name substring 窗口猜测和 overflow discovery。
+- [ ] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
 
-- [ ] 执行 `python -m pytest -q tests/test_context_compiler.py`，覆盖相同输入确定性、固定 258K window、预算正好/超限、Tool schema 估算、output reserve 和 safety margin，全部通过。
-- [ ] 构造超预算历史，观察到 current user、Runtime State、active Projection、Environment 必需事实与未闭合 Tool 语义单元被保留，recent tail 从完整安全边界开始。
-- [ ] 检查 Context diagnostics 可 JSON/display-safe，不包含 API key、完整外置 Tool Result、Provider native payload 或未脱敏异常。
+## Task 5：Session Store、durable append 与 single writer
 
-## Task 6 — 按需 Compactor 与 Projection Commit
+- [ ] 执行 `python -m pytest -q tests/test_session_files.py`，覆盖 monotonic sequence、durable append、尾部半写、中段损坏、unknown kind，全部通过。
+- [ ] 启动两个子进程 resume 同一 Session，观察只有一个取得 writer lock，另一方 session busy，无双 sequence/history corruption。
+- [ ] 删除 runtime log 后恢复结果不变；同 project key 可发现，其他项目不可见；last_used 不依赖 mtime。
+- [ ] 跨进程恢复新 Run/Turn 且 TaskState/PlanState 未被假装 checkpoint；同进程 continuation 仍按 T08 回归通过。
 
-- [ ] 执行 `python -m pytest -q tests/test_context_compaction.py`，覆盖 manual、auto、reactive overflow 单次 retry、第二次 overflow 硬失败、取消、ToolCall/invalid summary 拒绝和二次 compact，全部通过。
-- [ ] 对每个失败路径比较 compact 前后 history，观察到无新 Projection 且 active Projection 不变；成功两次时观察到两条不可变 Projection 和正确 previous link。
-- [ ] 检查 Compactor request 不携带 Tool、Permission、UI state、Runtime Log 或 AgentLoop，且取消沿现有 token 传播。
+## Task 6：大 Tool Result 外置与资源上限
 
-## Task 7 — 跨 Turn Runtime State 与正式 Request Composition
+- [ ] 执行 tool/provider/result persistence 定向测试，阈值下 inline、阈值上完整文件 hash 等于原文且 working view bounded。
+- [ ] 单 Result hard cap、Session quota、写入失败均返回受控结果，无 partial file/dangling ref；Feedback 记录数值选择证据。
+- [ ] 有效 range 可读；伪造 ref、路径文本、跨 Session ref、过大 range 全部 fail closed。
+- [ ] ToolCall ID、FIFO、Permission、`is_error`、取消和普通错误回归不变。
 
-- [ ] 执行 `python -m pytest -q tests/test_agent_loop.py tests/test_application_runs.py tests/test_application_runtime.py`，覆盖多 Turn、completed reset、failed/cancelled unfinished continuation、approved Plan、one-shot feedback 清理和 compaction 前后，全部通过。
-- [ ] 记录 Fake Provider 收到的正式 Agent requests，断言消费 Context Snapshot 而不是无条件全量 Run messages，同时 RunState 仍由 Agent Loop 唯一写入。
-- [ ] 执行 T06/T08 Pause、AskUser、Permission、Plan Review、Steering 回归，观察到不重放 Tool、不创建第二 Turn，且 Task/Plan 不被 summary 替代。
+## Task 7：有界 Compaction 与 Runtime Request Composition
 
-## Task 8 — `/compact`、`/new`、`/resume` 与 TUI 产品闭环
+- [ ] 执行 `python -m pytest -q tests/test_context_compaction.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
+- [ ] 待压缩历史超过 Compactor input budget 时按完整 semantic unit 有界滚动分批，每批输入/输出受限且 ToolCall/ToolResult 不拆。
+- [ ] manual/auto/一次 overflow 保护、single-flight、取消/非法 summary/ToolCall/二次 overflow 失败路径均不改变旧 Projection/History。
+- [ ] 记录 Fake Provider request，观察正式路径消费 ContextSnapshot，Projection 是 history authority，Core 无 Provider 名称分支。
 
-- [ ] 执行 `python -m pytest -q tests/test_command_registry.py tests/test_command_completion.py tests/test_command_dispatcher.py tests/test_tui.py`，三个命令不再返回 NOT_IMPLEMENTED，全部用例通过。
-- [ ] 验证 idle `/compact` 成功或明确无需压缩，active Turn 返回 unavailable 且不暂停/截断原 Turn；`/new` 创建新 session id 且旧 Session 文件字节不变。
-- [ ] 以至少 21 个当前项目 Session 验证 Picker：`last_used_at DESC`、每页 10 条、上下选择、左右翻页、单行首 User Message 省略、Enter 恢复、Esc 不切换 Session。
-- [ ] 重启式恢复后观察到原 session id、完整 transcript、最新 Projection 和 result ref 可用，同时没有恢复旧 active/paused Turn、waiter 或 Provider continuation。
-- [ ] `/status` 显示线性进度、used/258K 和百分比；输入区显示环形状态与同一百分比；unavailable 和窄终端降级有测试，`/clear` 仍不更换 Session。
+## Task 8：Session Slash Commands 与 TUI Context Status
 
-## Task 9 — B01 Context Diagnostics 与 Before/After Eval
+- [ ] 执行 command/TUI 定向测试，`/compact`、`/new`、`/resume` 不再 NOT_IMPLEMENTED；active compact unavailable，`/clear` 不换 Session。
+- [ ] 以至少 21 个同项目 Session 验证 durable last-used 倒序、每页 10 条、首 User 单行 preview/省略、上下选择、左右翻页、Enter、Esc 无副作用；其他 project key 不出现。
+- [ ] 并发 busy、损坏、未知 Session 有明确错误；resume 恢复同 session id/history/projection/ref 并开始新 Turn。
+- [ ] `/status` 线性条和输入区 ring 使用同一 Application usage；128K/1M 分母分别为 effective limit，另显示 258K policy cap；unavailable/窄终端/Headless 通过。
 
-- [ ] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py`，覆盖 compact count、estimated/actual input、selected/omitted interactions、evidence retention/rediscovery、repeated exploration、externalized count/bytes 和 read hits，全部通过。
-- [ ] 对没有 Context facts 的 attempt 断言对应维度为 `not_available`，不由 Eval 估算或猜测；安全字段不包含完整 Tool Result 或秘密。
-- [ ] 用相同模型、任务和运行参数的 fixture 验证 pre/post report 可 compare，且概率性质量不作为 pytest 成败断言。
+## Task 9：Context Diagnostics 与 Eval
 
-## Task 10 — [接入主流程] 正式 Composition 收口
+- [ ] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py` 及新增 diagnostics tests，全部通过。
+- [ ] baseline/candidate 报告包含 success/tokens/tool calls/compact/rediscovery/repeated exploration/externalization/stable prefix/cache reuse（可获得时）。
+- [ ] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；安全投影不含秘密或完整外置结果。
+- [ ] 长历史不变仅 Runtime State 更新的 fixture 能检测 prefix 回归；候选策略不要求在 pytest 中概率性胜出。
 
-- [ ] 从 `create_application` 创建 Headless Run，执行多 Turn、大 Tool Result、ToolResultRead、manual/auto compact、重建 Application 后 resume 与 final，整条 Fake Provider 用例通过。
-- [ ] 执行 `rg -n "RunState\.messages|_DEFAULT_MAX_RESULT_CHARS|Output truncated to 10000|NOT_IMPLEMENTED" src/uthcode`，所有命中均能被证明不再是正式 Agent Context 直通、永久 Tool Result 截断或三命令占位。
-- [ ] 执行 `python -m pytest -q tests/test_architecture_boundaries.py`，Core 不依赖 filesystem/SDK/Interface，Interface 不直连 Core/Integration Session Store，全部通过。
+## Task 10：[接入主流程] 正式 Context Composition 收口
 
-## Task 11 — [端到端验证] Context / Compaction / Evidence
+- [ ] 从正式 `create_application` Headless 入口执行多 Turn → 大结果 → ToolResultRead → compact → 重建 resume → final，全部通过。
+- [ ] 执行 `python -m pytest -q tests/test_architecture_boundaries.py`，Core 不依赖 filesystem/SDK/Interface，Interface 不直连 Integration Session Store。
+- [ ] 执行静态扫描，正式 Agent path 无全量 `RunState.messages` 直通、永久 10K 截断和三个命令占位。
 
-- [ ] 执行 T09 端到端用例，覆盖多 Turn、new/resume/picker/status、大结果重读、manual/auto/reactive compact、二次 Projection、Task/Plan 独立、失败不破坏和 diagnostics，全部通过。
-- [ ] 执行 `python -m pytest -q`，记录 passed/failed/skipped 精确数量和耗时。
-- [ ] 执行 `python -m compileall -q src tests eval` 和 `python -m pip check`，两者均退出 0。
+## Task 11：[端到端验证] Context / Session / Prefix
 
-## Task 12 — [遗留负担清理] 单历史 / 单 Context Path 收口
+- [ ] 从真实入口覆盖 prefix stability、authority、small/large/unknown model、AGENTS、compactor overflow、concurrent resume、runtime boundary、quota/ref、Picker。
+- [ ] 执行 `python -m pytest -q`，记录精确 passed/failed/skipped 和耗时。
+- [ ] 执行 `python -m compileall -q src tests eval` 与 `python -m pip check`，均退出 0。
 
-- [ ] 扫描 `src tests docs eval`，确认不存在永久 10k Tool Result 截断、Interface history authority、Context Compiler 写 Task/Plan、AgentEvent 全量持久化、Prompt Tool schema 副本、fake user compact summary 和 mutable history rewrite。
-- [ ] 扫描并确认未引入 Context Worker/Scheduler/第二 Loop、SQLite checkpoint、Context Source Registry、无调用方 Artifact Repository、Provider-specific Context 分支或旧行为兼容层。
-- [ ] 根据 `docs/README.md` 维护映射核对 `docs/Tools.md`、命令手册、相关 Core Design、A01/A03/A04/TUI 当前事实和索引，与当前 `src/ + tests/` 一致。
-- [ ] 对所有改动 Markdown 执行 UTF-8 decoding、replacement character、mojibake 和 fence balance 检查，全部通过；内链有效，示例不含真实秘密。
-- [ ] 执行 `git diff --check` 和 `git status --short`，无 whitespace error，变更只包含 T09 授权范围，且未执行 commit、push、merge、rebase、tag、release 或工作包归档。
+## Task 12：[遗留负担清理] 单历史 / 单 Context Path 收口
+
+- [ ] 扫描 `src tests docs eval`，不存在重复 Loader/Context path、mutable history rewrite、任意路径 result read、第二 Loop/Scheduler、SQLite checkpoint、动态 Context Source Registry、relevance/embedding 或兼容壳。
+- [ ] 按 `docs/README.md` 维护映射同步 UserManual、Tools、A01/A03/A04/TUI、Context-Index、OutstandingDebtList，与最终 `src/ + tests/` 一致。
+- [ ] 对改动 Markdown 执行 strict UTF-8、replacement character、常见 mojibake、fence balance 与链接检查，全部通过。
+- [ ] 执行 `git diff --check` 和 `git status --short`，无 whitespace error，范围仅含 T09，且未归档或执行 Git 写入。

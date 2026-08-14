@@ -1,32 +1,39 @@
-# W03 Compaction / Runtime Composition Worker Prompt
+# W03 Tool Result / Compaction / Runtime Composition Worker Prompt
 
-## 执行范围
+## 任务范围
 
-在 W01、W02 完成后，严格串行执行 Task 6 → Task 7。不执行 Slash/TUI、Eval 或包级文档收口。
+只执行：
+
+- Task 6：大 Tool Result 外置与资源上限
+- Task 7：有界 Compaction 与 Runtime Request Composition
+
+先读取 W01/W02 Feedback，核验 History、Compiler、Session store 和 limits contract。
 
 ## 必须读取
 
-1. `AGENTS.md`、`docs/rules/WorkPackageRules.md`，本工作包原始需求、Spec、Tasks、Checklist 和 W01/W02 Feedback。
-2. A01/A03/A04 current context，Task 6～7 列出的当前源码/测试，T05/T06/T08 归档中 Loop、Pause、Plan/Task/Steering 边界。
+- `AGENTS.md`、项目路由/规则、本工作包四个主文件、W01/W02 Feedback。
+- Tool Core/Application/Integration、Session files、AgentLoop/Run/generation、Provider mapper 与对应 tests。
 
-## 已确认决策
+## 必须交付
 
-- 路线 B：按需 model compaction；不创建 Context Agent、Worker、Scheduler、Graph 或第二 Agent Loop。
-- manual 仅 idle，auto 仅安全 request boundary，reactive 仅明确 context overflow 且同一逻辑请求最多一次 retry。
-- Compactor tool-free，只接受 prior summary + stable semantic head；只在完整有效文本后 commit Projection。
-- completed Turn 收口 active Task/Plan；failed/cancelled + unfinished Task 在同 Session 下一 Turn 延续；one-shot feedback 不延续。
+1. 用代表性输出和文件系统测试确定并在 Feedback 解释 inline/preview/single-result hard cap/session quota/read page limit。
+2. durable externalization、opaque session-scoped ref、bounded ToolResultRead、hash/size 校验；quota 错误不留 partial/dangling ref。
+3. CompactionInputBudget、OutputReserve、SummaryHardCap、single-flight。
+4. 超大候选按完整 semantic units 有界滚动分批；ToolCall/ToolResult 不拆，Compactor tool-free。
+5. Summary 保持 history authority，失败保留旧 Projection/History。
+6. Runtime 每次请求统一经 Compiler；Provider mapper 只转协议；overflow 仅一次最后保护。
+7. 写入 W03 Feedback 并同步 Tasks/Checklist。
 
-## 实施与禁止边界
+## 禁止
 
-- 所有正式 Agent requests 消费 ContextSnapshot；不再无条件传全量 messages。
-- 保持 Provider/model/tool/rule Turn 快照、Pause/Resume、Permission、Steering、FIFO 和 single RunState writer。
-- Compaction 不读写 TaskState/PlanState 权威值，不恢复或重放可能已产生副作用的 Tool。
-- 冻结文件规则与 Checklist 勾选规则同 W01。
+- 不提供任意路径读取，不做跨 Session ref，不建 Artifact GC。
+- 不绕过 compactor 自身预算，不做复杂 summary graph。
+- 不实现 relevance/embedding/Memory、Slash/TUI、Eval 或 Git 写入。
 
-## 测试与验收
+## 验证
 
-执行 Checklist Task 6～7 全部项、T06/T08 定向回归和 architecture boundaries。为 compactor failure/cancel/toolcall/invalid/second overflow 全部断言 history/projection 不破坏。
+覆盖 hard cap、session quota、partial cleanup、ref isolation、compactor-input overflow、合法 boundary 分批、summary authority、single-flight、Provider overflow 不作为 discovery、Core 不依赖 Provider SDK。
 
 ## Feedback
 
-创建 `feedback/W03-compaction-runtime-composition-feedback.md`。记录正式 request 数据流、跨 Turn 状态规则、取消/重试边界、命令精确结果和未完成项。需要第二 Runtime、Provider-specific Core 分支或 side-effect replay 时停止并记录。
+首次创建 `feedback/W03-compaction-runtime-composition-feedback.md`，记录资源上限选择证据、正式 request 数据流、精确测试结果、Checklist 状态和未完成项。不能在合法 semantic boundary 内处理或副作用状态不明时停止。

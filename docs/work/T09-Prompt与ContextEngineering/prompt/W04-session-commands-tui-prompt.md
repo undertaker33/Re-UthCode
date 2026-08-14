@@ -1,32 +1,39 @@
 # W04 Session Commands / TUI Worker Prompt
 
-## 执行范围
+## 任务范围
 
-在 W03 完成后执行 Task 8。不修改 Eval，不执行 Task 9～12。
+只执行：
+
+- Task 8：Session Slash Commands 与 TUI Context Status
+
+先读取 W01～W03 Feedback，核验 use case 后再接 Interface。
 
 ## 必须读取
 
-1. `AGENTS.md`、`docs/rules/WorkPackageRules.md`，本工作包原始需求、Spec、Tasks、Checklist 和 W01～W03 Feedback。
-2. `docs/context/A04-Orchestration/Orchestration-Context.md`、`docs/context/TUI/README.md`、Task 8 列出的 Application command、Session 和 TUI 源码/测试。
+- `AGENTS.md`、项目路由/规则、本工作包四个主文件、W01～W03 Feedback。
+- T02 Slash/TUI 归档证据、A04/TUI current context、command registry/dispatcher/models、TUI app/state/rendering 与 tests。
 
-## 已确认决策
+## 必须交付
 
-- `/compact` idle-only；`/new` 创建新 Session/Run；`/resume` 恢复原 Session identity 但从新 Turn 开始。
-- `/resume` 使用独立 Picker，不复用 slash completion；仅当前 project key，last-used 倒序，每页 10 条。
-- Picker 上下选择、左右翻页、Enter 确认、Esc 取消；Enter 前不改变当前 Session。
-- `/status` 线性进度与输入区环形指示器使用同一 Application usage；TUI 不自行估算。
+1. `/compact [focus]`、`/new`、`/resume [session_id]`、`/status` 的 Application/Slash/TUI 接线。
+2. resume 先取得 single-writer lock，只恢复 last complete History/Projection，创建新 Turn。
+3. 明确 busy、损坏、未知 session、compaction failure 的用户可见错误。
+4. status 显示 used/effective limit、258K policy cap、model limit source、Projection revision、compact count 和可选 prefix/cache 信息。
+5. TUI ring 使用 effective limit；Headless 路径不依赖 TUI。
+6. 独立 Picker 只列同 project key Session，按 durable last_used_at 倒序，每页 10 条；首条 User Message 单行 preview，↑/↓、←/→、Enter、Esc 行为不变，至少 21 条验证分页。
+7. `/status` 与 ring 使用同一 Application usage projection；草稿不计入、不可用不伪造 0、窄终端不破坏输入。
+8. 写入 W04 Feedback 并同步 Tasks/Checklist。
 
-## 实施与禁止边界
+## 禁止
 
-- Interface 只依赖 Application 公共值；Session discovery/filter/sort/reconstruction 和 Context usage 业务语义不进 TUI。
-- 保持 main-buffer scrollback、非 full-screen、无鼠标、已提交内容只追加、IME/focus 和现有最上层 Esc 消费规则。
-- 不把 `/clear` 改成 new/compact，不实现跨项目 Browser 或 active Runtime recovery。
-- 冻结文件规则与 Checklist 勾选规则同 W01。
+- 不宣称跨进程恢复 TaskState/PlanState、Pending Tool、AskUser 等内存 checkpoint。
+- 不把小窗口模型显示成固定 `/258K`。
+- 不直接从 Interface 访问 Session store、Provider、Loader 或 Compiler；不做 Git 写入。
 
-## 测试与验收
+## 验证
 
-执行 Checklist Task 8 全部项，包含至少 21 个 Session 的分页、窄终端省略/usage 降级、Esc 无副作用、same-session reconstruction 和原 TUI 回归；运行 architecture boundaries。
+覆盖命令路由、同进程 continuation/跨进程 resume 区别、session busy、new 释放旧锁、status small/large-window、ring 阈值、Headless 路径和既有 TUI 回归。
 
 ## Feedback
 
-创建 `feedback/W04-session-commands-tui-feedback.md`。记录 Application action 与 TUI projection 边界、Picker 状态机、usage 同源证据、命令精确结果和回归。需要让 Interface 直连 Core/Integration 或改变已确认交互时停止并记录。
+首次创建 `feedback/W04-session-commands-tui-feedback.md`，记录 Application/TUI 边界、Picker 状态机、usage 同源证据、精确测试结果与 Checklist 状态。若必须让 Interface 拥有 Session 业务或改变已确认键盘语义，停止并报告。
