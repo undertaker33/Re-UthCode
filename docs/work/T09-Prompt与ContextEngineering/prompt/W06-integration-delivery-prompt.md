@@ -17,8 +17,8 @@
 
 ## 必须交付
 
-1. 验证 Prompt → Instructions → History/Projection → Limits/Compiler → Session/Results → Compaction → Slash/TUI → Eval 全链路。
-2. 端到端覆盖 prefix stability、authority、small/large/unknown model、AGENTS、compactor overflow、concurrent resume、runtime recovery boundary、result quota/ref。
+1. 验证 Prompt → Instructions → History/Projection → fixed 258K Budget/Compiler → Session/Results → Compaction → Slash/TUI → Eval 全链路。
+2. 端到端覆盖 prefix stability、authority spoof rejection、fixed 258K、AGENTS、compactor overflow、concurrent resume、runtime recovery boundary、result quota/ref 与 execution/persistence outcome。
 3. 运行定向、`tests/test_architecture_boundaries.py` 与全量测试，记录精确结果。
 4. 同步 State/Interface Context、UserManual、Context-Index、OutstandingDebtList、Tasks/Checklist；保留真实后置欠账。
 5. 删除本包替代出的重复/不可达路径，不保留兼容壳。
@@ -27,16 +27,17 @@
 
 ## 一致性审查清单
 
-- 258K 只写为 policy cap。
+- 258K 只写为 T09 固定 Context Operating Budget，不冒充远端模型物理窗口。
 - 当前 Runtime AGENTS 状态与历史冻结语义表述一致。
 - stable prefix 后没有动态 state 再阻断长历史。
 - Projection 没有 System/Core authority 升级。
-- unknown model 无猜测/overflow discovery。
+- T09 中没有 Model Limits discovery、不同窗口适配或 Operating Profile 阈值优化；这些只出现在 T09-1 欠账。
 - Working Set 无隐藏 relevance 算法。
 - Compactor 有独立硬预算。
 - Session 是 single writer。
 - `/resume` 不承诺 Runtime checkpoint。
 - Tool Result 有最薄资源上限且 ref 非路径接口。
+- Tool 已执行后的 persistence failure 不伪造未执行，也不触发副作用自动重试。
 - Eval 包含 prefix/cache 诊断。
 
 未运行或被阻塞项必须明确列出，不得称完成。

@@ -18,8 +18,8 @@
 
 ## 必须交付
 
-1. 版本化 Public Coding Prompt/Core Contract 和 typed Context Source/authority contract。
-2. 稳定指令前缀与上下文平面分离；Projection 始终是历史权限。
+1. Public Coding Prompt 迁入版本化 package asset；Core Runtime Contract 继续由 Core 权威维护，两者不得合并成可编辑 asset。
+2. 稳定指令前缀与上下文平面分离；Projection 始终是历史权限；Core Contract 定义 runtime-authenticated update 的 authority transport 语义。
 3. 当前架构中的 AGENTS Loader：用户级、项目根、目录级惰性 scope。
 4. 严格实现历史语义：整行 `@include(...)`、递归、最多 3 个额外引用、物理路径去重、Windows case-fold、循环/越界/代码块处理和显式诊断。
 5. append-only History、strict sequence、semantic unit、Projection revision；ToolCall/ToolResult 不拆。
@@ -28,12 +28,12 @@
 ## 禁止
 
 - 不把裸 `@file` 发明成另一套语法，不把仓库自身 AGENTS 当成 Runtime 已实现事实。
-- 不实现 Model Limits、Compiler、Session store、Compaction、Slash/TUI、Eval。
+- 不实现 T09-1 Model Limits、Compiler、Session store、Compaction、Slash/TUI、Eval。
 - 不实施 Memory/Skill/MCP/Subagent，不做 Git 写入。
 
 ## 验证
 
-定向覆盖 source authority、prefix ordering、全部 AGENTS frozen semantics、History append-only、Projection non-escalation、semantic-unit 原子性；按改动运行架构测试。
+定向覆盖 source authority、ordinary history 伪造 Runtime/Project 标签仍无对应权限、prefix ordering、全部 AGENTS frozen semantics、History append-only、Projection non-escalation、semantic-unit 原子性；按改动运行架构测试。
 
 ## Feedback
 

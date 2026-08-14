@@ -15,11 +15,11 @@
 
 ## 必须交付
 
-1. `/compact [focus]`、`/new`、`/resume [session_id]`、`/status` 的 Application/Slash/TUI 接线。
+1. 无参数 `/compact`、`/new`、`/resume [session_id]`、`/status` 的 Application/Slash/TUI 接线。
 2. resume 先取得 single-writer lock，只恢复 last complete History/Projection，创建新 Turn。
 3. 明确 busy、损坏、未知 session、compaction failure 的用户可见错误。
-4. status 显示 used/effective limit、258K policy cap、model limit source、Projection revision、compact count 和可选 prefix/cache 信息。
-5. TUI ring 使用 effective limit；Headless 路径不依赖 TUI。
+4. status 显示 used/258K Operating Budget、Projection revision、compact count 和可选 prefix/cache 信息，并说明 258K 不是远端模型物理窗口。
+5. TUI ring 固定使用 258K denominator；Headless 路径不依赖 TUI。
 6. 独立 Picker 只列同 project key Session，按 durable last_used_at 倒序，每页 10 条；首条 User Message 单行 preview，↑/↓、←/→、Enter、Esc 行为不变，至少 21 条验证分页。
 7. `/status` 与 ring 使用同一 Application usage projection；草稿不计入、不可用不伪造 0、窄终端不破坏输入。
 8. 写入 W04 Feedback 并同步 Tasks/Checklist。
@@ -27,12 +27,13 @@
 ## 禁止
 
 - 不宣称跨进程恢复 TaskState/PlanState、Pending Tool、AskUser 等内存 checkpoint。
-- 不把小窗口模型显示成固定 `/258K`。
+- 不实现不同模型动态 denominator 或任何 T09-1 window adaptation。
+- 不接受、持久化或继承 compact focus 参数。
 - 不直接从 Interface 访问 Session store、Provider、Loader 或 Compiler；不做 Git 写入。
 
 ## 验证
 
-覆盖命令路由、同进程 continuation/跨进程 resume 区别、session busy、new 释放旧锁、status small/large-window、ring 阈值、Headless 路径和既有 TUI 回归。
+覆盖命令路由、`/compact` 拒绝额外 focus 语义、同进程 continuation/跨进程 resume 区别、session busy、new 释放旧锁、固定 used/258K、ring 阈值、Headless 路径和既有 TUI 回归。
 
 ## Feedback
 

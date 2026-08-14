@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已按 `685d85d8ad97c733151e3cd54655cf848343753a` 代码基线和历史冻结 AGENTS 语义完成任务包一致性返工；Spec/Tasks/Checklist 与 W01～W06 Prompt 已同步，尚未显式派发任何 Worker Prompt |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `6624e69a5649224055f5674e7e91a28f2bd5d04b` 完成第二轮任务包返工：T09 固定 258K Operating Budget，Model Limits/不同窗口适配后置 T09-1，并补齐 authority transport、无参数 `/compact`、Secret 与 Tool persistence 边界；尚未显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 

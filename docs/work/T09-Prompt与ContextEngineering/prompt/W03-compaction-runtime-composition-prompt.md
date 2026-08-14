@@ -18,11 +18,12 @@
 
 1. 用代表性输出和文件系统测试确定并在 Feedback 解释 inline/preview/single-result hard cap/session quota/read page limit。
 2. durable externalization、opaque session-scoped ref、bounded ToolResultRead、hash/size 校验；quota 错误不留 partial/dangling ref。
-3. CompactionInputBudget、OutputReserve、SummaryHardCap、single-flight。
-4. 超大候选按完整 semantic units 有界滚动分批；ToolCall/ToolResult 不拆，Compactor tool-free。
-5. Summary 保持 history authority，失败保留旧 Projection/History。
-6. Runtime 每次请求统一经 Compiler；Provider mapper 只转协议；overflow 仅一次最后保护。
-7. 写入 W03 Feedback 并同步 Tasks/Checklist。
+3. 分别表达 Tool execution outcome 与 result materialization/persistence outcome；副作用已发生后不伪造 Tool 未执行，不自动重试。
+4. CompactionInputBudget、OutputReserve、SummaryHardCap、single-flight。
+5. 超大候选按完整 semantic units 有界滚动分批；ToolCall/ToolResult 不拆，Compactor tool-free。
+6. Summary 保持 history authority，失败保留旧 Projection/History。
+7. Runtime 每次请求统一经 Compiler；Provider mapper 保留 Runtime/Project authority 和尾部顺序，ordinary history 不能伪造；overflow 仅一次最后保护。
+8. 写入 W03 Feedback 并同步 Tasks/Checklist。
 
 ## 禁止
 
@@ -32,7 +33,7 @@
 
 ## 验证
 
-覆盖 hard cap、session quota、partial cleanup、ref isolation、compactor-input overflow、合法 boundary 分批、summary authority、single-flight、Provider overflow 不作为 discovery、Core 不依赖 Provider SDK。
+覆盖 hard cap、session quota、partial cleanup、ref isolation、execution/persistence failure、不自动重试已产生副作用的 Tool、compactor-input overflow、合法 boundary 分批、summary authority、ordinary-history spoof rejection、single-flight、Provider overflow 不作为 discovery、Core 不依赖 Provider SDK。
 
 ## Feedback
 

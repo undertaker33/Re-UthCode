@@ -22,7 +22,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：Core 定义 provider-independent authority/stability/scope/provenance；asset 只拥有可编辑公共 Prompt；Tool schema 仍由 Tool System 唯一维护。
 - 依赖：无。
 - 参考：T03 归档包、`core/prompt.py`、`core/provider.py`、任务书第 5 节。
-- 完成边界：稳定前缀与 Contextual Plane 顺序可测试；Projection/User/Tool 内容不能升级权限；未实现 Loader/History/Compiler。
+- 完成边界：稳定前缀与 Contextual Plane 顺序可测试；Core Runtime Contract 声明 runtime-authenticated update 语义；Projection/User/Tool 内容不能升级或伪造 Runtime/Project authority；未实现 Loader/History/Compiler。
 
 ## Task 2：AGENTS / Project Instructions Loader
 
@@ -46,16 +46,16 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 参考：T04/T05/T08 当前事实、任务书第 4/11/13 节。
 - 完成边界：ToolCall/ToolResult 不可拆；Projection 不回写 History、不提升权限；同进程 Runtime State 与跨进程 Session resume 合同明确。
 
-## Task 4：Model Limits、Context Compiler 与确定性 Working Set
+## Task 4：Context Compiler、258K Budget 与确定性 Working Set
 
-- 任务目标：解析真实模型限制，以 258K policy cap 编译确定性 Snapshot，并保护 prefix cache。
-- 新增：`src/uthcode/application/model_limits.py`、`src/uthcode/application/context.py`、`src/uthcode/core/context.py`、精确 bundled model metadata 资源（若确有当前官方模型调用方）、`tests/test_model_limits.py`、`tests/test_context_compiler.py`。
-- 修改：`application/configuration.py`、`integrations/config/loader.py`、`integrations/config/template.py`、bootstrap/provider composition 和必要 Provider resolver；配置与架构测试。
-- 删除：固定 258K 作为物理窗口、overflow discovery、model-name substring 推断与“任务相关性”占位逻辑。
-- 文件职责：Integration 只解析可靠 metadata；Application 统一来源/限制；Core Compiler 只消费 resolved limits 和 typed sources。
+- 任务目标：以固定 258K Context Operating Budget 编译确定性 Snapshot，并保护 prefix cache。
+- 新增：`src/uthcode/application/context.py`、`src/uthcode/core/context.py`、`tests/test_context_compiler.py`。
+- 修改：bootstrap/request composition 与必要 Context/architecture tests；不修改 ModelProfile 输入字段或增加 Provider capability resolver。
+- 删除：动态窗口逻辑、按物理窗口百分比 trigger、“任务相关性”占位逻辑和把 258K 描述成远端物理窗口的文案。
+- 文件职责：Application 组装 typed sources 与固定 budget；Core Compiler 做确定性选择；Integration 不解析模型窗口、不拥有 Context policy。
 - 依赖：Task 1～3。
-- 参考：现有 ModelProfile/config security、Provider integrations、Usage cache fields、任务书第 7/8 节。
-- 完成边界：small/large/unknown model、project 不能提高可信上限、Protected Context、recent complete units、ref 跟随 unit、stable-prefix fingerprint 全部通过；无 retriever/embedding。
+- 参考：现有 Provider request/Usage、Prompt/Tool contract、任务书第 5/7/8 节；T09-1 只作欠账边界。
+- 完成边界：Protected Context、recent complete units、ref 跟随 unit、固定 258K budget、stable-prefix fingerprint 全部通过；无 Model Limits、retriever/embedding 或阈值专项优化。
 
 ## Task 5：Session Store、durable append 与 single writer
 
@@ -74,21 +74,21 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 新增：`src/uthcode/integrations/tools/tool_result_read.py`、`tests/test_tool_result_persistence.py`。
 - 修改：`core/tool.py`、`core/provider.py`、`application/tools.py`、`application/runs.py`、`integrations/session_files.py`、tool factory 与既有 tool/provider tests。
 - 删除：永久 10K 数据丢失路径和接受任意路径的读取可能性。
-- 文件职责：Tool 仍返回完整领域结果；Application materialize；Integration durable write/read；ToolResultRead 只接受当前 Session opaque ref。
+- 文件职责：Tool 仍返回完整领域 execution outcome；Application materialize 并分别表达 persistence outcome；Integration durable write/read；ToolResultRead 只接受当前 Session opaque ref。
 - 依赖：Task 3、Task 5。
 - 参考：T04 Tool FIFO/Permission/call-id 合同、任务书第 9 节。
-- 完成边界：用代表性输出/文件系统边界选择并在 Feedback 记录 inline/preview/single-result/session quota/read limit；quota 失败无 partial/dangling ref；不做 Artifact GC。
+- 完成边界：用代表性输出/文件系统边界选择并在 Feedback 记录 inline/preview/single-result/session quota/read limit；quota/persistence 失败无 partial/dangling ref，不伪造 Tool 未执行、不自动重试副作用；不做 Artifact GC。
 
 ## Task 7：有界 Compaction 与 Runtime Request Composition
 
 - 任务目标：让 Compactor 自身受预算约束，并使正式 Provider request 只消费 ContextSnapshot。
 - 新增：`tests/test_context_compaction.py` 及必要 request composition tests。
-- 修改：`application/context.py`、`application/generation.py`、`application/runs.py`、`core/agent.py` 与 Provider mapper tests。
+- 修改：`application/context.py`、`application/generation.py`、`application/runs.py`、`core/provider.py` 的统一 request DTO、`core/agent.py` 与三类 Provider mapper/contract tests。
 - 删除：全量 `RunState.messages` 直通 Provider、无界压缩输入、动态 state 插入稳定前缀和无限 overflow retry。
-- 文件职责：Application 组装 Sources、Compaction single-flight 与一次 overflow 保护；Core 保持唯一 RunState writer；Integration 仅 wire mapping。
+- 文件职责：Application 组装 Sources、Compaction single-flight、一次 overflow 保护及 authority-bearing semantic request；Core 保持唯一 RunState writer；Integration 仅做当前 Provider 最小 wire mapping。
 - 依赖：Task 4、Task 6。
-- 参考：T05 Agent Loop、T06/T08 lifecycle、任务书第 5/10 节。
-- 完成边界：CompactionInputBudget/OutputReserve/SummaryHardCap、完整 unit 滚动分批、tool-free、失败不切 Projection、summary authority 和 provider-independent path 通过。
+- 参考：当前 `GenerationRequest` 只有 `system_prompt + messages` 的事实、T05 Agent Loop、T06/T08 lifecycle、任务书第 5/10 节。
+- 完成边界：CompactionInputBudget/OutputReserve/SummaryHardCap、完整 unit 滚动分批、tool-free、失败不切 Projection、summary authority、ordinary history spoof rejection 和 provider-independent request path 通过；若现有 DTO 不足，在 Core/Application 收口。
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 
@@ -99,7 +99,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：Application 提供 UI-neutral action/catalog/usage；TUI 只持有页码/选择等临时状态并渲染。
 - 依赖：Task 5、Task 7。
 - 参考：T02 Slash/TUI、TUI Context docs、任务书第 11.1 节。
-- 完成边界：同 project key、durable last-used、10 条/页、首 User preview、21 条分页、键盘/Esc、busy/recovery、same usage projection、窄终端与 Headless 全覆盖。
+- 完成边界：同 project key、durable last-used、10 条/页、首 User preview、21 条分页、键盘/Esc、busy/recovery、固定 used/258K usage projection、窄终端与 Headless 全覆盖；不做不同模型 denominator。
 
 ## Task 9：Context Diagnostics 与 Eval
 
@@ -110,7 +110,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：Application 暴露 JSON-safe/脱敏 facts；Eval 只消费公开投影。
 - 依赖：Task 4、Task 7、Task 8 的公开 diagnostics contract。
 - 参考：B01 Spec/Feedback、现有 Usage cache fields、任务书第 8.3/12 节。
-- 完成边界：selected/omitted、compact、rediscovery、externalization、stable prefix、cache availability/provenance 和 runtime-only prefix 回归可比较；真实远程 baseline 仍需另行授权。
+- 完成边界：selected/omitted、compact、rediscovery、externalization、stable prefix、cache availability/provenance、authority spoof 和 execution/persistence failure 回归可比较；无小/大窗口适配 Eval，真实远程 baseline 仍需另行授权。
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
 
@@ -131,7 +131,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：E2E 证明产品行为，不复制单元实现。
 - 依赖：Task 10。
 - 参考：任务书第 12 节与 Checklist。
-- 完成边界：prefix/authority/model limits/AGENTS/compactor overflow/concurrent resume/runtime boundary/quota/Picker 全通过；全量 pytest、compileall、pip check 记录精确结果。
+- 完成边界：prefix/authority/fixed 258K/AGENTS/compactor overflow/concurrent resume/runtime boundary/quota/execution-persistence/Picker 全通过；全量 pytest、compileall、pip check 记录精确结果。
 
 ## Task 12：[遗留负担清理] 单历史 / 单 Context Path 收口
 

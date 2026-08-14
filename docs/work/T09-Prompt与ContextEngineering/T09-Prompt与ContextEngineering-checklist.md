@@ -6,6 +6,7 @@
 
 - [ ] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
 - [ ] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
+- [ ] 普通 User/Tool 历史伪造 Runtime/Project update 标签，观察其不能获得对应 authority；动态 update 不重建到长历史前的 system prefix，也不作为普通 User 裸文本。
 - [ ] 构造长历史只更新 TaskState，观察 stable-prefix fingerprint 不变，动态 delta 位于历史尾部附近。
 
 ## Task 2：AGENTS / Project Instructions Loader
@@ -20,11 +21,11 @@
 - [ ] 在 ToolCall/ToolResult 中间选择或 compact，观察受控拒绝且既有 records 字节不变。
 - [ ] 验证 Projection revision/previous link 不回写 History，Runtime Log/stream/UI facts 不进入语义历史。
 
-## Task 4：Model Limits、Context Compiler 与确定性 Working Set
+## Task 4：Context Compiler、258K Budget 与确定性 Working Set
 
-- [ ] 执行 `python -m pytest -q tests/test_model_limits.py tests/test_context_compiler.py tests/test_configuration.py tests/test_config_loader_integration.py`，全部通过。
-- [ ] 验证 128K 模型使用不超过 128K、>258K 模型最多 258K，均在首个 Provider 请求前解析。
-- [ ] 未知 compatible model 无可靠 metadata/用户声明时前置失败；搜索实现确认无 model-name substring 窗口猜测和 overflow discovery。
+- [ ] 执行 `python -m pytest -q tests/test_context_compiler.py` 及相关 request composition tests，全部通过。
+- [ ] 验证 Compiler、`/status` 与 ring 使用同一固定 258K Operating Budget，并明确不代表远端模型物理窗口。
+- [ ] 搜索 T09 实现确认没有 Model Limits resolver、`max_input_tokens` 配置、Provider/bundled window metadata 或小/大窗口适配。
 - [ ] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
 
 ## Task 5：Session Store、durable append 与 single writer
@@ -38,6 +39,7 @@
 
 - [ ] 执行 tool/provider/result persistence 定向测试，阈值下 inline、阈值上完整文件 hash 等于原文且 working view bounded。
 - [ ] 单 Result hard cap、Session quota、写入失败均返回受控结果，无 partial file/dangling ref；Feedback 记录数值选择证据。
+- [ ] Tool 已成功产生副作用但 persistence 失败时，模型/History/diagnostics 均不显示为 Tool 未执行，且不自动重试该 Tool。
 - [ ] 有效 range 可读；伪造 ref、路径文本、跨 Session ref、过大 range 全部 fail closed。
 - [ ] ToolCall ID、FIFO、Permission、`is_error`、取消和普通错误回归不变。
 
@@ -46,20 +48,20 @@
 - [ ] 执行 `python -m pytest -q tests/test_context_compaction.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
 - [ ] 待压缩历史超过 Compactor input budget 时按完整 semantic unit 有界滚动分批，每批输入/输出受限且 ToolCall/ToolResult 不拆。
 - [ ] manual/auto/一次 overflow 保护、single-flight、取消/非法 summary/ToolCall/二次 overflow 失败路径均不改变旧 Projection/History。
-- [ ] 记录 Fake Provider request，观察正式路径消费 ContextSnapshot，Projection 是 history authority，Core 无 Provider 名称分支。
+- [ ] 记录三类 Provider contract request，观察正式路径消费 ContextSnapshot、Projection 保持 history authority、Runtime/Project update 保留语义且 ordinary history 无法伪造；Integration 无 Context policy。
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 
 - [ ] 执行 command/TUI 定向测试，`/compact`、`/new`、`/resume` 不再 NOT_IMPLEMENTED；active compact unavailable，`/clear` 不换 Session。
 - [ ] 以至少 21 个同项目 Session 验证 durable last-used 倒序、每页 10 条、首 User 单行 preview/省略、上下选择、左右翻页、Enter、Esc 无副作用；其他 project key 不出现。
 - [ ] 并发 busy、损坏、未知 Session 有明确错误；resume 恢复同 session id/history/projection/ref 并开始新 Turn。
-- [ ] `/status` 线性条和输入区 ring 使用同一 Application usage；128K/1M 分母分别为 effective limit，另显示 258K policy cap；unavailable/窄终端/Headless 通过。
+- [ ] `/status` 线性条和输入区 ring 使用同一 Application usage，统一显示 used/258K Operating Budget；unavailable/窄终端/Headless 通过，无动态模型 denominator。
 
 ## Task 9：Context Diagnostics 与 Eval
 
 - [ ] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py` 及新增 diagnostics tests，全部通过。
 - [ ] baseline/candidate 报告包含 success/tokens/tool calls/compact/rediscovery/repeated exploration/externalization/stable prefix/cache reuse（可获得时）。
-- [ ] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；安全投影不含秘密或完整外置结果。
+- [ ] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；diagnostics 不额外复制 Runtime credential、完整外置结果、Provider native payload 或未脱敏内部异常。
 - [ ] 长历史不变仅 Runtime State 更新的 fixture 能检测 prefix 回归；候选策略不要求在 pytest 中概率性胜出。
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
@@ -70,7 +72,7 @@
 
 ## Task 11：[端到端验证] Context / Session / Prefix
 
-- [ ] 从真实入口覆盖 prefix stability、authority、small/large/unknown model、AGENTS、compactor overflow、concurrent resume、runtime boundary、quota/ref、Picker。
+- [ ] 从真实入口覆盖 prefix stability、authority spoof rejection、fixed 258K、AGENTS、compactor overflow、concurrent resume、runtime boundary、quota/ref、execution/persistence outcome、Picker。
 - [ ] 执行 `python -m pytest -q`，记录精确 passed/failed/skipped 和耗时。
 - [ ] 执行 `python -m compileall -q src tests eval` 与 `python -m pip check`，均退出 0。
 

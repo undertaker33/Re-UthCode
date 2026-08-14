@@ -19,14 +19,16 @@
 2. 复用 Provider 现有 cache read/write token Usage 映射并增加 availability/provenance；Provider 不支持时报告 `not_available`，不把现有默认 0 冒充实测值。
 3. baseline/candidate Eval 比较 success、tokens、tool calls、compact count、rediscovery、repeated exploration、externalization、prefix stability/cache reuse。
 4. 加入“长历史不变、仅 TaskState 更新”场景，证明 stable fingerprint 不变并发现 cache prefix 回归。
-5. Eval 只衡量策略，不把“候选必须更优”写为 pytest 通过条件。
-6. 写入 W05 Feedback 并同步 Tasks/Checklist。
+5. 增加 ordinary history 伪造 Runtime/Project 标签仍无对应 authority，以及 Tool 已执行但 persistence 失败不误报/重试的场景。
+6. Eval 只衡量策略，不把“候选必须更优”写为 pytest 通过条件。
+7. 写入 W05 Feedback 并同步 Tasks/Checklist。
 
 ## 禁止
 
-- 不记录 Prompt、秘密或完整敏感 Tool Result。
+- 不额外复制 Runtime credential/API key、完整大型 Tool Result、Provider native payload 或未脱敏内部异常；不承诺通用 Secret/DLP。
 - 不要求所有 Provider 提供相同 cache metrics。
 - 不实施 Memory injection、embedding/retriever、生产上下文策略重写或 Git 写入。
+- 不实现 128K/1M/unknown-model window Eval 或 258K 阈值专项优化；这些属于 T09-1。
 
 ## 验证
 
