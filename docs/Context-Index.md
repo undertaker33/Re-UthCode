@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-13
+snapshot_date: 2026-08-14
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-13
+status_snapshot: 2026-08-14
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| — | — | — | 当前没有未开始或部分实施的工作包 |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 原始需求已移入同名目录，Spec/Tasks/Checklist 与 W01～W06 Prompt 已生成，尚未由用户显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 
