@@ -4,25 +4,25 @@
 
 ## Task 1：Prompt Asset、Context Source 与权限平面
 
-- [ ] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
+- [x] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
 - [ ] 验证 Tool Schema 仅由 Tool System 维护并进入 `GenerationRequest.tools`/Provider native tools；虽计入 token budget、`tool_schema_fingerprint` 与 cache diagnostics，但 Public Prompt/Core Contract/AGENTS 中没有人工副本。
 - [ ] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
-- [ ] 普通 User/Tool 历史伪造 AGENTS/ProjectInstruction/Runtime 标签，观察其仍只在 Conversation Plane，不能进入 Instruction Plane。
+- [x] 普通 User/Tool 历史伪造 AGENTS/ProjectInstruction/Runtime 标签，观察其仍只在 Conversation Plane，不能进入 Instruction Plane。
 - [ ] 构造长历史只更新 TaskState/PlanState，观察 instruction epoch 与 stable instruction prefix fingerprint 不变，动态 facts 位于 Contextual Plane。
 
 ## Task 2：AGENTS / Project Instructions Loader
 
-- [ ] 执行 `python -m pytest -q tests/test_project_instructions.py tests/test_architecture_boundaries.py`，全部通过。
-- [ ] 覆盖 user/root/directory scope、整行单双引号 `@include`、递归、3 个额外文件、第 4 个失败、物理去重、Windows case-fold、直接/间接循环、越界、代码围栏/行内代码忽略。
-- [ ] 从 Read/Edit 路径首次进入子目录并发现新 AGENTS，观察 instruction epoch +1、stable prefix fingerprint 改变、reason 为 scope change，下一次 request 使用新 Instruction Plane；这不是 prefix regression。
-- [ ] 继续访问同一已生效目录且内容未变，观察 instruction epoch/fingerprint 不变；已生效 AGENTS 合法修改时创建新 epoch 并记录 content change；Core/Interface 不直接读文件。
-- [ ] 给定 persisted activated directory scopes，Loader 可从当前文件系统重建 effective instruction set；删除/修改 scope 文件产生明确 change facts，且不扫描 History/Read/Edit ToolCall 推断 scope。
+- [x] 执行 `python -m pytest -q tests/test_project_instructions.py tests/test_architecture_boundaries.py`，全部通过。
+- [x] 覆盖 user/root/directory scope、整行单双引号 `@include`、递归、3 个额外文件、第 4 个失败、物理去重、Windows case-fold、直接/间接循环、越界、代码围栏/行内代码忽略。
+- [x] 从 Read/Edit 路径首次进入子目录并发现新 AGENTS，观察 instruction epoch +1、stable prefix fingerprint 改变、reason 为 scope change，下一次 request 使用新 Instruction Plane；这不是 prefix regression。
+- [x] 继续访问同一已生效目录且内容未变，观察 instruction epoch/fingerprint 不变；已生效 AGENTS 合法修改时创建新 epoch 并记录 content change；Core/Interface 不直接读文件。
+- [x] 给定 persisted activated directory scopes，Loader 可从当前文件系统重建 effective instruction set；删除/修改 scope 文件产生明确 change facts，且不扫描 History/Read/Edit ToolCall 推断 scope。
 
 ## Task 3：Canonical History 与 Projection 基础
 
-- [ ] 执行 `python -m pytest -q tests/test_history_contract.py`，覆盖 schema/kind/sequence/round-trip/unknown 值，全部通过。
-- [ ] 在 ToolCall/ToolResult 中间选择或 compact，观察受控拒绝且既有 records 字节不变。
-- [ ] 验证 Projection revision/previous link 不回写 History，Runtime Log/stream/UI facts 不进入语义历史。
+- [x] 执行 `python -m pytest -q tests/test_history_contract.py`，覆盖 schema/kind/sequence/round-trip/unknown 值，全部通过。
+- [x] 在 ToolCall/ToolResult 中间选择或 compact，观察受控拒绝且既有 records 字节不变。
+- [x] 验证 Projection revision/previous link 不回写 History，Runtime Log/stream/UI facts 不进入语义历史。
 
 ## Task 4：Context Compiler、258K Budget 与确定性 Working Set
 

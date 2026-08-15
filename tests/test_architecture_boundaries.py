@@ -106,6 +106,7 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                 {
                     "uthcode.integrations.config.data",
                     "uthcode.integrations.config.loader",
+                    "uthcode.integrations.instruction_files",
                     "uthcode.integrations.permissions",
                     "uthcode.integrations.providers.factory",
                     "uthcode.integrations.tools.factory",

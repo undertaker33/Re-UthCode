@@ -16,6 +16,23 @@ from .bootstrap import (
     load_effective_config,
 )
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
+from .history import ApplicationHistory, HistoryCoordinator
+from .instructions import (
+    InstructionAuthorization,
+    InstructionBlock,
+    InstructionDiagnostic,
+    InstructionError,
+    InstructionIncludeCycleError,
+    InstructionLoadResult,
+    InstructionLoader,
+    InstructionPathRejectedError,
+    InstructionReadError,
+    InstructionReferenceLimitError,
+    InstructionScope,
+    InstructionSourceNotFoundError,
+    InstructionStateMetadata,
+    parse_instruction_references,
+)
 from .runtime_context import ApplicationRuntimeContext
 from .runs import AgentRun, TurnHandle
 from uthcode.core.interaction import (
@@ -110,6 +127,7 @@ __all__ = [
     "EffectiveConfig",
     "ApplicationStatus",
     "ApplicationRuntimeContext",
+    "ApplicationHistory",
     "AgentEvent",
     "AgentRun",
     "ArgumentSpec",
@@ -137,6 +155,20 @@ __all__ = [
     "GenerationCancelled",
     "GenerationCompleted",
     "GenerationRequest",
+    "InstructionAuthorization",
+    "InstructionBlock",
+    "InstructionDiagnostic",
+    "InstructionError",
+    "InstructionIncludeCycleError",
+    "InstructionLoadResult",
+    "InstructionLoader",
+    "InstructionPathRejectedError",
+    "InstructionReadError",
+    "InstructionReferenceLimitError",
+    "InstructionScope",
+    "InstructionSourceNotFoundError",
+    "InstructionStateMetadata",
+    "HistoryCoordinator",
     "InvocationStatus",
     "LaunchOptions",
     "ModelProfile",
@@ -197,4 +229,5 @@ __all__ = [
     "create_builtin_registry",
     "load_effective_config",
     "parse_command",
+    "parse_instruction_references",
 ]

@@ -38,6 +38,7 @@ from uthcode.core.prompt import (
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
+from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
 
@@ -133,6 +134,7 @@ class UthCodeApplication:
         runtime_context: ApplicationRuntimeContext | None = None,
         tool_service: ApplicationToolService | None = None,
         permission_rules_loader: PermissionRulesLoader | None = None,
+        instruction_loader: InstructionLoader | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -155,8 +157,15 @@ class UthCodeApplication:
             raise TypeError("tool_service must be an ApplicationToolService")
         if permission_rules_loader is not None and not callable(permission_rules_loader):
             raise TypeError("permission_rules_loader must be callable or None")
+        if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
+            raise TypeError("instruction_loader must be InstructionLoader or None")
         self._tool_service = tool_service
         self._permission_rules_loader = permission_rules_loader
+        self._instruction_loader = instruction_loader
+        if self._instruction_loader is not None:
+            # Session-start loading is Application-owned; the loader itself
+            # keeps filesystem policy in its Integration adapter.
+            self._instruction_loader.load_session(strict=False)
         self._current_model_ref = (
             configuration.model if configuration is not None else provider.identity.model
         )
@@ -172,6 +181,12 @@ class UthCodeApplication:
     @property
     def runtime_context(self) -> ApplicationRuntimeContext:
         return self._runtime_context
+
+    @property
+    def instruction_loader(self) -> InstructionLoader | None:
+        """Return the Application-owned current instruction state service."""
+
+        return self._instruction_loader
 
     @property
     def current_model_ref(self) -> str:
@@ -397,14 +412,19 @@ class UthCodeApplication:
             provider_protocol=identity.protocol,
             remote_model_id=identity.model,
         )
-        system_prompt = (
-            build_system_prompt(prompt_context)
-            if runtime_context is None
-            else build_system_prompt(
+        if self._instruction_loader is None and runtime_context is None:
+            # Keep the established no-argument Core call shape for embedded
+            # callers and its precise error boundary.
+            system_prompt = build_system_prompt(prompt_context)
+        else:
+            system_prompt = build_system_prompt(
+                prompt_context,
+                runtime_context=runtime_context,
+                instruction_blocks=self._instruction_loader.effective_instruction_set,
+            ) if self._instruction_loader is not None else build_system_prompt(
                 prompt_context,
                 runtime_context=runtime_context,
             )
-        )
         return replace(request, system_prompt=system_prompt)
 
     async def stream_generation(

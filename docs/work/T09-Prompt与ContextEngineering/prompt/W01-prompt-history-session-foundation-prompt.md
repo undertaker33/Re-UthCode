@@ -23,7 +23,7 @@
 3. 当前架构中的 AGENTS Loader：用户级、项目根、目录级惰性 scope；输出当前有效 instruction set 与可持久化 activated scope 标识，新 scope/内容变化创建 epoch，未变化复用当前 epoch；支持后续 Worker 按 persisted scopes 从当前文件系统重建，不扫描 History 猜 scope。
 4. 严格实现历史语义：整行 `@include(...)`、递归、最多 3 个额外引用、物理路径去重、Windows case-fold、循环/越界/代码块处理和显式诊断。
 5. append-only History、strict sequence、semantic unit、Projection revision；ToolCall/ToolResult 不拆。
-6. 写入 `feedback/W01-feedback.md`，同步 Tasks/Checklist 状态。
+6. 写入 `feedback/W01-prompt-history-session-foundation-feedback.md`，同步 Tasks/Checklist 状态。
 
 ## 禁止
 
