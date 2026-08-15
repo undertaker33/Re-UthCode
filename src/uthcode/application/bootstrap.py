@@ -16,6 +16,10 @@ from uthcode.integrations.config.loader import (
 )
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.permissions import load_permission_rules
+from uthcode.integrations.instruction_files import (
+    InstructionFileReader,
+    discover_project_root,
+)
 from uthcode.core.tool import Tool
 
 from .configuration import (
@@ -27,6 +31,7 @@ from .configuration import (
     ProviderProfile,
 )
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
+from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
 
@@ -134,6 +139,7 @@ def create_application(
     permission_writer=None,
     runtime_context: ApplicationRuntimeContext | None = None,
     tools: Sequence[Tool] | None = None,
+    instruction_loader: InstructionLoader | None = None,
 ) -> UthCodeApplication:
     """Build a Headless Application from one EffectiveConfig."""
 
@@ -150,8 +156,20 @@ def create_application(
         config.current_model,
     )
     writer = model_writer if model_writer is not None else _default_writer(config)
+    if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
+        raise TypeError("instruction_loader must be InstructionLoader or None")
+    loader = instruction_loader
+    if loader is None:
+        loader = InstructionLoader(
+            user_root=_instruction_user_root(config),
+            project_root=discover_project_root(runtime_context.workdir),
+            reader=InstructionFileReader(),
+        )
     tool_values = (
-        create_default_tools(runtime_context.workdir)
+        create_default_tools(
+            runtime_context.workdir,
+            on_path_access=loader.activate_for_path,
+        )
         if tools is None
         else tuple(tools)
     )
@@ -175,7 +193,17 @@ def create_application(
         permission_rules_loader=(
             lambda: load_permission_rules(cwd=runtime_context.workdir)
         ),
+        instruction_loader=loader,
     )
+
+
+def _instruction_user_root(config: EffectiveConfig) -> Path:
+    """Derive the user instruction root from the user config source."""
+
+    for source in config.sources:
+        if source.kind == "user" and source.path is not None:
+            return source.path.expanduser().resolve(strict=False).parent
+    return (Path.home() / ".uthcode").expanduser().resolve(strict=False)
 
 
 def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:

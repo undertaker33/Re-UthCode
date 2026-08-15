@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from uthcode.core.tool import Tool, ToolPlanningMetadata
@@ -16,6 +16,8 @@ from .workspace import FileReadTracker, WorkspacePathResolver
 
 def create_default_tools(
     workdir: str | os.PathLike[str] | Path,
+    *,
+    on_path_access: Callable[[Path], object] | None = None,
 ) -> tuple[Tool, ...]:
     """Create one isolated, ordered set of the six preflightable built-in tools.
 
@@ -28,9 +30,9 @@ def create_default_tools(
     resolver = WorkspacePathResolver(workdir)
     tracker = FileReadTracker()
     tools: Sequence[Tool] = (
-        ReadFileTool(resolver, tracker),
-        WriteFileTool(resolver, tracker),
-        EditFileTool(resolver, tracker),
+        ReadFileTool(resolver, tracker, on_path_access=on_path_access),
+        WriteFileTool(resolver, tracker, on_path_access=on_path_access),
+        EditFileTool(resolver, tracker, on_path_access=on_path_access),
         GlobTool(resolver),
         GrepTool(resolver),
         BashTool(resolver.root),

@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-13
+snapshot_date: 2026-08-14
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-13
+status_snapshot: 2026-08-15
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| — | — | — | 当前没有未开始或部分实施的工作包 |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `04fc736d6acf3002a24af5ed116cf07556c793da` 完成第四轮定点返工：Instruction State 通过 persisted activated scopes/epoch/fingerprint metadata 与当前文件系统 AGENTS 完成 `/resume` 闭环；Tool Schema 保持 Tool System 单一来源并只进入 `GenerationRequest.tools`；既有 epoch、固定 258K 与 T09-1 边界不变；尚未显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 
@@ -106,7 +106,7 @@ interfaces/cli.py 或 interfaces/tui/app.py
 
 - `[ABSENT]` LangGraph、LangChain Agent、图/DAG/工作流 DSL。
 - `[ABSENT]` OS Sandbox；`Bash` 是当前用户权限下的未沙箱化进程执行。
-- `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩。
+- `[ABSENT]` 持久 Session、Journal 存储、Memory、Dream、Context Compiler、Context Budget、结构化压缩、Runtime AGENTS / Project Instructions Loader、统一模型输入限制解析。
 - `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与 unfinished-task 完成阻断；普通 PLAN final 正常完成，正式 Plan Review 仅由 `ProposePlan` 控制 ToolCall 触发；不提供动态注册。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。

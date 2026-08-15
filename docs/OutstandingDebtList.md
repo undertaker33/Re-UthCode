@@ -7,19 +7,21 @@
 | 来源 | 欠账需求 | 回补前置 / 触发条件 |
 |---|---|---|
 | **T01 Provider** | 暂无明确能力欠账 | 当前 Provider 边界未发现必须依赖后置能力才能补齐的部分 |
-| **T02 Slash Command / TUI** | 补齐 `/compact`、`/new`、`/resume`、`/memory`、`/dream` 等已预留命令对应的真实行为；届时重新确认命令语义 | 对应的 Context、Session、Memory 等底层能力已经实现 |
-| **T03 System Prompt** | 支持运行时动态上下文参与 Prompt 构造，而不再只依赖当前固定 Prompt Section 与少量 Runtime Facts | Context Engineering 开始实施；出现项目指令、Memory、Skill Instructions 等真实动态上下文来源 |
+| **T02 Slash Command / TUI** | 补齐 `/memory`、`/dream` 等仍预留命令的真实行为；`/compact`、`/new`、`/resume` 已由 T09 工作包纳入回补范围 | 对应的 Memory、Dream 等底层能力已经实现 |
+| **T03 System Prompt** | Memory 或 Skill Instructions 在真实能力出现时作为新的强类型 Context Source 接入；已冻结的 AGENTS / Project Instructions、Prompt Asset、Runtime、Environment、Projection 和 Interaction History 由 T09 正式回补 | 首个 Memory 或 Skill Instructions 来源开始实施 |
 | **T04 Tool System** | 支持运行期间动态出现、启停或消失的 Tool，而不是只处理当前稳定 Tool 集合 | Skill、MCP 或其他真实动态 Tool 来源出现 |
-| **T04 Tool System** | 大型 Tool Result 在被截断后仍可被后续上下文可靠引用，而不是只能依赖当前消息内容 | Context 压缩/引用机制或持久化内容能力开始实施 |
-| **T05 Agent Loop** | 长对话下对历史消息进行选择、预算控制和压缩，避免 Run 的 messages 持续完整累积 | Context Budget / Context Compaction 开始实施 |
-| **T05 Agent Loop / Run** | Run 的有效状态可以跨进程、跨程序生命周期恢复，而不再仅存在于内存 | Persistent Session 能力开始实施 |
+| **T05 Agent Loop / Run** | 当前 active/paused Turn 的有效 Runtime State 可以跨进程、跨程序生命周期恢复；T09 工作包只恢复完整提交的 Session 语义历史并从新 Turn 继续 | 正式 Persistent Runtime Recovery 开始实施 |
 | **T06 Pause / Resume** | Pending Turn、AskUser、Permission 等暂停状态能够在进程退出后继续恢复 | Persistent Session 与运行状态持久化完成，并开始考虑 restart recovery |
 | **T07 Permission** | Skill、MCP、Subagent 等新增执行来源能够进入现有 Permission 决策链，而不是各自绕开权限系统 | 首个新的可执行能力接入 |
 | **T07 Permission** | Permission `ALLOW` 之后可以进一步受 OS 级执行隔离约束；Permission 不再承担其无法提供的安全边界 | OS Sandbox 开始实施，或出现不可信本地执行主体 |
-| **T08 Todo / Plan** | Todo / Plan 可以跨 Turn 延续，并定义何时继续使用、何时更新、何时失效，而不是每个新 Turn 直接重新开始 | Context Engineering 开始实施，能够明确跨 Turn 状态与上下文的关系 |
-| **T08 Todo / Plan** | Context Compaction 后仍能保留并恢复长期任务的有效 Todo / Plan 状态 | Structured Compaction 开始实施 |
 | **T08 Runtime Hook** | 在现有两个固定 Hook Point 无法满足真实能力后，再扩充新的 Hook 生命周期点或配置能力 | 出现 Skill、MCP、Subagent 或其他**确实无法由现有 Hook 表达**的真实调用方 |
-| **B01 私有测试集 v0** | 上下文有效性当前只能记录已有 evidence discovery、Usage 和 Tool 轨迹；无法计算压缩、Working Set 选择与淘汰、证据保留与恢复、Memory injection 命中等指标 | Context Compiler、Compaction、Working Set 或 Memory 任一能力开始实施并产生结构化运行事实时，在对应任务中接入 B01 的版本化 diagnostics |
+| **B01 私有测试集 v0** | Memory injection 命中指标仍不可用；T09 工作包已纳入 Context Compiler、Compaction、Working Set、Evidence 重新发现和 Tool Result 外置 diagnostics 的回补 | Memory 能力开始实施并产生结构化注入事实 |
+| **T09 Prompt / Context Engineering** | `/resume` 只恢复最后一个已完整提交的安全边界并开始新 Turn；不恢复退出时仍 active/paused 的 Turn、Pending Tool、Permission、AskUser waiter、Provider 请求或协程位置 | 后续正式 Persistent Runtime Recovery 开始实施，并准备回补 T05/T06 跨进程运行状态恢复时 |
+| **T09 Prompt / Context Engineering** | 确定性 Working Set 只保护必要上下文并按预算保留 recent complete semantic units；不检索久远但“相关”的证据 | Memory / Evidence Retrieval 有正式需求和可靠证据模型时 |
+| **T09 Prompt / Context Engineering** | 大 Tool Result 只有单项/Session 配额与 session-scoped ref；不提供跨 Session Artifact 生命周期、清理与 GC | 出现独立 Artifact Store 生命周期需求时 |
+| **T09 Prompt / Context Engineering** | Compaction 只做有界滚动批次；不实现层级 Summary Graph、后台 Context Agent 或高级渐进式压缩 | Eval 证明简单 Compaction 无法满足真实长任务时 |
+| **T09-1 Model Context Window 与 258K Operating Profile 优化** | 探索并实现真实 Context Window / max input limit 获取、可查询 Provider metadata、官方模型 bundled metadata、OpenAI-compatible / Local 显式配置、统一 Model Limits contract，以及真实窗口与 UthCode Working Budget 的解析；正式解决 T09 固定 258K 阶段不保证真实窗口小于 258K 的模型在长上下文下预算安全的问题 | T09 固定 258K Context Engine 完成并具备稳定 baseline 后 |
+| **T09-1 Model Context Window 与 258K Operating Profile 优化** | 完成 small-window / large-window adaptation，并基于 Prefix Cache、token、success Eval 调优 258K Operating Profile、Working Set 比例、Compaction trigger、recent tail 与 safety headroom | 真实窗口来源与统一 Budget Resolver 已收口，且有可比较 Eval 数据时 |
 
 ## 维护原则
 

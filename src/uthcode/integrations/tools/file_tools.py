@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
@@ -33,9 +33,16 @@ class ReadFileTool:
         },
     )
 
-    def __init__(self, resolver: WorkspacePathResolver, tracker: FileReadTracker) -> None:
+    def __init__(
+        self,
+        resolver: WorkspacePathResolver,
+        tracker: FileReadTracker,
+        *,
+        on_path_access: Callable[[Path], object] | None = None,
+    ) -> None:
         self._resolver = resolver
         self._tracker = tracker
+        self._on_path_access = on_path_access
 
     @property
     def definition(self) -> ToolDefinition:
@@ -70,6 +77,8 @@ class ReadFileTool:
             path = self._resolver.resolve(_text(arguments, "path"))
         except (WorkspacePathError, TypeError, ValueError) as exc:
             return _error(str(exc))
+
+        _notify_path_access(self._on_path_access, path)
 
         if not path.exists():
             return _error(f"Error: file not found: {self._resolver.display(path)}")
@@ -118,9 +127,16 @@ class WriteFileTool:
         },
     )
 
-    def __init__(self, resolver: WorkspacePathResolver, tracker: FileReadTracker) -> None:
+    def __init__(
+        self,
+        resolver: WorkspacePathResolver,
+        tracker: FileReadTracker,
+        *,
+        on_path_access: Callable[[Path], object] | None = None,
+    ) -> None:
         self._resolver = resolver
         self._tracker = tracker
+        self._on_path_access = on_path_access
 
     @property
     def definition(self) -> ToolDefinition:
@@ -198,9 +214,16 @@ class EditFileTool:
         },
     )
 
-    def __init__(self, resolver: WorkspacePathResolver, tracker: FileReadTracker) -> None:
+    def __init__(
+        self,
+        resolver: WorkspacePathResolver,
+        tracker: FileReadTracker,
+        *,
+        on_path_access: Callable[[Path], object] | None = None,
+    ) -> None:
         self._resolver = resolver
         self._tracker = tracker
+        self._on_path_access = on_path_access
 
     @property
     def definition(self) -> ToolDefinition:
@@ -235,6 +258,8 @@ class EditFileTool:
             path = self._resolver.resolve(_text(arguments, "path"))
         except (WorkspacePathError, TypeError, ValueError) as exc:
             return _error(str(exc))
+
+        _notify_path_access(self._on_path_access, path)
 
         if not path.exists():
             return _error(f"Error: file not found: {self._resolver.display(path)}")
@@ -297,6 +322,18 @@ def _error(message: str) -> ToolExecutionResult:
 
 def _cancelled() -> ToolExecutionResult:
     return ToolExecutionResult(_CANCELLED, is_error=True)
+
+
+def _notify_path_access(
+    callback: Callable[[Path], object] | None,
+    path: Path,
+) -> object | None:
+    if callback is None:
+        return None
+    # The callback runs before file I/O.  Its normal Loader failure mode is a
+    # diagnostic result (strict=False); unexpected exceptions remain visible
+    # to the ToolExecutor instead of being silently discarded.
+    return callback(path)
 
 
 __all__ = ["EditFileTool", "ReadFileTool", "WriteFileTool"]
