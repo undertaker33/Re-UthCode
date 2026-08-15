@@ -17,8 +17,8 @@
 
 ## 必须交付
 
-1. 验证 Prompt/AGENTS Instruction State → Instruction Epoch → History/Projection/Runtime → fixed 258K Budget/Compiler → 两平面 GenerationRequest → Provider mapping → Session/Results → Compaction → Slash/TUI → Eval 全链路。
-2. 端到端覆盖 runtime/projection prefix stability、AGENTS epoch/stable reuse、authority spoof rejection、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime recovery boundary、result quota/ref 与 execution/persistence outcome。
+1. 验证 Prompt/AGENTS Instruction State → Instruction Epoch → History/Projection/Runtime → fixed 258K Budget/Compiler → 两平面 + `GenerationRequest.tools` → Provider mapping → Session/Results → Compaction → Slash/TUI → Eval 全链路。
+2. 端到端覆盖 runtime/projection prefix stability、AGENTS epoch/stable reuse、Instruction State resume 未变化/离线变化、Tool Schema 单一来源、authority spoof rejection、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime recovery boundary、result quota/ref 与 execution/persistence outcome。
 3. 运行定向、`tests/test_architecture_boundaries.py` 与全量测试，记录精确结果。
 4. 同步 State/Interface Context、UserManual、Context-Index、OutstandingDebtList、Tasks/Checklist；保留真实后置欠账。
 5. 删除本包替代出的重复/不可达路径，不保留兼容壳。
@@ -31,6 +31,8 @@
 - 当前 Runtime AGENTS 状态与历史冻结语义表述一致。
 - Runtime/Projection 变化不改变 Instruction Epoch；AGENTS scope/content 真实变化允许创建有 reason 的新 epoch。
 - Instruction Plane 与 Conversation Plane 由 Core/Application 构造，Integration 只做协议映射。
+- `/resume` 从 metadata activated scopes 重读当前文件系统 AGENTS；未变化保持 epoch/fingerprint，离线变化创建新 epoch；不保存正文、不扫描 History、不建 Instruction Event Store。
+- Tool Schema 由 Tool System 唯一维护，只经 `GenerationRequest.tools` 映射；参与预算/诊断但不复制进 Prompt/Core Contract/AGENTS。
 - Projection 没有 System/Core authority 升级。
 - T09 中没有 Model Limits discovery、不同窗口适配或 Operating Profile 阈值优化；这些只出现在 T09-1 欠账。
 - Working Set 无隐藏 relevance 算法。

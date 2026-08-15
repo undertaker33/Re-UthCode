@@ -36,9 +36,11 @@
 
 ### 4.2 Context blocks and authority
 
-每个 Source 产出统一 block：`source_kind`、`authority`、`stability`、`scope`、`provenance`、`content`、`estimated_tokens`、`semantic_unit_id`（若有）。Provider mapper 只能转换，不得提升 authority。
+文本 Source 产出统一 block：`source_kind`、`authority`、`stability`、`scope`、`provenance`、`content`、`estimated_tokens`、`semantic_unit_id`（若有）。Tool Definition Source 产出 Tool System 的结构化 definitions、estimated tokens 与 schema fingerprint 输入，不伪装成文本 block。Provider mapper 只能转换，不得提升 authority或复制 schema。
 
-稳定指令前缀顺序：Public Prompt → Core Contract → 用户 AGENTS → 项目根 AGENTS → 当前作用域已生效的目录 AGENTS → 稳定工具/协议定义。该有序集合是 Instruction Plane，以 `instruction_epoch` 标识版本。
+稳定指令前缀顺序：Public Prompt → Core Contract → 用户 AGENTS → 项目根 AGENTS → 当前作用域已生效的目录 AGENTS → 其他真正属于 Instruction Plane 的稳定协议指令（如有）。该有序集合是 Instruction Plane，以 `instruction_epoch` 标识版本。
+
+Tool Definition / Tool Schema 由 Tool System 唯一维护，经 `GenerationRequest.tools` 进入 Provider native tools，不复制进 Public Prompt、Core Contract、AGENTS 或其他 Instruction Plane 文本。它计入 token budget，并可单独形成 `tool_schema_fingerprint` 和 cache diagnostics。
 
 Conversation Plane 顺序：Projection → retained raw history → runtime facts/delta → environment facts/delta → current user turn。Projection 始终是历史权限；Runtime facts 不是 Instructions。
 
@@ -55,6 +57,8 @@ Conversation Plane 顺序：Projection → retained raw history → runtime fact
 - 返回有序、带 scope/source/reason 的 blocks、当前有效 instruction set 与显式 diagnostics；Application 维护 session instruction epoch 和已见 identity；新 scope 首次生效或已生效内容变化时创建新 epoch，未变化的重复访问不创建。
 
 Integration 实现文件边界，Application 决定加载时机并生成 Source，Core 不读文件。
+
+Instruction State resume contract：Session metadata 保存已激活 directory scope 标识、当前 epoch、stable prefix fingerprint 和重建比较所需的最小 fingerprint 元数据，不保存 AGENTS 正文。activated scope 是已访问目录作用域，不等于当前存在 AGENTS 文件；文件删除后仍保留 scope 标识。`/resume` 加锁后按 metadata scopes 使用同一 Loader 重读当前文件系统；不扫描 History/ToolCall 推断 scopes。重建结果未变化时保留 epoch/fingerprint；修改、删除、重新出现或解析出的有效 instruction source 集合变化时，以当前文件系统为权威创建新 epoch并记录明确 reason。不得新增独立 Instruction Event Store 或 `instruction-history.jsonl`。
 
 ### 4.4 Fixed Context Operating Budget
 
@@ -106,13 +110,13 @@ sessions/<session-id>/
 └─ tool-results/
 ```
 
-metadata 和 record envelope 版本化；history append-only，active Projection 由最后一个合法 ProjectionRecord 推导，不维护可变 pointer 文件。`runtime.jsonl` 只保存非权威 lifecycle/diagnostics/Eval facts，删除它不改变语义恢复；stream delta、ToolProgress、UsageUpdated 与 UI lifecycle 不写入 history。写入 sequence 前持有 writer lock。实现使用进程持有的跨平台 OS advisory/exclusive lock（Windows/POSIX 适配），不是可残留的纯存在性锁；busy 明确失败。
+metadata 和 record envelope 版本化；metadata 同时保存已激活 directory instruction scopes、当前 epoch 与必要 fingerprint 元数据，但不保存 AGENTS 正文。history append-only，active Projection 由最后一个合法 ProjectionRecord 推导，不维护可变 pointer 文件。`runtime.jsonl` 只保存非权威 lifecycle/diagnostics/Eval facts，删除它不改变语义恢复；stream delta、ToolProgress、UsageUpdated 与 UI lifecycle 不写入 history。写入 sequence 前持有 writer lock。实现使用进程持有的跨平台 OS advisory/exclusive lock（Windows/POSIX 适配），不是可残留的纯存在性锁；busy 明确失败。
 
 ### 8.2 Commit and recovery
 
 - append 采用完整 JSONL record + flush/fsync；关联 metadata/projection 采用 temp + atomic replace。
 - 只恢复连续 strict sequence 和最后完整 commit boundary；损坏中段 fail closed，尾部不完整记录可诊断并忽略。
-- resume 先 lock，后读取/重建，再允许新 Turn append。
+- resume 先 lock，后恢复 History/Projection 并按 metadata scopes 重读当前 AGENTS、重建 Instruction State，再允许新 Turn append；重建结果变化时先原子更新 epoch/fingerprint metadata。
 - release 在 `/new`、Session close 或进程退出时发生。
 
 ### 8.3 Runtime boundary
@@ -130,7 +134,7 @@ Projection schema 至少保留目标/约束/决策/已做工作/未完成项/关
 ## 10. Runtime and provider integration
 
 - Application 在每次 Provider request 前调用 Compiler，使用固定 258K Budget；RunState 仍是唯一写入者。
-- 统一 request contract 表达 Instruction Plane、Conversation Plane 与 Tool Definitions；Provider mapper 仅映射到原生 `system`/`instructions`/system message 和会话协议，并将 ToolCall/ToolResult 转为合法形状。Core 不按 Provider 名称分支，ordinary history 伪造标签不能进入 Instruction Plane。
+- 统一 request contract 分别表达 Instruction Plane、Conversation Plane 与 `tools`；Provider mapper 仅映射到原生 `system`/`instructions`/system message、会话协议和 native tools，并将 ToolCall/ToolResult 转为合法形状。Core 不按 Provider 名称分支，ordinary history 伪造标签不能进入 Instruction Plane，Tool Schema 不复制为 Prompt 文本。
 - Provider 返回 cache metrics 时继续映射现有 Usage 计数，并在 Context diagnostics 中记录 availability/provenance；现有 Usage 默认 0 可保留以避免破坏累计语义，但 Provider 不支持时必须报告 `not_available`，不能把默认 0 冒充 Provider 实测值。
 - overflow 归一为受控 error；最多触发一次预算重编译/压缩保护，仍失败则停止。
 
@@ -138,7 +142,7 @@ Projection schema 至少保留目标/约束/决策/已做工作/未完成项/关
 
 - `/compact`：无参数的 Application compaction use case。
 - `/new`：关闭旧 Session/lock，创建新 Session。
-- `/resume [id]`：获取 lock、恢复 History/Projection、创建新 Turn；busy/损坏显式失败。
+- `/resume [id]`：获取 lock、恢复 History/Projection、按 persisted activated scopes 与当前文件系统 AGENTS 重建 Instruction State、创建新 Turn；busy/损坏显式失败。
 - `/status`：used/258K Operating Budget、projection revision、compact count、prefix/cache diagnostics。
 - TUI ring 使用 `used_tokens/258_000`，并说明分母不是远端模型物理窗口；Headless 无 TUI 依赖。
 
@@ -171,6 +175,6 @@ T09-1 后置：真实 Context Window/max input discovery、Provider/bundled meta
 
 ## 16. 验收标准
 
-必须覆盖：runtime/projection prefix stability、directory AGENTS epoch change 与 stable reuse、ordinary history authority spoof rejection、Projection authority non-escalation、固定 258K Budget及小窗口阶段边界、完整 AGENTS frozen semantics、compactor overflow、concurrent resume、runtime recovery boundary、result hard cap/quota/ref isolation、execution/persistence outcome 区分、strict sequence/durable append，以及 Provider mapper/Usage 可选 cache metrics。
+必须覆盖：runtime/projection prefix stability、directory AGENTS epoch change 与 stable reuse、Instruction State 跨进程 resume（未变化保持、离线变化创建新 epoch）、ordinary history authority spoof rejection、Projection authority non-escalation、Tool Schema 单一来源与 `GenerationRequest.tools` 映射、固定 258K Budget及小窗口阶段边界、完整 AGENTS frozen semantics、compactor overflow、concurrent resume、runtime recovery boundary、result hard cap/quota/ref isolation、execution/persistence outcome 区分、strict sequence/durable append，以及 Provider mapper/Usage 可选 cache metrics。
 
 最终执行定向、架构和全量测试，并同步任务书指定文档。未运行项必须明确记录。

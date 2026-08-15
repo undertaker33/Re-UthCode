@@ -16,7 +16,7 @@
 ## 必须交付
 
 1. 无参数 `/compact`、`/new`、`/resume [session_id]`、`/status` 的 Application/Slash/TUI 接线。
-2. resume 先取得 single-writer lock，只恢复 last complete History/Projection，创建新 Turn。
+2. resume 先取得 single-writer lock，恢复 last complete History/Projection，并复用 W02 的 persisted activated scopes + 当前文件系统 AGENTS 重建 Instruction State，再创建新 Turn；不恢复 Task/Plan checkpoint。
 3. 明确 busy、损坏、未知 session、compaction failure 的用户可见错误。
 4. status 显示 used/258K Operating Budget、Projection revision、instruction epoch、compact count 和可选 prefix/cache 信息，并说明 258K 不是远端模型物理窗口，当前阶段不保证 `<258K` 真实窗口模型的长上下文安全。
 5. TUI ring 固定使用 258K denominator；Headless 路径不依赖 TUI。
@@ -33,7 +33,7 @@
 
 ## 验证
 
-覆盖命令路由、`/compact` 拒绝额外 focus 语义、同进程 continuation/跨进程 resume 区别、session busy、new 释放旧锁、固定 used/258K、ring 阈值、Headless 路径和既有 TUI 回归。
+覆盖命令路由、`/compact` 拒绝额外 focus 语义、同进程 continuation/跨进程 resume 区别、Instruction State 重建后的命令结果、session busy、new 释放旧锁、固定 used/258K、ring 阈值、Headless 路径和既有 TUI 回归。
 
 ## Feedback
 

@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-14
+status_snapshot: 2026-08-15
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `afe2795795972ed9c3581fbd8b6ca087a1963379` 完成第三轮定点返工：AGENTS/Project Instructions 通过 epoch-based Instruction Plane 获得真实权限，Runtime/Projection 保持 Contextual Plane 与稳定 prefix；T09 仍固定 258K Operating Budget，且明确 `<258K` 真实窗口的阶段限制由 T09-1 解决；尚未显式派发任何 Worker Prompt |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `04fc736d6acf3002a24af5ed116cf07556c793da` 完成第四轮定点返工：Instruction State 通过 persisted activated scopes/epoch/fingerprint metadata 与当前文件系统 AGENTS 完成 `/resume` 闭环；Tool Schema 保持 Tool System 单一来源并只进入 `GenerationRequest.tools`；既有 epoch、固定 258K 与 T09-1 边界不变；尚未显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 

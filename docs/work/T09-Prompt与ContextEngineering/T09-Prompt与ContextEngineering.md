@@ -72,7 +72,7 @@ Summary 不因由模型生成而升级为 Core/System authority。Compiler 的 t
 ### 4.3 Session 与 Runtime State
 
 - 同进程失败或取消 Turn 后，`TaskState` / `PlanState` 继续遵守 T08 现有进程内规则。
-- 跨进程 `/resume` 只恢复最后完整提交边界的 Canonical History、Projection 与 Session 元数据，并开始一个新 Turn。
+- 跨进程 `/resume` 恢复最后完整提交边界的 Canonical History、Projection 与 Session 元数据，并依据持久化的已激活 directory instruction scopes 重建 Instruction State，再开始一个新 Turn。
 - T09 不持久化或恢复旧进程内存中的 active/paused Turn、TaskState、PlanState、Pending Tool、Permission、AskUser waiter、Provider 请求或协程位置。
 - Agent 可以依据恢复后的语义历史重新建立 Task/Plan，但这不是 checkpoint 恢复保证。
 
@@ -96,10 +96,12 @@ Stable Instruction Prefix
 ├─ 用户级 AGENTS
 ├─ 项目根 AGENTS
 ├─ 当前作用域已生效的目录级 AGENTS
-└─ 其他稳定工具/协议定义
+└─ 其他真正属于 Instruction Plane 的稳定协议指令（如有）
 ```
 
 上述有序集合构成 Session 的 Instruction State，并以 `instruction_epoch` 标识当前版本。真正改变指令权限集合的内容允许产生新的稳定指令前缀 epoch；权限正确性优先于强行复用旧 prefix cache。
+
+Tool Definition / Tool Schema 不属于上述文本前缀。它由 Tool System 唯一维护，经 `GenerationRequest.tools` 映射为 Provider native tools；不得人工复制进 Public Prompt、Core Contract 或 AGENTS。Tool Definitions 仍计入 token budget，并可参与 `tool_schema_fingerprint` 与 cache diagnostics，但这不使其成为 Instruction Plane 文本副本。
 
 ### 5.2 Conversation / Contextual Plane
 
@@ -134,7 +136,7 @@ Provider Integration native instruction/system mapping
 1. 普通 User/Tool 历史即使伪造 `[ProjectInstruction]`、`[AGENTS]` 或 `[RuntimeStateUpdate]` 标签，也只存在于 Conversation Plane，不能进入 Instruction Plane。
 2. Projection、Compaction Summary、Runtime State 与 Environment facts 不能映射成 Core/Project instruction。
 3. Instruction Plane 通过 Provider 原生最高指令通道表达；概念映射为 Anthropic `system`、OpenAI Responses `instructions`、OpenAI-compatible Chat `system` message，具体形状以当前正式 Provider contract 为准。
-4. Core 不按 Provider 名称分支；Integration 只转换 Instruction Plane、Conversation Plane 与 Tool Definitions 的协议形状，不拥有 Context policy。
+4. Core 不按 Provider 名称分支；Integration 分别转换 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的协议形状，不拥有 Context policy，也不把 Tool Schema 拼进 Prompt。
 5. 若现有统一 `GenerationRequest` 不能清晰表达 Instruction Plane 与 Conversation Plane，Task 7 在 Core/Application 的 provider-independent contract 中最小扩展；不得发明 history-tail high-authority role 或在 Integration 私拼 Prompt policy。
 
 当前事实代码中的 `GenerationRequest` 已有单一 `system_prompt` 与普通 `messages`，三类 Integration 分别映射到各自原生指令通道与会话通道。T09 Task 7 需要正式化这两个平面的构造和测试；只有真实调用边界需要时才扩展 DTO，不为内部 typed authority 虚构 Provider 不支持的 wire 权限。
@@ -150,7 +152,7 @@ Provider Integration native instruction/system mapping
 - `EnvironmentSource`
 - `ToolDefinitionSource`
 
-Source 提供 typed block、authority、stability、scope、provenance 与估算信息；`ProjectInstructionSource` 还提供当前生效的有序 instruction set 与 epoch change facts。Compiler 只消费统一 Source，不直接读 Provider SDK、文件系统或 TOML。
+文本 Source 提供 typed block、authority、stability、scope、provenance 与估算信息；`ProjectInstructionSource` 还提供当前生效的有序 instruction set 与 epoch change facts。`ToolDefinitionSource` 提供 Tool System 的结构化 definitions、预算估算与 schema fingerprint 输入，进入 request 的 `tools` 字段而非 Instruction Plane。Compiler 只消费统一 Source，不直接读 Provider SDK、文件系统或 TOML。
 
 ## 6. AGENTS / Project Instructions
 
@@ -174,7 +176,19 @@ Instruction Epoch 规则：
 - 已生效 AGENTS 内容合法变化：创建新 epoch；未变化或继续访问同一已生效 scope：不创建新 epoch。
 - Loader/Application 记录 scope added/content changed 等安全 diagnostics；不改写旧 History，也不把 AGENTS 作为会话尾部文本注入。
 
-### 6.2 当前架构落点
+### 6.2 Instruction State 的持久恢复
+
+Session metadata 持久化已激活的 directory scope 标识、当前 `instruction_epoch`、stable instruction prefix fingerprint，以及判断重建后 instruction set 是否变化所需的最小 fingerprint 元数据；不得持久化 AGENTS 正文副本作为新的权威来源。activated scope 表示该目录作用域已经被 Session 激活，不等于该目录当前一定存在 AGENTS 文件；文件删除后仍保留 scope 标识，以便后续 resume 能观察删除或重新出现。
+
+`/resume` 取得 single-writer lock 后：
+
+1. 读取 metadata 中已激活 scopes，不扫描历史 Read/Edit ToolCall 猜测 scope。
+2. 通过同一 Instruction Loader 重新读取当前文件系统中的 user/root AGENTS 与已激活 directory scopes；当前文件系统始终是内容权威。
+3. 重建 effective instruction set 并与持久 fingerprint 元数据比较。内容与 scope 均未变化时保持原 `instruction_epoch` 和 stable prefix fingerprint。
+4. AGENTS 离线期间被修改、删除，或已激活 scope 的有效集合发生变化时，使用当前文件系统结果创建新 Instruction Epoch，并记录 `instruction_content_changed`、`instruction_scope_removed` 等明确 `prefix_change_reason`。
+5. 将新的最小 metadata 原子持久化；不新增 Instruction Event Store、`instruction-history.jsonl`，也不改写 Canonical History。
+
+### 6.3 当前架构落点
 
 - Integration 负责文件发现、规范路径、物理身份、读取和 OS 边界。
 - Application 负责加载时机、Session/路径 scope、去重状态、当前有效 instruction set、epoch change 与 Source 组合。
@@ -269,7 +283,7 @@ Session 目录至少包含：
 
 ```text
 sessions/<session-id>/
-├─ metadata.json              # schema、project_key、created/last_used
+├─ metadata.json              # schema、project_key、created/last_used、activated instruction scopes/epoch/fingerprints
 ├─ history.jsonl              # InteractionRecord + ProjectionRecord
 ├─ runtime.jsonl              # 非语义权威 lifecycle/diagnostics/Eval facts
 ├─ writer.lock
@@ -278,11 +292,13 @@ sessions/<session-id>/
 
 `runtime.jsonl` 丢失不得改变语义恢复；Stream delta、ToolProgress、UsageUpdated、UI lifecycle 不进入 Canonical History。active Projection 由 history 中最后一个合法、完整提交的 ProjectionRecord 推导，不增加可变 current pointer。所有 envelope/version/kind/sequence/turn/call/ref 字段严格校验，未知 schema/kind 和中段损坏 fail closed。
 
+Instruction State 的恢复元数据属于 Session metadata，而不是 Runtime checkpoint：它只保存已激活 directory scopes、epoch 和必要 fingerprint，不保存 AGENTS 正文。`/resume` 必须重新读取当前文件系统并按第 6.2 节重建；这不恢复 TaskState/PlanState，也不引入新的事件存储。
+
 UthCode Runtime 自身持有的 Provider Credential、API Key、配置秘密、内部敏感构造信息和可能含秘密的原始异常，不得因 Context/Session 基础设施被主动注入 Prompt、History、Runtime Log 或 diagnostics。用户显式提供或经正常 Permission/Tool 语义产生的内容按既有 Session 语义处理；T09 不实现通用 Secret Detection、DLP 或自动脱敏系统。Diagnostics 仍不得额外复制 credential、完整大型 Tool Result、Provider native payload 或未脱敏内部异常。
 
 - `/compact`：触发有界压缩，成功后使用新 Projection。
 - `/new`：结束当前 Session 持有权，创建空 History 新 Session，保留用户/项目配置。
-- `/resume [session_id]`：获取 single-writer lock，恢复最后完整提交边界的 History/Projection，开始新 Turn；无 id 时使用现有选择契约。
+- `/resume [session_id]`：获取 single-writer lock，恢复最后完整提交边界的 History/Projection，并从 metadata scopes + 当前文件系统 AGENTS 重建 Instruction State，再开始新 Turn；无 id 时使用现有选择契约。
 - `/status`：显示 `used_tokens / 258K`、固定 Operating Budget 说明、compact count、Projection revision 与可选 prefix/cache diagnostics。
 
 TUI context ring 按固定 258K Operating Budget 计算；颜色阈值保持语义一致。Headless Application 路径必须独立工作。
@@ -312,6 +328,9 @@ Eval 用于比较策略效果，不把上下文策略写成 pytest 红绿门槛�
 11. 单 Result hard cap、Session quota 与 ref 越权读取失败。
 12. Tool 已成功执行但 persistence 失败时，不伪造 Tool 未执行，也不自动重试副作用。
 13. 测试与文档证明 T09 没有动态 Model Limits、不宣称小于 258K 的模型长上下文安全，overflow 不作 discovery。
+14. 激活目录 AGENTS 后退出并 `/resume`：文件未变化时 effective instruction set、epoch 与 fingerprint 保持。
+15. 激活目录 AGENTS 后退出，离线修改或删除 AGENTS，再 `/resume`：按当前文件系统创建新 epoch、改变 fingerprint 并记录明确 reason；不扫描 History 猜 scope。
+16. Tool Schema 只从 Tool System 进入 `GenerationRequest.tools`/Provider native tools；Prompt/Core Contract/AGENTS 中没有人工副本。
 
 ## 13. 实施顺序与 Worker
 
@@ -361,7 +380,7 @@ AGENTS / Project Instructions、Context Compiler、固定 258K Operating Budget�
 
 ```text
 Session
-├─ Instruction State（Public Prompt / Core Contract / effective AGENTS / epoch）
+├─ Instruction State（Public Prompt / Core Contract / effective AGENTS / activated scopes / epoch）
 ├─ Canonical History
 ├─ Projection
 ├─ Runtime State
@@ -373,6 +392,9 @@ Context Compiler
 └─ diagnostics
         ↓
 GenerationRequest
+├─ instruction plane
+├─ conversation plane
+└─ tools（Tool System 唯一来源）
         ↓
 Provider Integration（仅协议映射）
 ```
