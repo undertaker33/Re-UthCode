@@ -38,11 +38,11 @@
 
 每个 Source 产出统一 block：`source_kind`、`authority`、`stability`、`scope`、`provenance`、`content`、`estimated_tokens`、`semantic_unit_id`（若有）。Provider mapper 只能转换，不得提升 authority。
 
-稳定指令前缀顺序：Public Prompt → Core Contract → 用户 AGENTS → 项目根 AGENTS → 稳定工具/协议定义。
+稳定指令前缀顺序：Public Prompt → Core Contract → 用户 AGENTS → 项目根 AGENTS → 当前作用域已生效的目录 AGENTS → 稳定工具/协议定义。该有序集合是 Instruction Plane，以 `instruction_epoch` 标识版本。
 
-上下文平面顺序：Projection → retained raw history → scoped instruction delta → runtime delta → environment delta → current user turn。只有真实 Project Instruction / Core Runtime block 保留相应权限；Projection 始终是历史权限。
+Conversation Plane 顺序：Projection → retained raw history → runtime facts/delta → environment facts/delta → current user turn。Projection 始终是历史权限；Runtime facts 不是 Instructions。
 
-内部 authority 必须经 Compiler 形成可映射的 provider-independent semantic item，再由统一 request contract 和 Integration 转换为当前 Provider 可表达的最小 wire representation。权限来自 typed source 和受信任构造边界，不来自文本标签；普通历史伪造 Runtime/Project 标记仍是 history authority。动态 update 不重建到长历史之前的 system prefix，也不作为普通 User 裸文本发送。当前基线 DTO 只有单一 system prompt 与普通 messages，不能显式表达该区分；T09 必须在 Core/Application 收口这个缺口，不在 Integration 私拼 Context policy。
+内部 authority 用于 Context policy、排序、校验和 Provider mapping，不能创造 Provider 不存在的权限 role。真正需要 instruction authority 的 Public Prompt/Core Contract/AGENTS 必须来自受信任 Source，经 Compiler 分类进入 Instruction Plane；普通 User/Tool 即使伪造标签也只在 Conversation Plane。目录 AGENTS 新 scope 或内容变化创建新 Instruction Epoch，而不是作为 history-tail 高权限消息。当前基线 DTO 的 `system_prompt + messages` 已可对应单一指令通道与会话通道；Task 7 负责正式化这两个 provider-independent 平面，只有真实需要时才扩展 DTO，Integration 不私拼 Context policy。
 
 ### 4.3 Project instructions
 
@@ -52,7 +52,7 @@
 - 只识别整行 `@include("relative/path")` / `@include('relative/path')`；代码围栏和 inline code 忽略；
 - 引用相对当前文件，递归图最多 3 个额外文件；canonical physical identity 去重，Windows case-fold，循环/越界/超限/读取失败 fail closed；
 - user 图限制在 user config root，project/directory 图限制在 project root；
-- 返回有序、带 scope/source/reason 的 blocks 与显式 diagnostics；Application 维护 session instruction epoch 和已见 identity。
+- 返回有序、带 scope/source/reason 的 blocks、当前有效 instruction set 与显式 diagnostics；Application 维护 session instruction epoch 和已见 identity；新 scope 首次生效或已生效内容变化时创建新 epoch，未变化的重复访问不创建。
 
 Integration 实现文件边界，Application 决定加载时机并生成 Source，Core 不读文件。
 
@@ -60,20 +60,22 @@ Integration 实现文件边界，Application 决定加载时机并生成 Source�
 
 T09 固定使用 258,000-token Context Operating Budget。它是 UthCode 工作档位，不是远端模型物理窗口声明。T09 不发现模型窗口、不建立 Model Limits contract、不修改 ModelProfile 输入字段、不查询 Provider/bundled metadata，也不做小/大窗口适配。相关能力及阈值优化由 T09-1 探索。
 
+阶段限制：T09-1 完成前，不保证真实输入窗口小于 258K 的模型能安全运行到 T09 的长上下文规模。Provider overflow 最多触发一次受控 Compaction/重编译，不能用于反推窗口或动态修改 budget。
+
 ## 5. Compiler algorithm
 
 1. 验证 Source contract，并加载固定 258K Operating Budget。
-2. 构造稳定指令序列并计算规范化 fingerprint、token estimate、change reason；工具 schema 可单独 fingerprint。
+2. 从当前 Instruction State 构造 Instruction Plane，并计算 `instruction_epoch`、规范化 fingerprint、token estimate、change reason；工具 schema 可单独 fingerprint。
 3. 放入 Protected Context：稳定指令、current user、未闭合 unit、必要协议。
 4. 加入当前 Projection。
 5. 从新到旧选择 recent complete semantic units，ref/preview 跟随 unit；无 relevance scorer。
-6. 在尾部加入 instruction/runtime/environment deltas。
+6. 在尾部加入 runtime/environment deltas。
 7. 若超过固定 budget，在合法 unit boundary 裁剪；需要时请求 Compaction 后重新编译一次。
 8. 产出不可变 Snapshot 和 selected/omitted reasons。
 
 `ContextSnapshot` 至少记录：固定 budget、token estimate、selected/omitted block ids、Projection revision、instruction epoch、stable prefix estimated tokens/fingerprint/changed/reason、可选 tool schema fingerprint。
 
-仅 runtime delta 改变时，stable prefix fingerprint 必须保持不变；不得把动态 state 插入稳定前缀与 retained history 之间。
+仅 runtime/environment 或 Projection/Compaction revision 改变时，instruction epoch 与 stable prefix fingerprint 必须保持不变；不得把动态 state 插入稳定前缀与 retained history 之间。新目录 AGENTS 首次生效或已生效内容变化时创建新 epoch，允许 fingerprint 改变并记录 `instruction_scope_added` / `instruction_content_changed` 等原因；未变化的已生效 AGENTS 保持复用。
 
 ## 6. Token estimation
 
@@ -128,7 +130,7 @@ Projection schema 至少保留目标/约束/决策/已做工作/未完成项/关
 ## 10. Runtime and provider integration
 
 - Application 在每次 Provider request 前调用 Compiler，使用固定 258K Budget；RunState 仍是唯一写入者。
-- Provider mapper 保留 semantic order/authority，并将 ToolCall/ToolResult 转为合法协议形状；ordinary history 伪造标签不得获得 Runtime/Project authority。
+- 统一 request contract 表达 Instruction Plane、Conversation Plane 与 Tool Definitions；Provider mapper 仅映射到原生 `system`/`instructions`/system message 和会话协议，并将 ToolCall/ToolResult 转为合法形状。Core 不按 Provider 名称分支，ordinary history 伪造标签不能进入 Instruction Plane。
 - Provider 返回 cache metrics 时继续映射现有 Usage 计数，并在 Context diagnostics 中记录 availability/provenance；现有 Usage 默认 0 可保留以避免破坏累计语义，但 Provider 不支持时必须报告 `not_available`，不能把默认 0 冒充 Provider 实测值。
 - overflow 归一为受控 error；最多触发一次预算重编译/压缩保护，仍失败则停止。
 
@@ -144,7 +146,7 @@ Projection schema 至少保留目标/约束/决策/已做工作/未完成项/关
 
 ## 12. Diagnostics and Eval
 
-新增事件/快照 diagnostics：selected/omitted、externalized、compact start/end/fail、session busy/recovery、stable prefix fields、optional provider cache read/write tokens。Diagnostics 不得额外复制 Runtime credential/API key、完整大型 Tool Result、Provider native payload 或未脱敏内部异常。
+新增事件/快照 diagnostics：selected/omitted、externalized、compact start/end/fail、session busy/recovery、`instruction_epoch`、stable prefix fields/change reason、optional provider cache read/write tokens。Diagnostics 不得额外复制 Runtime credential/API key、完整大型 Tool Result、Provider native payload 或未脱敏内部异常。
 
 Eval 以 baseline/candidate 报告比较 success、tokens、tool calls、compact count、rediscovery、repeated exploration、externalization、prefix stability 与可用 cache reuse；不以策略优劣作为 pytest 必须红绿。
 
@@ -154,12 +156,12 @@ Eval 以 baseline/candidate 报告比较 success、tokens、tool calls、compact
 - 确定性：相同 Sources/固定 Budget 产生相同 Snapshot/fingerprint/reasons。
 - 安全：Runtime 自身 credential、配置秘密和内部敏感构造信息不得被基础设施主动注入 Prompt/History/Log/diagnostics；用户显式或经正常 Tool/Permission 产生的语义内容照常进入 Session。T09 不实现通用 Secret/DLP。ref 不是路径读取接口。
 - 可靠性：append durable、single writer、partial-tail 可恢复、中段损坏硬失败；Tool 副作用未知时不重试。
-- 性能：稳定前缀尽量复用；动态 delta 不无意义打碎长历史；Compactor/Tool Result 均有硬上限。
+- 性能：Runtime/Projection 动态变化不扰动 Instruction Plane；AGENTS 权限集合真实变化允许创建可解释的新 prefix epoch；Compactor/Tool Result 均有硬上限。
 - 可移植性：Windows/POSIX 锁与路径身份语义有测试；不新增运行时第三方依赖。
 
 ## 14. 能力欠账
 
-T09-1 后置：真实 Context Window/max input discovery、Provider/bundled metadata、自定义模型显式配置、统一 Model Limits、不同窗口 Budget Resolver、小/大窗口适配、258K Operating Profile 与 Working Set/Compaction/headroom/Prefix Cache Eval 调优。
+T09-1 后置：真实 Context Window/max input discovery、Provider/bundled metadata、自定义模型显式配置、统一 Model Limits、不同窗口 Budget Resolver、小/大窗口适配、258K Operating Profile 与 Working Set/Compaction/headroom/Prefix Cache Eval 调优。该欠账正式解决 T09 固定预算阶段对真实窗口小于 258K 模型不保证长上下文安全的问题。
 
 其他后置：active/paused Runtime checkpoint；Task/Plan/Pending Tool/Permission/AskUser/Provider continuation 的跨进程恢复；久远证据 Retrieval/Memory；Artifact GC；高级层级压缩/后台 Context Agent；Skill/MCP/Subagent/Multi-Agent context。AGENTS、固定 258K Budget、single writer、Compactor budget 和 Result quota 不属于欠账。
 
@@ -169,6 +171,6 @@ T09-1 后置：真实 Context Window/max input discovery、Provider/bundled meta
 
 ## 16. 验收标准
 
-必须覆盖：prefix stability、ordinary history authority spoof rejection、Projection authority non-escalation、固定 258K Budget、完整 AGENTS frozen semantics、compactor overflow、concurrent resume、runtime recovery boundary、result hard cap/quota/ref isolation、execution/persistence outcome 区分、strict sequence/durable append，以及 Provider mapper/Usage 可选 cache metrics。
+必须覆盖：runtime/projection prefix stability、directory AGENTS epoch change 与 stable reuse、ordinary history authority spoof rejection、Projection authority non-escalation、固定 258K Budget及小窗口阶段边界、完整 AGENTS frozen semantics、compactor overflow、concurrent resume、runtime recovery boundary、result hard cap/quota/ref isolation、execution/persistence outcome 区分、strict sequence/durable append，以及 Provider mapper/Usage 可选 cache metrics。
 
 最终执行定向、架构和全量测试，并同步任务书指定文档。未运行项必须明确记录。

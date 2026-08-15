@@ -15,11 +15,11 @@
 
 ## 必须交付
 
-1. selected/omitted、compact、externalization、session recovery/busy、stable-prefix diagnostics。
+1. selected/omitted、compact、externalization、session recovery/busy、instruction epoch 与 stable-prefix diagnostics/change reason。
 2. 复用 Provider 现有 cache read/write token Usage 映射并增加 availability/provenance；Provider 不支持时报告 `not_available`，不把现有默认 0 冒充实测值。
 3. baseline/candidate Eval 比较 success、tokens、tool calls、compact count、rediscovery、repeated exploration、externalization、prefix stability/cache reuse。
-4. 加入“长历史不变、仅 TaskState 更新”场景，证明 stable fingerprint 不变并发现 cache prefix 回归。
-5. 增加 ordinary history 伪造 Runtime/Project 标签仍无对应 authority，以及 Tool 已执行但 persistence 失败不误报/重试的场景。
+4. 加入 Runtime/Projection 变化不改 epoch/fingerprint、目录 AGENTS 新 scope 改变 epoch/fingerprint、已生效未变化 AGENTS 稳定复用的场景。
+5. 增加 ordinary history 伪造 AGENTS/Project/Runtime 标签仍不能进入 Instruction Plane，以及 Tool 已执行但 persistence 失败不误报/重试的场景。
 6. Eval 只衡量策略，不把“候选必须更优”写为 pytest 通过条件。
 7. 写入 W05 Feedback 并同步 Tasks/Checklist。
 
@@ -32,7 +32,7 @@
 
 ## 验证
 
-覆盖 diagnostics schema/序列化、缺失 cache metrics 的 NA 语义、现有 Usage 映射、deterministic Eval、baseline/candidate 报告一致性及全部前缀回归场景。
+覆盖 diagnostics schema/序列化、缺失 cache metrics 的 NA 语义、现有 Usage 映射、deterministic Eval、baseline/candidate 报告一致性、Instruction Epoch 的预期变化与全部前缀回归场景。
 
 ## Feedback
 

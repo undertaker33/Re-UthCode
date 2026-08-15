@@ -15,14 +15,14 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 
 ## Task 1：Prompt Asset、Context Source 与权限平面
 
-- 任务目标：拆分 Public Prompt/Core Contract，定义稳定指令与上下文平面的统一强类型输入。
+- 任务目标：拆分 Public Prompt/Core Contract，定义 Instruction Plane、Contextual Plane、authority/stability contract 与 Stable Instruction Prefix Epoch；明确 Runtime facts 不是 Instructions。
 - 新增：`src/uthcode/prompt_assets/coding_agent.md`、`src/uthcode/prompt_assets/__init__.py`、必要的 Context block/source models 与 `tests/test_system_prompt.py`、Context contract tests。
 - 修改：`src/uthcode/core/prompt.py` 及 package resource 配置。
 - 删除：被 asset 替代的公共 Prompt 硬编码副本；不删除 Core Runtime Contract。
 - 文件职责：Core 定义 provider-independent authority/stability/scope/provenance；asset 只拥有可编辑公共 Prompt；Tool schema 仍由 Tool System 唯一维护。
 - 依赖：无。
 - 参考：T03 归档包、`core/prompt.py`、`core/provider.py`、任务书第 5 节。
-- 完成边界：稳定前缀与 Contextual Plane 顺序可测试；Core Runtime Contract 声明 runtime-authenticated update 语义；Projection/User/Tool 内容不能升级或伪造 Runtime/Project authority；未实现 Loader/History/Compiler。
+- 完成边界：Instruction/Contextual Plane 顺序与 epoch contract 可测试；typed authority 不虚构 Provider role；Projection/User/Tool 内容不能进入 Instruction Plane 或伪造 Project authority；未实现 Loader/History/Compiler。
 
 ## Task 2：AGENTS / Project Instructions Loader
 
@@ -30,10 +30,10 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 新增：`src/uthcode/application/instructions.py`、`src/uthcode/integrations/instruction_files.py`、`tests/test_project_instructions.py`（具体稳定职责命名可按现有布局调整）。
 - 修改：Application tool/run composition 中 session-start 与 Read/Edit 路径命中通知；架构测试。
 - 删除：无；不得创建第二套裸 `@file` Loader。
-- 文件职责：Integration 负责物理路径/文件读取；Application 负责 user/root/directory scope、惰性发现、epoch/去重；Core 只接收 instruction blocks。
+- 文件职责：Integration 负责物理路径/文件读取；Application 负责 user/root/directory scope、惰性发现、当前有效 instruction set、epoch/去重及 scope/content change diagnostics；Core 只接收 instruction blocks。Task 2 不负责 Provider mapping。
 - 依赖：Task 1。
 - 参考：旧 `D:\project\UthCode\docs\work\Day7-记忆系统\` 的冻结语义与 `src/uthcode/instructions/` 实现证据；当前仓库 AGENTS.md 只作为开发约束。
-- 完成边界：用户/项目/目录、整行 `@include(...)`、递归最多 3 个额外文件、物理身份去重、Windows case-fold、循环/越界/代码块忽略全部有失败路径；不复制旧 LangGraph 结构。
+- 完成边界：用户/项目/目录、整行 `@include(...)`、递归最多 3 个额外文件、物理身份去重、Windows case-fold、循环/越界/代码块忽略全部有失败路径；新 scope/内容变化创建 epoch，未变化复用当前 epoch；不复制旧 LangGraph 结构。
 
 ## Task 3：Canonical History 与 Projection 基础
 
@@ -55,7 +55,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：Application 组装 typed sources 与固定 budget；Core Compiler 做确定性选择；Integration 不解析模型窗口、不拥有 Context policy。
 - 依赖：Task 1～3。
 - 参考：现有 Provider request/Usage、Prompt/Tool contract、任务书第 5/7/8 节；T09-1 只作欠账边界。
-- 完成边界：Protected Context、recent complete units、ref 跟随 unit、固定 258K budget、stable-prefix fingerprint 全部通过；无 Model Limits、retriever/embedding 或阈值专项优化。
+- 完成边界：Protected Context、recent complete units、ref 跟随 unit、固定 258K budget、instruction epoch/stable-prefix fingerprint 全部通过；Runtime/Projection 变化稳定，AGENTS epoch 变化可解释；无 Model Limits、retriever/embedding 或阈值专项优化。
 
 ## Task 5：Session Store、durable append 与 single writer
 
@@ -64,7 +64,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 修改：`application/bootstrap.py` 与可注入 storage root/config；必要的 lifecycle close/new/resume 接口。
 - 删除：可变 Projection pointer、mtime 产品排序、仅检查 lock 文件存在性的竞态实现。
 - 文件职责：Integration 实现 history/runtime/result bytes、OS lock、fsync/atomic replace；Application 实现 project_key/catalog/reconstruction。
-- 依赖：Task 3、Task 4 的 model/session metadata contract。
+- 依赖：Task 3、Task 4 的 History/Context Snapshot 与 Session metadata contract。
 - 参考：任务书第 4.4/11 节、T06/T08 resume 边界。
 - 完成边界：strict sequence、中段损坏、尾部半写、Runtime Log 丢失、跨项目隔离、并发子进程 resume 和 session busy 均有测试；不恢复 Task/Plan checkpoint。
 
@@ -81,14 +81,14 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 
 ## Task 7：有界 Compaction 与 Runtime Request Composition
 
-- 任务目标：让 Compactor 自身受预算约束，并使正式 Provider request 只消费 ContextSnapshot。
+- 任务目标：让 Compactor 自身受预算约束，并把 ContextSnapshot 的 Instruction Plane、Conversation Plane 与 Tool Definitions 组成统一 provider-independent GenerationRequest。
 - 新增：`tests/test_context_compaction.py` 及必要 request composition tests。
 - 修改：`application/context.py`、`application/generation.py`、`application/runs.py`、`core/provider.py` 的统一 request DTO、`core/agent.py` 与三类 Provider mapper/contract tests。
 - 删除：全量 `RunState.messages` 直通 Provider、无界压缩输入、动态 state 插入稳定前缀和无限 overflow retry。
-- 文件职责：Application 组装 Sources、Compaction single-flight、一次 overflow 保护及 authority-bearing semantic request；Core 保持唯一 RunState writer；Integration 仅做当前 Provider 最小 wire mapping。
+- 文件职责：Application 组装 Sources、Compaction single-flight、一次 overflow 保护与两平面 request；Core 保持唯一 RunState writer且不按 Provider 分支；Integration 仅将 Instruction Plane、Conversation Plane、Tool Definitions 映射到当前 Provider 协议。
 - 依赖：Task 4、Task 6。
-- 参考：当前 `GenerationRequest` 只有 `system_prompt + messages` 的事实、T05 Agent Loop、T06/T08 lifecycle、任务书第 5/10 节。
-- 完成边界：CompactionInputBudget/OutputReserve/SummaryHardCap、完整 unit 滚动分批、tool-free、失败不切 Projection、summary authority、ordinary history spoof rejection 和 provider-independent request path 通过；若现有 DTO 不足，在 Core/Application 收口。
+- 参考：当前 `GenerationRequest` 的 `system_prompt + messages` 可分别承载原生指令与会话通道的事实、T05 Agent Loop、T06/T08 lifecycle、任务书第 5/10 节。
+- 完成边界：CompactionInputBudget/OutputReserve/SummaryHardCap、完整 unit 滚动分批、tool-free、失败不切 Projection、summary authority、ordinary history spoof rejection 和两平面 provider-independent request path 通过；若现有 DTO 对真实调用边界不足，只在 Core/Application 最小扩展，不发明 history-tail high-authority role。
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 
@@ -110,7 +110,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：Application 暴露 JSON-safe/脱敏 facts；Eval 只消费公开投影。
 - 依赖：Task 4、Task 7、Task 8 的公开 diagnostics contract。
 - 参考：B01 Spec/Feedback、现有 Usage cache fields、任务书第 8.3/12 节。
-- 完成边界：selected/omitted、compact、rediscovery、externalization、stable prefix、cache availability/provenance、authority spoof 和 execution/persistence failure 回归可比较；无小/大窗口适配 Eval，真实远程 baseline 仍需另行授权。
+- 完成边界：selected/omitted、compact、rediscovery、externalization、instruction epoch/stable prefix、cache availability/provenance、authority spoof 和 execution/persistence failure 回归可比较；覆盖 Runtime/Projection 稳定、AGENTS epoch 变化与 stable reuse；无小/大窗口适配 Eval，真实远程 baseline 仍需另行授权。
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
 
@@ -131,7 +131,7 @@ Worker 内严格串行。每个 Worker 首次执行时创建同名 Feedback；�
 - 文件职责：E2E 证明产品行为，不复制单元实现。
 - 依赖：Task 10。
 - 参考：任务书第 12 节与 Checklist。
-- 完成边界：prefix/authority/fixed 258K/AGENTS/compactor overflow/concurrent resume/runtime boundary/quota/execution-persistence/Picker 全通过；全量 pytest、compileall、pip check 记录精确结果。
+- 完成边界：runtime/projection prefix stability、AGENTS epoch/stable reuse、authority spoof、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime boundary、quota/execution-persistence/Picker 全通过；全量 pytest、compileall、pip check 记录精确结果。
 
 ## Task 12：[遗留负担清理] 单历史 / 单 Context Path 收口
 

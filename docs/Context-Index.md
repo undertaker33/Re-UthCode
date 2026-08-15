@@ -85,7 +85,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `6624e69a5649224055f5674e7e91a28f2bd5d04b` 完成第二轮任务包返工：T09 固定 258K Operating Budget，Model Limits/不同窗口适配后置 T09-1，并补齐 authority transport、无参数 `/compact`、Secret 与 Tool persistence 边界；尚未显式派发任何 Worker Prompt |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | 已基于 `afe2795795972ed9c3581fbd8b6ca087a1963379` 完成第三轮定点返工：AGENTS/Project Instructions 通过 epoch-based Instruction Plane 获得真实权限，Runtime/Projection 保持 Contextual Plane 与稳定 prefix；T09 仍固定 258K Operating Budget，且明确 `<258K` 真实窗口的阶段限制由 T09-1 解决；尚未显式派发任何 Worker Prompt |
 
 ## 跨层最短链路
 

@@ -20,7 +20,7 @@
 | **T09 Prompt / Context Engineering** | 确定性 Working Set 只保护必要上下文并按预算保留 recent complete semantic units；不检索久远但“相关”的证据 | Memory / Evidence Retrieval 有正式需求和可靠证据模型时 |
 | **T09 Prompt / Context Engineering** | 大 Tool Result 只有单项/Session 配额与 session-scoped ref；不提供跨 Session Artifact 生命周期、清理与 GC | 出现独立 Artifact Store 生命周期需求时 |
 | **T09 Prompt / Context Engineering** | Compaction 只做有界滚动批次；不实现层级 Summary Graph、后台 Context Agent 或高级渐进式压缩 | Eval 证明简单 Compaction 无法满足真实长任务时 |
-| **T09-1 Model Context Window 与 258K Operating Profile 优化** | 探索并实现真实 Context Window / max input limit 获取、可查询 Provider metadata、官方模型 bundled metadata、OpenAI-compatible / Local 显式配置、统一 Model Limits contract，以及真实窗口与 UthCode Working Budget 的解析 | T09 固定 258K Context Engine 完成并具备稳定 baseline 后 |
+| **T09-1 Model Context Window 与 258K Operating Profile 优化** | 探索并实现真实 Context Window / max input limit 获取、可查询 Provider metadata、官方模型 bundled metadata、OpenAI-compatible / Local 显式配置、统一 Model Limits contract，以及真实窗口与 UthCode Working Budget 的解析；正式解决 T09 固定 258K 阶段不保证真实窗口小于 258K 的模型在长上下文下预算安全的问题 | T09 固定 258K Context Engine 完成并具备稳定 baseline 后 |
 | **T09-1 Model Context Window 与 258K Operating Profile 优化** | 完成 small-window / large-window adaptation，并基于 Prefix Cache、token、success Eval 调优 258K Operating Profile、Working Set 比例、Compaction trigger、recent tail 与 safety headroom | 真实窗口来源与统一 Budget Resolver 已收口，且有可比较 Eval 数据时 |
 
 ## 维护原则

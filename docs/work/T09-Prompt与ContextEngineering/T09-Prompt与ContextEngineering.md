@@ -93,10 +93,13 @@ Summary 不因由模型生成而升级为 Core/System authority。Compiler 的 t
 Stable Instruction Prefix
 ├─ Public Coding Prompt
 ├─ Core Runtime Contract
-├─ Session 启动时加载的稳定用户级 AGENTS
-├─ Session 启动时加载的项目根 AGENTS
+├─ 用户级 AGENTS
+├─ 项目根 AGENTS
+├─ 当前作用域已生效的目录级 AGENTS
 └─ 其他稳定工具/协议定义
 ```
+
+上述有序集合构成 Session 的 Instruction State，并以 `instruction_epoch` 标识当前版本。真正改变指令权限集合的内容允许产生新的稳定指令前缀 epoch；权限正确性优先于强行复用旧 prefix cache。
 
 ### 5.2 Conversation / Contextual Plane
 
@@ -104,38 +107,37 @@ Stable Instruction Prefix
 Conversation / Contextual Plane
 ├─ Projection / Compaction Summary（历史权限）
 ├─ retained raw semantic history
-├─ 目录级 Project Instruction update / delta（按其真实权限）
 ├─ TaskState / PlanState runtime update / delta
+├─ one-shot runtime feedback
 ├─ Environment update（必要时）
 └─ current user turn
 ```
 
-具体 Provider message role 由 Integration 根据协议映射，但不得改变 typed authority。高频变化的 TaskState、PlanState、one-shot feedback、Projection revision、环境变化不得插入稳定前缀与长历史之间。目录级 AGENTS 在路径首次命中时作为带 scope 的 instruction delta 追加；同 Session 内文件变化也产生新 epoch/delta，而不是回写旧前缀。
+高频变化的 TaskState、PlanState、one-shot feedback、Projection revision、环境变化留在 Contextual Plane，不得插入稳定指令前缀与长历史之间。目录级 AGENTS 不作为历史尾部的伪高权限消息；新 scope 首次生效或已生效内容合法变化时，从下一次合法 Provider request 开始使用新的 Instruction Epoch。旧 History 不回写。
 
 ### 5.3 Authority transport contract
 
-Python 内部 `authority` 字段不会自动被模型理解。Core Runtime Contract 必须预先声明：UthCode Runtime 可以在 Contextual Plane 注入由受信任 Runtime 构造边界产生的强类型更新；其权限来自 typed source、Compiler 构造与 Provider mapping contract，而不是块内 Markdown 标签。
+Python 内部 `authority` 字段不会自动变成 Provider wire role。typed authority 主要用于 UthCode 内部 Context policy、排序、校验和 Provider mapping，不得宣称它能创造 Provider 协议不存在的权限层级。Public Prompt、Core Contract 与 AGENTS 等真正需要 instruction authority 的内容，只能由受信任 Instruction Source 构造并进入 Instruction Plane。
 
 ```text
-typed source / authority
+trusted Instruction Source / typed authority
         ↓
-Context Compiler semantic item
+Context Compiler classification
         ↓
-GenerationRequest 可表达的权限与顺序
+GenerationRequest Instruction Plane
         ↓
-Provider Integration 最小 wire mapping
+Provider Integration native instruction/system mapping
 ```
 
 正式约束：
 
-1. `ProjectInstructionUpdate`、`RuntimeStateUpdate`、`EnvironmentUpdate` 必须保留各自语义和尾部顺序。
-2. 普通 User/Tool 历史即使伪造 `[RuntimeStateUpdate]` 等标签，也只能保持原 history authority。
-3. Projection 不能映射成 System/Core instruction。
-4. 动态 Runtime/Project update 不能全部重建到 system prompt 前部，也不能降级成普通 User history 裸文本。
-5. Worker 根据当前正式 Provider 协议选择最小映射，并用 Integration contract tests 证明 ordinary history 不能伪造 Runtime/Project authority；Integration 不拥有 Context policy。
-6. 若现有统一 `GenerationRequest` 无法表达该边界，必须在 Core/Application 的 provider-independent contract 收口，不采用 Provider-specific Prompt hack。
+1. 普通 User/Tool 历史即使伪造 `[ProjectInstruction]`、`[AGENTS]` 或 `[RuntimeStateUpdate]` 标签，也只存在于 Conversation Plane，不能进入 Instruction Plane。
+2. Projection、Compaction Summary、Runtime State 与 Environment facts 不能映射成 Core/Project instruction。
+3. Instruction Plane 通过 Provider 原生最高指令通道表达；概念映射为 Anthropic `system`、OpenAI Responses `instructions`、OpenAI-compatible Chat `system` message，具体形状以当前正式 Provider contract 为准。
+4. Core 不按 Provider 名称分支；Integration 只转换 Instruction Plane、Conversation Plane 与 Tool Definitions 的协议形状，不拥有 Context policy。
+5. 若现有统一 `GenerationRequest` 不能清晰表达 Instruction Plane 与 Conversation Plane，Task 7 在 Core/Application 的 provider-independent contract 中最小扩展；不得发明 history-tail high-authority role 或在 Integration 私拼 Prompt policy。
 
-当前事实代码中的 `GenerationRequest` 只有单一 `system_prompt` 与普通 `messages`，尚不能显式区分尾部的 runtime-authenticated Project/Runtime update 和 ordinary history；这是 T09 必须收口的真实 Core/Application DTO 缺口，不得退回“全塞 system prompt”或“伪装成 User history”。
+当前事实代码中的 `GenerationRequest` 已有单一 `system_prompt` 与普通 `messages`，三类 Integration 分别映射到各自原生指令通道与会话通道。T09 Task 7 需要正式化这两个平面的构造和测试；只有真实调用边界需要时才扩展 DTO，不为内部 typed authority 虚构 Provider 不支持的 wire 权限。
 
 ### 5.4 Context Source contract
 
@@ -148,7 +150,7 @@ Provider Integration 最小 wire mapping
 - `EnvironmentSource`
 - `ToolDefinitionSource`
 
-Source 提供 typed block、authority、stability、scope、provenance 与估算信息；Compiler 只消费统一 Source，不直接读 Provider SDK、文件系统或 TOML。
+Source 提供 typed block、authority、stability、scope、provenance 与估算信息；`ProjectInstructionSource` 还提供当前生效的有序 instruction set 与 epoch change facts。Compiler 只消费统一 Source，不直接读 Provider SDK、文件系统或 TOML。
 
 ## 6. AGENTS / Project Instructions
 
@@ -165,10 +167,17 @@ T09 必须按历史已冻结定义实现：
 7. 用户级引用受用户配置根约束，项目/目录级引用受项目根约束；越界、读取失败、循环和超限均显式诊断并 fail closed。
 8. 用户级 AGENTS 只能通过明确授权修改；项目级 AGENTS 遵守普通 workspace 权限。未来 Memory/Dream 不得修改 AGENTS。
 
+Instruction Epoch 规则：
+
+- Session 启动加载 user/root AGENTS，建立初始 Instruction Epoch。
+- 首次进入新目录并发现新的有效目录级 AGENTS：更新有效 instruction set，`instruction_epoch + 1`，下一次 request 使用新 Stable Instruction Prefix。
+- 已生效 AGENTS 内容合法变化：创建新 epoch；未变化或继续访问同一已生效 scope：不创建新 epoch。
+- Loader/Application 记录 scope added/content changed 等安全 diagnostics；不改写旧 History，也不把 AGENTS 作为会话尾部文本注入。
+
 ### 6.2 当前架构落点
 
 - Integration 负责文件发现、规范路径、物理身份、读取和 OS 边界。
-- Application 负责加载时机、Session/路径 scope、去重状态与 Source 组合。
+- Application 负责加载时机、Session/路径 scope、去重状态、当前有效 instruction set、epoch change 与 Source 组合。
 - Core 只接收 provider-independent 的 instruction block / authority，不读取文件。
 - Interface 不直接调用 Loader，只通过 Application。
 
@@ -180,7 +189,7 @@ UTHCODE_CONTEXT_BUDGET_TOKENS = 258_000
 
 258K 是 T09 Context Engine 的固定工作预算 / Operating Budget，不是所有远端模型真实物理 Context Window 的声明。T09 不发现 model window，不计算 `min(model_window, 258K)`，不改 `ModelProfile` 输入限制，不查询 Provider metadata，不维护 bundled context metadata，也不按模型改变 TUI denominator。
 
-真实模型窗口、统一 Model Limits contract、小/大窗口适配和 258K 专项阈值优化由 T09-1 探索。Provider overflow 在 T09 仍只是最后保护，可触发一次受控 Compaction/重编译；它不是窗口发现机制，也不能无限重试。
+真实模型窗口、统一 Model Limits contract、小/大窗口适配和 258K 专项阈值优化由 T09-1 探索。在 T09-1 完成前，UthCode 不保证真实输入窗口小于 258K 的模型能安全运行到 258K 长上下文规模：Compiler 可能仍处于自身预算内，而 Provider 已 overflow。Provider overflow 在 T09 仅是最后保护，最多触发一次受控 Compaction/重编译，仍失败则停止；不得据此反推模型窗口或动态修改 budget。
 
 ## 8. Context Compiler 与 Working Set
 
@@ -198,7 +207,7 @@ T09 没有 retriever、embedding、relevance scorer、evidence graph、Memory �
 2. Projection / prior summary。
 3. recent complete turns：从新到旧按预算选择完整 semantic units。
 4. Tool Result preview/ref 只跟随被保留的 semantic unit；不得单独漂移。
-5. runtime/environment/instruction delta 位于当前 Turn 附近。
+5. runtime/environment delta 位于当前 Turn 附近。
 
 80 Turn 前仍重要的证据检索属于未来 Evidence Retrieval / Memory，不在 T09 偷加启发式。
 
@@ -210,9 +219,10 @@ T09 没有 retriever、embedding、relevance scorer、evidence graph、Memory �
 - `stable_prefix_fingerprint`
 - `prefix_changed`
 - `prefix_change_reason`
+- `instruction_epoch`
 - 可选 `tool_schema_fingerprint`
 
-fingerprint 基于 Compiler 实际稳定语义序列的确定性规范化表示，只保存不可逆摘要和安全元数据，不复制原始 Context 文本；这不要求通用 secret scanner。仅 TaskState / Runtime State 更新时，稳定前缀 fingerprint 不变，历史公共前缀可继续复用。Provider 若返回 `cache_read_input_tokens`、`cache_creation/write_input_tokens` 或 `cached_input_tokens`，Integration 可继续映射现有 Usage token 计数，同时提供可选的 metrics availability/provenance；不支持时 diagnostics 为 `not_available`，不得把现有数值默认 0 解释成“Provider 明确报告 0”。不要求所有 Provider 支持同一指标。
+fingerprint 基于 Compiler 实际 Instruction Plane 的确定性规范化表示，只保存不可逆摘要和安全元数据，不复制原始 Context 文本；这不要求通用 secret scanner。仅 TaskState、PlanState、Environment、Projection 或 Compaction revision 更新时，`instruction_epoch` 与稳定指令前缀 fingerprint 不变。新目录 scope 首次生效或已生效 AGENTS 内容变化时允许 fingerprint 改变，并以 `instruction_scope_added`、`instruction_content_changed` 等最小 reason 解释；未变化的已生效 AGENTS 可稳定复用。Provider 若返回 `cache_read_input_tokens`、`cache_creation/write_input_tokens` 或 `cached_input_tokens`，Integration 可继续映射现有 Usage token 计数，同时提供可选的 metrics availability/provenance；不支持时 diagnostics 为 `not_available`，不得把现有数值默认 0 解释成“Provider 明确报告 0”。不要求所有 Provider 支持同一指标。
 
 T09 只保证 prefix 结构和可观测机制正确，不冻结最佳 compact threshold、headroom、Working Set 比例、recent-tail 大小、不同模型档位或按物理窗口百分比 trigger；这些属于 T09-1 Eval/优化。
 
@@ -289,16 +299,19 @@ Eval 用于比较策略效果，不把上下文策略写成 pytest 红绿门槛�
 
 必须包含场景：
 
-1. 长历史不变，仅 TaskState 更新，稳定前缀 fingerprint 不变且历史 prefix 不被无意义打碎。
+1. 长历史不变，仅 TaskState / PlanState 更新，Instruction Epoch 与稳定指令前缀 fingerprint 不变。
 2. User/Tool instruction-like 文本经 summary 后仍为历史权限。
-3. 普通 User/Tool 历史伪造 Runtime/Project update 标签时，仍不能获得对应 authority。
+3. 普通 User/Tool 历史伪造 AGENTS/Project/Runtime 标签时仍只在 Conversation Plane，不能进入 Instruction Plane。
 4. 固定 258K Budget 下 Working Set、Compaction 与 status/ring 口径一致。
-5. AGENTS 用户/项目/目录 scope、`@include` 递归、去重、循环、3 文件限制、越界和代码块忽略。
-6. Compactor 候选超过其输入预算时按完整 semantic boundary 分批。
-7. 两进程 resume 同 Session 时只有一个 writer，无双 sequence 或 corruption。
-8. 同进程 Turn continuation 与跨进程 Session resume 符合边界。
-9. 单 Result hard cap、Session quota 与 ref 越权读取失败。
-10. Tool 已成功执行但 persistence 失败时，不伪造 Tool 未执行，也不自动重试副作用。
+5. 首次命中新目录 AGENTS 时 epoch 增加、fingerprint 改变并记录 scope change；再次访问且内容未变时二者保持不变。
+6. 仅 Projection/Compaction revision 变化时 Instruction Plane、epoch 与 fingerprint 不变。
+7. AGENTS 用户/项目/目录 scope、`@include` 递归、去重、循环、3 文件限制、越界和代码块忽略。
+8. Compactor 候选超过其输入预算时按完整 semantic boundary 分批。
+9. 两进程 resume 同 Session 时只有一个 writer，无双 sequence 或 corruption。
+10. 同进程 Turn continuation 与跨进程 Session resume 符合边界。
+11. 单 Result hard cap、Session quota 与 ref 越权读取失败。
+12. Tool 已成功执行但 persistence 失败时，不伪造 Tool 未执行，也不自动重试副作用。
+13. 测试与文档证明 T09 没有动态 Model Limits、不宣称小于 258K 的模型长上下文安全，overflow 不作 discovery。
 
 ## 13. 实施顺序与 Worker
 
@@ -335,6 +348,7 @@ Worker 数保持 W01～W06，不因问题数量机械扩张；精确 Task 分配
 T09 完成后仍明确后置：
 
 - T09-1：真实 Context Window / max input discovery、Provider metadata、bundled metadata、自定义模型显式配置、统一 Model Limits、不同窗口 Budget Resolver、小/大窗口适配、258K Operating Profile、Working Set/Compaction/headroom 阈值与 Prefix Cache/token/success Eval 调优；
+- 在 T09-1 完成前，固定 258K Operating Budget 不保证真实输入窗口小于 258K 的模型在长上下文下预算安全；
 - active/paused Turn、TaskState、PlanState、Pending Tool、Permission、AskUser waiter、Provider 请求与协程位置的跨进程 checkpoint / recovery；
 - Memory / Evidence Retrieval 对久远但重要证据的选择；
 - 通用 Artifact 生命周期与 GC；
@@ -342,3 +356,23 @@ T09 完成后仍明确后置：
 - Skill、MCP deferred loading、Subagent/Multi-Agent context isolation。
 
 AGENTS / Project Instructions、Context Compiler、固定 258K Operating Budget、Session single writer、Compactor hard budget 和 Tool Result 最薄资源上限均属于 T09 正式范围。Model Limits 与不同窗口适配属于 T09-1，不得在 T09 Worker 中实施。
+
+最终组合结构：
+
+```text
+Session
+├─ Instruction State（Public Prompt / Core Contract / effective AGENTS / epoch）
+├─ Canonical History
+├─ Projection
+├─ Runtime State
+└─ Tool Results
+        ↓
+Context Compiler
+├─ Instruction Plane（epoch-based stable prefix）
+├─ Conversation Plane（Projection / history / runtime / environment / current user）
+└─ diagnostics
+        ↓
+GenerationRequest
+        ↓
+Provider Integration（仅协议映射）
+```

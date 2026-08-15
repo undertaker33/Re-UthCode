@@ -18,14 +18,14 @@
 
 1. T09 固定使用 258,000-token Context Operating Budget；它不是远端模型物理窗口声明。
 2. Working Set 只使用 Protected Context、active Projection、recent complete semantic units 与 current-turn deltas。
-3. stable-prefix diagnostics 保留；阈值和不同模型档位优化后置 T09-1。
+3. Instruction Plane 由当前 instruction epoch 决定；Runtime/Projection 变化不改 stable fingerprint，AGENTS 新 scope/内容变化允许创建新 epoch；阈值和不同模型档位优化后置 T09-1。
 4. Session single writer、strict sequence、durable append 和 Runtime State 非 checkpoint 边界保持不变。
 
 ## 必须交付
 
-1. Provider-independent Compiler/Snapshot、固定 258K Budget 和 deterministic token estimate。
+1. Provider-independent Compiler/Snapshot、固定 258K Budget 和 deterministic token estimate；从 W01 当前有效 instruction set 构造 Instruction Plane。
 2. Protected Context、Projection、recent complete semantic units、ref 跟随 unit；不得实现“相关性”算法。
-3. stable-prefix token/fingerprint/changed/reason diagnostics；runtime-only delta 不改 stable fingerprint。
+3. instruction epoch 与 stable-prefix token/fingerprint/changed/reason diagnostics；runtime/projection-only 变化不改 stable fingerprint，AGENTS epoch change 使用可解释 reason。
 4. Session versioned layout、durable append、strict sequence、last complete boundary recovery。
 5. `runtime.jsonl` 保持非语义权威；删除不影响恢复，stream/UI lifecycle 不写入 History。
 6. 进程持有的跨平台 OS 排他锁；resume 先锁后读，并发第二 writer fail closed。
@@ -40,7 +40,7 @@
 
 ## 验证
 
-覆盖 fixed 258K、runtime-only prefix stability、deterministic working set、无 T09-1 实现残留、并发子进程 resume、双 sequence 防护、尾记录恢复、中段损坏与跨进程 Runtime State 非 checkpoint 边界。
+覆盖 fixed 258K、runtime/projection prefix stability、AGENTS epoch change/stable reuse、deterministic working set、`<258K` 模型阶段限制、无 T09-1 实现残留、并发子进程 resume、双 sequence 防护、尾记录恢复、中段损坏与跨进程 Runtime State 非 checkpoint 边界。
 
 ## Feedback
 

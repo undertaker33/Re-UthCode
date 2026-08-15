@@ -6,14 +6,15 @@
 
 - [ ] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
 - [ ] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
-- [ ] 普通 User/Tool 历史伪造 Runtime/Project update 标签，观察其不能获得对应 authority；动态 update 不重建到长历史前的 system prefix，也不作为普通 User 裸文本。
-- [ ] 构造长历史只更新 TaskState，观察 stable-prefix fingerprint 不变，动态 delta 位于历史尾部附近。
+- [ ] 普通 User/Tool 历史伪造 AGENTS/ProjectInstruction/Runtime 标签，观察其仍只在 Conversation Plane，不能进入 Instruction Plane。
+- [ ] 构造长历史只更新 TaskState/PlanState，观察 instruction epoch 与 stable instruction prefix fingerprint 不变，动态 facts 位于 Contextual Plane。
 
 ## Task 2：AGENTS / Project Instructions Loader
 
 - [ ] 执行 `python -m pytest -q tests/test_project_instructions.py tests/test_architecture_boundaries.py`，全部通过。
 - [ ] 覆盖 user/root/directory scope、整行单双引号 `@include`、递归、3 个额外文件、第 4 个失败、物理去重、Windows case-fold、直接/间接循环、越界、代码围栏/行内代码忽略。
-- [ ] 从 Read/Edit 路径首次进入子目录，观察只追加新命中 instruction delta；Core/Interface 不直接读文件。
+- [ ] 从 Read/Edit 路径首次进入子目录并发现新 AGENTS，观察 instruction epoch +1、stable prefix fingerprint 改变、reason 为 scope change，下一次 request 使用新 Instruction Plane；这不是 prefix regression。
+- [ ] 继续访问同一已生效目录且内容未变，观察 instruction epoch/fingerprint 不变；已生效 AGENTS 合法修改时创建新 epoch 并记录 content change；Core/Interface 不直接读文件。
 
 ## Task 3：Canonical History 与 Projection 基础
 
@@ -26,6 +27,7 @@
 - [ ] 执行 `python -m pytest -q tests/test_context_compiler.py` 及相关 request composition tests，全部通过。
 - [ ] 验证 Compiler、`/status` 与 ring 使用同一固定 258K Operating Budget，并明确不代表远端模型物理窗口。
 - [ ] 搜索 T09 实现确认没有 Model Limits resolver、`max_input_tokens` 配置、Provider/bundled window metadata 或小/大窗口适配。
+- [ ] 文档/contract tests 明确 T09 不保证真实窗口小于 258K 的模型在长上下文下安全，overflow 最多一次保护且不作 discovery 或动态 budget 解析。
 - [ ] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
 
 ## Task 5：Session Store、durable append 与 single writer
@@ -48,7 +50,8 @@
 - [ ] 执行 `python -m pytest -q tests/test_context_compaction.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
 - [ ] 待压缩历史超过 Compactor input budget 时按完整 semantic unit 有界滚动分批，每批输入/输出受限且 ToolCall/ToolResult 不拆。
 - [ ] manual/auto/一次 overflow 保护、single-flight、取消/非法 summary/ToolCall/二次 overflow 失败路径均不改变旧 Projection/History。
-- [ ] 记录三类 Provider contract request，观察正式路径消费 ContextSnapshot、Projection 保持 history authority、Runtime/Project update 保留语义且 ordinary history 无法伪造；Integration 无 Context policy。
+- [ ] 记录三类 Provider contract request，观察 Instruction Plane、Conversation Plane、Tool Definitions 分别由 Core/Application 构造，Integration 只做原生协议映射；Projection 保持 history authority，ordinary history 无法进入 Instruction Plane。
+- [ ] 仅 Projection/Compaction revision 变化时，观察 instruction epoch、Instruction Plane 与 stable prefix fingerprint 均不变。
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 
@@ -62,7 +65,7 @@
 - [ ] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py` 及新增 diagnostics tests，全部通过。
 - [ ] baseline/candidate 报告包含 success/tokens/tool calls/compact/rediscovery/repeated exploration/externalization/stable prefix/cache reuse（可获得时）。
 - [ ] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；diagnostics 不额外复制 Runtime credential、完整外置结果、Provider native payload 或未脱敏内部异常。
-- [ ] 长历史不变仅 Runtime State 更新的 fixture 能检测 prefix 回归；候选策略不要求在 pytest 中概率性胜出。
+- [ ] fixtures 覆盖 Runtime/Projection 变化保持 epoch/fingerprint、目录 AGENTS 新 scope 改变 epoch/fingerprint、已生效未变化 AGENTS 稳定复用；候选策略不要求在 pytest 中概率性胜出。
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
 
@@ -72,7 +75,7 @@
 
 ## Task 11：[端到端验证] Context / Session / Prefix
 
-- [ ] 从真实入口覆盖 prefix stability、authority spoof rejection、fixed 258K、AGENTS、compactor overflow、concurrent resume、runtime boundary、quota/ref、execution/persistence outcome、Picker。
+- [ ] 从真实入口覆盖 runtime/projection prefix stability、AGENTS epoch/stable reuse、authority spoof rejection、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime boundary、quota/ref、execution/persistence outcome、Picker。
 - [ ] 执行 `python -m pytest -q`，记录精确 passed/failed/skipped 和耗时。
 - [ ] 执行 `python -m compileall -q src tests eval` 与 `python -m pip check`，均退出 0。
 
