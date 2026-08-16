@@ -38,8 +38,10 @@ from uthcode.core.prompt import (
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
+from .context import ApplicationContextService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
+from .sessions import ApplicationSession, ApplicationSessionService
 from .tools import ApplicationToolService
 
 
@@ -135,6 +137,8 @@ class UthCodeApplication:
         tool_service: ApplicationToolService | None = None,
         permission_rules_loader: PermissionRulesLoader | None = None,
         instruction_loader: InstructionLoader | None = None,
+        context_service: ApplicationContextService | None = None,
+        session_service: ApplicationSessionService | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -159,9 +163,15 @@ class UthCodeApplication:
             raise TypeError("permission_rules_loader must be callable or None")
         if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
             raise TypeError("instruction_loader must be InstructionLoader or None")
+        if context_service is not None and not isinstance(context_service, ApplicationContextService):
+            raise TypeError("context_service must be ApplicationContextService or None")
+        if session_service is not None and not isinstance(session_service, ApplicationSessionService):
+            raise TypeError("session_service must be ApplicationSessionService or None")
         self._tool_service = tool_service
         self._permission_rules_loader = permission_rules_loader
         self._instruction_loader = instruction_loader
+        self._context_service = context_service or ApplicationContextService()
+        self._session_service = session_service
         if self._instruction_loader is not None:
             # Session-start loading is Application-owned; the loader itself
             # keeps filesystem policy in its Integration adapter.
@@ -189,6 +199,18 @@ class UthCodeApplication:
         return self._instruction_loader
 
     @property
+    def context_service(self) -> ApplicationContextService:
+        """Return the Application-owned Context composition service."""
+
+        return self._context_service
+
+    @property
+    def session_service(self) -> ApplicationSessionService | None:
+        """Return the optional durable Session lifecycle service."""
+
+        return self._session_service
+
+    @property
     def current_model_ref(self) -> str:
         return self._current_model_ref
 
@@ -214,6 +236,41 @@ class UthCodeApplication:
         """Return the Application's immutable, ordered Tool definitions."""
 
         return self._tool_service.definitions()
+
+    def compile_context(self, **kwargs: Any):
+        """Compile a fixed-budget Context Snapshot from current sources."""
+
+        if "instruction_loader" not in kwargs:
+            kwargs["instruction_loader"] = self._instruction_loader
+        if "tool_definitions" not in kwargs:
+            kwargs["tool_definitions"] = self.tool_definitions()
+        return self._context_service.compile(**kwargs)
+
+    def context_usage(self, snapshot=None):
+        """Return the same fixed-budget usage projection for headless callers."""
+
+        return self._context_service.usage(snapshot)
+
+    def create_session(self, session_id: str | None = None) -> ApplicationSession:
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.create_session(session_id)
+
+    def resume_session(self, session_id: str) -> ApplicationSession:
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.resume_session(session_id)
+
+    def list_sessions(self):
+        if self._session_service is None:
+            return ()
+        return self._session_service.list_sessions()
+
+    def close(self) -> None:
+        """Release any Application-held Session writer lock."""
+
+        if self._session_service is not None:
+            self._session_service.close()
 
     def create_run(self, *, run_id: str | None = None) -> AgentRun:
         """Create one isolated in-memory Agent Run."""

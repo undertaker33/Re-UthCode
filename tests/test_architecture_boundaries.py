@@ -107,11 +107,14 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                     "uthcode.integrations.config.data",
                     "uthcode.integrations.config.loader",
                     "uthcode.integrations.instruction_files",
+                    "uthcode.integrations.session_files",
                     "uthcode.integrations.permissions",
                     "uthcode.integrations.providers.factory",
                     "uthcode.integrations.tools.factory",
                 }
             )
+        if source_path.name == "sessions.py":
+            allowed_integration_imports.add("uthcode.integrations.session_files")
         for value in values:
             if value.startswith("uthcode.integrations"):
                 assert value in allowed_integration_imports, source_path
@@ -237,7 +240,6 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         "graph",
         "prompts",
         "permissions",
-        "context",
         "memory",
         "session",
         "storage",

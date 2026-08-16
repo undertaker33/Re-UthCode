@@ -26,20 +26,20 @@
 
 ## Task 4：Context Compiler、258K Budget 与确定性 Working Set
 
-- [ ] 执行 `python -m pytest -q tests/test_context_compiler.py` 及相关 request composition tests，全部通过。
+- [x] 执行 `python -m pytest -q tests/test_context_compiler.py` 及相关 request composition tests，全部通过。
 - [ ] 验证 Compiler、`/status` 与 ring 使用同一固定 258K Operating Budget，并明确不代表远端模型物理窗口。
-- [ ] 搜索 T09 实现确认没有 Model Limits resolver、`max_input_tokens` 配置、Provider/bundled window metadata 或小/大窗口适配。
-- [ ] 文档/contract tests 明确 T09 不保证真实窗口小于 258K 的模型在长上下文下安全，overflow 最多一次保护且不作 discovery 或动态 budget 解析。
-- [ ] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
+- [x] 搜索 T09 实现确认没有 Model Limits resolver、`max_input_tokens` 配置、Provider/bundled window metadata 或小/大窗口适配。
+- [x] 文档/contract tests 明确 T09 不保证真实窗口小于 258K 的模型在长上下文下安全，overflow 最多一次保护且不作 discovery 或动态 budget 解析。
+- [x] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
 
 ## Task 5：Session Store、durable append 与 single writer
 
-- [ ] 执行 `python -m pytest -q tests/test_session_files.py`，覆盖 monotonic sequence、durable append、尾部半写、中段损坏、unknown kind，全部通过。
-- [ ] 启动两个子进程 resume 同一 Session，观察只有一个取得 writer lock，另一方 session busy，无双 sequence/history corruption。
-- [ ] 删除 runtime log 后恢复结果不变；同 project key 可发现，其他项目不可见；last_used 不依赖 mtime。
+- [x] 执行 `python -m pytest -q tests/test_session_files.py`，覆盖 monotonic sequence、durable append、尾部半写、中段损坏、unknown kind，全部通过。
+- [x] 启动两个子进程 resume 同一 Session，观察只有一个取得 writer lock，另一方 session busy，无双 sequence/history corruption。
+- [x] 删除 runtime log 后恢复结果不变；同 project key 可发现，其他项目不可见；last_used 不依赖 mtime。
 - [ ] 跨进程恢复新 Run/Turn 且 TaskState/PlanState 未被假装 checkpoint；同进程 continuation 仍按 T08 回归通过。
-- [ ] 激活 directory AGENTS → 关闭进程 → `/resume`：metadata 提供 activated scopes/epoch/fingerprint，当前文件系统内容未变化时 effective instruction set、epoch 与 fingerprint 保持；metadata 不含 AGENTS 正文。
-- [ ] 激活 directory AGENTS → 关闭进程 → 修改或删除 AGENTS → `/resume`：以当前文件系统为权威创建新 epoch、改变 fingerprint、记录明确 reason；删除后仍保留 activated directory scope 标识，使后续重新出现可被发现；无 `instruction-history.jsonl` 或独立 Instruction Event Store。
+- [x] 激活 directory AGENTS → 关闭进程 → `/resume`：metadata 提供 activated scopes/epoch/fingerprint，当前文件系统内容未变化时 effective instruction set、epoch 与 fingerprint 保持；metadata 不含 AGENTS 正文。
+- [x] 激活 directory AGENTS → 关闭进程 → 修改或删除 AGENTS → `/resume`：以当前文件系统为权威创建新 epoch、改变 fingerprint、记录明确 reason；删除后仍保留 activated directory scope 标识，使后续重新出现可被发现；无 `instruction-history.jsonl` 或独立 Instruction Event Store。
 
 ## Task 6：大 Tool Result 外置与资源上限
 
