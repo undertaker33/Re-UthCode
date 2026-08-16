@@ -406,6 +406,24 @@ class InstructionLoader:
         self._session_loaded = True
         return self._rebuild(strict=strict, new_scope=False)
 
+    def reset_for_new_session(self) -> None:
+        """Clear only per-Session activated directory Instruction State.
+
+        User/project files remain the current filesystem sources and are loaded
+        again by ``load_session``.  This is used by Application ``/new``
+        composition so a new Session does not inherit directory scopes from a
+        previous Session in the same process.
+        """
+
+        self._session_loaded = False
+        self._activated_directories = set()
+        self._blocks = ()
+        self._diagnostics = ()
+        self._source_fingerprints = ()
+        self._instruction_epoch = 0
+        self._stable_prefix_fingerprint = ""
+        self._change_reason = "initial"
+
     def load_for_path(
         self,
         target_path: str | Path,

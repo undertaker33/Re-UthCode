@@ -20,6 +20,7 @@ from uthcode.integrations.instruction_files import (
     InstructionFileReader,
     discover_project_root,
 )
+from uthcode.integrations.session_files import SessionFileStore
 from uthcode.core.tool import Tool
 
 from .configuration import (
@@ -31,6 +32,7 @@ from .configuration import (
     ProviderProfile,
 )
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
+from .sessions import ApplicationSessionService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
@@ -140,6 +142,8 @@ def create_application(
     runtime_context: ApplicationRuntimeContext | None = None,
     tools: Sequence[Tool] | None = None,
     instruction_loader: InstructionLoader | None = None,
+    storage_root: str | Path | None = None,
+    session_store: SessionFileStore | None = None,
 ) -> UthCodeApplication:
     """Build a Headless Application from one EffectiveConfig."""
 
@@ -165,6 +169,20 @@ def create_application(
             project_root=discover_project_root(runtime_context.workdir),
             reader=InstructionFileReader(),
         )
+    if session_store is not None and not isinstance(session_store, SessionFileStore):
+        raise TypeError("session_store must be SessionFileStore or None")
+    if session_store is not None and storage_root is not None:
+        raise TypeError("pass storage_root or session_store, not both")
+    session_service = ApplicationSessionService(
+        storage_root=(
+            Path(storage_root)
+            if storage_root is not None
+            else Path.home() / ".uthcode" / "sessions"
+        ),
+        project_key=str(loader.project_root),
+        instruction_loader=loader,
+        store=session_store,
+    )
     tool_values = (
         create_default_tools(
             runtime_context.workdir,
@@ -194,6 +212,7 @@ def create_application(
             lambda: load_permission_rules(cwd=runtime_context.workdir)
         ),
         instruction_loader=loader,
+        session_service=session_service,
     )
 
 

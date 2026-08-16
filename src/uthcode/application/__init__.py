@@ -16,6 +16,7 @@ from .bootstrap import (
     load_effective_config,
 )
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
+from .context import ApplicationContextService
 from .history import ApplicationHistory, HistoryCoordinator
 from .instructions import (
     InstructionAuthorization,
@@ -35,6 +36,7 @@ from .instructions import (
 )
 from .runtime_context import ApplicationRuntimeContext
 from .runs import AgentRun, TurnHandle
+from .sessions import ApplicationSession, ApplicationSessionService, SessionActiveError
 from uthcode.core.interaction import (
     PauseKind,
     PauseReason,
@@ -128,6 +130,9 @@ __all__ = [
     "ApplicationStatus",
     "ApplicationRuntimeContext",
     "ApplicationHistory",
+    "ApplicationContextService",
+    "ApplicationSession",
+    "ApplicationSessionService",
     "AgentEvent",
     "AgentRun",
     "ArgumentSpec",
@@ -210,6 +215,7 @@ __all__ = [
     "TaskState",
     "TaskStateChanged",
     "TaskStatus",
+    "SessionActiveError",
     "ToolCallPart",
     "ToolDefinition",
     "ToolResultPart",
