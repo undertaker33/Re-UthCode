@@ -19,9 +19,11 @@ from .models import (
     ModelSelected,
     OpenPermissionPicker,
     OpenModelPicker,
+    OpenSessionPicker,
     OutcomeStatus,
     PermissionModeSelected,
     QuitInterface,
+    SessionChanged,
     UiAction,
 )
 from .parser import CommandParser, parse_command
@@ -49,9 +51,11 @@ __all__ = [
     "ModelSelected",
     "OpenPermissionPicker",
     "OpenModelPicker",
+    "OpenSessionPicker",
     "OutcomeStatus",
     "PermissionModeSelected",
     "QuitInterface",
+    "SessionChanged",
     "UiAction",
     "complete_commands",
     "create_builtin_registry",

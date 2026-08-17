@@ -82,4 +82,65 @@ class PermissionPickerState:
         self.open = False
 
 
-__all__ = ["ModelPickerState", "PermissionPickerState"]
+@dataclass(slots=True)
+class SessionPickerState:
+    """Temporary page/selection state; discovery stays in Application."""
+
+    sessions: tuple[object, ...] = ()
+    page: int = 0
+    selected_index: int = 0
+    page_size: int = 10
+    open: bool = False
+
+    def __post_init__(self) -> None:
+        if self.page_size != 10:
+            raise ValueError("Session Picker page_size must remain 10")
+
+    @property
+    def page_count(self) -> int:
+        if not self.sessions:
+            return 0
+        return (len(self.sessions) + self.page_size - 1) // self.page_size
+
+    @property
+    def page_items(self) -> tuple[object, ...]:
+        start = self.page * self.page_size
+        return self.sessions[start : start + self.page_size]
+
+    @property
+    def selected(self) -> object | None:
+        items = self.page_items
+        if not items:
+            return None
+        return items[self.selected_index]
+
+    def replace(self, sessions: tuple[object, ...] | list[object]) -> None:
+        self.sessions = tuple(sessions)
+        self.page = 0
+        self.selected_index = 0
+        self.open = bool(self.sessions)
+
+    def move(self, delta: int) -> None:
+        items = self.page_items
+        if items:
+            self.selected_index = (self.selected_index + delta) % len(items)
+
+    def next_page(self) -> None:
+        if self.page_count:
+            self.page = min(self.page + 1, self.page_count - 1)
+            self.selected_index = min(self.selected_index, len(self.page_items) - 1)
+
+    def previous_page(self) -> None:
+        if self.page_count:
+            self.page = max(self.page - 1, 0)
+            self.selected_index = min(self.selected_index, len(self.page_items) - 1)
+
+    def close(self) -> None:
+        self.open = False
+
+
+__all__ = [
+    "ModelPickerState",
+    "PermissionPickerState",
+    "SessionPickerState",
+]

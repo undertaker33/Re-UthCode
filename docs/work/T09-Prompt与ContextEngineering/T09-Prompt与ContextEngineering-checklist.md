@@ -59,10 +59,10 @@
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 
-- [ ] 执行 command/TUI 定向测试，`/compact`、`/new`、`/resume` 不再 NOT_IMPLEMENTED；active compact unavailable，`/clear` 不换 Session。
-- [ ] 以至少 21 个同项目 Session 验证 durable last-used 倒序、每页 10 条、首 User 单行 preview/省略、上下选择、左右翻页、Enter、Esc 无副作用；其他 project key 不出现。
-- [ ] 并发 busy、损坏、未知 Session 有明确错误；resume 恢复同 session id/history/projection/ref、重建 effective Instruction State 并开始新 Turn。
-- [ ] `/status` 线性条和输入区 ring 使用同一 Application usage，统一显示 used/258K Operating Budget；unavailable/窄终端/Headless 通过，无动态模型 denominator。
+- [x] 执行 command/TUI 定向测试，`/compact`、`/new`、`/resume` 不再 NOT_IMPLEMENTED；active compact unavailable，`/clear` 不换 Session。
+- [x] 以至少 21 个同项目 Session 验证 durable last-used 倒序、每页 10 条、首 User 单行 preview/省略、上下选择、左右翻页、Enter、Esc 无副作用；其他 project key 不出现。
+- [x] 并发 busy、损坏、未知 Session 有明确错误；resume 恢复同 session id/history/projection/ref、重建 effective Instruction State 并开始新 Turn。
+- [x] `/status` 线性条和输入区 ring 使用同一 Application usage，统一显示 used/258K Operating Budget；unavailable/窄终端/Headless 通过，无动态模型 denominator。
 
 ## Task 9：Context Diagnostics 与 Eval
 

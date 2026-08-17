@@ -39,13 +39,18 @@ from uthcode.core.prompt import (
     EnvironmentSource,
     RuntimePromptContext,
 )
+from uthcode.core.context import CompactionResult, ContextUsage
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
-from .sessions import ApplicationSession, ApplicationSessionService
+from .sessions import (
+    ApplicationSession,
+    ApplicationSessionService,
+    SessionCatalogEntry,
+)
 from .tools import ApplicationToolService
 
 
@@ -64,6 +69,14 @@ class ApplicationStatus:
     provider_identity: ProviderIdentity
     configuration_sources: tuple[ConfigSource, ...]
     state: str = "ready"
+    context_usage: ContextUsage = ContextUsage(0, available=False)
+    projection_revision: int | None = None
+    instruction_epoch: int = 0
+    compact_count: int = 0
+    stable_prefix_fingerprint: str | None = None
+    prefix_changed: bool | None = None
+    prefix_change_reason: str | None = None
+    tool_schema_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +91,14 @@ class ApplicationStatus:
                 for source in self.configuration_sources
             ],
             "state": self.state,
+            "context_usage": self.context_usage.to_dict(),
+            "projection_revision": self.projection_revision,
+            "instruction_epoch": self.instruction_epoch,
+            "compact_count": self.compact_count,
+            "stable_prefix_fingerprint": self.stable_prefix_fingerprint,
+            "prefix_changed": self.prefix_changed,
+            "prefix_change_reason": self.prefix_change_reason,
+            "tool_schema_fingerprint": self.tool_schema_fingerprint,
         }
 
 
@@ -265,6 +286,54 @@ class UthCodeApplication:
             raise RuntimeError("durable Session storage is not configured")
         return self._session_service.resume_session(session_id)
 
+    def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
+        """Return the Application-owned same-project Session Picker data."""
+
+        if self._session_service is None:
+            return ()
+        return self._session_service.list_catalog()
+
+    def new_session_for_command(self) -> ApplicationSession:
+        """Create and commit a fresh Session only after staging succeeds."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        session = self._session_service.create_session_for_command()
+        self._refresh_context_for_session(session)
+        return session
+
+    def resume_session_for_command(self, session_id: str) -> ApplicationSession:
+        """Lock/recover the target before committing the Session switch."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        session = self._session_service.resume_session_for_command(session_id)
+        self._refresh_context_for_session(session)
+        return session
+
+    def compact_session(
+        self,
+        *,
+        summarize: Callable[[str], str] | None = None,
+    ) -> CompactionResult:
+        """Compact the active Session without mutating canonical History."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        session = self._session_service.active_session
+        if session is None:
+            raise RuntimeError("no active Session")
+        result = self._context_service.compact(
+            session.history,
+            projection=session.projection,
+            session_id=session.session_id,
+            summarize=summarize,
+        )
+        if result.changed and result.projection is not None:
+            session.append_projection(result.projection)
+            self._refresh_context_for_session(session)
+        return result
+
     def list_sessions(self):
         if self._session_service is None:
             return ()
@@ -340,11 +409,66 @@ class UthCodeApplication:
             else self._provider.identity.provider
         )
         sources = self._configuration.sources if self._configuration is not None else ()
+        snapshot = self._context_service.last_snapshot
+        usage = self._context_service.usage(snapshot)
+        active = (
+            self._session_service.active_session
+            if self._session_service is not None
+            else None
+        )
+        projection_revision = (
+            snapshot.projection_revision
+            if snapshot is not None
+            else (active.projection.revision if active and active.projection else None)
+        )
+        instruction_epoch = (
+            snapshot.instruction_epoch
+            if snapshot is not None
+            else (
+                self._instruction_loader.instruction_epoch
+                if self._instruction_loader is not None
+                else 0
+            )
+        )
+        stable_prefix_fingerprint = (
+            snapshot.stable_prefix_fingerprint
+            if snapshot is not None
+            else (
+                self._instruction_loader.stable_prefix_fingerprint
+                if self._instruction_loader is not None
+                else None
+            )
+        )
+        prefix_changed = snapshot.prefix_changed if snapshot is not None else None
+        prefix_change_reason = (
+            snapshot.prefix_change_reason if snapshot is not None else None
+        )
+        tool_schema_fingerprint = (
+            snapshot.tool_schema_fingerprint if snapshot is not None else None
+        )
         return ApplicationStatus(
             current_model=self._current_model_ref,
             provider_profile=provider_profile_id,
             provider_identity=self._provider.identity,
             configuration_sources=sources,
+            context_usage=usage,
+            projection_revision=projection_revision,
+            instruction_epoch=instruction_epoch,
+            compact_count=projection_revision or 0,
+            stable_prefix_fingerprint=stable_prefix_fingerprint,
+            prefix_changed=prefix_changed,
+            prefix_change_reason=prefix_change_reason,
+            tool_schema_fingerprint=tool_schema_fingerprint,
+        )
+
+    def _refresh_context_for_session(self, session: ApplicationSession) -> None:
+        """Refresh the stable Application usage projection at a Session boundary."""
+
+        self._context_service.compile(
+            instruction_loader=self._instruction_loader,
+            history=session.history,
+            projection=session.projection,
+            tool_definitions=self.tool_definitions(),
         )
 
     def select_model(self, model_ref: str) -> ModelProfile:
@@ -424,6 +548,12 @@ class UthCodeApplication:
             active = self._session_service.active_session
             return None if active is None else active.session_id
 
+        def active_history():
+            if self._session_service is None:
+                return None
+            active = self._session_service.active_session
+            return None if active is None else active.history
+
         def handle_provider_overflow() -> bool:
             """Perform one bounded compaction attempt, never window discovery."""
 
@@ -449,6 +579,7 @@ class UthCodeApplication:
                 messages,
                 run_id=state.run_id,
                 session_id=active_session_id(),
+                canonical_history=active_history(),
                 instruction_loader=self._instruction_loader,
                 runtime_context=runtime_context,
                 projection=active_projection(),

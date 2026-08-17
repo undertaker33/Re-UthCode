@@ -7,10 +7,56 @@ import re
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from uthcode.application import AgentEvent, TextPart
+from uthcode.application import AgentEvent, ContextUsage, TextPart
 
 
 _STREAM_RENDER_INTERVAL_SECONDS = 0.2
+
+
+def context_usage_style(usage: ContextUsage) -> str:
+    """Return the stable TUI severity class for the fixed-budget usage."""
+
+    if not isinstance(usage, ContextUsage):
+        raise TypeError("usage must be ContextUsage")
+    if not usage.available or usage.ratio is None:
+        return "class:status"
+    return "class:status.warning" if usage.ratio >= 0.90 else "class:status"
+
+
+def context_usage_bar(usage: ContextUsage, *, width: int = 10) -> tuple[str, str]:
+    """Render a fixed ``used/258K`` line without discovering model limits."""
+
+    if not isinstance(usage, ContextUsage):
+        raise TypeError("usage must be ContextUsage")
+    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+        raise ValueError("width must be a positive integer")
+    if not usage.available or usage.ratio is None:
+        return context_usage_style(usage), "context: unavailable/258K"
+    filled = min(width, max(0, int(round(usage.ratio * width))))
+    bar = "█" * filled + "░" * (width - filled)
+    return (
+        context_usage_style(usage),
+        f"context: [{bar}] {usage.used_tokens}/258K",
+    )
+
+
+def context_usage_ring(usage: ContextUsage) -> tuple[str, str]:
+    """Render the compact input-area ring from the same Application usage."""
+
+    if not isinstance(usage, ContextUsage):
+        raise TypeError("usage must be ContextUsage")
+    if not usage.available or usage.ratio is None:
+        return context_usage_style(usage), "◌ unavailable/258K"
+    glyph = (
+        "●"
+        if usage.ratio >= 0.90
+        else "◕"
+        if usage.ratio >= 0.75
+        else "◑"
+        if usage.ratio >= 0.50
+        else "◔"
+    )
+    return context_usage_style(usage), f"{glyph} {usage.used_tokens}/258K"
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,4 +359,7 @@ __all__ = [
     "TaskStateUpdate",
     "TextUpdate",
     "ToolUpdate",
+    "context_usage_bar",
+    "context_usage_ring",
+    "context_usage_style",
 ]

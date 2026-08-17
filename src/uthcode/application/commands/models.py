@@ -204,6 +204,25 @@ class OpenPermissionPicker(UiAction):
 
 
 @dataclass(frozen=True, slots=True)
+class OpenSessionPicker(UiAction):
+    """Request that the active interface show the Application Session picker."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionChanged(UiAction):
+    """Report that Application opened a new or restored Session."""
+
+    session_id: str
+    restored: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(self.restored, bool):
+            raise TypeError("restored must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class PermissionModeSelected(UiAction):
     """Report a user-selected permission mode to an interface."""
 
@@ -326,8 +345,10 @@ __all__ = [
     "ModelSelected",
     "OpenPermissionPicker",
     "OpenModelPicker",
+    "OpenSessionPicker",
     "OutcomeStatus",
     "PermissionModeSelected",
     "QuitInterface",
+    "SessionChanged",
     "UiAction",
 ]

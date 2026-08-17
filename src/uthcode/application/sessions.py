@@ -3,21 +3,55 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from uthcode.core.history import HistoryEntry, Projection, RuntimeLogEntry
+from uthcode.core.history import HistoryEntry, HistoryKind, Projection, RuntimeLogEntry
 from uthcode.integrations.session_files import (
     SessionFileStore,
+    SessionFileError,
     SessionMetadata,
     SessionSnapshot,
     SessionWriter,
 )
 
-from .instructions import InstructionLoader, InstructionStateMetadata
+from .instructions import InstructionError, InstructionLoader, InstructionStateMetadata
 
 
 class SessionActiveError(RuntimeError):
     """A second Application Session was opened before the active one closed."""
+
+
+class SessionOperationError(RuntimeError):
+    """Stable Application error for command-level Session failures."""
+
+    def __init__(self, kind: str, *, session_id: str | None = None) -> None:
+        if kind not in {"busy", "corrupt", "unknown", "storage"}:
+            raise ValueError("unknown Session operation error kind")
+        self.kind = kind
+        self.session_id = session_id
+        super().__init__(kind)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCatalogEntry:
+    """Application-owned, display-safe data for the independent TUI Picker."""
+
+    session_id: str
+    project_key: str
+    last_used_at: str
+    preview: str = ""
+    projection_revision: int | None = None
+    history_entries: int = 0
+    corrupt: bool = False
+
+
+@dataclass(slots=True)
+class _StagedSession:
+    """A lock-held target that has not become the Application active Session."""
+
+    session: "ApplicationSession"
+    instruction_loader: InstructionLoader | None
 
 
 class ApplicationSession:
@@ -114,14 +148,39 @@ class ApplicationSession:
     def close(self) -> None:
         if self._closed:
             return
+        # Sync is deliberately outside the release/finalize step.  If it
+        # fails, this Session remains open and _active still points at it so a
+        # transactional Session switch can abort without losing the writer.
+        self._prepare_close()
+        self._release_after_sync()
+
+    def _prepare_close(self) -> None:
+        """Persist close-time state without changing lifecycle ownership."""
+
+        self._require_open()
+        # Persist the latest activated directory scopes before releasing the
+        # process-held writer.  A caller may still use the explicit persist
+        # method for an earlier durable boundary.
+        self._service._sync_instruction_state(self._writer)
+
+    def _release_after_sync(self) -> None:
+        """Finalize a Session after its close-time sync has succeeded."""
+
+        if self._closed:
+            return
+        self._writer.close()
+        self._closed = True
+        self._service._forget(self)
+
+    def _close_staged(self) -> None:
+        """Release a failed staged writer without syncing current state."""
+
+        if self._closed:
+            return
         self._closed = True
         try:
-            # Persist the latest activated directory scopes before releasing
-            # the process-held writer.  A caller may still use the explicit
-            # persist method for an earlier durable boundary.
-            self._service._sync_instruction_state(self._writer)
-        finally:
             self._writer.close()
+        finally:
             self._service._forget(self)
 
     def _require_open(self) -> None:
@@ -183,6 +242,19 @@ class ApplicationSessionService:
         self._active = session
         return session
 
+    def create_session_for_command(
+        self,
+        session_id: str | None = None,
+    ) -> ApplicationSession:
+        """Map Integration file failures to the Application command boundary."""
+
+        try:
+            return self._commit_staged(self._stage_create_session(session_id))
+        except SessionFileError as exc:
+            raise _session_operation_error(exc, session_id=session_id) from exc
+        except (InstructionError, TypeError, ValueError) as exc:
+            raise SessionOperationError("storage", session_id=session_id) from exc
+
     def resume_session(self, session_id: str) -> ApplicationSession:
         self._require_no_active_session()
         writer = self.store.open_writer(
@@ -204,9 +276,63 @@ class ApplicationSessionService:
         self._active = session
         return session
 
+    def resume_session_for_command(self, session_id: str) -> ApplicationSession:
+        """Resume with a stable error category safe for Slash command output."""
+
+        try:
+            active = self._active
+            if active is not None and active.session_id == session_id:
+                # The current writer already owns this target.  Re-opening it
+                # would require releasing the very lock that proves it is
+                # active, so rebuild a candidate loader under that existing
+                # lock and commit only after the filesystem read succeeds.
+                return self._refresh_active_session_for_resume(active)
+            return self._commit_staged(self._stage_resume_session(session_id))
+        except SessionFileError as exc:
+            raise _session_operation_error(exc, session_id=session_id) from exc
+        except (InstructionError, TypeError, ValueError) as exc:
+            raise SessionOperationError("corrupt", session_id=session_id) from exc
+
     def list_sessions(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
         key = self.project_key if project_key is None else project_key
         return self.store.list_metadata(project_key=key)
+
+    def list_catalog(self) -> tuple[SessionCatalogEntry, ...]:
+        """Return same-project Sessions with durable ordering and bounded previews."""
+
+        entries: list[SessionCatalogEntry] = []
+        for metadata in self.list_sessions():
+            try:
+                snapshot = self.read_session(metadata.session_id)
+            except SessionFileError:
+                # Keep the selectable row visible so an explicit resume can
+                # report the stable corrupt/unknown error instead of silently
+                # hiding a durable Session from the user.
+                entries.append(
+                    SessionCatalogEntry(
+                        session_id=metadata.session_id,
+                        project_key=metadata.project_key,
+                        last_used_at=metadata.last_used_at,
+                        preview="[Session recovery unavailable]",
+                        corrupt=True,
+                    )
+                )
+                continue
+            entries.append(
+                SessionCatalogEntry(
+                    session_id=metadata.session_id,
+                    project_key=metadata.project_key,
+                    last_used_at=metadata.last_used_at,
+                    preview=_first_user_preview(snapshot),
+                    projection_revision=(
+                        snapshot.projection.revision
+                        if snapshot.projection is not None
+                        else None
+                    ),
+                    history_entries=len(snapshot.history.entries),
+                )
+            )
+        return tuple(entries)
 
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)
@@ -222,6 +348,107 @@ class ApplicationSessionService:
                 f"Application Session {self._active.session_id!r} is active; close it before opening another"
             )
 
+    def _stage_create_session(self, session_id: str | None) -> _StagedSession:
+        """Prepare a new Session while leaving the current one untouched."""
+
+        candidate_loader: InstructionLoader | None = None
+        if self.instruction_loader is not None:
+            candidate_loader = self.instruction_loader.fork_for_session()
+            candidate_loader.reset_for_new_session()
+            result = candidate_loader.load_session(strict=False)
+            state = result.instruction_state.to_dict()
+        else:
+            state = InstructionStateMetadata().to_dict()
+        metadata = self.store.create_session(
+            session_id,
+            project_key=self.project_key,
+            instruction_state=state,
+        )
+        writer = self.store.open_writer(
+            metadata.session_id,
+            expected_project_key=self.project_key,
+        )
+        try:
+            writer.__enter__()
+        except Exception:
+            writer.close()
+            raise
+        return _StagedSession(ApplicationSession(self, writer), candidate_loader)
+
+    def _stage_resume_session(self, session_id: str) -> _StagedSession:
+        """Lock and validate a target before touching the active Session."""
+
+        writer = self.store.open_writer(
+            session_id,
+            expected_project_key=self.project_key,
+        )
+        candidate_loader: InstructionLoader | None = None
+        try:
+            writer.__enter__()
+            if self.instruction_loader is not None:
+                candidate_loader = self.instruction_loader.fork_for_session()
+                state = InstructionStateMetadata.from_dict(
+                    writer.snapshot.metadata.instruction_state
+                )
+                candidate_loader.rebuild_from_metadata(state, strict=False)
+                # Persist only the target's freshly rebuilt metadata.  The
+                # current loader is not changed until _commit_staged().
+                writer.update_instruction_state(
+                    candidate_loader.instruction_state.to_dict()
+                )
+            else:
+                writer.touch()
+        except Exception:
+            writer.close()
+            raise
+        return _StagedSession(ApplicationSession(self, writer), candidate_loader)
+
+    def _refresh_active_session_for_resume(
+        self,
+        active: ApplicationSession,
+    ) -> ApplicationSession:
+        """Refresh an already-held target without releasing its writer lock."""
+
+        if self.instruction_loader is None:
+            active._writer.touch()
+            return active
+        candidate_loader = self.instruction_loader.fork_for_session()
+        state = InstructionStateMetadata.from_dict(
+            active._writer.snapshot.metadata.instruction_state
+        )
+        candidate_loader.rebuild_from_metadata(state, strict=False)
+        active._writer.update_instruction_state(
+            candidate_loader.instruction_state.to_dict()
+        )
+        self.instruction_loader.adopt_session_state(candidate_loader)
+        return active
+
+    def _commit_staged(self, staged: _StagedSession) -> ApplicationSession:
+        """Commit a fully locked/recovered target and release the old writer."""
+
+        old = self._active
+        try:
+            if old is not None:
+                # All target I/O and Instruction State rebuilding happened
+                # before this point.  Prepare the old close while it is still
+                # active; a sync failure leaves its writer and lifecycle
+                # ownership untouched.
+                old._prepare_close()
+            if self.instruction_loader is not None and staged.instruction_loader is not None:
+                self.instruction_loader.adopt_session_state(staged.instruction_loader)
+            self._active = staged.session
+            if old is not None:
+                # The old writer was already synchronized before the loader
+                # changed.  Release it without a second sync under the target
+                # Instruction State.
+                old._release_after_sync()
+            return staged.session
+        except Exception:
+            if old is not None and self._active is staged.session:
+                self._active = old
+            staged.session._close_staged()
+            raise
+
     def _sync_instruction_state(self, writer: SessionWriter) -> SessionMetadata:
         if self.instruction_loader is None:
             return writer.touch()
@@ -235,5 +462,62 @@ class ApplicationSessionService:
 __all__ = [
     "ApplicationSession",
     "ApplicationSessionService",
+    "SessionCatalogEntry",
     "SessionActiveError",
+    "SessionOperationError",
 ]
+
+
+def _first_user_preview(snapshot: SessionSnapshot, *, limit: int = 160) -> str:
+    """Extract only the first User Message and keep it to one display line."""
+
+    for entry in snapshot.history.entries:
+        if entry.kind is not HistoryKind.USER_MESSAGE:
+            continue
+        value = _preview_value(entry.payload)
+        if value:
+            normalized = " ".join(value.split())
+            if len(normalized) > limit:
+                return normalized[: max(1, limit - 1)].rstrip() + "…"
+            return normalized
+        break
+    return "(no user message)"
+
+
+def _preview_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "message", "part", "parts", "input"):
+            if key in value:
+                result = _preview_value(value[key])
+                if result:
+                    return result
+        return ""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return " ".join(
+            result
+            for item in value
+            if (result := _preview_value(item))
+        )
+    return ""
+
+
+def _session_operation_error(
+    exc: SessionFileError,
+    *,
+    session_id: str | None,
+) -> SessionOperationError:
+    from uthcode.integrations.session_files import (
+        SessionBusyError,
+        SessionCorruptError,
+        SessionNotFoundError,
+    )
+
+    if isinstance(exc, SessionBusyError):
+        return SessionOperationError("busy", session_id=session_id)
+    if isinstance(exc, SessionCorruptError):
+        return SessionOperationError("corrupt", session_id=session_id)
+    if isinstance(exc, SessionNotFoundError):
+        return SessionOperationError("unknown", session_id=session_id)
+    return SessionOperationError("storage", session_id=session_id)

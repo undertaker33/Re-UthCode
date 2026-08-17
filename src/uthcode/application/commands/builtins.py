@@ -18,10 +18,13 @@ from .models import (
     ModelSelected,
     OpenPermissionPicker,
     OpenModelPicker,
+    OpenSessionPicker,
     PermissionModeSelected,
     QuitInterface,
+    SessionChanged,
 )
 from .registry import CommandRegistry
+from ..sessions import SessionOperationError
 
 
 _MODEL_SWITCH_FAILURE = "模型切换失败"
@@ -145,6 +148,28 @@ def _status(context: CommandContext) -> str:
         str(getattr(source, "path", None) or getattr(source, "kind", "unknown"))
         for source in sources
     ) or "none"
+    usage = getattr(status, "context_usage", None)
+    available = bool(getattr(usage, "available", False))
+    used = getattr(usage, "used_tokens", None)
+    budget = getattr(usage, "budget_tokens", 258_000)
+    usage_text = (
+        f"{used}/{budget // 1000}K"
+        if available and isinstance(used, int)
+        else f"unavailable/{budget // 1000}K"
+    )
+    if available and isinstance(used, int):
+        filled = min(12, max(0, int(round((used / budget) * 12))))
+        usage_bar = "█" * filled + "░" * (12 - filled)
+        usage_line = f"context: [{usage_bar}] {usage_text}"
+    else:
+        usage_line = f"context: {usage_text}"
+    prefix = getattr(status, "stable_prefix_fingerprint", None) or "unavailable"
+    prefix_reason = getattr(status, "prefix_change_reason", None) or "unavailable"
+    cache_text = (
+        f"prefix={prefix}; changed={getattr(status, 'prefix_changed', None)}; "
+        f"reason={prefix_reason}; tool_schema="
+        f"{getattr(status, 'tool_schema_fingerprint', None) or 'unavailable'}"
+    )
     return "\n".join(
         (
             f"model: {getattr(status, 'current_model', 'unknown')}",
@@ -152,8 +177,82 @@ def _status(context: CommandContext) -> str:
             f"remote model: {provider_model}",
             f"config sources: {source_text}",
             f"state: {getattr(status, 'state', 'unknown')}",
+            f"{usage_line} Operating Budget (not a remote physical window)",
+            "stage limitation: before T09-1, a real model window <258K is not guaranteed safe at 258K long-context scale",
+            f"projection revision: {getattr(status, 'projection_revision', None)}",
+            f"instruction epoch: {getattr(status, 'instruction_epoch', 0)}",
+            f"compact count: {getattr(status, 'compact_count', 0)}",
+            f"cache diagnostics: {cache_text}",
         )
     )
+
+
+def _session_error(
+    exc: SessionOperationError,
+    *,
+    session_id: str | None = None,
+) -> CommandExecutionError:
+    if exc.kind == "busy":
+        return CommandExecutionError("Session busy; close the other writer and retry")
+    if exc.kind == "corrupt":
+        return CommandExecutionError("Session corrupt; resume stopped for safety")
+    if exc.kind == "unknown":
+        value = session_id or exc.session_id or "requested"
+        return CommandExecutionError(f"unknown Session: {value}")
+    return CommandExecutionError("Session storage error")
+
+
+def _compact(context: CommandContext) -> str:
+    application = context.application
+    compact = getattr(application, "compact_session", None)
+    if not callable(compact):
+        raise CommandExecutionError("/compact 需要 Application Session")
+    try:
+        result = compact()
+    except SessionOperationError as exc:
+        raise _session_error(exc) from None
+    except Exception:
+        raise CommandExecutionError("上下文压缩失败") from None
+    if not bool(getattr(result, "changed", False)):
+        reason = getattr(result, "failure", None) or "no_compaction_candidate"
+        raise CommandExecutionError(f"上下文压缩失败：{reason}")
+    projection = getattr(result, "projection", None)
+    revision = getattr(projection, "revision", None)
+    return (
+        "上下文已压缩；canonical History 未改写；"
+        f"Projection revision: {revision if revision is not None else 'unknown'}"
+    )
+
+
+def _new_session(context: CommandContext) -> SessionChanged:
+    application = context.application
+    create = getattr(application, "new_session_for_command", None)
+    if not callable(create):
+        raise CommandExecutionError("/new 需要 Application Session")
+    try:
+        session = create()
+    except SessionOperationError as exc:
+        raise _session_error(exc) from None
+    except Exception:
+        raise CommandExecutionError("无法创建新 Session") from None
+    return SessionChanged(str(session.session_id), restored=False)
+
+
+def _resume_session(context: CommandContext) -> OpenSessionPicker | SessionChanged:
+    application = context.application
+    session_id = context.invocation.args[0] if context.invocation.args else None
+    if session_id is None:
+        return OpenSessionPicker()
+    resume = getattr(application, "resume_session_for_command", None)
+    if not callable(resume):
+        raise CommandExecutionError("/resume 需要 Application Session")
+    try:
+        session = resume(session_id)
+    except SessionOperationError as exc:
+        raise _session_error(exc, session_id=session_id) from None
+    except Exception:
+        raise CommandExecutionError("无法恢复 Session") from None
+    return SessionChanged(str(session.session_id), restored=True)
 
 
 def create_builtin_registry() -> CommandRegistry:
@@ -229,7 +328,7 @@ def create_builtin_registry() -> CommandRegistry:
             aliases=("c",),
             description="压缩上下文",
             kind=CommandKind.LOCAL,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
+            handler=_compact,
         ),
         CommandDefinition(
             canonical="plan",
@@ -240,14 +339,15 @@ def create_builtin_registry() -> CommandRegistry:
         CommandDefinition(
             canonical="new",
             description="创建新会话",
-            kind=CommandKind.LOCAL,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
+            kind=CommandKind.LOCAL_UI,
+            handler=_new_session,
         ),
         CommandDefinition(
             canonical="resume",
             description="恢复会话",
             kind=CommandKind.LOCAL_UI,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
+            arguments=(ArgumentSpec("session-id", required=False),),
+            handler=_resume_session,
         ),
         CommandDefinition(
             canonical="login",
