@@ -66,10 +66,10 @@
 
 ## Task 9：Context Diagnostics 与 Eval
 
-- [ ] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py` 及新增 diagnostics tests，全部通过。
-- [ ] baseline/candidate 报告包含 success/tokens/tool calls/compact/rediscovery/repeated exploration/externalization/stable prefix/cache reuse（可获得时）。
-- [ ] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；diagnostics 不额外复制 Runtime credential、完整外置结果、Provider native payload 或未脱敏内部异常。
-- [ ] fixtures 覆盖 Runtime/Projection 变化保持 epoch/fingerprint、目录 AGENTS 新 scope 改变 epoch/fingerprint、已生效未变化 AGENTS 稳定复用，以及 resume 后未变化保持/离线变化产生明确 reason；候选策略不要求在 pytest 中概率性胜出。
+- [x] 执行 `python -m pytest -q tests/eval/test_eval_reporting.py tests/eval/test_eval_execution.py` 及新增 diagnostics tests，全部通过。
+- [x] baseline/candidate 报告包含 success/tokens/tool calls/compact/rediscovery/repeated exploration/externalization/stable prefix/cache reuse（可获得时）。
+- [x] Provider 不支持 cache metrics 时报告 `not_available`，不把 Usage 默认 0 冒充实测；diagnostics 不额外复制 Runtime credential、完整外置结果、Provider native payload 或未脱敏内部异常。
+- [x] fixtures 覆盖 Runtime/Projection 变化保持 epoch/fingerprint、目录 AGENTS 新 scope 改变 epoch/fingerprint、已生效未变化 AGENTS 稳定复用，以及 resume 后未变化保持/离线变化产生明确 reason；候选策略不要求在 pytest 中概率性胜出。
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
 

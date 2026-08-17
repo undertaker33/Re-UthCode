@@ -589,26 +589,36 @@ def _public_assistant_message(message: Message) -> Message:
     )
 
 
+def _merge_usage_details(previous: object, current: object) -> object:
+    """Merge provider-independent Usage evidence across Provider iterations."""
+
+    if isinstance(previous, Mapping) and isinstance(current, Mapping):
+        merged: dict[object, object] = dict(previous.items())
+        for key, value in current.items():
+            if key in merged:
+                merged[key] = _merge_usage_details(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    if (
+        isinstance(previous, (int, float))
+        and not isinstance(previous, bool)
+        and isinstance(current, (int, float))
+        and not isinstance(current, bool)
+    ):
+        return previous + current
+    return current
+
+
 def _add_usage(previous: Usage, current: Usage) -> Usage:
-    details: dict[str, object] = dict(previous.details.items())
-    for key, value in current.details.items():
-        old_value = details.get(key)
-        if (
-            isinstance(old_value, (int, float))
-            and not isinstance(old_value, bool)
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-        ):
-            details[key] = old_value + value
-        else:
-            details[key] = value
+    details = _merge_usage_details(previous.details, current.details)
     return Usage(
         input_tokens=previous.input_tokens + current.input_tokens,
         output_tokens=previous.output_tokens + current.output_tokens,
         total_tokens=previous.total_tokens + current.total_tokens,
         cache_read_tokens=previous.cache_read_tokens + current.cache_read_tokens,
         cache_write_tokens=previous.cache_write_tokens + current.cache_write_tokens,
-        details=details,
+        details=details,  # type: ignore[arg-type]
     )
 
 

@@ -84,7 +84,11 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner run `
 
 报告并列展示 `correctness`、`context`、`exploration`、`efficiency`、`stability`、`safety` 六维，不生成单一总分。每维保留状态、原始事实、分数、证据引用、逐次分数和中位数；缺少结构化事实使用 `not_available`，不把缺测写成零。
 
-`correctness` 只接受 verifier 结果，模型 final 不能覆盖失败。`safety` 单独保留 hard failure，不能被其他维度平均抵消。当前没有 Context Compiler、Compaction、Working Set 或 Memory 结构化事实，因此 Context 只在已有 evidence discovery、Usage 和 Tool 轨迹可确认时提供分数。
+`correctness` 只接受 verifier 结果，模型 final 不能覆盖失败。`safety` 单独保留 hard failure，不能被其他维度平均抵消。Context diagnostics 通过 Application 公共投影提供 selected/omitted block ID、预算使用、compact、instruction epoch、stable prefix fingerprint/change reason；投影不复制 Prompt/History/Tool Result 内容。
+
+每个 attempt 还保存 `diagnostic_facts`，并在聚合报告的 `facts` 节中比较以下观察值：`success`、`tokens`、`tool_calls`、`compact_count`、`rediscovery`、`repeated_exploration`、`externalization`、`prefix_stability` 和 `cache_reuse`。`compare` 会在兼容指纹与样本集合上给出 `delta.facts`，但不会把候选必须优于 baseline 作为 pytest 或报告兼容条件。
+
+Provider cache read/write 只有在现有 Usage mapper 明确提供字段时才标记为 `available`，并记录安全的字段路径 provenance；Provider 不支持或未提供字段时为 `not_available`，默认的数值 `0` 不视为测量值。Application diagnostics 也不会额外复制 Runtime credential、完整大型 Tool Result、Provider native payload 或未脱敏异常。固定 258K Operating Budget 仍不是远端模型物理上下文窗口；本 Eval 不执行 128K/1M/unknown-model window 或 258K 阈值专项优化。
 
 ## 清理与回滚
 

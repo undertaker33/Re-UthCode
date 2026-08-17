@@ -30,7 +30,11 @@ from eval.models import (
     TaskDefinition,
     VerifierResult,
 )
-from eval.metrics import compute_attempt_metrics, compute_metric_details
+from eval.metrics import (
+    compute_attempt_metrics,
+    compute_diagnostic_facts,
+    compute_metric_details,
+)
 from eval.workspace import AttemptPaths, capture_repository_snapshot, repository_status_delta
 from uthcode.application import (
     AgentEvent,
@@ -634,6 +638,21 @@ async def run_attempt(
     if error_type is not None:
         diagnostics["error_type"] = error_type
 
+    public_diagnostics = getattr(app, "diagnostics", None)
+    if callable(public_diagnostics):
+        try:
+            value = public_diagnostics()
+            if isinstance(value, Mapping):
+                diagnostics["application_diagnostics"] = dict(value)
+                context = value.get("context")
+                diagnostics["context_diagnostics"] = (
+                    dict(context) if isinstance(context, Mapping) else "not_available"
+                )
+        except Exception:
+            # A diagnostics projection is observational; it must never turn a
+            # completed attempt into a different execution result.
+            diagnostics["application_diagnostics"] = "not_available"
+
     # The verifier is deliberately called once after the Turn, including a
     # permission block, so partial side effects remain inspectable.
     if verifier is not None:
@@ -687,6 +706,12 @@ async def run_attempt(
         diagnostics=diagnostics,
         events=safe_events,
         task=task,
+    )
+    diagnostics["diagnostic_facts"] = compute_diagnostic_facts(
+        verifier_result=verifier_result,
+        turn_result=None if turn_result is None else turn_result.to_dict(),
+        diagnostics=diagnostics,
+        events=safe_events,
     )
     ended_at = _now()
     artifact_files = {

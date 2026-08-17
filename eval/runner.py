@@ -232,6 +232,7 @@ def _verifier(task_dir: Path, task: TaskDefinition) -> Callable[[Path], Verifier
 def _write_attempt_record(execution: AttemptExecution) -> dict[str, object]:
     payload = execution.record.to_dict()
     payload["metric_details"] = execution.diagnostics.get("metric_details", {})
+    payload["diagnostic_facts"] = execution.diagnostics.get("diagnostic_facts", {})
     return payload
 
 
