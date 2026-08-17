@@ -332,6 +332,8 @@ class AnthropicProvider:
             output_tokens = 0
             cache_read_tokens = 0
             cache_write_tokens = 0
+            cache_read_reported = False
+            cache_write_reported = False
 
             while True:
                 try:
@@ -361,11 +363,15 @@ class AnthropicProvider:
                         "Anthropic cache read tokens",
                         default=cache_read_tokens,
                     )
+                    if _field(usage, "cache_read_input_tokens") is not None:
+                        cache_read_reported = True
                     cache_write_tokens = usage_int(
                         _field(usage, "cache_creation_input_tokens"),
                         "Anthropic cache write tokens",
                         default=cache_write_tokens,
                     )
+                    if _field(usage, "cache_creation_input_tokens") is not None:
+                        cache_write_reported = True
                 elif event_type == "content_block_start":
                     index = _field(event, "index")
                     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
@@ -582,11 +588,15 @@ class AnthropicProvider:
                         "Anthropic cache read tokens",
                         default=cache_read_tokens,
                     )
+                    if _field(usage, "cache_read_input_tokens") is not None:
+                        cache_read_reported = True
                     cache_write_tokens = usage_int(
                         _field(usage, "cache_creation_input_tokens"),
                         "Anthropic cache write tokens",
                         default=cache_write_tokens,
                     )
+                    if _field(usage, "cache_creation_input_tokens") is not None:
+                        cache_write_reported = True
                 elif event_type == "message_stop":
                     message_stop_seen = True
                 elif event_type == "ping":
@@ -613,6 +623,14 @@ class AnthropicProvider:
                     "Anthropic stream ended without a stop reason"
                 )
             ordered_items = tuple(sorted(native_items, key=lambda item: item.sequence_index))
+            usage_details = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }
+            if cache_read_reported:
+                usage_details["cache_read_input_tokens"] = cache_read_tokens
+            if cache_write_reported:
+                usage_details["cache_creation_input_tokens"] = cache_write_tokens
             completed = ProviderResponse(
                 message=Message(
                     role="assistant",
@@ -627,12 +645,7 @@ class AnthropicProvider:
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
-                    details={
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_read_input_tokens": cache_read_tokens,
-                        "cache_creation_input_tokens": cache_write_tokens,
-                    },
+                    details=usage_details,
                 ),
                 finish_reason=_finish_reason(stop_reason),
                 native_items=ordered_items,

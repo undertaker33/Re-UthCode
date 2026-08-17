@@ -168,6 +168,7 @@ class ApplicationToolService:
         "_session_provider",
         "_tool_result_policy",
         "_workdir",
+        "_externalization_stats",
     )
 
     def __init__(
@@ -219,11 +220,28 @@ class ApplicationToolService:
             if workdir is not None
             else None
         )
+        self._externalization_stats: dict[str, object] = {
+            "attempts": 0,
+            "inline": 0,
+            "externalized": 0,
+            "failed": 0,
+            "externalized_bytes": 0,
+            "failed_bytes": 0,
+            "last": None,
+        }
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Return the immutable, registration-ordered public definitions."""
 
         return self._registry.definitions()
+
+    def public_diagnostics(self) -> dict[str, object]:
+        """Return aggregate Tool-result persistence facts without payloads."""
+
+        stats = dict(self._externalization_stats)
+        last = stats.get("last")
+        stats["last"] = dict(last) if isinstance(last, Mapping) else None
+        return {"schema_version": 1, "externalization": stats}
 
     def describe_tool_call(self, call: ToolCallPart) -> str:
         """Return a bounded, display-safe summary for one registered call.
@@ -333,6 +351,7 @@ class ApplicationToolService:
         # ToolResultRead is already a bounded page.  Never recursively
         # externalize the only reader for an externalized result.
         if outcome.tool_name == "ToolResultRead" or size_bytes <= self._tool_result_policy.inline_threshold_bytes:
+            self._record_materialization("inline", size_bytes)
             return ToolResultMaterialization(
                 execution=outcome,
                 result=outcome.result,
@@ -341,6 +360,7 @@ class ApplicationToolService:
             )
 
         if size_bytes > self._tool_result_policy.single_result_hard_cap_bytes:
+            self._record_materialization("failed", size_bytes, ToolResultTooLarge.code)
             metadata = {
                 **execution_metadata,
                 "persistence_status": ToolResultPersistenceStatus.FAILED.value,
@@ -422,6 +442,7 @@ class ApplicationToolService:
             outcome.is_error,
             metadata,
         )
+        self._record_materialization("externalized", reference.size_bytes)
         return ToolResultMaterialization(
             execution=outcome,
             result=result,
@@ -439,6 +460,7 @@ class ApplicationToolService:
         error_code: str,
         message: str,
     ) -> ToolResultMaterialization:
+        self._record_materialization("failed", size_bytes, error_code)
         metadata: Mapping[str, object] = {
             "execution_status": outcome.status.value,
             "persistence_status": ToolResultPersistenceStatus.FAILED.value,
@@ -452,6 +474,24 @@ class ApplicationToolService:
             size_bytes=size_bytes,
             error_code=error_code,
         )
+
+    def _record_materialization(
+        self,
+        status: str,
+        size_bytes: int,
+        error_code: str | None = None,
+    ) -> None:
+        stats = self._externalization_stats
+        stats["attempts"] = int(stats["attempts"]) + 1
+        stats[status] = int(stats[status]) + 1
+        if status == "externalized":
+            stats["externalized_bytes"] = int(stats["externalized_bytes"]) + size_bytes
+        if status == "failed":
+            stats["failed_bytes"] = int(stats["failed_bytes"]) + size_bytes
+        last: dict[str, object] = {"status": status, "size_bytes": size_bytes}
+        if error_code is not None:
+            last["error_code"] = error_code
+        stats["last"] = last
 
     def _read_tool_result_page(
         self,

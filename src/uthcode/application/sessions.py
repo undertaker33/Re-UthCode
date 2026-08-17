@@ -209,12 +209,29 @@ class ApplicationSessionService:
         self.project_key = project_key
         self.instruction_loader = instruction_loader
         self._active: ApplicationSession | None = None
+        self._last_operation: dict[str, object] | None = None
 
     @property
     def active_session(self) -> ApplicationSession | None:
         """Return the one lock-held Session, if the Application opened one."""
 
         return self._active
+
+    def public_diagnostics(self) -> dict[str, object]:
+        """Return Session recovery facts without storage paths or payloads."""
+
+        active = self._active
+        recovery = list(active.recovery_diagnostics) if active is not None else []
+        last = None if self._last_operation is None else dict(self._last_operation)
+        return {
+            "schema_version": 1,
+            "status": "active" if active is not None else "idle",
+            "active": active is not None,
+            "active_session_id": active.session_id if active is not None else None,
+            "recovery_diagnostics": recovery,
+            "last_operation": last,
+            "busy": bool(isinstance(last, Mapping) and last.get("kind") == "busy"),
+        }
 
     def create_session(self, session_id: str | None = None) -> ApplicationSession:
         self._require_no_active_session()
@@ -240,6 +257,12 @@ class ApplicationSessionService:
             raise
         session = ApplicationSession(self, writer)
         self._active = session
+        self._record_operation(
+            "create",
+            "success",
+            session.session_id,
+            recovery=session.recovery_diagnostics,
+        )
         return session
 
     def create_session_for_command(
@@ -249,10 +272,20 @@ class ApplicationSessionService:
         """Map Integration file failures to the Application command boundary."""
 
         try:
-            return self._commit_staged(self._stage_create_session(session_id))
+            session = self._commit_staged(self._stage_create_session(session_id))
+            self._record_operation(
+                "create",
+                "success",
+                session.session_id,
+                recovery=session.recovery_diagnostics,
+            )
+            return session
         except SessionFileError as exc:
-            raise _session_operation_error(exc, session_id=session_id) from exc
+            error = _session_operation_error(exc, session_id=session_id)
+            self._record_operation("create", "failed", session_id, kind=error.kind)
+            raise error from exc
         except (InstructionError, TypeError, ValueError) as exc:
+            self._record_operation("create", "failed", session_id, kind="storage")
             raise SessionOperationError("storage", session_id=session_id) from exc
 
     def resume_session(self, session_id: str) -> ApplicationSession:
@@ -274,6 +307,12 @@ class ApplicationSessionService:
             raise
         session = ApplicationSession(self, writer)
         self._active = session
+        self._record_operation(
+            "resume",
+            "success",
+            session.session_id,
+            recovery=session.recovery_diagnostics,
+        )
         return session
 
     def resume_session_for_command(self, session_id: str) -> ApplicationSession:
@@ -286,11 +325,22 @@ class ApplicationSessionService:
                 # would require releasing the very lock that proves it is
                 # active, so rebuild a candidate loader under that existing
                 # lock and commit only after the filesystem read succeeds.
-                return self._refresh_active_session_for_resume(active)
-            return self._commit_staged(self._stage_resume_session(session_id))
+                session = self._refresh_active_session_for_resume(active)
+            else:
+                session = self._commit_staged(self._stage_resume_session(session_id))
+            self._record_operation(
+                "resume",
+                "success",
+                session.session_id,
+                recovery=session.recovery_diagnostics,
+            )
+            return session
         except SessionFileError as exc:
-            raise _session_operation_error(exc, session_id=session_id) from exc
+            error = _session_operation_error(exc, session_id=session_id)
+            self._record_operation("resume", "failed", session_id, kind=error.kind)
+            raise error from exc
         except (InstructionError, TypeError, ValueError) as exc:
+            self._record_operation("resume", "failed", session_id, kind="corrupt")
             raise SessionOperationError("corrupt", session_id=session_id) from exc
 
     def list_sessions(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
@@ -457,6 +507,25 @@ class ApplicationSessionService:
     def _forget(self, session: ApplicationSession) -> None:
         if self._active is session:
             self._active = None
+
+    def _record_operation(
+        self,
+        operation: str,
+        status: str,
+        session_id: str | None,
+        *,
+        kind: str | None = None,
+        recovery: Sequence[str] = (),
+    ) -> None:
+        value: dict[str, object] = {
+            "operation": operation,
+            "status": status,
+            "session_id": session_id,
+            "recovery_diagnostics": [str(item) for item in recovery],
+        }
+        if kind is not None:
+            value["kind"] = kind
+        self._last_operation = value
 
 
 __all__ = [

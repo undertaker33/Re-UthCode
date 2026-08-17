@@ -25,6 +25,44 @@ DIMENSIONS = (
     "safety",
 )
 
+DIAGNOSTIC_FACTS = (
+    "success",
+    "tokens",
+    "tool_calls",
+    "compact_count",
+    "rediscovery",
+    "repeated_exploration",
+    "externalization",
+    "prefix_stability",
+    "cache_reuse",
+)
+
+_CONTEXT_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "status",
+        "budget_tokens",
+        "used_tokens",
+        "token_estimate",
+        "selected_block_ids",
+        "omitted_block_ids",
+        "selected_count",
+        "omitted_count",
+        "omitted_reasons",
+        "projection_revision",
+        "instruction_epoch",
+        "stable_prefix_estimated_tokens",
+        "stable_prefix_fingerprint",
+        "prefix_changed",
+        "prefix_change_reason",
+        "tool_schema_fingerprint",
+        "tool_schema_estimated_tokens",
+        "over_budget",
+        "score",
+        "rediscovery_count",
+        "rediscovery",
+    }
+)
+
 _SECRET_KEY = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|authorization|token)"
 )
@@ -269,7 +307,13 @@ def _context(
     refs: list[str] = []
     raw: dict[str, object] = {}
     if explicit_mapping is not None:
-        raw.update({str(key): _json_safe(value) for key, value in explicit_mapping.items()})
+        raw.update(
+            {
+                str(key): _json_safe(value)
+                for key, value in explicit_mapping.items()
+                if str(key) in _CONTEXT_DIAGNOSTIC_KEYS
+            }
+        )
         refs.append("diagnostics.context_diagnostics")
 
     if event_values is not None:
@@ -338,6 +382,36 @@ def _usage(turn: Mapping[str, object] | None) -> dict[str, object]:
     return dict(usage) if usage is not None else {}
 
 
+def _provider_usage(diagnostics: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = diagnostics.get("provider_usage")
+    if isinstance(value, Mapping):
+        return value
+    application = diagnostics.get("application_diagnostics")
+    if isinstance(application, Mapping) and isinstance(application.get("provider_usage"), Mapping):
+        return application["provider_usage"]  # type: ignore[return-value]
+    return None
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _provider_or_turn_token(
+    provider_usage: Mapping[str, object] | None,
+    turn_usage: Mapping[str, object],
+    field_name: str,
+) -> int | None:
+    """Use each measured Provider field independently, then Turn Usage."""
+
+    if provider_usage is not None:
+        provider_value = _optional_int(provider_usage.get(field_name))
+        if provider_value is not None:
+            return provider_value
+    return _optional_int(turn_usage.get(field_name))
+
+
 def _efficiency(
     turn: Mapping[str, object] | None,
     diagnostics: Mapping[str, object],
@@ -346,19 +420,50 @@ def _efficiency(
     if turn is None and not diagnostics:
         return _metric(MetricStatus.NOT_AVAILABLE, None, {}, ("turn_result", "diagnostics"))
     usage = _usage(turn)
+    provider_usage = _provider_usage(diagnostics)
     tools = _tool_facts(event_values) if event_values is not None else {}
+    measured_input = _provider_or_turn_token(provider_usage, usage, "input_tokens")
+    measured_output = _provider_or_turn_token(provider_usage, usage, "output_tokens")
+    measured_total = _provider_or_turn_token(provider_usage, usage, "total_tokens")
+    cache_read = (
+        provider_usage.get("cache_read")
+        if provider_usage is not None
+        else None
+    )
+    cache_write = (
+        provider_usage.get("cache_write")
+        if provider_usage is not None
+        else None
+    )
     raw = {
-        "input_tokens": _int(usage.get("input_tokens")),
-        "output_tokens": _int(usage.get("output_tokens")),
-        "total_tokens": _int(usage.get("total_tokens")),
-        "cache_read_tokens": _int(usage.get("cache_read_tokens")),
-        "cache_write_tokens": _int(usage.get("cache_write_tokens")),
+        "input_tokens": measured_input,
+        "output_tokens": measured_output,
+        "total_tokens": measured_total,
+        "cache_read_tokens": (
+            _optional_int(cache_read.get("tokens"))
+            if isinstance(cache_read, Mapping)
+            and cache_read.get("status") == "available"
+            else None
+        ),
+        "cache_write_tokens": (
+            _optional_int(cache_write.get("tokens"))
+            if isinstance(cache_write, Mapping)
+            and cache_write.get("status") == "available"
+            else None
+        ),
         "provider_iterations": _int(turn.get("iteration_count")) if turn is not None else None,
         "tool_calls": _int(turn.get("tool_call_count")) if turn is not None else tools.get("tool_calls"),
         "failed_tools": tools.get("failed_tools") if tools else None,
         "duration_seconds": diagnostics.get("duration_seconds"),
     }
     total = raw["total_tokens"]
+    if not isinstance(total, int):
+        return _metric(
+            MetricStatus.NOT_AVAILABLE,
+            None,
+            raw,
+            ("turn_result.usage", "diagnostics.provider_usage"),
+        )
     duration = _number(raw["duration_seconds"], 0.0)
     # This is a bounded observability score, not a cross-model quality score.
     score = max(0.0, 100.0 - min(50.0, float(total) / 100.0) - min(30.0, duration))
@@ -435,6 +540,201 @@ def _safety(
     return _metric(MetricStatus.AVAILABLE, 0 if hard_failure else 100, raw, ("diagnostics", "verifier_result", "events"))
 
 
+def _fact(
+    status: MetricStatus | str,
+    value: object = None,
+    evidence_refs: Sequence[str] = (),
+    **extra: object,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "status": (
+            MetricStatus.NOT_AVAILABLE.value
+            if status == MetricStatus.NOT_AVAILABLE or status == MetricStatus.NOT_AVAILABLE.value
+            else MetricStatus.AVAILABLE.value
+        ),
+        "value": _json_safe(value),
+        "evidence_refs": [str(item) for item in evidence_refs],
+    }
+    result.update({str(key): _json_safe(item) for key, item in extra.items()})
+    return result
+
+
+def _context_diagnostic_mapping(diagnostics: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = diagnostics.get("context_diagnostics")
+    if isinstance(value, Mapping):
+        return value
+    application = diagnostics.get("application_diagnostics")
+    if isinstance(application, Mapping) and isinstance(application.get("context"), Mapping):
+        return application["context"]  # type: ignore[return-value]
+    return None
+
+
+def _application_diagnostic_mapping(diagnostics: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = diagnostics.get("application_diagnostics")
+    return value if isinstance(value, Mapping) else None
+
+
+def compute_diagnostic_facts(
+    *,
+    verifier_result: object,
+    turn_result: object,
+    diagnostics: Mapping[str, object] | None,
+    events: Sequence[object] | None,
+) -> dict[str, dict[str, object]]:
+    """Return repeatable Context/Eval facts with explicit NA states.
+
+    These facts describe what the runtime observed.  They are not quality
+    gates and intentionally do not assert that a candidate strategy must beat
+    its baseline.
+    """
+
+    diagnostic_values = diagnostics if isinstance(diagnostics, Mapping) else {}
+    event_values = _events(events)
+    turn = _turn_mapping(turn_result)
+    verifier = _verifier_mapping(verifier_result)
+    facts: dict[str, dict[str, object]] = {}
+
+    finish_category = diagnostic_values.get("finish_category")
+    if isinstance(finish_category, str):
+        facts["success"] = _fact(
+            MetricStatus.AVAILABLE,
+            finish_category == "success",
+            ("diagnostics.finish_category",),
+        )
+    elif turn is not None and isinstance(turn.get("status"), str):
+        facts["success"] = _fact(
+            MetricStatus.AVAILABLE,
+            turn.get("status") == "completed"
+            and (verifier is None or verifier.get("success") is True),
+            ("turn_result.status",),
+        )
+    else:
+        facts["success"] = _fact(MetricStatus.NOT_AVAILABLE, None, ("diagnostics.finish_category",))
+
+    usage = _usage(turn)
+    token_value = {
+        key: _optional_int(usage.get(key))
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    if any(value is not None for value in token_value.values()):
+        facts["tokens"] = _fact(
+            MetricStatus.AVAILABLE,
+            token_value,
+            ("turn_result.usage",),
+        )
+    else:
+        facts["tokens"] = _fact(MetricStatus.NOT_AVAILABLE, None, ("turn_result.usage",))
+
+    tool_facts = _tool_facts(event_values) if event_values is not None else {}
+    tool_count = (
+        _optional_int(turn.get("tool_call_count"))
+        if turn is not None
+        else None
+    )
+    if tool_count is None:
+        tool_count = _optional_int(tool_facts.get("tool_calls"))
+    facts["tool_calls"] = _fact(
+        MetricStatus.AVAILABLE if tool_count is not None else MetricStatus.NOT_AVAILABLE,
+        tool_count,
+        ("turn_result.tool_call_count", "events.tool_started"),
+    )
+
+    application = _application_diagnostic_mapping(diagnostic_values)
+    compaction = (
+        application.get("compaction")
+        if application is not None
+        else diagnostic_values.get("compaction")
+    )
+    compact_count = _optional_int(compaction.get("count")) if isinstance(compaction, Mapping) else None
+    if compact_count is None:
+        compact_count = _optional_int(diagnostic_values.get("compact_count"))
+    facts["compact_count"] = _fact(
+        MetricStatus.AVAILABLE if compact_count is not None else MetricStatus.NOT_AVAILABLE,
+        compact_count,
+        ("diagnostics.application_diagnostics.compaction.count",),
+    )
+
+    context = _context_diagnostic_mapping(diagnostic_values)
+    rediscovery = None
+    if context is not None:
+        rediscovery = _optional_int(context.get("rediscovery_count"))
+        if rediscovery is None:
+            rediscovery = _optional_int(context.get("rediscovery"))
+    facts["rediscovery"] = _fact(
+        MetricStatus.AVAILABLE if rediscovery is not None else MetricStatus.NOT_AVAILABLE,
+        rediscovery,
+        ("diagnostics.context_diagnostics.rediscovery_count",),
+    )
+
+    repeated = _optional_int(tool_facts.get("repeated_file_reads")) if event_values is not None else None
+    facts["repeated_exploration"] = _fact(
+        MetricStatus.AVAILABLE if repeated is not None else MetricStatus.NOT_AVAILABLE,
+        repeated,
+        ("events.tool_started",),
+    )
+
+    externalization = (
+        application.get("externalization")
+        if application is not None
+        else diagnostic_values.get("externalization")
+    )
+    external_value = None
+    if isinstance(externalization, Mapping):
+        external_value = {
+            key: _optional_int(externalization.get(key))
+            for key in (
+                "attempts",
+                "inline",
+                "externalized",
+                "failed",
+                "externalized_bytes",
+                "failed_bytes",
+            )
+        }
+    facts["externalization"] = _fact(
+        MetricStatus.AVAILABLE if external_value is not None else MetricStatus.NOT_AVAILABLE,
+        external_value,
+        ("diagnostics.application_diagnostics.externalization",),
+    )
+
+    prefix_value = None
+    if context is not None and isinstance(context.get("prefix_changed"), bool):
+        prefix_value = {
+            "stable": not context["prefix_changed"],
+            "fingerprint": context.get("stable_prefix_fingerprint"),
+            "instruction_epoch": _optional_int(context.get("instruction_epoch")),
+            "change_reason": context.get("prefix_change_reason"),
+        }
+    facts["prefix_stability"] = _fact(
+        MetricStatus.AVAILABLE if prefix_value is not None else MetricStatus.NOT_AVAILABLE,
+        prefix_value,
+        ("diagnostics.context_diagnostics.prefix_changed",),
+    )
+
+    provider_usage = _provider_usage(diagnostic_values)
+    cache_value = None
+    if provider_usage is not None:
+        read = provider_usage.get("cache_read")
+        write = provider_usage.get("cache_write")
+        read_available = isinstance(read, Mapping) and read.get("status") == "available"
+        write_available = isinstance(write, Mapping) and write.get("status") == "available"
+        if read_available or write_available:
+            cache_value = {
+                "cache_read_tokens": read.get("tokens") if isinstance(read, Mapping) else None,
+                "cache_write_tokens": write.get("tokens") if isinstance(write, Mapping) else None,
+                "cache_read_status": read.get("status") if isinstance(read, Mapping) else "not_available",
+                "cache_write_status": write.get("status") if isinstance(write, Mapping) else "not_available",
+                "cache_read_provenance": read.get("provenance") if isinstance(read, Mapping) else None,
+                "cache_write_provenance": write.get("provenance") if isinstance(write, Mapping) else None,
+            }
+    facts["cache_reuse"] = _fact(
+        MetricStatus.AVAILABLE if cache_value is not None else MetricStatus.NOT_AVAILABLE,
+        cache_value,
+        ("diagnostics.provider_usage.cache_read", "diagnostics.provider_usage.cache_write"),
+    )
+    return facts
+
+
 def compute_metric_details(
     *,
     verifier_result: object,
@@ -485,7 +785,9 @@ def compute_attempt_metrics(
 
 __all__ = [
     "DIMENSIONS",
+    "DIAGNOSTIC_FACTS",
     "compute_attempt_metrics",
+    "compute_diagnostic_facts",
     "compute_metric_details",
     "scan_for_secrets",
 ]

@@ -257,11 +257,15 @@ class AgentRun:
             termination_reason=state_snapshot.termination_reason,
         )
 
-    def _complete_turn(self, handle: TurnHandle) -> None:
+    def _complete_turn(self, handle: TurnHandle, result: TurnResult) -> None:
         if self._active_turn is not handle:
             return
         self._state = handle._driver.execution.state
         self._behavior_mode = self._state.behavior_mode
+        # Application owns the public diagnostics projection.  The value is
+        # the cumulative Usage of this terminal Turn (including all Provider
+        # iterations/tool continuations), not a second Provider request.
+        self._application._record_formal_run_usage(result.usage)
         self._active_turn = None
 
 
@@ -523,7 +527,7 @@ class _TurnDriver:
                 self._result_future.set_result(result)
             handle = self._handle
             if handle is not None:
-                self._run._complete_turn(handle)
+                self._run._complete_turn(handle, result)
         self._clear_pause_coordination()
         self._close_event_stream()
 

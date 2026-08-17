@@ -55,6 +55,9 @@ class ApplicationContextService:
             token_estimator=self._compiler.token_estimator
         )
         self._last_snapshot: ContextSnapshot | None = None
+        self._compact_count = 0
+        self._compaction_events: list[dict[str, object]] = []
+        self._last_compaction: dict[str, object] | None = None
 
     @property
     def compiler(self) -> ContextCompiler:
@@ -158,13 +161,99 @@ class ApplicationContextService:
     ) -> CompactionResult:
         """Return a safe Projection candidate without mutating History."""
 
-        return self._compactor.compact(
-            history,
-            projection=projection,
-            session_id=session_id,
-            summarize=summarize,
-            cancellation=cancellation,
+        self._compact_count += 1
+        attempt = self._compact_count
+        try:
+            result = self._compactor.compact(
+                history,
+                projection=projection,
+                session_id=session_id,
+                summarize=summarize,
+                cancellation=cancellation,
+            )
+        except Exception:
+            self._record_compaction(
+                {
+                    "attempt": attempt,
+                    "status": "failed",
+                    "changed": False,
+                    "failure": "compaction_error",
+                    "batch_count": 0,
+                }
+            )
+            raise
+        self._record_compaction(
+            {
+                "attempt": attempt,
+                "status": (
+                    "failed"
+                    if result.failure is not None
+                    else ("completed" if result.changed else "no_change")
+                ),
+                "changed": result.changed,
+                "failure": result.failure,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "batch_count": len(result.batches),
+            }
         )
+        return result
+
+    def public_diagnostics(self) -> dict[str, object]:
+        """Return a bounded diagnostics projection without Context content."""
+
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            context: dict[str, object] = {"status": "not_available"}
+        else:
+            context = {
+                "status": "available",
+                "budget_tokens": snapshot.budget_tokens,
+                "used_tokens": snapshot.used_tokens,
+                "token_estimate": snapshot.token_estimate,
+                "selected_block_ids": list(snapshot.selected_block_ids),
+                "omitted_block_ids": list(snapshot.omitted_block_ids),
+                "selected_count": len(snapshot.selected_blocks),
+                "omitted_count": len(snapshot.omitted_blocks),
+                "omitted_reasons": [
+                    {"block_id": block_id, "reason": reason}
+                    for block_id, reason in snapshot.omitted_reasons
+                ],
+                "projection_revision": snapshot.projection_revision,
+                "instruction_epoch": snapshot.instruction_epoch,
+                "stable_prefix_estimated_tokens": snapshot.stable_prefix_estimated_tokens,
+                "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
+                "prefix_changed": snapshot.prefix_changed,
+                "prefix_change_reason": snapshot.prefix_change_reason,
+                "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
+                "tool_schema_estimated_tokens": snapshot.tool_schema_estimated_tokens,
+                "over_budget": snapshot.over_budget,
+            }
+        return {
+            "schema_version": 1,
+            "context": context,
+            "compaction": {
+                # A resumed Session may already carry a durable Projection
+                # revision before this process performs a compaction.  Keep
+                # the public count compatible with that durable fact while
+                # still counting current-process attempts.
+                "count": max(
+                    self._compact_count,
+                    (
+                        snapshot.projection_revision or 0
+                        if snapshot is not None
+                        else 0
+                    ),
+                ),
+                "last": None if self._last_compaction is None else dict(self._last_compaction),
+                "events": [dict(item) for item in self._compaction_events],
+            },
+        }
+
+    def _record_compaction(self, event: dict[str, object]) -> None:
+        self._last_compaction = dict(event)
+        self._compaction_events.append(dict(event))
+        del self._compaction_events[:-16]
 
     def compose_generation_request(
         self,

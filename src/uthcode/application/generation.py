@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from uthcode.core.agent import (
@@ -21,6 +21,7 @@ from uthcode.core.planning import (
 )
 from uthcode.core.provider import (
     CancellationToken,
+    GenerationCompleted,
     GenerationRequest,
     ProviderEvent,
     ProviderIdentity,
@@ -28,6 +29,7 @@ from uthcode.core.provider import (
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
+    Usage,
     validated_provider_stream,
 )
 from uthcode.core.prompt import (
@@ -52,6 +54,7 @@ from .sessions import (
     SessionCatalogEntry,
 )
 from .tools import ApplicationToolService
+from .provider_usage import public_usage_diagnostics
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
@@ -77,6 +80,7 @@ class ApplicationStatus:
     prefix_changed: bool | None = None
     prefix_change_reason: str | None = None
     tool_schema_fingerprint: str | None = None
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +103,7 @@ class ApplicationStatus:
             "prefix_changed": self.prefix_changed,
             "prefix_change_reason": self.prefix_change_reason,
             "tool_schema_fingerprint": self.tool_schema_fingerprint,
+            "diagnostics": dict(self.diagnostics),
         }
 
 
@@ -197,6 +202,7 @@ class UthCodeApplication:
         self._instruction_loader = instruction_loader
         self._context_service = context_service or ApplicationContextService()
         self._session_service = session_service
+        self._provider_usage_diagnostics = public_usage_diagnostics(None)
         if self._instruction_loader is not None:
             # Session-start loading is Application-owned; the loader itself
             # keeps filesystem policy in its Integration adapter.
@@ -401,6 +407,49 @@ class UthCodeApplication:
             "manual Tool execution is disabled; use AgentRun.start_turn"
         )
 
+    def diagnostics(self) -> dict[str, object]:
+        """Return the safe public diagnostics projection for Eval and UIs."""
+
+        context = self._context_service.public_diagnostics()
+        tools = self._tool_service.public_diagnostics()
+        session = (
+            self._session_service.public_diagnostics()
+            if self._session_service is not None
+            else {
+                "schema_version": 1,
+                "status": "not_available",
+                "active": False,
+                "active_session_id": None,
+                "recovery_diagnostics": [],
+                "last_operation": None,
+                "busy": False,
+            }
+        )
+        return {
+            "schema_version": 1,
+            "context": context.get("context", {"status": "not_available"}),
+            "compaction": context.get("compaction", {"count": 0, "events": []}),
+            "externalization": tools.get(
+                "externalization", {"status": "not_available"}
+            ),
+            "session": session,
+            "provider_usage": dict(self._provider_usage_diagnostics),
+        }
+
+    def _record_formal_run_usage(self, usage: Usage) -> None:
+        """Project one terminal AgentRun's observed cumulative Usage.
+
+        ``AgentRun`` owns the terminal-result boundary, while this Application
+        method owns the diagnostics state.  A terminal Turn with no observed
+        Provider Usage does not erase the last observable projection, so
+        cancel/failure paths cannot manufacture a measurement or hide a prior
+        one merely by constructing an empty default ``Usage``.
+        """
+
+        projection = public_usage_diagnostics(usage)
+        if projection.get("status") == "available":
+            self._provider_usage_diagnostics = projection
+
     def status(self) -> ApplicationStatus:
         profile = self.current_provider_profile
         provider_profile_id = (
@@ -446,6 +495,13 @@ class UthCodeApplication:
         tool_schema_fingerprint = (
             snapshot.tool_schema_fingerprint if snapshot is not None else None
         )
+        diagnostics = self.diagnostics()
+        compaction = diagnostics.get("compaction")
+        compact_count = (
+            compaction.get("count", 0)
+            if isinstance(compaction, Mapping)
+            else 0
+        )
         return ApplicationStatus(
             current_model=self._current_model_ref,
             provider_profile=provider_profile_id,
@@ -454,11 +510,12 @@ class UthCodeApplication:
             context_usage=usage,
             projection_revision=projection_revision,
             instruction_epoch=instruction_epoch,
-            compact_count=projection_revision or 0,
+            compact_count=compact_count if isinstance(compact_count, int) else 0,
             stable_prefix_fingerprint=stable_prefix_fingerprint,
             prefix_changed=prefix_changed,
             prefix_change_reason=prefix_change_reason,
             tool_schema_fingerprint=tool_schema_fingerprint,
+            diagnostics=diagnostics,
         )
 
     def _refresh_context_for_session(self, session: ApplicationSession) -> None:
@@ -691,6 +748,10 @@ class UthCodeApplication:
             request,
             cancellation=token,
         ):
+            if isinstance(event, GenerationCompleted):
+                self._provider_usage_diagnostics = public_usage_diagnostics(
+                    event.response.usage
+                )
             yield event
 
 
