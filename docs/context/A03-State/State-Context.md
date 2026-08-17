@@ -5,7 +5,7 @@ layer: A03-State
 context_file: docs/context/A03-State/State-Context.md
 owns: current in-memory Run/Turn facts + conversation + events + safe projections
 current_shape: immutable Core state with Application-owned lifecycle
-explicit_absence: persistent session + memory + context compiler
+explicit_absence: persistent runtime checkpoint + memory/retrieval
 ```
 
 ## 当前结论
@@ -14,10 +14,12 @@ explicit_absence: persistent session + memory + context compiler
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
-- `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；这只说明可序列化，不表示已经持久化。
+- `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
+- `[FACT]` Application 在 terminal Turn 边界把新增 Message 转换为 Canonical History，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 History identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、History、Projection、Runtime 和 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
+- `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/History/Projection/Runtime/Tool Schema 组成固定 258K Context Snapshot；Projection 变化不改变 Instruction Epoch 或 stable prefix，AGENTS scope/content 变化才创建新 epoch。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
-- `[ABSENT]` 当前没有 Session Store、Journal Store、持久 Memory、Context Compiler 或结构化压缩。
+- `[BOUNDARY]` Session Store、Canonical History、Projection、Tool Result ref 和 Instruction State metadata 已持久化；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## 权威源码索引
 
@@ -42,6 +44,9 @@ explicit_absence: persistent session + memory + context compiler
 | permission mode | `AgentRun` + `UthCodeApplication` | 当前 Run；安全默认值为用户配置偏好 | Run-local `set_permission_mode`；Application 默认仅允许 `default|auto` |
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
+| committed History | active `ApplicationSession` / `SessionWriter` | terminal Turn 后追加；resume 读取当前 Session | `ApplicationSession.history`、Context Compiler |
+| Projection | `ApplicationSession` / `SessionWriter` | manual/overflow compaction 后追加 revision | Context diagnostics、Conversation Plane |
+| Instruction State metadata | `InstructionLoader` + Session metadata | Session create/resume/terminal close 边界 | epoch/fingerprint/reason diagnostics |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |
 | behavior mode | `RunState` / `AgentRun` idle selection | 当前 Turn；批准 Plan 后切回 DEFAULT，下一 Turn 继承最终 mode | `BehaviorModeChanged`, `Run.behavior_mode` |
 | PlanState / TaskState | `RunState` | 当前 Turn；Plan revision/approval 与 Todo replace-all | `PlanProposed`, `TaskStateChanged`, prompt facts |
@@ -130,17 +135,15 @@ turn_completed | turn_failed | turn_cancelled
 ```text
 implemented context:
   ApplicationRuntimeContext = workdir + platform + current_date
-  Prompt context            = runtime facts + selected model/provider identity
-  Conversation context      = RunState.messages
+  Instruction Plane         = Prompt Asset + Core Contract + current AGENTS State
+  Conversation Plane        = Projection + committed History + current Run delta
+  Tool System               = Application Tool definitions -> GenerationRequest.tools
+  Context Budget            = fixed 258K Operating Budget
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
 not implemented context:
-  Context Compiler
-  token budget allocation
-  structured compaction
   retrieval context
-  persistent session history
   persistent Memory
 ```
 
@@ -152,7 +155,7 @@ not implemented context:
 - `RunSnapshot` 不得新增 conversation、Tool result 或秘密正文。
 - 同一 Run 同时最多一个 active Turn；终态必须释放 active slot。
 - Pause 不是 `RunStatus`；不要新增第二套 paused state 与 Core continuation 竞争权威性。
-- JSON 方法不等于持久化授权；在正式存储需求出现前不要添加隐式磁盘写入。
+- JSON 方法不等于 Runtime checkpoint；只有 Application Session lifecycle 明确调用时才执行 durable append，不由 Core 或 Interface 隐式写盘。
 
 ## 修改路由
 

@@ -19,6 +19,9 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
+- `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造固定 258K Operating Budget 的 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools`；Provider Integration 只负责原生协议映射。
+- `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
+- `[FACT]` terminal History persistence 将 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State metadata sync 分开记录 outcome；只有可判定 `durability=durable` 的 History append 才按 `persisted_message_count` 推进 Run 的 process cursor。append 后的 reload/touch 失败会保留 durable 事实并显示 partial diagnostics；无法通过结构化 History identity reconciliation 判定时，active Session writer 进入 quarantine，所有新 Run 与语义写入 fail closed，不重试未知批次。必须显式关闭 writer，再由 fresh writer 重新打开并验证/恢复后才解除 quarantine。真正未落盘的 append 失败则 cursor 不推进；失败批次在进程内保留原始 Session/Turn identity 并按 FIFO 重试。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。
 
 ## 权威源码索引
@@ -31,6 +34,8 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 | ReAct Runtime | `src/uthcode/core/agent.py` | `AgentLoop`, `AgentTurnExecution`, `AgentExecutionSegment`, `AgentLoopConfig` |
 | Application Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService`, `_SecretRedactor`, `describe_tool_call`, `_create_agent_loop` |
 | Turn 依赖快照与 Prompt 注入 | `src/uthcode/application/generation.py` | `_start_agent_turn`, `_prepare_request` |
+| Context/History 组合 | `src/uthcode/application/context.py`, `src/uthcode/application/history.py` | `compose_generation_request`, `history_entries_for_message` |
+| Session 结果与 History 边界 | `src/uthcode/application/sessions.py`, `src/uthcode/integrations/session_files.py` | `ApplicationSession`, `SessionWriter`, `ToolResultRead` |
 | Provider 适配 | `src/uthcode/integrations/providers/` | `anthropic.py`, `openai_responses.py`, `openai_compat.py`, `fake.py`, `factory.py` |
 | Tool 适配 | `src/uthcode/integrations/tools/` | `factory.py`, `file_tools.py`, `search_tools.py`, `process_tools.py`, `workspace.py` |
 
@@ -44,7 +49,7 @@ AgentRun.start_turn(user_input)
      -> TurnStarted（仅一次）
      -> IterationStarted
      -> request_preparer
-        -> Application 注入 system_prompt、固定 model/provider、固定 ToolDefinition 顺序
+        -> Application 编译 Context Snapshot，注入 system_prompt、Conversation 与固定 ToolDefinition 顺序
      -> validated_provider_stream
         -> reasoning/text delta 转 AgentEvent
         -> 验证唯一终态与完整 ProviderResponse
@@ -96,6 +101,7 @@ tool:
   Glob      -> workspace 内路径匹配
   Grep      -> workspace 内内容搜索
   Bash      -> workdir 下未沙箱化进程执行
+  ToolResultRead -> 当前 Session opaque ref 的有界页读取
 ```
 
 ## 不属于当前执行层
@@ -103,7 +109,9 @@ tool:
 - `[ABSENT]` 并行 Tool Batch、DAG、通用工作流引擎。
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
-- `[DEFER]` 完整 Context Compiler、Context Budget、压缩和持久 Memory；当前 Provider 请求直接使用 Run 内消息历史。
+- `[FACT]` Context Compiler、固定 258K Operating Budget、Projection/Compaction 与 Session History 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。
+- `[BOUNDARY]` Session 只恢复已完整提交的 History、Projection、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
+- `[DEFER]` Memory、retrieval 与真实模型窗口解析仍不属于当前执行层。
 
 ## 修改路由
 

@@ -23,6 +23,7 @@ from uthcode.core.provider import (
     CancellationToken,
     GenerationCompleted,
     GenerationRequest,
+    Message,
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
@@ -32,6 +33,7 @@ from uthcode.core.provider import (
     Usage,
     validated_provider_stream,
 )
+from uthcode.core.history import HistoryEntry
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -47,10 +49,12 @@ from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService
 from .instructions import InstructionLoader
+from .history import history_entries_for_message
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
     ApplicationSession,
     ApplicationSessionService,
+    HistoryAppendOutcome,
     SessionCatalogEntry,
 )
 from .tools import ApplicationToolService
@@ -105,6 +109,49 @@ class ApplicationStatus:
             "tool_schema_fingerprint": self.tool_schema_fingerprint,
             "diagnostics": dict(self.diagnostics),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryPersistenceOutcome:
+    """Describe the two durable boundaries of one terminal Run delta."""
+
+    history_appended: bool
+    instruction_state_synced: bool
+    failure_stage: str | None
+    persisted_message_count: int
+    history_metadata_synced: bool = True
+    history_reload_succeeded: bool = True
+    history_durability: str = "durable"
+    failure_stages: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        if (
+            self.history_appended
+            and self.instruction_state_synced
+            and self.history_metadata_synced
+            and self.history_durability == "durable"
+            and not self.failure_stages
+        ):
+            return "committed"
+        if self.history_appended:
+            return "partial"
+        if self.failure_stage is None:
+            return "not_available"
+        return "failed"
+
+    @property
+    def error_code(self) -> str | None:
+        return {
+            "history_append": "history_persistence_failed",
+            "history_append_reconciled": "history_append_reconciled",
+            "history_reload": "history_reload_failed",
+            "history_metadata_sync": "history_metadata_sync_failed",
+            "history_durability_unknown": "history_durability_unknown",
+            "instruction_state_sync": "instruction_state_sync_failed",
+            "session_boundary": "session_boundary",
+            "invalid_message": "invalid_message",
+        }.get(self.failure_stage)
 
 
 class GenerationHandle:
@@ -203,6 +250,19 @@ class UthCodeApplication:
         self._context_service = context_service or ApplicationContextService()
         self._session_service = session_service
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
+        self._history_persistence_diagnostics: dict[str, object] = {
+            "status": "not_available",
+            "history_appended": False,
+            "instruction_state_synced": False,
+            "history_metadata_synced": False,
+            "history_reload_succeeded": False,
+            "history_durability": "not_available",
+            "failure_stage": None,
+            "failure_stages": [],
+            "persisted_message_count": 0,
+            "committed_turns": 0,
+            "error_code": None,
+        }
         if self._instruction_loader is not None:
             # Session-start loading is Application-owned; the loader itself
             # keeps filesystem policy in its Integration adapter.
@@ -287,6 +347,16 @@ class UthCodeApplication:
             raise RuntimeError("durable Session storage is not configured")
         return self._session_service.create_session(session_id)
 
+    def ensure_session(self) -> ApplicationSession | None:
+        """Open a fresh durable Session for an interactive entry point."""
+
+        if self._session_service is None:
+            return None
+        active = self._session_service.active_session
+        if active is not None:
+            return active
+        return self.new_session_for_command()
+
     def resume_session(self, session_id: str) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
@@ -363,6 +433,18 @@ class UthCodeApplication:
             permission_mode=self._default_permission_mode,
         )
 
+    def _require_run_start_allowed(self) -> None:
+        """Reject Provider work while the active Session writer is quarantined."""
+
+        if self._session_service is None:
+            return
+        active = self._session_service.active_session
+        if active is not None and active.durability_unknown:
+            raise RuntimeError(
+                "Session History durability is unknown; close and reopen the "
+                "Session to reconcile before starting a new Turn"
+            )
+
     @property
     def default_permission_mode(self) -> PermissionMode:
         return self._default_permission_mode
@@ -434,6 +516,198 @@ class UthCodeApplication:
             ),
             "session": session,
             "provider_usage": dict(self._provider_usage_diagnostics),
+            "history_persistence": dict(self._history_persistence_diagnostics),
+        }
+
+    def _active_session_id(self) -> str | None:
+        if self._session_service is None:
+            return None
+        active = self._session_service.active_session
+        return None if active is None else active.session_id
+
+    def _persist_run_messages(
+        self,
+        messages: Sequence[Message],
+        *,
+        session_id: str | None,
+        turn_id: str,
+    ) -> HistoryPersistenceOutcome:
+        """Commit one terminal Run delta through separate durable boundaries."""
+
+        if session_id is None or self._session_service is None:
+            return HistoryPersistenceOutcome(
+                False,
+                False,
+                None,
+                0,
+                history_durability="not_available",
+            )
+        active = self._session_service.active_session
+        if active is None or active.session_id != session_id:
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "session_boundary",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=False,
+                history_durability="not_durable",
+                failure_stages=("session_boundary",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+        if active.durability_unknown:
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "history_durability_unknown",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=False,
+                history_durability="unknown",
+                failure_stages=("history_durability_unknown",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+        if not all(isinstance(message, Message) for message in messages):
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "invalid_message",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=False,
+                history_durability="not_durable",
+                failure_stages=("invalid_message",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+
+        entries: list[HistoryEntry] = []
+        try:
+            sequence = active.history.last_sequence + 1
+            for message in messages:
+                converted = history_entries_for_message(
+                    active.session_id,
+                    turn_id,
+                    sequence,
+                    message,
+                )
+                entries.extend(converted)
+                sequence += len(converted)
+            if entries:
+                append_outcome = active.append_history(tuple(entries))
+        except Exception:
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "history_append",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=False,
+                history_durability="not_durable",
+                failure_stages=("history_append",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+
+        if not isinstance(append_outcome, HistoryAppendOutcome):
+            active._quarantine_unknown_durability()
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "history_durability_unknown",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=False,
+                history_durability="unknown",
+                failure_stages=("history_durability_unknown",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+        if append_outcome.durability == "unknown":
+            active._quarantine_unknown_durability()
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                "history_durability_unknown",
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=append_outcome.reload_succeeded,
+                history_durability="unknown",
+                failure_stages=("history_durability_unknown",),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+        if not append_outcome.history_appended:
+            failure_stage = append_outcome.failure_stage or "history_append"
+            outcome = HistoryPersistenceOutcome(
+                False,
+                False,
+                failure_stage,
+                0,
+                history_metadata_synced=False,
+                history_reload_succeeded=append_outcome.reload_succeeded,
+                history_durability=append_outcome.durability,
+                failure_stages=(failure_stage,),
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+
+        append_failures = (
+            (append_outcome.failure_stage,)
+            if append_outcome.failure_stage is not None
+            else ()
+        )
+        history_outcome = HistoryPersistenceOutcome(
+            True,
+            False,
+            append_outcome.failure_stage or "instruction_state_sync",
+            len(messages),
+            history_metadata_synced=append_outcome.metadata_synced,
+            history_reload_succeeded=append_outcome.reload_succeeded,
+            history_durability=append_outcome.durability,
+            failure_stages=append_failures,
+        )
+        try:
+            active.persist_instruction_state()
+        except Exception:
+            failure_stages = append_failures + ("instruction_state_sync",)
+            outcome = replace(
+                history_outcome,
+                failure_stage=append_outcome.failure_stage or "instruction_state_sync",
+                failure_stages=failure_stages,
+            )
+            self._record_history_persistence(outcome)
+            return outcome
+
+        outcome = replace(
+            history_outcome,
+            instruction_state_synced=True,
+            failure_stage=append_outcome.failure_stage,
+            failure_stages=append_failures,
+        )
+        self._record_history_persistence(outcome)
+        return outcome
+
+    def _record_history_persistence(
+        self,
+        outcome: HistoryPersistenceOutcome,
+    ) -> None:
+        self._history_persistence_diagnostics = {
+            "status": outcome.status,
+            "history_appended": outcome.history_appended,
+            "instruction_state_synced": outcome.instruction_state_synced,
+            "history_metadata_synced": outcome.history_metadata_synced,
+            "history_reload_succeeded": outcome.history_reload_succeeded,
+            "history_durability": outcome.history_durability,
+            "failure_stage": outcome.failure_stage,
+            "failure_stages": list(outcome.failure_stages),
+            "persisted_message_count": outcome.persisted_message_count,
+            "committed_turns": int(
+                self._history_persistence_diagnostics.get("committed_turns", 0)
+            ) + (1 if outcome.history_appended and outcome.persisted_message_count else 0),
+            "error_code": outcome.error_code,
         }
 
     def _record_formal_run_usage(self, usage: Usage) -> None:
@@ -577,6 +851,7 @@ class UthCodeApplication:
         behavior_mode: BehaviorMode,
         permission_resolver: PermissionResolver,
         session_grant_sink: SessionGrantSink,
+        process_message_start: int = 0,
     ) -> AgentTurnExecution:
         """Start a Core Turn with Application-owned snapshots.
 
@@ -632,8 +907,9 @@ class UthCodeApplication:
             visible_definitions: tuple[ToolDefinition, ...],
             runtime_context: RuntimePromptContext,
         ) -> GenerationRequest:
+            process_messages = messages[process_message_start:]
             request, _snapshot = self._context_service.compose_generation_request(
-                messages,
+                process_messages,
                 run_id=state.run_id,
                 session_id=active_session_id(),
                 canonical_history=active_history(),

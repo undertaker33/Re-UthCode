@@ -17,7 +17,7 @@ from .bootstrap import (
 )
 from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
 from .context import ApplicationContextService
-from .history import ApplicationHistory, HistoryCoordinator
+from .history import ApplicationHistory, history_entries_for_message
 from .instructions import (
     InstructionAuthorization,
     InstructionBlock,
@@ -39,6 +39,7 @@ from .runs import AgentRun, TurnHandle
 from .sessions import (
     ApplicationSession,
     ApplicationSessionService,
+    HistoryAppendOutcome,
     SessionActiveError,
     SessionCatalogEntry,
     SessionOperationError,
@@ -148,6 +149,7 @@ __all__ = [
     "ApplicationContextService",
     "ApplicationSession",
     "ApplicationSessionService",
+    "HistoryAppendOutcome",
     "SessionCatalogEntry",
     "SessionOperationError",
     "AgentEvent",
@@ -197,7 +199,7 @@ __all__ = [
     "InstructionScope",
     "InstructionSourceNotFoundError",
     "InstructionStateMetadata",
-    "HistoryCoordinator",
+    "history_entries_for_message",
     "InvocationStatus",
     "LaunchOptions",
     "ModelProfile",

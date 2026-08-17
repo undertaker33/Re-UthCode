@@ -27,7 +27,7 @@
 ## Task 4：Context Compiler、258K Budget 与确定性 Working Set
 
 - [x] 执行 `python -m pytest -q tests/test_context_compiler.py` 及相关 request composition tests，全部通过。
-- [ ] 验证 Compiler、`/status` 与 ring 使用同一固定 258K Operating Budget，并明确不代表远端模型物理窗口。
+- [x] 验证 Compiler、`/status` 与 ring 使用同一固定 258K Operating Budget，并明确不代表远端模型物理窗口。
 - [x] 搜索 T09 实现确认没有 Model Limits resolver、`max_input_tokens` 配置、Provider/bundled window metadata 或小/大窗口适配。
 - [x] 文档/contract tests 明确 T09 不保证真实窗口小于 258K 的模型在长上下文下安全，overflow 最多一次保护且不作 discovery 或动态 budget 解析。
 - [x] 超预算时保留 Protected Context/未闭合 unit/current user，recent complete units 从新到旧选择，result ref 只跟随保留 unit；无关键词/embedding relevance。
@@ -37,7 +37,7 @@
 - [x] 执行 `python -m pytest -q tests/test_session_files.py`，覆盖 monotonic sequence、durable append、尾部半写、中段损坏、unknown kind，全部通过。
 - [x] 启动两个子进程 resume 同一 Session，观察只有一个取得 writer lock，另一方 session busy，无双 sequence/history corruption。
 - [x] 删除 runtime log 后恢复结果不变；同 project key 可发现，其他项目不可见；last_used 不依赖 mtime。
-- [ ] 跨进程恢复新 Run/Turn 且 TaskState/PlanState 未被假装 checkpoint；同进程 continuation 仍按 T08 回归通过。
+- [x] 跨进程恢复新 Run/Turn 且 TaskState/PlanState 未被假装 checkpoint；同进程 continuation 仍按 T08 回归通过。
 - [x] 激活 directory AGENTS → 关闭进程 → `/resume`：metadata 提供 activated scopes/epoch/fingerprint，当前文件系统内容未变化时 effective instruction set、epoch 与 fingerprint 保持；metadata 不含 AGENTS 正文。
 - [x] 激活 directory AGENTS → 关闭进程 → 修改或删除 AGENTS → `/resume`：以当前文件系统为权威创建新 epoch、改变 fingerprint、记录明确 reason；删除后仍保留 activated directory scope 标识，使后续重新出现可被发现；无 `instruction-history.jsonl` 或独立 Instruction Event Store。
 
@@ -73,19 +73,19 @@
 
 ## Task 10：[接入主流程] 正式 Context Composition 收口
 
-- [ ] 从正式 `create_application` Headless 入口执行多 Turn → 大结果 → ToolResultRead → compact → 重建 resume → final，全部通过。
-- [ ] 执行 `python -m pytest -q tests/test_architecture_boundaries.py`，Core 不依赖 filesystem/SDK/Interface，Interface 不直连 Integration Session Store。
-- [ ] 执行静态扫描，正式 Agent path 无全量 `RunState.messages` 直通、永久 10K 截断和三个命令占位。
+- [x] 从正式 `create_application` Headless 入口执行多 Turn → 大结果 → ToolResultRead → compact → 重建 resume → final，全部通过。
+- [x] 执行 `python -m pytest -q tests/test_architecture_boundaries.py`，Core 不依赖 filesystem/SDK/Interface，Interface 不直连 Integration Session Store。
+- [x] 执行静态扫描，正式 Agent path 无全量 `RunState.messages` 直通、永久 10K 截断和三个命令占位。
 
 ## Task 11：[端到端验证] Context / Session / Prefix
 
-- [ ] 从真实入口覆盖 runtime/projection prefix stability、AGENTS epoch/stable reuse、Instruction State resume 未变化/离线变化、Tool Schema 单一来源、authority spoof rejection、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime boundary、quota/ref、execution/persistence outcome、Picker。
-- [ ] 执行 `python -m pytest -q`，记录精确 passed/failed/skipped 和耗时。
-- [ ] 执行 `python -m compileall -q src tests eval` 与 `python -m pip check`，均退出 0。
+- [x] 从真实入口覆盖 runtime/projection prefix stability、AGENTS epoch/stable reuse、Instruction State resume 未变化/离线变化、Tool Schema 单一来源、authority spoof rejection、fixed 258K及小窗口阶段边界、compactor overflow、concurrent resume、runtime boundary、quota/ref、execution/persistence outcome、Picker。
+- [x] 执行 `python -m pytest -q`，记录精确 passed/failed/skipped 和耗时。
+- [x] 执行 `python -m compileall -q src tests eval` 与 `python -m pip check`，均退出 0。
 
 ## Task 12：[遗留负担清理] 单历史 / 单 Context Path 收口
 
-- [ ] 扫描 `src tests docs eval`，不存在重复 Loader/Context path、mutable history rewrite、任意路径 result read、第二 Loop/Scheduler、SQLite checkpoint、动态 Context Source Registry、relevance/embedding 或兼容壳。
-- [ ] 按 `docs/README.md` 维护映射同步 UserManual、Tools、A01/A03/A04/TUI、Context-Index、OutstandingDebtList，与最终 `src/ + tests/` 一致。
-- [ ] 对改动 Markdown 执行 strict UTF-8、replacement character、常见 mojibake、fence balance 与链接检查，全部通过。
-- [ ] 执行 `git diff --check` 和 `git status --short`，无 whitespace error，范围仅含 T09，且未归档或执行 Git 写入。
+- [x] 扫描 `src tests docs eval`，不存在重复 Loader/Context path、mutable history rewrite、任意路径 result read、第二 Loop/Scheduler、SQLite checkpoint、动态 Context Source Registry、relevance/embedding 或兼容壳。
+- [x] 按 `docs/README.md` 维护映射同步 UserManual、Tools、A01/A03/A04/TUI、Context-Index、OutstandingDebtList，与最终 `src/ + tests/` 一致。
+- [x] 对改动 Markdown 执行 strict UTF-8、replacement character、常见 mojibake、fence balance 与链接检查，全部通过。
+- [x] 执行 `git diff --check` 和 `git status --short`，无 whitespace error，范围仅含 T09，且未归档或执行 Git 写入。

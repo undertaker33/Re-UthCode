@@ -8,6 +8,7 @@ from pathlib import Path
 
 from uthcode.core.history import HistoryEntry, HistoryKind, Projection, RuntimeLogEntry
 from uthcode.integrations.session_files import (
+    HistoryAppendOutcome,
     SessionFileStore,
     SessionFileError,
     SessionMetadata,
@@ -109,20 +110,38 @@ class ApplicationSession:
     def recovery_diagnostics(self) -> tuple[str, ...]:
         return self.snapshot.recovery_diagnostics
 
-    def append_history(self, entries: HistoryEntry | Sequence[HistoryEntry]) -> SessionSnapshot:
+    @property
+    def durability_unknown(self) -> bool:
+        """Whether this active Session writer is quarantined."""
+
         self._require_open()
+        return self._writer.durability_unknown
+
+    def _require_writable(self) -> None:
+        self._require_open()
+        self._writer._require_writable()
+
+    def _quarantine_unknown_durability(self) -> None:
+        self._require_open()
+        self._writer.quarantine_unknown_durability()
+
+    def append_history(
+        self,
+        entries: HistoryEntry | Sequence[HistoryEntry],
+    ) -> HistoryAppendOutcome:
+        self._require_writable()
         return self._writer.append_history(entries)
 
     def append_projection(self, projection: Projection) -> SessionSnapshot:
-        self._require_open()
+        self._require_writable()
         return self._writer.append_projection(projection)
 
     def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
-        self._require_open()
+        self._require_writable()
         return self._writer.append_runtime(entry)
 
     def persist_tool_result(self, content: str, *, policy: object | None = None) -> object:
-        self._require_open()
+        self._require_writable()
         return self._writer.persist_tool_result(content, policy=policy)
 
     def read_tool_result(
@@ -142,11 +161,14 @@ class ApplicationSession:
         )
 
     def persist_instruction_state(self) -> SessionMetadata:
-        self._require_open()
+        self._require_writable()
         return self._service._sync_instruction_state(self._writer)
 
     def close(self) -> None:
         if self._closed:
+            return
+        if self._writer.durability_unknown:
+            self._release_after_quarantine()
             return
         # Sync is deliberately outside the release/finalize step.  If it
         # fails, this Session remains open and _active still points at it so a
@@ -165,6 +187,15 @@ class ApplicationSession:
 
     def _release_after_sync(self) -> None:
         """Finalize a Session after its close-time sync has succeeded."""
+
+        if self._closed:
+            return
+        self._writer.close()
+        self._closed = True
+        self._service._forget(self)
+
+    def _release_after_quarantine(self) -> None:
+        """Release an unknown writer without performing another mutation."""
 
         if self._closed:
             return
@@ -531,6 +562,7 @@ class ApplicationSessionService:
 __all__ = [
     "ApplicationSession",
     "ApplicationSessionService",
+    "HistoryAppendOutcome",
     "SessionCatalogEntry",
     "SessionActiveError",
     "SessionOperationError",

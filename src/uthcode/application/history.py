@@ -1,13 +1,8 @@
-"""Application-owned in-memory orchestration for Core history values.
-
-This is intentionally a value/service skeleton.  It does not open files,
-write a Session, or recover a Run; those responsibilities belong to later
-T09 Tasks.
-"""
+"""Application-owned history conversion and in-memory orchestration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from uthcode.core.history import (
@@ -17,6 +12,7 @@ from uthcode.core.history import (
     Projection,
     RuntimeLog,
     RuntimeLogEntry,
+    history_entries_from_message,
 )
 from uthcode.core.provider import JsonPayload, Message
 
@@ -92,10 +88,8 @@ class ApplicationHistory:
     ) -> "ApplicationHistory":
         """Append a Message's provider-independent semantic parts in order."""
 
-        from uthcode.core.history import history_entries_from_message
-
         result = self
-        for entry in history_entries_from_message(
+        for entry in history_entries_for_message(
             self.session_id,
             turn_id,
             self.history.last_sequence + 1,
@@ -145,7 +139,21 @@ class ApplicationHistory:
         return self.replace_projection(projection)
 
 
-HistoryCoordinator = ApplicationHistory
+def history_entries_for_message(
+    session_id: str,
+    turn_id: str,
+    sequence: int,
+    message: Message,
+) -> tuple[HistoryEntry, ...]:
+    """Convert one Message while retaining its identity-local reconstruction."""
+
+    entries = history_entries_from_message(session_id, turn_id, sequence, message)
+    converted: list[HistoryEntry] = []
+    for entry in entries:
+        payload = dict(entry.payload)
+        payload["message"] = message.to_dict()
+        converted.append(replace(entry, payload=payload))
+    return tuple(converted)
 
 
-__all__ = ["ApplicationHistory", "HistoryCoordinator"]
+__all__ = ["ApplicationHistory", "history_entries_for_message"]

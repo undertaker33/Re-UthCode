@@ -16,11 +16,7 @@ from uthcode.core.context import (
     instruction_text_from_context_snapshot,
     messages_from_context_snapshot,
 )
-from uthcode.core.history import (
-    CanonicalHistory,
-    Projection,
-    history_entries_from_message,
-)
+from uthcode.core.history import CanonicalHistory, Projection
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -40,6 +36,7 @@ from uthcode.core.provider import GenerationRequest, Message, ToolDefinition
 from uthcode.core.provider import CancellationToken
 
 from .instructions import InstructionLoader
+from .history import history_entries_for_message
 
 
 class ApplicationContextService:
@@ -349,11 +346,9 @@ def _history_for_messages(session_id: str, messages: Sequence[Message]) -> Canon
     sequence = 1
     for index, message in enumerate(messages):
         turn_id = f"runtime-{index + 1}"
-        entries = history_entries_from_message(session_id, turn_id, sequence, message)
+        entries = history_entries_for_message(session_id, turn_id, sequence, message)
         for entry in entries:
-            payload: dict[str, Any] = dict(entry.payload)
-            payload["message"] = message.to_dict()
-            history = history.append(replace(entry, payload=payload))
+            history = history.append(entry)
         sequence += len(entries)
     return history
 

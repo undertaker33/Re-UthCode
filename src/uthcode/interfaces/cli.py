@@ -203,12 +203,15 @@ async def _stream_exec(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
-    run: AgentRun = application.create_run()
-    turn: TurnHandle = run.start_turn(prompt)
-    projection = _ExecProjection()
-    terminal_code: int | None = None
-    paused_for_noninteractive = False
     try:
+        ensure_session = getattr(application, "ensure_session", None)
+        if callable(ensure_session):
+            ensure_session()
+        run: AgentRun = application.create_run()
+        turn: TurnHandle = run.start_turn(prompt)
+        projection = _ExecProjection()
+        terminal_code: int | None = None
+        paused_for_noninteractive = False
         async for event in turn.events():
             if event.event_type == "turn_paused":
                 if not paused_for_noninteractive:
@@ -327,12 +330,17 @@ def main(
         except Exception:
             _write_diagnostic(error_stream, "application configuration failed")
             return 2
-        return _run_exec(
-            application,
-            prompt.strip(),
-            stdout=output_stream,
-            stderr=error_stream,
-        )
+        try:
+            return _run_exec(
+                application,
+                prompt.strip(),
+                stdout=output_stream,
+                stderr=error_stream,
+            )
+        finally:
+            close = getattr(application, "close", None)
+            if callable(close):
+                close()
 
     try:
         runtime_context = ApplicationRuntimeContext.from_system(
@@ -344,6 +352,7 @@ def main(
             config_loader=loader,
             application_factory=factory,
         )
+        application.ensure_session()
         if tui_runner is None:
             result = _default_tui_runner(application)
         else:
@@ -364,6 +373,9 @@ def main(
     except Exception:
         _write_diagnostic(error_stream, "interface failed")
         return 1
+    finally:
+        if "application" in locals() and isinstance(application, UthCodeApplication):
+            application.close()
 
 
 __all__ = ["main"]

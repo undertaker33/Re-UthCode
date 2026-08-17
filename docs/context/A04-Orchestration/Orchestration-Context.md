@@ -13,6 +13,8 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
+- `[FACT]` CLI/TUI 进入正式运行前通过 Application `ensure_session()` 打开一个 fresh Session；terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
+- `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；Integration 不重新编译 Context。
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 `RuntimeHookSet`、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；AgentLoop 始终先组合强制 Hook，再按固定顺序运行可选 Hook。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
@@ -25,7 +27,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` verifier 作为独立离线子进程读取 attempt workspace；`eval/metrics.py` 与 `eval/reporting.py` 只消费公开事件、终态、verifier 和受控 diagnostics，报告并列保留六个维度，不生成总分。
 - `[FACT]` 真实 Eval 运行必须显式提供 `--model` 远端模型标识；该标识进入 attempt 和聚合报告的 `model_id` 指纹。报告同时保存 `task_sample_counts`；Compare 先校验每份报告的映射非空、键集合等于 `task_ids` 且计数总和等于 `sample_count`，再要求两边逐任务样本计数映射完全一致。
 - `[BOUNDARY]` Eval 不注册正式 `uthcode` CLI，不接入 CI，不修改 `src/uthcode/**`；workspace、home、artifact、cache 和 report 都必须位于物理校验过的仓库外专用根。
-- `[ABSENT]` Context Compiler、Compaction、Working Set、Memory 的结构化运行事实；因此 Context 指标只在已有 evidence discovery、Usage 或 Tool 轨迹可确认时可用。
+- `[FACT]` Eval diagnostics 可以消费固定预算、selected/omitted blocks、Projection/Compaction、epoch/prefix、Tool externalization、Session recovery 和 Provider Usage 的安全投影；Memory/retrieval 仍保持 `not_available`。
 
 ## 物理依赖边界
 
@@ -62,6 +64,7 @@ python -m uthcode / uthcode
      -> permission rule loader
      -> ApplicationToolService
      -> UthCodeApplication
+  -> CLI/TUI: application.ensure_session()
 ```
 
 ## 普通请求编排
@@ -74,6 +77,7 @@ Interface
   -> typed interaction pending: TurnHandle.resume(typed response) / cancel()
   -> TurnHandle.events(): 单消费者增量流
   -> TurnHandle.result(): 可重复等待终态
+  -> terminal: Application 分别完成 History append/reload/metadata touch 与 Instruction State sync；按可判定 durable outcome 推进 message cursor，按原始 Turn identity FIFO 重试 pending batch，未知 durability quarantine active Session writer 并要求 close/reopen recovery，再记录 diagnostics
 ```
 
 ### TUI
@@ -126,6 +130,9 @@ implemented:
   /clear
   /model [model-ref]
   /permission [default|auto|full_access]
+  /compact
+  /new
+  /resume [session-id]
   /status
   /quit
   /plan
@@ -134,9 +141,6 @@ implemented:
 
 declared_but_not_implemented:
   /config
-  /compact
-  /new
-  /resume
   /login
   /memory
   /dream
@@ -160,7 +164,7 @@ declared_but_not_implemented:
 - `[ABSENT]` Subagent 创建、Agent 身份/角色、Agent 间协议。
 - `[ABSENT]` 自动任务拆分、依赖图、并行 Worker、合并结果策略。
 - `[ABSENT]` Multi-Agent 共享 Context、共享 Memory、资源锁和调度策略。
-- `[ABSENT]` 通用 workflow engine、后台任务队列、跨进程恢复。
+- `[BOUNDARY]` 不恢复跨进程 Runtime checkpoint；resume 只重建已提交 Session History/Projection/Instruction State，并从新 Run/Turn 开始。
 - `[DEFER]` Web/Desktop/IDE 等新 Interface；新增时仍必须只接 Application。
 
 ## 修改路由
