@@ -342,6 +342,40 @@ class SessionFileStore:
         loaded = self._load_snapshot(path, expected_project_key=expected_project_key)
         return loaded.snapshot
 
+    def persist_tool_result(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        policy: object | None = None,
+    ) -> object:
+        """Persist one complete Tool Result under the validated Session root."""
+
+        from .tools.tool_result_read import ToolResultFileStore
+
+        return ToolResultFileStore(self).persist(session_id, content, policy=policy)  # type: ignore[arg-type]
+
+    def read_tool_result(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        policy: object | None = None,
+    ) -> object:
+        """Read one bounded page through an opaque, Session-owned ref."""
+
+        from .tools.tool_result_read import ToolResultFileStore
+
+        return ToolResultFileStore(self).read_page(  # type: ignore[arg-type]
+            session_id,
+            ref,
+            offset=offset,
+            limit=limit,
+            policy=policy,
+        )
+
     def list_metadata(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
         if not self.root.is_dir():
             return ()
@@ -498,6 +532,36 @@ class SessionWriter:
         _append_jsonl(self.store.session_path(self.session_id) / "history.jsonl", envelopes)
         self._reload(touch=True)
         return self.snapshot
+
+    def persist_tool_result(
+        self,
+        content: str,
+        *,
+        policy: object | None = None,
+    ) -> object:
+        """Persist a result while this writer owns the Session lock."""
+
+        self._require_open()
+        return self.store.persist_tool_result(self.session_id, content, policy=policy)
+
+    def read_tool_result(
+        self,
+        ref: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        policy: object | None = None,
+    ) -> object:
+        """Read a bounded result page through the held Session boundary."""
+
+        self._require_open()
+        return self.store.read_tool_result(
+            self.session_id,
+            ref,
+            offset=offset,
+            limit=limit,
+            policy=policy,
+        )
 
     def append_projection(self, projection: Projection) -> SessionSnapshot:
         self._require_open()

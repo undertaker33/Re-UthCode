@@ -59,7 +59,7 @@ def _plain(value: Any) -> Any:
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_plain(item) for item in value]
     return value
 

@@ -36,6 +36,15 @@ def _request(text: str = "hello") -> GenerationRequest:
     return GenerationRequest(messages=(Message("user", (TextPart(text),)),))
 
 
+def _request_text(request: GenerationRequest) -> str:
+    return "\n".join(
+        part.text
+        for message in request.messages
+        for part in message.parts
+        if isinstance(part, TextPart)
+    )
+
+
 def _completed(text: str = "done") -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
@@ -304,12 +313,19 @@ async def test_model_switch_refreshes_prompt_model_protocol_and_remote_identity(
     second_prompt = providers["two/ref"].recorded_requests[0].system_prompt
     assert first_prompt is not None
     assert second_prompt is not None
-    assert "模型选择：one/ref" in first_prompt
-    assert "Provider 协议：protocol-one/ref" in first_prompt
-    assert "远端模型：remote-one" in first_prompt
-    assert "模型选择：two/ref" in second_prompt
-    assert "Provider 协议：protocol-two/ref" in second_prompt
-    assert "远端模型：remote-two" in second_prompt
+    assert first_prompt == second_prompt
+    assert (
+        providers["one/ref"].recorded_requests[0].metadata["stable_prefix_fingerprint"]
+        == providers["two/ref"].recorded_requests[0].metadata["stable_prefix_fingerprint"]
+    )
+    assert "模型选择：one/ref" not in first_prompt
+    assert "模型选择：two/ref" not in second_prompt
+    assert "模型选择：one/ref" in _request_text(providers["one/ref"].recorded_requests[0])
+    assert "Provider 协议：protocol-one/ref" in _request_text(providers["one/ref"].recorded_requests[0])
+    assert "远端模型：remote-one" in _request_text(providers["one/ref"].recorded_requests[0])
+    assert "模型选择：two/ref" in _request_text(providers["two/ref"].recorded_requests[0])
+    assert "Provider 协议：protocol-two/ref" in _request_text(providers["two/ref"].recorded_requests[0])
+    assert "远端模型：remote-two" in _request_text(providers["two/ref"].recorded_requests[0])
 
 
 @pytest.mark.asyncio
@@ -364,9 +380,9 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
     assert len(providers["two/ref"].recorded_requests) == 0
     old_request = providers["one/ref"].recorded_requests[0]
     assert old_request.system_prompt is not None
-    assert "模型选择：one/ref" in old_request.system_prompt
-    assert "Provider 协议：protocol-one/ref" in old_request.system_prompt
-    assert "远端模型：remote-one" in old_request.system_prompt
+    assert "模型选择：one/ref" in _request_text(old_request)
+    assert "Provider 协议：protocol-one/ref" in _request_text(old_request)
+    assert "远端模型：remote-one" in _request_text(old_request)
 
     new_handle = application.start_generation(_request("new"))
     new_events = await _collect(new_handle)
@@ -376,9 +392,9 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
     assert len(providers["two/ref"].recorded_requests) == 1
     new_request = providers["two/ref"].recorded_requests[0]
     assert new_request.system_prompt is not None
-    assert "模型选择：two/ref" in new_request.system_prompt
-    assert "Provider 协议：protocol-two/ref" in new_request.system_prompt
-    assert "远端模型：remote-two" in new_request.system_prompt
+    assert "模型选择：two/ref" in _request_text(new_request)
+    assert "Provider 协议：protocol-two/ref" in _request_text(new_request)
+    assert "远端模型：remote-two" in _request_text(new_request)
 
 
 @pytest.mark.asyncio
@@ -424,9 +440,9 @@ async def test_failed_model_switch_keeps_old_prompt_identity(
 
     prompt = old_provider.recorded_requests[0].system_prompt
     assert prompt is not None
-    assert "模型选择：one/ref" in prompt
-    assert "Provider 协议：protocol-one/ref" in prompt
-    assert "远端模型：remote-one" in prompt
+    assert "模型选择：one/ref" in _request_text(old_provider.recorded_requests[0])
+    assert "Provider 协议：protocol-one/ref" in _request_text(old_provider.recorded_requests[0])
+    assert "远端模型：remote-one" in _request_text(old_provider.recorded_requests[0])
 
 
 def test_create_application_injection_receives_application_profiles() -> None:

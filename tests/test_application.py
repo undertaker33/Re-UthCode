@@ -6,6 +6,7 @@ import socket
 import pytest
 
 from uthcode.application import (
+    ApplicationContextService,
     ApplicationRuntimeContext,
     EffectiveConfig,
     ProviderKind,
@@ -99,21 +100,19 @@ async def test_application_injects_authoritative_prompt_without_mutating_request
     prepared = provider.recorded_requests[0]
     assert prepared is not request
     assert prepared.system_prompt is not None
-    workdir_line = next(
-        line
-        for line in prepared.system_prompt.splitlines()
-        if line.startswith("- 工作目录：")
+    assert "工作目录：" not in prepared.system_prompt
+    environment_text = "\n".join(
+        part.text
+        for message in prepared.messages
+        for part in message.parts
+        if isinstance(part, TextPart)
     )
-    rendered_workdir = workdir_line.removeprefix("- 工作目录：")
-    expected_workdir = str(context.workdir).replace("\\", "\\\\").replace(
-        "_", "\\_"
-    )
-    assert rendered_workdir == expected_workdir
-    assert "平台：TestOS / 1.0" in prepared.system_prompt
-    assert "当前日期：2026-08-05" in prepared.system_prompt
-    assert "模型选择：remote-model" in prepared.system_prompt
-    assert "Provider 协议：test-protocol" in prepared.system_prompt
-    assert "远端模型：remote-model" in prepared.system_prompt
+    assert f"工作目录：{context.workdir}" in environment_text
+    assert "平台：TestOS / 1.0" in environment_text
+    assert "当前日期：2026-08-05" in environment_text
+    assert "模型选择：remote-model" in environment_text
+    assert "Provider 协议：test-protocol" in environment_text
+    assert "远端模型：remote-model" in environment_text
     assert request.to_dict() == original
     assert request.system_prompt is None
 
@@ -238,15 +237,13 @@ def test_application_rejects_caller_model_before_provider_call() -> None:
 def test_prompt_build_failure_rejects_request_before_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uthcode.application.generation as generation_module
-
     provider = FakeProvider()
     application = UthCodeApplication(provider)
 
-    def fail(_context: object) -> str:
+    def fail(*_args: object, **_kwargs: object):
         raise RuntimeError("prompt build failed")
 
-    monkeypatch.setattr(generation_module, "build_system_prompt", fail)
+    monkeypatch.setattr(ApplicationContextService, "compose_generation_request", fail)
 
     with pytest.raises(RuntimeError, match="prompt build failed"):
         application.start_generation(_request())

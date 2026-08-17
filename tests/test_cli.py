@@ -205,7 +205,7 @@ def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
     assert stdout == "ignored\n"
     assert stderr == ""
     request = application.provider.recorded_requests[0]
-    assert request.messages[0].parts[0].text == "hello"
+    assert request.messages[0].parts[-1].text == "hello"
 
 
 def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
@@ -220,7 +220,7 @@ def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
     assert result == 0
     assert stdout == "fake response\n"
     assert stderr == ""
-    assert application.provider.recorded_requests[0].messages[0].parts[0].text == "/help"
+    assert application.provider.recorded_requests[0].messages[0].parts[-1].text == "/help"
 
 
 def test_exec_rejects_empty_prompt_without_creating_a_request() -> None:
@@ -511,8 +511,12 @@ def test_exec_uses_one_normalized_workdir_for_config_and_prompt(
     assert captured_contexts[0].workdir == expected
     prompt = providers[0].recorded_requests[0].system_prompt
     assert prompt is not None
-    assert "工作目录：" in prompt
-    assert "project" in prompt
+    assert "工作目录：" not in prompt
+    assert any(
+        isinstance(part, TextPart) and "工作目录：" in part.text
+        for message in providers[0].recorded_requests[0].messages
+        for part in message.parts
+    )
 
 
 def test_exec_default_workdir_is_shared_with_application_context() -> None:

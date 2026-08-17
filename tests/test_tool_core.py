@@ -479,7 +479,7 @@ async def test_executor_pre_cancel_does_not_start_any_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_executor_truncates_success_and_error_results_once() -> None:
+async def test_executor_preserves_full_success_and_error_results() -> None:
     long_output = "x" * 10_500
     success = OutputTool("success", long_output)
     error = OutputTool("error", long_output, is_error=True)
@@ -494,10 +494,8 @@ async def test_executor_truncates_success_and_error_results_once() -> None:
         cancellation=CancellationToken(),
     )
 
-    suffix = "[Output truncated to 10000 characters]"
-    assert all(len(result.content) <= 10_000 for result in results)
-    assert all(result.content.endswith(suffix) for result in results)
-    assert all(result.content.count(suffix) == 1 for result in results)
+    assert results[0].content == long_output
+    assert results[1].content == long_output
     assert results[0].is_error is False
     assert results[1].is_error is True
 

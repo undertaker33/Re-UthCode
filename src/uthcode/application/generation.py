@@ -31,9 +31,13 @@ from uthcode.core.provider import (
     validated_provider_stream,
 )
 from uthcode.core.prompt import (
+    ContextAuthority,
+    ContextBlock,
+    ContextScope,
+    ContextSourceKind,
+    ContextStability,
+    EnvironmentSource,
     RuntimePromptContext,
-    SystemPromptContext,
-    build_system_prompt,
 )
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
@@ -408,24 +412,58 @@ class UthCodeApplication:
         tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
         tool_definitions += (PROPOSE_PLAN_TOOL_DEFINITION,)
 
+        def active_projection():
+            if self._session_service is None:
+                return None
+            active = self._session_service.active_session
+            return None if active is None else active.projection
+
+        def active_session_id():
+            if self._session_service is None:
+                return None
+            active = self._session_service.active_session
+            return None if active is None else active.session_id
+
+        def handle_provider_overflow() -> bool:
+            """Perform one bounded compaction attempt, never window discovery."""
+
+            if self._session_service is not None:
+                active = self._session_service.active_session
+                if active is not None:
+                    candidate = self._context_service.compact(
+                        active.history,
+                        projection=active.projection,
+                        session_id=active.session_id,
+                    )
+                    if candidate.changed and candidate.projection is not None:
+                        active.append_projection(candidate.projection)
+                        return True
+            return False
+
         def prepare(
             messages: tuple[Message, ...],
             visible_definitions: tuple[ToolDefinition, ...],
             runtime_context: RuntimePromptContext,
         ) -> GenerationRequest:
-            request = GenerationRequest(messages=messages, tools=visible_definitions)
-            return self._prepare_request(
-                request,
-                provider,
-                model_ref=model_ref,
+            request, _snapshot = self._context_service.compose_generation_request(
+                messages,
+                run_id=state.run_id,
+                session_id=active_session_id(),
+                instruction_loader=self._instruction_loader,
                 runtime_context=runtime_context,
+                projection=active_projection(),
+                tool_definitions=visible_definitions,
+                environment_sources=self._environment_sources(model_ref, provider.identity),
+                model=model_ref,
             )
+            return request
 
         loop = self._tool_service._create_agent_loop(
             provider,
             prepare,
             permission_resolver=permission_resolver,
             session_grant_sink=session_grant_sink,
+            overflow_handler=handle_provider_overflow,
         )
         execution = loop.start_turn(
             state,
@@ -460,29 +498,44 @@ class UthCodeApplication:
         selected_model_ref = (
             self._current_model_ref if model_ref is None else model_ref
         )
-        prompt_context = SystemPromptContext(
-            workdir=str(self._runtime_context.workdir),
-            platform_name=self._runtime_context.platform_name,
-            platform_release=self._runtime_context.platform_release,
-            current_date=self._runtime_context.current_date,
-            model_ref=selected_model_ref,
-            provider_protocol=identity.protocol,
-            remote_model_id=identity.model,
+        compiled_request, _snapshot = self._context_service.compose_generation_request(
+            request.messages,
+            run_id="generation",
+            instruction_loader=self._instruction_loader,
+            runtime_context=runtime_context,
+            tool_definitions=request.tools,
+            environment_sources=self._environment_sources(selected_model_ref, identity),
+            model=selected_model_ref,
         )
-        if self._instruction_loader is None and runtime_context is None:
-            # Keep the established no-argument Core call shape for embedded
-            # callers and its precise error boundary.
-            system_prompt = build_system_prompt(prompt_context)
-        else:
-            system_prompt = build_system_prompt(
-                prompt_context,
-                runtime_context=runtime_context,
-                instruction_blocks=self._instruction_loader.effective_instruction_set,
-            ) if self._instruction_loader is not None else build_system_prompt(
-                prompt_context,
-                runtime_context=runtime_context,
+        return replace(compiled_request, model=selected_model_ref)
+
+    def _environment_sources(
+        self,
+        model_ref: str,
+        identity: ProviderIdentity,
+    ) -> tuple[EnvironmentSource, ...]:
+        content = "\n".join(
+            (
+                f"- 工作目录：{self._runtime_context.workdir}",
+                f"- 平台：{self._runtime_context.platform_name} / {self._runtime_context.platform_release}",
+                f"- 当前日期：{self._runtime_context.current_date}",
+                f"- Provider 协议：{identity.protocol}",
+                f"- 远端模型：{identity.model}",
+                f"- 模型选择：{model_ref}",
             )
-        return replace(request, system_prompt=system_prompt)
+        )
+        return (
+            EnvironmentSource(
+                ContextBlock(
+                    source_kind=ContextSourceKind.ENVIRONMENT_FACT,
+                    authority=ContextAuthority.ENVIRONMENT,
+                    stability=ContextStability.DYNAMIC,
+                    scope=ContextScope.TURN,
+                    provenance="application:environment",
+                    content=content,
+                )
+            ),
+        )
 
     async def stream_generation(
         self,

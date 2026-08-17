@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
+from typing import Any
 
 from uthcode.core.context import (
+    CompactionResult,
+    ContextCompactor,
     ContextCompiler,
     ContextSnapshot,
     ContextSourceBundle,
     ContextUsage,
+    instruction_text_from_context_snapshot,
+    messages_from_context_snapshot,
 )
-from uthcode.core.history import CanonicalHistory, Projection
+from uthcode.core.history import CanonicalHistory, Projection, history_entries_from_message
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -26,7 +32,8 @@ from uthcode.core.prompt import (
     ToolDefinitionSource,
     build_runtime_prompt_section,
 )
-from uthcode.core.provider import Message, ToolDefinition
+from uthcode.core.provider import GenerationRequest, Message, ToolDefinition
+from uthcode.core.provider import CancellationToken
 
 from .instructions import InstructionLoader
 
@@ -34,8 +41,15 @@ from .instructions import InstructionLoader
 class ApplicationContextService:
     """Assemble current Application sources without owning Context policy."""
 
-    def __init__(self, compiler: ContextCompiler | None = None) -> None:
+    def __init__(
+        self,
+        compiler: ContextCompiler | None = None,
+        compactor: ContextCompactor | None = None,
+    ) -> None:
         self._compiler = compiler or ContextCompiler()
+        self._compactor = compactor or ContextCompactor(
+            token_estimator=self._compiler.token_estimator
+        )
         self._last_snapshot: ContextSnapshot | None = None
 
     @property
@@ -124,6 +138,114 @@ class ApplicationContextService:
         if value is None:
             return ContextUsage(0, available=False)
         return value.usage
+
+    @property
+    def compactor(self) -> ContextCompactor:
+        return self._compactor
+
+    def compact(
+        self,
+        history: CanonicalHistory,
+        *,
+        projection: Projection | None = None,
+        session_id: str | None = None,
+        summarize=None,
+        cancellation: CancellationToken | None = None,
+    ) -> CompactionResult:
+        """Return a safe Projection candidate without mutating History."""
+
+        return self._compactor.compact(
+            history,
+            projection=projection,
+            session_id=session_id,
+            summarize=summarize,
+            cancellation=cancellation,
+        )
+
+    def compose_generation_request(
+        self,
+        messages: Sequence[Message],
+        *,
+        run_id: str,
+        session_id: str | None = None,
+        instruction_loader: InstructionLoader | None = None,
+        runtime_context: RuntimePromptContext | None = None,
+        projection: Projection | None = None,
+        tool_definitions: Sequence[ToolDefinition] = (),
+        environment_sources: Sequence[object] = (),
+        model: str | None = None,
+        previous_snapshot: ContextSnapshot | None = None,
+    ) -> tuple[GenerationRequest, ContextSnapshot]:
+        """Compile every runtime request through one fixed-budget Context path."""
+
+        values = tuple(messages)
+        if not all(isinstance(message, Message) for message in values):
+            raise TypeError("messages must contain Message values")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise ValueError("session_id must be a non-empty string or None")
+        history_session_id = (
+            session_id
+            if session_id is not None
+            else (projection.session_id if projection is not None else f"run:{run_id}")
+        )
+        if projection is not None and history_session_id != projection.session_id:
+            raise ValueError("session_id must match the supplied Projection")
+        ordinary_tools = tuple(tool_definitions)
+        if not all(isinstance(item, ToolDefinition) for item in ordinary_tools):
+            raise TypeError("tool_definitions must contain ToolDefinition values")
+
+        current_user: Message | None = None
+        history_messages = values
+        if values and values[-1].role == "user":
+            current_user = values[-1]
+            history_messages = values[:-1]
+        history = _history_for_messages(history_session_id, history_messages)
+        snapshot = self.compile(
+            instruction_loader=instruction_loader,
+            history=history,
+            projection=projection,
+            current_user=current_user,
+            runtime_context=runtime_context,
+            environment_sources=environment_sources,
+            tool_definitions=ordinary_tools,
+            previous_snapshot=previous_snapshot,
+        )
+        conversation = messages_from_context_snapshot(snapshot)
+        prompt = instruction_text_from_context_snapshot(snapshot)
+        metadata: dict[str, object] = {
+            "context_budget_tokens": snapshot.budget_tokens,
+            "context_token_estimate": snapshot.token_estimate,
+            "context_selected_block_ids": list(snapshot.selected_block_ids),
+            "context_omitted_block_ids": list(snapshot.omitted_block_ids),
+            "projection_revision": snapshot.projection_revision,
+            "instruction_epoch": snapshot.instruction_epoch,
+            "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
+            "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
+        }
+        request = GenerationRequest(
+            messages=conversation,
+            system_prompt=prompt,
+            model=model,
+            tools=snapshot.tool_definitions,
+            metadata=metadata,
+        )
+        return request, snapshot
+
+
+def _history_for_messages(session_id: str, messages: Sequence[Message]) -> CanonicalHistory:
+    history = CanonicalHistory(session_id)
+    sequence = 1
+    for index, message in enumerate(messages):
+        turn_id = f"runtime-{index + 1}"
+        entries = history_entries_from_message(session_id, turn_id, sequence, message)
+        for entry in entries:
+            payload: dict[str, Any] = dict(entry.payload)
+            payload["message"] = message.to_dict()
+            history = history.append(replace(entry, payload=payload))
+        sequence += len(entries)
+    return history
 
 
 __all__ = ["ApplicationContextService"]

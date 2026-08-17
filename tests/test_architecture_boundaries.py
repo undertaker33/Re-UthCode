@@ -115,6 +115,10 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
             )
         if source_path.name == "sessions.py":
             allowed_integration_imports.add("uthcode.integrations.session_files")
+        if source_path.name == "tools.py":
+            allowed_integration_imports.add(
+                "uthcode.integrations.tools.tool_result_read"
+            )
         for value in values:
             if value.startswith("uthcode.integrations"):
                 assert value in allowed_integration_imports, source_path

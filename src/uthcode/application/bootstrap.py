@@ -207,6 +207,7 @@ def create_application(
             tool_values,
             workdir=runtime_context.workdir,
             secret_env_names=secret_env_names,
+            session_provider=lambda: session_service.active_session,
         ),
         permission_rules_loader=(
             lambda: load_permission_rules(cwd=runtime_context.workdir)

@@ -208,22 +208,39 @@ def _tool_names(provider: _ScriptedFakeProvider, index: int) -> tuple[str, ...]:
     return tuple(tool.name for tool in provider.requests[index].tools)
 
 
+def _without_context(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    """Ignore dynamic Context Plane text when checking conversation append-only order."""
+
+    normalized: list[Message] = []
+    for message in messages:
+        parts = tuple(
+            part
+            for part in message.parts
+            if not (
+                isinstance(part, TextPart)
+                and part.text.startswith("[Context]\n")
+            )
+        )
+        normalized.append(Message(message.role, parts, message.native_items))
+    return tuple(normalized)
+
+
 def _new_tool_results_from_follow_up_requests(
     provider: _ScriptedFakeProvider,
 ) -> list[ToolResultPart]:
     """Read only the newly appended role=tool messages in each request."""
 
     results: list[ToolResultPart] = []
-    previous_messages = provider.requests[0].messages
+    previous_messages = _without_context(provider.requests[0].messages)
     for request in provider.requests[1:]:
         current_messages = request.messages
-        assert current_messages[: len(previous_messages)] == previous_messages
+        assert _without_context(current_messages[: len(previous_messages)]) == previous_messages
         for message in current_messages[len(previous_messages) :]:
             if message.role != "tool":
                 continue
             assert all(isinstance(part, ToolResultPart) for part in message.parts)
             results.extend(message.parts)  # type: ignore[arg-type]
-        previous_messages = current_messages
+        previous_messages = _without_context(current_messages)
     return results
 
 
@@ -516,6 +533,7 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "ProposePlan",
     )
@@ -527,6 +545,7 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
         "Grep",
         "Bash",
         "WaitForSteering",
+        "ToolResultRead",
         "AskUserQuestion",
         "TodoWrite",
     )
@@ -577,7 +596,12 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
     assert steering_occurrences[:6] == [0] * 6
     assert all(count == 1 for count in steering_occurrences[6:])
     steering_request = provider.requests[6]
-    assert "一次性运行反馈类型：user_steering" in (steering_request.system_prompt or "")
+    assert any(
+        isinstance(part, TextPart)
+        and "一次性运行反馈类型：user_steering" in part.text
+        for message in steering_request.messages
+        for part in message.parts
+    )
 
     next_handle = run.start_turn("check the next turn")
     next_events = [event async for event in next_handle.events()]
@@ -585,9 +609,21 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
     assert next_result.final_text == "next turn is reset"
     assert run.behavior_mode is BehaviorMode.DEFAULT
     next_request = provider.requests[-1]
-    assert "当前 TaskState：空。" in (next_request.system_prompt or "")
-    assert "当前 PlanState：空。" in (next_request.system_prompt or "")
-    assert "一次性运行反馈类型：" not in (next_request.system_prompt or "")
+    assert any(
+        isinstance(part, TextPart) and "当前 TaskState：空。" in part.text
+        for message in next_request.messages
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and "当前 PlanState：空。" in part.text
+        for message in next_request.messages
+        for part in message.parts
+    )
+    assert not any(
+        isinstance(part, TextPart) and "一次性运行反馈类型：" in part.text
+        for message in next_request.messages[-1:]
+        for part in message.parts
+    )
     assert any(
         message.role == "user"
         and any(
@@ -669,6 +705,7 @@ async def test_t08_plan_full_access_rejects_hidden_write_before_permission(
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "ProposePlan",
     )

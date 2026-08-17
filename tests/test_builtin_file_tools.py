@@ -512,7 +512,7 @@ async def test_cancelled_write_has_no_file_side_effect(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_file_output_is_truncated_only_by_core_executor(tmp_path: Path) -> None:
+async def test_file_output_reaches_application_materialization_unchanged(tmp_path: Path) -> None:
     target = tmp_path / "large.txt"
     target.write_text("x" * 11_000, encoding="utf-8")
     resolver = WorkspacePathResolver(tmp_path)
@@ -527,4 +527,5 @@ async def test_file_output_is_truncated_only_by_core_executor(tmp_path: Path) ->
     )
 
     assert results[0].is_error is False
-    assert results[0].content.endswith("\n[Output truncated to 10000 characters]")
+    assert len(results[0].content) > 10_000
+    assert "[Output truncated" not in results[0].content
