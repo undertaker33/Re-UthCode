@@ -16,7 +16,11 @@ from uthcode.core.context import (
     instruction_text_from_context_snapshot,
     messages_from_context_snapshot,
 )
-from uthcode.core.history import CanonicalHistory, Projection, history_entries_from_message
+from uthcode.core.history import (
+    CanonicalHistory,
+    Projection,
+    history_entries_from_message,
+)
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -168,6 +172,7 @@ class ApplicationContextService:
         *,
         run_id: str,
         session_id: str | None = None,
+        canonical_history: CanonicalHistory | None = None,
         instruction_loader: InstructionLoader | None = None,
         runtime_context: RuntimePromptContext | None = None,
         projection: Projection | None = None,
@@ -185,13 +190,28 @@ class ApplicationContextService:
             raise ValueError("run_id must be a non-empty string")
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise ValueError("session_id must be a non-empty string or None")
+        if canonical_history is not None and not isinstance(canonical_history, CanonicalHistory):
+            raise TypeError("canonical_history must be a CanonicalHistory or None")
         history_session_id = (
             session_id
             if session_id is not None
-            else (projection.session_id if projection is not None else f"run:{run_id}")
+            else (
+                projection.session_id
+                if projection is not None
+                else (
+                    canonical_history.session_id
+                    if canonical_history is not None
+                    else f"run:{run_id}"
+                )
+            )
         )
         if projection is not None and history_session_id != projection.session_id:
             raise ValueError("session_id must match the supplied Projection")
+        if (
+            canonical_history is not None
+            and history_session_id != canonical_history.session_id
+        ):
+            raise ValueError("session_id must match the supplied Canonical History")
         ordinary_tools = tuple(tool_definitions)
         if not all(isinstance(item, ToolDefinition) for item in ordinary_tools):
             raise TypeError("tool_definitions must contain ToolDefinition values")
@@ -201,7 +221,8 @@ class ApplicationContextService:
         if values and values[-1].role == "user":
             current_user = values[-1]
             history_messages = values[:-1]
-        history = _history_for_messages(history_session_id, history_messages)
+        process_history = _history_for_messages(history_session_id, history_messages)
+        history = _merge_canonical_history(canonical_history, process_history)
         snapshot = self.compile(
             instruction_loader=instruction_loader,
             history=history,
@@ -246,6 +267,41 @@ def _history_for_messages(session_id: str, messages: Sequence[Message]) -> Canon
             history = history.append(replace(entry, payload=payload))
         sequence += len(entries)
     return history
+
+
+def _merge_canonical_history(
+    canonical_history: CanonicalHistory | None,
+    process_history: CanonicalHistory,
+) -> CanonicalHistory:
+    """Join durable History with this Run's ordered process-local delta.
+
+    The compiler needs one Canonical History so Projection can filter its
+    covered range and leave the raw tail visible.  The two inputs are separate
+    ownership domains: durable History is the restored base, while
+    ``process_history`` contains only this process's Run/Turn delta.  Its
+    entries are always appended, including equal payloads, because message
+    content cannot identify whether two same-text Turns are the same fact.
+    """
+
+    if canonical_history is None:
+        return process_history
+    if canonical_history.session_id != process_history.session_id:
+        raise ValueError("Canonical History and process messages belong to different Sessions")
+    if not process_history.entries:
+        return canonical_history
+    if not canonical_history.entries:
+        return process_history
+
+    merged = canonical_history
+    for entry in process_history.entries:
+        merged = merged.append(
+            replace(
+                entry,
+                session_id=merged.session_id,
+                sequence=merged.last_sequence + 1,
+            )
+        )
+    return merged
 
 
 __all__ = ["ApplicationContextService"]

@@ -42,7 +42,7 @@ def test_root_completion_returns_all_visible_commands_and_help_last() -> None:
     }
 
 
-def test_prefix_completion_matches_canonical_and_aliases_and_marks_unimplemented() -> None:
+def test_prefix_completion_matches_canonical_and_aliases_and_marks_implemented() -> None:
     registry = create_builtin_registry()
     engine = CompletionEngine(registry)
 
@@ -56,8 +56,8 @@ def test_prefix_completion_matches_canonical_and_aliases_and_marks_unimplemented
     assert len(names) == len(set(names))
     assert any(
         candidate.canonical == "compact"
-        and candidate.availability is CommandAvailability.NOT_IMPLEMENTED
-        and "未实现" in candidate.display
+        and candidate.availability is CommandAvailability.IMPLEMENTED
+        and "未实现" not in candidate.display
         for candidate in candidates
     )
 

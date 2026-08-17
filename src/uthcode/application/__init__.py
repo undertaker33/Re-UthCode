@@ -36,7 +36,14 @@ from .instructions import (
 )
 from .runtime_context import ApplicationRuntimeContext
 from .runs import AgentRun, TurnHandle
-from .sessions import ApplicationSession, ApplicationSessionService, SessionActiveError
+from .sessions import (
+    ApplicationSession,
+    ApplicationSessionService,
+    SessionActiveError,
+    SessionCatalogEntry,
+    SessionOperationError,
+)
+from uthcode.core.context import ContextUsage
 from uthcode.core.interaction import (
     PauseKind,
     PauseReason,
@@ -118,9 +125,11 @@ from .commands import (
     ModelSelected,
     OpenPermissionPicker,
     OpenModelPicker,
+    OpenSessionPicker,
     OutcomeStatus,
     PermissionModeSelected,
     QuitInterface,
+    SessionChanged,
     UiAction,
     complete_commands,
     create_builtin_registry,
@@ -139,6 +148,8 @@ __all__ = [
     "ApplicationContextService",
     "ApplicationSession",
     "ApplicationSessionService",
+    "SessionCatalogEntry",
+    "SessionOperationError",
     "AgentEvent",
     "AgentRun",
     "ArgumentSpec",
@@ -167,6 +178,7 @@ __all__ = [
     "CompactionPolicy",
     "CompactionResult",
     "ContextOverflowError",
+    "ContextUsage",
     "CompletionBlocked",
     "GenerationHandle",
     "GenerationCancelled",
@@ -193,6 +205,7 @@ __all__ = [
     "ModelSelected",
     "OpenPermissionPicker",
     "OpenModelPicker",
+    "OpenSessionPicker",
     "OutcomeStatus",
     "PermissionModeSelected",
     "ProviderKind",
@@ -228,6 +241,7 @@ __all__ = [
     "TaskStateChanged",
     "TaskStatus",
     "SessionActiveError",
+    "SessionChanged",
     "ToolCallPart",
     "ToolDefinition",
     "ToolResultPart",

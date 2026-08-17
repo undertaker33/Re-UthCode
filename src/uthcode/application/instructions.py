@@ -362,6 +362,39 @@ class InstructionLoader:
         self._stable_prefix_fingerprint = ""
         self._change_reason = "initial"
 
+    def fork_for_session(self) -> "InstructionLoader":
+        """Create an independent loader for a staged Session transition.
+
+        Session switching must be able to rebuild the target Instruction State
+        while the current Session is still active.  A fork shares only the
+        read-only file reader and configuration roots; all loaded state belongs
+        to the returned loader.
+        """
+
+        return type(self)(
+            user_root=self.user_root,
+            project_root=self.project_root,
+            reader=self._reader,
+            max_reference_files=self.max_reference_files,
+            agents_filename=self.agents_filename,
+        )
+
+    def adopt_session_state(self, other: "InstructionLoader") -> None:
+        """Commit another loader's already-validated state into this loader."""
+
+        if not isinstance(other, InstructionLoader):
+            raise TypeError("other must be an InstructionLoader")
+        if self.user_root != other.user_root or self.project_root != other.project_root:
+            raise ValueError("InstructionLoader roots must match")
+        self._session_loaded = other._session_loaded
+        self._activated_directories = set(other._activated_directories)
+        self._blocks = other._blocks
+        self._diagnostics = other._diagnostics
+        self._source_fingerprints = other._source_fingerprints
+        self._instruction_epoch = other._instruction_epoch
+        self._stable_prefix_fingerprint = other._stable_prefix_fingerprint
+        self._change_reason = other._change_reason
+
     @property
     def blocks(self) -> tuple[ContextBlock, ...]:
         return self._blocks

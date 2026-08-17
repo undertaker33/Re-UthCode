@@ -47,10 +47,12 @@ from uthcode.application import (
     ModelSelected,
     OpenPermissionPicker,
     OpenModelPicker,
+    OpenSessionPicker,
     PermissionMode,
     PermissionModeSelected,
     ProviderError,
     QuitInterface,
+    SessionChanged,
     TurnHandle,
     UthCodeApplication,
     create_builtin_registry,
@@ -58,8 +60,13 @@ from uthcode.application import (
 
 from .completion import CompletionMenuItem, CompletionMenuState
 from .interaction import InteractionMode, PlanReviewAction, TuiInteractionState
-from .picker import ModelPickerState, PermissionPickerState
-from .rendering import AgentEventRenderer, MarkdownStream, RenderBatch
+from .picker import ModelPickerState, PermissionPickerState, SessionPickerState
+from .rendering import (
+    AgentEventRenderer,
+    MarkdownStream,
+    RenderBatch,
+    context_usage_ring,
+)
 from .state import EscArmState, previous_grapheme_length
 from .terminal import (
     CLEAR_VIEWPORT,
@@ -114,6 +121,7 @@ class UthCodeTUI:
         self.completion = CompletionMenuState()
         self.picker = ModelPickerState()
         self.permission_picker = PermissionPickerState()
+        self.session_picker = SessionPickerState()
         self.interaction = TuiInteractionState()
         self.buffer = Buffer(
             multiline=True,
@@ -234,6 +242,7 @@ class UthCodeTUI:
         pending = tuple(task for task in self._background_tasks if not task.done())
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        self.application.close()
 
     def _application_completion(self, text: str) -> tuple[CompletionMenuItem, ...]:
         engine = CompletionEngine(self.registry, self.application)
@@ -337,11 +346,21 @@ class UthCodeTUI:
             if self._run.permission_mode is PermissionMode.FULL_ACCESS
             else "class:status"
         )
+        usage = self.application.context_usage()
+        ring_style, ring_text = context_usage_ring(usage)
+        columns, _rows = self._terminal_size()
+        if columns < 48:
+            # Preserve a useful fixed-budget signal in narrow terminals while
+            # leaving the main input buffer and its prompt untouched.
+            return [
+                (ring_style, f" {ring_text} | "),
+                (permission_style, f"permission: {self._run.permission_mode.value}"),
+            ]
         return [
             ("class:status", f" {self.activity} | {self.application.current_model_ref} | "),
             ("class:status", f"mode: {self._run.behavior_mode.value} | "),
             (permission_style, f"permission: {self._run.permission_mode.value}"),
-            ("class:status", f" | {self.application.runtime_context.workdir} "),
+            ("class:status", f" | {ring_text} | {self.application.runtime_context.workdir} "),
         ]
 
     def _preview_fragments(self) -> StyleAndTextTuples:
@@ -381,6 +400,38 @@ class UthCodeTUI:
             if warning is not None:
                 rows.append(("class:interaction.hint", f"{warning}\n"))
             return rows
+        if self.session_picker.open:
+            items = self.session_picker.page_items
+            columns, _rows = self._terminal_size()
+            height = self._candidate_height()
+            rows: StyleAndTextTuples = [
+                (
+                    "class:interaction.hint",
+                    f"Session {self.session_picker.page + 1}/{self.session_picker.page_count} · "
+                    "↑/↓ select · ←/→ page · Enter resume · Esc back\n",
+                )
+            ]
+            visible = max(0, height - 1)
+            for index, entry in enumerate(items[:visible]):
+                session_id = str(getattr(entry, "session_id", "unknown"))
+                last_used = str(getattr(entry, "last_used_at", "unknown"))
+                preview = _bounded_display_text(
+                    str(getattr(entry, "preview", "")),
+                    width=max(12, columns - len(session_id) - 24),
+                )
+                marker = "›" if index == self.session_picker.selected_index else " "
+                style = (
+                    "class:candidate.selected"
+                    if index == self.session_picker.selected_index
+                    else "class:candidate"
+                )
+                rows.append(
+                    (
+                        style,
+                        f"{marker} {session_id} · {last_used} · {preview}\n",
+                    )
+                )
+            return rows
         items = self.picker.models
         selected = self.picker.selected_index
         height = self._candidate_height()
@@ -401,7 +452,13 @@ class UthCodeTUI:
         completion_open = Condition(lambda: self.completion.open)
         picker_open = Condition(lambda: self.picker.open)
         permission_picker_open = Condition(lambda: self.permission_picker.open)
-        menu_open = completion_open | picker_open | permission_picker_open
+        session_picker_open = Condition(lambda: self.session_picker.open)
+        menu_open = (
+            completion_open
+            | picker_open
+            | permission_picker_open
+            | session_picker_open
+        )
 
         @bindings.add(Keys.ControlM, eager=True)
         def _submit(event: object) -> None:
@@ -414,6 +471,8 @@ class UthCodeTUI:
                 self._select_picker_model()
             elif self.permission_picker.open:
                 self._select_permission_mode()
+            elif self.session_picker.open:
+                self._select_session()
             else:
                 text = self.buffer.text
                 if text.strip():
@@ -476,6 +535,7 @@ class UthCodeTUI:
                 and not self.completion.open
                 and not self.picker.open
                 and not self.permission_picker.open
+                and not self.session_picker.open
                 and not self.interaction.open
             ),
             eager=True,
@@ -489,7 +549,7 @@ class UthCodeTUI:
         @bindings.add(Keys.ControlH, eager=True)
         def _backspace(event: object) -> None:
             del event
-            if self.picker.open or self.permission_picker.open:
+            if self.picker.open or self.permission_picker.open or self.session_picker.open:
                 return
             before = self.buffer.text[: self.buffer.cursor_position]
             count = previous_grapheme_length(before)
@@ -503,6 +563,8 @@ class UthCodeTUI:
                 self.completion.move(-1)
             elif self.permission_picker.open:
                 self.permission_picker.move(-1)
+            elif self.session_picker.open:
+                self.session_picker.move(-1)
             else:
                 self.picker.move(-1)
 
@@ -513,8 +575,22 @@ class UthCodeTUI:
                 self.completion.move(1)
             elif self.permission_picker.open:
                 self.permission_picker.move(1)
+            elif self.session_picker.open:
+                self.session_picker.move(1)
             else:
                 self.picker.move(1)
+
+        @bindings.add(Keys.Left, filter=session_picker_open, eager=True)
+        def _session_previous_page(event: object) -> None:
+            del event
+            self.session_picker.previous_page()
+            self._invalidate()
+
+        @bindings.add(Keys.Right, filter=session_picker_open, eager=True)
+        def _session_next_page(event: object) -> None:
+            del event
+            self.session_picker.next_page()
+            self._invalidate()
 
         @bindings.add(Keys.Tab, eager=True)
         def _tab(event: object) -> None:
@@ -540,6 +616,9 @@ class UthCodeTUI:
             elif self.permission_picker.open:
                 self.permission_picker.close()
                 self._reset_interaction_context()
+            elif self.session_picker.open:
+                self.session_picker.close()
+                self._reset_interaction_context()
             elif self.interaction.open:
                 self._handle_interaction_escape()
             elif self._active_handle is not None and self._active_handle.paused:
@@ -562,6 +641,7 @@ class UthCodeTUI:
         elif (
             not self.picker.open
             and not self.permission_picker.open
+            and not self.session_picker.open
             and text.lstrip().startswith("/")
         ):
             self.completion.replace(self._application_completion(text))
@@ -587,6 +667,15 @@ class UthCodeTUI:
                 return
             if self._active_handle is not None and invocation.canonical == "model":
                 await self._show_error("生成进行中不能切换模型")
+                return
+            if self._active_handle is not None and invocation.canonical in {
+                "compact",
+                "new",
+                "resume",
+            }:
+                await self._show_error(
+                    f"生成进行中不能执行 /{invocation.canonical}"
+                )
                 return
             outcome = self.dispatcher.dispatch(invocation)
             if outcome is not None:
@@ -630,6 +719,13 @@ class UthCodeTUI:
             )
         elif isinstance(action, OpenPermissionPicker):
             self.permission_picker.replace(self._run.permission_mode)
+        elif isinstance(action, OpenSessionPicker):
+            catalog = getattr(self.application, "session_catalog", None)
+            sessions = tuple(catalog()) if callable(catalog) else ()
+            if not sessions:
+                await self._show_error("没有可恢复的 Session")
+            else:
+                self.session_picker.replace(sessions)
         elif isinstance(action, QuitInterface):
             self._closing = True
             self.ui.exit()
@@ -646,6 +742,20 @@ class UthCodeTUI:
             else:
                 self._run.set_behavior_mode(action.mode)  # type: ignore[attr-defined]
                 self.activity = f"mode: {action.mode.value}"
+        elif isinstance(action, SessionChanged):
+            self._run = self.application.create_run()
+            self._reset_stream_projection()
+            self.interaction.close()
+            self.completion.close()
+            self.picker.close()
+            self.permission_picker.close()
+            self.session_picker.close()
+            self._picker_draft = None
+            self.activity = (
+                f"resumed: {action.session_id}"
+                if action.restored
+                else f"new session: {action.session_id}"
+            )
         prompt = outcome.prompt
         if prompt:
             if self._active_handle is None:
@@ -1052,6 +1162,15 @@ class UthCodeTUI:
         self._spawn(self._handle_submission(f"/permission {mode.value}"))
         self._reset_interaction_context()
 
+    def _select_session(self) -> None:
+        entry = self.session_picker.selected
+        self.session_picker.close()
+        if entry is not None:
+            session_id = str(getattr(entry, "session_id", ""))
+            if session_id:
+                self._spawn(self._handle_submission(f"/resume {session_id}"))
+        self._reset_interaction_context()
+
     async def _clear_viewport(self) -> None:
         self._reset_stream_projection()
         self._sync_renderer_width()
@@ -1106,6 +1225,7 @@ class UthCodeTUI:
             self.completion.open
             or self.picker.open
             or self.permission_picker.open
+            or self.session_picker.open
             or self.interaction.open
         ) and self._candidate_height() > 0
 
@@ -1148,6 +1268,7 @@ class UthCodeTUI:
                 self.completion.open
                 or self.picker.open
                 or self.permission_picker.open
+                or self.session_picker.open
                 or self.interaction.open
             )
             else 0
@@ -1188,6 +1309,25 @@ class UthCodeTUI:
     def _write(self, value: str) -> None:
         self.ui.output.write_raw(value)
         self.ui.output.flush()
+
+
+def _bounded_display_text(text: str, *, width: int) -> str:
+    """Keep Picker previews single-line and terminal-width bounded."""
+
+    normalized = " ".join(text.split())
+    if get_cwidth(normalized) <= width:
+        return normalized
+    if width <= 1:
+        return "…"
+    result = ""
+    current_width = 0
+    for character in normalized:
+        character_width = max(0, get_cwidth(character))
+        if current_width + character_width + get_cwidth("…") > width:
+            break
+        result += character
+        current_width += character_width
+    return result.rstrip() + "…"
 
 
 def _window_start(selected: int, total: int, height: int) -> int:

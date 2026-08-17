@@ -270,9 +270,6 @@ def test_behavior_mode_commands_reject_arguments_without_producing_prompt(
     "canonical",
     [
         "config",
-        "compact",
-        "new",
-        "resume",
         "login",
         "memory",
         "dream",
