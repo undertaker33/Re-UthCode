@@ -87,6 +87,26 @@ class ApplicationSession:
         self._require_open()
         return self._writer.append_runtime(entry)
 
+    def persist_tool_result(self, content: str, *, policy: object | None = None) -> object:
+        self._require_open()
+        return self._writer.persist_tool_result(content, policy=policy)
+
+    def read_tool_result(
+        self,
+        ref: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        policy: object | None = None,
+    ) -> object:
+        self._require_open()
+        return self._writer.read_tool_result(
+            ref,
+            offset=offset,
+            limit=limit,
+            policy=policy,
+        )
+
     def persist_instruction_state(self) -> SessionMetadata:
         self._require_open()
         return self._service._sync_instruction_state(self._writer)
@@ -130,6 +150,12 @@ class ApplicationSessionService:
         self.project_key = project_key
         self.instruction_loader = instruction_loader
         self._active: ApplicationSession | None = None
+
+    @property
+    def active_session(self) -> ApplicationSession | None:
+        """Return the one lock-held Session, if the Application opened one."""
+
+        return self._active
 
     def create_session(self, session_id: str | None = None) -> ApplicationSession:
         self._require_no_active_session()

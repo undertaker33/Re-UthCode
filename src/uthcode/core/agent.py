@@ -51,6 +51,7 @@ from .hooks import (
 )
 from .provider import (
     CancellationToken,
+    ContextOverflowError,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -102,12 +103,20 @@ from .planning import (
     parse_todo_write_arguments,
 )
 from .prompt import RuntimePromptContext
-from .tool import PreparedToolCall, ToolExecutor, ToolPlanningAccess, ToolRegistry
+from .tool import (
+    PreparedToolCall,
+    ToolExecutor,
+    ToolPlanningAccess,
+    ToolRegistry,
+    ToolResultMaterialization,
+    ToolResultMaterializer,
+)
 
 
 AgentEventSink = Callable[[AgentEvent], None]
 PermissionResolver = Callable[[PermissionAction], PermissionDecision]
 SessionGrantSink = Callable[[PermissionAction], None]
+OverflowHandler = Callable[[], bool | Awaitable[bool]]
 
 
 _STEERING_FEEDBACK_TEXT = (
@@ -746,6 +755,8 @@ class AgentLoop:
         tool_call_describer: ToolCallDescriber | None = None,
         permission_resolver: PermissionResolver | None = None,
         session_grant_sink: SessionGrantSink | None = None,
+        result_materializer: ToolResultMaterializer | None = None,
+        overflow_handler: OverflowHandler | None = None,
     ) -> None:
         if not isinstance(provider, ProviderPort):
             raise TypeError("provider must implement ProviderPort")
@@ -768,6 +779,10 @@ class AgentLoop:
             raise TypeError("permission_resolver must be callable or None")
         if session_grant_sink is not None and not callable(session_grant_sink):
             raise TypeError("session_grant_sink must be callable or None")
+        if result_materializer is not None and not callable(result_materializer):
+            raise TypeError("result_materializer must be callable or None")
+        if overflow_handler is not None and not callable(overflow_handler):
+            raise TypeError("overflow_handler must be callable or None")
         self._provider = provider
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
@@ -777,6 +792,8 @@ class AgentLoop:
         self._tool_call_describer = tool_call_describer
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
+        self._result_materializer = result_materializer
+        self._overflow_handler = overflow_handler
 
     @property
     def config(self) -> AgentLoopConfig:
@@ -863,6 +880,7 @@ class AgentTurnExecution:
         "_pending_permission_choice",
         "_pending_steering",
         "_steering_requested_emitted",
+        "_overflow_retry_used",
     )
 
     def __init__(
@@ -895,6 +913,7 @@ class AgentTurnExecution:
         self._pending_permission_choice: PermissionApprovalChoice | None = None
         self._pending_steering: SteeringRequest | None = None
         self._steering_requested_emitted = False
+        self._overflow_retry_used = False
 
     @property
     def state(self) -> RunState:
@@ -1221,6 +1240,27 @@ class AgentTurnExecution:
                         pause_signal = self._renew_pause_signal_after_steering()
                         continue
                     return self._fail_segment(events, TerminationReason.INVALID_PROVIDER_RESPONSE)
+                except ContextOverflowError:
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
+                    if self._overflow_retry_used or self._loop._overflow_handler is None:
+                        return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                    self._overflow_retry_used = True
+                    try:
+                        retry_value = self._loop._overflow_handler()
+                        can_retry = (
+                            await retry_value
+                            if inspect.isawaitable(retry_value)
+                            else retry_value
+                        )
+                    except Exception:
+                        can_retry = False
+                    if not isinstance(can_retry, bool) or not can_retry:
+                        return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                    self._continuation = None
+                    continue
                 except ProviderError:
                     if self._pending_steering is not None:
                         self._apply_pending_steering(events)
@@ -2058,11 +2098,27 @@ class AgentTurnExecution:
         """Execute exactly one already-prepared call and normalize failures."""
 
         call = prepared.call
+        outcome = None
         try:
-            result = await self._loop._tool_executor.execute_prepared(
+            outcome = await self._loop._tool_executor.execute_prepared_outcome(
                 prepared,
                 cancellation=self._cancellation,
             )
+            if self._loop._result_materializer is None:
+                result = outcome.result
+            else:
+                materialized_value = self._loop._result_materializer(outcome)
+                materialized = (
+                    await materialized_value
+                    if inspect.isawaitable(materialized_value)
+                    else materialized_value
+                )
+                if isinstance(materialized, ToolResultMaterialization):
+                    result = materialized.result
+                elif isinstance(materialized, ToolResultPart):
+                    result = materialized
+                else:
+                    raise TypeError("result_materializer must return a ToolResultMaterialization or ToolResultPart")
             if not isinstance(result, ToolResultPart) or result.tool_call_id != call.tool_call_id:
                 return (
                     _controlled_tool_result(
@@ -2080,8 +2136,20 @@ class AgentTurnExecution:
                 "cancelled",
             )
         except Exception:
+            execution_status = "unknown" if outcome is None else outcome.status.value
+            message = (
+                "Error: tool result materialization failed after execution; "
+                "the Tool already ran and will not be retried"
+                if outcome is not None
+                else "Error: tool execution failed"
+            )
             return (
-                _controlled_tool_result(call, "Error: tool execution failed"),
+                ToolResultPart(
+                    call.tool_call_id,
+                    message,
+                    True,
+                    {"execution_status": execution_status, "persistence_status": "failed"},
+                ),
                 True,
                 "failed",
             )

@@ -132,7 +132,7 @@ def _freeze_json(value: Any) -> Any:
         return value
     if isinstance(value, Mapping):
         return JsonPayload(value)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (FrozenList, list, tuple)):
         return FrozenList(_freeze_json(item) for item in value)
     raise TypeError(f"value of type {type(value).__name__} is not JSON-safe")
 
@@ -273,6 +273,7 @@ class ToolResultPart(_JsonModel):
     tool_call_id: str
     content: str
     is_error: bool = False
+    metadata: JsonPayload = field(default_factory=JsonPayload)
 
     def __post_init__(self) -> None:
         _require_text(self.tool_call_id, "tool_call_id")
@@ -280,14 +281,18 @@ class ToolResultPart(_JsonModel):
             raise TypeError("content must be a string")
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
+        object.__setattr__(self, "metadata", JsonPayload(self.metadata))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "type": "tool_result",
             "tool_call_id": self.tool_call_id,
             "content": self.content,
             "is_error": self.is_error,
         }
+        if self.metadata:
+            value["metadata"] = _json_value(self.metadata)
+        return value
 
 
 MessagePart: TypeAlias = TextPart | ReasoningPart | ToolCallPart | ToolResultPart
@@ -359,6 +364,7 @@ def _part_from_dict(value: Mapping[str, Any]) -> MessagePart:
             tool_call_id=value["tool_call_id"],
             content=value["content"],
             is_error=value.get("is_error", False),
+            metadata=value.get("metadata", {}),
         )
     raise ValueError(f"unknown message part type: {part_type!r}")
 
@@ -488,6 +494,31 @@ class GenerationRequest(_JsonModel):
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "metadata", JsonPayload(self.metadata))
+
+    @property
+    def instruction_plane(self) -> str | None:
+        """The provider-independent Instruction Plane carried by this DTO.
+
+        ``system_prompt`` remains the serialized compatibility name because
+        the three provider integrations already map it to their native
+        instruction channel.  The property makes the two-plane contract
+        explicit without duplicating the payload or introducing a second
+        source of truth.
+        """
+
+        return self.system_prompt
+
+    @property
+    def conversation_plane(self) -> tuple[Message, ...]:
+        """The provider-independent Conversation Plane carried by this DTO."""
+
+        return self.messages
+
+    @property
+    def tool_system(self) -> tuple[ToolDefinition, ...]:
+        """The structured Tool System; schemas never belong in prompt text."""
+
+        return self.tools
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> GenerationRequest:
@@ -790,6 +821,16 @@ class ProviderError(Exception):
         super().__init__(message)
 
 
+class ContextOverflowError(ProviderError):
+    """A Provider rejected one request for exceeding its context capacity.
+
+    This is a typed last-protection signal only.  It is not a model-window
+    discovery API; the Application may use it for one bounded recompile.
+    """
+
+    code = "context_overflow"
+
+
 class ProviderConfigurationError(ProviderError):
     code = "provider_configuration_error"
 
@@ -951,6 +992,7 @@ class ProviderPort(Protocol):
 __all__ = [
     "AuthenticationError",
     "CancellationToken",
+    "ContextOverflowError",
     "FinishReason",
     "GenerationCancelled",
     "GenerationCompleted",

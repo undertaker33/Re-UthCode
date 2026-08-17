@@ -5,10 +5,10 @@
 ## Task 1：Prompt Asset、Context Source 与权限平面
 
 - [x] 执行 Prompt/Context contract 定向测试，asset 在 source/wheel 可读，公共 Prompt 不能删除 Core Contract，Tool schema 无副本。
-- [ ] 验证 Tool Schema 仅由 Tool System 维护并进入 `GenerationRequest.tools`/Provider native tools；虽计入 token budget、`tool_schema_fingerprint` 与 cache diagnostics，但 Public Prompt/Core Contract/AGENTS 中没有人工副本。
-- [ ] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
+- [x] 验证 Tool Schema 仅由 Tool System 维护并进入 `GenerationRequest.tools`/Provider native tools；虽计入 token budget、`tool_schema_fingerprint` 与 cache diagnostics，但 Public Prompt/Core Contract/AGENTS 中没有人工副本。
+- [x] 构造 User/Tool instruction-like 历史与 summary，观察 Provider 前语义 authority 仍为 history。
 - [x] 普通 User/Tool 历史伪造 AGENTS/ProjectInstruction/Runtime 标签，观察其仍只在 Conversation Plane，不能进入 Instruction Plane。
-- [ ] 构造长历史只更新 TaskState/PlanState，观察 instruction epoch 与 stable instruction prefix fingerprint 不变，动态 facts 位于 Contextual Plane。
+- [x] 构造长历史只更新 TaskState/PlanState，观察 instruction epoch 与 stable instruction prefix fingerprint 不变，动态 facts 位于 Contextual Plane。
 
 ## Task 2：AGENTS / Project Instructions Loader
 
@@ -43,19 +43,19 @@
 
 ## Task 6：大 Tool Result 外置与资源上限
 
-- [ ] 执行 tool/provider/result persistence 定向测试，阈值下 inline、阈值上完整文件 hash 等于原文且 working view bounded。
-- [ ] 单 Result hard cap、Session quota、写入失败均返回受控结果，无 partial file/dangling ref；Feedback 记录数值选择证据。
-- [ ] Tool 已成功产生副作用但 persistence 失败时，模型/History/diagnostics 均不显示为 Tool 未执行，且不自动重试该 Tool。
-- [ ] 有效 range 可读；伪造 ref、路径文本、跨 Session ref、过大 range 全部 fail closed。
-- [ ] ToolCall ID、FIFO、Permission、`is_error`、取消和普通错误回归不变。
+- [x] 执行 tool/provider/result persistence 定向测试，阈值下 inline、阈值上完整文件 hash 等于原文且 working view bounded。
+- [x] 单 Result hard cap、Session quota、写入失败均返回受控结果，无 partial file/dangling ref；Feedback 记录数值选择证据。
+- [x] Tool 已成功产生副作用但 persistence 失败时，模型/History/diagnostics 均不显示为 Tool 未执行，且不自动重试该 Tool。
+- [x] 有效 range 可读；伪造 ref、路径文本、跨 Session ref、过大 range 全部 fail closed。
+- [x] ToolCall ID、FIFO、Permission、`is_error`、取消和普通错误回归不变。
 
 ## Task 7：有界 Compaction 与 Runtime Request Composition
 
-- [ ] 执行 `python -m pytest -q tests/test_context_compaction.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
-- [ ] 待压缩历史超过 Compactor input budget 时按完整 semantic unit 有界滚动分批，每批输入/输出受限且 ToolCall/ToolResult 不拆。
-- [ ] manual/auto/一次 overflow 保护、single-flight、取消/非法 summary/ToolCall/二次 overflow 失败路径均不改变旧 Projection/History。
-- [ ] 记录三类 Provider contract request，观察 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 分字段构造，Integration 只做原生协议映射；Tool Schema 不复制进 Prompt，Projection 保持 history authority，ordinary history 无法进入 Instruction Plane。
-- [ ] 仅 Projection/Compaction revision 变化时，观察 instruction epoch、Instruction Plane 与 stable prefix fingerprint 均不变。
+- [x] 执行 `python -m pytest -q tests/test_context_compaction.py tests/test_agent_loop.py tests/test_application_runs.py`，全部通过。
+- [x] 待压缩历史超过 Compactor input budget 时按完整 semantic unit 有界滚动分批，每批输入/输出受限且 ToolCall/ToolResult 不拆。
+- [x] manual/auto/一次 overflow 保护、single-flight、取消/非法 summary/ToolCall/二次 overflow 失败路径均不改变旧 Projection/History。
+- [x] 记录三类 Provider contract request，观察 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 分字段构造，Integration 只做原生协议映射；Tool Schema 不复制进 Prompt，Projection 保持 history authority，ordinary history 无法进入 Instruction Plane。
+- [x] 仅 Projection/Compaction revision 变化时，观察 instruction epoch、Instruction Plane 与 stable prefix fingerprint 均不变。
 
 ## Task 8：Session Slash Commands 与 TUI Context Status
 

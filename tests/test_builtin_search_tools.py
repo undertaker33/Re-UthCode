@@ -325,7 +325,7 @@ async def test_search_order_is_stable_and_output_truncates_in_core(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_large_search_output_is_truncated_by_core_executor(tmp_path: Path) -> None:
+async def test_large_search_output_reaches_application_materialization_unchanged(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text(("x" * 200 + "\n") * 100, encoding="utf-8")
     registry = ToolRegistry((GrepTool(WorkspacePathResolver(tmp_path)),))
     executor = ToolExecutor(registry)
@@ -337,4 +337,5 @@ async def test_large_search_output_is_truncated_by_core_executor(tmp_path: Path)
     )
 
     assert results[0].is_error is False
-    assert results[0].content.endswith("\n[Output truncated to 10000 characters]")
+    assert len(results[0].content) > 10_000
+    assert "[Output truncated" not in results[0].content

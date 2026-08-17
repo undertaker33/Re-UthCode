@@ -669,7 +669,7 @@ async def test_bash_schema_rejects_timeout_outside_one_to_six_hundred(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_bash_output_is_truncated_by_core_executor(tmp_path: Path) -> None:
+async def test_bash_output_reaches_application_materialization_unchanged(tmp_path: Path) -> None:
     registry = ToolRegistry((BashTool(tmp_path),))
     executor = ToolExecutor(registry)
 
@@ -686,4 +686,5 @@ async def test_bash_output_is_truncated_by_core_executor(tmp_path: Path) -> None
     )
 
     assert results[0].is_error is False
-    assert results[0].content.endswith("\n[Output truncated to 10000 characters]")
+    assert len(results[0].content) > 10_000
+    assert "[Output truncated" not in results[0].content

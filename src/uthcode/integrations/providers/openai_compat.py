@@ -20,6 +20,7 @@ from openai import (
 from uthcode.core.provider import (
     AuthenticationError,
     CancellationToken,
+    ContextOverflowError,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -257,6 +258,8 @@ def _map_error(error: BaseException) -> ProviderError:
             return AuthenticationError()
         if error.status_code == 429:
             return RateLimitError()
+        if error.status_code == 413:
+            return ContextOverflowError()
         return ProviderError()
     return ProviderError()
 

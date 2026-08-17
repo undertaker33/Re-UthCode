@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeAlias, runtime_checkable
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -22,10 +22,6 @@ from .provider import (
 from .permission import Effect, PermissionAction, ResourceScope
 
 
-_DEFAULT_MAX_RESULT_CHARS = 10_000
-_TRUNCATION_SUFFIX_TEMPLATE = "\n[Output truncated to {limit} characters]"
-
-
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
     """The small result returned by one Core Tool implementation."""
@@ -38,6 +34,114 @@ class ToolExecutionResult:
             raise TypeError("content must be a string")
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
+
+
+class ToolExecutionStatus(str, Enum):
+    """The fact known about the Tool execution itself."""
+
+    SUCCEEDED = "succeeded"
+    SUCCESS = "succeeded"
+    FAILED = "failed"
+    ERROR = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class ToolResultPersistenceStatus(str, Enum):
+    """The separate materialization fact for one executed Tool result."""
+
+    INLINE = "inline"
+    EXTERNALIZED = "externalized"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionOutcome:
+    """Full, provider-independent outcome returned by Core execution.
+
+    Core deliberately keeps the complete content.  Resource policy belongs to
+    Application/Integration materialization and therefore cannot silently turn
+    a successfully executed side effect into an unexecuted call.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    content: str
+    is_error: bool
+    status: ToolExecutionStatus
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
+            raise ValueError("tool_call_id must be a non-empty string")
+        if not isinstance(self.tool_name, str) or not self.tool_name:
+            raise ValueError("tool_name must be a non-empty string")
+        if not isinstance(self.content, str):
+            raise TypeError("content must be a string")
+        if not isinstance(self.is_error, bool):
+            raise TypeError("is_error must be a boolean")
+        if not isinstance(self.status, ToolExecutionStatus):
+            try:
+                object.__setattr__(self, "status", ToolExecutionStatus(self.status))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("status must be a ToolExecutionStatus") from exc
+
+    @property
+    def result(self) -> ToolResultPart:
+        return ToolResultPart(self.tool_call_id, self.content, self.is_error)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultMaterialization:
+    """The result visible to the next model request plus persistence facts."""
+
+    execution: ToolExecutionOutcome
+    result: ToolResultPart
+    persistence_status: ToolResultPersistenceStatus
+    reference: str | None = None
+    size_bytes: int = 0
+    sha256: str | None = None
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution, ToolExecutionOutcome):
+            raise TypeError("execution must be a ToolExecutionOutcome")
+        if not isinstance(self.result, ToolResultPart):
+            raise TypeError("result must be a ToolResultPart")
+        if self.result.tool_call_id != self.execution.tool_call_id:
+            raise ValueError("materialized result must preserve the Tool call id")
+        if not isinstance(self.persistence_status, ToolResultPersistenceStatus):
+            try:
+                object.__setattr__(
+                    self,
+                    "persistence_status",
+                    ToolResultPersistenceStatus(self.persistence_status),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "persistence_status must be a ToolResultPersistenceStatus"
+                ) from exc
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int):
+            raise TypeError("size_bytes must be an integer")
+        if self.size_bytes < 0:
+            raise ValueError("size_bytes must be non-negative")
+        if self.reference is not None and (
+            not isinstance(self.reference, str) or not self.reference
+        ):
+            raise ValueError("reference must be a non-empty string or None")
+        if self.sha256 is not None and (
+            not isinstance(self.sha256, str) or not self.sha256
+        ):
+            raise ValueError("sha256 must be a non-empty string or None")
+        if self.error_code is not None and (
+            not isinstance(self.error_code, str) or not self.error_code
+        ):
+            raise ValueError("error_code must be a non-empty string or None")
+
+
+ToolResultMaterializer: TypeAlias = Callable[
+    [ToolExecutionOutcome],
+    ToolResultMaterialization | ToolResultPart | Awaitable[ToolResultMaterialization | ToolResultPart],
+]
 
 
 @runtime_checkable
@@ -196,15 +300,10 @@ class ToolExecutor:
     def __init__(
         self,
         registry: ToolRegistry,
-        *,
-        max_result_chars: int = _DEFAULT_MAX_RESULT_CHARS,
     ) -> None:
-        if isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int):
-            raise TypeError("max_result_chars must be an integer")
-        if max_result_chars <= 0:
-            raise ValueError("max_result_chars must be positive")
+        if not isinstance(registry, ToolRegistry):
+            raise TypeError("registry must be a ToolRegistry")
         self._registry = registry
-        self._max_result_chars = max_result_chars
 
     def prepare_call(
         self,
@@ -264,6 +363,21 @@ class ToolExecutor:
     ) -> ToolResultPart:
         """Execute one already-prepared call without validation or preflight."""
 
+        return (await self.execute_prepared_outcome(prepared, cancellation=cancellation)).result
+
+    async def execute_prepared_outcome(
+        self,
+        prepared: PreparedToolCall,
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionOutcome:
+        """Execute one call and return the complete execution fact.
+
+        This method performs no resource-policy materialization and never
+        retries a Tool.  ``execute_prepared`` remains as a small compatibility
+        convenience for Core callers that only need the inline result object.
+        """
+
         if not isinstance(prepared, PreparedToolCall):
             raise TypeError("prepared must be a PreparedToolCall")
         if not isinstance(cancellation, CancellationToken):
@@ -271,27 +385,59 @@ class ToolExecutor:
         call = prepared.call
         tool = prepared.tool
         if cancellation.cancelled:
-            return self._cancelled(call)
+            return ToolExecutionOutcome(
+                call.tool_call_id,
+                call.name,
+                "Error: tool call cancelled",
+                True,
+                ToolExecutionStatus.CANCELLED,
+            )
         try:
             result = await tool.execute(
                 prepared.execution_arguments,
                 cancellation=cancellation,
             )
         except GenerationCancelled:
-            return self._cancelled(call)
+            return ToolExecutionOutcome(
+                call.tool_call_id,
+                call.name,
+                "Error: tool call cancelled",
+                True,
+                ToolExecutionStatus.CANCELLED,
+            )
         except asyncio.CancelledError:
             if cancellation.cancelled:
-                return self._cancelled(call)
+                return ToolExecutionOutcome(
+                    call.tool_call_id,
+                    call.name,
+                    "Error: tool call cancelled",
+                    True,
+                    ToolExecutionStatus.CANCELLED,
+                )
             raise
         except Exception:
-            return self._error(call, f"Error: tool execution failed for {call.name}")
+            return ToolExecutionOutcome(
+                call.tool_call_id,
+                call.name,
+                f"Error: tool execution failed for {call.name}",
+                True,
+                ToolExecutionStatus.UNKNOWN,
+            )
 
         if not isinstance(result, ToolExecutionResult):
-            return self._error(call, "Error: tool execution returned an invalid result")
-        return ToolResultPart(
-            tool_call_id=call.tool_call_id,
-            content=self._truncate(result.content),
-            is_error=result.is_error,
+            return ToolExecutionOutcome(
+                call.tool_call_id,
+                call.name,
+                "Error: tool execution returned an invalid result",
+                True,
+                ToolExecutionStatus.UNKNOWN,
+            )
+        return ToolExecutionOutcome(
+            call.tool_call_id,
+            call.name,
+            result.content,
+            result.is_error,
+            ToolExecutionStatus.FAILED if result.is_error else ToolExecutionStatus.SUCCEEDED,
         )
 
     def _cancelled(self, call: ToolCallPart) -> ToolResultPart:
@@ -300,18 +446,9 @@ class ToolExecutor:
     def _error(self, call: ToolCallPart, content: str) -> ToolResultPart:
         return ToolResultPart(
             tool_call_id=call.tool_call_id,
-            content=self._truncate(content),
+            content=content,
             is_error=True,
         )
-
-    def _truncate(self, content: str) -> str:
-        if len(content) <= self._max_result_chars:
-            return content
-        suffix = _TRUNCATION_SUFFIX_TEMPLATE.format(limit=self._max_result_chars)
-        prefix_length = max(0, self._max_result_chars - len(suffix))
-        if prefix_length == 0:
-            return suffix[: self._max_result_chars]
-        return content[:prefix_length] + suffix
 
 
 def _require_tool_call(call: ToolCallPart) -> None:
@@ -372,11 +509,16 @@ def _invalid_arguments_message(name: str, error: ValidationError) -> str:
 __all__ = [
     "PreparedToolCall",
     "Tool",
+    "ToolExecutionOutcome",
     "ToolExecutionResult",
+    "ToolExecutionStatus",
     "ToolExecutor",
     "ToolPlanningAccess",
     "ToolPlanningMetadata",
     "ToolPreflight",
     "ToolPreparation",
+    "ToolResultMaterialization",
+    "ToolResultMaterializer",
+    "ToolResultPersistenceStatus",
     "ToolRegistry",
 ]

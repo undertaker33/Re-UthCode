@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path, PureWindowsPath
 
@@ -12,6 +12,7 @@ from uthcode.core.provider import (
     ProviderPort,
     ToolCallPart,
     ToolDefinition,
+    ToolResultPart,
 )
 from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
@@ -20,6 +21,20 @@ from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.planning import PROPOSE_PLAN_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
 from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
+from uthcode.core.tool import (
+    ToolExecutionOutcome,
+    ToolResultMaterialization,
+    ToolResultPersistenceStatus,
+)
+from uthcode.integrations.tools.tool_result_read import (
+    ToolResultError,
+    ToolResultPage,
+    ToolResultPolicy,
+    ToolResultReadTool,
+    ToolResultReference,
+    ToolResultTooLarge,
+    format_externalized_preview,
+)
 
 
 _MAX_SUMMARY_CHARS = 240
@@ -150,6 +165,8 @@ class ApplicationToolService:
         "_redactor",
         "_registry",
         "_runtime_hooks",
+        "_session_provider",
+        "_tool_result_policy",
         "_workdir",
     )
 
@@ -159,17 +176,37 @@ class ApplicationToolService:
         *,
         workdir: str | PathLike[str] | Path | None = None,
         secret_env_names: Sequence[str] = (),
+        session_provider: Callable[[], object | None] | None = None,
+        tool_result_policy: ToolResultPolicy | None = None,
     ) -> None:
         tool_values = tuple(tools)
         reserved_names = {
             ASK_USER_TOOL_DEFINITION.name,
             TODO_WRITE_TOOL_DEFINITION.name,
             PROPOSE_PLAN_TOOL_DEFINITION.name,
+            "ToolResultRead",
         }
         if any(tool.definition.name in reserved_names for tool in tool_values):
             raise ValueError(
                 "AskUserQuestion is reserved for the Application Agent path; "
                 "TodoWrite and ProposePlan are reserved for the Core Agent path"
+            )
+        if session_provider is not None and not callable(session_provider):
+            raise TypeError("session_provider must be callable or None")
+        self._session_provider = session_provider
+        self._tool_result_policy = (
+            ToolResultPolicy() if tool_result_policy is None else tool_result_policy
+        )
+        if not isinstance(self._tool_result_policy, ToolResultPolicy):
+            raise TypeError("tool_result_policy must be a ToolResultPolicy or None")
+        if session_provider is not None:
+            tool_values = (
+                *tool_values,
+                ToolResultReadTool(
+                    self._read_tool_result_page,
+                    session_provider,
+                    policy=self._tool_result_policy,
+                ),
             )
         self._registry = ToolRegistry(tool_values)
         self._executor = ToolExecutor(self._registry)
@@ -237,6 +274,11 @@ class ApplicationToolService:
                         _safe_text(arguments.get("include"), "<include unavailable>")
                     )
                     summary += f" include={include}"
+            elif call.name == "ToolResultRead":
+                ref = _safe_text(arguments.get("ref"), "<ref unavailable>")
+                offset = arguments.get("offset", 0)
+                limit = arguments.get("limit", self._tool_result_policy.read_page_limit_bytes)
+                summary = f"ToolResultRead ref={ref} offset={offset} limit={limit}"
             else:
                 # A custom Tool may have arbitrary argument names.  Its name
                 # is useful, while its argument payload is not safe to echo.
@@ -253,6 +295,7 @@ class ApplicationToolService:
         *,
         permission_resolver: Callable[[PermissionAction], PermissionDecision],
         session_grant_sink: Callable[[PermissionAction], None] | None = None,
+        overflow_handler: Callable[[], object] | None = None,
     ) -> AgentLoop:
         """Build a Core Loop over this service's one Registry/Executor.
 
@@ -270,7 +313,165 @@ class ApplicationToolService:
             tool_call_describer=self.describe_tool_call,
             permission_resolver=permission_resolver,
             session_grant_sink=session_grant_sink,
+            result_materializer=self.materialize_tool_result,
+            overflow_handler=overflow_handler,
         )
+
+    def materialize_tool_result(
+        self,
+        outcome: ToolExecutionOutcome,
+    ) -> ToolResultMaterialization:
+        """Apply Application resource policy after Core has executed a Tool."""
+
+        if not isinstance(outcome, ToolExecutionOutcome):
+            raise TypeError("outcome must be a ToolExecutionOutcome")
+        size_bytes = len(outcome.content.encode("utf-8"))
+        execution_metadata: dict[str, object] = {
+            "execution_status": outcome.status.value,
+        }
+
+        # ToolResultRead is already a bounded page.  Never recursively
+        # externalize the only reader for an externalized result.
+        if outcome.tool_name == "ToolResultRead" or size_bytes <= self._tool_result_policy.inline_threshold_bytes:
+            return ToolResultMaterialization(
+                execution=outcome,
+                result=outcome.result,
+                persistence_status=ToolResultPersistenceStatus.INLINE,
+                size_bytes=size_bytes,
+            )
+
+        if size_bytes > self._tool_result_policy.single_result_hard_cap_bytes:
+            metadata = {
+                **execution_metadata,
+                "persistence_status": ToolResultPersistenceStatus.FAILED.value,
+                "error_code": ToolResultTooLarge.code,
+                "size_bytes": size_bytes,
+            }
+            result = ToolResultPart(
+                outcome.tool_call_id,
+                "Error: Tool execution completed, but the result exceeded the "
+                f"{self._tool_result_policy.single_result_hard_cap_bytes}-byte hard cap; "
+                "the Tool already ran and will not be retried",
+                outcome.is_error,
+                metadata,
+            )
+            return ToolResultMaterialization(
+                execution=outcome,
+                result=result,
+                persistence_status=ToolResultPersistenceStatus.FAILED,
+                size_bytes=size_bytes,
+                error_code=ToolResultTooLarge.code,
+            )
+
+        session = self._session_provider() if self._session_provider is not None else None
+        if session is None or not callable(getattr(session, "persist_tool_result", None)):
+            return self._persistence_failure(
+                outcome,
+                size_bytes=size_bytes,
+                error_code="active_session_required",
+                message=(
+                    "Error: Tool execution completed, but this large result requires an "
+                    "active Session for durable persistence; the Tool already ran and "
+                    "will not be retried"
+                ),
+            )
+
+        try:
+            reference = session.persist_tool_result(
+                outcome.content,
+                policy=self._tool_result_policy,
+            )
+            if not isinstance(reference, ToolResultReference):
+                raise TypeError("Session returned an invalid Tool Result reference")
+        except ToolResultError as exc:
+            return self._persistence_failure(
+                outcome,
+                size_bytes=size_bytes,
+                error_code=exc.code,
+                message=(
+                    f"Error: Tool execution completed, but result persistence failed "
+                    f"({exc.code}); the Tool already ran and will not be retried"
+                ),
+            )
+        except Exception:
+            return self._persistence_failure(
+                outcome,
+                size_bytes=size_bytes,
+                error_code="result_persistence_failed",
+                message=(
+                    "Error: Tool execution completed, but result persistence failed; "
+                    "the Tool already ran and will not be retried"
+                ),
+            )
+
+        metadata = {
+            **execution_metadata,
+            "persistence_status": ToolResultPersistenceStatus.EXTERNALIZED.value,
+            "ref": reference.ref,
+            "size_bytes": reference.size_bytes,
+            "sha256": reference.sha256,
+        }
+        visible = format_externalized_preview(
+            outcome.content,
+            reference,
+            preview_limit_bytes=self._tool_result_policy.preview_limit_bytes,
+        )
+        result = ToolResultPart(
+            outcome.tool_call_id,
+            visible,
+            outcome.is_error,
+            metadata,
+        )
+        return ToolResultMaterialization(
+            execution=outcome,
+            result=result,
+            persistence_status=ToolResultPersistenceStatus.EXTERNALIZED,
+            reference=reference.ref,
+            size_bytes=reference.size_bytes,
+            sha256=reference.sha256,
+        )
+
+    def _persistence_failure(
+        self,
+        outcome: ToolExecutionOutcome,
+        *,
+        size_bytes: int,
+        error_code: str,
+        message: str,
+    ) -> ToolResultMaterialization:
+        metadata: Mapping[str, object] = {
+            "execution_status": outcome.status.value,
+            "persistence_status": ToolResultPersistenceStatus.FAILED.value,
+            "error_code": error_code,
+            "size_bytes": size_bytes,
+        }
+        return ToolResultMaterialization(
+            execution=outcome,
+            result=ToolResultPart(outcome.tool_call_id, message, outcome.is_error, metadata),
+            persistence_status=ToolResultPersistenceStatus.FAILED,
+            size_bytes=size_bytes,
+            error_code=error_code,
+        )
+
+    def _read_tool_result_page(
+        self,
+        session_id: str,
+        ref: str,
+        offset: int,
+        limit: int,
+    ) -> ToolResultPage:
+        session = self._session_provider() if self._session_provider is not None else None
+        if session is None or getattr(session, "session_id", None) != session_id:
+            raise ToolResultError("Tool Result ref is not owned by the active Session")
+        page = session.read_tool_result(
+            ref,
+            offset=offset,
+            limit=limit,
+            policy=self._tool_result_policy,
+        )
+        if not isinstance(page, ToolResultPage):
+            raise ToolResultError("Session returned an invalid Tool Result page")
+        return page
 
 
 def _safe_text(value: object, fallback: str) -> str:

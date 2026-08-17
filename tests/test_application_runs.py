@@ -116,6 +116,39 @@ def _response(
     )
 
 
+def _request_text(request: GenerationRequest) -> str:
+    return "\n".join(
+        part.text
+        for message in request.messages
+        for part in message.parts
+        if isinstance(part, TextPart)
+    )
+
+
+def _latest_user_text(request: GenerationRequest) -> str:
+    for message in reversed(request.messages):
+        if message.role == "user":
+            return "\n".join(
+                part.text for part in message.parts if isinstance(part, TextPart)
+            )
+    return ""
+
+
+def _without_context(message: Message) -> Message:
+    return Message(
+        message.role,
+        tuple(
+            part
+            for part in message.parts
+            if not (
+                isinstance(part, TextPart)
+                and part.text.startswith("[Context]\n")
+            )
+        ),
+        message.native_items,
+    )
+
+
 class _ScriptedProvider:
     def __init__(self, scripts: Iterable[Iterable[ProviderEvent]], *, model: str = "fake-model") -> None:
         self.identity = ProviderIdentity("fake", "script", model)
@@ -487,8 +520,12 @@ async def test_same_run_history_is_retained_and_different_runs_are_isolated() ->
         "assistant",
         "user",
     ]
-    assert first_second_request.messages[0].parts == (TextPart("first question"),)
-    assert isolated_request.messages[0].parts == (TextPart("isolated question"),)
+    assert _without_context(first_second_request.messages[0]).parts == (
+        TextPart("first question"),
+    )
+    assert _without_context(isolated_request.messages[0]).parts == (
+        TextPart("isolated question"),
+    )
     assert len(isolated_request.messages) == 1
     assert first_run.snapshot().run_id == "first-run"
     assert second_run.snapshot().run_id == "second-run"
@@ -527,11 +564,13 @@ async def test_model_switch_after_start_does_not_change_active_turn(tmp_path: Pa
 
     assert len(first_provider.requests) == 1
     assert len(second_provider.requests) == 0
-    assert "模型选择：one/ref" in (first_provider.requests[0].system_prompt or "")
+    assert "模型选择：one/ref" not in (first_provider.requests[0].system_prompt or "")
+    assert "模型选择：one/ref" in _request_text(first_provider.requests[0])
 
     await run.start_turn("use new snapshot").result()
     assert len(second_provider.requests) == 1
-    assert "模型选择：two/ref" in (second_provider.requests[0].system_prompt or "")
+    assert "模型选择：two/ref" not in (second_provider.requests[0].system_prompt or "")
+    assert "模型选择：two/ref" in _request_text(second_provider.requests[0])
 
 
 @pytest.mark.asyncio
@@ -1296,8 +1335,9 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
     assert [item.name for item in provider.requests[0].tools] == [
         "ReadFile",
         "Glob",
-        "Grep",
+            "Grep",
             "Bash",
+            "ToolResultRead",
             "AskUserQuestion",
             "ProposePlan",
         ]
@@ -1308,11 +1348,12 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
-    assert "当前行为模式：PLAN" in (provider.requests[0].system_prompt or "")
-    assert "当前行为模式：DEFAULT" in (provider.requests[1].system_prompt or "")
+    assert "当前行为模式：PLAN" in _latest_user_text(provider.requests[0])
+    assert "当前行为模式：DEFAULT" in _latest_user_text(provider.requests[1])
 
 
 @pytest.mark.asyncio
@@ -1437,6 +1478,7 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
@@ -1523,17 +1565,15 @@ async def test_t08_application_todo_completion_gate_continues_without_exposing_c
         isinstance(event, AssistantMessageDelta) and event.text == "hidden premature"
         for event in events
     )
-    assert "一次性运行反馈类型：completion_blocked" in (
-        provider.requests[2].system_prompt or ""
-    )
-    assert "[completed] verify" in (provider.requests[3].system_prompt or "")
+    assert "一次性运行反馈类型：completion_blocked" in _latest_user_text(provider.requests[2])
+    assert "[completed] verify" in _latest_user_text(provider.requests[3])
     snapshot_payload = run.snapshot().to_dict()
     assert "task_state" not in snapshot_payload and "plan_state" not in snapshot_payload
     next_handle = run.start_turn("next turn")
     next_result = await asyncio.wait_for(next_handle.result(), timeout=1)
     assert next_result.status is RunStatus.COMPLETED
-    assert "当前 TaskState：空" in (provider.requests[4].system_prompt or "")
-    assert "一次性运行反馈类型" not in (provider.requests[4].system_prompt or "")
+    assert "当前 TaskState：空" in _latest_user_text(provider.requests[4])
+    assert "一次性运行反馈类型" not in _latest_user_text(provider.requests[4])
 
 
 @pytest.mark.asyncio
@@ -1568,16 +1608,14 @@ async def test_t08_application_steering_interrupts_provider_and_cleans_coordinat
     assert result.run_id == "steer-run" and result.final_text == "updated answer"
     assert len(provider.requests) == 2
     assert [message.role for message in provider.requests[1].messages] == ["user", "user"]
-    assert provider.requests[1].messages[-1].parts == (TextPart("also verify tests"),)
+    assert provider.requests[1].messages[-1].parts[-1] == TextPart("also verify tests")
     requested = [event for event in events if isinstance(event, UserSteeringRequested)]
     applied = [event for event in events if isinstance(event, UserSteeringApplied)]
     assert len(requested) == len(applied) == 1
     assert requested[0].steering_id == applied[0].steering_id
     assert sum(isinstance(event, TurnStarted) for event in events) == 1
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
-    assert "一次性运行反馈类型：user_steering" in (
-        provider.requests[1].system_prompt or ""
-    )
+    assert "一次性运行反馈类型：user_steering" in _latest_user_text(provider.requests[1])
     assert handle.steer("after terminal") is False
     assert handle._driver.execution.pending_steering is None
     assert handle._driver._response_waiter is None
@@ -1618,18 +1656,17 @@ async def test_t08_application_plan_generation_accepts_steering_but_review_pause
     assert run.behavior_mode is BehaviorMode.PLAN
     assert handle.steer("must use typed revise now") is False
     assert [message.role for message in provider.requests[1].messages] == ["user", "user"]
-    assert provider.requests[1].messages[-1].parts == (TextPart("also cover rollback"),)
+    assert provider.requests[1].messages[-1].parts[-1] == TextPart("also cover rollback")
     assert [item.name for item in provider.requests[1].tools] == [
         "ReadFile",
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "ProposePlan",
     ]
-    assert "一次性运行反馈类型：user_steering" in (
-        provider.requests[1].system_prompt or ""
-    )
+    assert "一次性运行反馈类型：user_steering" in _latest_user_text(provider.requests[1])
     assert handle.cancel() is True
 
     events = await asyncio.wait_for(events_task, timeout=1)
@@ -1705,6 +1742,7 @@ async def test_t08_plan_approval_updates_active_run_and_next_turn_keeps_default_
         "Glob",
         "Grep",
         "Bash",
+        "ToolResultRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
@@ -1727,7 +1765,7 @@ async def test_t08_plan_approval_updates_active_run_and_next_turn_keeps_default_
     next_result = await asyncio.wait_for(next_handle.result(), timeout=1)
     assert next_result.status is RunStatus.COMPLETED
     assert run.behavior_mode is BehaviorMode.DEFAULT
-    next_prompt = provider.requests[3].system_prompt or ""
+    next_prompt = _latest_user_text(provider.requests[3])
     assert "当前行为模式：DEFAULT" in next_prompt
     assert "当前 TaskState：空" in next_prompt
     assert "当前 PlanState：空" in next_prompt
@@ -1820,13 +1858,13 @@ async def test_t08_approved_plan_todo_state_survives_typed_pause_then_resets_nex
         True,
         False,
     ]
-    assert "[in_progress] verify" in (provider.requests[2].system_prompt or "")
-    assert "revision=1, approved" in (provider.requests[2].system_prompt or "")
+    assert "[in_progress] verify" in _latest_user_text(provider.requests[2])
+    assert "revision=1, approved" in _latest_user_text(provider.requests[2])
 
     next_handle = run.start_turn("next")
     assert (await asyncio.wait_for(next_handle.result(), timeout=1)).status is RunStatus.COMPLETED
-    assert "当前 TaskState：空" in (provider.requests[5].system_prompt or "")
-    assert "当前 PlanState：空" in (provider.requests[5].system_prompt or "")
+    assert "当前 TaskState：空" in _latest_user_text(provider.requests[5])
+    assert "当前 PlanState：空" in _latest_user_text(provider.requests[5])
 
 
 @pytest.mark.asyncio
@@ -1889,7 +1927,7 @@ async def test_t08_steering_preserves_task_state_until_model_explicitly_rewrites
         "old goal",
         "new goal",
     ]
-    steering_prompt = provider.requests[2].system_prompt or ""
+    steering_prompt = _latest_user_text(provider.requests[2])
     assert "[in_progress] old goal" in steering_prompt
     assert "一次性运行反馈类型：user_steering" in steering_prompt
 
@@ -1970,7 +2008,7 @@ async def test_t08_steering_pending_makes_provider_pause_rejection_truthful(
     assert result.status is RunStatus.COMPLETED
     assert result.final_text == "updated answer"
     assert len(provider.requests) == 2
-    assert provider.requests[1].messages[-1].parts == (TextPart("updated goal"),)
+    assert provider.requests[1].messages[-1].parts[-1] == TextPart("updated goal")
     assert sum(isinstance(event, UserSteeringApplied) for event in events) == 1
     assert not any(isinstance(event, TurnPaused) for event in events)
 
