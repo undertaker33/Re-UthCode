@@ -196,6 +196,7 @@ class UthCodeTUI:
 
     async def run_async(self) -> int:
         try:
+            self.application.ensure_session()
             await self.ui.run_async(
                 pre_run=lambda: self._spawn(self._show_startup())
             )

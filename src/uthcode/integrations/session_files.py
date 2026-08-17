@@ -51,6 +51,10 @@ class SessionWriterRequiredError(SessionFileError):
     """A durable mutation was attempted without the held writer lock."""
 
 
+class SessionDurabilityUnknownError(SessionFileError):
+    """The held Session writer is quarantined after an unknown append outcome."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -203,6 +207,33 @@ class SessionSnapshot:
             "last_record_sequence": self.last_record_sequence,
             "recovery_diagnostics": list(self.recovery_diagnostics),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAppendOutcome:
+    """Separate durable History append from reload and metadata touch steps."""
+
+    snapshot: SessionSnapshot
+    history_appended: bool
+    reload_succeeded: bool
+    metadata_synced: bool
+    failure_stage: str | None
+    durability: str
+
+    def __post_init__(self) -> None:
+        if self.durability not in {
+            "not_attempted",
+            "durable",
+            "not_durable",
+            "unknown",
+        }:
+            raise ValueError(f"unknown History append durability: {self.durability!r}")
+        if self.history_appended != (self.durability == "durable"):
+            raise ValueError("history_appended must match the durable outcome")
+        if not isinstance(self.reload_succeeded, bool):
+            raise TypeError("reload_succeeded must be a boolean")
+        if not isinstance(self.metadata_synced, bool):
+            raise TypeError("metadata_synced must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +477,7 @@ class SessionWriter:
         self._lock = _ExclusiveFileLock(store.session_path(session_id) / "writer.lock")
         self._loaded: _LoadedSnapshot | None = None
         self._closed = False
+        self._durability_unknown = False
 
     def __enter__(self) -> "SessionWriter":
         if self._closed:
@@ -476,6 +508,26 @@ class SessionWriter:
         self._lock.release()
 
     @property
+    def durability_unknown(self) -> bool:
+        """Whether this held writer must be closed and reopened to reconcile."""
+
+        return self._durability_unknown
+
+    def quarantine_unknown_durability(self) -> None:
+        """Quarantine this writer until a fresh writer validates the Session."""
+
+        self._require_open()
+        self._durability_unknown = True
+
+    def _require_writable(self) -> None:
+        self._require_open()
+        if self._durability_unknown:
+            raise SessionDurabilityUnknownError(
+                "Session History durability is unknown; close and reopen the "
+                "Session to reconcile before writing"
+            )
+
+    @property
     def snapshot(self) -> SessionSnapshot:
         self._require_open()
         assert self._loaded is not None
@@ -486,13 +538,13 @@ class SessionWriter:
         return self.snapshot.metadata
 
     def touch(self) -> SessionMetadata:
-        self._require_open()
+        self._require_writable()
         metadata = replace(self.metadata, last_used_at=_now())
         self._write_metadata(metadata)
         return metadata
 
     def update_instruction_state(self, instruction_state: Mapping[str, object]) -> SessionMetadata:
-        self._require_open()
+        self._require_writable()
         metadata = replace(
             self.metadata,
             instruction_state=_safe_instruction_state(instruction_state),
@@ -501,13 +553,24 @@ class SessionWriter:
         self._write_metadata(metadata)
         return metadata
 
-    def append_history(self, entries: HistoryEntry | Sequence[HistoryEntry]) -> SessionSnapshot:
-        self._require_open()
+    def append_history(
+        self,
+        entries: HistoryEntry | Sequence[HistoryEntry],
+    ) -> HistoryAppendOutcome:
+        self._require_writable()
         values = (entries,) if isinstance(entries, HistoryEntry) else tuple(entries)
         if not values:
-            return self.snapshot
+            return HistoryAppendOutcome(
+                snapshot=self.snapshot,
+                history_appended=False,
+                reload_succeeded=True,
+                metadata_synced=True,
+                failure_stage=None,
+                durability="not_attempted",
+            )
         if not all(isinstance(entry, HistoryEntry) for entry in values):
             raise TypeError("entries must contain HistoryEntry values")
+        before = self.snapshot
         expected_semantic = self.snapshot.history.last_sequence + 1
         expected_record = self.snapshot.next_record_sequence
         envelopes: list[dict[str, object]] = []
@@ -529,9 +592,108 @@ class SessionWriter:
             expected_semantic += 1
             expected_record += 1
         _validate_history_append(self.snapshot.history, values)
-        _append_jsonl(self.store.session_path(self.session_id) / "history.jsonl", envelopes)
-        self._reload(touch=True)
-        return self.snapshot
+        path = self.store.session_path(self.session_id) / "history.jsonl"
+        try:
+            _append_jsonl(path, envelopes)
+        except Exception:
+            reconciliation, snapshot = self._reconcile_history_append(before, values)
+            if reconciliation == "durable":
+                return self._finish_history_append(
+                    reload_succeeded=False,
+                    failure_stage="history_append_reconciled",
+                )
+            if reconciliation == "not_durable":
+                return HistoryAppendOutcome(
+                    snapshot=self.snapshot if snapshot is None else snapshot,
+                    history_appended=False,
+                    reload_succeeded=False,
+                    metadata_synced=False,
+                    failure_stage="history_append",
+                    durability="not_durable",
+                )
+            self.quarantine_unknown_durability()
+            return HistoryAppendOutcome(
+                snapshot=self.snapshot,
+                history_appended=False,
+                reload_succeeded=False,
+                metadata_synced=False,
+                failure_stage="history_durability_unknown",
+                durability="unknown",
+            )
+
+        try:
+            self._reload(touch=False)
+        except Exception:
+            reconciliation, _snapshot = self._reconcile_history_append(before, values)
+            if reconciliation != "durable":
+                self.quarantine_unknown_durability()
+                return HistoryAppendOutcome(
+                    snapshot=self.snapshot,
+                    history_appended=False,
+                    reload_succeeded=False,
+                    metadata_synced=False,
+                    failure_stage="history_durability_unknown",
+                    durability="unknown",
+                )
+            return self._finish_history_append(
+                reload_succeeded=False,
+                failure_stage="history_reload",
+            )
+        return self._finish_history_append(
+            reload_succeeded=True,
+            failure_stage=None,
+        )
+
+    def _finish_history_append(
+        self,
+        *,
+        reload_succeeded: bool,
+        failure_stage: str | None,
+    ) -> HistoryAppendOutcome:
+        metadata_synced = True
+        final_failure_stage = failure_stage
+        try:
+            self.touch()
+        except Exception:
+            metadata_synced = False
+            if final_failure_stage is None:
+                final_failure_stage = "history_metadata_sync"
+        return HistoryAppendOutcome(
+            snapshot=self.snapshot,
+            history_appended=True,
+            reload_succeeded=reload_succeeded,
+            metadata_synced=metadata_synced,
+            failure_stage=final_failure_stage,
+            durability="durable",
+        )
+
+    def _reconcile_history_append(
+        self,
+        before: SessionSnapshot,
+        values: Sequence[HistoryEntry],
+    ) -> tuple[str, SessionSnapshot | None]:
+        """Reconcile a post-write exception using structured History identity."""
+
+        try:
+            loaded = self.store._load_snapshot(
+                self.store.session_path(self.session_id),
+                expected_project_key=self.expected_project_key,
+                recover_incomplete_tail=False,
+            )
+        except Exception:
+            return "unknown", None
+
+        actual = loaded.snapshot.history.entries
+        expected = before.history.entries + tuple(values)
+        if actual == expected:
+            self._loaded = loaded
+            self._repair_tails()
+            return "durable", loaded.snapshot
+        if actual == before.history.entries:
+            self._loaded = loaded
+            self._repair_tails()
+            return "not_durable", loaded.snapshot
+        return "unknown", loaded.snapshot
 
     def persist_tool_result(
         self,
@@ -541,7 +703,7 @@ class SessionWriter:
     ) -> object:
         """Persist a result while this writer owns the Session lock."""
 
-        self._require_open()
+        self._require_writable()
         return self.store.persist_tool_result(self.session_id, content, policy=policy)
 
     def read_tool_result(
@@ -564,7 +726,7 @@ class SessionWriter:
         )
 
     def append_projection(self, projection: Projection) -> SessionSnapshot:
-        self._require_open()
+        self._require_writable()
         if not isinstance(projection, Projection):
             raise TypeError("projection must be a Projection")
         if projection.session_id != self.session_id:
@@ -594,7 +756,7 @@ class SessionWriter:
         return self.snapshot
 
     def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
-        self._require_open()
+        self._require_writable()
         if not isinstance(entry, RuntimeLogEntry):
             raise TypeError("entry must be RuntimeLogEntry")
         envelope = {
@@ -989,10 +1151,12 @@ def _read_runtime(path: Path) -> tuple[RuntimeLog, int, int, list[str]]:
 
 
 __all__ = [
+    "HistoryAppendOutcome",
     "SESSION_RECORD_SCHEMA_VERSION",
     "SESSION_SCHEMA_VERSION",
     "SessionBusyError",
     "SessionCorruptError",
+    "SessionDurabilityUnknownError",
     "SessionFileError",
     "SessionFileStore",
     "SessionMetadata",

@@ -11,10 +11,12 @@ import pytest
 
 from uthcode.core.history import CanonicalHistory, HistoryKind, RuntimeLogEntry
 from uthcode.integrations.session_files import (
+    HistoryAppendOutcome,
     SessionBusyError,
     SessionCorruptError,
     SessionFileError,
     SessionFileStore,
+    SessionWriter,
 )
 
 
@@ -80,6 +82,98 @@ def test_session_layout_durable_append_projection_and_runtime_boundary(tmp_path:
     assert without_runtime.history == recovered.history
     assert without_runtime.projection == recovered.projection
     assert without_runtime.runtime_log.entries == ()
+
+
+def test_append_history_reports_durable_when_post_append_touch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, _history = _entries()
+    touch_calls = 0
+    original_touch = SessionWriter.touch
+
+    def fail_first_touch(self: SessionWriter):
+        nonlocal touch_calls
+        touch_calls += 1
+        if touch_calls == 1:
+            raise OSError("injected post-append metadata touch failure")
+        return original_touch(self)
+
+    monkeypatch.setattr(SessionWriter, "touch", fail_first_touch)
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_history(entries[:1])
+        assert isinstance(outcome, HistoryAppendOutcome)
+        assert outcome.history_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is True
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "history_metadata_sync"
+        assert outcome.snapshot.history.entries == entries[:1]
+        assert writer.snapshot.history.entries == entries[:1]
+
+    assert store.read_session("session-1").history.entries == entries[:1]
+
+
+def test_append_history_reconciles_post_append_reload_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, _history = _entries()
+    reload_calls = 0
+    original_reload = SessionWriter._reload
+
+    def fail_first_reload(self: SessionWriter, *, touch: bool):
+        nonlocal reload_calls
+        reload_calls += 1
+        if reload_calls == 1:
+            raise OSError("injected post-append reload failure")
+        return original_reload(self, touch=touch)
+
+    monkeypatch.setattr(SessionWriter, "_reload", fail_first_reload)
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_history(entries[:1])
+        assert outcome.history_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is True
+        assert outcome.failure_stage == "history_reload"
+        assert writer.snapshot.history.entries == entries[:1]
+
+    assert store.read_session("session-1").history.entries == entries[:1]
+
+
+def test_append_history_reports_unknown_when_post_append_reconciliation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, _history = _entries()
+
+    def fail_reload(self: SessionWriter, *, touch: bool):
+        raise OSError("injected reload failure")
+
+    def fail_load(*args: object, **kwargs: object):
+        raise OSError("injected reconciliation read failure")
+
+    monkeypatch.setattr(SessionWriter, "_reload", fail_reload)
+    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
+    with store.open_writer("session-1") as writer:
+        monkeypatch.setattr(store, "_load_snapshot", fail_load)
+        outcome = writer.append_history(entries[:1])
+        assert outcome.history_appended is False
+        assert outcome.durability == "unknown"
+        assert outcome.failure_stage == "history_durability_unknown"
+        assert writer.durability_unknown is True
+        with pytest.raises(SessionFileError, match="durability is unknown"):
+            writer.append_history(entries[:1])
+        with pytest.raises(SessionFileError, match="durability is unknown"):
+            writer.append_projection(_history.project(revision=1))
+        assert history_path.read_bytes().splitlines()
 
 
 def test_tail_recovery_repairs_before_next_append_and_middle_damage_fails_closed(tmp_path: Path) -> None:

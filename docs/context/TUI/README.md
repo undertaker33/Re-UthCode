@@ -28,7 +28,7 @@ src/uthcode/interfaces/tui/
 ├── app.py         # prompt_toolkit Application、按键、命令和 Turn 生命周期
 ├── completion.py  # Slash Command 候选状态
 ├── interaction.py  # 暂停菜单、问题导航、答案草稿与复核
-├── picker.py      # 模型候选状态
+├── picker.py      # 模型、权限和 Session 候选状态
 ├── rendering.py   # Application 事件投影与 Markdown 流式边界
 ├── state.py       # 双 Esc 状态与 Unicode grapheme 计算
 ├── terminal.py    # Rich 永久输出、欢迎区、消息和工具样式
@@ -46,7 +46,7 @@ Windows Console Unicode / VT 按键 / bracketed paste
                  ↓              ↓
         Slash / Model 候选     普通消息
                  ↓              ↓
-              UthCodeApplication / AgentRun
+              UthCodeApplication / active Session / AgentRun
                           ↓
                     公开 AgentEvent
                           ↓
@@ -65,7 +65,7 @@ Application(
 )
 ```
 
-普通文本的入口由当前 `AgentRun` 生命周期决定：idle 时调用 `start_turn`；active 且没有 typed interaction 时调用同一 `TurnHandle.steer(text)`。AskUser、Permission、Provider Retry 与 Plan Review 任一交互 pending 时，输入始终先归当前交互层，不能旁路成 Steering 或第二个 Turn。
+普通文本的入口由当前 `AgentRun` 生命周期决定：CLI/TUI 启动时由 Application 确保 active Session，idle 时调用 `start_turn`；active 且没有 typed interaction 时调用同一 `TurnHandle.steer(text)`。terminal Turn 的新增 History、Tool Result ref 与 Instruction State 由 Application 持久化。AskUser、Permission、Provider Retry 与 Plan Review 任一交互 pending 时，输入始终先归当前交互层，不能旁路成 Steering 或第二个 Turn。
 
 Windows 使用 prompt_toolkit 的原生 `KEY_EVENT_RECORD` Unicode 输入路径，并对 `Shift+Enter` 做一处修饰键映射。这样既不把 IME 提交拆成单字节，也不要求 Windows Terminal 支持 Kitty 键盘协议；模型或工具进程修改控制台代码页后，输入仍以 Unicode 进入 `Buffer`。粘贴由 prompt_toolkit 处理并原样保留多行文本。
 
@@ -140,6 +140,8 @@ Slash Command 使用 Application 的正式 Completion 数据源。候选随草�
 
 Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 和旧 Prompt `/do` 不再存在。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
 
+`/compact`、`/new`、`/resume [session-id]` 通过 Application 完成 Projection、Session 切换和当前文件系统 Instruction State 重建；TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个固定 258K Operating Budget 投影，不把它解释为远端模型物理窗口。
+
 `/model` 打开模型候选时保存原草稿；按 `Esc` 后关闭选择器并恢复原对话输入。命令定义、参数提示和模型目录都来自 Application，TUI 不维护副本。
 
 ## Behavior Mode、Plan、Todo 与 Steering
@@ -160,11 +162,13 @@ active Turn 接受 Steering 后，用户文本立即作为一条新的 user reco
 
 Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resume 通道。选择修订时只收集非空修改点并提交精确 revision response；选择批准后同一 handle 恢复，TUI 不自行改写 Run/Plan/Task 状态。选择 Cancel 仍走当前 Turn 的既有取消收口。
 
-`Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，不提供跨进程恢复。
+`Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，但会通过 `/resume` 读取已完整提交的 Session History/Projection/Instruction State，不恢复暂停协程或 Runtime checkpoint。
 
 ## 启动、`/clear` 与退出
 
 启动先发送 `CSI 2J` 和 Home，只清当前视口，然后显示包含 UthCode Logo、当前模型、cwd 和主要快捷键的欢迎区。
+
+欢迎区之前由 Application 确保一个 active Session；退出时 TUI 调用 Application close，释放 Session writer。`/new` 会创建 fresh Session，`/resume` 会在锁定并重建目标 Instruction State 后切换。
 
 `/clear` 使用相同的清视口语义并打印新视图分隔线：
 
@@ -183,7 +187,7 @@ Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resum
 
 - 修改 Application 公共事件；
 - 修改 Agent Core、Provider 或工具协议；
-- 增加持久 Session、Permission、Diff Viewer 或会话存储；
+- 改变 Application 已定义的 Session、Permission、Diff Viewer 或会话存储语义；
 - 从界面读取 Provider SDK 类型或工具原始结果。
 
 ## 验证方法

@@ -8,6 +8,7 @@ import posixpath
 import re
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from uthcode.core.agent import (
@@ -37,7 +38,7 @@ from uthcode.core.permission import (
     SessionGrant,
 )
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import CancellationToken
+from uthcode.core.provider import CancellationToken, Message
 
 if TYPE_CHECKING:
     from .generation import UthCodeApplication
@@ -47,6 +48,16 @@ _END = object()
 _CANCELLED = object()
 _APPLIED = object()
 _OUTSIDE_DIRECTORY_GRANT_TOOLS = frozenset({"ReadFile", "WriteFile", "EditFile"})
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPersistenceBatch:
+    """An in-memory retry unit retaining its original Session/Turn identity."""
+
+    session_id: str | None
+    turn_id: str
+    messages: tuple[Message, ...]
+    blocked: bool = False
 
 
 def _new_identifier(value: str | None, field_name: str) -> str:
@@ -113,6 +124,10 @@ class AgentRun:
         "_permission_mode",
         "_session_grants",
         "_behavior_mode",
+        "_persisted_message_count",
+        "_pending_persistence_batches",
+        "_turn_message_start",
+        "_turn_session_id",
     )
 
     def __init__(
@@ -136,6 +151,10 @@ class AgentRun:
         self._permission_mode = permission_mode
         self._session_grants: list[SessionGrant] = []
         self._behavior_mode = BehaviorMode.DEFAULT
+        self._persisted_message_count = 0
+        self._pending_persistence_batches: list[_PendingPersistenceBatch] = []
+        self._turn_message_start: int | None = None
+        self._turn_session_id: str | None = None
 
     @property
     def permission_mode(self) -> PermissionMode:
@@ -220,8 +239,15 @@ class AgentRun:
             raise ValueError("user_input must be a non-empty string")
         if self._active_turn is not None:
             raise RuntimeError("AgentRun already has an active Turn")
+        if any(batch.blocked for batch in self._pending_persistence_batches):
+            raise RuntimeError(
+                "History persistence durability is unknown; the pending batch must be reconciled"
+            )
+        self._application._require_run_start_allowed()
 
+        message_start = len(self._state.messages)
         turn_id = uuid.uuid4().hex
+        self._turn_session_id = self._application._active_session_id()
         cancellation = CancellationToken()
         execution = self._application._start_agent_turn(
             self._state,
@@ -231,8 +257,10 @@ class AgentRun:
             behavior_mode=self._behavior_mode,
             permission_resolver=self._resolve_permission,
             session_grant_sink=self._store_session_grant,
+            process_message_start=self._persisted_message_count,
         )
         self._state = execution.state
+        self._turn_message_start = message_start
         driver = _TurnDriver(self, execution)
         handle = TurnHandle(self, driver)
         driver.attach(handle)
@@ -262,6 +290,40 @@ class AgentRun:
             return
         self._state = handle._driver.execution.state
         self._behavior_mode = self._state.behavior_mode
+        turn_message_start = self._turn_message_start
+        current_messages = (
+            tuple(self._state.messages[turn_message_start:])
+            if turn_message_start is not None
+            else ()
+        )
+        if current_messages:
+            self._pending_persistence_batches.append(
+                _PendingPersistenceBatch(
+                    session_id=self._turn_session_id,
+                    turn_id=result.turn_id,
+                    messages=current_messages,
+                )
+            )
+        self._turn_message_start = None
+        self._turn_session_id = None
+        while self._pending_persistence_batches:
+            batch = self._pending_persistence_batches[0]
+            if batch.blocked:
+                break
+            outcome = self._application._persist_run_messages(
+                batch.messages,
+                session_id=batch.session_id,
+                turn_id=batch.turn_id,
+            )
+            if not outcome.persisted_message_count:
+                if getattr(outcome, "history_durability", None) == "unknown":
+                    self._pending_persistence_batches[0] = replace(
+                        batch,
+                        blocked=True,
+                    )
+                break
+            self._persisted_message_count += outcome.persisted_message_count
+            del self._pending_persistence_batches[0]
         # Application owns the public diagnostics projection.  The value is
         # the cumulative Usage of this terminal Turn (including all Provider
         # iterations/tool continuations), not a second Provider request.

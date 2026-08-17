@@ -6,6 +6,8 @@
 Agent Core = Model + Context + Tools + Runtime Control
 ```
 
+在当前实现中，Context 不是一段不可区分的 System Prompt。T03 的正式边界是 `Instruction Plane + Conversation Plane + Tool Definitions`：前两者由 Application Context Compiler 组合，Tool Schema 只进入 `GenerationRequest.tools`。Compiler 使用固定的 258K Operating Budget；这是 UthCode 的运行预算，不是对任何远端模型物理窗口的声明。terminal Turn 的已提交事实进入 Session，`/resume` 从中重建新的 Run/Turn，但不恢复 Runtime checkpoint。
+
 Model 决定下一步做什么，Context 提供判断所需的信息，Tools 让决定作用于真实项目，Runtime Control 则让整个过程可约束、可暂停、可恢复、可验证。
 
 这组文档结合 UthCode 的实际设计，从一次请求如何进入系统讲起，逐步走完 Agent Core 的运行闭环。章节按项目能力形成的阶段划分，但不是任务书摘要；即使不阅读源码，也可以把它当作一份简短的 Agent 工程教程。
