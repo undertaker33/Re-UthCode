@@ -110,9 +110,9 @@ tool:
 - `[ABSENT]` 并行 Tool Batch、DAG、通用工作流引擎。
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
-- `[FACT]` Context Compiler、固定 258K Operating Budget、Projection/Compaction 与 Session History 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。
+- `[FACT]` Context Compiler、固定 258K Operating Budget、Projection 数据模型、Compactor 有界分批/校验机制与 Session History 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产组合未提供 summarizer，因此 `/compact` 和 Provider overflow compaction 当前返回 `summarizer_unavailable`，不会生成新 Projection。
 - `[BOUNDARY]` Session 只恢复已完整提交的 History、Projection、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
-- `[DEFER]` Memory、retrieval 与真实模型窗口解析仍不属于当前执行层。
+- `[DEFER]` 生产 tool-free summarizer、Memory、retrieval 与真实模型窗口解析仍不属于当前执行层。
 
 ## 修改路由
 

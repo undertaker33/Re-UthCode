@@ -140,7 +140,7 @@ Slash Command 使用 Application 的正式 Completion 数据源。候选随草�
 
 Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 和旧 Prompt `/do` 不再存在。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
 
-`/compact`、`/new`、`/resume [session-id]` 通过 Application 完成 Projection、Session 切换和当前文件系统 Instruction State 重建；TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个固定 258K Operating Budget 投影，不把它解释为远端模型物理窗口。
+`/new`、`/resume [session-id]` 通过 Application 完成 Session 切换和当前文件系统 Instruction State 重建；`/compact` 也进入 Application/Session 路径，但当前没有生产 summarizer，只会显示受控错误 `summarizer_unavailable`，不会生成 Projection。TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个固定 258K Operating Budget 投影，不把它解释为远端模型物理窗口。
 
 `/model` 打开模型候选时保存原草稿；按 `Esc` 后关闭选择器并恢复原对话输入。命令定义、参数提示和模型目录都来自 Application，TUI 不维护副本。
 

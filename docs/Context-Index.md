@@ -45,8 +45,8 @@ path_migration:
 | --- | --- | --- | --- | --- |
 | 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定 Runtime Hook | 已有单 Agent、显式串行 ReAct Runtime、固定 `RuntimeHookSet` | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、Hook 边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Hook、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定 Hook 执行位；无 OS Sandbox、动态 Hook registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
-| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、固定 258K Context Compiler、Canonical History、Projection、Session metadata、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Session ensure/close、`/plan`、`/do`、`/compact`、`/new`、`/resume`；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Session、Plan/Task、Steering |
+| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、固定 258K Context Compiler、Canonical History、Projection 数据模型、Session metadata、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；Compactor 机制已有但生产 summarizer 未接通；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Session ensure/close、`/plan`、`/do`、`/new`、`/resume`；`/compact` 已注册但当前固定返回 `summarizer_unavailable`；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Session、Plan/Task、Steering |
 
 ## current-status
 
@@ -80,7 +80,7 @@ status_values:
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
 | B01 | 私有测试集 v0 | `docs/work/B01-私有测试集v0/` | W03 第二轮已关闭报告级 `task_sample_counts` 内部一致性阻断；Task 1～9 Checklist 已完成；Eval 77、定向 297、架构 23、全量 1084 passed/3 skipped；真实 baseline 仍需单独授权，工作包未归档 |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | W06 及定点返工完成 Task 10～12：正式 create_application/CLI/TUI 链路接入固定 258K Context、Session History/Projection、Tool Result ref、Instruction State resume、分阶段 persistence outcome 与 Eval diagnostics；Checklist 全部完成，Feedback 已记录，工作包未归档 |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | W06 及定点返工接入固定 258K Context、Session History/Projection、Tool Result ref、Instruction State resume、分阶段 persistence outcome 与 Eval diagnostics；Checklist 与 Feedback 已完成，但生产 summarizer 未接通，`/compact` 与 overflow compaction 当前只能安全失败，该缺口已明确转入 T09-1；工作包未归档 |
 
 ### `not_implemented`
 
@@ -109,8 +109,8 @@ interfaces/cli.py 或 interfaces/tui/app.py
 
 - `[ABSENT]` LangGraph、LangChain Agent、图/DAG/工作流 DSL。
 - `[ABSENT]` OS Sandbox；`Bash` 是当前用户权限下的未沙箱化进程执行。
-- `[FACT]` 持久 Session History、Projection、Tool Result ref、Instruction State metadata、Context Compiler、固定 258K Operating Budget、Compaction、Runtime AGENTS / Project Instructions Loader 已进入正式链路；terminal History 的 append/reload/last-used metadata touch 与 Instruction State sync 分开诊断，只有可判定 durable 的 message append 才推进 cursor，metadata 半失败不会回退；append 后无法 reconciliation 的未知批次会 quarantine active Session writer，新的 Run/语义写入均 fail closed，只有 close 后 fresh writer 验证/恢复才解除；真正 append 失败时才保留进程内 pending batch，按原始 Session/Turn identity FIFO 重试，不引入 Runtime checkpoint。
-- `[ABSENT]` Persistent Runtime checkpoint、Memory、Dream、retrieval、统一模型输入限制解析。
+- `[FACT]` 持久 Session History、Projection 数据模型、Tool Result ref、Instruction State metadata、Context Compiler、固定 258K Operating Budget、Compactor 有界分批/校验机制与 Runtime AGENTS / Project Instructions Loader 已进入正式链路；terminal History 的 append/reload/last-used metadata touch 与 Instruction State sync 分开诊断，只有可判定 durable 的 message append 才推进 cursor，metadata 半失败不会回退；append 后无法 reconciliation 的未知批次会 quarantine active Session writer，新的 Run/语义写入均 fail closed，只有 close 后 fresh writer 验证/恢复才解除；真正 append 失败时才保留进程内 pending batch，按原始 Session/Turn identity FIFO 重试，不引入 Runtime checkpoint。
+- `[ABSENT]` 生产 Compaction summarizer、可成功的 `/compact`/overflow compaction、Persistent Runtime checkpoint、Memory、Dream、retrieval、统一模型输入限制解析。
 - `[FACT]` 固定 `RuntimeHookSet` 已接入 PLAN 只读工具边界与 unfinished-task 完成阻断；普通 PLAN final 正常完成，正式 Plan Review 仅由 `ProposePlan` 控制 ToolCall 触发；不提供动态注册。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。

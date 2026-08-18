@@ -17,6 +17,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
 - `[FACT]` Application 在 terminal Turn 边界把新增 Message 转换为 Canonical History，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 History identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、History、Projection、Runtime 和 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
 - `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/History/Projection/Runtime/Tool Schema 组成固定 258K Context Snapshot；Projection 变化不改变 Instruction Epoch 或 stable prefix，AGENTS scope/content 变化才创建新 epoch。
+- `[BOUNDARY]` `ContextCompactor` 能生成并校验 Projection candidate，但生产 Application 没有注入 summarizer；当前手动 `/compact` 与 overflow path 都不会提交新的 Projection，只返回 `summarizer_unavailable`。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
 - `[BOUNDARY]` Session Store、Canonical History、Projection、Tool Result ref 和 Instruction State metadata 已持久化；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
@@ -45,7 +46,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
 | committed History | active `ApplicationSession` / `SessionWriter` | terminal Turn 后追加；resume 读取当前 Session | `ApplicationSession.history`、Context Compiler |
-| Projection | `ApplicationSession` / `SessionWriter` | manual/overflow compaction 后追加 revision | Context diagnostics、Conversation Plane |
+| Projection | `ApplicationSession` / `SessionWriter` | 仅在合法 Compaction candidate 成功持久化后追加 revision；当前生产 summarizer 缺失，正常入口不会产生新 revision | Context diagnostics、Conversation Plane |
 | Instruction State metadata | `InstructionLoader` + Session metadata | Session create/resume/terminal close 边界 | epoch/fingerprint/reason diagnostics |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |
 | behavior mode | `RunState` / `AgentRun` idle selection | 当前 Turn；批准 Plan 后切回 DEFAULT，下一 Turn 继承最终 mode | `BehaviorModeChanged`, `Run.behavior_mode` |

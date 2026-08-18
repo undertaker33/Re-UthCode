@@ -47,6 +47,8 @@ terminal Turn 在 Application 边界把新增 Message 通过 active Session 的 
 
 `/resume` 恢复已提交的 History、Projection、Tool Result ref 和 Instruction State，并从新的 Run/Turn 开始。它不跨进程恢复 `TaskState`、`PlanState`、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
 
+长期 Session 的 Working Set、持久化、Tool Result 外置和 Compaction 边界见 [T09：让长期会话拥有可治理的上下文](T09-context-engineering.md)。
+
 ## Prompt 不是安全边界
 
 System Prompt 可以要求模型遵守规则，但模型输出仍是不可信输入。路径限制、参数校验和权限判断必须由 Runtime 与工具执行。工程上应把 Prompt 视为行为引导，把代码检查视为真正约束。

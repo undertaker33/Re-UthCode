@@ -16,6 +16,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`、Model `remote_id`/`display_name`；`/model` 原子写回只修改用户级 `default_model`。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
 - `[FACT]` CLI/TUI 进入正式运行前通过 Application `ensure_session()` 打开一个 fresh Session；terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
 - `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；Integration 不重新编译 Context。
+- `[BOUNDARY]` `/compact` 已通过 Command/Application/Session 路径调用 `ContextCompactor`，但 composition root 未提供生产 summarizer，因此当前固定安全失败为 `summarizer_unavailable`；Provider overflow 的自动压缩也不能成功重编译或重试。
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 `RuntimeHookSet`、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；AgentLoop 始终先组合强制 Hook，再按固定顺序运行可选 Hook。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
@@ -131,7 +132,6 @@ implemented:
   /clear
   /model [model-ref]
   /permission [default|auto|full_access]
-  /compact
   /new
   /resume [session-id]
   /status
@@ -146,9 +146,12 @@ declared_but_not_implemented:
   /memory
   /dream
   /review
+
+registered_but_runtime_unavailable:
+  /compact  # 缺少生产 summarizer，返回 summarizer_unavailable
 ```
 
-命令注册表中保留的未实现命令只返回 `NOT_IMPLEMENTED`；`/plan` 与 `/do` 已由同一 Registry 选择 Behavior Mode，`/build` 只是 `/do` alias。Plan/Task/Steering 状态仍由 Core/Application 权威链路持有，不由命令或 TUI 复制。
+命令注册表中保留的未实现命令只返回 `NOT_IMPLEMENTED`；`/compact` 不属于 `NOT_IMPLEMENTED`，它会进入正式 Session use case，但因生产 summarizer 未组合而返回 `summarizer_unavailable`。`/plan` 与 `/do` 已由同一 Registry 选择 Behavior Mode，`/build` 只是 `/do` alias。Plan/Task/Steering 状态仍由 Core/Application 权威链路持有，不由命令或 TUI 复制。
 
 ## 编排不变量
 

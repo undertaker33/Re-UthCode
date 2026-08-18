@@ -23,5 +23,6 @@ Model 决定下一步做什么，Context 提供判断所需的信息，Tools 让
 | 长任务如何暂停、询问用户、恢复和取消？ | [T06：让运行过程可以被控制](T06-interaction-control.md) |
 | 如何限制 Agent 的行动，而不把权限误认为沙箱？ | [T07：把权限判断放进执行链](T07-permission-system.md) |
 | 计划、Todo 和运行中补充指令如何进入同一个循环？ | [T08：在同一运行时中加入规划](T08-planning-and-task-control.md) |
+| 长期 Session 如何保存事实、编译工作集并控制上下文预算？ | [T09：让长期会话拥有可治理的上下文](T09-context-engineering.md) |
 
-建议按顺序阅读。前四章介绍 Agent 的组成，T05 将它们闭合成循环，后三章解释一个工程化 Agent 如何接受用户控制。
+建议按顺序阅读。前四章介绍 Agent 的组成，T05 将它们闭合成循环，T06～T08 解释一个工程化 Agent 如何接受用户控制，T09 则说明长期 Session 如何治理上下文与持久事实。
