@@ -80,13 +80,11 @@ status_values:
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
 | B01 | 私有测试集 v0 | `docs/work/B01-私有测试集v0/` | W03 第二轮已关闭报告级 `task_sample_counts` 内部一致性阻断；Task 1～9 Checklist 已完成；Eval 77、定向 297、架构 23、全量 1084 passed/3 skipped；真实 baseline 仍需单独授权，工作包未归档 |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | W06 及定点返工接入固定 258K Context、Session History/Projection、Tool Result ref、Instruction State resume、分阶段 persistence outcome 与 Eval diagnostics；Checklist 与 Feedback 已完成，但生产 summarizer 未接通，`/compact` 与 overflow compaction 当前只能安全失败，该缺口已明确转入 T09-1；工作包未归档 |
+| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | W06 及定点返工接入固定 258K Context、Session History/Projection、Tool Result ref、Instruction State resume、分阶段 persistence outcome 与 Eval diagnostics；Checklist 与 Feedback 已完成，但生产 summarizer 未接通，`/compact` 与 overflow compaction 当前只能安全失败，该缺口保留在 `docs/OutstandingDebtList.md` 待重新规划；工作包未归档 |
 
 ### `not_implemented`
 
-| Task | 任务包 | 当前路径 | 当前证据 |
-| --- | --- | --- | --- |
-| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已按基线 `1887361d...` 和新 D3 从零重写 Taskbook，并重新生成 9 个 Task、Checklist 与 W01～W06 Prompt；尚未显式派发任何 Worker，源码仍为固定 258K + Projection + `summarizer_unavailable` 基线 |
+当前无未实施工作包。
 
 ## 跨层最短链路
 
