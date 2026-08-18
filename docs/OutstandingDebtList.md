@@ -20,9 +20,9 @@
 | **T09 Prompt / Context Engineering** | 确定性 Working Set 只保护必要上下文并按预算保留 recent complete semantic units；不检索久远但“相关”的证据 | Memory / Evidence Retrieval 有正式需求和可靠证据模型时 |
 | **T09 Prompt / Context Engineering** | 大 Tool Result 只有单项/Session 配额与 session-scoped ref；不提供跨 Session Artifact 生命周期、清理与 GC | 出现独立 Artifact Store 生命周期需求时 |
 | **T09 Prompt / Context Engineering** | Compaction 只做有界滚动批次；不实现层级 Summary Graph、后台 Context Agent 或高级渐进式压缩 | Eval 证明简单 Compaction 无法满足真实长任务时 |
-| **T09-1 Context 预算与 Compact 协议补齐** | 探索并实现真实 Context Window / max input limit 获取、可查询 Provider metadata、官方模型 bundled metadata、OpenAI-compatible / Local 显式配置、统一 Model Limits contract，以及真实窗口与 UthCode Working Budget 的解析；正式解决 T09 固定 258K 阶段不保证真实窗口小于 258K 的模型在长上下文下预算安全的问题 | 已由 `docs/work/T09-1-Context预算与Compact协议补齐/` 的 Task 1 承接；待对应 Checklist 与 Feedback 完成后删除本条 |
+| **T09-1 Context 预算与 Compact 协议补齐** | 探索并实现真实 Context Window / max input limit 获取、可查询 Provider metadata、官方模型 bundled metadata、OpenAI-compatible / Local 显式配置、统一 Model Limits contract，以及真实窗口与 UthCode Working Budget 的解析；正式解决 T09 固定 258K 阶段不保证真实窗口小于 258K 的模型在长上下文下预算安全的问题 | 已由 `docs/work/T09-1-Context预算与Compact协议补齐/` 的 Task 1、Task 3 承接；待对应 Checklist 与 Feedback 完成后删除本条 |
 | **T09-1 Context 预算与 Compact 协议补齐** | 为现有有界 `ContextCompactor` 接通正式 tool-free summarizer use case，收口异步 Provider 请求、模型选择、取消、失败和最多一次 overflow retry；在此之前 `/compact` 与 overflow compaction 均只会返回 `summarizer_unavailable` | 已由 `docs/work/T09-1-Context预算与Compact协议补齐/` 的 Task 4、Task 6 承接；待对应 Checklist 与 Feedback 完成后删除本条 |
-| **T09-1 Context 预算与 Compact 协议补齐** | 完成 small-window / large-window adaptation，并基于 Prefix Cache、token、success Eval 调优 Operating Profile、Working Set、Compaction trigger、recent tail 与 safety headroom | 已由 `docs/work/T09-1-Context预算与Compact协议补齐/` 的 Task 1、Task 3、Task 7 承接；待对应 Checklist 与 Feedback 完成后删除本条 |
+| **T09-1 Context 预算与 Compact 协议补齐** | 完成 small-window / large-window adaptation，并基于 Prefix Cache、token、success Eval 调优 Operating Profile、Working Set、Compaction trigger、recent tail 与 safety headroom | 已由 `docs/work/T09-1-Context预算与Compact协议补齐/` 的 Task 1、Task 3、Task 6 承接；待对应 Checklist 与 Feedback 完成后删除本条 |
 
 ## 维护原则
 
