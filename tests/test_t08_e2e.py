@@ -192,7 +192,7 @@ def _config() -> EffectiveConfig:
         "local/ref",
         provider_profile_id="local",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
 
 

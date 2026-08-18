@@ -14,6 +14,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     ToolResultPart,
 )
+from uthcode.core.secrets import SecretValue
 from uthcode.core.agent import AgentLoop
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.hooks import RuntimeHookSet
@@ -75,16 +76,21 @@ _BARE_API_KEY = re.compile(
 
 
 class _SecretRedactor:
-    """Redact current secret sources without retaining their values.
+    """Redact current secret sources without exposing their values.
 
-    Environment values are read only while a summary is being sanitized.  The
-    redactor stores configured environment *names*, never their values, and
-    never returns the values through an exception, event, or diagnostic.
+    Environment names are resolved only while a summary is being sanitized;
+    user-level literal/env credentials arrive as opaque ``SecretValue``
+    objects. The redactor never returns values through an exception, event, or
+    diagnostic.
     """
 
-    __slots__ = ("_secret_env_names",)
+    __slots__ = ("_secret_env_names", "_secret_values")
 
-    def __init__(self, secret_env_names: Sequence[str]) -> None:
+    def __init__(
+        self,
+        secret_env_names: Sequence[str] = (),
+        secret_values: Sequence[SecretValue] = (),
+    ) -> None:
         names: list[str] = []
         for name in secret_env_names:
             if not isinstance(name, str):
@@ -92,6 +98,13 @@ class _SecretRedactor:
             if name and name not in names:
                 names.append(name)
         self._secret_env_names = tuple(names)
+        values: list[SecretValue] = []
+        for value in secret_values:
+            if not isinstance(value, SecretValue):
+                raise TypeError("secret_values must contain SecretValue values")
+            if value not in values:
+                values.append(value)
+        self._secret_values = tuple(values)
 
     def redact(self, value: str) -> str:
         if not isinstance(value, str):
@@ -122,6 +135,7 @@ class _SecretRedactor:
             for name in self._secret_env_names
             if os.environ.get(name)
         ]
+        configured_values.extend(secret.reveal() for secret in self._secret_values)
         for secret in sorted(set(configured_values), key=len, reverse=True):
             redacted = redacted.replace(secret, _REDACTED)
         ambient_values = {
@@ -177,6 +191,7 @@ class ApplicationToolService:
         *,
         workdir: str | PathLike[str] | Path | None = None,
         secret_env_names: Sequence[str] = (),
+        secret_values: Sequence[SecretValue] = (),
         session_provider: Callable[[], object | None] | None = None,
         tool_result_policy: ToolResultPolicy | None = None,
     ) -> None:
@@ -214,7 +229,7 @@ class ApplicationToolService:
         # AgentLoop owns mandatory control hooks; this slot contains only
         # optional Application-composed hooks.
         self._runtime_hooks = RuntimeHookSet()
-        self._redactor = _SecretRedactor(secret_env_names)
+        self._redactor = _SecretRedactor(secret_env_names, secret_values)
         self._workdir = (
             Path(workdir).expanduser().resolve(strict=False)
             if workdir is not None

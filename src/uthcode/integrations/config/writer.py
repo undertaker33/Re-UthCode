@@ -28,9 +28,9 @@ def _write_user_preference(
     atomic same-filesystem operation.
     """
 
-    if field == "model":
+    if field == "default_model":
         if not isinstance(value, str) or not value.strip():
-            raise ValueError("model_ref must be a non-empty string")
+            raise ValueError("default_model must be a non-empty string")
     elif field == "default_permission_mode":
         if value not in {"default", "auto"}:
             raise ValueError("default_permission_mode must be default or auto")
@@ -43,6 +43,8 @@ def _write_user_preference(
     except Exception:
         raise ValueError("user configuration is not valid TOML") from None
 
+    if "model" in document:
+        raise ValueError("unsupported configuration field: model")
     document[field] = value
     rendered = dumps(document)
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
@@ -63,10 +65,10 @@ def _write_user_preference(
     return target
 
 
-def write_user_model(path: str | os.PathLike[str], model_ref: str) -> Path:
-    """Atomically update only the root ``model`` value of a user file."""
+def write_user_default_model(path: str | os.PathLike[str], model_ref: str) -> Path:
+    """Atomically update only the root ``default_model`` value of a user file."""
 
-    return _write_user_preference(path, "model", model_ref)
+    return _write_user_preference(path, "default_model", model_ref)
 
 
 def write_user_default_permission_mode(
@@ -77,4 +79,4 @@ def write_user_default_permission_mode(
     return _write_user_preference(path, "default_permission_mode", mode)
 
 
-__all__ = ["write_user_default_permission_mode", "write_user_model"]
+__all__ = ["write_user_default_model", "write_user_default_permission_mode"]

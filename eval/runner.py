@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import re
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -42,6 +44,7 @@ from uthcode.application import (
     ToolCallPart,
     Usage,
 )
+from uthcode.core import SecretValue
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -190,16 +193,23 @@ def _config(
             "fake/eval",
             provider_profile_id="eval-fake",
             provider_kind=ProviderKind.FAKE,
-            remote_model_id=model_id,
+            remote_id=model_id,
         )
     if provider_kind is ProviderKind.OPENAI_COMPAT:
         raise EvalExecutionError("OpenAI-compatible live runs require an explicitly supplied endpoint")
+    if not isinstance(api_key_env, str) or re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*", api_key_env
+    ) is None:
+        raise EvalExecutionError("live Provider requires a valid API-key environment variable name")
+    secret = os.environ.get(api_key_env)
+    if not secret or not secret.strip():
+        raise EvalExecutionError("live Provider API-key environment variable is missing or empty")
     return EffectiveConfig.single_model(
         "live/eval",
         provider_profile_id="eval-live",
         provider_kind=provider_kind,
-        remote_model_id=model_id,
-        api_key_env=api_key_env,
+        remote_id=model_id,
+        api_key=SecretValue(secret),
     )
 
 

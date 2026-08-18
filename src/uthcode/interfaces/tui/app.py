@@ -441,7 +441,7 @@ class UthCodeTUI:
         for index in range(start, min(len(items), start + height)):
             model = items[index]
             ref = model.model_ref
-            label = model.label or ref
+            label = model.display_name or ref
             current = " · current" if ref == self.picker.current_model_ref else ""
             marker = "›" if index == selected else " "
             style = "class:candidate.selected" if index == selected else "class:candidate"

@@ -13,7 +13,7 @@ from uthcode.integrations.config.loader import (
 )
 from uthcode.integrations.config.writer import (
     write_user_default_permission_mode,
-    write_user_model,
+    write_user_default_model,
 )
 
 
@@ -22,9 +22,9 @@ def test_user_permission_default_loads_writes_and_rejects_unsafe_values(tmp_path
     user = home / ".uthcode" / "config.toml"
     user.parent.mkdir(parents=True)
     user.write_text(
-        '# keep\ndefault_permission_mode = "auto"\nmodel = "local/ref"\n'
+        '# keep\ndefault_permission_mode = "auto"\ndefault_model = "local/ref"\n'
         '[providers.local]\nkind = "fake"\n'
-        '[models."local/ref"]\nprovider = "local"\nmodel = "fake"\n',
+        '[models."local/ref"]\nprovider = "local"\nremote_id = "fake"\n',
         encoding="utf-8",
     )
 
@@ -42,8 +42,8 @@ def test_project_permission_default_is_rejected(tmp_path: Path) -> None:
     user = home / ".uthcode" / "config.toml"
     user.parent.mkdir(parents=True)
     user.write_text(
-        'model = "local/ref"\n[providers.local]\nkind = "fake"\n'
-        '[models."local/ref"]\nprovider = "local"\nmodel = "fake"\n',
+        'default_model = "local/ref"\n[providers.local]\nkind = "fake"\n'
+        '[models."local/ref"]\nprovider = "local"\nremote_id = "fake"\n',
         encoding="utf-8",
     )
     project = tmp_path / ".uthcode" / "config.toml"
@@ -58,15 +58,15 @@ def _write_user_config(home: Path, *, model: str = "base/ref") -> Path:
     path = home / ".uthcode" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        f'''model = "{model}"
+        f'''default_model = "{model}"
 
 [providers.local]
 kind = "fake"
 
 [models."base/ref"]
 provider = "local"
-model = "base-remote"
-label = "Base"
+remote_id = "base-remote"
+display_name = "Base"
 max_output_tokens = 128
 ''',
         encoding="utf-8",
@@ -80,12 +80,12 @@ def test_loader_returns_immutable_canonical_raw_data(tmp_path: Path) -> None:
     data = load_config_data(cwd=tmp_path, home=home)
 
     assert isinstance(data, LoadedConfigData)
-    assert data.model == "base/ref"
+    assert data.default_model == "base/ref"
     assert data.providers["local"] == {"kind": "fake"}
     assert data.models["base/ref"] == {
         "provider_profile_id": "local",
-        "remote_model_id": "base-remote",
-        "label": "Base",
+        "remote_id": "base-remote",
+        "display_name": "Base",
         "max_output_tokens": 128,
     }
     assert data.sources == (LoadedConfigSource("user", (home / ".uthcode" / "config.toml").resolve()),)
@@ -93,7 +93,7 @@ def test_loader_returns_immutable_canonical_raw_data(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         data.providers["other"] = {"kind": "fake"}  # type: ignore[index]
     with pytest.raises(TypeError):
-        data.models["base/ref"]["remote_model_id"] = "changed"  # type: ignore[index]
+        data.models["base/ref"]["remote_id"] = "changed"  # type: ignore[index]
 
 
 def test_loader_returns_raw_data_with_sources_and_cli_precedence(tmp_path: Path) -> None:
@@ -106,20 +106,20 @@ def test_loader_returns_raw_data_with_sources_and_cli_precedence(tmp_path: Path)
     project = root / ".uthcode" / "config.toml"
     project.parent.mkdir()
     project.write_text(
-        '''model = "project/ref"
+        '''default_model = "project/ref"
 [models."project/ref"]
 provider = "local"
-model = "project-remote"
+remote_id = "project-remote"
 ''',
         encoding="utf-8",
     )
 
     data = load_config_data(cwd=cwd, home=home, model="base/ref")
 
-    assert data.model == "base/ref"
+    assert data.default_model == "base/ref"
     assert data.models["project/ref"] == {
         "provider_profile_id": "local",
-        "remote_model_id": "project-remote",
+        "remote_id": "project-remote",
     }
     assert data.sources == (
         LoadedConfigSource("user", user.resolve()),
@@ -142,7 +142,7 @@ def test_loader_preserves_initialization_and_field_evidence(tmp_path: Path) -> N
     with pytest.raises(ConfigurationError) as missing_model:
         load_config_data(cwd=tmp_path, home=home)
     assert missing_model.value.path == user.resolve()
-    assert missing_model.value.field == "model"
+    assert missing_model.value.field == "default_model"
 
 
 def test_discover_config_paths_deduplicates_physical_files(tmp_path: Path) -> None:
@@ -154,7 +154,7 @@ def test_discover_config_paths_deduplicates_physical_files(tmp_path: Path) -> No
     (root / ".git").mkdir()
     root_config = root / ".uthcode" / "config.toml"
     root_config.parent.mkdir()
-    root_config.write_text('[models."base/ref"]\nlabel = "same"\n', encoding="utf-8")
+    root_config.write_text('[models."base/ref"]\ndisplay_name = "same"\n', encoding="utf-8")
     duplicate = cwd / ".uthcode" / "config.toml"
     duplicate.parent.mkdir()
     try:
@@ -174,7 +174,7 @@ def test_user_model_writeback_preserves_comments_and_project_file(
 ) -> None:
     user = tmp_path / "config.toml"
     original = '''# keep this comment
-model = "old/ref"
+default_model = "old/ref"
 
 [providers.local]
 kind = "fake"
@@ -182,23 +182,23 @@ kind = "fake"
 # keep model comment
 [models."old/ref"]
 provider = "local"
-model = "old-remote"
-label = "Old"
+remote_id = "old-remote"
+display_name = "Old"
 '''
     user.write_text(original, encoding="utf-8")
     project = tmp_path / "project.toml"
-    project_text = 'model = "old/ref"\n'
+    project_text = 'default_model = "old/ref"\n'
     project.write_text(project_text, encoding="utf-8")
 
-    write_user_model(user, "new/ref")
+    write_user_default_model(user, "new/ref")
     updated = user.read_text(encoding="utf-8")
 
-    assert 'model = "new/ref"' in updated
+    assert 'default_model = "new/ref"' in updated
     assert "# keep this comment" in updated
     assert "# keep model comment" in updated
     assert updated.index("[providers.local]") < updated.index('[models."old/ref"]')
     assert 'kind = "fake"' in updated
-    assert 'model = "old-remote"' in updated
+    assert 'remote_id = "old-remote"' in updated
     assert project.read_text(encoding="utf-8") == project_text
 
 
@@ -207,7 +207,7 @@ def test_user_model_writeback_keeps_bytes_when_replace_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = tmp_path / "config.toml"
-    original = 'model = "old/ref"\n\n[providers.local]\nkind = "fake"\n'
+    original = 'default_model = "old/ref"\n\n[providers.local]\nkind = "fake"\n'
     user.write_text(original, encoding="utf-8")
 
     import uthcode.integrations.config.writer as writer
@@ -217,7 +217,7 @@ def test_user_model_writeback_keeps_bytes_when_replace_fails(
 
     monkeypatch.setattr(writer.os, "replace", fail_replace)
     with pytest.raises(OSError, match="simulated atomic replace failure"):
-        writer.write_user_model(user, "new/ref")
+        writer.write_user_default_model(user, "new/ref")
 
     assert user.read_text(encoding="utf-8") == original
     assert not list(tmp_path.glob(".*.tmp"))

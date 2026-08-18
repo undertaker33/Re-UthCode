@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-17
+snapshot_date: 2026-08-18
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-17
+status_snapshot: 2026-08-18
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -102,6 +102,8 @@ interfaces/cli.py 或 interfaces/tui/app.py
   -> application/runs.py:_TurnDriver
   -> AgentEvent 流 / TurnResult
 ```
+
+配置 contract 当前事实：用户级 `config.toml` 使用 `default_model`、Provider `api_key`（literal 或 `env:VARIABLE_NAME`）、Model `remote_id`/`display_name`/可选 `reasoning_effort`；项目配置不得定义 Provider、端点或凭据等价字段。逻辑 Model Profile ID 仅用于界面和状态，AgentRun 与 direct generation 都把快照的 `remote_id` 写入 `GenerationRequest.model`；`/model` 原子写回只修改用户级 `default_model`。
 
 ## 全局禁止推断
 

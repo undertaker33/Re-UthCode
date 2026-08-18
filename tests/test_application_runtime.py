@@ -138,7 +138,7 @@ async def test_stream_generation_is_a_convenience_over_generation_handle() -> No
 
 def _runtime_config(tmp_path: Path) -> EffectiveConfig:
     return EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={
             "local": ProviderProfile("local", ProviderKind.FAKE),
         },
@@ -155,9 +155,9 @@ def _builder(provider: ProviderProfile, model: ModelProfile) -> FakeProvider:
         identity=ProviderIdentity(
             provider.provider_profile_id,
             "script",
-            model.remote_model_id,
+            model.remote_id,
         ),
-        events=(_completed(model.remote_model_id),),
+        events=(_completed(model.remote_id),),
     )
 
 
@@ -184,7 +184,7 @@ def test_candidate_provider_failure_does_not_change_runtime_or_file(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.toml"
-    original = 'model = "one/ref"\n'
+    original = 'default_model = "one/ref"\n'
     config_path.write_text(original, encoding="utf-8")
     config = _runtime_config(tmp_path)
     calls: list[str] = []
@@ -238,7 +238,7 @@ def test_user_model_write_failure_does_not_replace_candidate_or_current_model(
 
 def test_successful_model_switch_updates_provider_and_only_user_selection() -> None:
     config = EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={"local": ProviderProfile("local", ProviderKind.FAKE)},
         models={
             "one/ref": ModelProfile("one/ref", "local", "remote-one"),
@@ -255,12 +255,12 @@ def test_successful_model_switch_updates_provider_and_only_user_selection() -> N
 
     chosen = application.select_model("two/ref")
 
-    assert chosen.remote_model_id == "remote-two"
+    assert chosen.remote_id == "remote-two"
     assert writes == ["two/ref"]
     assert application.provider is not old_provider
     assert application.provider.identity.model == "remote-two"
     assert application.current_model_ref == "two/ref"
-    assert config.model == "one/ref"
+    assert config.default_model == "one/ref"
 
 
 @pytest.mark.asyncio
@@ -268,7 +268,7 @@ async def test_model_switch_refreshes_prompt_model_protocol_and_remote_identity(
     tmp_path: Path,
 ) -> None:
     config = EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={
             "first": ProviderProfile("first", ProviderKind.FAKE),
             "second": ProviderProfile("second", ProviderKind.FAKE),
@@ -291,9 +291,9 @@ async def test_model_switch_refreshes_prompt_model_protocol_and_remote_identity(
             identity=ProviderIdentity(
                 provider.provider_profile_id,
                 f"protocol-{model.model_ref}",
-                model.remote_model_id,
+                model.remote_id,
             ),
-            events=(_completed(model.remote_model_id),),
+            events=(_completed(model.remote_id),),
         )
         providers[model.model_ref] = instance
         return instance
@@ -333,7 +333,7 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
     tmp_path: Path,
 ) -> None:
     config = EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={
             "first": ProviderProfile("first", ProviderKind.FAKE),
             "second": ProviderProfile("second", ProviderKind.FAKE),
@@ -356,9 +356,9 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
             identity=ProviderIdentity(
                 provider.provider_profile_id,
                 f"protocol-{model.model_ref}",
-                model.remote_model_id,
+                model.remote_id,
             ),
-            events=(_completed(model.remote_model_id),),
+            events=(_completed(model.remote_id),),
         )
         providers[model.model_ref] = instance
         return instance
@@ -412,9 +412,9 @@ async def test_failed_model_switch_keeps_old_prompt_identity(
             identity=ProviderIdentity(
                 provider.provider_profile_id,
                 f"protocol-{model.model_ref}",
-                model.remote_model_id,
+                model.remote_id,
             ),
-            events=(_completed(model.remote_model_id),),
+            events=(_completed(model.remote_id),),
         )
 
     def writer(_model_ref: str) -> None:
@@ -450,7 +450,7 @@ def test_create_application_injection_receives_application_profiles() -> None:
         "profile/ref",
         provider_profile_id="profile",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="remote-id",
+        remote_id="remote-id",
         max_output_tokens=321,
     )
     seen: list[tuple[ProviderProfile, ModelProfile]] = []
@@ -469,7 +469,7 @@ def test_create_application_injection_receives_application_profiles() -> None:
     provider, model = seen[0]
     assert provider.provider_profile_id == "profile"
     assert model.model_ref == "profile/ref"
-    assert model.remote_model_id == "remote-id"
+    assert model.remote_id == "remote-id"
     assert model.max_output_tokens == 321
 
 
@@ -482,7 +482,7 @@ def test_bootstrap_passes_max_output_tokens_to_integration_provider_config(
         "profile/ref",
         provider_profile_id="profile",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="remote-id",
+        remote_id="remote-id",
         max_output_tokens=321,
     )
     seen: list[object] = []

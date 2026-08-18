@@ -165,7 +165,7 @@ def _build_application(
     config = EffectiveConfig.single_model(
         "fake/ref",
         provider_profile_id="fake",
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
     return create_application(
         config,

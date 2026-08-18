@@ -46,7 +46,7 @@ def _configuration() -> EffectiveConfig:
         "test/ref",
         provider_profile_id="test",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="test-model",
+        remote_id="test-model",
     )
 
 

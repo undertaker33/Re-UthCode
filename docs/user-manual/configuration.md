@@ -1,6 +1,6 @@
 # 配置说明
 
-UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`permissions.toml` 管理工具权限规则。API Key 真实值只能放在环境变量中。
+UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`permissions.toml` 管理工具权限规则。Provider 只允许在用户级配置中定义；项目配置只能选择用户级 Provider 和模型参数。API Key 可直接写入用户级 `api_key`（literal），或使用 `env:VARIABLE_NAME` 读取当前进程环境变量；项目配置禁止凭据和端点。
 
 ## `config.toml`
 
@@ -9,26 +9,29 @@ UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`
 真实模型示例：
 
 ```toml
-model = "my-provider/chat"
+default_model = "my-provider/chat"
 default_permission_mode = "default"
 
 [providers.my-provider]
 kind = "openai_compat"
 base_url = "https://your-provider.example/v1"
-api_key_env = "MY_PROVIDER_API_KEY"
+api_key = "env:MY_PROVIDER_API_KEY"
 
 [models."my-provider/chat"]
 provider = "my-provider"
-model = "your-model-id"
-label = "My Chat Model"
+remote_id = "your-model-id"
+display_name = "My Chat Model"
 max_output_tokens = 4096
+reasoning_effort = "medium"
 ```
 
-在启动 UthCode 的终端中设置密钥：
+使用 env 写法时，在启动 UthCode 的终端中设置密钥：
 
 ```powershell
 $env:MY_PROVIDER_API_KEY = "your-api-key"
 ```
+
+也可以在用户配置中写入 `api_key = "literal-secret"`。两种形式都会在内部保存为不可序列化的脱敏凭据；真实值不会进入 Prompt、History、Event、diagnostics 或 Eval artifact。`env:` 后必须是明确的环境变量名，变量缺失或为空会受控失败；UthCode 不会猜测变量名。
 
 支持的 `kind`：
 
@@ -40,6 +43,8 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 | `fake` | 离线体验和测试 |
 
 用户配置中的 `default_permission_mode` 只能是 `default` 或 `auto`；`full_access` 只能在当前运行中选择。项目配置可以选择用户已信任的 Provider、模型和非敏感模型参数，但不能定义 Provider、修改端点或密钥来源，也不能设置默认权限模式。
+
+模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
 
 ## `permissions.toml`
 

@@ -21,7 +21,7 @@ from uthcode.application import (
 
 def _mapping() -> dict[str, object]:
     return {
-        "model": "profile/ref",
+        "default_model": "profile/ref",
         "providers": {
             "profile": {
                 "kind": "fake",
@@ -30,8 +30,8 @@ def _mapping() -> dict[str, object]:
         "models": {
             "profile/ref": {
                 "provider_profile_id": "profile",
-                "remote_model_id": "remote-id",
-                "label": "Readable label",
+                "remote_id": "remote-id",
+                "display_name": "Readable label",
                 "max_output_tokens": 128,
             }
         },
@@ -47,7 +47,7 @@ def test_model_profile_keeps_provider_ref_model_ref_and_remote_id_distinct() -> 
     assert provider.provider_profile_id == "profile"
     assert model.model_ref == "profile/ref"
     assert model.provider_profile_id == "profile"
-    assert model.remote_model_id == "remote-id"
+    assert model.remote_id == "remote-id"
     assert config.current_model is model
 
 
@@ -67,7 +67,7 @@ def test_model_profile_keeps_provider_ref_model_ref_and_remote_id_distinct() -> 
                 "models": {
                     "profile/ref": {
                         "provider_profile_id": "missing",
-                        "remote_model_id": "remote-id",
+                        "remote_id": "remote-id",
                     }
                 },
             },
@@ -84,7 +84,7 @@ def test_model_references_and_provider_kind_are_validated(
 
     with pytest.raises((ConfigurationModelError, ValueError), match="unknown selected model"):
         EffectiveConfig(
-            model="missing/ref",
+            default_model="missing/ref",
             providers={"profile": ProviderProfile("profile", ProviderKind.FAKE)},
             models={
                 "profile/ref": ModelProfile(
@@ -105,11 +105,11 @@ def test_effective_config_is_deeply_immutable_and_copies_input_mapping() -> None
     sources = [ConfigSource("user", Path("C:/user/config.toml"))]
     config = EffectiveConfig.from_mapping(raw, sources=sources)
 
-    raw["model"] = "changed"
+    raw["default_model"] = "changed"
     raw["providers"] = {}
     sources.append(ConfigSource("project", Path("C:/project/config.toml")))
 
-    assert config.model == "profile/ref"
+    assert config.default_model == "profile/ref"
     assert tuple(config.providers) == ("profile",)
     assert len(config.sources) == 1
     with pytest.raises(TypeError):
@@ -117,7 +117,7 @@ def test_effective_config_is_deeply_immutable_and_copies_input_mapping() -> None
     with pytest.raises(TypeError):
         config.models["profile/ref"] = config.current_model  # type: ignore[index]
     with pytest.raises(AttributeError):
-        config.model = "changed"  # type: ignore[misc]
+        config.default_model = "changed"  # type: ignore[misc]
 
 
 def test_single_model_headless_constructor_is_application_owned() -> None:
@@ -125,13 +125,13 @@ def test_single_model_headless_constructor_is_application_owned() -> None:
         "local/ref",
         provider_profile_id="local",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="remote-local",
-        label="Local model",
+        remote_id="remote-local",
+        display_name="Local model",
         source=ConfigSource("embedded"),
     )
 
-    assert config.model == "local/ref"
-    assert config.current_model.remote_model_id == "remote-local"
+    assert config.default_model == "local/ref"
+    assert config.current_model.remote_id == "remote-local"
     assert config.providers["local"].kind is ProviderKind.FAKE
     assert config.sources == (ConfigSource("embedded"),)
 
@@ -171,7 +171,7 @@ def test_application_configuration_has_no_synonym_properties() -> None:
                 "models": {
                     "profile/ref": {
                         "provider_profile_id": "default",
-                        "remote_model_id": "remote-id",
+                        "remote_id": "remote-id",
                     }
                 },
             }
@@ -204,7 +204,7 @@ def test_effective_config_rejects_removed_temperature_field() -> None:
     mapping["models"] = {
         "profile/ref": {
             "provider_profile_id": "profile",
-            "remote_model_id": "remote-id",
+            "remote_id": "remote-id",
             "temperature": 0.2,
         }
     }
@@ -217,15 +217,15 @@ def _write_user_config(home: Path, *, model: str = "base/ref") -> Path:
     path = home / ".uthcode" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        f'''model = "{model}"
+        f'''default_model = "{model}"
 
 [providers.local]
 kind = "fake"
 
 [models."base/ref"]
 provider = "local"
-model = "base-remote"
-label = "Base"
+remote_id = "base-remote"
+display_name = "Base"
 max_output_tokens = 128
 ''',
         encoding="utf-8",
@@ -313,16 +313,27 @@ def test_missing_user_config_creates_safe_template_and_stops(tmp_path: Path) -> 
     assert raised.value.template_path == template.resolve()
     assert template.is_file()
     content = template.read_text(encoding="utf-8")
-    assert "# model =" in content
-    assert '# kind = "openai_compat"' in content
-    assert '# base_url = "https://api.deepseek.com"' in content
-    assert '# api_key_env = "DEEPSEEK_API_KEY"' in content
-    assert "openai_responses" in content
-    assert "anthropic" in content
-    assert "fake kind is only for explicit offline testing" in content
-    assert '$env:DEEPSEEK_API_KEY = "your-api-key"' in content
-    assert "sk-" not in content
-    assert "not the key itself" in content
+    assert 'default_model = ""' in content
+    assert 'default_permission_mode = "default"' in content
+    assert "[providers.slot-1]" in content
+    assert '[models."slot-1"]' in content
+    assert 'api_key = ""' in content
+    assert "env:" in content
+    assert content.count('# reasoning_effort = ""') == 3
+    assert '# reasoning_effort = "medium"' not in content
+    for forbidden in (
+        "fake",
+        "anthropic",
+        "openai_responses",
+        "openai_compat",
+        "literal-secret",
+        "VARIABLE_NAME",
+        "your-key",
+        "https://",
+        "sk-",
+    ):
+        assert forbidden not in content
+    assert "delete" in content.lower()
 
 
 def test_comment_only_user_template_reports_initialization_guidance(
@@ -338,7 +349,7 @@ def test_comment_only_user_template_reports_initialization_guidance(
 
     assert raised.value.template_path == (home / ".uthcode" / "config.toml").resolve()
     assert "configuration is not initialized" in str(raised.value)
-    assert "edit and uncomment" in str(raised.value)
+    assert "fill one complete" in str(raised.value)
 
 
 def test_partially_enabled_user_config_without_model_keeps_field_error(
@@ -353,8 +364,8 @@ def test_partially_enabled_user_config_without_model_keeps_field_error(
         load_effective_config(cwd=tmp_path, home=home)
 
     assert not isinstance(raised.value, ConfigurationInitializationRequired)
-    assert raised.value.field == "model"
-    assert "configuration requires a selected model" in str(raised.value)
+    assert raised.value.field == "default_model"
+    assert "configuration requires a default_model" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -400,8 +411,8 @@ def test_git_root_to_cwd_project_layers_merge_nearest_first(tmp_path: Path) -> N
     root_config.write_text(
         '''[models."root/ref"]
 provider = "local"
-model = "root-remote"
-label = "root"
+remote_id = "root-remote"
+display_name = "root"
 ''',
         encoding="utf-8",
     )
@@ -409,24 +420,24 @@ label = "root"
     one_config.parent.mkdir()
     one_config.write_text(
         '''[models."root/ref"]
-label = "one"
+display_name = "one"
 ''',
         encoding="utf-8",
     )
     two_config = nested / ".uthcode" / "config.toml"
     two_config.parent.mkdir()
     two_config.write_text(
-        '''model = "root/ref"
+        '''default_model = "root/ref"
 [models."root/ref"]
-label = "two"
+display_name = "two"
 ''',
         encoding="utf-8",
     )
 
     config = load_effective_config(cwd=nested, home=home)
 
-    assert config.model == "root/ref"
-    assert config.models["root/ref"].label == "two"
+    assert config.default_model == "root/ref"
+    assert config.models["root/ref"].display_name == "two"
     assert [source.path for source in config.sources] == [
         home.joinpath(".uthcode", "config.toml").resolve(),
         root_config.resolve(),
@@ -445,13 +456,13 @@ def test_git_worktree_dot_git_file_is_detected(tmp_path: Path) -> None:
     config_path = root / ".uthcode" / "config.toml"
     config_path.parent.mkdir()
     config_path.write_text(
-        '[models."base/ref"]\nlabel = "worktree"\n',
+        '[models."base/ref"]\ndisplay_name = "worktree"\n',
         encoding="utf-8",
     )
 
     config = load_effective_config(cwd=cwd, home=home)
 
-    assert config.models["base/ref"].label == "worktree"
+    assert config.models["base/ref"].display_name == "worktree"
     assert config.sources[-1].path == config_path.resolve()
 
 
@@ -463,19 +474,19 @@ def test_non_git_directory_only_reads_cwd_project_config(tmp_path: Path) -> None
     cwd.mkdir(parents=True)
     (parent / ".uthcode").mkdir()
     (parent / ".uthcode" / "config.toml").write_text(
-        'model = "missing/ref"\n',
+        'default_model = "missing/ref"\n',
         encoding="utf-8",
     )
     cwd_config = cwd / ".uthcode" / "config.toml"
     cwd_config.parent.mkdir()
     cwd_config.write_text(
-        'model = "base/ref"\n',
+        'default_model = "base/ref"\n',
         encoding="utf-8",
     )
 
     config = load_effective_config(cwd=cwd, home=home)
 
-    assert config.model == "base/ref"
+    assert config.default_model == "base/ref"
     assert [source.path for source in config.sources] == [
         (home / ".uthcode" / "config.toml").resolve(),
         cwd_config.resolve(),
@@ -492,7 +503,7 @@ def test_physical_duplicate_project_config_is_loaded_once(tmp_path: Path) -> Non
     root_config = root / ".uthcode" / "config.toml"
     root_config.parent.mkdir()
     root_config.write_text(
-        '[models."base/ref"]\nlabel = "same-file"\n',
+        '[models."base/ref"]\ndisplay_name = "same-file"\n',
         encoding="utf-8",
     )
     duplicate = cwd / ".uthcode" / "config.toml"
@@ -561,17 +572,17 @@ def test_project_model_can_reference_user_provider_and_cli_model_has_priority(
     project = cwd / ".uthcode" / "config.toml"
     project.parent.mkdir()
     project.write_text(
-        '''model = "project/ref"
+        '''default_model = "project/ref"
 [models."project/ref"]
 provider = "local"
-model = "project-remote"
+remote_id = "project-remote"
 ''',
         encoding="utf-8",
     )
 
     config = load_effective_config(cwd=cwd, home=home, model="base/ref")
 
-    assert config.model == "base/ref"
+    assert config.default_model == "base/ref"
     assert config.models["project/ref"].provider_profile_id == "local"
     assert config.sources[-1].kind == "cli"
 
@@ -584,10 +595,10 @@ def test_invalid_project_model_provider_reference_reports_project_path(tmp_path:
     project = cwd / ".uthcode" / "config.toml"
     project.parent.mkdir()
     project.write_text(
-        '''model = "project/ref"
+        '''default_model = "project/ref"
 [models."project/ref"]
 provider = "missing"
-model = "remote"
+remote_id = "remote"
 ''',
         encoding="utf-8",
     )
@@ -609,5 +620,5 @@ def test_loader_does_not_read_environment_secrets_or_make_provider_requests(
 
     config = load_effective_config(cwd=tmp_path, home=home)
 
-    assert config.providers["local"].api_key_env is None
+    assert config.providers["local"].api_key is None
     assert "sk-configuration-test-secret" not in repr(config)

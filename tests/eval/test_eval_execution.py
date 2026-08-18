@@ -46,6 +46,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     Usage,
 )
+from uthcode.core.secrets import SecretValue
 from uthcode.core.tool import ToolExecutionResult, ToolPreparation
 from uthcode.integrations.providers.fake import FakeProvider
 
@@ -223,7 +224,7 @@ def _config() -> EffectiveConfig:
         "fake/eval",
         provider_profile_id="eval-fake",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="eval-model",
+        remote_id="eval-model",
     )
 
 
@@ -653,8 +654,8 @@ async def test_non_fake_provider_is_rejected_before_factory_without_live_authori
         "remote/eval",
         provider_profile_id="remote",
         provider_kind=ProviderKind.ANTHROPIC,
-        remote_model_id="remote-model",
-        api_key_env="EVAL_TEST_API_KEY",
+        remote_id="remote-model",
+        api_key=SecretValue("synthetic-eval-key"),
     )
     factory_calls: list[object] = []
 

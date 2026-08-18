@@ -57,14 +57,14 @@ interfaces -> application -> core
 - `Bash` 是当前 OS 用户权限下的 unsandboxed process execution，不得描述为 Sandbox。
 - Permission 固定支持 `default`、`auto`、`full_access`。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但仍受用户/项目显式 Guard ASK/DENY 和灾难性 circuit breaker 约束；工具注册、参数校验、OS 权限和第三方权限始终有效，项目配置不得静默启用 `full_access`。
 - Permission Approval 是应用层授权，不是 OS Sandbox。Session Grant 只属于当前 `AgentRun`，不得自动持久化。
-- API key 真实值只从环境变量读取，不得写入配置、事件、日志、Journal 或 Snapshot。Permission 动作规则与普通 `config.toml` 分离。
+- API key 只允许出现在用户级 `config.toml` 的 Provider `api_key` 字段，形式为 literal 或 `env:VARIABLE_NAME`；项目配置禁止 Provider、端点和一切凭据等价字段。解析后的值必须进入不可序列化、`repr` 脱敏的内部 `SecretValue`，只在 Provider SDK 构造边界显式取值，不得进入 Prompt、History、Event、日志、Journal、Snapshot、diagnostics 或 Eval artifact。Permission 动作规则与普通 `config.toml` 分离。
 
 ## 配置安全
 
 - 普通配置按“默认值 -> 用户配置 -> 项目配置”合并。Git 仓库内从仓库根到当前目录发现项目配置；非 Git 目录只读取当前目录；候选路径在加载前规范化、解析物理路径并去重。
 - 项目配置只能覆盖允许字段或收紧权限，不得修改秘密来源、重定向 Provider/端点/Key，或将权限提升为 `full_access`。
 - 项目配置只能引用用户配置中的可信 Provider，并调整非秘密 Model 数据；检测到凭据或等价重定向字段时必须硬失败。
-- 用户默认模型写回只原子修改用户配置顶层 `model`，不得写入项目配置或改变 Provider/Model 表。
+- 用户默认模型写回只原子修改用户配置顶层 `default_model`，不得写入项目配置或改变 Provider/Model 表。
 
 ## 增量开发原则
 

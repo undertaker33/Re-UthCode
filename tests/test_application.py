@@ -124,7 +124,7 @@ async def test_formal_bootstrap_builds_a_fake_headless_application() -> None:
             "bootstrap/ref",
             provider_profile_id="bootstrap",
             provider_kind=ProviderKind.FAKE,
-            remote_model_id="bootstrap-fake",
+            remote_id="bootstrap-fake",
         )
     )
 

@@ -27,6 +27,7 @@ from uthcode.core.provider import (
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
+    ReasoningOptions,
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
@@ -66,6 +67,12 @@ ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
 PermissionWriter = Callable[[PermissionMode], object]
 PermissionRulesLoader = Callable[[], RuleSet]
+
+
+def _reasoning_options(effort: str | None) -> ReasoningOptions | None:
+    if effort is None:
+        return None
+    return ReasoningOptions(enabled=effort != "none", effort=effort)
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +278,9 @@ class UthCodeApplication:
             # so this diagnostic prefix is never persisted or adopted there.
             self._instruction_loader.load_session(strict=False)
         self._current_model_ref = (
-            configuration.model if configuration is not None else provider.identity.model
+            configuration.default_model
+            if configuration is not None
+            else provider.identity.model
         )
 
     @property
@@ -920,6 +929,16 @@ class UthCodeApplication:
 
         provider = self._provider
         model_ref = self._current_model_ref
+        model_profile = self.current_model
+        remote_model_id = (
+            model_profile.remote_id if model_profile is not None else provider.identity.model
+        )
+        reasoning = _reasoning_options(
+            model_profile.reasoning_effort if model_profile is not None else None
+        )
+        max_output_tokens = (
+            model_profile.max_output_tokens if model_profile is not None else None
+        )
         ordinary_tool_definitions = self._tool_service.definitions()
         tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
         tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
@@ -975,7 +994,9 @@ class UthCodeApplication:
                 projection=active_projection(),
                 tool_definitions=visible_definitions,
                 environment_sources=self._environment_sources(model_ref, provider.identity),
-                model=model_ref,
+                model=remote_model_id,
+                reasoning=reasoning,
+                max_output_tokens=max_output_tokens,
             )
             return request
 
@@ -1019,6 +1040,28 @@ class UthCodeApplication:
         selected_model_ref = (
             self._current_model_ref if model_ref is None else model_ref
         )
+        selected_profile = (
+            self._configuration.models.get(selected_model_ref)
+            if self._configuration is not None
+            else None
+        )
+        remote_model_id = (
+            selected_profile.remote_id
+            if selected_profile is not None
+            else identity.model
+        )
+        reasoning = (
+            _reasoning_options(selected_profile.reasoning_effort)
+            if selected_profile is not None and selected_profile.reasoning_effort is not None
+            else request.reasoning
+        )
+        max_output_tokens = (
+            request.max_output_tokens
+            if request.max_output_tokens is not None
+            else selected_profile.max_output_tokens
+            if selected_profile is not None
+            else None
+        )
         compiled_request, _snapshot = self._context_service.compose_generation_request(
             request.messages,
             run_id="generation",
@@ -1026,9 +1069,12 @@ class UthCodeApplication:
             runtime_context=runtime_context,
             tool_definitions=request.tools,
             environment_sources=self._environment_sources(selected_model_ref, identity),
-            model=selected_model_ref,
+            model=remote_model_id,
+            reasoning=reasoning,
+            max_output_tokens=max_output_tokens,
+            temperature=request.temperature,
         )
-        return replace(compiled_request, model=selected_model_ref)
+        return compiled_request
 
     def _environment_sources(
         self,

@@ -62,7 +62,7 @@ def _config(model: str = "fake/ref") -> EffectiveConfig:
         model,
         provider_profile_id="fake",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
 
 
@@ -449,7 +449,7 @@ def test_exec_cwd_and_model_are_process_overrides_only(tmp_path: Path) -> None:
     project.mkdir()
     user_config = home / ".uthcode" / "config.toml"
     user_config.parent.mkdir(parents=True)
-    original = '''model = "fake/ref"\n\n[providers.fake]\nkind = "fake"\n\n[models."fake/ref"]\nprovider = "fake"\nmodel = "fake-model"\n'''
+    original = '''default_model = "fake/ref"\n\n[providers.fake]\nkind = "fake"\n\n[models."fake/ref"]\nprovider = "fake"\nremote_id = "fake-model"\n'''
     user_config.write_text(original, encoding="utf-8")
 
     captured: list[LaunchOptions] = []
@@ -594,7 +594,7 @@ def _write_fake_user_config(home: Path) -> Path:
     path = home / ".uthcode" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        '''model = "local/echo"\n\n[providers.local]\nkind = "fake"\n\n[models."local/echo"]\nprovider = "local"\nmodel = "echo"\n''',
+        '''default_model = "local/echo"\n\n[providers.local]\nkind = "fake"\n\n[models."local/echo"]\nprovider = "local"\nremote_id = "echo"\n''',
         encoding="utf-8",
     )
     return path
@@ -649,7 +649,7 @@ def test_formal_module_exec_first_run_creates_template_and_stops(tmp_path: Path)
     assert second_run.returncode == 2
     assert second_run.stdout == ""
     assert "configuration is not initialized" in second_run.stderr
-    assert "edit and uncomment" in second_run.stderr
+    assert "fill one complete" in second_run.stderr
 
 
 def test_formal_entries_reject_project_provider_data(tmp_path: Path) -> None:

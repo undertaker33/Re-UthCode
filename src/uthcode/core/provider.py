@@ -841,7 +841,7 @@ class MissingSecretError(ProviderConfigurationError):
     def __init__(self, environment_variable: str) -> None:
         _require_text(environment_variable, "environment_variable")
         self.environment_variable = environment_variable
-        super().__init__(f"Missing secret environment variable: {environment_variable}")
+        super().__init__(f"Provider credential is missing: {environment_variable}")
 
 
 class AuthenticationError(ProviderError):

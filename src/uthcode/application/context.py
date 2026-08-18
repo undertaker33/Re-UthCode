@@ -32,7 +32,12 @@ from uthcode.core.prompt import (
     ToolDefinitionSource,
     build_runtime_prompt_section,
 )
-from uthcode.core.provider import GenerationRequest, Message, ToolDefinition
+from uthcode.core.provider import (
+    GenerationRequest,
+    Message,
+    ReasoningOptions,
+    ToolDefinition,
+)
 from uthcode.core.provider import CancellationToken
 
 from .instructions import InstructionLoader
@@ -295,6 +300,9 @@ class ApplicationContextService:
         tool_definitions: Sequence[ToolDefinition] = (),
         environment_sources: Sequence[object] = (),
         model: str | None = None,
+        reasoning: ReasoningOptions | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
         previous_snapshot: ContextSnapshot | None = None,
     ) -> tuple[GenerationRequest, ContextSnapshot]:
         """Compile every runtime request through one fixed-budget Context path."""
@@ -366,6 +374,9 @@ class ApplicationContextService:
             system_prompt=prompt,
             model=model,
             tools=snapshot.tool_definitions,
+            reasoning=reasoning,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
             metadata=metadata,
         )
         return request, snapshot

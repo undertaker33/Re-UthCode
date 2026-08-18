@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any
 
 from uthcode.core.permission import PermissionMode
+from uthcode.core.secrets import SecretValue
 
 
 class ConfigurationModelError(ValueError):
@@ -83,9 +84,18 @@ class ProviderKind(str, Enum):
             ) from exc
 
 
-_PROVIDER_MAPPING_FIELDS = frozenset({"kind", "base_url", "api_key_env"})
+_PROVIDER_MAPPING_FIELDS = frozenset({"kind", "base_url", "api_key"})
 _MODEL_MAPPING_FIELDS = frozenset(
-    {"provider_profile_id", "remote_model_id", "label", "max_output_tokens"}
+    {
+        "provider_profile_id",
+        "remote_id",
+        "display_name",
+        "max_output_tokens",
+        "reasoning_effort",
+    }
+)
+_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 
 
@@ -121,12 +131,12 @@ class ConfigSource:
 
 @dataclass(frozen=True, slots=True)
 class ProviderProfile:
-    """A trusted Provider identity and its non-secret construction inputs."""
+    """A trusted Provider identity and opaque construction inputs."""
 
     provider_profile_id: str
     kind: ProviderKind | str
     base_url: str | None = None
-    api_key_env: str | None = None
+    api_key: SecretValue | str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.provider_profile_id, "provider_profile_id")
@@ -134,11 +144,13 @@ class ProviderProfile:
         object.__setattr__(self, "kind", kind)
         if self.base_url is not None:
             _require_text(self.base_url, "base_url")
-        if self.api_key_env is not None:
-            _require_text(self.api_key_env, "api_key_env")
-        if kind is not ProviderKind.FAKE and self.api_key_env is None:
+        if isinstance(self.api_key, str) and not self.api_key.strip():
+            object.__setattr__(self, "api_key", None)
+        elif self.api_key is not None and not isinstance(self.api_key, SecretValue):
+            object.__setattr__(self, "api_key", SecretValue(self.api_key))
+        if kind is not ProviderKind.FAKE and self.api_key is None:
             raise ConfigurationModelError(
-                "non-fake Provider profiles require api_key_env"
+                "non-fake Provider profiles require a non-empty api_key"
             )
         if kind is ProviderKind.OPENAI_COMPAT and self.base_url is None:
             raise ConfigurationModelError(
@@ -152,16 +164,17 @@ class ModelProfile:
 
     model_ref: str
     provider_profile_id: str
-    remote_model_id: str
-    label: str | None = None
+    remote_id: str
+    display_name: str | None = None
     max_output_tokens: int | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.model_ref, "model_ref")
         _require_text(self.provider_profile_id, "provider_profile_id")
-        _require_text(self.remote_model_id, "remote_model_id")
-        if self.label is not None:
-            _require_text(self.label, "label")
+        _require_text(self.remote_id, "remote_id")
+        if self.display_name is not None:
+            _require_text(self.display_name, "display_name")
         if self.max_output_tokens is not None and (
             isinstance(self.max_output_tokens, bool)
             or not isinstance(self.max_output_tokens, int)
@@ -170,8 +183,16 @@ class ModelProfile:
             raise ConfigurationModelError(
                 "max_output_tokens must be a positive integer or None"
             )
-        if self.label is None:
-            object.__setattr__(self, "label", self.remote_model_id)
+        if self.reasoning_effort is not None:
+            if (
+                not isinstance(self.reasoning_effort, str)
+                or self.reasoning_effort not in _REASONING_EFFORTS
+            ):
+                raise ConfigurationModelError(
+                    "reasoning_effort must be one of: none, minimal, low, medium, high, xhigh, max"
+                )
+        if self.display_name is None:
+            object.__setattr__(self, "display_name", self.remote_id)
 
 
 def _coerce_source(value: ConfigSource | str | Path) -> ConfigSource:
@@ -186,14 +207,14 @@ def _coerce_source(value: ConfigSource | str | Path) -> ConfigSource:
 class EffectiveConfig:
     """Validated, deeply immutable configuration consumed by Application."""
 
-    model: str
+    default_model: str
     providers: Mapping[str, ProviderProfile]
     models: Mapping[str, ModelProfile]
     sources: tuple[ConfigSource, ...] = ()
     default_permission_mode: PermissionMode = PermissionMode.DEFAULT
 
     def __post_init__(self) -> None:
-        _require_text(self.model, "model")
+        _require_text(self.default_model, "default_model")
         mode = self.default_permission_mode
         if not isinstance(mode, PermissionMode):
             try:
@@ -229,7 +250,7 @@ class EffectiveConfig:
                     provider_profile_id=provider_profile_id,
                     kind=value.get("kind"),
                     base_url=value.get("base_url"),
-                    api_key_env=value.get("api_key_env"),
+                    api_key=value.get("api_key"),
                 )
             else:
                 raise TypeError("providers must contain ProviderProfile values")
@@ -255,20 +276,34 @@ class EffectiveConfig:
                 profile = ModelProfile(
                     model_ref=model_ref,
                     provider_profile_id=value.get("provider_profile_id"),
-                    remote_model_id=value.get("remote_model_id"),
-                    label=value.get("label"),
+                    remote_id=value.get("remote_id"),
+                    display_name=value.get("display_name"),
                     max_output_tokens=value.get("max_output_tokens"),
+                    reasoning_effort=value.get("reasoning_effort"),
                 )
             else:
                 raise TypeError("models must contain ModelProfile values")
             models[model_ref] = profile
 
-        if self.model not in models:
-            raise ConfigurationModelError(f"unknown selected model: {self.model!r}")
+        if self.default_model not in models:
+            raise ConfigurationModelError(f"unknown selected model: {self.default_model!r}")
         for profile in models.values():
             if profile.provider_profile_id not in providers:
                 raise ConfigurationModelError(
                     f"unknown provider reference: {profile.provider_profile_id!r}"
+                )
+            provider = providers[profile.provider_profile_id]
+            if (
+                profile.reasoning_effort is not None
+                and profile.reasoning_effort != "none"
+                and provider.kind not in {
+                    ProviderKind.FAKE,
+                    ProviderKind.OPENAI_RESPONSES,
+                    ProviderKind.OPENAI_COMPAT,
+                }
+            ):
+                raise ConfigurationModelError(
+                    f"Provider {provider.provider_profile_id!r} does not support reasoning_effort"
                 )
 
         source_values = tuple(_coerce_source(value) for value in self.sources)
@@ -286,17 +321,19 @@ class EffectiveConfig:
         if not isinstance(value, Mapping):
             raise TypeError("EffectiveConfig requires a mapping")
         unsupported = [
-            key for key in value if key not in {"model", "providers", "models", "default_permission_mode"}
+            key
+            for key in value
+            if key not in {"default_model", "providers", "models", "default_permission_mode"}
         ]
         if unsupported:
             raise ConfigurationModelError(
                 f"unsupported EffectiveConfig field: {unsupported[0]!r}"
             )
-        selected = value.get("model")
+        selected = value.get("default_model")
         if selected is None:
-            raise ConfigurationModelError("configuration requires a selected model")
+            raise ConfigurationModelError("configuration requires a default_model")
         return cls(
-            model=selected,
+            default_model=selected,
             providers=value.get("providers", {}),
             models=value.get("models", {}),
             sources=tuple(sources),
@@ -310,37 +347,39 @@ class EffectiveConfig:
         *,
         provider_profile_id: str = "default",
         provider_kind: ProviderKind | str = ProviderKind.FAKE,
-        remote_model_id: str | None = None,
-        label: str | None = None,
-        api_key_env: str | None = None,
+        remote_id: str | None = None,
+        display_name: str | None = None,
+        api_key: SecretValue | str | None = None,
         base_url: str | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
         source: ConfigSource | str | Path | None = None,
     ) -> EffectiveConfig:
         """Build a minimal valid configuration for an embedded caller."""
 
-        if remote_model_id is None:
-            remote_model_id = model_ref
+        if remote_id is None:
+            remote_id = model_ref
         config_source = () if source is None else (_coerce_source(source),)
         if source is None:
             config_source = (ConfigSource("embedded"),)
         return cls(
-            model=model_ref,
+            default_model=model_ref,
             providers={
                 provider_profile_id: ProviderProfile(
                     provider_profile_id=provider_profile_id,
                     kind=provider_kind,
                     base_url=base_url,
-                    api_key_env=api_key_env,
+                    api_key=api_key,
                 )
             },
             models={
                 model_ref: ModelProfile(
                     model_ref=model_ref,
                     provider_profile_id=provider_profile_id,
-                    remote_model_id=remote_model_id,
-                    label=label,
+                    remote_id=remote_id,
+                    display_name=display_name,
                     max_output_tokens=max_output_tokens,
+                    reasoning_effort=reasoning_effort,
                 )
             },
             sources=config_source,
@@ -348,10 +387,10 @@ class EffectiveConfig:
 
     @property
     def current_model(self) -> ModelProfile:
-        return self.models[self.model]
+        return self.models[self.default_model]
 
     def provider_for(self, model_ref: str | None = None) -> ProviderProfile:
-        ref = self.model if model_ref is None else model_ref
+        ref = self.default_model if model_ref is None else model_ref
         return self.providers[self.models[ref].provider_profile_id]
 
     def model_catalog(self) -> tuple[ModelProfile, ...]:

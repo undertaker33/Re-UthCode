@@ -9,9 +9,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from uthcode.core.secrets import SecretValue
+
 
 def _freeze(value: Any, *, field: str) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (str, bool, int, SecretValue)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -62,17 +64,17 @@ class LoadedConfigSource:
 
 @dataclass(frozen=True, slots=True)
 class LoadedConfigData:
-    """Deeply immutable raw primitives produced by the Integration loader."""
+    """Deeply immutable values produced by the Integration loader."""
 
-    model: str
+    default_model: str
     providers: Mapping[str, Mapping[str, object]]
     models: Mapping[str, Mapping[str, object]]
     sources: tuple[LoadedConfigSource, ...]
     default_permission_mode: str = "default"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.model, str) or not self.model.strip():
-            raise ValueError("model must be a non-empty string")
+        if not isinstance(self.default_model, str) or not self.default_model.strip():
+            raise ValueError("default_model must be a non-empty string")
         if self.default_permission_mode not in {"default", "auto"}:
             raise ValueError("default_permission_mode must be default or auto")
         object.__setattr__(

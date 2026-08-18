@@ -9,34 +9,53 @@ from pathlib import Path
 
 USER_CONFIG_TEMPLATE = """# UthCode user configuration
 #
-# To configure an OpenAI-compatible Provider:
-# 1. Replace the example values below for your Provider and model.
-# 2. Uncomment the TOML configuration lines (leave these instructions commented).
-# 3. Set the environment variable named by api_key_env, then run `uthcode` again.
+# Fill one complete provider slot and one complete model slot, then set
+# default_model to the model slot ID. Delete unused slots when convenient.
+# api_key accepts a direct value or an environment reference using the env:
+# prefix. Configure provider kind, endpoint, and environment variable names
+# only in this user-level file; project configuration cannot contain them.
+# reasoning_effort is optional: none, minimal, low, medium, high, xhigh, max.
+# The first run creates this empty template and stops with an initialization
+# message; it is not a runnable configuration until a complete pair is filled.
 #
-# PowerShell example for the current terminal only:
-# $env:DEEPSEEK_API_KEY = \"your-api-key\"
-#
-# Never put an API key value in this file. api_key_env is the environment
-# variable name, not the key itself.
-#
-# Supported real Provider kinds: openai_compat, openai_responses, anthropic.
-# Every real Provider requires api_key_env. openai_compat also requires base_url.
-# The fake kind is only for explicit offline testing.
-#
-# default_permission_mode = \"default\" # allowed: default, auto
-# model = \"deepseek/chat\"
-#
-# [providers.deepseek]
-# kind = \"openai_compat\"
-# base_url = \"https://api.deepseek.com\"
-# api_key_env = \"DEEPSEEK_API_KEY\"
-#
-# [models.\"deepseek/chat\"]
-# provider = \"deepseek\"
-# model = \"deepseek-chat\"
-# label = \"DeepSeek Chat\"
+default_model = \"\"
+default_permission_mode = \"default\"
+
+[providers.slot-1]
+kind = \"\"
+api_key = \"\"
+# base_url = \"\"
+
+[providers.slot-2]
+kind = \"\"
+api_key = \"\"
+# base_url = \"\"
+
+[providers.slot-3]
+kind = \"\"
+api_key = \"\"
+# base_url = \"\"
+
+[models.\"slot-1\"]
+provider = \"\"
+remote_id = \"\"
+# display_name = \"\"
 # max_output_tokens = 4096
+# reasoning_effort = \"\"
+
+[models.\"slot-2\"]
+provider = \"\"
+remote_id = \"\"
+# display_name = \"\"
+# max_output_tokens = 4096
+# reasoning_effort = \"\"
+
+[models.\"slot-3\"]
+provider = \"\"
+remote_id = \"\"
+# display_name = \"\"
+# max_output_tokens = 4096
+# reasoning_effort = \"\"
 """
 
 
