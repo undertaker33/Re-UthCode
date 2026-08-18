@@ -19,9 +19,12 @@ from uthcode.application import (
     Usage,
     create_application,
 )
-from uthcode.application.instructions import InstructionLoader
+from uthcode.application.instructions import (
+    InstructionLoader,
+    InstructionSourceNotFoundError,
+)
 from uthcode.application.runtime_context import ApplicationRuntimeContext
-from uthcode.application.sessions import ApplicationSession
+from uthcode.application.sessions import ApplicationSession, SessionOperationError
 from uthcode.core.context import ContextCompactor
 from uthcode.core.history import HistoryKind
 from uthcode.core.provider import (
@@ -30,7 +33,11 @@ from uthcode.core.provider import (
     GenerationRequest,
 )
 from uthcode.integrations.instruction_files import InstructionFileReader
-from uthcode.integrations.session_files import SessionFileStore, SessionWriter
+from uthcode.integrations.session_files import (
+    ProjectionAppendOutcome,
+    SessionFileStore,
+    SessionWriter,
+)
 
 
 def _completed(
@@ -199,6 +206,125 @@ def _history_message_entries(session: ApplicationSession, turn_id: str):
 
 def _history_entries_for_turn(session: ApplicationSession, turn_id: str):
     return [entry for entry in session.history.entries if entry.turn_id == turn_id]
+
+
+def test_w06_formal_create_fails_closed_on_include_without_partial_parent_prefix(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    sessions = SessionFileStore(tmp_path / "sessions")
+    application = _build_application(project, sessions, _TerminalProvider())
+    try:
+        (project / "AGENTS.md").write_text(
+            "parent instruction\n@include(\"missing.md\")\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(InstructionSourceNotFoundError):
+            application.create_session("include-create-fails-closed")
+        assert application.session_service is not None
+        assert application.session_service.active_session is None
+        assert application.instruction_loader is not None
+        # reset_for_new_session happens before the strict rebuild; a failed
+        # include cannot leave the parent AGENTS block active in a new Session.
+        assert application.instruction_loader.blocks == ()
+        assert not sessions.session_path("include-create-fails-closed").exists()
+    finally:
+        application.close()
+
+
+def test_w06_direct_create_failure_preserves_loader_until_successful_commit(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("stable parent\n", encoding="utf-8")
+    sessions = SessionFileStore(tmp_path / "sessions")
+    application = _build_application(project, sessions, _TerminalProvider())
+    loader = application.instruction_loader
+    assert loader is not None
+    before = (
+        loader.blocks,
+        loader.instruction_epoch,
+        loader.stable_prefix_fingerprint,
+        loader.activated_directory_scopes,
+    )
+    try:
+        (project / "AGENTS.md").write_text(
+            "parent must not partially commit\n@include(\"missing.md\")\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(InstructionSourceNotFoundError):
+            application.create_session("direct-create-fails-closed")
+        assert (
+            loader.blocks,
+            loader.instruction_epoch,
+            loader.stable_prefix_fingerprint,
+            loader.activated_directory_scopes,
+        ) == before
+        assert not sessions.session_path("direct-create-fails-closed").exists()
+
+        (project / "AGENTS.md").write_text("committed parent\n", encoding="utf-8")
+        session = application.create_session("direct-create-succeeds")
+        assert session.session_id == "direct-create-succeeds"
+        assert any(block.content == "committed parent\n" for block in loader.blocks)
+        session.close()
+    finally:
+        application.close()
+
+
+def test_w06_formal_resume_and_refresh_fail_closed_without_adopting_partial_include(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("stable parent\n", encoding="utf-8")
+    sessions = SessionFileStore(tmp_path / "sessions")
+
+    first = _build_application(project, sessions, _TerminalProvider())
+    first.create_session("include-resume-fails-closed").close()
+    first.close()
+
+    second = _build_application(project, sessions, _TerminalProvider())
+    try:
+        (project / "AGENTS.md").write_text(
+            "new parent must not activate\n@include(\"missing.md\")\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(InstructionSourceNotFoundError):
+            second.resume_session("include-resume-fails-closed")
+        assert second.session_service is not None
+        assert second.session_service.active_session is None
+        # The failed writer was released, so a subsequent fresh writer can
+        # still inspect the durable Session rather than inheriting a lock.
+        with sessions.open_writer("include-resume-fails-closed") as writer:
+            assert writer.snapshot.session_id == "include-resume-fails-closed"
+    finally:
+        second.close()
+
+    # Refresh uses the staged Application path and must preserve the active
+    # Session/Instruction State when rebuilding the current filesystem fails.
+    (project / "AGENTS.md").write_text("stable parent\n", encoding="utf-8")
+    third = _build_application(project, sessions, _TerminalProvider())
+    try:
+        active = third.resume_session("include-resume-fails-closed")
+        old_history = active.history
+        (project / "AGENTS.md").write_text(
+            "refresh parent must not activate\n@include(\"missing.md\")\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SessionOperationError) as error:
+            third.resume_session_for_command("include-resume-fails-closed")
+        assert error.value.kind == "corrupt"
+        assert third.session_service is not None
+        assert third.session_service.active_session is active
+        assert active.history == old_history
+        assert any(
+            block.content == "stable parent\n"
+            for block in third.instruction_loader.blocks  # type: ignore[union-attr]
+        )
+    finally:
+        third.close()
 
 
 @pytest.mark.asyncio
@@ -536,6 +662,133 @@ async def test_w06_unknown_history_append_durability_fails_closed(
             run.snapshot().turn_id,
             run.snapshot().turn_id,
         ]
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_w06_unknown_projection_durability_blocks_new_run_until_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    sessions = SessionFileStore(tmp_path / "sessions")
+    provider = _TerminalProvider()
+    application = _build_application(project, sessions, provider)
+    session = application.create_session("p0-projection-unknown")
+    first = await application.create_run(run_id="p0-projection-run-1").start_turn(
+        "P0_PROJECTION_FIRST"
+    ).result()
+    history_path = sessions.session_path("p0-projection-unknown") / "history.jsonl"
+    original_reload = SessionWriter._reload
+    original_load = SessionFileStore._load_snapshot
+
+    def fail_reload(self: SessionWriter, *, touch: bool):
+        raise OSError("injected Projection reload failure")
+
+    def fail_load(self: SessionFileStore, *args: object, **kwargs: object):
+        raise OSError("injected Projection reconciliation read failure")
+
+    monkeypatch.setattr(SessionWriter, "_reload", fail_reload)
+    monkeypatch.setattr(SessionFileStore, "_load_snapshot", fail_load)
+    try:
+        failed = application.compact_session(summarize=lambda _value: "P0_PROJECTION_SUMMARY")
+        assert first.final_text == "answer-1"
+        assert failed.changed is False
+        assert failed.failure == "projection_durability_unknown"
+        assert session.durability_unknown is True
+        before_new_run = history_path.read_bytes()
+
+        second_run = application.create_run(run_id="p0-projection-run-2")
+        with pytest.raises(RuntimeError, match="durability is unknown"):
+            await second_run.start_turn("P0_PROJECTION_MUST_NOT_RUN").result()
+        assert len(provider.requests) == 1
+        assert history_path.read_bytes() == before_new_run
+    finally:
+        monkeypatch.setattr(SessionWriter, "_reload", original_reload)
+        monkeypatch.setattr(SessionFileStore, "_load_snapshot", original_load)
+        application.close()
+
+    reopened = application.resume_session("p0-projection-unknown")
+    try:
+        assert reopened.projection is not None
+        assert reopened.projection.revision == 1
+        recovered = await application.create_run(run_id="p0-projection-run-3").start_turn(
+            "P0_PROJECTION_AFTER_REOPEN"
+        ).result()
+        assert recovered.final_text == "answer-2"
+        assert len(provider.requests) == 2
+        assert len(history_path.read_bytes().splitlines()) == 5
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["unknown", "not_durable", "append"])
+async def test_w06_compaction_diagnostics_match_projection_persistence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    sessions = SessionFileStore(tmp_path / "sessions")
+    application = _build_application(project, sessions, _TerminalProvider())
+    session = application.create_session(f"p0-compaction-{failure_mode}")
+    await application.create_run(run_id=f"p0-compaction-run-{failure_mode}").start_turn(
+        "P0_COMPACTION_SEED"
+    ).result()
+
+    if failure_mode == "unknown":
+        def fail_unknown(self: ApplicationSession, projection: object):
+            del projection
+            self._quarantine_unknown_durability()
+            return ProjectionAppendOutcome(
+                snapshot=self.snapshot,
+                projection_appended=False,
+                reload_succeeded=False,
+                metadata_synced=False,
+                failure_stage="projection_durability_unknown",
+                durability="unknown",
+            )
+
+        monkeypatch.setattr(ApplicationSession, "append_projection", fail_unknown)
+    elif failure_mode == "not_durable":
+        def fail_not_durable(self: ApplicationSession, projection: object):
+            del projection
+            return ProjectionAppendOutcome(
+                snapshot=self.snapshot,
+                projection_appended=False,
+                reload_succeeded=False,
+                metadata_synced=False,
+                failure_stage="projection_append",
+                durability="not_durable",
+            )
+
+        monkeypatch.setattr(ApplicationSession, "append_projection", fail_not_durable)
+    else:
+        def fail_append(self: ApplicationSession, projection: object):
+            del self, projection
+            raise OSError("injected Projection append failure")
+
+        monkeypatch.setattr(ApplicationSession, "append_projection", fail_append)
+
+    try:
+        result = application.compact_session(summarize=lambda _value: "P0_COMPACTION_SUMMARY")
+        expected_failure = (
+            "projection_durability_unknown"
+            if failure_mode == "unknown"
+            else ("projection_append" if failure_mode == "not_durable" else "projection_append_failed")
+        )
+        assert result.changed is False
+        assert result.failure == expected_failure
+        last = application.diagnostics()["compaction"]["last"]
+        assert isinstance(last, dict)
+        assert last["status"] == "failed"
+        assert last["changed"] is False
+        assert last["failure"] == expected_failure
+        assert session.projection is None
     finally:
         application.close()
 

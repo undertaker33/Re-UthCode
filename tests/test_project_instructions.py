@@ -194,6 +194,30 @@ def test_include_parser_and_loader_are_bounded_and_fail_closed(tmp_path: Path) -
         "@include('two.md')\n"
     ) == ("one.md", "two.md")
 
+    # A closing fence must use the same marker character and be at least as
+    # long as its opener.  Three backticks inside a four-backtick fence are
+    # ordinary fenced content, not an early close; the same boundary applies
+    # to tildes.
+    assert parse_instruction_references(
+        "````python\n"
+        '@include("inside-short-close.md")\n'
+        "```\n"
+        '@include("inside-three.md")\n'
+        "````\n"
+        '@include("after-backticks.md")\n'
+        "~~~~\n"
+        "~~~\n"
+        '@include("inside-tilde.md")\n'
+        "~~~~\n"
+        '@include("after-tilde.md")\n'
+    ) == ("after-backticks.md", "after-tilde.md")
+    assert parse_instruction_references(
+        "```\n"
+        '@include("inside-long-close.md")\n'
+        "````\n"
+        '@include("after-long-close.md")\n'
+    ) == ("after-long-close.md",)
+
     loader, _user_root, project_root = _loader(tmp_path)
     (project_root / "AGENTS.md").write_text(
         "\n".join(f'@include("extra-{index}.md")' for index in range(4)),

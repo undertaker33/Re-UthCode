@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 
 import pytest
@@ -13,13 +13,17 @@ from uthcode.application import (
     create_application,
 )
 from uthcode.application.context import ApplicationContextService
+from uthcode.application.history import history_entries_for_message
+from uthcode.application.sessions import ApplicationSession
 from uthcode.core.agent import AgentLoop, RunState, TerminationReason
 from uthcode.core.context import (
     CompactionInProgress,
     CompactionPolicy,
     ContextCompactor,
+    ContextCompilationError,
     ContextCompiler,
     DeterministicTokenEstimator,
+    messages_from_context_snapshot,
 )
 from uthcode.core.history import CanonicalHistory, HistoryKind
 from uthcode.core.prompt import RuntimePromptContext
@@ -35,6 +39,7 @@ from uthcode.core.provider import (
     TextPart,
     ToolCallPart,
     ToolDefinition,
+    ToolResultPart,
     Usage,
 )
 from uthcode.core.tool import ToolExecutor, ToolRegistry
@@ -361,6 +366,51 @@ def test_context_message_projection_reassembles_one_multi_part_history_message()
     assert request.messages[-1].parts == (TextPart("current"),)
 
 
+def test_context_message_projection_keeps_adjacent_same_role_messages_in_one_turn() -> None:
+    session_id = "same-turn-message-identity"
+    history = CanonicalHistory(session_id)
+    sequence = 1
+    original_messages = (
+        Message("user", (TextPart("initial"),)),
+        Message("user", (TextPart("steering"),)),
+        Message("assistant", (TextPart("first response"),)),
+        Message("assistant", (TextPart("second response"),)),
+        Message("user", (TextPart("part-one"), TextPart("part-two"))),
+    )
+    for message in original_messages:
+        entries = history_entries_for_message(
+            session_id,
+            "one-turn-with-steering",
+            sequence,
+            message,
+        )
+        history = CanonicalHistory(session_id, history.entries + entries)
+        sequence += len(entries)
+
+    snapshot = ContextCompiler().compile(history=history)
+    restored = messages_from_context_snapshot(snapshot)
+
+    assert restored == original_messages
+
+
+def test_context_message_projection_rejects_missing_message_identity() -> None:
+    session_id = "missing-message-identity"
+    turn_id = "current-turn"
+    message = Message("user", (TextPart("part-one"), TextPart("part-two")))
+    history = CanonicalHistory(session_id)
+    for entry in history_entries_for_message(session_id, turn_id, 1, message):
+        payload = dict(entry.payload)
+        payload.pop("message_id")
+        history = CanonicalHistory(
+            session_id,
+            history.entries + (replace(entry, payload=payload),),
+        )
+
+    snapshot = ContextCompiler().compile(history=history)
+    with pytest.raises(ContextCompilationError, match="identity is missing"):
+        messages_from_context_snapshot(snapshot)
+
+
 def test_compaction_cancellation_is_a_failed_candidate() -> None:
     history = _history_with_units()
     previous = history.project(revision=1, sequence_start=1, sequence_end=2, summary="old")
@@ -631,5 +681,55 @@ async def test_formal_application_overflow_with_invalid_summary_fails_closed(
         assert len(provider.requests) == 1
         assert session.projection is None
         assert result.termination_reason is TerminationReason.PROVIDER_ERROR
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_formal_overflow_projection_append_failure_updates_compaction_diagnostics(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _OverflowProvider(1)
+    config = EffectiveConfig.single_model(
+        "fake/ref",
+        provider_profile_id="fake",
+        remote_model_id="fake-model",
+    )
+    application = create_application(
+        config,
+        provider_builder=lambda _profile, _model: provider,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    real_compact = application.context_service.compact
+
+    def compact_with_summary(history, **kwargs):
+        return real_compact(history, summarize=lambda _value: "overflow summary", **kwargs)
+
+    def fail_projection_append(self: ApplicationSession, projection: object):
+        del self, projection
+        raise OSError("injected overflow Projection append failure")
+
+    monkeypatch.setattr(application.context_service, "compact", compact_with_summary)
+    monkeypatch.setattr(ApplicationSession, "append_projection", fail_projection_append)
+    session = application.create_session("formal-overflow-projection-failure")
+    history = _append_user(
+        CanonicalHistory("formal-overflow-projection-failure"),
+        "old",
+        "old semantic unit",
+    )
+    session.append_history(history.entries)
+
+    try:
+        result = await application.create_run(run_id="formal-overflow-projection-failure-run").start_turn(
+            "overflow request"
+        ).result()
+        assert result.termination_reason is TerminationReason.PROVIDER_ERROR
+        diagnostics = application.diagnostics()["compaction"]["last"]
+        assert isinstance(diagnostics, dict)
+        assert diagnostics["status"] == "failed"
+        assert diagnostics["changed"] is False
+        assert diagnostics["failure"] == "projection_append_failed"
     finally:
         application.close()

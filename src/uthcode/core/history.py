@@ -585,8 +585,13 @@ def history_entries_from_message(
 
     if not isinstance(message, Message):
         raise TypeError("message must be a Message")
+    # ``turn_id`` is intentionally not a Message identity: Steering can add
+    # several adjacent user Messages to one Turn.  A deterministic id based
+    # on the first strict sequence keeps multipart parts together while
+    # keeping independent same-role Messages distinct during reconstruction.
+    message_id = f"message-{sequence}"
     entries: list[HistoryEntry] = []
-    for part in message.parts:
+    for part_index, part in enumerate(message.parts):
         if isinstance(part, ToolCallPart):
             kind = HistoryKind.TOOL_CALL
             payload = part.to_dict()
@@ -600,6 +605,8 @@ def history_entries_from_message(
                 else HistoryKind.ASSISTANT_MESSAGE
             )
             payload = {"role": message.role, "part": part.to_dict()}
+        payload["message_id"] = message_id
+        payload["message_part_index"] = part_index
         entries.append(
             HistoryEntry(
                 session_id=session_id,
@@ -620,7 +627,12 @@ def history_entries_from_message(
                 sequence=sequence,
                 turn_id=turn_id,
                 kind=(HistoryKind.USER_MESSAGE if message.role == "user" else HistoryKind.ASSISTANT_MESSAGE),
-                payload={"role": message.role, "parts": []},
+                payload={
+                    "role": message.role,
+                    "parts": [],
+                    "message_id": message_id,
+                    "message_part_index": 0,
+                },
                 created_at=datetime.now(timezone.utc).isoformat(),
                 commit_boundary=True,
                 semantic_unit_id=None,

@@ -404,3 +404,98 @@ NO_COLOR=1、TERM=dumb：tests/test_tui.py 为 69 passed, 3 failed；失败均�
 ```
 
 最终 UTF-8/replacement/mojibake/fence 检查和相对链接检查通过；相对链接检查结果为 `relative_links_checked=23`、`relative_links_missing=0`。本轮未执行 Git commit、push、PR、merge、rebase、tag、release 或工作包归档。
+
+## 11. 第四轮定点修复：Projection、Message identity、AGENTS fail-closed 与 Markdown fence
+
+### 11.1 Projection post-append durability contract
+
+根因是 Projection 记录与后续 reload、metadata touch 仍被当成一个无返回值写入步骤；append 已落盘而 reload/touch 失败时，调用方无法知道是否可以重试，且 unknown 情况没有把当前 SessionWriter 隔离。现在 `SessionWriter.append_projection()` 返回结构化 `ProjectionAppendOutcome`：
+
+- append 后 reload 失败会重新读取结构化 Session snapshot，并按 History、Projection、record sequence 做 reconciliation；确认 durable 时只更新当前 writer，不再次 append，确认 not durable 时才允许安全重试。
+- metadata touch 失败不撤销已 durable 的 Projection，返回 `metadata_synced=False`；Projection revision 与全局 record sequence 仍严格递增。
+- append/reload 后无法判定时返回 `durability="unknown"` 并设置 SessionWriter quarantine；History、Projection、Runtime、Tool Result、Instruction State 和新 Run 均 fail closed，必须 close/reopen 后再验证。
+- Application compact/overflow path 只在 Projection outcome 确认 durable 后刷新 Context；not durable/unknown 不把候选 Projection 暴露为成功。新 Run 在 quarantine 时不会调用 Provider。
+
+### 11.2 同 Turn 消息 identity 与恢复
+
+根因是恢复 identity 只使用 `(session_id, turn_id, role)`，导致 Steering 产生的相邻 user Message 和同角色独立结构化 Message 被合并或跳过。Core history adapter 现在为每个 Message 写入 deterministic `message_id` 与 `message_part_index`；Context reconstruction 以该 identity 局部合并 multipart parts，并保留同 Turn 相邻同角色 Message，不使用全局文本去重。ToolCall/ToolResult payload 和 semantic unit 关系保持不变。
+
+### 11.3 AGENTS include formal path fail-closed
+
+正式 `create_session`、staged create、direct/staged resume 与 active refresh 均使用 `strict=True`。严格失败在 writer/metadata/loader commit 前结束；staged resume 失败时不采用候选 Loader，当前 active Session、scope、epoch 和 resume metadata 不被部分更新。`load_session(strict=False)` 仍只供直接 Loader 诊断调用，正式 Session 不会让失败 include 的父 AGENTS block 生效。
+
+### 11.4 Markdown fence boundary
+
+`parse_instruction_references()` 现在记录 opening fence 的字符和长度，只有相同字符且 closing 长度不短于 opening、尾部仅为空白时才关闭；因此四反引号中的三反引号、不同字符或更短 closing 都不会提前结束，围栏内 `@include` 永远不解析。反引号、波浪号及 opening/closing 长度边界均有回归覆盖。
+
+### 11.5 新增回归与精确验证
+
+新增或补充：
+
+- `tests/test_session_files.py`：Projection post-append touch/reload reconciliation、unknown quarantine、strict record sequence/reopen revision 和其他写入口阻断。
+- `tests/test_context_compaction.py`、`tests/test_w04_session_commands.py`：同 Turn 相邻同角色、Steering、multipart Message 的 compile/resume 恢复。
+- `tests/test_w06_integration_delivery.py`：formal create/resume/refresh include fail-closed，以及 Projection unknown 后新 Run 阻断和 reopen 恢复。
+- `tests/test_project_instructions.py`：反引号/波浪号 fence 相同字符、短/长 closing boundary。
+
+本轮命令结果：
+
+```text
+定向集合（session/context/project-instructions/W04/W06/architecture）：110 passed in 16.44s
+python -m pytest -q：1215 passed, 3 skipped, 3 failed in 100.88s
+默认环境的 3 个失败均为既知 NO_COLOR 下 tests/test_tui.py truecolor 断言；非本轮改动。
+清除 NO_COLOR、TERM=xterm-truecolor 后 python -m pytest -q：1218 passed, 3 skipped in 102.65s
+python -m compileall -q src tests eval：exit 0
+python -m pip check：No broken requirements found.
+git diff --check：exit 0；仅有既有 LF→CRLF 工作树提示，无 whitespace error。
+uth-utf8-guard：本 Feedback 写回前后均通过，无 replacement character、mojibake 或不平衡 fence。
+```
+
+Checklist 已全部处于 `[x]`，本轮没有重复修改；T09 Prompt、Spec、Tasks、Checklist 与 W01～W06 Prompt 保持冻结。未修改 Environment Plane 文档，不实施 `/compact`、summarizer 或自动阈值后置能力；未执行 commit、push、PR、merge、rebase、tag、release 或工作包归档。
+
+## 12. 复审追加：schema v1 兼容、direct create 隔离与 Compaction diagnostics
+
+### 12.1 对第四轮记录的更正
+
+第 11 节此前只明确了带新 `message_id` 的 multipart 恢复，没有明确覆盖修复前同 schema v1、每个 History entry 携带完整 `message` 的合法 multipart；Projection persistence 结果也已落盘，但 Application Compaction diagnostics 尚未与最终返回结果统一；此外 direct `create_session()` 虽然使用 strict Loader，却仍会先清空当前 Loader。以上三项声明与实现边界现已补正如下。
+
+### 12.2 schema v1 legacy multipart contract
+
+保留 schema v1，不引入迁移。没有 `message_id` 的旧 full-message entry 只有在以下条件同时成立时才按相邻 multipart continuation 处理：同一 session/turn/role、严格相邻 sequence、完整 Message 相同、当前 `part` 等于 Message 的下一顺序 part，并且首 part 与下一 part 不产生无法区分的重复歧义；否则视为独立 Message 或 fail closed。新 `message_id` 路径保持原有 identity-local 规则，不使用全局文本/内容去重。ToolCall/ToolResult pair、重复文本独立 Message、Steering 和新旧 multipart 均有回归覆盖。
+
+### 12.3 direct create 与 Compaction diagnostics
+
+- `ApplicationSessionService.create_session()` 现在复用 staged/fork Loader，候选严格加载成功后才 commit；include 失败不会清空当前 blocks、epoch、fingerprint、activated scopes，也不会创建 Session metadata/目录或留下 writer。成功路径再原子采用 candidate。
+- `ApplicationContextService.finalize_compaction()` 在 Projection persistence 返回后回写同一最后事件。unknown、not-durable 和 append exception 均让最终 `CompactionResult` 与 `application.diagnostics()["compaction"]` 一致地显示 `failed`、`changed=false` 和对应 failure；manual compact 与 Provider overflow commit failure 共用该边界。
+
+### 12.4 本轮新增回归与精确验证
+
+- `test_context_message_projection_restores_schema_v1_legacy_multipart_identity`：旧 v1 multipart、重复同内容独立 Message、ToolCall/ToolResult。
+- `test_w06_direct_create_failure_preserves_loader_until_successful_commit`：direct create 失败状态、无 Session 目录、成功后 candidate commit。
+- `test_w06_compaction_diagnostics_match_projection_persistence_failure`：unknown/not-durable/append failure 三种 manual compact outcome。
+- `test_formal_overflow_projection_append_failure_updates_compaction_diagnostics`：overflow commit failure diagnostics。
+
+```text
+定向集合（context/W06/session/project-instructions/W04/architecture）：110 passed in 16.44s
+python -m pytest -q：1221 passed, 3 skipped, 3 failed in 99.29s
+默认环境的 3 个失败仍为既知 NO_COLOR 下 tests/test_tui.py truecolor 断言。
+清除 NO_COLOR、TERM=xterm-truecolor 后 python -m pytest -q：1224 passed, 3 skipped in 100.34s
+python -m compileall -q src tests eval：exit 0
+python -m pip check：No broken requirements found.
+git diff --check：exit 0；仅有既有 LF→CRLF 工作树提示，无 whitespace error。
+uth-utf8-guard：本 Feedback 写回前后通过，无 replacement character、mojibake 或不平衡 fence。
+```
+
+未修改 Environment Plane 文档；未修改冻结 task/spec/tasks/checklist/prompts；未执行 commit、push、PR、merge、rebase、tag、release 或工作包归档。
+
+## 13. 收口更正：删除无事实前提的旧 Session 兼容
+
+第 12.2 节将“同 schema v1 且没有 `message_id`”假定为已存在的旧持久化数据，该前提没有代码、发布或生产 Session 样本证据。Session History 持久化是 T09 当前新建能力，项目又明确禁止为不存在的旧数据保留兼容逻辑，因此不进行虚构的迁移演练。
+
+当前正式 contract 收口为：
+
+- `history_entries_from_message()` 为每个 Message 持久化明确 `message_id` 和 `message_part_index`；
+- Context reconstruction 只按该结构化 identity 合并 multipart，不做全局文本去重；
+- History Message 缺少 `message_id` 时 fail closed，不尝试推断或兼容未证实的旧格式；
+- 删除 legacy multipart 推断分支和对应的人工剥离字段“迁移”测试，改为缺失 identity 的 fail-closed 回归。
+
+direct create 事务隔离、Compaction diagnostics 最终结果同步以及第 11 节的其余实施修复均保留，本次更正不扩大 T09 范围。
