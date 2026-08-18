@@ -133,9 +133,12 @@ def test_runner_persists_explicit_model_identifier_in_fingerprint(tmp_path: Path
     assert record["fingerprints"]["model_id"] == "offline-model-v2"
 
 
-def test_runner_builds_live_config_with_selected_remote_model() -> None:
+def test_runner_builds_live_config_with_selected_remote_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EVAL_TEST_KEY", "synthetic-eval-key")
     config = _config(ProviderKind.ANTHROPIC, "EVAL_TEST_KEY", "claude-sonnet-4-20250514")
-    assert config.current_model.remote_model_id == "claude-sonnet-4-20250514"
+    assert config.current_model.remote_id == "claude-sonnet-4-20250514"
     assert config.provider_for().kind is ProviderKind.ANTHROPIC
 
 

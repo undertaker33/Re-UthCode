@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from tomlkit import parse
 
 from .data import LoadedConfigData, LoadedConfigSource
 from .template import create_user_template
+from uthcode.core.secrets import SecretValue
 
 
 class ConfigurationError(ValueError):
@@ -41,15 +43,17 @@ class ConfigurationInitializationRequired(ConfigurationError):
     def __init__(self, path: Path) -> None:
         self.template_path = path
         super().__init__(
-            "configuration is not initialized; edit and uncomment one complete "
-            "Provider and Model example, then run again",
+            "configuration is not initialized; fill one complete Provider and "
+            "Model slot, set default_model, then run again",
             path=path,
         )
 
 
-_ROOT_FIELDS = frozenset({"model", "providers", "models", "default_permission_mode"})
-_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key_env"})
-_MODEL_FIELDS = frozenset({"provider", "model", "label", "max_output_tokens"})
+_ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode"})
+_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key"})
+_MODEL_FIELDS = frozenset(
+    {"provider", "remote_id", "display_name", "max_output_tokens", "reasoning_effort"}
+)
 _SUPPORTED_PROVIDER_KINDS = frozenset(
     {"fake", "anthropic", "openai_responses", "openai_compat"}
 )
@@ -62,7 +66,6 @@ _PROJECT_FORBIDDEN_FIELDS = frozenset(
         "url",
         "endpoint",
         "api_key",
-        "api_key_env",
         "secret",
         "secret_env",
         "secret_source",
@@ -75,6 +78,10 @@ _PROJECT_FORBIDDEN_FIELDS = frozenset(
         "headers",
     }
 )
+_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _physical_path(path: str | os.PathLike[str] | Path) -> Path:
@@ -343,6 +350,36 @@ def _validate_project_mapping(mapping: Mapping[str, Any], *, path: Path) -> None
     _validate_model_tables(mapping, path=path, project=True)
 
 
+def _blank(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _resolve_api_key(value: object, *, path: Path, field: str) -> SecretValue | None:
+    """Parse one user-only credential expression without exposing its value."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ConfigurationError("api_key must be a string", path=path, field=field)
+    if value.startswith("env:"):
+        name = value[4:]
+        if _ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise ConfigurationError(
+                "api_key environment variable name is invalid",
+                path=path,
+                field=field,
+            )
+        secret = os.environ.get(name)
+        if not secret or not secret.strip():
+            raise ConfigurationError(
+                "api_key environment variable is missing or empty",
+                path=path,
+                field=field,
+            )
+        return SecretValue(secret)
+    return SecretValue(value)
+
+
 def _provider_profiles(
     mapping: Mapping[str, Any],
     *,
@@ -360,35 +397,42 @@ def _provider_profiles(
         )
         kind = profile.get("kind")
         base_url = profile.get("base_url")
-        api_key_env = profile.get("api_key_env")
+        api_key_value = profile.get("api_key")
+        if _blank(kind) and _blank(api_key_value) and _blank(base_url):
+            continue
         if (
             not isinstance(kind, str)
             or not kind.strip()
             or kind.strip().lower() not in _SUPPORTED_PROVIDER_KINDS
             or (base_url is not None and (not isinstance(base_url, str) or not base_url.strip()))
-            or (
-                api_key_env is not None
-                and (not isinstance(api_key_env, str) or not api_key_env.strip())
-            )
-            or (
-                kind.strip().lower() != "fake"
-                and (not isinstance(api_key_env, str) or not api_key_env.strip())
-            )
-            or (
-                kind.strip().lower() == "openai_compat"
-                and (not isinstance(base_url, str) or not base_url.strip())
-            )
         ):
             raise ConfigurationError(
                 "invalid Provider profile",
                 path=path,
                 field=f"providers.{profile_id}",
             )
+        api_key = _resolve_api_key(
+            api_key_value,
+            path=path,
+            field=f"providers.{profile_id}.api_key",
+        )
+        if kind.strip().lower() != "fake" and api_key is None:
+            raise ConfigurationError(
+                "real Provider requires a non-empty api_key",
+                path=path,
+                field=f"providers.{profile_id}.api_key",
+            )
+        if kind.strip().lower() == "openai_compat" and not isinstance(base_url, str):
+            raise ConfigurationError(
+                "OpenAI-compatible Provider requires base_url",
+                path=path,
+                field=f"providers.{profile_id}.base_url",
+            )
         raw: dict[str, object] = {"kind": kind}
         if "base_url" in profile:
             raw["base_url"] = base_url
-        if "api_key_env" in profile:
-            raw["api_key_env"] = api_key_env
+        if api_key is not None:
+            raw["api_key"] = api_key
         result[profile_id] = raw
     return result
 
@@ -404,6 +448,17 @@ def _model_tables(mapping: Mapping[str, Any], *, path: Path) -> dict[str, dict[s
             path=path,
             field=f"models.{model_ref}",
         )
+        if all(
+            _blank(profile.get(key))
+            for key in (
+                "provider",
+                "remote_id",
+                "display_name",
+                "max_output_tokens",
+                "reasoning_effort",
+            )
+        ):
+            continue
         result[model_ref] = dict(profile)
     return result
 
@@ -416,23 +471,34 @@ def _model_profiles(
     result: dict[str, dict[str, object]] = {}
     for model_ref, raw_profile in raw_models.items():
         provider_profile_id = raw_profile.get("provider")
-        remote_model_id = raw_profile.get("model")
-        label = raw_profile.get("label")
+        remote_id = raw_profile.get("remote_id")
+        display_name = raw_profile.get("display_name")
         max_output_tokens = raw_profile.get("max_output_tokens")
+        reasoning_effort = raw_profile.get("reasoning_effort")
         if (
             not isinstance(model_ref, str)
             or not model_ref.strip()
             or not isinstance(provider_profile_id, str)
             or not provider_profile_id.strip()
-            or not isinstance(remote_model_id, str)
-            or not remote_model_id.strip()
-            or (label is not None and (not isinstance(label, str) or not label.strip()))
+            or not isinstance(remote_id, str)
+            or not remote_id.strip()
+            or (
+                display_name is not None
+                and (not isinstance(display_name, str) or not display_name.strip())
+            )
             or (
                 max_output_tokens is not None
                 and (
                     isinstance(max_output_tokens, bool)
                     or not isinstance(max_output_tokens, int)
                     or max_output_tokens <= 0
+                )
+            )
+            or (
+                reasoning_effort is not None
+                and (
+                    not isinstance(reasoning_effort, str)
+                    or reasoning_effort not in _REASONING_EFFORTS
                 )
             )
         ):
@@ -443,12 +509,14 @@ def _model_profiles(
             )
         raw: dict[str, object] = {
             "provider_profile_id": provider_profile_id,
-            "remote_model_id": remote_model_id,
+            "remote_id": remote_id,
         }
-        if "label" in raw_profile:
-            raw["label"] = label
+        if "display_name" in raw_profile:
+            raw["display_name"] = display_name
         if "max_output_tokens" in raw_profile:
             raw["max_output_tokens"] = max_output_tokens
+        if "reasoning_effort" in raw_profile:
+            raw["reasoning_effort"] = reasoning_effort
         result[model_ref] = raw
     return result
 
@@ -504,15 +572,17 @@ def load_config_data(
         )
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
-    selected_ref = user_mapping.get("model")
+    selected_ref = user_mapping.get("default_model")
+    if not providers and not models and _blank(selected_ref):
+        raise ConfigurationInitializationRequired(user_path)
     sources = [LoadedConfigSource("user", user_path)]
 
     for kind, path in paths[1:]:
         project_mapping = _read_mapping(path)
         _validate_project_mapping(project_mapping, path=path)
         _merge_models(models, project_mapping, path=path)
-        if "model" in project_mapping:
-            selected_ref = project_mapping["model"]
+        if "default_model" in project_mapping:
+            selected_ref = project_mapping["default_model"]
         sources.append(LoadedConfigSource(kind, path))
 
     if model is not None:
@@ -520,15 +590,23 @@ def load_config_data(
         sources.append(LoadedConfigSource("cli"))
     if not isinstance(selected_ref, str) or not selected_ref.strip():
         raise ConfigurationError(
-            "configuration requires a selected model",
+            "configuration requires a default_model",
             path=user_path,
-            field="model",
+            field="default_model",
+        )
+
+    canonical_models = _model_profiles(models, path=user_path)
+    if selected_ref not in canonical_models:
+        raise ConfigurationError(
+            "default_model must reference an enabled Model profile",
+            path=user_path,
+            field="default_model",
         )
 
     return LoadedConfigData(
-        model=selected_ref,
+        default_model=selected_ref,
         providers=providers,
-        models=_model_profiles(models, path=user_path),
+        models=canonical_models,
         sources=tuple(sources),
         default_permission_mode=default_permission_mode,
     )

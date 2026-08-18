@@ -48,18 +48,18 @@ def _completed() -> GenerationCompleted:
 
 def _application() -> tuple[UthCodeApplication, list[str]]:
     config = EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={"local": ProviderProfile("local", ProviderKind.FAKE)},
         models={
-            "one/ref": {"provider_profile_id": "local", "remote_model_id": "one"},
-            "two/ref": {"provider_profile_id": "local", "remote_model_id": "two"},
+            "one/ref": {"provider_profile_id": "local", "remote_id": "one"},
+            "two/ref": {"provider_profile_id": "local", "remote_id": "two"},
         },
     )
     writes: list[str] = []
 
     def builder(provider, model):  # type: ignore[no-untyped-def]
         return FakeProvider(
-            identity=ProviderIdentity(provider.provider_profile_id, "fake", model.remote_model_id),
+            identity=ProviderIdentity(provider.provider_profile_id, "fake", model.remote_id),
             events=(_completed(),),
         )
 

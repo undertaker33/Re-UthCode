@@ -13,20 +13,20 @@ uthcode --help
 
 ## 首次配置
 
-第一次运行 `uthcode` 时，程序会创建 `~/.uthcode/config.toml` 并停止。编辑该文件后重新运行。完整字段见[配置说明](configuration.md)。
+第一次运行 `uthcode` 时，程序会创建包含三个空 Provider/Model 槽位的 `~/.uthcode/config.toml` 并停止。填写一组完整槽位并设置 `default_model` 后重新运行。完整字段见[配置说明](configuration.md)。
 
 不连接网络的最小配置：
 
 ```toml
-model = "local/echo"
+default_model = "local/echo"
 
 [providers.local]
 kind = "fake"
 
 [models."local/echo"]
 provider = "local"
-model = "echo"
-label = "Offline Echo"
+remote_id = "echo"
+display_name = "Offline Echo"
 ```
 
 ## 开始使用

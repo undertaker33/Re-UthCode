@@ -24,7 +24,7 @@ python -m pip install -e .
 uthcode
 ```
 
-首次运行会创建 `~/.uthcode/config.toml`。完成模型配置后，再次运行 `uthcode` 即可；也可以先配置 Fake Provider 离线体验。
+首次运行会创建包含三个空 Provider/Model 槽位的 `~/.uthcode/config.toml` 并停止。填写一组完整配置后，将 `default_model` 指向模型逻辑 ID，再次运行 `uthcode` 即可；也可以填写 Fake Provider 离线体验。
 
 > `Bash` 使用当前操作系统用户权限执行，不是 OS Sandbox。请先在受版本控制的项目中使用，并留意权限确认内容。
 
@@ -41,5 +41,5 @@ uthcode
 
 - 开发环境使用仓库约定的 Conda 环境：`conda activate re-uthcode`。
 - 运行测试：`python -m pytest -q`。
-- 需要与项目成员共享模型选择或权限规则时，可提交项目内的 `.uthcode/config.toml` 与 `.uthcode/permissions.toml`；不要提交 API Key。
+- 需要与项目成员共享模型选择或权限规则时，可提交项目内的 `.uthcode/config.toml` 与 `.uthcode/permissions.toml`；Provider 和 `api_key` 只保存在用户级配置，不要提交 API Key。
 - 了解当前实现边界可查看[核心设计索引](docs/core-design/README.md)。

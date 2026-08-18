@@ -13,6 +13,7 @@ from uthcode.core.provider import (
     ProviderIdentity,
     TextPart,
 )
+from uthcode.core.secrets import SecretValue
 from uthcode.integrations.providers.config import ProviderConfig, ProviderKind
 from uthcode.integrations.providers.factory import create_provider
 from uthcode.integrations.providers.fake import FakeProvider
@@ -33,7 +34,7 @@ def _request() -> GenerationRequest:
             ProviderConfig(
                 kind=ProviderKind.ANTHROPIC,
                 model="deepseek-test",
-                api_key_env="DEEPSEEK_API_KEY",
+                api_key="sk-factory-test-secret",
                 base_url="https://mock.invalid/anthropic",
             ),
             ProviderIdentity("anthropic", "messages", "deepseek-test"),
@@ -42,7 +43,7 @@ def _request() -> GenerationRequest:
             ProviderConfig(
                 kind=ProviderKind.OPENAI_RESPONSES,
                 model="deepseek-test",
-                api_key_env="DEEPSEEK_API_KEY",
+                api_key="sk-factory-test-secret",
                 base_url="https://mock.invalid/v1",
             ),
             ProviderIdentity("openai", "responses", "deepseek-test"),
@@ -51,7 +52,7 @@ def _request() -> GenerationRequest:
             ProviderConfig(
                 kind=ProviderKind.OPENAI_COMPAT,
                 model="deepseek-test",
-                api_key_env="DEEPSEEK_API_KEY",
+                api_key="sk-factory-test-secret",
                 base_url="https://mock.invalid/v1",
             ),
             ProviderIdentity("openai", "chat_completions", "deepseek-test"),
@@ -70,7 +71,6 @@ def test_factory_constructs_each_provider_without_network(
         raise AssertionError("provider construction must not access the network")
 
     secret = "sk-factory-test-secret"
-    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
 
     with monkeypatch.context() as socket_patch:
         socket_patch.setattr(socket, "create_connection", blocked)
@@ -100,16 +100,15 @@ def test_fake_provider_does_not_require_a_secret(monkeypatch: pytest.MonkeyPatch
     "kind",
     [ProviderKind.ANTHROPIC, ProviderKind.OPENAI_RESPONSES, ProviderKind.OPENAI_COMPAT],
 )
-def test_missing_secret_fails_with_only_environment_variable_name(
+def test_missing_secret_fails_with_only_safe_field_name(
     kind: ProviderKind,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    environment_variable = "MISSING_FACTORY_SECRET"
-    monkeypatch.delenv(environment_variable, raising=False)
+    environment_variable = "api_key"
     config = ProviderConfig(
         kind=kind,
         model="test-model",
-        api_key_env=environment_variable,
+        api_key=None,
         base_url="https://mock.invalid/v1" if kind is not ProviderKind.ANTHROPIC else None,
     )
 
@@ -117,7 +116,7 @@ def test_missing_secret_fails_with_only_environment_variable_name(
         create_provider(config)
 
     assert raised.value.environment_variable == environment_variable
-    assert str(raised.value) == f"Missing secret environment variable: {environment_variable}"
+    assert str(raised.value) == f"Provider credential is missing: {environment_variable}"
     assert "sk-factory-test-secret" not in repr(config)
     assert "sk-factory-test-secret" not in repr(raised.value)
 
@@ -127,11 +126,10 @@ def test_openai_compatible_provider_requires_explicit_base_url(
     base_url: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-factory-test-secret")
     config = ProviderConfig(
         kind=ProviderKind.OPENAI_COMPAT,
         model="test-model",
-        api_key_env="DEEPSEEK_API_KEY",
+        api_key=SecretValue("sk-factory-test-secret"),
         base_url=base_url,
     )
 
@@ -139,12 +137,54 @@ def test_openai_compatible_provider_requires_explicit_base_url(
         create_provider(config)
 
 
+def test_provider_configuration_rejects_unknown_reasoning_effort_and_unsupported_kind() -> None:
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="test-model",
+            api_key=SecretValue("synthetic"),
+            reasoning_effort="turbo",
+        )
+
+    config = ProviderConfig(
+        kind=ProviderKind.ANTHROPIC,
+        model="test-model",
+        api_key=SecretValue("synthetic"),
+        reasoning_effort="high",
+    )
+    with pytest.raises(ProviderConfigurationError, match="does not support reasoning_effort"):
+        create_provider(config)
+
+
+def test_provider_constructor_exception_cannot_echo_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "constructor-secret-891"
+    config = ProviderConfig(
+        kind=ProviderKind.OPENAI_RESPONSES,
+        model="test-model",
+        api_key=SecretValue(secret),
+        base_url="https://mock.invalid/v1",
+    )
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(secret)
+
+    import uthcode.integrations.providers.factory as factory
+
+    monkeypatch.setattr(factory, "build_openai_responses_provider", fail)
+    with pytest.raises(ProviderConfigurationError, match="construction failed") as raised:
+        create_provider(config)
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
 def test_config_rejects_unknown_kind_and_does_not_store_secret() -> None:
     with pytest.raises(ValueError, match="unknown provider kind"):
         ProviderConfig(kind="future-provider", model="test-model")
 
     config = ProviderConfig(kind="fake", model="test-model")
-    assert not hasattr(config, "api_key")
+    assert config.api_key is None
     assert config.kind is ProviderKind.FAKE
 
 

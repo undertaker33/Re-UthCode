@@ -11,7 +11,7 @@ from .loader import (
     resolve_user_home,
 )
 from .template import USER_CONFIG_TEMPLATE, create_user_template
-from .writer import write_user_model
+from .writer import write_user_default_model
 
 __all__ = [
     "ConfigurationError",
@@ -25,5 +25,5 @@ __all__ = [
     "load_config_data",
     "physical_path",
     "resolve_user_home",
-    "write_user_model",
+    "write_user_default_model",
 ]

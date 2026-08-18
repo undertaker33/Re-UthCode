@@ -191,21 +191,22 @@ def _config_fingerprint(config: EffectiveConfig) -> dict[str, str]:
         key: {
             "kind": profile.kind.value,
             "base_url": profile.base_url,
-            "api_key_env": profile.api_key_env,
+            "api_key_configured": profile.api_key is not None,
         }
         for key, profile in config.providers.items()
     }
     models = {
         key: {
             "provider_profile_id": profile.provider_profile_id,
-            "remote_model_id": profile.remote_model_id,
-            "label": profile.label,
+            "remote_id": profile.remote_id,
+            "display_name": profile.display_name,
             "max_output_tokens": profile.max_output_tokens,
+            "reasoning_effort": profile.reasoning_effort,
         }
         for key, profile in config.models.items()
     }
     payload = {
-        "model": config.model,
+        "default_model": config.default_model,
         "providers": providers,
         "models": models,
         "default_permission_mode": config.default_permission_mode.value,
@@ -214,8 +215,8 @@ def _config_fingerprint(config: EffectiveConfig) -> dict[str, str]:
     provider = config.provider_for()
     return {
         "config": _hash_payload(payload),
-        "model": _hash_payload({"model": current.model_ref, "remote_model_id": current.remote_model_id}),
-        "model_id": current.remote_model_id,
+        "model": _hash_payload({"model_ref": current.model_ref, "remote_id": current.remote_id}),
+        "model_id": current.remote_id,
         "provider": _hash_payload({"kind": provider.kind.value, "base_url": provider.base_url}),
     }
 
@@ -486,11 +487,9 @@ async def run_attempt(
 
     config_fingerprints = _config_fingerprint(config)
     configured_secret_values = tuple(
-        value
+        profile.api_key.reveal()
         for profile in config.providers.values()
-        if profile.api_key_env is not None
-        for value in (os.environ.get(profile.api_key_env),)
-        if value
+        if profile.api_key is not None
     )
     effective_secret_values = tuple(dict.fromkeys((*secret_values, *configured_secret_values)))
     revision = _git_revision(attempt.repo_root)

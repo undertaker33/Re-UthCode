@@ -342,7 +342,7 @@ def _config() -> EffectiveConfig:
         "local/ref",
         provider_profile_id="local",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
 
 
@@ -536,7 +536,7 @@ async def test_model_switch_after_start_does_not_change_active_turn(tmp_path: Pa
     first_provider = _ScriptedProvider(((_response(TextPart("old answer")),),), model="remote-one")
     second_provider = _ScriptedProvider(((_response(TextPart("new answer")),),), model="remote-two")
     config = EffectiveConfig(
-        model="one/ref",
+        default_model="one/ref",
         providers={
             "one": ProviderProfile("one", ProviderKind.FAKE),
             "two": ProviderProfile("two", ProviderKind.FAKE),

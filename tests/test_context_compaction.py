@@ -597,7 +597,7 @@ async def test_formal_application_overflow_without_summarizer_fails_closed(tmp_p
         "fake/ref",
         provider_profile_id="fake",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
     application = create_application(
         config,
@@ -640,7 +640,7 @@ async def test_formal_application_overflow_with_invalid_summary_fails_closed(
         "fake/ref",
         provider_profile_id="fake",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
     application = create_application(
         config,
@@ -694,7 +694,7 @@ async def test_formal_overflow_projection_append_failure_updates_compaction_diag
     config = EffectiveConfig.single_model(
         "fake/ref",
         provider_profile_id="fake",
-        remote_model_id="fake-model",
+        remote_id="fake-model",
     )
     application = create_application(
         config,

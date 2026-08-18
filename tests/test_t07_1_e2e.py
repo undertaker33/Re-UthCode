@@ -79,7 +79,7 @@ def _application(workdir: Path, provider: _ScriptedProvider, tool: _SafeBash):
         "t07-1/ref",
         provider_profile_id="t07-1",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="offline",
+        remote_id="offline",
     )
     context = ApplicationRuntimeContext.from_system(
         workdir=workdir,

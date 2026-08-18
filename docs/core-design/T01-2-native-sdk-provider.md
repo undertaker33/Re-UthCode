@@ -28,6 +28,6 @@ Tool Call 的名称和 JSON 参数可能分散在多个事件里到达。因此 
 
 ## 错误也必须穿过边界
 
-认证失败、限流和网络错误会转换为 UthCode 的稳定错误类型。API Key 则只通过配置指定的环境变量进入 SDK，不成为普通配置值、事件或运行状态的一部分。
+认证失败、限流和网络错误会转换为 UthCode 的稳定错误类型。API Key 只允许来自用户级配置的 `api_key` literal 或 `env:VARIABLE_NAME`，进入 SDK 前解析为不可序列化且 `repr` 脱敏的内部凭据；它不成为普通配置值、Prompt、History、Event、diagnostics 或运行状态的一部分。
 
 到这里，模型输出已经被翻译成 Core 能理解的语言。接下来要看用户输入如何从不同入口抵达这套 Core。

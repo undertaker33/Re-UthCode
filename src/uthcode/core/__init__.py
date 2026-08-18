@@ -216,6 +216,7 @@ from .provider import (
     Usage,
     validated_provider_stream,
 )
+from .secrets import SecretValue
 from .history import (
     CanonicalHistory,
     HistoryBoundaryError,
@@ -413,6 +414,7 @@ __all__ = [
     "UserSteeringApplied",
     "UserSteeringRequested",
     "SemanticUnit",
+    "SecretValue",
     "agent_event_from_dict",
     "agent_event_from_json",
     "build_runtime_prompt_section",

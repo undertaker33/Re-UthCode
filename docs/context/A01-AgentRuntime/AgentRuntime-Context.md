@@ -20,6 +20,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
 - `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造固定 258K Operating Budget 的 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools`；Provider Integration 只负责原生协议映射。
+- `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；Application 在 AgentRun 与 direct generation 两条路径都将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
 - `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
 - `[FACT]` terminal History persistence 将 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State metadata sync 分开记录 outcome；只有可判定 `durability=durable` 的 History append 才按 `persisted_message_count` 推进 Run 的 process cursor。append 后的 reload/touch 失败会保留 durable 事实并显示 partial diagnostics；无法通过结构化 History identity reconciliation 判定时，active Session writer 进入 quarantine，所有新 Run 与语义写入 fail closed，不重试未知批次。必须显式关闭 writer，再由 fresh writer 重新打开并验证/恢复后才解除 quarantine。真正未落盘的 append 失败则 cursor 不推进；失败批次在进程内保留原始 Session/Turn identity 并按 FIFO 重试。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。

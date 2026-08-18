@@ -56,7 +56,7 @@ def _configuration() -> EffectiveConfig:
         "w04/ref",
         provider_profile_id="w04",
         provider_kind=ProviderKind.FAKE,
-        remote_model_id="w04-model",
+        remote_id="w04-model",
     )
 
 

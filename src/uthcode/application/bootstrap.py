@@ -66,8 +66,8 @@ class ConfigurationInitializationRequired(ConfigurationError):
     def __init__(self, template_path: str | Path) -> None:
         self.template_path = Path(template_path)
         super().__init__(
-            "configuration is not initialized; edit and uncomment one complete "
-            "Provider and Model example, then run again: "
+            "configuration is not initialized; fill one complete Provider and "
+            "Model slot, set default_model, then run again: "
             f"{self.template_path}",
         )
         self.path = self.template_path
@@ -84,10 +84,11 @@ def _provider_config(
 
     return ProviderConfig(
         kind=ProviderKind(provider.kind.value),
-        model=model.remote_model_id,
-        api_key_env=provider.api_key_env,
+        model=model.remote_id,
+        api_key=provider.api_key,
         base_url=provider.base_url,
         max_output_tokens=model.max_output_tokens,
+        reasoning_effort=model.reasoning_effort,
     )
 
 
@@ -111,10 +112,10 @@ def _default_writer(configuration: EffectiveConfig) -> ModelWriter | None:
     path = user_sources[0].path
     assert path is not None
     writer_module = import_module("uthcode.integrations.config.writer")
-    write_user_model = writer_module.write_user_model
+    write_user_default_model = writer_module.write_user_default_model
 
     def write(model_ref: str) -> object:
-        return write_user_model(path, model_ref)
+        return write_user_default_model(path, model_ref)
 
     return write
 
@@ -191,10 +192,10 @@ def create_application(
         if tools is None
         else tuple(tools)
     )
-    secret_env_names = tuple(
-        profile.api_key_env
+    secret_values = tuple(
+        profile.api_key
         for profile in config.providers.values()
-        if profile.api_key_env is not None
+        if profile.api_key is not None
     )
     return UthCodeApplication(
         provider,
@@ -206,7 +207,7 @@ def create_application(
         tool_service=ApplicationToolService(
             tool_values,
             workdir=runtime_context.workdir,
-            secret_env_names=secret_env_names,
+            secret_values=secret_values,
             session_provider=lambda: session_service.active_session,
         ),
         permission_rules_loader=(
@@ -231,7 +232,7 @@ def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
     try:
         return EffectiveConfig.from_mapping(
             {
-                "model": data.model,
+                "default_model": data.default_model,
                 "providers": data.providers,
                 "models": data.models,
                 "default_permission_mode": data.default_permission_mode,

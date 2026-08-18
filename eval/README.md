@@ -62,7 +62,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner compare `
 
 ## 真实 Provider 与成本
 
-真实 Provider 不是默认路径。只有同时提供 `--live`、`--live-authorized`、Provider kind、`--model <真实模型标识>` 和 API-key 环境变量名称时，runner 才允许进入真实调用链；`--model` 是必填的实际远端模型 ID，并会以 `model_id` 写入每个 attempt 的不可变指纹和聚合报告。API key 的真实值仍只能由环境变量提供，绝不写入参数、报告或日志。授权必须来自用户对网络访问与费用的明确决定。
+真实 Provider 不是默认路径。只有同时提供 `--live`、`--live-authorized`、Provider kind、`--model <真实模型标识>` 和 API-key 环境变量名称时，runner 才允许进入真实调用链；`--model` 是必填的实际远端模型 ID，并会以 `model_id` 写入每个 attempt 的不可变指纹和聚合报告。独立 Eval CLI 保留 `--api-key-env` 参数，在边界解析为新的内部凭据；它不形成 `config.toml` 双轨。API key 的真实值绝不写入参数、报告或日志。授权必须来自用户对网络访问与费用的明确决定。
 
 真实运行示例（仅示例，不代表已授权或已执行）：
 
