@@ -96,7 +96,9 @@ class InstructionFileReader(Protocol):
 _INCLUDE_RE = re.compile(
     r'^\s*@include\(\s*(?:"(?P<double>[^"\r\n]+)"|\'(?P<single>[^\'\r\n]+)\')\s*\)\s*$'
 )
-_FENCE_RE = re.compile(r"^\s*(?P<marker>`{3,}|~{3,})")
+_FENCE_RE = re.compile(
+    r"^[ ]{0,3}(?P<marker>`{3,}|~{3,})(?P<tail>[^\r\n]*)$"
+)
 
 
 def parse_instruction_references(content: str) -> tuple[str, ...]:
@@ -111,6 +113,7 @@ def parse_instruction_references(content: str) -> tuple[str, ...]:
     references: list[str] = []
     in_fence = False
     fence_character = ""
+    fence_length = 0
     for line in content.splitlines():
         fence = _FENCE_RE.match(line)
         if fence is not None:
@@ -118,9 +121,15 @@ def parse_instruction_references(content: str) -> tuple[str, ...]:
             if not in_fence:
                 in_fence = True
                 fence_character = marker[0]
-            elif marker[0] == fence_character:
+                fence_length = len(marker)
+            elif (
+                marker[0] == fence_character
+                and len(marker) >= fence_length
+                and not fence.group("tail").strip()
+            ):
                 in_fence = False
                 fence_character = ""
+                fence_length = 0
             continue
         if in_fence:
             continue

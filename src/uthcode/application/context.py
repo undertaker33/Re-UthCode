@@ -252,6 +252,36 @@ class ApplicationContextService:
         self._compaction_events.append(dict(event))
         del self._compaction_events[:-16]
 
+    def finalize_compaction(self, result: CompactionResult) -> None:
+        """Reconcile diagnostics with the final persistence outcome.
+
+        ``compact()`` records the in-memory candidate before Application
+        persists its Projection.  A failed append must replace that provisional
+        completed event so public diagnostics describe the same result callers
+        receive.
+        """
+
+        if not isinstance(result, CompactionResult):
+            raise TypeError("result must be a CompactionResult")
+        if self._last_compaction is None:
+            return
+        event = dict(self._last_compaction)
+        event.update(
+            {
+                "status": (
+                    "failed"
+                    if result.failure is not None
+                    else ("completed" if result.changed else "no_change")
+                ),
+                "changed": result.changed,
+                "failure": result.failure,
+                "batch_count": len(result.batches),
+            }
+        )
+        self._last_compaction = event
+        if self._compaction_events:
+            self._compaction_events[-1] = dict(event)
+
     def compose_generation_request(
         self,
         messages: Sequence[Message],

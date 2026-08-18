@@ -641,7 +641,7 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
         raise TypeError("snapshot must be a ContextSnapshot")
     result: list[Message] = []
     contextual_texts: list[str] = []
-    last_history_identity: tuple[str, str, str] | None = None
+    last_history_identity: tuple[str, ...] | None = None
     last_history_was_full_message = False
 
     def append(message: Message) -> None:
@@ -735,16 +735,35 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
 
 def _history_entry_message(
     entry: HistoryEntry,
-) -> tuple[tuple[str, str, str], Message, bool]:
+) -> tuple[tuple[str, ...], Message, bool]:
     if not hasattr(entry, "payload") or not hasattr(entry, "kind"):
         raise ContextCompilationError("history entry is malformed")
     payload = entry.payload
     if isinstance(payload, Mapping):
+        def identity_for(message: Message) -> tuple[str, ...]:
+            # The turn is a recovery scope, not a Message identity.  A single
+            # Turn may contain multiple adjacent user Messages (for example
+            # Steering) and multiple independent structured Messages with
+            # the same role.  Application/Core history writers persist the
+            # deterministic ``message_id`` created from each message's first
+            # sequence; use it when present and never fall back to text.
+            message_id = payload.get("message_id")
+            if isinstance(message_id, str) and message_id.strip():
+                return (entry.session_id, entry.turn_id, message.role, message_id)
+            # Core also accepts standalone atomic History entries that do not
+            # claim to represent a reconstructable full Message.  Keep those
+            # entry-local; only the full-message persistence envelope below
+            # requires an explicit Message identity.
+            return (entry.session_id, entry.turn_id, message.role, f"entry:{entry.sequence}")
+
         message_value = payload.get("message")
         if isinstance(message_value, Mapping):
+            message_id = payload.get("message_id")
+            if not isinstance(message_id, str) or not message_id.strip():
+                raise ContextCompilationError("history message identity is missing")
             try:
                 message = Message.from_dict(message_value)
-                return (entry.session_id, entry.turn_id, message.role), message, True
+                return identity_for(message), message, True
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history message payload is malformed") from None
         part_value = payload.get("part")
@@ -752,19 +771,19 @@ def _history_entry_message(
             role = payload.get("role", "user")
             try:
                 message = Message.from_dict({"role": role, "parts": [part_value]})
-                return (entry.session_id, entry.turn_id, message.role), message, False
+                return identity_for(message), message, False
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history part payload is malformed") from None
         if payload.get("type") == "tool_call":
             try:
                 message = Message.from_dict({"role": "assistant", "parts": [dict(payload)]})
-                return (entry.session_id, entry.turn_id, message.role), message, False
+                return identity_for(message), message, False
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history ToolCall payload is malformed") from None
         if payload.get("type") == "tool_result":
             try:
                 message = Message.from_dict({"role": "tool", "parts": [dict(payload)]})
-                return (entry.session_id, entry.turn_id, message.role), message, False
+                return identity_for(message), message, False
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history ToolResult payload is malformed") from None
     raise ContextCompilationError("history entry does not carry a Message payload")

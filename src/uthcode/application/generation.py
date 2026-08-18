@@ -55,6 +55,7 @@ from .sessions import (
     ApplicationSession,
     ApplicationSessionService,
     HistoryAppendOutcome,
+    ProjectionAppendOutcome,
     SessionCatalogEntry,
 )
 from .tools import ApplicationToolService
@@ -264,8 +265,10 @@ class UthCodeApplication:
             "error_code": None,
         }
         if self._instruction_loader is not None:
-            # Session-start loading is Application-owned; the loader itself
-            # keeps filesystem policy in its Integration adapter.
+            # Application construction may collect diagnostics for the
+            # interactive shell.  Formal create/resume/refresh boundaries
+            # below rebuild with strict=True before a Session becomes active,
+            # so this diagnostic prefix is never persisted or adopted there.
             self._instruction_loader.load_session(strict=False)
         self._current_model_ref = (
             configuration.model if configuration is not None else provider.identity.model
@@ -406,9 +409,63 @@ class UthCodeApplication:
             summarize=summarize,
         )
         if result.changed and result.projection is not None:
-            session.append_projection(result.projection)
-            self._refresh_context_for_session(session)
+            result = self._commit_projection_candidate(session, result)
         return result
+
+    def _commit_projection_candidate(
+        self,
+        session: ApplicationSession,
+        result: CompactionResult,
+    ) -> CompactionResult:
+        """Commit a Projection candidate without confusing persistence failure with success."""
+
+        def finish(final: CompactionResult) -> CompactionResult:
+            self._context_service.finalize_compaction(final)
+            return final
+
+        candidate = result.projection
+        if candidate is None:
+            return finish(result)
+        try:
+            outcome = session.append_projection(candidate)
+        except Exception:
+            # Validation or a pre-append failure means no Projection was
+            # committed.  The writer remains the authority for whether a
+            # retry is safe; do not expose the in-memory candidate as active.
+            return finish(replace(
+                result,
+                projection=session.projection,
+                summary=(session.projection.summary if session.projection is not None else None),
+                changed=False,
+                failure="projection_append_failed",
+            ))
+        if not isinstance(outcome, ProjectionAppendOutcome):
+            session._quarantine_unknown_durability()
+            return finish(replace(
+                result,
+                projection=session.projection,
+                summary=(session.projection.summary if session.projection is not None else None),
+                changed=False,
+                failure="projection_durability_unknown",
+            ))
+        if outcome.durability == "unknown":
+            return finish(replace(
+                result,
+                projection=session.projection,
+                summary=(session.projection.summary if session.projection is not None else None),
+                changed=False,
+                failure="projection_durability_unknown",
+            ))
+        if not outcome.projection_appended:
+            return finish(replace(
+                result,
+                projection=session.projection,
+                summary=(session.projection.summary if session.projection is not None else None),
+                changed=False,
+                failure=outcome.failure_stage or "projection_append_failed",
+            ))
+        self._refresh_context_for_session(session)
+        return finish(result)
 
     def list_sessions(self):
         if self._session_service is None:
@@ -898,8 +955,8 @@ class UthCodeApplication:
                         session_id=active.session_id,
                     )
                     if candidate.changed and candidate.projection is not None:
-                        active.append_projection(candidate.projection)
-                        return True
+                        committed = self._commit_projection_candidate(active, candidate)
+                        return committed.changed
             return False
 
         def prepare(

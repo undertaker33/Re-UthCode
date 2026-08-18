@@ -12,8 +12,10 @@ import pytest
 from uthcode.core.history import CanonicalHistory, HistoryKind, RuntimeLogEntry
 from uthcode.integrations.session_files import (
     HistoryAppendOutcome,
+    ProjectionAppendOutcome,
     SessionBusyError,
     SessionCorruptError,
+    SessionDurabilityUnknownError,
     SessionFileError,
     SessionFileStore,
     SessionWriter,
@@ -173,7 +175,129 @@ def test_append_history_reports_unknown_when_post_append_reconciliation_fails(
             writer.append_history(entries[:1])
         with pytest.raises(SessionFileError, match="durability is unknown"):
             writer.append_projection(_history.project(revision=1))
-        assert history_path.read_bytes().splitlines()
+    assert history_path.read_bytes().splitlines()
+
+
+def test_append_projection_reports_durable_when_post_append_touch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, history = _entries()
+    with store.open_writer("session-1") as writer:
+        writer.append_history(entries)
+        touch_calls = 0
+        original_touch = SessionWriter.touch
+
+        def fail_first_projection_touch(self: SessionWriter):
+            nonlocal touch_calls
+            touch_calls += 1
+            if touch_calls == 1:
+                raise OSError("injected Projection metadata touch failure")
+            return original_touch(self)
+
+        monkeypatch.setattr(SessionWriter, "touch", fail_first_projection_touch)
+        outcome = writer.append_projection(history.project(revision=1))
+
+        assert isinstance(outcome, ProjectionAppendOutcome)
+        assert outcome.projection_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is True
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "projection_metadata_sync"
+        assert outcome.snapshot.projection is not None
+        assert outcome.snapshot.projection.revision == 1
+        assert writer.durability_unknown is False
+
+    recovered = store.read_session("session-1")
+    assert recovered.projection is not None
+    assert recovered.projection.revision == 1
+
+
+def test_append_projection_reconciles_post_append_reload_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, history = _entries()
+    with store.open_writer("session-1") as writer:
+        writer.append_history(entries)
+        reload_calls = 0
+        original_reload = SessionWriter._reload
+
+        def fail_first_projection_reload(self: SessionWriter, *, touch: bool):
+            nonlocal reload_calls
+            reload_calls += 1
+            if reload_calls == 1:
+                raise OSError("injected Projection reload failure")
+            return original_reload(self, touch=touch)
+
+        monkeypatch.setattr(SessionWriter, "_reload", fail_first_projection_reload)
+        outcome = writer.append_projection(history.project(revision=1))
+
+        assert outcome.projection_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is True
+        assert outcome.failure_stage == "projection_reload"
+        assert writer.snapshot.projection is not None
+        assert writer.snapshot.last_record_sequence == 4
+
+    recovered = store.read_session("session-1")
+    assert recovered.projection is not None
+    assert recovered.projection.revision == 1
+    assert recovered.last_record_sequence == 4
+
+
+def test_append_projection_unknown_durability_quarantines_all_writes_until_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project-1")
+    entries, history = _entries()
+    with store.open_writer("session-1") as writer:
+        writer.append_history(entries)
+
+        def fail_reload(self: SessionWriter, *, touch: bool):
+            raise OSError("injected Projection reload failure")
+
+        def fail_load(*args: object, **kwargs: object):
+            raise OSError("injected Projection reconciliation read failure")
+
+        monkeypatch.setattr(SessionWriter, "_reload", fail_reload)
+        monkeypatch.setattr(store, "_load_snapshot", fail_load)
+        outcome = writer.append_projection(history.project(revision=1))
+
+        assert outcome.projection_appended is False
+        assert outcome.durability == "unknown"
+        assert outcome.failure_stage == "projection_durability_unknown"
+        assert writer.durability_unknown is True
+        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
+            writer.append_history(entries[:1])
+        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
+            writer.append_projection(history.project(revision=1))
+        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
+            writer.append_runtime(RuntimeLogEntry("projection-unknown"))
+
+    # The record is recoverable after the process-held quarantined writer is
+    # closed, and a fresh writer can continue with the next Projection
+    # revision without duplicating the durable record.
+    monkeypatch.undo()
+    with store.open_writer("session-1") as writer:
+        assert writer.snapshot.projection is not None
+        assert writer.snapshot.projection.revision == 1
+        next_projection = history.project(revision=2)
+        outcome = writer.append_projection(next_projection)
+        assert outcome.projection_appended is True
+        assert outcome.snapshot.projection is not None
+        assert outcome.snapshot.projection.revision == 2
+    recovered = store.read_session("session-1")
+    assert recovered.projection is not None
+    assert recovered.projection.revision == 2
+    assert recovered.last_record_sequence == 5
 
 
 def test_tail_recovery_repairs_before_next_append_and_middle_damage_fails_closed(tmp_path: Path) -> None:

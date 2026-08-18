@@ -20,6 +20,7 @@ from uthcode.application import (
     create_builtin_registry,
 )
 from uthcode.application.instructions import InstructionLoader
+from uthcode.application.history import history_entries_for_message
 from uthcode.application.runtime_context import ApplicationRuntimeContext
 from uthcode.core.history import (
     CanonicalHistory,
@@ -335,6 +336,46 @@ async def test_resumed_history_is_injected_once_across_multiple_turns(
         assert "TURN_1_MARKER" in _request_text(second_request)
         assert "TURN_2_MARKER" in _request_text(second_request)
         assert second_request.messages[-1].parts[-1] == TextPart("TURN_2_MARKER")
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_adjacent_same_role_messages_within_one_turn(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(events=(_completed(),))
+    store = SessionFileStore(tmp_path / "sessions")
+    application = _application(tmp_path, store, provider=provider)
+    try:
+        session = application.create_session("resume-same-turn")
+        messages = (
+            Message("user", (TextPart("initial request"),)),
+            Message("user", (TextPart("steering request"),)),
+            Message("assistant", (TextPart("first answer"),)),
+            Message("assistant", (TextPart("second answer"),)),
+            Message("user", (TextPart("part-one"), TextPart("part-two"))),
+        )
+        history = CanonicalHistory("resume-same-turn")
+        sequence = 1
+        for message in messages:
+            entries = history_entries_for_message(
+                "resume-same-turn",
+                "same-turn",
+                sequence,
+                message,
+            )
+            history = CanonicalHistory("resume-same-turn", history.entries + entries)
+            sequence += len(entries)
+        session.append_history(history.entries)
+        session.close()
+
+        application.resume_session_for_command("resume-same-turn")
+        await application.create_run().start_turn("continue").result()
+
+        request = provider.recorded_requests[0]
+        assert request.messages[: len(messages)] == messages
+        assert request.messages[-1].parts[-1] == TextPart("continue")
     finally:
         application.close()
 

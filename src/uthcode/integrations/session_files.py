@@ -237,6 +237,40 @@ class HistoryAppendOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectionAppendOutcome:
+    """Separate durable Projection append from reload and metadata touch.
+
+    A Projection record is part of the append-only History file.  The JSONL
+    write can therefore succeed even when the subsequent in-memory reload or
+    last-used metadata touch fails.  Callers must be able to distinguish that
+    durable half-success from a safely retryable non-write and from an outcome
+    that cannot be reconciled while the current writer is still held.
+    """
+
+    snapshot: SessionSnapshot
+    projection_appended: bool
+    reload_succeeded: bool
+    metadata_synced: bool
+    failure_stage: str | None
+    durability: str
+
+    def __post_init__(self) -> None:
+        if self.durability not in {
+            "not_attempted",
+            "durable",
+            "not_durable",
+            "unknown",
+        }:
+            raise ValueError(f"unknown Projection append durability: {self.durability!r}")
+        if self.projection_appended != (self.durability == "durable"):
+            raise ValueError("projection_appended must match the durable outcome")
+        if not isinstance(self.reload_succeeded, bool):
+            raise TypeError("reload_succeeded must be a boolean")
+        if not isinstance(self.metadata_synced, bool):
+            raise TypeError("metadata_synced must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class _ParsedLine:
     value: Mapping[str, object]
     start: int
@@ -725,7 +759,7 @@ class SessionWriter:
             policy=policy,
         )
 
-    def append_projection(self, projection: Projection) -> SessionSnapshot:
+    def append_projection(self, projection: Projection) -> ProjectionAppendOutcome:
         self._require_writable()
         if not isinstance(projection, Projection):
             raise TypeError("projection must be a Projection")
@@ -751,9 +785,128 @@ class SessionWriter:
             "sequence": self.snapshot.next_record_sequence,
             "projection": projection.to_dict(),
         }
-        _append_jsonl(self.store.session_path(self.session_id) / "history.jsonl", (envelope,))
-        self._reload(touch=True)
-        return self.snapshot
+        before = self.snapshot
+        path = self.store.session_path(self.session_id) / "history.jsonl"
+        try:
+            _append_jsonl(path, (envelope,))
+        except Exception:
+            reconciliation, snapshot = self._reconcile_projection_append(before, projection)
+            if reconciliation == "durable":
+                return self._finish_projection_append(
+                    reload_succeeded=False,
+                    failure_stage="projection_append_reconciled",
+                )
+            if reconciliation == "not_durable":
+                return ProjectionAppendOutcome(
+                    snapshot=self.snapshot if snapshot is None else snapshot,
+                    projection_appended=False,
+                    reload_succeeded=False,
+                    metadata_synced=False,
+                    failure_stage="projection_append",
+                    durability="not_durable",
+                )
+            self.quarantine_unknown_durability()
+            return ProjectionAppendOutcome(
+                snapshot=self.snapshot,
+                projection_appended=False,
+                reload_succeeded=False,
+                metadata_synced=False,
+                failure_stage="projection_durability_unknown",
+                durability="unknown",
+            )
+
+        try:
+            # Keep reload and metadata touch as distinct post-append stages.
+            # A failure here must be reconciled against the durable record
+            # before the caller decides whether a retry is safe.
+            self._reload(touch=False)
+        except Exception:
+            reconciliation, snapshot = self._reconcile_projection_append(before, projection)
+            if reconciliation == "durable":
+                return self._finish_projection_append(
+                    reload_succeeded=False,
+                    failure_stage="projection_reload",
+                )
+            if reconciliation == "not_durable":
+                return ProjectionAppendOutcome(
+                    snapshot=self.snapshot if snapshot is None else snapshot,
+                    projection_appended=False,
+                    reload_succeeded=False,
+                    metadata_synced=False,
+                    failure_stage="projection_reload",
+                    durability="not_durable",
+                )
+            self.quarantine_unknown_durability()
+            return ProjectionAppendOutcome(
+                snapshot=self.snapshot,
+                projection_appended=False,
+                reload_succeeded=False,
+                metadata_synced=False,
+                failure_stage="projection_durability_unknown",
+                durability="unknown",
+            )
+        return self._finish_projection_append(
+            reload_succeeded=True,
+            failure_stage=None,
+        )
+
+    def _finish_projection_append(
+        self,
+        *,
+        reload_succeeded: bool,
+        failure_stage: str | None,
+    ) -> ProjectionAppendOutcome:
+        metadata_synced = True
+        final_failure_stage = failure_stage
+        try:
+            self.touch()
+        except Exception:
+            metadata_synced = False
+            if final_failure_stage is None:
+                final_failure_stage = "projection_metadata_sync"
+        return ProjectionAppendOutcome(
+            snapshot=self.snapshot,
+            projection_appended=True,
+            reload_succeeded=reload_succeeded,
+            metadata_synced=metadata_synced,
+            failure_stage=final_failure_stage,
+            durability="durable",
+        )
+
+    def _reconcile_projection_append(
+        self,
+        before: SessionSnapshot,
+        projection: Projection,
+    ) -> tuple[str, SessionSnapshot | None]:
+        """Reconcile one Projection append by record identity, not content heuristics."""
+
+        try:
+            loaded = self.store._load_snapshot(
+                self.store.session_path(self.session_id),
+                expected_project_key=self.expected_project_key,
+                recover_incomplete_tail=False,
+            )
+            actual = loaded.snapshot
+            expected_record_sequence = before.next_record_sequence
+            if (
+                actual.history.entries == before.history.entries
+                and actual.projection == before.projection
+                and actual.last_record_sequence == before.last_record_sequence
+            ):
+                self._loaded = loaded
+                self._repair_tails()
+                return "not_durable", loaded.snapshot
+            if (
+                actual.history.entries == before.history.entries
+                and actual.projection == projection
+                and actual.last_record_sequence == expected_record_sequence
+            ):
+                self._loaded = loaded
+                self._repair_tails()
+                return "durable", loaded.snapshot
+            return "unknown", actual
+        except Exception:
+            return "unknown", None
 
     def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
         self._require_writable()
@@ -1152,6 +1305,7 @@ def _read_runtime(path: Path) -> tuple[RuntimeLog, int, int, list[str]]:
 
 __all__ = [
     "HistoryAppendOutcome",
+    "ProjectionAppendOutcome",
     "SESSION_RECORD_SCHEMA_VERSION",
     "SESSION_SCHEMA_VERSION",
     "SessionBusyError",

@@ -9,6 +9,7 @@ from pathlib import Path
 from uthcode.core.history import HistoryEntry, HistoryKind, Projection, RuntimeLogEntry
 from uthcode.integrations.session_files import (
     HistoryAppendOutcome,
+    ProjectionAppendOutcome,
     SessionFileStore,
     SessionFileError,
     SessionMetadata,
@@ -132,7 +133,7 @@ class ApplicationSession:
         self._require_writable()
         return self._writer.append_history(entries)
 
-    def append_projection(self, projection: Projection) -> SessionSnapshot:
+    def append_projection(self, projection: Projection) -> ProjectionAppendOutcome:
         self._require_writable()
         return self._writer.append_projection(projection)
 
@@ -266,28 +267,11 @@ class ApplicationSessionService:
 
     def create_session(self, session_id: str | None = None) -> ApplicationSession:
         self._require_no_active_session()
-        if self.instruction_loader is not None:
-            self.instruction_loader.reset_for_new_session()
-            result = self.instruction_loader.load_session(strict=False)
-            state = result.instruction_state.to_dict()
-        else:
-            state = InstructionStateMetadata().to_dict()
-        metadata = self.store.create_session(
-            session_id,
-            project_key=self.project_key,
-            instruction_state=state,
-        )
-        writer = self.store.open_writer(
-            metadata.session_id,
-            expected_project_key=self.project_key,
-        )
-        try:
-            writer.__enter__()
-        except Exception:
-            writer.close()
-            raise
-        session = ApplicationSession(self, writer)
-        self._active = session
+        # Keep Loader state transactional just like the command path: strict
+        # include failure must not clear or partially replace the current
+        # loader before a Session and its metadata are committed.
+        staged = self._stage_create_session(session_id)
+        session = self._commit_staged(staged)
         self._record_operation(
             "create",
             "success",
@@ -321,23 +305,11 @@ class ApplicationSessionService:
 
     def resume_session(self, session_id: str) -> ApplicationSession:
         self._require_no_active_session()
-        writer = self.store.open_writer(
-            session_id,
-            expected_project_key=self.project_key,
-        )
-        try:
-            writer.__enter__()
-            if self.instruction_loader is not None:
-                state = InstructionStateMetadata.from_dict(writer.snapshot.metadata.instruction_state)
-                self.instruction_loader.rebuild_from_metadata(state, strict=False)
-                self._sync_instruction_state(writer)
-            else:
-                writer.touch()
-        except Exception:
-            writer.close()
-            raise
-        session = ApplicationSession(self, writer)
-        self._active = session
+        # Use the same staged loader boundary as the command path.  A strict
+        # include failure must not leave a previously active instruction
+        # prefix installed on the Application while this target is rejected.
+        staged = self._stage_resume_session(session_id)
+        session = self._commit_staged(staged)
         self._record_operation(
             "resume",
             "success",
@@ -436,7 +408,7 @@ class ApplicationSessionService:
         if self.instruction_loader is not None:
             candidate_loader = self.instruction_loader.fork_for_session()
             candidate_loader.reset_for_new_session()
-            result = candidate_loader.load_session(strict=False)
+            result = candidate_loader.load_session(strict=True)
             state = result.instruction_state.to_dict()
         else:
             state = InstructionStateMetadata().to_dict()
@@ -471,7 +443,7 @@ class ApplicationSessionService:
                 state = InstructionStateMetadata.from_dict(
                     writer.snapshot.metadata.instruction_state
                 )
-                candidate_loader.rebuild_from_metadata(state, strict=False)
+                candidate_loader.rebuild_from_metadata(state, strict=True)
                 # Persist only the target's freshly rebuilt metadata.  The
                 # current loader is not changed until _commit_staged().
                 writer.update_instruction_state(
@@ -497,7 +469,7 @@ class ApplicationSessionService:
         state = InstructionStateMetadata.from_dict(
             active._writer.snapshot.metadata.instruction_state
         )
-        candidate_loader.rebuild_from_metadata(state, strict=False)
+        candidate_loader.rebuild_from_metadata(state, strict=True)
         active._writer.update_instruction_state(
             candidate_loader.instruction_state.to_dict()
         )
@@ -563,6 +535,7 @@ __all__ = [
     "ApplicationSession",
     "ApplicationSessionService",
     "HistoryAppendOutcome",
+    "ProjectionAppendOutcome",
     "SessionCatalogEntry",
     "SessionActiveError",
     "SessionOperationError",
