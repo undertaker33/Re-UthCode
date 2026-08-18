@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 原始需求已收拢并完成事实核验；Spec、Tasks、Checklist 与 W01～W07 Prompt 已生成，尚未显式派发任何 Worker，源码仍为固定 258K + Projection + `summarizer_unavailable` 基线 |
+| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已按基线 `1887361d...` 和新 D3 从零重写 Taskbook，并重新生成 9 个 Task、Checklist 与 W01～W06 Prompt；尚未显式派发任何 Worker，源码仍为固定 258K + Projection + `summarizer_unavailable` 基线 |
 
 ## 跨层最短链路
 

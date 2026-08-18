@@ -1,51 +1,33 @@
-# W05 L5 Timeline Aging / HistoryRead Worker Prompt
+# W05 L5 Independent Aging / HistoryRead Worker Prompt
 
 ## 任务范围与顺序
 
-在 W01～W04 完成后，只执行 Task 5：L5 Timeline Aging 与 HistoryRead。完成 Feedback 后停止，不接 command lifecycle 或最终文档。
+W01～W04完成后只执行Task 5“L5独立老化与 HistoryRead”。完成Feedback后停止，不接manual command或最终文档。
 
 ## 必须读取
 
-1. `AGENTS.md`、`docs/README.md`、`docs/Context-Index.md`
-2. `docs/rules/WorkPackageRules.md`
-3. 本工作包原始需求、Spec、Tasks、Checklist
-4. `docs/context/A01-AgentRuntime/AgentRuntime-Context.md`
-5. `docs/context/A03-State/State-Context.md`
-6. W01～W04 Feedback
-7. Task 5 列出的源码、测试、现有 `ToolResultRead` 与 default tool composition
+全局规则、WorkPackageRules、本工作包四文件、A01/A03 Context、W01～W04 Feedback、Task 5源码测试、现有ToolResultRead/default tool composition。使用`re-uthcode`。
 
-使用 Conda 环境 `re-uthcode`。冻结文档不得改写；只勾选 Task 5 已满足复选框并创建/追加 Feedback。
+必须逐一读取：`application/context.py`、`application/tools.py`、`application/bootstrap.py`、`integrations/tools/factory.py`、现有`integrations/tools/tool_result_read.py`、`tests/test_timeline_contract.py`、`tests/test_context_compaction.py`、`tests/test_application_tools.py`、`tests/test_tool_result_persistence.py`、`tests/test_context_budget_gate.py`。
 
-## 已确认决策
+冻结文档不得改写；只勾选Task 5现有项并创建/追加Feedback。
 
-- L5 仅处理 old complete Compact Epoch；Epoch 由 checkpoint transaction 边界推导。
-- L5 每次重新读取 raw Transcript refs，不把旧 fine/macro summary 当作权威证据，不做 summary-of-summary。
-- 成功结果为一个 bounded EpochMacroSummary，随后最后提交 ActiveCheckpoint；旧 records 物理保留、逻辑由 coverage 替代。
-- 当前模型无 safe epoch 时 fail closed，不静默切模型。
-- HistoryRead 与 ToolResultRead 独立：current Session only、opaque exact ref、bounded page、read-only、no index/search、不接受路径、不递归 externalize。
+## 冻结决策
 
-## 修改范围
+- D1：L5使用当前主模型，内部request无Agent Tools并通过Hard Gate。
+- D2：无Compact FSM。
+- D3：L5 Fine Timeline pressure独立于Auto/Hard pressure。
+- L5只选择old complete epoch并重读raw Transcript refs；不做summary-of-summary。
+- HistoryRead current Session only、opaque exact ref、bounded、read-only、no path/search/cross-session。
 
-仅修改 Tasks Task 5 列出的文件；新增 `src/uthcode/integrations/tools/history_read.py`、`tests/test_history_read_tool.py`。若 default tool factory 需要机械注册可最小修改对应列出文件。
+## 修改范围与交付
 
-## 必须交付
-
-- Fine Timeline > F 的 old complete epoch selection、raw evidence resolution、macro commit 与 logical supersede。
-- no-safe-epoch、cancel、invalid result 继续 checkpoint-safe。
-- HistoryRead same-session ownership、opaque ref validation、bounded pagination、cross-session/path denial。
-- 保持 ToolResultRead、Permission/Tool FIFO 与大 Tool Result 行为不回退。
+仅Task 5文件，新增HistoryRead实现与测试。交付Fine pressure trigger、raw provenance、macro+checkpoint、logical supersession、no-safe-epoch和安全reader；保持ToolResultRead/Permission/FIFO不回退。
 
 ## 禁止
 
-- 不实现 Memory、semantic search、embedding、cross-session history、Timeline GC、Artifact lifecycle。
-- 不使用 summary-of-summary，不创建通用 History Repository/Manager/Index。
-- 不修改 Command/TUI/status、Runtime recovery 或独立模型决策。
-- 不执行 Git 写入或归档。
+不实现Memory/retrieval/embedding、cross-session history、Timeline GC、通用Repository/Index、Command/TUI、Runtime recovery或Git写入。
 
-## 验证
+## 验证与Feedback
 
-逐项执行 Task 5 Checklist；测试必须证明 L5 request provenance 来自 raw Transcript，并覆盖 malformed/cross-session ref、bounded page、no-safe-epoch 与 ToolResultRead regression。
-
-## Feedback
-
-首次创建 `feedback/W05-l5-history-read-feedback.md`。说明 epoch/coverage、raw provenance、HistoryRead 安全边界、修改文件、精确测试、Checklist 状态、差异、风险与清理。
+执行Task 5 Checklist，证明L5在无Auto/Hard pressure下可触发且input来自raw evidence。创建`feedback/W05-l5-history-read-feedback.md`，记录epoch/coverage、安全边界、文件、精确测试、Checklist、差异、风险与cleanup。
