@@ -84,7 +84,9 @@ status_values:
 
 ### `not_implemented`
 
-当前无未实施工作包。
+| Task | 任务包 | 当前路径 | 当前证据 |
+| --- | --- | --- | --- |
+| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已基于 `94eb397f...` 验证当前源码与官方参考并完成 Spec、Tasks、Checklist 和 6 个 Worker Prompt；尚无 Worker Feedback，未开始实施 |
 
 ## 跨层最短链路
 
