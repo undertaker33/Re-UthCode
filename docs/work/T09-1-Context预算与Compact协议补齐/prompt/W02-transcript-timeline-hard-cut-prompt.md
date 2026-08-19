@@ -2,6 +2,10 @@
 
 你负责执行 T09-1 的 T02。前置 T01 必须已完成并有 Feedback；否则停止。不得执行 T03～T08，不做 Git 写入或归档。
 
+## 实施起点与事实核对
+
+以用户实际派发本 Prompt 时的当前仓库状态为实施起点，不要求 HEAD 等于任何固定 SHA，也不要求 checkout 历史 Commit。完整读取前置 W01 Feedback 与下列文件后，必须重新核对当前真实 `src/ + tests/` 与冻结任务定义；只有源码实质变化已经使产品语义、架构边界或 T02 hard-cut 完成范围失效时，才停止相关范围并按 Feedback 规则报告。普通后续 Commit、Feedback 追加或 Checklist 勾选不构成基线冲突。
+
 ## 开始前必须完整读取
 
 1. `AGENTS.md`、`docs/README.md`、`docs/Context-Index.md`、`docs/rules/WorkPackageRules.md`

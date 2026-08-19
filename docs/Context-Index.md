@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已基于 merge baseline `40e9b2ea...` 的等价 Git tree 原位返工：取消 bundled metadata，明确 user/project limit authority、分维 Provider limits、Pressure/Preflight/overflow 三层语义，并把 T01/T02 改为可独立运行的竖切任务；Spec、Tasks、Checklist 与 6 个 Worker Prompt 已同步，Feedback 为空，仍未开始实施 |
+| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 当前设计曾以历史分析基线 `40e9b2ea...` 核对源码事实；该 SHA 不构成 Worker 固定实施前置。任务包已取消 bundled metadata，明确 user/project limit authority、分维 Provider limits、Pressure/Preflight/overflow 三层语义，并将 T01/T02 收口为独立竖切任务；Worker 以实际派发时当前仓库状态重新核对 `src/ + tests/`。Spec、Tasks、Checklist 与 6 个 Worker Prompt 已同步，Feedback 为空，仍为 `not_implemented` |
 
 ## 跨层最短链路
 

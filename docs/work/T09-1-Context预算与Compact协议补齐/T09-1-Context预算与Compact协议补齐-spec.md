@@ -75,7 +75,8 @@ T09 已建立持久会话、确定性 Context Compiler、Tool Result 外置和�
 ### T08：[遗留负担清理] 删除阶段性与兼容逻辑
 
 - 删除固定 258K runtime authority、Projection/CanonicalHistory 生产语义、old Session 新写入、旧阶段文案和重复 Context 编排。
-- 删除 bundled official model metadata 相关设计、实现、测试和欠账；该路线已取消，不转记未来能力。
+- 确认 bundled official model metadata 相关设计、实现、测试和欠账持续不存在；该路线已取消，不重新登记为未来能力。
+- 重新盘点 `T02 Slash Command / TUI`、`B01 私有测试集 v0`、三条 T09 Context 欠账及其它被 T09-1 实际改变的条目；完全回补则删除、部分改变则更新、仍成立则保留、用户取消则删除且不转登记。
 - 删除不可达分支、重复导出、兼容 alias/wrapper；确认没有第四种 Timeline record、持久 Compact FSM、独立 compaction model 或无调用方抽象。
 
 ## 非功能要求
@@ -124,7 +125,7 @@ Timeline: Fine / Macro / Active checkpoint
 
 无新增能力欠账。
 
-本包实现完成后回补 T09 的动态模型限制、生产 tool-free Compaction、small/large-window adaptation 三项既有欠账。原先“维护 bundled official metadata”方案由用户明确取消：若滚动清单存在该项，应删除而非保留或改写为未来欠账。只有 T01～T08 全部完成、Checklist 完成且 Feedback 已记录后，才能删除其余已真实回补条目。
+本包实现完成后回补 T09 的动态模型限制、生产 tool-free Compaction、small/large-window adaptation 三项既有欠账。原先“维护 bundled official metadata”方案已取消并已从滚动清单移除，后续只确认其持续不存在。T08 还必须重新盘点因 `/compact` 和生产 Compaction 结果变化而部分受影响的 `T02 Slash Command / TUI`、`B01 私有测试集 v0` 等条目；只有实现完成、对应 Checklist 完成且 Feedback 有真实验收记录，才删除已完全回补部分，部分改变的记录必须改写而不是整条误删。
 
 ## Out of Scope
 

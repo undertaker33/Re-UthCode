@@ -2,9 +2,13 @@
 
 你负责按顺序执行 T09-1 的 T05、T06。T01～T04 必须完成并有 Feedback。先独立完成并验收 T05，再执行 T06；不得执行 T07/T08，不做 Git 写入或归档。
 
+## 实施起点与事实核对
+
+以用户实际派发本 Prompt 时的当前仓库状态为实施起点，不要求 HEAD 等于任何固定 SHA，也不要求 checkout 历史 Commit。完整读取前置 Feedback 与下列文件后，必须重新核对当前真实 `src/ + tests/`；只有源码实质变化已经使冻结产品语义、架构边界或 T05/T06 完成范围失效时，才停止相关范围并按 Feedback 规则报告。普通后续 Commit、Feedback 追加或 Checklist 勾选不构成基线冲突。
+
 ## 开始前必须完整读取
 
-- `AGENTS.md`、文档路由、工作包规则、T09-1 四份主文档与 W01～W04 Feedback。
+- `AGENTS.md`、`docs/README.md`、`docs/Context-Index.md`、`docs/rules/WorkPackageRules.md`、T09-1 四份主文档与 W01～W04 Feedback。
 - `core/agent.py` awaitable preparer/overflow 代码及测试；Application generation/context/session/tools/bootstrap；command registry/dispatcher/builtins；CLI/TUI 正式入口。
 
 ## T05：Application/Headless 完成边界
