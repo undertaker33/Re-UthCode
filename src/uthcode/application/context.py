@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from uthcode.core.context import (
+    ContextBudget,
     CompactionResult,
     ContextCompactor,
     ContextCompiler,
+    ContextCountEstimate,
+    ContextRequestSafetyError,
     ContextSnapshot,
     ContextSourceBundle,
     ContextUsage,
+    RequestAccounting,
+    account_generation_request,
+    evaluate_gates,
     instruction_text_from_context_snapshot,
     messages_from_context_snapshot,
+    preflight_safety_count,
+    pressure_estimate,
+    resolve_context_budget,
 )
 from uthcode.core.history import CanonicalHistory, Projection
 from uthcode.core.prompt import (
@@ -35,8 +44,12 @@ from uthcode.core.prompt import (
 from uthcode.core.provider import (
     GenerationRequest,
     Message,
+    ModelLimits,
     ReasoningOptions,
+    ReasoningPart,
     ToolDefinition,
+    ToolResultPart,
+    TextPart,
 )
 from uthcode.core.provider import CancellationToken
 
@@ -60,6 +73,11 @@ class ApplicationContextService:
         self._compact_count = 0
         self._compaction_events: list[dict[str, object]] = []
         self._last_compaction: dict[str, object] | None = None
+        self._last_budget: ContextBudget | None = None
+        self._last_gate: dict[str, object] | None = None
+        self._last_pressure: ContextCountEstimate | None = None
+        self._last_accounting: RequestAccounting | None = None
+        self._last_count_fallback: str | None = None
 
     @property
     def compiler(self) -> ContextCompiler:
@@ -84,6 +102,7 @@ class ApplicationContextService:
         environment_sources: Sequence[object] = (),
         tool_definitions: Sequence[ToolDefinition] = (),
         previous_snapshot: ContextSnapshot | None = None,
+        context_budget: ContextBudget | None = None,
     ) -> ContextSnapshot:
         if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
             raise TypeError("instruction_loader must be InstructionLoader or None")
@@ -92,6 +111,8 @@ class ApplicationContextService:
         ordinary_tools = tuple(tool_definitions)
         if not all(isinstance(item, ToolDefinition) for item in ordinary_tools):
             raise TypeError("tool_definitions must contain ToolDefinition values")
+        if context_budget is not None and not isinstance(context_budget, ContextBudget):
+            raise TypeError("context_budget must be a ContextBudget or None")
 
         project_source = None
         if instruction_loader is not None:
@@ -135,11 +156,18 @@ class ApplicationContextService:
             environment_sources=tuple(environment_sources),
             tool_source=tool_source,
         )
-        snapshot = self._compiler.compile(
+        compiler = self._compiler
+        if context_budget is not None and compiler.budget_tokens != context_budget.effective_input_limit:
+            compiler = ContextCompiler(
+                budget_tokens=context_budget.effective_input_limit,
+                token_estimator=compiler.token_estimator,
+            )
+        snapshot = compiler.compile(
             bundle,
             previous_snapshot=(self._last_snapshot if previous_snapshot is None else previous_snapshot),
         )
         self._last_snapshot = snapshot
+        self._last_budget = context_budget
         return snapshot
 
     def usage(self, snapshot: ContextSnapshot | None = None) -> ContextUsage:
@@ -234,6 +262,21 @@ class ApplicationContextService:
         return {
             "schema_version": 1,
             "context": context,
+            "budget": (
+                None if self._last_budget is None else self._last_budget.to_dict()
+            ),
+            "request_accounting": (
+                None
+                if self._last_accounting is None
+                else self._last_accounting.to_dict()
+            ),
+            "gate": None if self._last_gate is None else dict(self._last_gate),
+            "pressure": (
+                None
+                if self._last_pressure is None
+                else self._last_pressure.to_dict()
+            ),
+            "count_fallback": self._last_count_fallback,
             "compaction": {
                 # A resumed Session may already carry a durable Projection
                 # revision before this process performs a compaction.  Keep
@@ -304,8 +347,24 @@ class ApplicationContextService:
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         previous_snapshot: ContextSnapshot | None = None,
+        configured_input_limit: int | None = None,
+        provider_limits: ModelLimits | None = None,
+        context_budget: ContextBudget | None = None,
+        provider_count: ContextCountEstimate | int | None = None,
+        defer_hard_gate: bool = False,
+        count_fallback: str | None = None,
+        candidate_messages: Sequence[Message] | None = None,
+        disable_reductions: bool = False,
+        reduction_levels: Sequence[str] = (),
     ) -> tuple[GenerationRequest, ContextSnapshot]:
-        """Compile every runtime request through one fixed-budget Context path."""
+        """Compile and, when limits are supplied, preflight one final request.
+
+        The service is also used by read-only Context tests and diagnostics,
+        so callers may omit limits when they only need a provider-independent
+        snapshot.  The formal Application generation path always supplies a
+        resolved ``ContextBudget`` before it can hand this request to a
+        Provider.
+        """
 
         values = tuple(messages)
         if not all(isinstance(message, Message) for message in values):
@@ -339,6 +398,37 @@ class ApplicationContextService:
         ordinary_tools = tuple(tool_definitions)
         if not all(isinstance(item, ToolDefinition) for item in ordinary_tools):
             raise TypeError("tool_definitions must contain ToolDefinition values")
+        if provider_limits is not None and not isinstance(provider_limits, ModelLimits):
+            raise TypeError("provider_limits must be ModelLimits or None")
+        if context_budget is not None and not isinstance(context_budget, ContextBudget):
+            raise TypeError("context_budget must be a ContextBudget or None")
+        if not isinstance(defer_hard_gate, bool):
+            raise TypeError("defer_hard_gate must be a boolean")
+        if not isinstance(disable_reductions, bool):
+            raise TypeError("disable_reductions must be a boolean")
+        if count_fallback is not None and (
+            not isinstance(count_fallback, str) or not count_fallback
+        ):
+            raise ValueError("count_fallback must be a non-empty string or None")
+        if candidate_messages is not None:
+            candidate_messages = tuple(candidate_messages)
+            if not all(isinstance(message, Message) for message in candidate_messages):
+                raise TypeError("candidate_messages must contain Message values")
+        reduction_levels = tuple(reduction_levels)
+        if any(not isinstance(level, str) or not level for level in reduction_levels):
+            raise ValueError("reduction_levels must contain non-empty strings")
+        if context_budget is not None and (
+            configured_input_limit is not None or provider_limits is not None
+        ):
+            raise TypeError("pass context_budget or individual limits, not both")
+        if context_budget is None and (
+            configured_input_limit is not None or provider_limits is not None
+        ):
+            context_budget = resolve_context_budget(
+                configured_input_limit=configured_input_limit,
+                provider_limits=provider_limits,
+                requested_output_reserve=(max_output_tokens or 0),
+            )
 
         current_user: Message | None = None
         history_messages = values
@@ -356,10 +446,15 @@ class ApplicationContextService:
             environment_sources=environment_sources,
             tool_definitions=ordinary_tools,
             previous_snapshot=previous_snapshot,
+            context_budget=context_budget,
         )
-        conversation = messages_from_context_snapshot(snapshot)
+        conversation = (
+            tuple(candidate_messages)
+            if candidate_messages is not None
+            else messages_from_context_snapshot(snapshot)
+        )
         prompt = instruction_text_from_context_snapshot(snapshot)
-        metadata: dict[str, object] = {
+        base_metadata: dict[str, object] = {
             "context_budget_tokens": snapshot.budget_tokens,
             "context_token_estimate": snapshot.token_estimate,
             "context_selected_block_ids": list(snapshot.selected_block_ids),
@@ -369,17 +464,213 @@ class ApplicationContextService:
             "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
             "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
         }
-        request = GenerationRequest(
-            messages=conversation,
-            system_prompt=prompt,
-            model=model,
-            tools=snapshot.tool_definitions,
-            reasoning=reasoning,
-            max_output_tokens=max_output_tokens,
-            temperature=temperature,
-            metadata=metadata,
-        )
+
+        def build_candidate(candidate_messages: Sequence[Message]) -> GenerationRequest:
+            return GenerationRequest(
+                messages=tuple(candidate_messages),
+                system_prompt=prompt,
+                model=model,
+                tools=snapshot.tool_definitions,
+                reasoning=reasoning,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                metadata=base_metadata,
+            )
+
+        request = build_candidate(conversation)
+        accounting = account_generation_request(request)
+        gate = None
+        pressure_count = None
+        reduction_steps: list[str] = list(reduction_levels)
+        candidate_messages = tuple(conversation)
+        if context_budget is not None:
+            if disable_reductions:
+                count = preflight_safety_count(
+                    request,
+                    context_budget,
+                    provider_count=provider_count,
+                )
+                pressure_count = pressure_estimate(request, context_budget)
+                gate = evaluate_gates(
+                    context_budget,
+                    count,
+                    accounting=accounting,
+                    pressure_count=pressure_count,
+                )
+            else:
+                for level, reducer in (
+                    ("L1", _externalize_tool_result_previews),
+                    ("L2", _shrink_inactive_previews),
+                ):
+                    count = preflight_safety_count(
+                        request,
+                        context_budget,
+                        provider_count=(provider_count if not reduction_steps else None),
+                    )
+                    pressure_count = pressure_estimate(request, context_budget)
+                    gate = evaluate_gates(
+                        context_budget,
+                        count,
+                        accounting=accounting,
+                        pressure_count=pressure_count,
+                    )
+                    if gate.hard_safe and not gate.auto_pressure:
+                        break
+                    reduced = reducer(candidate_messages)
+                    if not reduced.changed:
+                        continue
+                    candidate_messages = reduced.messages
+                    reduction_steps.append(level)
+                    request = build_candidate(candidate_messages)
+                    accounting = account_generation_request(request)
+                if gate is None or reduction_steps:
+                    count = preflight_safety_count(
+                        request,
+                        context_budget,
+                        provider_count=None,
+                    )
+                    pressure_count = pressure_estimate(request, context_budget)
+                    gate = evaluate_gates(
+                        context_budget,
+                        count,
+                        accounting=accounting,
+                        pressure_count=pressure_count,
+                    )
+            if not gate.hard_safe and not defer_hard_gate:
+                raise ContextRequestSafetyError(
+                    "final request failed the preflight Hard Gate: " + gate.reason
+                )
+
+        metadata = dict(base_metadata)
+        metadata["request_accounting"] = accounting.to_dict()
+        if context_budget is not None and gate is not None:
+            metadata["context_budget"] = context_budget.to_dict()
+            metadata["context_gate"] = gate.to_dict()
+            metadata["context_pressure"] = (
+                None if pressure_count is None else pressure_count.to_dict()
+            )
+            metadata["context_reduction_levels"] = list(reduction_steps)
+            metadata["context_count_source"] = gate.count_source
+            metadata["context_count_fallback"] = count_fallback
+            self._last_budget = context_budget
+            self._last_gate = gate.to_dict()
+            self._last_pressure = pressure_count
+            self._last_count_fallback = count_fallback
+        else:
+            self._last_gate = None
+            self._last_pressure = None
+            self._last_count_fallback = None
+        self._last_accounting = accounting
+        request = replace(request, metadata=metadata)
         return request, snapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _ReductionResult:
+    messages: tuple[Message, ...]
+    changed: bool
+
+
+def _externalize_tool_result_previews(
+    messages: Sequence[Message],
+    *,
+    threshold: int = 8_192,
+) -> _ReductionResult:
+    """Apply the deterministic L1 request-side preview reduction.
+
+    The normal Application tool path already materializes oversized results
+    before they enter durable History.  This bounded fallback covers embedded
+    callers that supply a raw ``GenerationRequest`` directly; it keeps every
+    ToolCall/ToolResult part and changes only the provider-visible preview.
+    """
+
+    changed = False
+    result: list[Message] = []
+    for message in messages:
+        parts: list[object] = []
+        for part in message.parts:
+            if isinstance(part, ToolResultPart) and len(part.content) > threshold:
+                changed = True
+                parts.append(
+                    replace(
+                        part,
+                        content=(
+                            f"[externalized tool result {part.tool_call_id}; "
+                            "use the bounded result reader for the full value]"
+                        ),
+                        metadata={
+                            **dict(part.metadata),
+                            "context_reduction": "L1_externalized_preview",
+                            "original_characters": len(part.content),
+                        },
+                    )
+                )
+            else:
+                parts.append(part)
+        result.append(replace(message, parts=tuple(parts)))
+    return _ReductionResult(tuple(result), changed)
+
+
+def _bounded_preview(text: str, *, limit: int = 2_048) -> str:
+    if len(text) <= limit:
+        return text
+    left = max(1, (limit - 64) // 2)
+    right = max(1, limit - 64 - left)
+    return (
+        text[:left]
+        + "\n[… context preview reduced deterministically …]\n"
+        + text[-right:]
+    )
+
+
+def _shrink_inactive_previews(
+    messages: Sequence[Message],
+    *,
+    limit: int = 2_048,
+) -> _ReductionResult:
+    """Apply bounded L2 previews without splitting ToolCall/ToolResult pairs."""
+
+    changed = False
+    result: list[Message] = []
+    current_user_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].role == "user"
+        ),
+        None,
+    )
+    for index, message in enumerate(messages):
+        parts: list[object] = []
+        for part in message.parts:
+            if (
+                index != current_user_index
+                and isinstance(part, (TextPart, ReasoningPart, ToolResultPart))
+            ):
+                preview = _bounded_preview(part.text if isinstance(part, (TextPart, ReasoningPart)) else part.content, limit=limit)
+                original = part.text if isinstance(part, (TextPart, ReasoningPart)) else part.content
+                if preview != original:
+                    changed = True
+                    if isinstance(part, TextPart):
+                        parts.append(replace(part, text=preview))
+                    elif isinstance(part, ReasoningPart):
+                        parts.append(replace(part, text=preview))
+                    else:
+                        parts.append(
+                            replace(
+                                part,
+                                content=preview,
+                                metadata={
+                                    **dict(part.metadata),
+                                    "context_reduction": "L2_bounded_preview",
+                                    "original_characters": len(original),
+                                },
+                            )
+                        )
+                    continue
+            parts.append(part)
+        result.append(replace(message, parts=tuple(parts)))
+    return _ReductionResult(tuple(result), changed)
 
 
 def _history_for_messages(session_id: str, messages: Sequence[Message]) -> CanonicalHistory:
@@ -389,7 +680,14 @@ def _history_for_messages(session_id: str, messages: Sequence[Message]) -> Canon
         turn_id = f"runtime-{index + 1}"
         entries = history_entries_for_message(session_id, turn_id, sequence, message)
         for entry in entries:
-            history = history.append(entry)
+            # These entries are a deterministic, process-local projection of
+            # the messages supplied to request preparation.  Wall-clock
+            # timestamps here would make an otherwise identical rebuild
+            # Provider-visible only through diagnostics/block IDs, defeating
+            # exact count -> rebuild -> re-gate verification.
+            history = history.append(
+                replace(entry, created_at=f"runtime:{entry.sequence:08d}")
+            )
         sequence += len(entries)
     return history
 

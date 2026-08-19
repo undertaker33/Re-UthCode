@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, ClassVar, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Awaitable, ClassVar, Protocol, TypeAlias, runtime_checkable
 
 
 JsonValue: TypeAlias = Any
@@ -557,6 +557,97 @@ class GenerationRequest(_JsonModel):
         return cls.from_dict(parsed)
 
 
+def _require_positive_optional_int(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer or None")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLimits(_JsonModel):
+    """Provider-reported physical limits for one remote model.
+
+    The three dimensions intentionally remain independent.  An adapter that
+    cannot prove a dimension leaves it as ``None`` instead of deriving it from
+    a model name or from another dimension.
+    """
+
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_combined_tokens: int | None = None
+    source: str = "provider_runtime"
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_input_tokens",
+            "max_output_tokens",
+            "max_combined_tokens",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _require_positive_optional_int(getattr(self, field_name), field_name),
+            )
+        _require_text(self.source, "source")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCountEstimate(_JsonModel):
+    """A sourced, explicitly approximate input count for a request."""
+
+    input_tokens: int
+    source: str
+    kind: str = "preflight_local_estimate"
+    safety_allowance: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.input_tokens, bool) or not isinstance(self.input_tokens, int):
+            raise TypeError("input_tokens must be a non-negative integer")
+        if self.input_tokens < 0:
+            raise ValueError("input_tokens must be a non-negative integer")
+        _require_text(self.source, "source")
+        if self.kind not in {
+            "pressure_estimate",
+            "preflight_provider_count",
+            "preflight_local_estimate",
+        }:
+            raise ValueError("unsupported ContextCountEstimate kind")
+        if (
+            isinstance(self.safety_allowance, bool)
+            or not isinstance(self.safety_allowance, int)
+            or self.safety_allowance < 0
+        ):
+            raise ValueError("safety_allowance must be a non-negative integer")
+
+    @property
+    def safety_adjusted_tokens(self) -> int:
+        return self.input_tokens + self.safety_allowance
+
+
+@runtime_checkable
+class SupportsModelLimits(Protocol):
+    """Optional Provider capability for reliable runtime model limits."""
+
+    def resolve_model_limits(
+        self,
+        model: str,
+    ) -> ModelLimits | None | Awaitable[ModelLimits | None]:
+        ...
+
+
+@runtime_checkable
+class SupportsInputTokenCount(Protocol):
+    """Optional Provider capability for final-request input estimates."""
+
+    def count_input_tokens(
+        self,
+        request: GenerationRequest,
+    ) -> ContextCountEstimate | int | None | Awaitable[ContextCountEstimate | int | None]:
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class Usage(_JsonModel):
     input_tokens: int = 0
@@ -992,6 +1083,7 @@ class ProviderPort(Protocol):
 __all__ = [
     "AuthenticationError",
     "CancellationToken",
+    "ContextCountEstimate",
     "ContextOverflowError",
     "FinishReason",
     "GenerationCancelled",
@@ -1002,6 +1094,7 @@ __all__ = [
     "JsonValue",
     "Message",
     "MessagePart",
+    "ModelLimits",
     "MissingSecretError",
     "NativeItem",
     "NativeItemCompleted",
@@ -1012,6 +1105,8 @@ __all__ = [
     "ProviderIdentity",
     "ProviderPort",
     "ProviderResponse",
+    "SupportsInputTokenCount",
+    "SupportsModelLimits",
     "provider_event_from_dict",
     "provider_event_from_json",
     "RateLimitError",

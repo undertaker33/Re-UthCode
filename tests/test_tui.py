@@ -59,6 +59,7 @@ from uthcode.application import (
 from uthcode.core.provider import (
     CancellationToken,
     FinishReason,
+    ModelLimits,
     NetworkError,
     ProviderEvent,
     RateLimitError,
@@ -99,6 +100,9 @@ from uthcode.interfaces.tui.terminal import (
 from uthcode.interfaces.tui.windows_input import create_windows_unicode_input
 
 
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
+
+
 class RecordingOutput(DummyOutput):
     def __init__(self) -> None:
         self.events: list[tuple[str, str]] = []
@@ -131,7 +135,7 @@ class _ScriptedProvider(FakeProvider):
         delay: float = 0.0,
         delays: tuple[float, ...] | None = None,
     ) -> None:
-        super().__init__(delay=delay)
+        super().__init__(delay=delay, model_limits=TEST_LIMITS)
         self._scripts = tuple(tuple(script) for script in scripts)
         self._delays = delays
 
@@ -335,7 +339,9 @@ def _completed(
 def _application(*events: object, delay: float = 0.0) -> UthCodeApplication:
     provider_events = events or (_completed("fake response"),)
     return UthCodeApplication(
-        FakeProvider(events=provider_events, delay=delay),  # type: ignore[arg-type]
+        FakeProvider(
+            events=provider_events, delay=delay, model_limits=TEST_LIMITS
+        ),  # type: ignore[arg-type]
         runtime_context=ApplicationRuntimeContext.from_system(
             workdir=Path("C:/workspace"),
             platform_name="TestOS",

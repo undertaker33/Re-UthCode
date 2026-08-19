@@ -14,7 +14,7 @@ _STREAM_RENDER_INTERVAL_SECONDS = 0.2
 
 
 def context_usage_style(usage: ContextUsage) -> str:
-    """Return the stable TUI severity class for the fixed-budget usage."""
+    """Return the stable TUI severity class for dynamic usage."""
 
     if not isinstance(usage, ContextUsage):
         raise TypeError("usage must be ContextUsage")
@@ -24,19 +24,27 @@ def context_usage_style(usage: ContextUsage) -> str:
 
 
 def context_usage_bar(usage: ContextUsage, *, width: int = 10) -> tuple[str, str]:
-    """Render a fixed ``used/258K`` line without discovering model limits."""
+    """Render usage using the resolved operating limit when available."""
 
     if not isinstance(usage, ContextUsage):
         raise TypeError("usage must be ContextUsage")
     if isinstance(width, bool) or not isinstance(width, int) or width < 1:
         raise ValueError("width must be a positive integer")
+    budget = usage.budget_tokens
+    budget_label = (
+        f"{budget // 1000}K"
+        if isinstance(budget, int) and budget >= 1000
+        else str(budget)
+        if isinstance(budget, int)
+        else "?"
+    )
     if not usage.available or usage.ratio is None:
-        return context_usage_style(usage), "context: unavailable/258K"
+        return context_usage_style(usage), f"context: unavailable/{budget_label}"
     filled = min(width, max(0, int(round(usage.ratio * width))))
     bar = "█" * filled + "░" * (width - filled)
     return (
         context_usage_style(usage),
-        f"context: [{bar}] {usage.used_tokens}/258K",
+        f"context: [{bar}] {usage.used_tokens}/{budget_label}",
     )
 
 
@@ -45,8 +53,16 @@ def context_usage_ring(usage: ContextUsage) -> tuple[str, str]:
 
     if not isinstance(usage, ContextUsage):
         raise TypeError("usage must be ContextUsage")
+    budget = usage.budget_tokens
+    budget_label = (
+        f"{budget // 1000}K"
+        if isinstance(budget, int) and budget >= 1000
+        else str(budget)
+        if isinstance(budget, int)
+        else "?"
+    )
     if not usage.available or usage.ratio is None:
-        return context_usage_style(usage), "◌ unavailable/258K"
+        return context_usage_style(usage), f"◌ unavailable/{budget_label}"
     glyph = (
         "●"
         if usage.ratio >= 0.90
@@ -56,7 +72,7 @@ def context_usage_ring(usage: ContextUsage) -> tuple[str, str]:
         if usage.ratio >= 0.50
         else "◔"
     )
-    return context_usage_style(usage), f"{glyph} {usage.used_tokens}/258K"
+    return context_usage_style(usage), f"{glyph} {usage.used_tokens}/{budget_label}"
 
 
 @dataclass(frozen=True, slots=True)

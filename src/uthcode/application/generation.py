@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from asyncio import CancelledError
+import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -21,9 +23,15 @@ from uthcode.core.planning import (
 )
 from uthcode.core.provider import (
     CancellationToken,
+    ContextOverflowError,
     GenerationCompleted,
+    GenerationCancelled,
     GenerationRequest,
+    InvalidProviderResponseError,
     Message,
+    ModelLimits,
+    ProviderConfigurationError,
+    ProviderError,
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
@@ -44,7 +52,15 @@ from uthcode.core.prompt import (
     EnvironmentSource,
     RuntimePromptContext,
 )
-from uthcode.core.context import CompactionResult, ContextUsage
+from uthcode.core.context import (
+    CompactionResult,
+    ContextBudget,
+    ContextBudgetError,
+    ContextCountEstimate,
+    ContextRequestSafetyError,
+    ContextUsage,
+    resolve_context_budget,
+)
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
@@ -73,6 +89,228 @@ def _reasoning_options(effort: str | None) -> ReasoningOptions | None:
     if effort is None:
         return None
     return ReasoningOptions(enabled=effort != "none", effort=effort)
+
+
+def _validate_model_limits(value: object) -> ModelLimits | None:
+    if value is not None and not isinstance(value, ModelLimits):
+        raise TypeError("Provider model limits must be ModelLimits or None")
+    return value
+
+
+def _resolve_model_limits_sync(
+    provider: ProviderPort,
+    model: str,
+) -> ModelLimits | None:
+    resolver = getattr(provider, "resolve_model_limits", None)
+    if not callable(resolver):
+        return None
+    value = resolver(model)
+    if inspect.isawaitable(value):
+        # A synchronous start_generation cannot safely run an async metadata
+        # operation.  Close coroutine objects to avoid an un-awaited warning;
+        # the configured limit, if present, remains usable for this path.
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        return None
+    return _validate_model_limits(value)
+
+
+async def _resolve_model_limits_async(
+    provider: ProviderPort,
+    model: str,
+) -> ModelLimits | None:
+    resolver = getattr(provider, "resolve_model_limits", None)
+    if not callable(resolver):
+        return None
+    value = resolver(model)
+    if inspect.isawaitable(value):
+        value = await value
+    return _validate_model_limits(value)
+
+
+def _validate_provider_count(value: object) -> ContextCountEstimate | int | None:
+    if value is not None and not isinstance(value, (ContextCountEstimate, int)):
+        raise TypeError(
+            "Provider input count must be ContextCountEstimate, int, or None"
+        )
+    if isinstance(value, bool):
+        raise TypeError("Provider input count must not be boolean")
+    return value
+
+
+def _request_reduction_levels(request: GenerationRequest) -> tuple[str, ...]:
+    raw = request.metadata.get("context_reduction_levels", ())
+    if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
+        return ()
+    return tuple(value for value in raw if isinstance(value, str) and value)
+
+
+@dataclass(frozen=True, slots=True)
+class _CountResolution:
+    value: ContextCountEstimate | int | None
+    fallback_reason: str | None = None
+
+
+def _is_controlled_count_failure(error: Exception) -> bool:
+    """Return whether a count endpoint outage may use the local estimate.
+
+    Type/value errors, provider configuration errors, malformed responses and
+    limit/overflow authority errors must remain visible to the request
+    preparer.  Only operational unavailability is eligible for a conservative
+    local fallback.
+    """
+
+    if isinstance(
+        error,
+        (
+            TypeError,
+            ValueError,
+            ContextBudgetError,
+            ProviderConfigurationError,
+            ContextOverflowError,
+            InvalidProviderResponseError,
+            GenerationCancelled,
+        ),
+    ):
+        return False
+    return isinstance(error, (ProviderError, OSError, TimeoutError))
+
+
+def _count_input_tokens_sync(
+    provider: ProviderPort,
+    request: GenerationRequest,
+) -> _CountResolution:
+    counter = getattr(provider, "count_input_tokens", None)
+    if not callable(counter):
+        return _CountResolution(None, "capability_missing")
+    try:
+        value = counter(request)
+    except (GenerationCancelled, CancelledError):
+        raise
+    except Exception as exc:
+        if _is_controlled_count_failure(exc):
+            return _CountResolution(None, "provider_count_failure")
+        raise
+    if inspect.isawaitable(value):
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        return _CountResolution(None, "capability_unavailable")
+    validated = _validate_provider_count(value)
+    if validated is None:
+        return _CountResolution(None, "provider_count_unavailable")
+    return _CountResolution(validated)
+
+
+async def _count_input_tokens_async(
+    provider: ProviderPort,
+    request: GenerationRequest,
+) -> _CountResolution:
+    counter = getattr(provider, "count_input_tokens", None)
+    if not callable(counter):
+        return _CountResolution(None, "capability_missing")
+    try:
+        value = counter(request)
+        while inspect.isawaitable(value):
+            value = await value
+    except (GenerationCancelled, CancelledError):
+        raise
+    except Exception as exc:
+        if _is_controlled_count_failure(exc):
+            return _CountResolution(None, "provider_count_failure")
+        raise
+    validated = _validate_provider_count(value)
+    if validated is None:
+        return _CountResolution(None, "provider_count_unavailable")
+    return _CountResolution(validated)
+
+
+def _prepare_counted_request_sync(
+    provider: ProviderPort,
+    compose: Callable[[ContextCountEstimate | int | None, bool, str | None], GenerationRequest],
+    finalize: Callable[
+        [GenerationRequest, ContextCountEstimate | int | None, bool, str | None],
+        GenerationRequest,
+    ],
+) -> GenerationRequest:
+    """Count, rebuild and re-gate until one exact request is ready to send."""
+
+    counted_request = compose(None, True, None)
+    resolution = _count_input_tokens_sync(provider, counted_request)
+    if resolution.fallback_reason is not None:
+        return compose(None, False, resolution.fallback_reason)
+
+    provider_count = resolution.value
+    rebuild_from_sources = True
+    for _ in range(8):
+        if rebuild_from_sources:
+            candidate = compose(provider_count, True, None)
+            if candidate != counted_request:
+                counted_request = candidate
+                resolution = _count_input_tokens_sync(provider, counted_request)
+                if resolution.fallback_reason is not None:
+                    return compose(None, False, resolution.fallback_reason)
+                provider_count = resolution.value
+            rebuild_from_sources = False
+
+        final_request = finalize(counted_request, provider_count, False, None)
+        if final_request == counted_request:
+            # Return the exact immutable object that the Provider just counted.
+            # Equality is sufficient for semantics, while identity makes the
+            # count/send correspondence explicit for request-capturing ports.
+            return counted_request
+        counted_request = final_request
+        resolution = _count_input_tokens_sync(provider, counted_request)
+        if resolution.fallback_reason is not None:
+            return compose(None, False, resolution.fallback_reason)
+        provider_count = resolution.value
+
+    raise ContextRequestSafetyError(
+        "Provider input count did not stabilize for the final request"
+    )
+
+
+async def _prepare_counted_request_async(
+    provider: ProviderPort,
+    compose: Callable[[ContextCountEstimate | int | None, bool, str | None], GenerationRequest],
+    finalize: Callable[
+        [GenerationRequest, ContextCountEstimate | int | None, bool, str | None],
+        GenerationRequest,
+    ],
+) -> GenerationRequest:
+    """Async counterpart of the exact final-request count/re-gate loop."""
+
+    counted_request = compose(None, True, None)
+    resolution = await _count_input_tokens_async(provider, counted_request)
+    if resolution.fallback_reason is not None:
+        return compose(None, False, resolution.fallback_reason)
+
+    provider_count = resolution.value
+    rebuild_from_sources = True
+    for _ in range(8):
+        if rebuild_from_sources:
+            candidate = compose(provider_count, True, None)
+            if candidate != counted_request:
+                counted_request = candidate
+                resolution = await _count_input_tokens_async(provider, counted_request)
+                if resolution.fallback_reason is not None:
+                    return compose(None, False, resolution.fallback_reason)
+                provider_count = resolution.value
+            rebuild_from_sources = False
+
+        final_request = finalize(counted_request, provider_count, False, None)
+        if final_request == counted_request:
+            return counted_request
+        counted_request = final_request
+        resolution = await _count_input_tokens_async(provider, counted_request)
+        if resolution.fallback_reason is not None:
+            return compose(None, False, resolution.fallback_reason)
+        provider_count = resolution.value
+
+    raise ContextRequestSafetyError(
+        "Provider input count did not stabilize for the final request"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,7 +579,7 @@ class UthCodeApplication:
         return self._tool_service.definitions()
 
     def compile_context(self, **kwargs: Any):
-        """Compile a fixed-budget Context Snapshot from current sources."""
+        """Compile a dynamic Context Snapshot from current sources."""
 
         if "instruction_loader" not in kwargs:
             kwargs["instruction_loader"] = self._instruction_loader
@@ -350,7 +588,7 @@ class UthCodeApplication:
         return self._context_service.compile(**kwargs)
 
     def context_usage(self, snapshot=None):
-        """Return the same fixed-budget usage projection for headless callers."""
+        """Return the same dynamic usage projection for headless callers."""
 
         return self._context_service.usage(snapshot)
 
@@ -939,6 +1177,9 @@ class UthCodeApplication:
         max_output_tokens = (
             model_profile.max_output_tokens if model_profile is not None else None
         )
+        configured_input_limit = (
+            model_profile.context_window if model_profile is not None else None
+        )
         ordinary_tool_definitions = self._tool_service.definitions()
         tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
         tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
@@ -978,27 +1219,91 @@ class UthCodeApplication:
                         return committed.changed
             return False
 
-        def prepare(
+        limits_ready = False
+        frozen_provider_limits: ModelLimits | None = None
+        frozen_budget: ContextBudget | None = None
+
+        async def prepare(
             messages: tuple[Message, ...],
             visible_definitions: tuple[ToolDefinition, ...],
             runtime_context: RuntimePromptContext,
         ) -> GenerationRequest:
+            nonlocal limits_ready, frozen_provider_limits, frozen_budget
+            if not limits_ready:
+                frozen_provider_limits = await _resolve_model_limits_async(
+                    provider,
+                    remote_model_id,
+                )
+                frozen_budget = resolve_context_budget(
+                    configured_input_limit=configured_input_limit,
+                    provider_limits=frozen_provider_limits,
+                    requested_output_reserve=(max_output_tokens or 0),
+                )
+                limits_ready = True
             process_messages = messages[process_message_start:]
-            request, _snapshot = self._context_service.compose_generation_request(
-                process_messages,
-                run_id=state.run_id,
-                session_id=active_session_id(),
-                canonical_history=active_history(),
-                instruction_loader=self._instruction_loader,
-                runtime_context=runtime_context,
-                projection=active_projection(),
-                tool_definitions=visible_definitions,
-                environment_sources=self._environment_sources(model_ref, provider.identity),
-                model=remote_model_id,
-                reasoning=reasoning,
-                max_output_tokens=max_output_tokens,
-            )
-            return request
+
+            def compose(
+                provider_count: ContextCountEstimate | int | None,
+                defer_hard_gate: bool,
+                count_fallback: str | None,
+            ) -> GenerationRequest:
+                request, _snapshot = self._context_service.compose_generation_request(
+                    process_messages,
+                    run_id=state.run_id,
+                    session_id=active_session_id(),
+                    canonical_history=active_history(),
+                    instruction_loader=self._instruction_loader,
+                    runtime_context=runtime_context,
+                    projection=active_projection(),
+                    tool_definitions=visible_definitions,
+                    environment_sources=self._environment_sources(model_ref, provider.identity),
+                    model=remote_model_id,
+                    reasoning=reasoning,
+                    max_output_tokens=max_output_tokens,
+                    context_budget=frozen_budget,
+                    provider_count=provider_count,
+                    defer_hard_gate=defer_hard_gate,
+                    count_fallback=count_fallback,
+                )
+                return request
+
+            def finalize(
+                candidate: GenerationRequest,
+                provider_count: ContextCountEstimate | int | None,
+                defer_hard_gate: bool,
+                count_fallback: str | None,
+            ) -> GenerationRequest:
+                request, _snapshot = self._context_service.compose_generation_request(
+                    process_messages,
+                    run_id=state.run_id,
+                    session_id=active_session_id(),
+                    canonical_history=active_history(),
+                    instruction_loader=self._instruction_loader,
+                    runtime_context=runtime_context,
+                    projection=active_projection(),
+                    tool_definitions=visible_definitions,
+                    environment_sources=self._environment_sources(model_ref, provider.identity),
+                    model=remote_model_id,
+                    reasoning=reasoning,
+                    max_output_tokens=max_output_tokens,
+                    context_budget=frozen_budget,
+                    provider_count=provider_count,
+                    defer_hard_gate=defer_hard_gate,
+                    count_fallback=count_fallback,
+                    candidate_messages=candidate.messages,
+                    disable_reductions=True,
+                    reduction_levels=_request_reduction_levels(candidate),
+                )
+                return request
+
+            try:
+                return await _prepare_counted_request_async(provider, compose, finalize)
+            except GenerationCancelled:
+                # AgentLoop treats asyncio cancellation as the cooperative
+                # cancellation channel around request preparation.  A
+                # Provider count endpoint may expose its own Core cancellation
+                # exception, so translate it without entering local fallback.
+                raise CancelledError()
 
         loop = self._tool_service._create_agent_loop(
             provider,
@@ -1062,19 +1367,66 @@ class UthCodeApplication:
             if selected_profile is not None
             else None
         )
-        compiled_request, _snapshot = self._context_service.compose_generation_request(
-            request.messages,
-            run_id="generation",
-            instruction_loader=self._instruction_loader,
-            runtime_context=runtime_context,
-            tool_definitions=request.tools,
-            environment_sources=self._environment_sources(selected_model_ref, identity),
-            model=remote_model_id,
-            reasoning=reasoning,
-            max_output_tokens=max_output_tokens,
-            temperature=request.temperature,
+        configured_input_limit = (
+            selected_profile.context_window if selected_profile is not None else None
         )
-        return compiled_request
+        provider_limits = _resolve_model_limits_sync(provider, remote_model_id)
+        budget = resolve_context_budget(
+            configured_input_limit=configured_input_limit,
+            provider_limits=provider_limits,
+            requested_output_reserve=(max_output_tokens or 0),
+        )
+        def compose(
+            provider_count: ContextCountEstimate | int | None,
+            defer_hard_gate: bool,
+            count_fallback: str | None,
+        ) -> GenerationRequest:
+            compiled_request, _snapshot = self._context_service.compose_generation_request(
+                request.messages,
+                run_id="generation",
+                instruction_loader=self._instruction_loader,
+                runtime_context=runtime_context,
+                tool_definitions=request.tools,
+                environment_sources=self._environment_sources(selected_model_ref, identity),
+                model=remote_model_id,
+                reasoning=reasoning,
+                max_output_tokens=max_output_tokens,
+                temperature=request.temperature,
+                context_budget=budget,
+                provider_count=provider_count,
+                defer_hard_gate=defer_hard_gate,
+                count_fallback=count_fallback,
+            )
+            return compiled_request
+
+        def finalize(
+            candidate: GenerationRequest,
+            provider_count: ContextCountEstimate | int | None,
+            defer_hard_gate: bool,
+            count_fallback: str | None,
+        ) -> GenerationRequest:
+            compiled_request, _snapshot = self._context_service.compose_generation_request(
+                request.messages,
+                run_id="generation",
+                instruction_loader=self._instruction_loader,
+                runtime_context=runtime_context,
+                tool_definitions=request.tools,
+                environment_sources=self._environment_sources(selected_model_ref, identity),
+                model=remote_model_id,
+                reasoning=reasoning,
+                max_output_tokens=max_output_tokens,
+                temperature=request.temperature,
+                context_budget=budget,
+                provider_count=provider_count,
+                defer_hard_gate=defer_hard_gate,
+                count_fallback=count_fallback,
+                candidate_messages=candidate.messages,
+                disable_reductions=True,
+                reduction_levels=_request_reduction_levels(candidate),
+            )
+            return compiled_request
+
+        return _prepare_counted_request_sync(provider, compose, finalize)
 
     def _environment_sources(
         self,

@@ -45,6 +45,7 @@ from uthcode.application import (
     Usage,
 )
 from uthcode.core import SecretValue
+from uthcode.core.provider import ModelLimits
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,9 @@ class _ScriptedProvider:
         self.identity = ProviderIdentity("fake", "eval", model_id)
         self._scripts = tuple(tuple(script) for script in scripts)
         self._request_index = 0
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="eval.fake_runtime")
 
     async def stream(self, request: object, *, cancellation: object) -> AsyncIterator[GenerationCompleted]:
         del request

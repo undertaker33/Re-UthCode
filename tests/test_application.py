@@ -20,6 +20,7 @@ from uthcode.core.provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextDelta,
@@ -30,6 +31,9 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _request() -> GenerationRequest:
@@ -60,7 +64,10 @@ def test_offline_guard_blocks_network_construction() -> None:
 
 @pytest.mark.asyncio
 async def test_headless_application_streams_text_usage_and_one_terminal_event() -> None:
-    provider = FakeProvider(events=(TextDelta("hel"), TextDelta("lo"), _completed()))
+    provider = FakeProvider(
+        events=(TextDelta("hel"), TextDelta("lo"), _completed()),
+        model_limits=TEST_LIMITS,
+    )
     application = UthCodeApplication(provider)
 
     events = await _collect(application)
@@ -88,6 +95,7 @@ async def test_application_injects_authoritative_prompt_without_mutating_request
     provider = FakeProvider(
         identity=ProviderIdentity("fake", "test-protocol", "remote-model"),
         events=(_completed(),),
+        model_limits=TEST_LIMITS,
     )
     application = UthCodeApplication(provider, runtime_context=context)
     request = _request()
@@ -125,6 +133,7 @@ async def test_formal_bootstrap_builds_a_fake_headless_application() -> None:
             provider_profile_id="bootstrap",
             provider_kind=ProviderKind.FAKE,
             remote_id="bootstrap-fake",
+            context_window=1_000_000,
         )
     )
 
@@ -147,7 +156,8 @@ async def test_tool_call_events_keep_script_order() -> None:
                     ToolCallArgumentsDelta("call-1", '"uth"}'),
                     ToolCallCompleted("call-1", "search", {"q": "uth"}),
                     _completed(),
-                )
+                ),
+                model_limits=TEST_LIMITS,
             )
         )
     )
@@ -171,7 +181,10 @@ async def test_tool_call_events_keep_script_order() -> None:
     ],
 )
 async def test_invalid_terminal_shapes_are_rejected(script: tuple[object, ...]) -> None:
-    provider = FakeProvider(events=script)  # type: ignore[arg-type]
+    provider = FakeProvider(
+        events=script,
+        model_limits=TEST_LIMITS,
+    )  # type: ignore[arg-type]
     observed: list[object] = []
 
     with pytest.raises(InvalidProviderResponseError):
@@ -183,7 +196,9 @@ async def test_invalid_terminal_shapes_are_rejected(script: tuple[object, ...]) 
 
 @pytest.mark.asyncio
 async def test_explicit_cancellation_is_distinct_from_task_cancellation() -> None:
-    application = UthCodeApplication(FakeProvider(events=(_completed(),), delay=10))
+    application = UthCodeApplication(
+        FakeProvider(events=(_completed(),), delay=10, model_limits=TEST_LIMITS)
+    )
     handle = application.start_generation(_request())
 
     async def collect_handle() -> list[object]:
@@ -197,7 +212,11 @@ async def test_explicit_cancellation_is_distinct_from_task_cancellation() -> Non
         await task
 
     task_cancelled = asyncio.create_task(
-        _collect(UthCodeApplication(FakeProvider(events=(_completed(),), delay=10)))
+        _collect(
+            UthCodeApplication(
+                FakeProvider(events=(_completed(),), delay=10, model_limits=TEST_LIMITS)
+            )
+        )
     )
     await asyncio.sleep(0.05)
     task_cancelled.cancel()
@@ -237,7 +256,7 @@ def test_application_rejects_caller_model_before_provider_call() -> None:
 def test_prompt_build_failure_rejects_request_before_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeProvider()
+    provider = FakeProvider(model_limits=TEST_LIMITS)
     application = UthCodeApplication(provider)
 
     def fail(*_args: object, **_kwargs: object):

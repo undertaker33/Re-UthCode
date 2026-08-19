@@ -2,15 +2,15 @@
 
 ## T01：动态模型限制与确定性请求安全链
 
-- [ ] 执行 `python -m pytest tests/test_configuration.py tests/test_config_loader_integration.py tests/test_provider_model_limits.py tests/test_context_budget_gate.py tests/test_context_compiler.py tests/test_application_runtime.py tests/test_application_runs.py tests/test_agent_loop.py -q`，全部通过。
-- [ ] 用户配置 `context_window` 只接受 positive int；用户缺失且 Provider 无可靠 input metadata 时明确失败，生产代码无固定窗口或 bundled metadata fallback。
-- [ ] 项目层只能保留/收紧用户 `context_window`；项目补造缺失值或放大用户值均失败。
-- [ ] `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 分维保存与校验；unknown 不伪造，larger Provider input 不扩大用户上限。
-- [ ] Pressure Estimate 与 Preflight Safety Count/Estimate 来源、allowance、用途可观察；测试不把近似 estimate 断言为数学精确。
-- [ ] final request accounting 覆盖 instruction、messages、tools、已知 framing 与 requested output reserve；每一维 Hard Gate 都发生在 Provider call 前。
-- [ ] 25K profile 自适应收缩、1M profile 绝对 cap；存在 `auto_pressure=true && hard_safe=true` 场景。
-- [ ] L1-L3 deterministic、protected/current/tool pair 完整；每次 reduce 后 rebuild/re-gate；required facts 超限时 Provider call count 为 0。
-- [ ] 正式 Application→Compiler→现有 awaitable preparer→AgentLoop→Provider path 可运行；`core/agent.py` 未新增重复 async protocol。
+- [x] 执行 `python -m pytest tests/test_configuration.py tests/test_config_loader_integration.py tests/test_provider_model_limits.py tests/test_context_budget_gate.py tests/test_context_compiler.py tests/test_application_runtime.py tests/test_application_runs.py tests/test_agent_loop.py -q`，全部通过。
+- [x] 用户配置 `context_window` 只接受 positive int；用户缺失且 Provider 无可靠 input metadata 时明确失败，生产代码无固定窗口或 bundled metadata fallback。
+- [x] 项目层只能保留/收紧用户 `context_window`；项目补造缺失值或放大用户值均失败。
+- [x] `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 分维保存与校验；unknown 不伪造，larger Provider input 不扩大用户上限。
+- [x] Pressure Estimate 与 Preflight Safety Count/Estimate 来源、allowance、用途可观察；测试不把近似 estimate 断言为数学精确。
+- [x] final request accounting 覆盖 instruction、messages、tools、已知 framing 与 requested output reserve；每一维 Hard Gate 都发生在 Provider call 前。
+- [x] 25K profile 自适应收缩、1M profile 绝对 cap；存在 `auto_pressure=true && hard_safe=true` 场景。
+- [x] L1-L3 deterministic、protected/current/tool pair 完整；每次 reduce 后 rebuild/re-gate；required facts 超限时 Provider call count 为 0。
+- [x] 正式 Application→Compiler→现有 awaitable preparer→AgentLoop→Provider path 可运行；`core/agent.py` 未新增重复 async protocol。
 
 ## T02：Transcript、Timeline 与 Session v2 一次性硬切
 

@@ -151,13 +151,17 @@ def _status(context: CommandContext) -> str:
     usage = getattr(status, "context_usage", None)
     available = bool(getattr(usage, "available", False))
     used = getattr(usage, "used_tokens", None)
-    budget = getattr(usage, "budget_tokens", 258_000)
-    usage_text = (
-        f"{used}/{budget // 1000}K"
-        if available and isinstance(used, int)
-        else f"unavailable/{budget // 1000}K"
+    budget = getattr(usage, "budget_tokens", None)
+    budget_label = (
+        f"{budget // 1000}K" if isinstance(budget, int) and budget >= 1000 else
+        str(budget) if isinstance(budget, int) else "?"
     )
-    if available and isinstance(used, int):
+    usage_text = (
+        f"{used}/{budget_label}"
+        if available and isinstance(used, int) and isinstance(budget, int)
+        else f"unavailable/{budget_label}"
+    )
+    if available and isinstance(used, int) and isinstance(budget, int) and budget > 0:
         filled = min(12, max(0, int(round((used / budget) * 12))))
         usage_bar = "█" * filled + "░" * (12 - filled)
         usage_line = f"context: [{usage_bar}] {usage_text}"
@@ -177,8 +181,7 @@ def _status(context: CommandContext) -> str:
             f"remote model: {provider_model}",
             f"config sources: {source_text}",
             f"state: {getattr(status, 'state', 'unknown')}",
-            f"{usage_line} Operating Budget (not a remote physical window)",
-            "stage limitation: before T09-1, a real model window <258K is not guaranteed safe at 258K long-context scale",
+            f"{usage_line} dynamic input operating limit",
             f"projection revision: {getattr(status, 'projection_revision', None)}",
             f"instruction epoch: {getattr(status, 'instruction_epoch', 0)}",
             f"compact count: {getattr(status, 'compact_count', 0)}",

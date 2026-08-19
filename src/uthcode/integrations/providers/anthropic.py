@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from anthropic import (
 from uthcode.core.provider import (
     AuthenticationError,
     CancellationToken,
+    ContextCountEstimate,
     ContextOverflowError,
     FinishReason,
     GenerationCancelled,
@@ -27,6 +29,7 @@ from uthcode.core.provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    ModelLimits,
     NativeItem,
     NativeItemCompleted,
     NetworkError,
@@ -79,6 +82,16 @@ def _field(value: object, name: str, default: object = None) -> object:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _positive_optional_int(value: object, *, allow_zero: bool = False) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or (value == 0 and not allow_zero):
+        return None
+    return value
 
 
 def _text(value: object, label: str, *, allow_empty: bool = True) -> str:
@@ -278,6 +291,64 @@ class AnthropicProvider:
     @property
     def identity(self) -> ProviderIdentity:
         return self._identity
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits | None:
+        """Read reliable runtime limits when the configured client exposes them."""
+
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
+        models_api = getattr(self._client, "models", None)
+        retrieve = getattr(models_api, "retrieve", None)
+        if not callable(retrieve):
+            return None
+        value = retrieve(model)
+        if inspect.isawaitable(value):
+            value = await value
+        max_input = _positive_optional_int(
+            _field(value, "max_input_tokens"),
+        )
+        max_output = _positive_optional_int(
+            _field(value, "max_tokens"),
+        )
+        if max_input is None and max_output is None:
+            return None
+        return ModelLimits(
+            max_input_tokens=max_input,
+            max_output_tokens=max_output,
+            source="anthropic.models",
+        )
+
+    async def count_input_tokens(
+        self,
+        request: GenerationRequest,
+    ) -> ContextCountEstimate | None:
+        """Use Anthropic's structured count endpoint without exposing SDK DTOs."""
+
+        if not isinstance(request, GenerationRequest):
+            raise TypeError("request must be a GenerationRequest")
+        messages_api = getattr(self._client, "messages", None)
+        count_tokens = getattr(messages_api, "count_tokens", None)
+        if not callable(count_tokens):
+            return None
+        kwargs: dict[str, object] = {
+            "model": request.model or self._model_name,
+            "messages": _request_messages(request, self._identity),
+        }
+        if request.system_prompt is not None:
+            kwargs["system"] = request.system_prompt
+        if request.tools:
+            kwargs["tools"] = _request_tools(request.tools)
+        value = count_tokens(**kwargs)
+        if inspect.isawaitable(value):
+            value = await value
+        input_tokens = _positive_optional_int(_field(value, "input_tokens"), allow_zero=True)
+        if input_tokens is None:
+            return None
+        return ContextCountEstimate(
+            input_tokens=input_tokens,
+            source="anthropic.messages.count_tokens",
+            kind="preflight_provider_count",
+        )
 
     async def stream(
         self,

@@ -293,7 +293,7 @@ def test_restart_process_boundary_creates_new_run_without_pending_or_t06_state_f
             UthCodeApplication,
             Usage,
         )
-        from uthcode.core import FinishReason
+        from uthcode.core import FinishReason, ModelLimits
         from uthcode.integrations.providers.fake import FakeProvider
 
 
@@ -324,7 +324,11 @@ def test_restart_process_boundary_creates_new_run_without_pending_or_t06_state_f
                             usage=Usage(),
                         )
                     ),
-                )
+                ),
+                model_limits=ModelLimits(
+                    max_input_tokens=1_000_000,
+                    source="test.fake",
+                ),
             )
             application = UthCodeApplication(provider)
             run = application.create_run()
@@ -384,7 +388,7 @@ def test_restart_process_boundary_creates_new_run_without_pending_or_t06_state_f
             UthCodeApplication,
             Usage,
         )
-        from uthcode.core import FinishReason
+        from uthcode.core import FinishReason, ModelLimits
         from uthcode.integrations.providers.fake import FakeProvider
 
 
@@ -398,7 +402,11 @@ def test_restart_process_boundary_creates_new_run_without_pending_or_t06_state_f
                             usage=Usage(),
                         )
                     ),
-                )
+                ),
+                model_limits=ModelLimits(
+                    max_input_tokens=1_000_000,
+                    source="test.fake",
+                ),
             )
             application = UthCodeApplication(provider)
             run = application.create_run()

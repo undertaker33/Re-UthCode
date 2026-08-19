@@ -193,6 +193,7 @@ def _config() -> EffectiveConfig:
         provider_profile_id="local",
         provider_kind=ProviderKind.FAKE,
         remote_id="fake-model",
+        context_window=1_000_000,
     )
 
 

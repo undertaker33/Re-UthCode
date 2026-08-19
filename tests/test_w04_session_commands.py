@@ -31,6 +31,7 @@ from uthcode.core.provider import (
     FinishReason,
     GenerationCompleted,
     Message,
+    ModelLimits,
     ProviderResponse,
     TextPart,
     ToolCallPart,
@@ -53,6 +54,9 @@ from uthcode.interfaces.tui.rendering import (
 )
 
 
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
+
+
 def _application(
     tmp_path: Path,
     store: SessionFileStore,
@@ -69,7 +73,7 @@ def _application(
         project_root=project_root,
         reader=InstructionFileReader(),
     )
-    config = EffectiveConfig.single_model("fake/model")
+    config = EffectiveConfig.single_model("fake/model", context_window=1_000_000)
     return create_application(
         config,
         provider_builder=(
@@ -180,13 +184,13 @@ def test_new_resume_restore_history_projection_instruction_state_and_status(
 
         status = dispatcher.dispatch_text("/status")
         assert status is not None and status.output is not None
-        assert "context: " in status.output and "/258K Operating Budget" in status.output
+        assert "context: " in status.output and "dynamic input operating limit" in status.output
         assert "projection revision: 1" in status.output
         assert "instruction epoch:" in status.output
         assert "compact count: 1" in status.output
-        assert "not a remote physical window" in status.output
-        assert "stage limitation" in status.output
-        assert "<258K" in status.output
+        assert "not a remote physical window" not in status.output
+        assert "stage limitation" not in status.output
+        assert "258K" not in status.output
 
         # A resumed process gets a new in-memory Run; durable History is not a
         # Task/Plan/Pending-Tool checkpoint and is not copied into RunState.
@@ -199,7 +203,7 @@ def test_new_resume_restore_history_projection_instruction_state_and_status(
 async def test_resumed_canonical_history_enters_headless_provider_request(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed(),))
+    provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -228,7 +232,7 @@ async def test_resumed_canonical_history_enters_headless_provider_request(
 async def test_resumed_projection_keeps_summary_and_raw_history_tail(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed(),))
+    provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -270,7 +274,7 @@ async def test_resumed_projection_keeps_summary_and_raw_history_tail(
 async def test_resumed_tool_history_keeps_native_tool_pair(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed(),))
+    provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -313,7 +317,9 @@ async def test_resumed_tool_history_keeps_native_tool_pair(
 async def test_resumed_history_is_injected_once_across_multiple_turns(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed("first"), _completed("second")))
+    provider = FakeProvider(
+        events=(_completed("first"), _completed("second")), model_limits=TEST_LIMITS
+    )
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -344,7 +350,7 @@ async def test_resumed_history_is_injected_once_across_multiple_turns(
 async def test_resume_preserves_adjacent_same_role_messages_within_one_turn(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed(),))
+    provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -414,7 +420,10 @@ def test_same_text_process_turn_is_not_deduplicated_against_durable_history() ->
 async def test_formal_run_keeps_same_text_turn_after_restored_history(
     tmp_path: Path,
 ) -> None:
-    provider = FakeProvider(events=(_completed("first answer"), _completed("second answer")))
+    provider = FakeProvider(
+        events=(_completed("first answer"), _completed("second answer")),
+        model_limits=TEST_LIMITS,
+    )
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store, provider=provider)
     try:
@@ -508,7 +517,7 @@ async def test_failed_resume_keeps_current_session_lock_state_and_continuation(
 ) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     setup = _application(tmp_path, store)
-    owner_provider = FakeProvider(events=(_completed(),))
+    owner_provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     owner = _application(tmp_path, store, provider=owner_provider)
     held_app = _application(tmp_path, store)
     try:
@@ -757,17 +766,17 @@ def test_session_picker_has_fixed_ten_page_and_keyboard_state() -> None:
     assert picker.open is False
 
 
-def test_status_bar_and_input_ring_share_fixed_usage_projection() -> None:
-    low = ContextUsage(10)
-    high = ContextUsage(250_000)
-    unavailable = ContextUsage(0, available=False)
+def test_status_bar_and_input_ring_share_dynamic_usage_projection() -> None:
+    low = ContextUsage(10, budget_tokens=25_000)
+    high = ContextUsage(250_000, budget_tokens=250_000)
+    unavailable = ContextUsage(0, budget_tokens=None, available=False)
 
     assert context_usage_style(low) == "class:status"
     assert context_usage_style(high) == "class:status.warning"
     assert context_usage_style(unavailable) == "class:status"
-    assert context_usage_bar(low)[1].endswith("10/258K")
-    assert context_usage_ring(high)[1].endswith("250000/258K")
-    assert "unavailable/258K" in context_usage_ring(unavailable)[1]
+    assert context_usage_bar(low)[1].endswith("10/25K")
+    assert context_usage_ring(high)[1].endswith("250000/250K")
+    assert "unavailable/?" in context_usage_ring(unavailable)[1]
 
 
 @pytest.mark.asyncio

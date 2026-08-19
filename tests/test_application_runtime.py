@@ -23,6 +23,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextDelta,
@@ -30,6 +31,9 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _request(text: str = "hello") -> GenerationRequest:
@@ -64,6 +68,7 @@ async def test_generation_handles_cancel_independently_and_record_requests() -> 
     provider = FakeProvider(
         events=(TextDelta("done"), _completed()),
         delay=0.15,
+        model_limits=TEST_LIMITS,
     )
     application = UthCodeApplication(provider)
     first = application.start_generation(_request("first"))
@@ -127,7 +132,7 @@ async def test_stream_generation_is_a_convenience_over_generation_handle() -> No
             return handle
 
     application = RecordingApplication(
-        FakeProvider(events=(TextDelta("ok"), _completed()))
+        FakeProvider(events=(TextDelta("ok"), _completed()), model_limits=TEST_LIMITS)
     )
     events = [event async for event in application.stream_generation(_request())]
 
@@ -158,6 +163,7 @@ def _builder(provider: ProviderProfile, model: ModelProfile) -> FakeProvider:
             model.remote_id,
         ),
         events=(_completed(model.remote_id),),
+        model_limits=TEST_LIMITS,
     )
 
 
@@ -294,6 +300,7 @@ async def test_model_switch_refreshes_prompt_model_protocol_and_remote_identity(
                 model.remote_id,
             ),
             events=(_completed(model.remote_id),),
+            model_limits=TEST_LIMITS,
         )
         providers[model.model_ref] = instance
         return instance
@@ -359,6 +366,7 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
                 model.remote_id,
             ),
             events=(_completed(model.remote_id),),
+            model_limits=TEST_LIMITS,
         )
         providers[model.model_ref] = instance
         return instance
@@ -415,6 +423,7 @@ async def test_failed_model_switch_keeps_old_prompt_identity(
                 model.remote_id,
             ),
             events=(_completed(model.remote_id),),
+            model_limits=TEST_LIMITS,
         )
 
     def writer(_model_ref: str) -> None:
@@ -460,6 +469,7 @@ def test_create_application_injection_receives_application_profiles() -> None:
         return FakeProvider(
             identity=ProviderIdentity("fake", "script", "remote-id"),
             events=(_completed(),),
+            model_limits=TEST_LIMITS,
         )
 
     application = create_application(config, provider_builder=build)
@@ -492,6 +502,7 @@ def test_bootstrap_passes_max_output_tokens_to_integration_provider_config(
         return FakeProvider(
             identity=ProviderIdentity("fake", "script", "remote-id"),
             events=(_completed(),),
+            model_limits=TEST_LIMITS,
         )
 
     monkeypatch.setattr(provider_factory, "create_provider", observe)
@@ -508,7 +519,7 @@ def test_create_application_rejects_single_argument_provider_builder() -> None:
     config = EffectiveConfig.single_model("profile/ref")
 
     def build(_provider: ProviderProfile) -> FakeProvider:
-        return FakeProvider(events=(_completed(),))
+        return FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
 
     with pytest.raises(TypeError):
         create_application(config, provider_builder=build)  # type: ignore[arg-type]

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 
 from uthcode.core.provider import (
     CancellationToken,
+    ContextCountEstimate,
     GenerationCancelled,
     GenerationRequest,
+    ModelLimits,
     ProviderError,
     ProviderEvent,
     ProviderIdentity,
@@ -26,6 +28,11 @@ class FakeProvider:
         *,
         delay: float = 0.0,
         error: ProviderError | None = None,
+        model_limits: ModelLimits | None = None,
+        input_token_counter: Callable[
+            [GenerationRequest], ContextCountEstimate | int | None
+        ]
+        | None = None,
     ) -> None:
         self._identity = identity or ProviderIdentity("fake", "script", "fake-model")
         if delay < 0:
@@ -35,6 +42,12 @@ class FakeProvider:
         self._events = tuple(events)
         self._delay = delay
         self._error = error
+        if model_limits is not None and not isinstance(model_limits, ModelLimits):
+            raise TypeError("model_limits must be ModelLimits or None")
+        self._model_limits = model_limits
+        if input_token_counter is not None and not callable(input_token_counter):
+            raise TypeError("input_token_counter must be callable or None")
+        self._input_token_counter = input_token_counter
         self.requests: list[GenerationRequest] = []
 
     @property
@@ -44,6 +57,22 @@ class FakeProvider:
     @property
     def recorded_requests(self) -> tuple[GenerationRequest, ...]:
         return tuple(self.requests)
+
+    def resolve_model_limits(self, model: str) -> ModelLimits | None:
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
+        return self._model_limits
+
+    def count_input_tokens(
+        self,
+        request: GenerationRequest,
+    ) -> ContextCountEstimate | int | None:
+        if self._input_token_counter is None:
+            return None
+        value = self._input_token_counter(request)
+        if value is not None and not isinstance(value, (ContextCountEstimate, int)):
+            raise TypeError("input_token_counter must return a ContextCountEstimate, int, or None")
+        return value
 
     async def _wait_for_delay(self, cancellation: CancellationToken) -> None:
         cancellation.raise_if_cancelled()

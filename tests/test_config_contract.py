@@ -20,6 +20,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextPart,
@@ -34,6 +35,9 @@ from uthcode.integrations.config.loader import (
 )
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _write_user(home: Path, text: str) -> Path:
@@ -301,6 +305,7 @@ async def test_direct_and_agent_run_use_remote_id_and_reasoning_snapshot() -> No
         provider = FakeProvider(
             identity=ProviderIdentity("fake", "script", remote_id),
             events=(_completed(),),
+            model_limits=TEST_LIMITS,
         )
         providers[model.model_ref] = provider  # type: ignore[attr-defined]
         return provider

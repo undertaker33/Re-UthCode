@@ -80,6 +80,7 @@ def _application(workdir: Path, provider: _ScriptedProvider, tool: _SafeBash):
         provider_profile_id="t07-1",
         provider_kind=ProviderKind.FAKE,
         remote_id="offline",
+        context_window=1_000_000,
     )
     context = ApplicationRuntimeContext.from_system(
         workdir=workdir,

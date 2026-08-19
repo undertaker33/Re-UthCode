@@ -31,6 +31,7 @@ from uthcode.core.provider import (
     CancellationToken,
     FinishReason,
     GenerationRequest,
+    ModelLimits,
 )
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import (
@@ -73,6 +74,9 @@ class _IntegrationProvider:
         self.final_text = final_text
         self.requests: list[GenerationRequest] = []
 
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -112,6 +116,9 @@ class _TerminalProvider:
         self.identity = ProviderIdentity("fake", "p0", "fake-model")
         self.requests: list[GenerationRequest] = []
 
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -127,6 +134,9 @@ class _ToolTerminalProvider:
     def __init__(self) -> None:
         self.identity = ProviderIdentity("fake", "p0", "fake-model")
         self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,
@@ -353,7 +363,7 @@ async def test_w06_formal_application_chain_persists_compacts_and_resumes(
         assert initial.system_prompt is not None
         assert "spoof-agents" not in initial.system_prompt
         assert "ToolResultRead" in {tool.name for tool in initial.tools}
-        assert initial.metadata["context_budget_tokens"] == 258_000
+        assert initial.metadata["context_budget_tokens"] == 1_000_000
         assert "max_input_tokens" not in initial.to_dict()
         assert after_read.metadata["instruction_epoch"] != initial.metadata["instruction_epoch"]
         assert after_read.metadata["stable_prefix_fingerprint"] != initial.metadata[

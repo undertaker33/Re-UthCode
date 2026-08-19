@@ -28,12 +28,16 @@ from uthcode.core.provider import (
     FinishReason,
     GenerationCompleted,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextPart,
     Usage,
 )
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _completed() -> GenerationCompleted:
@@ -61,6 +65,7 @@ def _application() -> tuple[UthCodeApplication, list[str]]:
         return FakeProvider(
             identity=ProviderIdentity(provider.provider_profile_id, "fake", model.remote_id),
             events=(_completed(),),
+            model_limits=TEST_LIMITS,
         )
 
     return create_application(

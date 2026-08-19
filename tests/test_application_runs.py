@@ -83,6 +83,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderEvent,
     ProviderIdentity,
     ProviderResponse,
@@ -100,6 +101,9 @@ from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.application.tools import ApplicationToolService
 from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _response(
@@ -155,6 +159,9 @@ class _ScriptedProvider:
         self.scripts = tuple(tuple(script) for script in scripts)
         self.requests: list[GenerationRequest] = []
 
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -176,6 +183,9 @@ class _GatedProvider:
         self.requests: list[GenerationRequest] = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,
@@ -200,6 +210,9 @@ class _StreamingGatedProvider:
         self.partial_emitted = asyncio.Event()
         self.release = asyncio.Event()
 
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -223,6 +236,9 @@ class _FailThenProvider:
         self.response = response
         self.requests: list[GenerationRequest] = []
 
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -243,6 +259,9 @@ class _SteeringRaceProvider:
         self.requests: list[GenerationRequest] = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,
@@ -358,7 +377,7 @@ def _context(workdir: Path) -> ApplicationRuntimeContext:
 @pytest.mark.asyncio
 async def test_turn_can_start_without_an_event_loop_and_result_is_reusable() -> None:
     application = UthCodeApplication(
-        FakeProvider(events=(_response(TextPart("answer")),))
+        FakeProvider(events=(_response(TextPart("answer")),), model_limits=TEST_LIMITS)
     )
     run = application.create_run(run_id="run-1")
     handle = run.start_turn("hello")
@@ -379,7 +398,7 @@ async def test_turn_can_start_without_an_event_loop_and_result_is_reusable() -> 
 
 @pytest.mark.asyncio
 async def test_events_and_result_share_one_execution_and_events_are_single_consumer() -> None:
-    provider = FakeProvider(events=(_response(TextPart("answer")),))
+    provider = FakeProvider(events=(_response(TextPart("answer")),), model_limits=TEST_LIMITS)
     run = UthCodeApplication(provider).create_run()
     handle = run.start_turn("hello")
 
@@ -397,7 +416,9 @@ async def test_events_and_result_share_one_execution_and_events_are_single_consu
 
 @pytest.mark.asyncio
 async def test_active_turn_is_exclusive_and_cancel_is_idempotent() -> None:
-    provider = FakeProvider(events=(_response(TextPart("answer")),), delay=0.05)
+    provider = FakeProvider(
+        events=(_response(TextPart("answer")),), delay=0.05, model_limits=TEST_LIMITS
+    )
     run = UthCodeApplication(provider).create_run()
     active = run.start_turn("first")
 
@@ -414,7 +435,9 @@ async def test_active_turn_is_exclusive_and_cancel_is_idempotent() -> None:
 
 @pytest.mark.asyncio
 async def test_completed_turn_releases_run_when_event_iterator_is_closed_after_first_event() -> None:
-    provider = FakeProvider(events=(_response(TextPart("answer")),), delay=0.01)
+    provider = FakeProvider(
+        events=(_response(TextPart("answer")),), delay=0.01, model_limits=TEST_LIMITS
+    )
     run = UthCodeApplication(provider).create_run()
     handle = run.start_turn("first")
     event_iterator = handle.events()
@@ -429,7 +452,9 @@ async def test_completed_turn_releases_run_when_event_iterator_is_closed_after_f
 
 @pytest.mark.asyncio
 async def test_events_call_without_iteration_starts_and_releases_the_run() -> None:
-    provider = FakeProvider(events=(_response(TextPart("answer")),), delay=0.01)
+    provider = FakeProvider(
+        events=(_response(TextPart("answer")),), delay=0.01, model_limits=TEST_LIMITS
+    )
     run = UthCodeApplication(provider).create_run()
     event_iterator = run.start_turn("first").events()
 
@@ -441,7 +466,9 @@ async def test_events_call_without_iteration_starts_and_releases_the_run() -> No
 
 @pytest.mark.asyncio
 async def test_cancelled_event_consumer_does_not_hold_a_completed_run() -> None:
-    provider = FakeProvider(events=(_response(TextPart("answer")),), delay=0.01)
+    provider = FakeProvider(
+        events=(_response(TextPart("answer")),), delay=0.01, model_limits=TEST_LIMITS
+    )
     run = UthCodeApplication(provider).create_run()
     handle = run.start_turn("first")
     first_event_seen = asyncio.Event()
@@ -466,14 +493,17 @@ async def test_cancelled_event_consumer_does_not_hold_a_completed_run() -> None:
 @pytest.mark.parametrize("terminal_path", ("completed", "failed", "cancelled"))
 async def test_every_provider_terminal_path_releases_run_once(terminal_path: str) -> None:
     if terminal_path == "failed":
-        provider = FakeProvider(error=ProviderError("synthetic provider failure"))
+        provider = FakeProvider(
+            error=ProviderError("synthetic provider failure"), model_limits=TEST_LIMITS
+        )
     elif terminal_path == "cancelled":
         provider = FakeProvider(
             events=(_response(TextPart("answer")),),
             delay=0.02,
+            model_limits=TEST_LIMITS,
         )
     else:
-        provider = FakeProvider(events=(_response(TextPart("answer")),))
+        provider = FakeProvider(events=(_response(TextPart("answer")),), model_limits=TEST_LIMITS)
 
     run = UthCodeApplication(provider).create_run()
     handle = run.start_turn("first")
@@ -947,7 +977,7 @@ async def test_application_driver_task_cancellation_closes_turn_without_unhandle
 async def test_application_driver_unexpected_exception_closes_result_events_and_active_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeProvider(events=(_response(TextPart("done")),))
+    provider = FakeProvider(events=(_response(TextPart("done")),), model_limits=TEST_LIMITS)
     run = UthCodeApplication(provider).create_run(run_id="exception-run")
     handle = run.start_turn("unexpected exception")
     target = handle._driver.execution
@@ -1290,7 +1320,7 @@ async def test_application_resume_cancel_race_is_cancel_wins_without_resumed_eve
 
 @pytest.mark.asyncio
 async def test_application_terminal_controls_are_rejected_without_new_events() -> None:
-    provider = FakeProvider(events=(_response(TextPart("done")),))
+    provider = FakeProvider(events=(_response(TextPart("done")),), model_limits=TEST_LIMITS)
     handle = UthCodeApplication(provider).create_run().start_turn("done")
     events = await _collect(handle)
     result = await handle.result()
@@ -1877,6 +1907,9 @@ async def test_t08_steering_preserves_task_state_until_model_explicitly_rewrites
     class GateSecondRequestProvider:
         identity = ProviderIdentity("fake", "gate-second", "fake-model")
 
+        def resolve_model_limits(self, _model: str) -> ModelLimits:
+            return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
+
         def __init__(self) -> None:
             self.requests: list[GenerationRequest] = []
             self.entered = asyncio.Event()
@@ -2051,7 +2084,9 @@ async def test_t08_steering_pending_makes_tool_boundary_pause_rejection_truthful
 
 
 def test_t08_idle_behavior_mode_is_run_local_without_runstate_replacement() -> None:
-    run = UthCodeApplication(FakeProvider(events=())).create_run(run_id="local-mode")
+    run = UthCodeApplication(
+        FakeProvider(events=(), model_limits=TEST_LIMITS)
+    ).create_run(run_id="local-mode")
     initial_state = run._state
     initial_payload = initial_state.to_dict()
 

@@ -57,6 +57,7 @@ def _configuration() -> EffectiveConfig:
         provider_profile_id="w04",
         provider_kind=ProviderKind.FAKE,
         remote_id="w04-model",
+        context_window=1_000_000,
     )
 
 
