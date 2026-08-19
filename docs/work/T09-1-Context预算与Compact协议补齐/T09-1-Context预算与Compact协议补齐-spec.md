@@ -2,171 +2,156 @@
 
 ## 背景
 
-T09 已建立持久会话、确定性 Context Compiler、Tool Result 外置和有界 Compactor，但当前运行时仍以固定 Operating Budget 作为唯一预算权威，无法同时保护小窗口模型并利用大窗口模型。生产组合也未接通可用的语义压缩模型调用，原始会话事实与压缩视图仍共用单层历史协议，无法表达可恢复的多阶段压缩与 Timeline 老化。
+T09 已建立持久会话、确定性 Context Compiler、Tool Result 外置和有界 Compactor，但生产运行时仍把固定 `258_000` 当作唯一预算权威，请求计数没有覆盖发送前的最终结构，原始事实与压缩视图仍共用 `CanonicalHistory/Projection`。现有 `AgentLoop` 已经能够 await sync/awaitable `request_preparer` 与 overflow handler，本包只复用该合同，不重复设计异步协议。
 
-本包在现有模块化单体、单 Agent ReAct Loop、Session single-writer 和安全配置边界内，完成动态模型窗口、双 Gate、Transcript/Timeline、确定性与语义 reduction、手动 Compact、一次 overflow retry、原始证据回读及包级文档收口。
+本包在模块化单体、单 Agent ReAct Loop、Session single-writer 和安全配置边界内，原位完成动态限制、多维 Hard Gate、Transcript/Timeline、L1-L5、手动 Compact、一次 overflow recovery、证据回读与正式入口收口。
 
 ## 目标
 
-- 每个可运行模型都显式声明 Operating Context Window，并由可靠 Provider 限制只做收紧。
-- 将 proactive Context pressure 与真实请求安全拆成两个独立判断；所有真实模型调用发送前都经过最终请求 Hard Gate。
-- 以 Transcript 保存当前 Session 已闭合的原始语义事实，以 append-only Timeline 保存派生语义视图，并用最后提交的 checkpoint 确定有效状态。
-- 建立不调用模型的确定性 reduction、使用当前冻结主模型的有界语义 reduction，以及不依赖持久 Compact 状态机的多 epoch catch-up。
-- 让 Fine Timeline 可独立老化，并允许模型通过 current-Session opaque ref 有界读取原始 Transcript 证据。
-- 让手动 Compact、自动治理、Provider overflow recovery、CLI/TUI/Headless 和安全 diagnostics 复用同一 Application 边界。
-- 硬切新的 Session 持久化格式；不迁移、不双读写、不保留旧 Projection 兼容层。
+- 模型限制只来自用户显式配置和可选的可靠 Provider 运行时 metadata；不维护 bundled model metadata、本地型号表、模型目录或硬编码默认窗口。
+- 项目配置只能保留或收紧用户配置的 `context_window`，不能补造用户缺失值，也不能放大用户可信上限。
+- 分别表达配置运行输入上限、Provider 最大输入、Provider 最大输出、可选 combined-context 上限；按各维语义独立验证，不折叠成单一 `E`。
+- 将 proactive Pressure Estimate、发送前 Preflight Safety Count/Estimate 与 Provider overflow 最终裁决分层；所有真实模型调用发送前都 fail closed Hard Gate。
+- 以 Transcript 保存当前 Session 已闭合原始事实，以 append-only Timeline 保存派生语义视图，并用最后提交 checkpoint 确定有效状态。
+- 建立确定性 L1-L3、复用当前主模型的 L4、Timeline Aging L5、bounded catch-up、manual compact 和一次 overflow reduction/retry。
+- 硬切 Session v2；不迁移、不双读写、不保留旧 Projection 兼容层。
 
 ## 能力清单
 
-### T01：模型窗口、Provider 能力与双 Gate 预算
+### T01：动态模型限制与确定性请求安全链
 
-- 可运行模型显式提供正整数 Operating Context Window。
-- 可靠 Provider input ceiling 只收紧有效限制；缺失能力时使用配置窗口，不虚构 metadata。
-- Provider count 与确定性 local estimate 进入统一 estimate 语义，并由集中 policy 解析 uncertainty。
-- Working headroom、保留预算和压缩预算对小窗口自适应收缩，对大窗口使用绝对上限，避免统一百分比规则。
-- Auto Gate 与 Hard Gate 可独立观察，允许 proactive pressure 与 hard-safe 同时成立。
+- `ModelProfile.context_window` 是用户可显式配置的正整数输入运行上限；若用户未配置，只有可靠 Provider input metadata 能建立本次可运行上限，两者都缺失时初始化或发送前明确失败。
+- 项目层 `context_window` 只有在用户层已有该值且不大于用户值时才允许；Provider metadata 也只能收紧最终 operating input limit。
+- Provider limits DTO 分开保存 `max_input_tokens`、`max_output_tokens` 和可选 `max_combined_tokens`；未知维度保持未知。
+- 不引入 bundled metadata；Anthropic 可通过 fake client 测试可靠运行时 limits，OpenAI/Compat 在无可靠来源时不伪造。
+- Pressure Estimate 用于 Auto Gate；Preflight Safety Count/Estimate 用于 Hard Gate；两者共享集中 uncertainty/safety allowance，但不声称近似计数数学精确。
+- 最终候选请求的 instruction、messages、tools、已知 framing、requested output reserve 按维度验证；input limit、output limit、combined limit 各自成立才可调用 Provider。
+- 在同一任务内接通正式 `Application -> Context Compiler -> request_preparer -> AgentLoop -> ProviderPort` 链，完成 L1-L3、rebuild/re-gate，并删除固定 258K authority。
 
-### T02：Transcript、Timeline 与 Session v2
+### T02：Transcript、Timeline 与 Session v2 一次性硬切
 
-- Transcript 成为当前 Session 的原始 durable closed semantic fact authority。
-- Timeline 只允许 Fine semantic entry、Epoch macro summary 与 Active checkpoint 三类产品记录。
-- 成功的语义派生 transaction 先写派生记录、最后写 checkpoint；loader 忽略 checkpoint 后未闭合尾部。
-- fresh Session 使用分离的 Transcript、Timeline、Runtime Log 与 Tool Result 文件；旧 Session 明确不兼容。
+- Transcript 成为当前 Session durable closed semantic fact authority；Timeline 只允许 Fine entry、Epoch macro summary、Active checkpoint 三类产品记录。
+- 成功派生 transaction 先写派生记录、最后写 checkpoint；loader 忽略 checkpoint 后未闭合尾部。
+- fresh Session 使用 `transcript.jsonl`、`timeline.jsonl`、`runtime.jsonl`、metadata、lock 与 tool-results；old v1 明确 incompatible。
+- 同一任务迁移 Context compiler、Application generation/history/session 与所有生产调用方，并删除 `CanonicalHistory`、`Projection` 和 `history.jsonl` 新写入路径。
 - 保留 strict sequence、完整 Tool semantic group、single writer、fsync、reconciliation、quarantine 与 close/reopen recovery。
 
-### T03：最终请求计数与确定性 L1-L3
+### T03：生产 L4 与 bounded catch-up
 
-- Context Compiler 继续作为唯一 model-view builder。
-- 每次普通请求先形成最终候选 request，再对 system、messages、tools、输出预留和已知结构 overhead 做计数与 Gate 判断。
-- L1 复用 Tool Result 外置，L2 确定性收缩 bounded preview，L3 按完整 inactive Turn/semantic unit 省略 raw view。
-- protected context、当前 Turn 和 ToolCall/ToolResult 配对不可拆分。
-- L1-L3 后重新组装并重做 Auto/Hard Gate；required facts 自身超限时 fail closed。
+- L4 使用 active Turn 冻结的主 Provider/model/limits，idle manual 使用当前选择；Compact request 独立、tool-free、bounded。
+- 每个 Compact request 自身先通过 Hard Gate，不递归触发 Auto compact。
+- 结构化结果按 covered Turn 形成 Fine entries，校验通过后 checkpoint 最后提交。
+- 一次编排允许多个有界 epoch；每次 commit 后 rebuild 并重做 Gate。
+- no-progress、repeated failure、no-safe-epoch、cancellation 都有限且可观测，不产生伪提交。
 
-### T04：生产 L4 与 bounded catch-up
-
-- L4 使用 active Turn 冻结的主 Provider、model 与窗口；idle manual 场景使用当前选择。
-- Compact request 独立、tool-free、bounded，并在调用模型前执行 Hard Gate。
-- 结构化输出按 covered Turn 形成 Fine semantic entries；校验通过后 checkpoint 最后提交。
-- 一次编排允许多个有界 epoch，每次提交后重新构建并重做 Gate。
-- no-progress、repeated failure、no-safe-epoch 与 cancellation 都有有限、可观测且不产生伪提交的结果。
-- Auto pressure 在有限治理后仍未解决但 Hard-safe 时允许发送并记录原因；Hard-unsafe 始终 fail closed。
-
-### T05：L5 Timeline Aging 与 HistoryRead
+### T04：L5 Timeline Aging 与 HistoryRead
 
 - Fine Timeline 超预算可独立触发 L5，不依赖普通请求先达到 Auto pressure。
-- L5 只选择旧的完整 compact epoch，并重新读取 raw Transcript evidence，禁止 summary-of-summary。
-- 成功 L5 追加 epoch macro summary 与最后 checkpoint，在 logical view 中 supersede 旧 Fine entries，不删除物理记录。
-- HistoryRead 只读取 active Session 的精确 opaque Transcript ref，结果有界、只读，不支持搜索或跨 Session。
-- HistoryRead 输出不会递归外置。
+- L5 只选择旧完整 epoch，并从 raw Transcript refs 重新取证，禁止 summary-of-summary。
+- 成功 L5 追加 macro 与最后 checkpoint，在 logical view 中 supersede 旧 Fine entries，不删除物理记录。
+- HistoryRead 只读 active Session 的精确 opaque Transcript ref，结果有界，不搜索、不跨 Session、不递归外置。
 
-### T06：[接入主流程] 生命周期、命令与 overflow recovery
+### T05：Application Compact 生命周期与 overflow recovery
 
-- Application 在每次下一普通 Provider call 前 durable append 已闭合事实，并在 terminal tail 提交余下事实；不持久化 open continuation。
-- active Turn 冻结 Provider、model、窗口、output 与 tools；运行中切换模型只影响下一 Turn。
-- 手动 Compact 进入与自动治理相同的异步 Application orchestrator，低 pressure 也可执行；无候选时 success no-op。
-- 普通 Provider overflow 最多强制 reduction 后 retry 一次；二次 overflow 失败且不修改窗口事实。
-- 同步命令保持兼容，Compact 命令可 await；TUI 只做异步命令适配，不拥有 Context 语义。
-- CLI、TUI 与 Headless 的所有真实模型调用都经过相同 Hard Gate。
+- 下一普通调用前 durable append 已闭合事实，terminal tail 补齐余下闭合事实；不持久化 open continuation。
+- active Turn 冻结 Provider、model、input/output/combined limits 与 tools；运行中 `/model` 只影响下一 Turn。
+- manual compact 与自动治理复用同一 Application orchestrator；低 pressure 可执行，无候选为 success no-op。
+- ordinary Provider overflow 最多执行一次 `reduce -> rebuild -> re-gate -> retry`；第二次 overflow 停止，不反向修改任何窗口事实。
+- 直接 Application/Headless 路径已可运行、测试、回退，尚不依赖命令或 TUI 接入。
+
+### T06：[接入主流程] 命令、TUI 与正式入口收口
+
+- `/compact`、`/status`、CLI/TUI/bootstrap 正式接入 T05 Application 边界。
+- 复用现有 AgentLoop sync/awaitable 合同，只对 Application command dispatcher/TUI 做所需 async adaptation，不新增第二套 preparer/overflow protocol。
+- CLI、TUI、Headless 不拥有 Context 编排；旧同步-only compact 路径与旧入口在同一任务删除。
 
 ### T07：[端到端验证] Diagnostics、Eval、文档与回归
 
-- status 与公开 diagnostics 展示动态窗口、有效限制、Gate、count source、Timeline 与 pressure 结果，但不泄露正文、摘要、Tool Result 或秘密。
-- Eval 只消费公开安全 diagnostics，按既有并列维度比较，不新增总分，不把 tuning 默认值定义为产品成败阈值。
-- 用户手册、Core Design、Tool 清单、当前事实文档和索引与代码事实同步。
-- 从正式 Application/command/headless 入口覆盖普通、自动、手动、overflow、resume、HistoryRead 和失败路径。
-- T05/T06/T08、架构边界与全量测试回归通过。
+- status/diagnostics 分别展示 configured/provider/effective input、provider output/combined、count source、uncertainty、Auto/Hard、Timeline 与 outcome，不泄露正文或秘密。
+- Eval 只消费公开安全 diagnostics，维持并列指标，不新增总分，不把 tuning 默认值变成产品阈值。
+- 正式 Application/command/headless 入口覆盖普通、自动、手动、overflow、resume、HistoryRead 与失败路径。
+- 用户手册、Core Design、Tools、A03/A04、索引与当前代码事实同步。
 
 ### T08：[遗留负担清理] 删除阶段性与兼容逻辑
 
-- 删除固定预算作为 runtime safety authority、Projection 生产语义、旧 Session 新写入路径和同步-only Compact 路径。
-- 删除不可达分支、重复 Context 编排、旧文案、旧导出与只为早期实现存在的 alias/wrapper。
-- 确认未新增第四种 Timeline 产品记录、持久 Compact FSM、独立 compaction model、跨 Provider fallback 或无调用方的系统级抽象。
-- 保留 Permission、Plan/Todo、Runtime Hook、其它 Slash Command 与 TUI rendering 的既有语义。
+- 删除固定 258K runtime authority、Projection/CanonicalHistory 生产语义、old Session 新写入、旧阶段文案和重复 Context 编排。
+- 删除 bundled official model metadata 相关设计、实现、测试和欠账；该路线已取消，不转记未来能力。
+- 删除不可达分支、重复导出、兼容 alias/wrapper；确认没有第四种 Timeline record、持久 Compact FSM、独立 compaction model 或无调用方抽象。
 
 ## 非功能要求
 
-- Core 不依赖 filesystem、network、Provider SDK、Application、Integration 或 Interface。
-- Provider SDK 类型截止在 Integration，Application/Core 只消费 UthCode-owned DTO。
+- Core 不依赖 filesystem、network、Provider SDK、Application、Integration 或 Interface；SDK 类型截止在 Integration。
 - Interface 只调用 Application；Headless 不依赖 TUI。
-- 所有 reduction 与 persistence 都按完整语义边界工作，ToolCall 与匹配 ToolResult 不可拆。
-- 未知 durability 继续 fail closed；无法确认副作用时不盲目重试。
-- Context、diagnostics、Event、Journal、Snapshot 与 Eval artifact 不得泄露 API key、秘密或 raw evidence 正文。
-- 无真实 Provider 网络调用也能完成必过测试；Provider capability 使用 fake SDK/client fixture。
+- reduction 与 persistence 按完整语义边界工作，ToolCall/ToolResult 不可拆。
+- 未知 durability fail closed；无法确认副作用时不盲目重试。
+- Context、diagnostics、Event、Journal、Snapshot、Eval artifact 不泄露秘密或 raw evidence 正文。
+- 必过测试不依赖真实 Provider 网络；capability 使用 fake SDK/client fixture。
 - 不新增第三方依赖。
 
 ## 设计骨架
 
 ```text
-Configured operating window
-        + optional reliable Provider ceiling
-        ↓
-Effective limit + adaptive capped profile
-        ↓
-final candidate request assembly
-        ↓
-count estimate + uncertainty
-        ↓
-Auto Gate / Hard Gate
-        ↓
-L1 -> L2 -> L3 -> optional L4 catch-up
-        ↓
-rebuild + re-gate
-        ↓
-Hard-safe Provider call or fail closed
+user configured input limit? ─┐
+reliable provider max input? ─┼─> effective operating input limit (至少一项存在，取更紧者)
+provider max output? ─────────┤
+provider combined limit? ─────┘   未知维度保持 unknown
+
+final candidate request
+  ├─ pressure estimate + allowance ──> Auto Gate
+  └─ preflight safety count/estimate
+       ├─ input <= effective input limit
+       ├─ requested output <= known provider output limit
+       └─ input + output reserve <= known combined limit
+             ↓
+        Hard-safe Provider call / fail closed
 ```
 
 ```text
-Transcript (raw closed facts) ──► HistoryRead
+Transcript raw closed facts ──► HistoryRead
             │
             └──► L4/L5 evidence
                          │
                          ▼
-Timeline: Fine entries / Macro summaries / Active checkpoint
+Timeline: Fine / Macro / Active checkpoint
                          │
                          ▼
                  logical model view
 ```
 
-Compact 编排只在当前 Application 调用栈保存 attempt、coverage、previous estimate、current epoch 与 cancellation；持久状态只由 Transcript 与 latest valid checkpoint 推导。
+计数是带来源与 allowance 的安全估计，不是 tokenizer 精确性的虚假承诺；Provider overflow 仍是外部最终裁决。Compact attempt、coverage、previous estimate、epoch 与 cancellation 只在当前 Application 调用栈中保存。
 
 ## 能力欠账
 
 无新增能力欠账。
 
-本包计划回补 `docs/OutstandingDebtList.md` 中 T09 的三项 Context 欠账：真实模型窗口与 Provider limits、生产 tool-free Compaction、small/large-window adaptation。工作包创建时只更新其回补触发状态；只有本包实现完成、Checklist 全部完成且 Feedback 已记录后才能从滚动清单删除。
-
-Persistent Runtime Recovery、Memory/Evidence Retrieval、Artifact Store GC、Timeline physical GC、后台 Context Agent 和独立 compaction model 属于 Out of Scope，不登记为本包新增欠账。
+本包实现完成后回补 T09 的动态模型限制、生产 tool-free Compaction、small/large-window adaptation 三项既有欠账。原先“维护 bundled official metadata”方案由用户明确取消：若滚动清单存在该项，应删除而非保留或改写为未来欠账。只有 T01～T08 全部完成、Checklist 完成且 Feedback 已记录后，才能删除其余已真实回补条目。
 
 ## Out of Scope
 
-- Memory、Embedding、Vector/semantic retrieval、跨 Session History retrieval。
-- active/paused Run/Turn、Pending Tool、Permission、AskUser、Provider coroutine 的跨进程恢复。
+- bundled model metadata、本地 Model Catalog、硬编码模型默认窗口、自动模型发现 UI。
+- Memory、Embedding、Vector/semantic retrieval、跨 Session retrieval。
+- active/paused Run/Turn、Pending Tool、Permission、Provider coroutine 的跨进程恢复。
 - 独立 Compaction Model、跨 Provider fallback、后台 Context Agent、Job Scheduler、持久 Compact FSM。
-- Timeline physical GC、rotation/self-compaction、Artifact Store 生命周期与 GC。
+- Timeline physical GC、Artifact Store 生命周期与 GC。
 - Subagent、Multi-Agent、Worktree。
-- Provider 全量 Model Catalog、自动模型发现 UI、新的 headroom 用户配置子系统。
 - Provider-specific server-side context editing 进入 Core。
-- 旧 T09 Session migration、dual read、dual write、compatibility alias。
-- Permission、Plan/Todo、Runtime Hook、TUI rendering 与其它 Slash Command 的非必要重构。
+- old Session migration、dual read/write、compatibility alias。
+- Permission、Plan/Todo、Runtime Hook、TUI rendering 与其它命令的非必要重构。
 
 ## 验收标准
 
-1. 所有 runnable model 有明确正整数 Operating Context Window；没有固定窗口 fallback。
-2. 可靠 Provider ceiling 只收紧有效限制，缺失时不伪造；Provider overflow 不反向学习窗口。
-3. Auto Gate 与 Hard Gate 独立，headroom 对小窗口收缩且对大窗口封顶。
-4. 每个普通、L4、L5、manual 与 retry 模型调用都基于最终 request 通过 Hard Gate。
-5. Provider count 与 local estimate 都带来源和有界 uncertainty。
-6. L1-L3 确定性工作；仍处于 Auto pressure 时尝试 L4，已清除时不做无意义 L4。
-7. L4/L5 tool-free、bounded、复用当前主模型，并且自身只做 Hard Gate、不递归 Auto compact。
-8. bounded catch-up 支持多个 epoch，每批 checkpoint 最后提交并重新 Gate，没有持久 Compact FSM。
-9. finite reduction 后 Auto unresolved + Hard-safe 可发送并记录原因；Hard-unsafe Provider call count 为零。
-10. Transcript 与 Timeline 职责分离，Timeline 只有三类产品记录，trailing incomplete transaction 不生效。
-11. L5 从 raw Transcript 取证且不做 summary-of-summary；HistoryRead 只允许 current Session exact bounded read。
-12. fresh Session 使用 v2 文件布局；old v1 明确不兼容，无迁移或双轨逻辑。
-13. closed facts 在 request preparation 与 terminal 边界增量 durable；不持久化 open runtime continuation。
-14. 手动 Compact 可在低 pressure 执行，无候选时 success no-op 且无 Timeline garbage。
-15. ordinary overflow 最多 reduction + retry 一次，二次 overflow 停止且不修改窗口。
-16. status、diagnostics 与 Eval 不泄露正文或秘密，且不建立总分。
-17. CLI、TUI、Headless、Session resume、Permission、Plan/Todo 与固定 Hook 行为回归通过。
-18. 架构测试、相关定向测试与全量回归通过；文档与当前 `src/ + tests/` 一致。
-19. 没有旧 Projection/固定预算生产 authority、compatibility layer、第四种 Timeline record 或无调用方系统抽象。
+1. 用户配置与可靠 Provider metadata 是唯一模型限制来源；无 bundled metadata 或固定 fallback。
+2. 用户未配置且 Provider 无可靠 input limit 时 fail closed；项目不能补造或放大用户 `context_window`。
+3. input、output、combined limits 分维表达和校验，unknown 不伪造、不折叠为单一 `E`。
+4. Pressure Estimate 与 Preflight Safety Count/Estimate 分层；近似计数带集中 allowance，不宣称数学精确。
+5. 每个 ordinary/L4/L5/manual/retry 调用均在发送前通过最终请求 Hard Gate；protected facts 自身超限时 Provider call count 为 0。
+6. T01 独立接通正式请求链和 L1-L3，删除固定 258K authority；T02 独立完成所有 History/Session 生产调用方硬切。
+7. L4/L5 tool-free、bounded、复用冻结主模型；catch-up 多 epoch、checkpoint-last、每批 rebuild/re-gate，无持久 FSM。
+8. L5 从 raw Transcript 取证；HistoryRead 只允许 current Session exact bounded read。
+9. fresh Session 使用 v2；old v1 incompatible，无迁移、双轨或 Projection 兼容层。
+10. closed facts 在 request preparation 与 terminal 边界增量 durable；不持久化 open continuation。
+11. manual compact 低 pressure 可执行、无候选 success no-op；ordinary overflow 只允许一次 bounded retry。
+12. 已存在的 sync/awaitable preparer/overflow 合同仅被复用，无重复协议或无必要 `core/agent.py` 改造。
+13. diagnostics/Eval 不泄露正文或秘密，不建立总分。
+14. CLI、TUI、Headless、resume、Permission、Plan/Todo、Hook、架构测试和全量回归通过。
+15. 生产路径中旧 authority、旧 Session writer、bundled metadata、第四种 Timeline record 与无调用方抽象为零。

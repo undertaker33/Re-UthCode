@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-18
+snapshot_date: 2026-08-19
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-18
+status_snapshot: 2026-08-19
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已基于 `94eb397f...` 验证当前源码与官方参考并完成 Spec、Tasks、Checklist 和 6 个 Worker Prompt；尚无 Worker Feedback，未开始实施 |
+| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | 已基于 merge baseline `40e9b2ea...` 的等价 Git tree 原位返工：取消 bundled metadata，明确 user/project limit authority、分维 Provider limits、Pressure/Preflight/overflow 三层语义，并把 T01/T02 改为可独立运行的竖切任务；Spec、Tasks、Checklist 与 6 个 Worker Prompt 已同步，Feedback 为空，仍未开始实施 |
 
 ## 跨层最短链路
 
