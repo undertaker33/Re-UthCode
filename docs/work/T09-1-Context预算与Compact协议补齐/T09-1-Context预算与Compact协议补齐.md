@@ -13,23 +13,23 @@ https://github.com/undertaker33/Re-UthCode
 本任务唯一分析与后续实施基线：
 
 ```text
-94eb397f6de9d56131bca898a88be05c3ad082e5
+40e9b2eaf984dbc266fa16e786f03de57435dfad
 ```
 
-该 Commit 的提交语义为：
+该 Commit 是 T09-1 正式工作包的合并提交。经 Git tree 核验，它与当前本地返工起点 `76cfb53fbe2fbf628bea488aee75d4cfc853cbed` 的源码、测试和文档树完全一致。
 
 ```text
-docs: 移除 T09-1 工作包文档
+Merge pull request #24: T09-1 Context预算与Compact协议补齐工作包
 ```
 
-该基线已经移除此前的 T09-1 工作包文档，并把尚未回补的 Context 能力重新保留为当前能力欠账。当前源码与测试状态已直接在本 Commit 下重新核对，不继承任何旧任务书的代码事实判断。
+该基线已经包含 T09-1 正式工作包，但尚未派发 Worker、没有实现提交、Checklist 全未勾选且 Feedback 为空。当前源码与测试状态已直接在该 merge tree 下重新核对；本次按用户批准的返工提示词原位修订，不继承任务书中与真实代码冲突的判断。
 
 因此：
 
-- 本任务书不恢复已删除的旧工作包；
-- 旧 T09-1 任务书、Spec、Tasks、Checklist、Worker Prompt 只作为历史设计证据；
-- 所有源码、测试、目录、接口和当前能力判断以 `94eb397f...` 的真实 `src/ + tests/` 为准；
-- 后续编码不得因为旧任务书曾经存在而保留兼容层、旧 Task 编号或旧 Projection 语义。
+- 保留原工作包目录与四份主文档，原位返工，不创建 `v2`、`fix`、`retry` 平行包；
+- Worker Prompt 仍为独立可派发文件，Feedback 目录保持空，直到真实实施发生；
+- 所有源码、测试、目录、接口和当前能力判断以 `40e9b2ea...` 的真实 `src/ + tests/` 为准；
+- 后续编码不得因早期方案而保留 fixed 258K、旧 Projection、bundled metadata 或兼容双轨。
 
 ### 1.2 已读取的全局约束与当前事实
 
@@ -138,13 +138,13 @@ tests/test_w06_integration_delivery.py
 
 ## 2. 当前实现基线
 
-T09 已完成第一版 Context Engineering，但 `94eb397f...` 的正式源码仍处于以下阶段。
+T09 已完成第一版 Context Engineering，但 `40e9b2ea...` 的正式源码仍处于以下阶段。
 
 ### 2.1 当前请求链路
 
 ```text
 AgentLoop
-   ↓ request_preparer（同步）
+   ↓ request_preparer（sync | awaitable，Core 已支持）
 UthCodeApplication._start_agent_turn.prepare()
    ↓
 ApplicationContextService.compose_generation_request()
@@ -157,6 +157,8 @@ GenerationRequest
    ↓
 ProviderPort
 ```
+
+`overflow_handler` 同样已经支持 sync | awaitable 和一次性 retry guard。T09-1 只复用、类型校准并回归取消/错误行为，不把 async hook 支持重复列为新增能力；当前 Application 的 `prepare()` 仍是同步 closure，真实 L4/L5 可在既有 awaitable 边界接入。
 
 ### 2.2 当前关键事实
 
@@ -287,7 +289,7 @@ read-only
 
 1. 固定 258K 既不能保护小窗口模型，也不能充分使用大窗口模型。
 2. “是否应该提前治理”与“当前请求是否绝对允许发送”尚未区分。
-3. 本地 token estimate 与 Provider 最终 serialization/tokenization 存在误差，裸 estimate `< C` 不能作为硬安全依据。
+3. 本地 token estimate 与 Provider 最终 serialization/tokenization 存在误差，裸 estimate 低于某个 input limit 不能作为数学精确的硬安全依据。
 4. Provider overflow 发生后再处理太晚，而且不能用 overflow 反推窗口。
 5. 当前 `/compact` 与 overflow compact 没有生产 summarizer。
 6. 单层 Projection 无法同时表达：
@@ -308,18 +310,15 @@ read-only
 完成后形成以下正式请求链：
 
 ```text
-                 ModelProfile.context_window = C
-                            │
-         reliable Provider ceiling? ─────┐
-                            │             │
-                            └──────┬──────┘
-                                   ▼
-                         Effective Limit E
+ user configured input? ───────┐
+ reliable Provider max input? ─┼──► effective operating input limit
+ Provider max output? ─────────┤
+ Provider combined limit? ─────┘      （各维独立、unknown 不伪造）
                                    │
 User / Tool / Resume ──► assemble final candidate request
                                    │
                                    ▼
-                         Budget / Count Resolver
+                 Pressure / Preflight Resolver
                                    │
                       ┌────────────┴────────────┐
                       ▼                         ▼
@@ -380,13 +379,13 @@ timeline.jsonl
 自动 L4/L5 发生在 active Turn 内时：
 
 ```text
-使用该 Turn 已冻结的 Provider / model / C snapshot
+使用该 Turn 已冻结的 Provider / model / 分维 limits snapshot
 ```
 
 idle 状态手动 `/compact`：
 
 ```text
-使用 Application 当前选中的 Provider / model / C
+使用 Application 当前选中的 Provider / model / 分维 limits
 ```
 
 Compact 请求：
@@ -464,30 +463,33 @@ Transcript + latest valid ActiveCheckpoint
 
 ### 4.4 冻结决策 D3：Auto Gate 与 Hard Gate 分离
 
-#### 4.4.1 Operating Context Window 与 Effective Limit
+#### 4.4.1 模型限制来源与分维语义
+
+模型限制只能来自：
 
 ```text
-C = ModelProfile.context_window
+C_user?       = 用户显式配置的 operating input limit
+P_input?      = 可靠 Provider runtime max input
+P_output?     = 可靠 Provider runtime max output
+P_combined?   = Provider 明确定义的 combined-context limit
+O_request     = 本次最终 GenerationRequest 的 requested output reserve
 ```
 
-当 Provider 能提供可靠 physical / max-input ceiling：
+当前调用的有效输入运行上限为所有已知 input 上限中的更紧者：
 
 ```text
-E = min(C, reliable_provider_ceiling)
+C_effective = min(available C_user, P_input)
 ```
 
-否则：
+若 `C_user` 与 `P_input` 都缺失，则当前模型不能发送请求，必须明确 fail closed；不得回退到固定 258K、型号名推断、bundled table 或本地 catalog。
 
-```text
-E = C
-```
+配置权威规则：
 
-规则：
-
-- `C` 是 UthCode 当前模型的 Operating Context Window；
-- Provider ceiling 只允许收紧，不允许扩大 C；
-- Provider 无可靠 metadata 时不得虚构 ceiling；
-- Provider overflow 不得被用于学习或修改 C。
+- 用户配置是可信项目上限来源；项目配置只有在用户已经配置 `context_window` 时才能保持或收紧，不能补造缺失值或放大用户值；
+- Provider metadata 只能收紧已配置 limit，或在用户未提供时为当前运行建立可靠 input limit；
+- `P_input`、`P_output`、`P_combined` 是不同物理维度，unknown 保持 unknown，不压扁为一个 `E`；
+- Provider overflow 是最终外部裁决，不得反向学习、缓存或修改任何 limit；
+- 取消 bundled official model metadata 路线，不登记为未来能力欠账。
 
 #### 4.4.2 Hard Gate：请求安全边界
 
@@ -503,49 +505,52 @@ L5 model call
 overflow retry
 ```
 
-Hard Gate 基于**最终将发送的完整 `GenerationRequest`**，至少计算：
+Hard Gate 基于**最终将发送的完整 `GenerationRequest`**，由 Preflight Safety Count/Estimate 至少覆盖：
 
 ```text
-final input token count / estimate
-+ effective output reserve
-+ counting / serialization uncertainty
+instruction + messages + tools + known framing 的 input count/estimate
+requested output reserve
+集中定义的 counting / serialization safety allowance
 ```
 
-若：
+按维度独立判断：
 
 ```text
-projected_hard_usage > E
+input_estimate + allowance <= C_effective
+O_request <= P_output                     （仅 P_output 已知时）
+input_estimate + allowance + O_request <= P_combined
+                                              （仅 P_combined 已知时）
 ```
 
-则：
+任一已知维度不满足，或 `C_effective` 无法建立，则：
 
 ```text
 Provider call count = 0
 必须 reduction 或 fail closed
 ```
 
-Hard Gate 不得实现为：
+Hard Gate 是发送前的 fail-closed guard，但 local/Provider count 可能仍是估计值；不得把它宣传为数学精确，也不得实现为：
 
 ```text
-used >= 90% * C
+used >= 90% * C_effective
 ```
 
 也不得把：
 
 ```text
-local estimate < C
+local estimate < C_effective
 ```
 
 直接等价为 safe。
 
-Provider-side token count 可作为更高可信度输入，但仍必须保留 bounded uncertainty。
+Provider-side token count 可作为更高可信度输入，但仍须记录来源并应用集中 safety allowance；Provider 实际 overflow 继续保持最终权威。
 
 #### 4.4.3 Auto Gate：proactive Context Pressure
 
 定义：
 
 ```text
-AutoGate = E - R
+AutoGate = C_effective - R
 
 R = adaptive working headroom
 ```
@@ -553,7 +558,7 @@ R = adaptive working headroom
 `R` 的长期产品约束：
 
 1. 小窗口时自动缩小；
-2. 随 E 增长可缓慢增大；
+2. 随 `C_effective` 增长可缓慢增大；
 3. 大窗口有绝对上限；
 4. 不按固定百分比无限线性增长；
 5. 1M Context 不因统一 90% 规则固定损失约 100K；
@@ -568,7 +573,7 @@ R = adaptive working headroom
 ```text
 assemble final candidate request
         ↓
-resolve E / output reserve / uncertainty / R
+resolve dimensioned limits / output reserve / allowance / R
         ↓
 Auto Gate
         │
@@ -607,7 +612,7 @@ Auto Gate
 必须满足：
 
 ```text
-E = 258K
+C_effective = 258K（仅为测试输入，不是默认值）
 L1-L3: 259K → 257K
 257K 仍高于 Auto Gate
 
@@ -731,8 +736,8 @@ forced reduction
 ```text
 直接失败
 不继续探测
-不修改 C
-不动态猜测 E
+不修改任何 limit facts
+不动态猜测或反向学习窗口
 ```
 
 Compact 内部模型请求不得递归启动另一套 Compact。若其 bounded request 仍 overflow，应作为当前 L4/L5 attempt 的受控失败或重新选择更小 safe epoch；禁止形成递归 compaction loop。
@@ -743,12 +748,12 @@ Compact 内部模型请求不得递归启动另一套 Compact。若其 bounded r
 
 ### 5.1 本任务回补的既有能力欠账
 
-当前 `docs/OutstandingDebtList.md` 已把原 T09-1 删除后留下的三项欠账重新归入 T09。本任务自然回补：
+当前 `docs/OutstandingDebtList.md` 已把尚未实现的 T09 Context 能力列为欠账。本任务自然回补：
 
 | 来源 | 本任务回补内容 |
 | --- | --- |
-| T09 Prompt / Context Engineering | 真实 Context Window / max input、可靠 Provider metadata、显式 Model operating window、统一 Model Limits 与 Working Budget 解析 |
-| T09 Prompt / Context Engineering | 正式 tool-free Compaction model use case、异步 Provider 调用、取消、失败与一次 overflow retry |
+| T09 Prompt / Context Engineering | 用户显式 Context Window、可靠 Provider runtime limits、分维 input/output/combined contract 与自适应 Working Budget |
+| T09 Prompt / Context Engineering | 正式 tool-free Compaction model use case、复用既有 awaitable hook、取消、失败与一次 overflow retry |
 | T09 Prompt / Context Engineering | small-window / large-window adaptation、Operating Profile、Working Set、trigger、recent tail 与 safety headroom |
 
 ### 5.2 本任务新增能力欠账
@@ -766,7 +771,7 @@ Timeline physical GC
 独立 compaction model
 ```
 
-任务书阶段不得直接修改 `docs/OutstandingDebtList.md`；后续正式工作包生成/拆分时按届时规则同步。
+“维护 bundled official model metadata”路线已由用户取消：如果欠账清单存在该项，应立即删除，不得改写为未来能力。本包其余欠账只有在真实实现、Checklist 与 Feedback 全部完成后才能删除。
 
 ---
 
@@ -777,11 +782,12 @@ Timeline physical GC
 | 普通请求低于 Auto Gate | final request 已组装，Auto safe | 直接进入 Hard Gate | 无 Timeline 变化 | Hard safe 后发送 |
 | Auto pressure，但 L1-L3 足够 | deterministic reduction 后低于 Auto Gate | 不执行 L4 | Transcript 不变 | Hard safe 后发送 |
 | L1-L3 只降到 Hard Limit 以下 | 仍高于 Auto Gate | 继续 L4 | 可产生 Timeline transaction | 不擦边发送 |
-| Hard Gate unsafe | projected hard usage > E | Provider 不得调用 | 可先 reduction；无法解决则无语义提交 | fail closed |
+| Hard Gate unsafe | 任一已知 input/output/combined 维度失败或 input limit 无法建立 | Provider 不得调用 | 可先 reduction；无法解决则无语义提交 | fail closed |
 | local estimate 与 Provider count 不同 | Provider 提供 count | 优先 provider estimate，并加对应 uncertainty | 诊断记录 count source | 再做 Auto/Hard 判断 |
 | Provider count 不可用 | capability 缺失或受控失败 | 用 deterministic conservative estimate + 更保守 uncertainty | 无 | 不伪造 exact count |
-| reliable ceiling < C | Provider 能证明较小 max input | E 收紧为 ceiling | Turn budget snapshot 固定 | 不按更大 C 发送 |
-| Provider 无 ceiling | OpenAI-compatible 等无可靠 metadata | E=C | 无 | 不虚构 discovery |
+| reliable input < user limit | Provider 能证明较小 max input | effective input 收紧 | Turn limits snapshot 固定 | 不按更大用户值发送 |
+| 用户与 Provider input 都未知 | 无可证 input limit | 不组装可发送请求 | 无 | 明确 fail closed |
+| Provider output/combined 未知 | 无可靠 metadata | 只跳过未知维度，不伪造值 | diagnostics 标记 unknown | 仍执行已知 input Gate |
 | 小窗口模型 | C≈25K | R、A/F/U、Compact input/output budget 同步收缩 | policy 变化 | 不被大窗口 reserve 挤死 |
 | 大窗口模型 | C≈1M | R 有绝对 cap；retained profile 不线性放大 | 无提前强压缩 | 可真正使用大窗口 |
 | L4 单 Epoch 足够 | Auto pressure 经 L1-L3 未清除 | bounded raw epoch → SemanticEntry → checkpoint | Timeline append | rebuild 后继续 |
@@ -795,7 +801,7 @@ Timeline physical GC
 | 手动 `/compact` 有价值 | 即使低于 Auto Gate | 同一 orchestrator force reduction | 正常 Timeline commit | success |
 | 手动 `/compact` 无候选 | 无完整 epoch或无 reduction value | safe no-op | 不写 Timeline | success no-op |
 | 首次 Provider overflow | preflight 曾认为安全 | forced reduction + rebuild + Hard Gate + retry 1 次 | 可正常产生 Timeline commit | 成功或二次 overflow |
-| 第二次 Provider overflow | retry 仍 overflow | 停止 | 不学习 C | 规范化失败 |
+| 第二次 Provider overflow | retry 仍 overflow | 停止 | 不学习或修改任何 limit facts | 规范化失败 |
 | Crash 在 L4/L5 model call 中 | checkpoint 未提交 | 重启只认旧 checkpoint | 本批无效 | 从 raw evidence 重推 |
 | Crash 在 entries 后 checkpoint 前 | trailing records 已落盘 | loader 忽略未闭合 transaction | 旧 checkpoint 仍 authority | 无 rollback FSM |
 | Resume v2 | Transcript + Timeline valid | 恢复 durable closed facts，创建 fresh Run | 不恢复 old active Turn | 继续 Session |
@@ -811,7 +817,7 @@ Timeline physical GC
 | 能力 | 所属模块 | 状态所有者 | 调用方 | 依赖方向 | 原因 |
 | --- | --- | --- | --- | --- | --- |
 | Transcript / Timeline value contract | Core | 无持久 IO；只定义 immutable semantic values | Application / Session Integration | Application/Integration → Core | Provider-independent 产品语义 |
-| Model operating window `C` | Application configuration | `ModelProfile` | Application budget resolver | Integration config → Application | 用户/开发者可明确配置的运行模型事实 |
+| configured operating input limit | Application configuration | `ModelProfile` | Application budget resolver | Integration config → Application | 用户可显式配置；项目只能保持/收紧 |
 | Provider reliable limits | Core capability contract + Integration implementation | Provider adapter/cache | Application | Application → Core contract；Integration → Core | SDK/network 截止在 Integration |
 | Provider token count | Core capability contract + Integration implementation | 无长期状态 | Application Hard Gate | Application → Core contract；Integration → Core | 对最终 Provider request 做高可信度 estimate |
 | Working Headroom policy | Core Context pure policy | 无业务状态 | Application Context Orchestrator | Application → Core | 纯确定性 Provider-independent 预算数学 |
@@ -834,12 +840,14 @@ Timeline physical GC
 ModelLimits
   max_input_tokens?
   max_output_tokens?
+  max_combined_tokens?
   source
 
-TokenCountEstimate
+ContextCountEstimate
   input_tokens
   source
-  kind = provider_estimate | local_estimate
+  kind = pressure_estimate | preflight_provider_count | preflight_local_estimate
+  safety_allowance
 
 SupportsModelLimits
   resolve_model_limits(model) -> ModelLimits?
@@ -850,7 +858,7 @@ SupportsInputTokenCount
 
 最终私有函数/协议名可遵循现有命名风格微调，但语义必须保持。
 
-禁止把这些能力强行塞成所有 Provider 必须实现的方法；没有可靠 metadata 的 Provider 应自然退化到 configured `C` 与 local estimate。
+禁止把这些能力强行塞成所有 Provider 必须实现的方法；没有可靠 metadata 时保留 unknown。只有用户已显式配置 input limit 时才能配合 local estimate 继续，否则 fail closed。
 
 ---
 
@@ -867,9 +875,9 @@ SupportsInputTokenCount
 额外约束：
 
 - UthCode 不因为 Anthropic 能动态查询，就要求 OpenAI / OpenAI-compatible 伪造相同能力；
-- `ModelProfile.context_window` 始终是跨 Provider 的 operating authority；
-- Provider metadata 只作为可验证的额外安全证据；
-- 本任务不建立全量 Model Catalog、自动联网枚举 UI 或新的模型注册中心。
+- 用户显式 `ModelProfile.context_window` 与可靠 Provider runtime input metadata 至少一项存在，才能建立 operating input limit；
+- Provider metadata 是可验证的运行时安全证据，input/output/combined 三维不互相替代；
+- 本任务取消 bundled official metadata，不建立 Model Catalog、型号表、自动联网枚举 UI 或模型注册中心。
 
 ---
 
@@ -881,7 +889,7 @@ SupportsInputTokenCount
 src/uthcode/
 ├─ core/
 │  ├─ __init__.py                                  [修改]
-│  ├─ agent.py                                     [修改]
+│  ├─ agent.py                                     [验收，原则上不修改]
 │  ├─ context.py                                   [修改]
 │  ├─ history.py                                   [修改]
 │  ├─ prompt.py                                    [修改]
@@ -974,29 +982,29 @@ src/uthcode/integrations/config/data.py
 | 文件路径 | 操作 | 文件职责 | 核心改动 | 输入 | 输出 | 禁止事项 | 对应测试 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `core/history.py` | 修改 | raw Transcript 与 derived Timeline Core contract | `TranscriptEntry/Transcript/TranscriptRef/SemanticEntry/EpochMacroSummary/ActiveCheckpoint/Timeline`；删除 Projection 生产 authority | closed semantic facts | immutable values | fs、SDK、兼容 alias | history/timeline |
-| `core/context.py` | 修改 | dynamic budget、Gate、deterministic reduction、Compiler | 去除固定 258K invariant；定义 C/E/R/A/F/U、Auto/Hard decision、L1-L3 | typed sources + budget | snapshot / gate / reduction plan | Provider SDK/network | compiler/budget |
+| `core/context.py` | 修改 | dynamic budget、Gate、deterministic reduction、Compiler | 去除固定 258K invariant；定义分维 limits、R/A/F/U、Pressure/Preflight、Auto/Hard、L1-L3 | typed sources + budget | snapshot / gate / reduction plan | Provider SDK/network | compiler/budget |
 | `core/prompt.py` | 修改 | Context source authority | Transcript/Timeline source kinds；保持 summary 为 conversation/history authority | typed sources | ContextBlock | 将 summary 升级为 System | compiler |
 | `core/provider.py` | 修改 | SDK-neutral Provider contracts | `ModelLimits`、token-count estimate、可选 capability contract | model/request | UthCode DTO | SDK type | provider limits/architecture |
-| `core/agent.py` | 修改 | ReAct behavior loop | request preparer 支持 await；overflow hook 只感知“重建后是否可 retry”的 Application 结果 | messages/tools | provider request | Timeline/Budget ownership | agent/application runs |
+| `core/agent.py` | 验收，原则上不修改 | ReAct behavior loop | 复用现有 sync/awaitable request preparer 与 overflow hook；只回归 typing/cancel/error | messages/tools | provider request | 重复 async protocol、Timeline/Budget ownership | agent/application runs |
 | `core/__init__.py` | 修改 | Core exports | 新 contract export，移除失效 Projection export | - | imports | legacy alias | import/architecture |
 | `application/history.py` | 修改 | Message → durable Transcript | 只生成完整 closed semantic unit；保持 ToolCall/Result 原子性 | Message | TranscriptEntry | open fragment | history/runs |
-| `application/context.py` | 修改 | Context 总编排 | resolve C/E/count/uncertainty/R；Auto/Hard Gate；L1-L5；B′；tool-free request；parse/validate | frozen Turn snapshot + Session facts + Provider capability | safe request / compact result | SDK、持久 FSM | gate/compaction/e2e |
-| `application/configuration.py` | 修改 | operating model profile | `ModelProfile.context_window` 为正整数；更新 mapping/single_model contract | config | C | 隐式 258K fallback | configuration |
-| `application/generation.py` | 修改 | Turn snapshot 与正式 Provider path | 冻结 C；async prepare；incremental closed Transcript persistence；manual compact；一次 overflow retry；status | Run/Turn | Agent execution/diagnostics | Context state 下放 AgentLoop | runtime/runs/e2e |
+| `application/context.py` | 修改 | Context 总编排 | resolve configured/provider/effective input、output/combined、count/allowance/R；Auto/Hard；L1-L5；B′ | frozen Turn limits + Session facts + Provider capability | safe request / compact result | SDK、持久 FSM | gate/compaction/e2e |
+| `application/configuration.py` | 修改 | operating model profile | optional positive `context_window`；user authority 与 project tighten-only contract | config | configured input limit? | fixed/bundled fallback | configuration |
+| `application/generation.py` | 修改 | Turn snapshot 与正式 Provider path | 冻结分维 limits；复用 awaitable prepare；closed Transcript；manual compact；一次 overflow retry；status | Run/Turn | Agent execution/diagnostics | Context state 下放 AgentLoop | runtime/runs/e2e |
 | `application/sessions.py` | 修改 | Session use-case | Transcript/Timeline snapshot、append、checkpoint transaction outcome | Core records | durable outcome | runtime checkpoint | session/e2e |
 | `application/tools.py` | 修改 | Tool composition | reserved `HistoryRead`；active Session reader；自身 bounded output 不递归外置 | TranscriptRef | ToolResult | cross-session/search | tool/history-read |
 | `application/bootstrap.py` | 修改 | composition root | Provider optional capabilities、Session、HistoryRead wiring | EffectiveConfig | Application | SDK 泄露到 Application type | runtime |
-| `commands/builtins.py` | 修改 | `/compact` `/status` | async compact；success/no-op/failure；动态 C/E/Auto/Hard diagnostics | Application | outcome text | fixed 258K 文案 | commands |
+| `commands/builtins.py` | 修改 | `/compact` `/status` | async compact；success/no-op/failure；分维 limits/Auto/Hard diagnostics | Application | outcome text | fixed 258K 文案 | commands |
 | `commands/dispatcher.py` | 修改 | command execution | 增加最小 awaitable handler dispatch；保留 sync handler | handler | CommandOutcome | Context orchestration | dispatcher/tui |
 | `commands/models.py` | 修改 | command typing | handler 支持 sync/awaitable result | handler | type contract | Context logic | dispatcher |
-| `config/loader.py` | 修改 | TOML validation/overlay | 支持 `context_window` positive int；项目只能覆盖已有 model 的非 credential 字段 | TOML | LoadedConfigData | provider redirect | config |
-| `config/template.py` | 修改 | first-run template | 明确 `context_window` 必填示例与 operating 语义 | - | template | 假称 remote discovery | config |
+| `config/loader.py` | 修改 | TOML validation/overlay | optional positive `context_window`；项目只能保持/收紧用户已有值，不能补造 | TOML | LoadedConfigData | provider redirect/limit enlargement | config |
+| `config/template.py` | 修改 | first-run template | 明确用户 `context_window` 显式配置与 Provider reliable fallback 语义 | - | template | bundled/default window | config |
 | `providers/anthropic.py` | 修改 | Anthropic adapter | Models API limits + Messages count_tokens；转换为 Core DTO | remote model / GenerationRequest | limits/count estimate | SDK type 越界 | anthropic/provider limits |
 | `session_files.py` | 修改 | Session v2 durable files | `transcript.jsonl` + `timeline.jsonl`；checkpoint recovery；old schema reject | Core records | snapshot | dual read/write/migration | session |
 | `tools/history_read.py` | 新增 | raw Transcript exact-ref reader | opaque ref validation、current Session ownership、bounded page | ref/offset/limit | bounded page | arbitrary path/search | history-read |
 | `interfaces/tui/app.py` | 修改 | async command adaptation | await Application dispatcher；不新增 Context 语义 | command outcome | UI projection | Budget/Timeline ownership | tui |
 | `eval/metrics.py` | 修改 | Eval safe diagnostics consumer | 消费 Gate/Timeline/pressure 字段，不依赖 Projection/258K | public diagnostics | existing metrics | raw context text/new total score | diagnostics fixture |
-| `docs/**` | 修改 | 用户与开发者文档 | 同步真实 C/E、Auto/Hard、Transcript/Timeline、HistoryRead、config、commands | implemented facts | docs | 把规划写成现状 | doc checks |
+| `docs/**` | 修改 | 用户与开发者文档 | 同步分维 limits、Pressure/Preflight、Auto/Hard、Transcript/Timeline、HistoryRead、config、commands | implemented facts | docs | 把规划写成现状 | doc checks |
 
 ---
 
@@ -1010,14 +1018,12 @@ ModelProfile
   provider_profile_id
   remote_id
   display_name?
-  context_window: positive int   # C
+  context_window: positive int?  # 用户显式 operating input limit
   max_output_tokens?
   reasoning_effort?
 ```
 
-`context_window` 是显式 Operating Context Window。
-
-任何真实 runnable model 必须有 C；不得在缺失时静默回退到 258K。
+`context_window` 若存在，只能来自用户显式配置；项目配置只能保持/收紧用户值。用户值可缺省，但只有可靠 Provider input metadata 能补足本次运行 limit；两者皆无时模型不可发送，不得回退到 258K 或型号表。
 
 ### 11.2 ModelLimits
 
@@ -1025,30 +1031,32 @@ ModelProfile
 ModelLimits
   max_input_tokens?
   max_output_tokens?
+  max_combined_tokens?
   source
 ```
 
 语义：
 
 - 来自 Provider 可验证 metadata；
-- `max_input_tokens` 只用于收紧 E；
-- 不能覆盖用户配置的更小 C；
+- 三个字段分别保持 Provider 声明的 input、output、combined 语义；
+- `max_input_tokens` 只能收紧更小的用户值，不能扩大它；
+- `max_output_tokens` 校验/收紧本次 output reserve；`max_combined_tokens` 只在 Provider 明确定义 combined 语义时参与；
 - 不存在可靠值时返回 absent，而不是猜值。
 
-### 11.3 TokenCountEstimate
+### 11.3 Pressure Estimate 与 Preflight Safety Count/Estimate
 
 ```text
-TokenCountEstimate
+ContextCountEstimate
   input_tokens
   source
   kind:
-    provider_estimate
-    local_estimate
+    pressure_estimate
+    preflight_provider_count
+    preflight_local_estimate
+  safety_allowance
 ```
 
-Hard Gate 不直接相信任何一种 count。
-
-Application 根据 count kind 选择集中定义的 uncertainty allowance。
+Pressure Estimate 服务 Auto Gate，不是发送安全证明。Preflight count/estimate 基于最终 request 服务 Hard Gate；即便来自 Provider count API，也只记录更高可信来源而不宣称数学精确。Application 根据来源在单点 policy 选择 safety allowance。
 
 ### 11.4 ContextBudget
 
@@ -1056,14 +1064,17 @@ Application 根据 count kind 选择集中定义的 uncertainty allowance。
 
 ```text
 ContextBudget
-  configured_context_window = C
-  effective_context_limit = E
+  configured_input_limit?
+  provider_max_input?
+  effective_input_limit
+  provider_max_output?
+  provider_combined_limit?
 
-  output_reserve
-  counting_uncertainty
+  requested_output_reserve
+  safety_allowance
 
   working_headroom = R
-  auto_gate_limit = E - R
+  auto_gate_limit = effective_input_limit - R
 
   active_evidence_budget = A
   fine_timeline_budget = F
@@ -1079,9 +1090,11 @@ ContextBudget
 约束：
 
 ```text
-0 < E <= C
-0 < R < E
-auto_gate_limit < E
+effective_input_limit 来自至少一个已知 input limit
+若 user/provider input 同时存在，effective_input_limit <= 两者
+0 < R < effective_input_limit
+auto_gate_limit < effective_input_limit
+known output/combined limit 按各自维度独立成立
 A/F/U/compact budget 均必须能在小窗口中退化
 retained profile 对大 C 以 absolute cap 为主
 ```
@@ -1094,15 +1107,20 @@ retained profile 对大 C 以 absolute cap 为主
 GateDecision
   input_tokens
   count_source
-  output_reserve
-  uncertainty
-  hard_projected_usage
+  requested_output_reserve
+  safety_allowance
+  preflight_input_usage
 
   auto_pressure: bool
   hard_safe: bool
 
   auto_gate_limit
-  effective_context_limit
+  effective_input_limit
+  provider_output_limit?
+  provider_combined_limit?
+  input_safe
+  output_safe
+  combined_safe
   reason
 ```
 
@@ -1110,7 +1128,7 @@ GateDecision
 
 ```text
 auto_pressure = input-side working usage > auto_gate_limit
-hard_safe = hard_projected_usage <= E
+hard_safe = input_safe && output_safe && combined_safe
 ```
 
 Auto 与 Hard 可以出现：
@@ -1278,12 +1296,12 @@ AgentLoop
    ▼
 Application Context Orchestrator
    │
-   ├─ frozen Turn model / C
+   ├─ frozen Turn model / dimensioned limits
    ├─ current Transcript / Timeline
    ├─ optional Provider ModelLimits
    ├─ final GenerationRequest assembly
-   ├─ Provider count or local estimate
-   ├─ resolve E / R / A / F / U / uncertainty
+   ├─ Pressure Estimate / Preflight provider count or local estimate
+   ├─ resolve effective input / output / combined / R / A / F / U / allowance
    ├─ Auto Gate
    ├─ L1-L3
    ├─ L4/B′ if proactive pressure remains
@@ -1390,7 +1408,7 @@ build tool-free request
         ↓
 Hard Gate(compact request)
         ↓
-same frozen provider/model/C
+same frozen provider/model/dimensioned limits
         ↓
 parse + validate
   - contiguous coverage
@@ -1474,8 +1492,8 @@ vector DB
 - append durability unknown 沿用 Session quarantine；
 - unknown durability 不得自动重复写；
 - Provider count failure 只有存在安全 local fallback 时才继续；
-- reliable physical ceiling 明确小于 configured C 时 E 收紧；
--普通请求 context overflow 最多 forced reduction + retry 一次。
+- reliable Provider input 明确小于 configured input 时 effective input 收紧；
+- 普通请求 context overflow 最多 forced reduction + rebuild + re-gate + retry 一次。
 
 ---
 
@@ -1483,9 +1501,9 @@ vector DB
 
 | 现有能力 / 文件 | 当前状态 | 本次处理 | 是否修改 | 回归要求 |
 | --- | --- | --- | --- | --- |
-| AgentLoop | sync request preparer + overflow handler | 支持 await，但不感知 Context internals | 修改 | ReAct/tool/pause 行为不变 |
+| AgentLoop | request preparer 与 overflow handler 已支持 sync/awaitable | 复用并回归，不新增协议 | 原则上不修改 | ReAct/tool/pause/cancel 行为不变 |
 | RunState | in-memory runtime authority | 保持原所有权 | 保持语义 | T05/T06/T08 回归 |
-| active Turn model snapshot | 已冻结 Provider/model/output/tools | 把 C/limits capability 一并纳入 frozen snapshot | 修改 Application | mid-turn `/model` 不影响 C |
+| active Turn model snapshot | 已冻结 Provider/model/output/tools | 把分维 limits capability 一并纳入 frozen snapshot | 修改 Application | mid-turn `/model` 不影响当前 limits |
 | CanonicalHistory | raw durable facts | 硬切为 Transcript | 替换 | strict sequence/semantic unit 保留 |
 | Projection | 单层 compact view | 被 Timeline 取代 | 删除生产语义 | 无 compatibility alias |
 | Session single writer | lock/fsync/reconcile/quarantine | 复用到 v2 files | 修改 | durability 语义不退化 |
@@ -1493,10 +1511,10 @@ vector DB
 | ToolResult externalization | 已正式可用 | 继续作为 L1 基础 | 只调用 | 不重复实现 |
 | ToolResultRead | current Session result ref | 保持独立 | 不改变语义 | 与 HistoryRead 互不越权 |
 | `/compact` | 已注册但生产失败 | 接真实 async orchestrator | 修改 | success/no-op/failure |
-| `/status` | fixed 258K | 动态 C/E/Auto/Hard/Timeline | 修改 | 无正文泄露 |
+| `/status` | fixed 258K | 分维 limits、Pressure/Preflight、Auto/Hard/Timeline | 修改 | 无正文泄露 |
 | `/resume` | durable history + fresh Run | 恢复 Transcript + committed Timeline | 修改数据源 | 不恢复 active Turn |
 | Eval diagnostics | Projection/258K | Gate/Timeline safe projection | 修改 | 不新增总分 |
-| OpenAI Responses/Compat | 无可靠统一 window discovery | configured C 继续工作 | 默认不动 | 不伪造 capability |
+| OpenAI Responses/Compat | 无可靠统一 window discovery | 用户配置可用；若用户也缺失 input limit 则 fail closed | 默认不动 | 不伪造 capability |
 | Anthropic | 无 limits/count | 增加官方 capability adapter | 修改 | SDK 截止 Integration |
 
 ---
@@ -1533,22 +1551,23 @@ local fallback 使用现有 deterministic estimator 的保守演化版本。
 
 ## 15. 实施任务拆分
 
-> 本节只是正式任务书内部的实施阶段划分，不是 WorkPackage Tasks/Worker 拆分。本次交付不生成 Spec、Tasks、Checklist 或 Worker Prompt。
+> 本节与正式 Tasks 保持同一原子边界。T01～T08 均须独立可运行、可测试、可审查、可回退；不得把关键生产调用方留给后续任务。正式工作包、Checklist 与 6 份独立 Worker Prompt 已在本目录原位同步。
 
-### I01：Model Operating Window、Provider Limits 与双 Gate Budget Contract
+### I01 / T01：动态模型限制与确定性请求安全链
 
 **任务目标**
 
-移除固定 258K runtime invariant，建立：
+移除固定 258K runtime invariant，并在同一任务接通正式请求链，建立：
 
 ```text
-C
-E
+configured/provider/effective input limits
+provider output/combined limits
 adaptive capped R
 Auto Gate
 Hard Gate
-count source + uncertainty
+Pressure Estimate / Preflight Safety Count/Estimate + allowance
 A/F/U retained profile
+final request accounting + L1-L3 + rebuild/re-gate
 ```
 
 **涉及文件**
@@ -1561,6 +1580,8 @@ integrations/config/loader.py
 integrations/config/template.py
 integrations/providers/anthropic.py
 application/bootstrap.py
+application/context.py
+application/generation.py
 tests/test_configuration.py
 tests/test_config_contract.py
 tests/test_provider_model_limits.py
@@ -1570,21 +1591,23 @@ tests/test_anthropic_integration.py
 
 **实现要求**
 
-- `ModelProfile.context_window` 为 required positive int；
+- 用户 `ModelProfile.context_window` 为 optional positive int；项目只能保持/收紧用户已有值；
 - 不存在隐式 258K fallback；
-- `E=min(C,reliable ceiling)`；
-- Provider 无 ceiling 时 E=C；
-- Provider count 与 local estimate 都进入统一 TokenCountEstimate 语义；
-- uncertainty 根据 count source 由单点 policy 解析；
+- 不存在 bundled metadata/catalog/hardcoded window；用户 input 与可靠 Provider input 两者皆无时 fail closed；
+- input/output/combined limits 分维表达，unknown 不伪造；
+- Pressure Estimate 与 Preflight Count/Estimate 分层；allowance 根据 count source 由单点 policy 解析；
 - R 满足 adaptive + absolute cap；
 - small-window A/F/U/compact budgets 自动退化；
 - large-window retained profile 不线性增长；
 - Anthropic 使用当前官方 `max_input_tokens` / `max_tokens` 与 count endpoint；
 - OpenAI/compat 不伪造 capability。
+- final request accounting 覆盖 instruction/messages/tools/framing/output reserve；
+- L1-L3 每步后 rebuild/re-gate，required facts 超限时 Provider call count 为 0；
+- 正式 Application→Compiler→既有 awaitable preparer→AgentLoop→ProviderPort 在本任务闭环。
 
 **完成结果**
 
-不依赖 Timeline 即可纯测试 Budget/Gate contracts。
+不依赖 Timeline/L4 即可从正式 Application 路径测试 dynamic limits、Budget/Gate、L1-L3 和 Provider call/fail-closed。
 
 **明确不做**
 
@@ -1592,7 +1615,24 @@ Model Catalog UI、自动联网枚举全部 Provider 模型。
 
 ---
 
-### I02：Transcript / Timeline Core Contract 与 Session v2 Hard Cut
+#### I01-b：Final Request Accounting、ContextCompiler 与确定性 L1-L3
+
+该部分属于 T01 同一提交、同一验收边界，不得拆成独立 Worker 或推迟到 T03。
+
+```text
+final request assembly
+→ Pressure/Preflight count
+→ Auto Gate
+→ L1-L3
+→ rebuild
+→ Auto/Hard recheck
+```
+
+涉及 `core/context.py`、`core/prompt.py`、`application/context.py`、`application/generation.py` 及 compiler/gate/tool-result/application tests。ContextCompiler 仍是唯一 model-view builder；L1 复用 Tool Result externalization，L2 deterministic bounded preview shrink/mask，L3 只省略 complete inactive semantic unit。protected/current/tool pair 不可拆；final accounting 覆盖 instruction/messages/tools/framing/output reserve；每步 rebuild/re-gate；required facts 自身超过已知 input/combined limit 时 unresolvable，Provider call count 为 0。
+
+---
+
+### I02 / T02：Transcript / Timeline Core Contract 与 Session v2 Hard Cut
 
 **任务目标**
 
@@ -1648,52 +1688,7 @@ tool-results/
 
 ---
 
-### I03：Final Request Accounting、ContextCompiler 与确定性 L1-L3
-
-**任务目标**
-
-让每次 ordinary request 在 semantic compact 前完成：
-
-```text
-final request assembly
-→ count
-→ Auto Gate
-→ L1-L3
-→ rebuild
-→ Auto/Hard recheck
-```
-
-**涉及文件**
-
-```text
-core/context.py
-core/prompt.py
-application/context.py
-tests/test_context_compiler.py
-tests/test_context_budget_gate.py
-tests/test_tool_result_persistence.py
-```
-
-**实现要求**
-
-- ContextCompiler 是唯一 model-view builder；
-- L1：现有 Tool Result externalization；
-- L2：deterministic bounded preview shrink/mask；
-- L3：按 complete inactive Turn/semantic unit 省略 raw view；
-- protected context/current Turn/tool pair 不可拆；
-- final request accounting 覆盖 system/messages/tools 与已知结构化 overhead；
-- L1-L3 后仍高于 Auto Gate，即使 Hard-safe，也返回 L4-required；
-- L1-L3 清除 Auto pressure 且 Hard-safe，不执行 L4；
-- required protected/current facts 自身超过 E 时直接 unresolvable；
-- diagnostics 只含 token/count/id/reason。
-
-**完成结果**
-
-不用调用模型即可证明双 Gate 与 deterministic reduction 完整工作。
-
----
-
-### I04：Production L4 与 B′ Bounded Catch-up
+### I03 / T03：Production L4 与 B′ Bounded Catch-up
 
 **任务目标**
 
@@ -1702,7 +1697,6 @@ tests/test_tool_result_persistence.py
 **涉及文件**
 
 ```text
-core/agent.py
 application/context.py
 application/generation.py
 application/sessions.py
@@ -1715,8 +1709,8 @@ tests/test_t09_1_context_protocol_e2e.py
 
 **实现要求**
 
-- request preparer awaitable；
-- L4 使用 frozen Turn provider/model/C；
+- 复用现有 request preparer/overflow handler sync|awaitable contract，不重复改造 `core/agent.py`；
+- L4 使用 frozen Turn provider/model/分维 limits；
 - manual idle later 使用 current model；
 - L4 tools=()；
 - Compact request 自身 Hard-gated；
@@ -1737,7 +1731,7 @@ tests/test_t09_1_context_protocol_e2e.py
 
 ---
 
-### I05：L5 Timeline Aging 与 HistoryRead
+### I04 / T04：L5 Timeline Aging 与 HistoryRead
 
 **任务目标**
 
@@ -1776,26 +1770,19 @@ Timeline 可以老化，但 raw evidence 永久仍以 Transcript 为 authority�
 
 ---
 
-### I06：正式生命周期接入、Manual Compact 与 Overflow Retry
+### I05 / T05：Application Compact 生命周期与 Overflow Recovery
 
 **任务目标**
 
-把新 Context 协议接入真实 Run、Command、TUI/Headless 生命周期。
+先把新 Context 协议接入真实 Run 与 Application/Headless 生命周期，形成不依赖命令/TUI 的完整能力。
 
 **涉及文件**
 
 ```text
 application/generation.py
 application/sessions.py
-application/commands/builtins.py
-application/commands/dispatcher.py
-application/commands/models.py
-interfaces/tui/app.py
 tests/test_application_runtime.py
 tests/test_application_runs.py
-tests/test_command_dispatcher.py
-tests/test_w04_session_commands.py
-tests/test_tui.py
 tests/test_t09_1_context_protocol_e2e.py
 ```
 
@@ -1805,24 +1792,58 @@ tests/test_t09_1_context_protocol_e2e.py
 - terminal tail 继续提交；
 - durable cursor 不重复 append；
 - 不写 open continuation；
-- `/compact` await 同一个 Application orchestrator；
+- Application manual compact API await 同一个 orchestrator；
 - manual compact 不依赖 Auto Gate；
 - no candidate = success no-op；
 - 不创建新 Session/Run/Turn；
 - compact single-flight 保留；
 - Provider overflow 普通 request 最多一次 forced reduction + retry；
 - second overflow fail；
-- 不修改 C；
-- active Turn `/model` 不改变 frozen C；
-- `/status` 展示安全 diagnostics。
+- 不修改任何 limit facts；
+- active Turn `/model` 不改变 frozen limits snapshot。
 
 **完成结果**
 
-CLI/TUI/Headless 正式链路都经过相同 Context safety boundary。
+Application/Headless 正式链路经过相同 Context safety boundary，可独立验收。
 
 ---
 
-### I07：Diagnostics、Eval、文档与回归收口
+### I06 / T06：[接入主流程] 命令、TUI 与正式入口收口
+
+**任务目标**
+
+在 T05 已通过后，把 manual compact、status 和正式生成入口接到 Command、CLI、TUI；删除旧同步-only 路径，不让 Interface 拥有 Context 语义。
+
+**涉及文件**
+
+```text
+application/bootstrap.py
+application/commands/builtins.py
+application/commands/dispatcher.py
+application/commands/models.py
+interfaces/cli.py
+interfaces/tui/app.py
+tests/test_command_dispatcher.py
+tests/test_w04_session_commands.py
+tests/test_cli.py
+tests/test_tui.py
+```
+
+**实现要求**
+
+- `/compact` await T05 同一 Application API，`/status` 展示安全的分维 limits/Gate/Timeline diagnostics；
+- dispatcher 最小支持 awaitable handler，所有 sync commands 保持；
+- TUI 只 await outcome，CLI/TUI/Headless 不复制 Context orchestration；
+- bootstrap 完成正式组合，删除 placeholder/重复入口；
+- 回归既有 preparer/overflow awaitable、cancel/error tests，不新增第二套协议。
+
+**完成结果**
+
+CLI/TUI/Headless 全部复用同一 Application safety boundary，旧入口为零。
+
+---
+
+### I07 / T07：[端到端验证] Diagnostics、Eval、文档与回归收口
 
 **任务目标**
 
@@ -1850,7 +1871,8 @@ docs/user-manual/configuration.md
 文档明确：
 
 ```text
-C vs E
+configured/provider/effective input 与 provider output/combined
+Pressure Estimate vs Preflight Safety Count/Estimate
 Auto Gate vs Hard Gate
 adaptive capped working headroom
 Transcript vs Timeline
@@ -1877,16 +1899,39 @@ Eval：
 
 ---
 
+### I08 / T08：[遗留负担清理] 删除阶段性与兼容逻辑
+
+**任务目标**
+
+在 T07 验收后删除 fixed 258K、Projection/CanonicalHistory、old writer、sync-only compact、旧阶段文案、重复入口与取消的 bundled metadata 路线。
+
+**实现要求**
+
+- 以调用图和 `rg` 证明旧 production authority 为零；old-v1 fixture 只用于 incompatible 测试；
+- 删除 bundled official metadata/catalog/hardcoded window 设计、实现、测试及其欠账，不转记 future debt；
+- Timeline record 恰为三类，B′ 无持久 FSM，Compact 无独立 model/provider fallback；
+- 保护 Permission、Plan/Todo、Runtime Hook、其它命令与 TUI rendering；
+- 清理后重跑最小定向、架构与全量测试，并写真实 Feedback；
+- 全部任务和 Feedback 完成后将索引更新为 `implemented_unarchived`，不自动归档。
+
+**完成结果**
+
+仓库只剩一条生产 Context/Session/Compact 路径，取消路线和无调用方抽象为零。
+
+---
+
 ## 16. 测试矩阵
 
 | 场景 | 主要测试 | 必须证明 |
 | --- | --- | --- |
-| C required | `test_configuration.py`, `test_config_contract.py` | runnable model 无 C 时 fail；positive C 正常 |
-| model switch | `test_application_runtime.py` | 下一 Turn 换 C，active Turn C 不变 |
-| E resolution | `test_provider_model_limits.py` | ceiling<C 收紧；ceiling>C 不扩大；absent => C |
+| limit source | `test_configuration.py`, `test_config_loader_integration.py` | user positive 可用；user 与 reliable Provider input 都缺失时 fail |
+| project authority | 同上 | project 只能保持/收紧 user `context_window`，不能补造/扩大 |
+| model switch | `test_application_runtime.py` | 下一 Turn 换 limits，active Turn snapshot 不变 |
+| input resolution | `test_provider_model_limits.py` | Provider input 只收紧 user；user 缺失可用 reliable Provider；双方缺失 fail |
+| output/combined | `test_provider_model_limits.py` | 分维校验，unknown 不伪造、不折叠 |
 | Anthropic limits | `test_anthropic_integration.py` | SDK metadata → Core ModelLimits，无 SDK leak |
 | Provider count | `test_provider_model_limits.py` | structured request count 返回 estimate source |
-| count uncertainty | `test_context_budget_gate.py` | provider/local count 都不是裸 hard fact |
+| count allowance | `test_context_budget_gate.py` | Pressure 与 Preflight 分层；provider/local count 都不是数学精确 hard fact |
 | Auto vs Hard | `test_context_budget_gate.py` | 可出现 Auto pressure=true、Hard safe=true |
 | 禁止统一 90% | `test_context_budget_gate.py` | 1M R 有 absolute cap；不固定丢 100K |
 | 25K small-window | `test_context_budget_gate.py` | R/A/F/U/compact budget 收缩，不套大窗口 reserve |
@@ -1894,7 +1939,7 @@ Eval：
 | L1 externalization | `test_tool_result_persistence.py` | large raw Tool Result 不进入工作请求 |
 | L2 preview shrink | `test_context_compiler.py` | deterministic bounded |
 | L3 omit inactive | `test_context_compiler.py` | complete semantic boundary |
-| L1-L3 259K→257K | `test_context_budget_gate.py` | 若仍高于 Auto，必须 L4-required |
+| L1-L3 synthetic 259K→257K | `test_context_budget_gate.py` | 258K 仅测试输入；若仍高于 Auto，必须 L4-required |
 | L1-L3 clear Auto | 同上 | 不调用 L4 |
 | Hard unsafe | 同上 / e2e | Provider call count=0 |
 | Transcript sequence | `test_history_contract.py` | strict append-only/current Session |
@@ -1919,9 +1964,10 @@ Eval：
 | manual `/compact` below Auto | commands/e2e | 仍可压缩 |
 | manual no-op | commands | success no-op，无 Timeline garbage |
 | overflow first retry | e2e | forced reduction 后只 retry 一次 |
-| overflow second fail | e2e | 不循环、不修改 C |
+| overflow second fail | e2e | 不循环、不修改任何 limit facts |
 | incremental persistence | runs/session | user/tool closed facts crash 后存在 |
 | open continuation | runs/session | 未闭合事实不持久 |
+| existing awaitable hooks | `test_agent_loop.py` | preparer/overflow sync|awaitable、cancel/error 无重复协议 |
 | async command | dispatcher/tui | sync commands 不回退，`/compact` 可 await |
 | diagnostics secrecy | `test_w05_diagnostics.py` | 无 Transcript/summary/tool/secret 正文 |
 | Headless | `test_w06_integration_delivery.py` | 不依赖 TUI |
@@ -1947,6 +1993,7 @@ Projection revision 作为 active compaction state
 Session v1 对 History + Projection 的新写入路径
 /status 中 before T09-1 / fixed 258K 文案
 同步-only /compact handler path
+bundled official model metadata / 本地型号表 / 硬编码窗口路线及其欠账
 ```
 
 可以重新设计后保留的现有机制：
@@ -1979,18 +2026,18 @@ TUI rendering
 
 编码完成必须同时满足：
 
-1. 所有 runnable `ModelProfile` 都有明确 positive `context_window=C`；固定 258K 不再是 runtime safety authority。
-2. reliable Provider ceiling 存在时 `E=min(C, ceiling)`；不存在时 E=C；不得虚构 metadata。
-3. Auto Gate 与 Hard Gate 是两个不同产品语义。
-4. Auto Gate 使用 adaptive + absolute capped working headroom，不存在统一 90% 规则。
-5. 25K 等小窗口不会被大窗口 reserve 挤死；1M 窗口不会固定浪费约 100K。
-6. 每个真实 Provider model call 前都经过 Hard Gate。
-7. Hard Gate 基于最终结构化 request，并包含 output reserve 与 counting/serialization uncertainty。
-8. Provider-side count 被视为高可信度 estimate，而非绝对无误差事实。
-9. L1-L3 都是 deterministic，不调用模型。
-10. L1-L3 后仍处于 Auto pressure 时，即使 Hard-safe，也会尝试 L4。
-11. L1-L3 已清除 Auto pressure 且 Hard-safe 时不会无意义执行 L4。
-12. L4 使用当前 frozen main model/provider/C，tools 为空，不存在独立 compaction model。
+1. 用户显式配置与可靠 Provider runtime metadata 是唯一 limit 来源；用户 input 与 Provider input 都缺失时 fail closed，固定 258K/bundled table 不再是 authority。
+2. 项目配置只能保持/收紧用户 `context_window`，不能补造或扩大；Provider input 也只能收紧更小用户值。
+3. configured/provider/effective input、provider output、optional combined limit 分维表达和校验，unknown 不伪造、不折叠为单一 `E`。
+4. Pressure Estimate 与 Preflight Safety Count/Estimate 是不同语义，Auto Gate 与 Hard Gate 是两个不同产品判断。
+5. Auto Gate 使用 adaptive + absolute capped working headroom，不存在统一 90% 规则。
+6. 25K 等小窗口不会被大窗口 reserve 挤死；1M 窗口不会固定浪费约 100K。
+7. 每个真实 Provider model call 前都经过 Hard Gate。
+8. Hard Gate 基于最终结构化 request，分别覆盖 input、requested output、known combined 与集中 safety allowance。
+9. Provider-side count 被视为高可信度 estimate，而非绝对无误差事实；Provider overflow 仍是最终裁决。
+10. L1-L3 都是 deterministic，不调用模型，并与 dynamic limits/正式请求链在 T01 同一任务闭环。
+11. L1-L3 后仍处于 Auto pressure 时，即使 Hard-safe，也会尝试 L4；已清除时不做无意义 L4。
+12. L4 使用当前 frozen main model/provider/分维 limits，tools 为空，不存在独立 compaction model。
 13. L4 request 自身 Hard-gated，且不会递归 Auto compact。
 14. B′ 支持 1..N bounded epoch；每批 commit 后 rebuild + re-gate。
 15. B′ 没有 persistent Compact FSM/Job/next pointer。
@@ -2006,17 +2053,19 @@ TUI rendering
 25. closed semantic facts 在 request preparation 边界增量 durable；active/paused Runtime continuation 仍不持久。
 26. `/compact` 走同一 Application orchestrator，低于 Auto Gate 也能手动触发。
 27. `/compact` 无候选是 success no-op，不制造 Timeline garbage。
-28. ordinary Provider overflow 最多 forced reduction + retry 一次；第二次失败，不学习 C。
+28. ordinary Provider overflow 最多 forced reduction + rebuild + re-gate + retry 一次；第二次失败，不学习或修改任何 limit facts。
 29. Anthropic SDK 类型仅存在 Integration；Application/Core 只消费 UthCode-owned DTO。
 30. OpenAI Responses / Compat 不为了统一接口伪造 window discovery。
-31. `/status` 与 diagnostics 使用动态 C/E/Auto/Hard/Timeline 语义且不泄露 Context 正文。
+31. `/status` 与 diagnostics 使用分维 limits、Pressure/Preflight、Auto/Hard/Timeline 语义且不泄露 Context 正文。
 32. Eval 继续作为改进效果测量器，不把 tuning default 变成固定产品成败标准。
 33. Headless Application 完整可运行，不依赖 TUI。
 34. T05/T06 Persistent Runtime Recovery 边界保持。
 35. 没有新增无真实调用方的 Manager / Registry / Scheduler / Event Bus。
 36. 没有旧 T09 Session compatibility layer。
 37. 相关单测、架构测试和全量回归通过。
-38. 实施后的 Context 边界可作为后续 Memory/Evidence Retrieval 的真实基线，但本任务没有预建 retrieval index/protocol。
+38. 既有 request preparer 与 overflow handler sync|awaitable contract 仅被复用和回归，没有重复 async protocol 或无必要 AgentLoop 改造。
+39. bundled official model metadata 路线已取消并从欠账删除，不转登记 future debt。
+40. 实施后的 Context 边界可作为后续 Memory/Evidence Retrieval 的真实基线，但本任务没有预建 retrieval index/protocol。
 
 ---
 
@@ -2024,20 +2073,20 @@ TUI rendering
 
 编码代理只在以下情况停止并报告用户：
 
-- 实际基线不是 `94eb397f6de9d56131bca898a88be05c3ad082e5`；
-- `94eb397f...` 的真实 `src/ + tests/` 与本任务书关键事实不一致；
+- 实际基线 tree 不是 `40e9b2eaf984dbc266fa16e786f03de57435dfad`；
+- `40e9b2ea...` 的真实 `src/ + tests/` 与本任务书关键事实不一致；
 - AGENTS / UserDecisionBoundary 与 D1/D2/D3 发生实质冲突；
 - 必须改变 `interfaces -> application -> core` / Integration 截止 SDK 的冻结边界；
 - 必须新增第四种 Timeline 产品 record 才能完成 crash-safe commit；
 - B′ 必须依赖跨进程 Compact FSM 才能正确工作；
 - 必须引入独立 compaction model 或跨 Provider fallback；
-- `ModelProfile.context_window` 无法在不增加另一套模型配置体系的情况下成为 operating authority；
+- 用户显式配置与可靠 Provider metadata 无法在现有配置体系中形成唯一 limit authority；
 - 第三方官方 API 当前事实变化，导致已规划 Provider capability 公共语义不成立；
 - 必须扩大到 Persistent Runtime Recovery、Memory、Artifact GC、Timeline GC 等独立能力；
 - 实际修改范围显著超出任务书且不是机械 import/test/doc 跟随；
 - 需要旧 Session migration / compatibility；
 - 出现未计划的安全边界变化；
-- 两项已冻结决策发生真实冲突。
+- 已冻结决策发生真实冲突。
 
 以下情况不得停止等待用户，应由编码代理在当前范围自行处理：
 
@@ -2082,6 +2131,7 @@ Multi-Agent
 Worktree
 
 Provider 全量 Model Catalog UI
+bundled official model metadata / 本地型号表 / 硬编码模型窗口
 自动模型能力发现 UI
 为了 Headroom 建独立用户配置子系统
 
@@ -2142,4 +2192,4 @@ logical Fine Timeline 受 F 约束
 
 ---
 
-> 本任务书由 T09-1 重写要求重新生成；未生成 Spec、Tasks、Checklist 或 Worker Prompt。后续若需要正式创建工作包，应以本任务书和届时最新代码基线重新拆分，不得恢复已删除的旧 T09-1 拆分结果。
+> 本任务书已按 `40e9b2ea...` 基线原位返工，并与同目录 Spec、Tasks、Checklist、6 份独立 Worker Prompt 同步。当前仍为 `not_implemented`；后续只能按依赖顺序派发 Worker，不得恢复返工前的横向拆分或伪造 Feedback。
