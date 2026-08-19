@@ -73,9 +73,9 @@
 
 - [ ] `rg -n "UTHCODE_CONTEXT_BUDGET_TOKENS|fixed 258K|固定 258K|before T09-1|summarizer_unavailable" src tests eval docs` 只剩冻结历史/归档证据；生产代码与当前事实文档旧 authority 为 0。
 - [ ] `rg -n "\bProjection\b|\bCanonicalHistory\b|history\.jsonl" src/uthcode tests` 不存在生产 contract、旧 writer 或兼容 alias；old-v1 fixture 的唯一保留原因写入 Feedback。
-- [ ] `rg -n "bundled.*model|model.*catalog|hard.?coded.*context" src/uthcode tests docs` 不存在 bundled official metadata、本地型号表或硬编码模型窗口路线。
+- [ ] `rg -n "bundled.*model|model.*catalog|hard.?coded.*context" src/uthcode tests docs` 确认 bundled metadata / model catalog / hardcoded official model window 路线在源码、测试、当前事实文档和 `docs/OutstandingDebtList.md` 中均保持不存在，且未重新登记为 future debt。
 - [ ] Timeline 产品 record 仍只有三类；无持久 FSM/Job/pointer、独立 compaction model、跨 Provider fallback、无调用方 Manager/Registry/Scheduler。
 - [ ] Permission、Plan/Todo、Runtime Hook、其它 Slash Commands 与 TUI rendering 无范围外重构。
 - [ ] 清理后重跑最小定向、`tests/test_architecture_boundaries.py` 与全量测试，精确结果写入 `feedback/W06-delivery-regression-cleanup-feedback.md`。
-- [ ] `docs/OutstandingDebtList.md` 删除已取消的 bundled metadata 路线；其余 T09 欠账仅在真实回补、全部 Checklist 与 Feedback 完成后删除。
+- [ ] 逐条复核 `docs/OutstandingDebtList.md` 中所有被 T09-1 实际改变的条目：`T02 Slash Command / TUI` 只移除已回补的 `/compact` 部分并保留 `/memory`、`/dream`；`B01 私有测试集 v0` 按真实 Compaction 结果删除或更新相关部分；三条 T09 Context 欠账只有实现、Checklist、Feedback 证据齐全才删除；其它条目按“完全回补删除、部分改变更新、仍成立保留、用户取消删除且不转登记”处理。
 - [ ] `docs/Context-Index.md` 在全部实现与反馈完成后更新为 `implemented_unarchived`；工作包留在 `docs/work/` 等待用户手动归档。

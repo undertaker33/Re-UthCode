@@ -324,13 +324,15 @@ Headless/Application 正式入口可覆盖 ordinary/post-tool/resume/manual/over
 ### 修改和删除文件
 
 - 按 `rg` 与调用图结果修改/删除 `src/`、`tests/`、`eval/`、当前事实 `docs/` 中确认无调用方的旧路径。
-- `docs/OutstandingDebtList.md`：立即删除已取消的 bundled official metadata 路线；其余条目仅在真实回补且全部任务/Feedback 完成后删除。
+- `docs/OutstandingDebtList.md`：确认已取消的 bundled official metadata 路线持续不存在；重新盘点所有被 T09-1 实际改变的条目，按完全回补、部分改变、仍成立或用户取消分别删除、更新、保留或删除且不转登记。
 - `docs/Context-Index.md`：全部完成后更新为 `implemented_unarchived`，不自动归档。
 
 ### 文件职责及实施内容
 
 - 证明 production 固定 258K、Projection/CanonicalHistory、old history writer、sync-only compact、`summarizer_unavailable` 为零。
-- 证明 bundled metadata/catalog/hardcoded model defaults 路线为零，且未转登记为欠账。
+- 证明 bundled metadata/catalog/hardcoded official model window 路线在源码、测试、当前事实文档和欠账清单中为零，且未转登记为 future debt。
+- 逐条复核 `T02 Slash Command / TUI`：只移除已回补的 `/compact` 部分，继续保留仍成立的 `/memory`、`/dream`；复核 `B01 私有测试集 v0` 中“生产 Compaction 不可运行/无可比较结果”的部分，按真实验收删除或更新。
+- 三条 T09 Context 回补欠账仅在实现完成、对应 Checklist 完成且 Feedback 有真实验收记录时删除；其它受影响条目部分改变时只改内容或触发条件，禁止因部分完成整条误删。
 - 证明 Timeline record 恰为三类，catch-up 无持久 FSM，Compact 无独立 model/provider fallback。
 - 删除重复 export/wrapper/alias/unreachable branch；保护 Permission、Plan/Todo、Hook、其它命令和 TUI rendering。
 - 清理后重跑定向、架构和全量测试；精确结果写入 W06 Feedback。

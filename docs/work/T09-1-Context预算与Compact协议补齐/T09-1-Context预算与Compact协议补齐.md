@@ -2,7 +2,7 @@
 
 ## 1. 分析基线
 
-### 1.1 目标仓库与唯一基线
+### 1.1 目标仓库与历史分析基线
 
 目标仓库：
 
@@ -10,13 +10,13 @@
 https://github.com/undertaker33/Re-UthCode
 ```
 
-本任务唯一分析与后续实施基线：
+本次 T09-1 设计与返工时用于核对源码事实的历史分析基线：
 
 ```text
 40e9b2eaf984dbc266fa16e786f03de57435dfad
 ```
 
-该 Commit 是 T09-1 正式工作包的合并提交。经 Git tree 核验，它与当前本地返工起点 `76cfb53fbe2fbf628bea488aee75d4cfc853cbed` 的源码、测试和文档树完全一致。
+该 Commit 是形成当前设计时用于核对 `src/ + tests/` 事实的历史分析基线，用于说明原 T09-1 工作包从什么状态开始返工以及当前设计为何形成。它不是 Worker 必须 checkout、长期保持或按 HEAD 等值校验的实施 Commit。
 
 ```text
 Merge pull request #24: T09-1 Context预算与Compact协议补齐工作包
@@ -28,7 +28,7 @@ Merge pull request #24: T09-1 Context预算与Compact协议补齐工作包
 
 - 保留原工作包目录与四份主文档，原位返工，不创建 `v2`、`fix`、`retry` 平行包；
 - Worker Prompt 仍为独立可派发文件，Feedback 目录保持空，直到真实实施发生；
-- 所有源码、测试、目录、接口和当前能力判断以 `40e9b2ea...` 的真实 `src/ + tests/` 为准；
+- 本任务书中的“当前实现基线”记录 `40e9b2ea...` 当时的 `src/ + tests/` 事实；Worker 实施时必须以用户实际派发 Prompt 时的当前仓库状态为起点重新核对；
 - 后续编码不得因早期方案而保留 fixed 258K、旧 Projection、bundled metadata 或兼容双轨。
 
 ### 1.2 已读取的全局约束与当前事实
@@ -138,7 +138,7 @@ tests/test_w06_integration_delivery.py
 
 ## 2. 当前实现基线
 
-T09 已完成第一版 Context Engineering，但 `40e9b2ea...` 的正式源码仍处于以下阶段。
+T09 已完成第一版 Context Engineering；在历史分析基线 `40e9b2ea...` 下，正式源码仍处于以下阶段。该描述是设计证据，不是未来 Worker 的固定 HEAD 要求。
 
 ### 2.1 当前请求链路
 
@@ -771,7 +771,9 @@ Timeline physical GC
 独立 compaction model
 ```
 
-“维护 bundled official model metadata”路线已由用户取消：如果欠账清单存在该项，应立即删除，不得改写为未来能力。本包其余欠账只有在真实实现、Checklist 与 Feedback 全部完成后才能删除。
+“维护 bundled official model metadata”路线已由用户取消，并已从滚动欠账中移除；T08 只需确认该路线在源码、测试、当前事实文档和欠账清单中继续不存在，且未重新登记为 future debt。
+
+T08 必须重新盘点所有被 T09-1 实际改变的现有欠账，至少包括 `T02 Slash Command / TUI`、`B01 私有测试集 v0` 与上表三条 T09 Context 欠账。统一按真实验收结果处理：已完全回补则删除；部分改变则只更新内容或触发条件；仍成立则保留；用户明确取消则删除且不得转登记。三条 T09 Context 欠账只有在实现完成、对应 Checklist 完成且 Feedback 有真实验收记录后才允许删除。
 
 ---
 
@@ -1650,14 +1652,23 @@ Transcript + Timeline
 
 ```text
 core/history.py
+core/context.py
 core/prompt.py
 core/__init__.py
 application/history.py
+application/context.py
+application/generation.py
 application/sessions.py
 integrations/session_files.py
 tests/test_history_contract.py
 tests/test_timeline_contract.py
 tests/test_session_files.py
+tests/test_context_compiler.py
+tests/test_context_compaction.py
+tests/test_application_runtime.py
+tests/test_application_runs.py
+tests/test_w04_session_commands.py
+所有实际 CanonicalHistory / Projection / history.jsonl production caller 及对应 tests
 ```
 
 **实现要求**
@@ -1680,11 +1691,12 @@ tool-results/
 - `ActiveCheckpoint` 最后提交；
 - loader 忽略 checkpoint 后 trailing incomplete transaction；
 - Transcript strict sequence 与 complete Tool semantic unit 保留；
-- existing reconciliation/quarantine 保留。
+- existing reconciliation/quarantine 保留；
+- 同一任务迁移 Context source/compiler、Application generation/history/session、Integration store 与全部生产调用方，不允许留下“新 DTO/Store 已存在但正式 Compiler/Application 仍依赖旧 Projection”的半成品状态。
 
 **完成结果**
 
-无真实 L4 模型调用也能完整创建、加载、恢复 Transcript/Timeline。
+无真实 L4 模型调用也能完整创建、运行、持久化并恢复 Transcript/Timeline；所有生产 caller 已切到新 authority，old v1 只保留明确 incompatible 行为。
 
 ---
 
@@ -1903,12 +1915,14 @@ Eval：
 
 **任务目标**
 
-在 T07 验收后删除 fixed 258K、Projection/CanonicalHistory、old writer、sync-only compact、旧阶段文案、重复入口与取消的 bundled metadata 路线。
+在 T07 验收后删除 fixed 258K、Projection/CanonicalHistory、old writer、sync-only compact、旧阶段文案和重复入口，并确认已取消的 bundled metadata 路线持续不存在。
 
 **实现要求**
 
 - 以调用图和 `rg` 证明旧 production authority 为零；old-v1 fixture 只用于 incompatible 测试；
-- 删除 bundled official metadata/catalog/hardcoded window 设计、实现、测试及其欠账，不转记 future debt；
+- 确认 bundled official metadata/catalog/hardcoded official window 路线在源码、测试、当前事实文档和 `OutstandingDebtList.md` 中均不存在，且未重新登记为 future debt；
+- 重新盘点所有被 T09-1 实际改变的欠账：`T02 Slash Command / TUI` 仅删除已回补的 `/compact` 部分并保留仍成立的 `/memory`、`/dream`；`B01 私有测试集 v0` 按真实 Compaction 结果删除或更新对应部分；三条 T09 Context 欠账仅在实现、Checklist、Feedback 三项证据齐全后删除；
+- 对其它受影响条目同样执行“完全回补则删除、部分改变则更新、仍成立则保留、用户取消则删除且不转登记”，禁止因一条记录部分完成而整条误删；
 - Timeline record 恰为三类，B′ 无持久 FSM，Compact 无独立 model/provider fallback；
 - 保护 Permission、Plan/Todo、Runtime Hook、其它命令与 TUI rendering；
 - 清理后重跑最小定向、架构与全量测试，并写真实 Feedback；
@@ -2071,10 +2085,11 @@ TUI rendering
 
 ## 19. 编码停止条件
 
-编码代理只在以下情况停止并报告用户：
+Worker 开始实施时，以用户实际派发对应 Prompt 时的当前仓库状态为起点。开始编码前必须重新核对当前 `src/ + tests/`、前置 Worker Feedback 与任务书关键事实；普通后续 Commit、任务包修订、文档更新、Feedback 追加和 Checklist 勾选不构成基线冲突，不得仅因当前 HEAD SHA 与历史分析 SHA 不同而停止。
 
-- 实际基线 tree 不是 `40e9b2eaf984dbc266fa16e786f03de57435dfad`；
-- `40e9b2ea...` 的真实 `src/ + tests/` 与本任务书关键事实不一致；
+编码代理只在以下情况停止相关范围并通过 Feedback 报告用户：
+
+- 当前源码已经发生会使本任务书产品语义、架构边界、任务依赖或完成范围失效的实质变化；
 - AGENTS / UserDecisionBoundary 与 D1/D2/D3 发生实质冲突；
 - 必须改变 `interfaces -> application -> core` / Integration 截止 SDK 的冻结边界；
 - 必须新增第四种 Timeline 产品 record 才能完成 crash-safe commit；
@@ -2192,4 +2207,4 @@ logical Fine Timeline 受 F 约束
 
 ---
 
-> 本任务书已按 `40e9b2ea...` 基线原位返工，并与同目录 Spec、Tasks、Checklist、6 份独立 Worker Prompt 同步。当前仍为 `not_implemented`；后续只能按依赖顺序派发 Worker，不得恢复返工前的横向拆分或伪造 Feedback。
+> 本任务书最初基于历史分析基线 `40e9b2ea...` 形成，并与同目录 Spec、Tasks、Checklist、6 份独立 Worker Prompt 同步。当前仍为 `not_implemented`；Worker 以实际派发时的当前仓库状态起步并重新核对真实 `src/ + tests/`，不得把历史 SHA 当作固定实施前置，也不得恢复返工前的横向拆分或伪造 Feedback。
