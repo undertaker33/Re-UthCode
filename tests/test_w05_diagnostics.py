@@ -32,6 +32,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderResponse,
     ProviderEvent,
     ProviderIdentity,
@@ -51,6 +52,9 @@ from uthcode.integrations.tools.tool_result_read import ToolResultPolicy
 from uthcode.integrations.instruction_files import InstructionFileReader
 
 
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
+
+
 def _completed(usage: Usage) -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
@@ -68,6 +72,9 @@ class _ScriptedProvider:
         self.identity = ProviderIdentity("fake", "script", "fake-model")
         self.scripts = scripts
         self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,
@@ -102,7 +109,8 @@ async def test_application_diagnostics_are_json_safe_and_do_not_copy_payloads() 
                         },
                     )
                 ),
-            )
+            ),
+            model_limits=TEST_LIMITS,
         )
     )
 
@@ -182,7 +190,8 @@ async def test_formal_agent_run_projects_terminal_usage_to_application_diagnosti
                         },
                     )
                 ),
-            )
+            ),
+            model_limits=TEST_LIMITS,
         )
     )
 

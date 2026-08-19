@@ -52,7 +52,14 @@ class ConfigurationInitializationRequired(ConfigurationError):
 _ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode"})
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key"})
 _MODEL_FIELDS = frozenset(
-    {"provider", "remote_id", "display_name", "max_output_tokens", "reasoning_effort"}
+    {
+        "provider",
+        "remote_id",
+        "display_name",
+        "context_window",
+        "max_output_tokens",
+        "reasoning_effort",
+    }
 )
 _SUPPORTED_PROVIDER_KINDS = frozenset(
     {"fake", "anthropic", "openai_responses", "openai_compat"}
@@ -454,6 +461,7 @@ def _model_tables(mapping: Mapping[str, Any], *, path: Path) -> dict[str, dict[s
                 "provider",
                 "remote_id",
                 "display_name",
+                "context_window",
                 "max_output_tokens",
                 "reasoning_effort",
             )
@@ -473,6 +481,7 @@ def _model_profiles(
         provider_profile_id = raw_profile.get("provider")
         remote_id = raw_profile.get("remote_id")
         display_name = raw_profile.get("display_name")
+        context_window = raw_profile.get("context_window")
         max_output_tokens = raw_profile.get("max_output_tokens")
         reasoning_effort = raw_profile.get("reasoning_effort")
         if (
@@ -495,6 +504,14 @@ def _model_profiles(
                 )
             )
             or (
+                context_window is not None
+                and (
+                    isinstance(context_window, bool)
+                    or not isinstance(context_window, int)
+                    or context_window <= 0
+                )
+            )
+            or (
                 reasoning_effort is not None
                 and (
                     not isinstance(reasoning_effort, str)
@@ -513,6 +530,8 @@ def _model_profiles(
         }
         if "display_name" in raw_profile:
             raw["display_name"] = display_name
+        if "context_window" in raw_profile:
+            raw["context_window"] = context_window
         if "max_output_tokens" in raw_profile:
             raw["max_output_tokens"] = max_output_tokens
         if "reasoning_effort" in raw_profile:
@@ -526,8 +545,46 @@ def _merge_models(
     overlay: Mapping[str, Any],
     *,
     path: Path,
+    user_models: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
+    project = user_models is not None
     for model_ref, raw_profile in _model_tables(overlay, path=path).items():
+        if project and "context_window" in raw_profile:
+            user_profile = user_models.get(model_ref, {})
+            user_limit = user_profile.get("context_window")
+            project_limit = raw_profile.get("context_window")
+            if user_limit is None:
+                raise ConfigurationError(
+                    "project context_window cannot create a missing user limit",
+                    path=path,
+                    field=f"models.{model_ref}.context_window",
+                )
+            if (
+                isinstance(user_limit, bool)
+                or not isinstance(user_limit, int)
+                or user_limit <= 0
+            ):
+                raise ConfigurationError(
+                    "user context_window is invalid",
+                    path=path,
+                    field=f"models.{model_ref}.context_window",
+                )
+            if (
+                isinstance(project_limit, bool)
+                or not isinstance(project_limit, int)
+                or project_limit <= 0
+            ):
+                raise ConfigurationError(
+                    "context_window must be a positive integer",
+                    path=path,
+                    field=f"models.{model_ref}.context_window",
+                )
+            if project_limit > user_limit:
+                raise ConfigurationError(
+                    "project context_window cannot expand the user limit",
+                    path=path,
+                    field=f"models.{model_ref}.context_window",
+                )
         current = target.setdefault(model_ref, {})
         current.update(raw_profile)
 
@@ -572,6 +629,7 @@ def load_config_data(
         )
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
+    user_models = {key: dict(value) for key, value in models.items()}
     selected_ref = user_mapping.get("default_model")
     if not providers and not models and _blank(selected_ref):
         raise ConfigurationInitializationRequired(user_path)
@@ -580,7 +638,7 @@ def load_config_data(
     for kind, path in paths[1:]:
         project_mapping = _read_mapping(path)
         _validate_project_mapping(project_mapping, path=path)
-        _merge_models(models, project_mapping, path=path)
+        _merge_models(models, project_mapping, path=path, user_models=user_models)
         if "default_model" in project_mapping:
             selected_ref = project_mapping["default_model"]
         sources.append(LoadedConfigSource(kind, path))

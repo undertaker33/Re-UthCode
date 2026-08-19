@@ -40,6 +40,7 @@ api_key = \"\"
 provider = \"\"
 remote_id = \"\"
 # display_name = \"\"
+# context_window = 〈正整数〉
 # max_output_tokens = 4096
 # reasoning_effort = \"\"
 
@@ -47,6 +48,7 @@ remote_id = \"\"
 provider = \"\"
 remote_id = \"\"
 # display_name = \"\"
+# context_window = 〈正整数〉
 # max_output_tokens = 4096
 # reasoning_effort = \"\"
 
@@ -54,6 +56,7 @@ remote_id = \"\"
 provider = \"\"
 remote_id = \"\"
 # display_name = \"\"
+# context_window = 〈正整数〉
 # max_output_tokens = 4096
 # reasoning_effort = \"\"
 """

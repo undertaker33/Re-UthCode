@@ -37,6 +37,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderError,
     ProviderEvent,
     ProviderIdentity,
@@ -49,6 +50,9 @@ from uthcode.core.provider import (
 from uthcode.core.secrets import SecretValue
 from uthcode.core.tool import ToolExecutionResult, ToolPreparation
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _response(*parts: object, finish_reason: FinishReason = FinishReason.STOP) -> GenerationCompleted:
@@ -66,6 +70,9 @@ class _ScriptedProvider:
         self.identity = ProviderIdentity("fake", "eval-script", "eval-model")
         self._scripts = tuple(tuple(script) for script in scripts)
         self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,
@@ -323,7 +330,9 @@ async def test_forged_attempt_with_non_git_repo_root_is_rejected_before_writes(t
 async def test_run_attempt_uses_one_run_turn_event_stream_result_and_verifier(tmp_path: Path) -> None:
     task = _task()
     attempt = _attempt(tmp_path, task)
-    provider = FakeProvider(events=(_response(TextPart("done")),))
+    provider = FakeProvider(
+        events=(_response(TextPart("done")),), model_limits=TEST_LIMITS
+    )
     calls, verifier = _verifier_calls()
     factory_calls: list[object] = []
 
@@ -547,7 +556,9 @@ async def test_undeclared_interaction_is_not_answered_and_is_cancelled_once(tmp_
 async def test_timeout_cancels_once_and_does_not_retry_workspace(tmp_path: Path) -> None:
     task = _task(timeout_seconds=1)
     attempt = _attempt(tmp_path, task)
-    provider = FakeProvider(events=(_response(TextPart("late")),), delay=1.0)
+    provider = FakeProvider(
+        events=(_response(TextPart("late")),), delay=1.0, model_limits=TEST_LIMITS
+    )
 
     execution = await run_attempt(
         task,
@@ -570,7 +581,10 @@ async def test_timeout_cancels_once_and_does_not_retry_workspace(tmp_path: Path)
 async def test_provider_and_verifier_failures_remain_separate_categories(tmp_path: Path) -> None:
     task = _task()
     provider_attempt = _attempt(tmp_path, task, attempt_id="provider")
-    provider = FakeProvider(error=ProviderError("provider secret must not be echoed"))
+    provider = FakeProvider(
+        error=ProviderError("provider secret must not be echoed"),
+        model_limits=TEST_LIMITS,
+    )
     provider_execution = await run_attempt(
         task,
         provider_attempt,
@@ -583,7 +597,9 @@ async def test_provider_and_verifier_failures_remain_separate_categories(tmp_pat
     assert provider_execution.diagnostics["failure_class"] == "provider"
 
     verifier_attempt = _attempt(tmp_path, task, attempt_id="verifier")
-    verifier_provider = FakeProvider(events=(_response(TextPart("done")),))
+    verifier_provider = FakeProvider(
+        events=(_response(TextPart("done")),), model_limits=TEST_LIMITS
+    )
 
     def broken_verifier(_workspace: Path) -> VerifierResult:
         raise RuntimeError("verifier secret must not be echoed")
@@ -607,7 +623,9 @@ async def test_artifacts_are_redacted_and_runner_errors_are_structured(tmp_path:
     task = _task()
     attempt = _attempt(tmp_path, task)
     secret = "TOP-SECRET-EVAL-123"
-    provider = FakeProvider(events=(_response(TextPart(f"api_key={secret}")),))
+    provider = FakeProvider(
+        events=(_response(TextPart(f"api_key={secret}")),), model_limits=TEST_LIMITS
+    )
 
     execution = await run_attempt(
         task,

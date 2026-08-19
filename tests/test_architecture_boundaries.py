@@ -324,7 +324,9 @@ import sys
 from uthcode.application import EffectiveConfig, GenerationRequest, Message, TextPart, create_application
 
 async def main():
-    application = create_application(EffectiveConfig.single_model('fake/ref'))
+    application = create_application(
+        EffectiveConfig.single_model('fake/ref', context_window=1_000_000)
+    )
     request = GenerationRequest(messages=(Message('user', (TextPart('hello'),)),))
     events = [event async for event in application.stream_generation(request)]
     assert events

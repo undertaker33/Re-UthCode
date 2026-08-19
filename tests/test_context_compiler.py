@@ -15,7 +15,6 @@ from uthcode.application.context import ApplicationContextService
 from uthcode.core.context import (
     ContextCompiler,
     ContextSourceBundle,
-    UTHCODE_CONTEXT_BUDGET_TOKENS,
 )
 from uthcode.core.history import CanonicalHistory, HistoryKind
 from uthcode.core.prompt import (
@@ -68,7 +67,7 @@ def _history() -> CanonicalHistory:
     )
 
 
-def test_compiler_is_fixed_budget_deterministic_and_unit_atomic() -> None:
+def test_compiler_is_dynamic_budget_deterministic_and_unit_atomic() -> None:
     def estimate(text: str) -> int:
         if '"sequence":1' in text:
             return 180_000
@@ -76,7 +75,7 @@ def test_compiler_is_fixed_budget_deterministic_and_unit_atomic() -> None:
             return 180_000
         return max(1, len(text) // 4)
 
-    compiler = ContextCompiler(token_estimator=estimate)
+    compiler = ContextCompiler(budget_tokens=258_000, token_estimator=estimate)
     project = _project_source("project rule", 1)
     tool_source = ToolDefinitionSource((ToolDefinition("ReadFile", "read", {"type": "object"}),))
     sources = ContextSourceBundle(
@@ -90,7 +89,7 @@ def test_compiler_is_fixed_budget_deterministic_and_unit_atomic() -> None:
     second = compiler.compile(sources)
 
     assert first == second
-    assert first.budget_tokens == UTHCODE_CONTEXT_BUDGET_TOKENS
+    assert first.budget_tokens == 258_000
     assert first.token_estimate >= first.stable_prefix_estimated_tokens + first.tool_schema_estimated_tokens
     assert first.tool_schema_fingerprint == tool_source.tool_schema_fingerprint
     assert "ReadFile" not in "\n".join(block.content for block in first.instruction_plane)
@@ -100,8 +99,8 @@ def test_compiler_is_fixed_budget_deterministic_and_unit_atomic() -> None:
 
 
 def test_budget_is_not_a_model_window_resolver() -> None:
-    with pytest.raises(ValueError, match="fixed 258K"):
-        ContextCompiler(budget_tokens=1)
+    compiler = ContextCompiler(budget_tokens=1)
+    assert compiler.budget_tokens == 1
 
 
 def test_runtime_and_projection_changes_do_not_change_stable_prefix() -> None:
@@ -223,6 +222,7 @@ def test_application_context_service_keeps_current_user_at_conversation_tail() -
 
 def test_current_user_is_protected_and_remains_at_conversation_tail_over_budget() -> None:
     snapshot = ContextCompiler(
+        budget_tokens=258_000,
         token_estimator=lambda text: 300_000 if text == "current user" else 1,
     ).compile(
         history=_history(),
@@ -249,7 +249,7 @@ def test_recent_history_selection_is_newest_first_but_composed_in_time_order() -
             return 100_000
         return 1
 
-    snapshot = ContextCompiler(token_estimator=estimate).compile(history=history)
+    snapshot = ContextCompiler(budget_tokens=300_000, token_estimator=estimate).compile(history=history)
     history_blocks = [block for block in snapshot.selected_blocks if block.semantic_unit_id is not None]
 
     assert len(history_blocks) == 2
@@ -331,7 +331,7 @@ def test_application_composes_context_and_resumes_instruction_state(tmp_path: Pa
         session_store=sessions,
     )
     snapshot = first_app.compile_context(current_user="inspect this")
-    assert snapshot.budget_tokens == UTHCODE_CONTEXT_BUDGET_TOKENS
+    assert snapshot.budget_tokens is None
     assert snapshot.tool_schema_fingerprint is not None
 
     session = first_app.create_session("session-1")

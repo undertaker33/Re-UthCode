@@ -351,8 +351,8 @@ class UthCodeTUI:
         ring_style, ring_text = context_usage_ring(usage)
         columns, _rows = self._terminal_size()
         if columns < 48:
-            # Preserve a useful fixed-budget signal in narrow terminals while
-            # leaving the main input buffer and its prompt untouched.
+            # Preserve a useful dynamic-limit signal in narrow terminals
+            # while leaving the main input buffer and its prompt untouched.
             return [
                 (ring_style, f" {ring_text} | "),
                 (permission_style, f"permission: {self._run.permission_mode.value}"),

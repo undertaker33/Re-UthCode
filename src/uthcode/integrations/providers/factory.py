@@ -68,6 +68,10 @@ def create_provider(config: ProviderConfig) -> ProviderPort:
                     )
                 ),
             ),
+            # The configured fake Provider has no reliable model metadata;
+            # callers must provide context_window or an explicit runtime
+            # capability in the same way as any other Provider.
+            model_limits=None,
         )
 
     if config.kind is ProviderKind.OPENAI_COMPAT and not config.base_url:

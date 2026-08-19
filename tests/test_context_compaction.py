@@ -34,6 +34,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextPart,
@@ -539,6 +540,9 @@ class _OverflowProvider:
     def __post_init__(self) -> None:
         self.identity = ProviderIdentity("fake", "overflow", "model")
         self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken):
         self.requests.append(request)

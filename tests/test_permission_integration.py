@@ -32,6 +32,7 @@ from uthcode.core.provider import (
     GenerationCompleted,
     GenerationRequest,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     TextPart,
@@ -59,6 +60,10 @@ class _ScriptedProvider:
     def __init__(self, scripts: Iterable[Iterable[object]]) -> None:
         self.scripts = tuple(tuple(script) for script in scripts)
         self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, model: str) -> ModelLimits:
+        del model
+        return ModelLimits(max_input_tokens=1_000_000, source="test.runtime")
 
     async def stream(
         self,

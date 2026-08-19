@@ -90,6 +90,7 @@ _MODEL_MAPPING_FIELDS = frozenset(
         "provider_profile_id",
         "remote_id",
         "display_name",
+        "context_window",
         "max_output_tokens",
         "reasoning_effort",
     }
@@ -166,6 +167,7 @@ class ModelProfile:
     provider_profile_id: str
     remote_id: str
     display_name: str | None = None
+    context_window: int | None = None
     max_output_tokens: int | None = None
     reasoning_effort: str | None = None
 
@@ -175,6 +177,14 @@ class ModelProfile:
         _require_text(self.remote_id, "remote_id")
         if self.display_name is not None:
             _require_text(self.display_name, "display_name")
+        if self.context_window is not None and (
+            isinstance(self.context_window, bool)
+            or not isinstance(self.context_window, int)
+            or self.context_window <= 0
+        ):
+            raise ConfigurationModelError(
+                "context_window must be a positive integer or None"
+            )
         if self.max_output_tokens is not None and (
             isinstance(self.max_output_tokens, bool)
             or not isinstance(self.max_output_tokens, int)
@@ -278,6 +288,7 @@ class EffectiveConfig:
                     provider_profile_id=value.get("provider_profile_id"),
                     remote_id=value.get("remote_id"),
                     display_name=value.get("display_name"),
+                    context_window=value.get("context_window"),
                     max_output_tokens=value.get("max_output_tokens"),
                     reasoning_effort=value.get("reasoning_effort"),
                 )
@@ -352,6 +363,7 @@ class EffectiveConfig:
         api_key: SecretValue | str | None = None,
         base_url: str | None = None,
         max_output_tokens: int | None = None,
+        context_window: int | None = None,
         reasoning_effort: str | None = None,
         source: ConfigSource | str | Path | None = None,
     ) -> EffectiveConfig:
@@ -378,6 +390,7 @@ class EffectiveConfig:
                     provider_profile_id=provider_profile_id,
                     remote_id=remote_id,
                     display_name=display_name,
+                    context_window=context_window,
                     max_output_tokens=max_output_tokens,
                     reasoning_effort=reasoning_effort,
                 )

@@ -23,6 +23,7 @@ from uthcode.application import (
 from uthcode.application.tools import ApplicationToolService
 from uthcode.core.provider import (
     FinishReason,
+    ModelLimits,
     ProviderEvent,
     ProviderIdentity,
     ToolCallCompleted,
@@ -41,12 +42,16 @@ from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools.factory import create_default_tools
 
 
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
+
+
 def _configuration() -> EffectiveConfig:
     return EffectiveConfig.single_model(
         "test/ref",
         provider_profile_id="test",
         provider_kind=ProviderKind.FAKE,
         remote_id="test-model",
+        context_window=1_000_000,
     )
 
 
@@ -116,6 +121,7 @@ class _TwoTurnFakeProvider(FakeProvider):
         super().__init__(
             identity=ProviderIdentity("fake", "script", "fake-model"),
             events=(),
+            model_limits=TEST_LIMITS,
         )
         self._scripts = tuple(tuple(script) for script in scripts)
 
@@ -135,7 +141,7 @@ class _TwoTurnFakeProvider(FakeProvider):
 
 @pytest.mark.asyncio
 async def test_default_tools_are_ordered_and_not_injected_into_generation() -> None:
-    provider = FakeProvider(events=(_completed(),))
+    provider = FakeProvider(events=(_completed(),), model_limits=TEST_LIMITS)
     application = create_application(
         _configuration(),
         provider_builder=lambda _provider, _model: provider,

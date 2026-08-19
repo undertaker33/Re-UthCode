@@ -1,9 +1,9 @@
-"""Provider-independent Context Compiler contracts.
+"""Provider-independent Context compilation and request-safety contracts.
 
-The compiler in this module deliberately knows nothing about a Provider, a
-filesystem, or a UI.  It turns the typed Context sources owned by Core and
-Application into one deterministic, immutable snapshot.  The 258K value is an
-UthCode operating budget; it is not a model-window discovery mechanism.
+The compiler deliberately knows nothing about a Provider, a filesystem, or a
+UI.  Runtime limits and request counts arrive as UthCode-owned values; this
+module applies deterministic working-set and gate policy without guessing a
+model window.
 """
 
 from __future__ import annotations
@@ -34,15 +34,324 @@ from .prompt import (
     core_runtime_contract_source,
     public_prompt_source,
 )
-from .provider import CancellationToken, Message, TextPart, ToolCallPart, ToolDefinition, ToolResultPart
+from .provider import (
+    CancellationToken,
+    ContextCountEstimate,
+    GenerationRequest,
+    Message,
+    ModelLimits,
+    TextPart,
+    ToolCallPart,
+    ToolDefinition,
+    ToolResultPart,
+)
 
 
-UTHCODE_CONTEXT_BUDGET_TOKENS = 258_000
 _MISSING = object()
 
 
 class ContextCompilationError(ValueError):
     """A Context source or compiler input violates the Core contract."""
+
+
+class ContextBudgetError(ValueError):
+    """The known input limits cannot form a safe operating budget."""
+
+
+class ContextRequestSafetyError(ContextBudgetError):
+    """A final Provider-visible request is not safe to send."""
+
+
+def adaptive_working_headroom(effective_input_limit: int) -> int:
+    """Return a capped proactive reserve for one effective input limit.
+
+    The reserve is intentionally a small-window adaptive value with an
+    absolute ceiling.  It is a policy input to Auto Gate, never a Provider
+    safety proof and never a percentage-only rule.
+    """
+
+    if (
+        isinstance(effective_input_limit, bool)
+        or not isinstance(effective_input_limit, int)
+        or effective_input_limit <= 0
+    ):
+        raise ValueError("effective_input_limit must be a positive integer")
+    return min(
+        48_000,
+        max(512, effective_input_limit // 20),
+        max(1, effective_input_limit - 1),
+    )
+
+
+def safety_allowance_for(
+    effective_input_limit: int,
+    *,
+    kind: str,
+) -> int:
+    """Return the centralized uncertainty allowance for a count source."""
+
+    if kind == "pressure_estimate":
+        return min(4_096, max(64, effective_input_limit // 50), max(0, effective_input_limit - 1))
+    if kind == "preflight_provider_count":
+        return min(2_048, max(32, effective_input_limit // 100), max(0, effective_input_limit - 1))
+    if kind == "preflight_local_estimate":
+        return min(8_192, max(128, effective_input_limit // 20), max(0, effective_input_limit - 1))
+    raise ValueError("unsupported count kind")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudget:
+    """The independent dimensions used to govern one request."""
+
+    configured_input_limit: int | None = None
+    provider_max_input: int | None = None
+    effective_input_limit: int | None = None
+    provider_max_output: int | None = None
+    provider_combined_limit: int | None = None
+    requested_output_reserve: int = 0
+    safety_allowance: int = 0
+    working_headroom: int | None = None
+    auto_gate_limit: int | None = None
+    active_evidence_budget: int | None = None
+    fine_timeline_budget: int | None = None
+    uncompressed_tail_budget: int | None = None
+    retained_target: int | None = None
+    retained_hard_cap: int | None = None
+    compaction_input_budget: int | None = None
+    compaction_output_reserve: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "configured_input_limit",
+            "provider_max_input",
+            "provider_max_output",
+            "provider_combined_limit",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{field_name} must be a positive integer or None")
+        effective = self.effective_input_limit
+        known_inputs = tuple(
+            value
+            for value in (self.configured_input_limit, self.provider_max_input)
+            if value is not None
+        )
+        if not known_inputs:
+            raise ContextBudgetError(
+                "at least one configured or reliable Provider input limit is required"
+            )
+        if effective is None:
+            effective = min(known_inputs)
+            object.__setattr__(self, "effective_input_limit", effective)
+        if (
+            isinstance(effective, bool)
+            or not isinstance(effective, int)
+            or effective <= 0
+        ):
+            raise ValueError("effective_input_limit must be a positive integer")
+        if effective <= 1:
+            raise ContextBudgetError(
+                "effective input limit is too small for a request safety budget"
+            )
+        if known_inputs and effective > min(known_inputs):
+            raise ValueError("effective_input_limit cannot exceed a known input limit")
+        for field_name in ("requested_output_reserve", "safety_allowance"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+
+        reserve = self.working_headroom
+        if reserve is None:
+            reserve = adaptive_working_headroom(effective)
+            object.__setattr__(self, "working_headroom", reserve)
+        if isinstance(reserve, bool) or not isinstance(reserve, int) or not 0 < reserve < effective:
+            raise ValueError("working_headroom must be positive and smaller than the input limit")
+        auto_gate = self.auto_gate_limit
+        if auto_gate is None:
+            auto_gate = effective - reserve
+            object.__setattr__(self, "auto_gate_limit", auto_gate)
+        if isinstance(auto_gate, bool) or not isinstance(auto_gate, int) or not 0 < auto_gate < effective:
+            raise ValueError("auto_gate_limit must be positive and smaller than the input limit")
+
+        active = self.active_evidence_budget
+        fine = self.fine_timeline_budget
+        tail = self.uncompressed_tail_budget
+        if active is None:
+            active = min(effective, max(1, min(48_000, max(128, effective // 5))))
+            object.__setattr__(self, "active_evidence_budget", active)
+        if fine is None:
+            fine = min(effective, max(1, min(16_000, max(64, effective // 16))))
+            object.__setattr__(self, "fine_timeline_budget", fine)
+        if tail is None:
+            tail = min(effective, max(1, min(8_000, max(64, effective // 32))))
+            object.__setattr__(self, "uncompressed_tail_budget", tail)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (active, fine, tail)
+        ):
+            raise ValueError("retained context budgets must be positive integers")
+
+        retained_target = self.retained_target
+        if retained_target is None:
+            retained_target = min(effective - reserve, active + fine + tail)
+            object.__setattr__(self, "retained_target", retained_target)
+        retained_cap = self.retained_hard_cap
+        if retained_cap is None:
+            retained_cap = min(effective, max(retained_target, active + fine + tail))
+            object.__setattr__(self, "retained_hard_cap", retained_cap)
+        if (
+            isinstance(retained_target, bool)
+            or not isinstance(retained_target, int)
+            or retained_target <= 0
+            or isinstance(retained_cap, bool)
+            or not isinstance(retained_cap, int)
+            or retained_cap < retained_target
+            or retained_cap > effective
+        ):
+            raise ValueError("retained target/cap is invalid")
+
+        compact_input = self.compaction_input_budget
+        if compact_input is None:
+            compact_input = min(effective, min(64_000, max(256, effective // 4)))
+            object.__setattr__(self, "compaction_input_budget", compact_input)
+        compact_output = self.compaction_output_reserve
+        if compact_output is None:
+            compact_output = min(
+                max(1, compact_input - 1),
+                min(4_096, max(32, effective // 64)),
+            )
+            object.__setattr__(self, "compaction_output_reserve", compact_output)
+        if (
+            isinstance(compact_input, bool)
+            or not isinstance(compact_input, int)
+            or compact_input <= 0
+            or isinstance(compact_output, bool)
+            or not isinstance(compact_output, int)
+            or compact_output <= 0
+            or compact_output >= compact_input
+        ):
+            raise ValueError("compaction budgets are invalid")
+
+    @classmethod
+    def from_limits(
+        cls,
+        *,
+        configured_input_limit: int | None,
+        provider_limits: ModelLimits | None,
+        requested_output_reserve: int = 0,
+        safety_allowance: int = 0,
+    ) -> "ContextBudget":
+        if provider_limits is not None and not isinstance(provider_limits, ModelLimits):
+            raise TypeError("provider_limits must be ModelLimits or None")
+        return cls(
+            configured_input_limit=configured_input_limit,
+            provider_max_input=(
+                provider_limits.max_input_tokens if provider_limits is not None else None
+            ),
+            provider_max_output=(
+                provider_limits.max_output_tokens if provider_limits is not None else None
+            ),
+            provider_combined_limit=(
+                provider_limits.max_combined_tokens if provider_limits is not None else None
+            ),
+            requested_output_reserve=requested_output_reserve,
+            safety_allowance=safety_allowance,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "configured_input_limit": self.configured_input_limit,
+            "provider_max_input": self.provider_max_input,
+            "effective_input_limit": self.effective_input_limit,
+            "provider_max_output": self.provider_max_output,
+            "provider_combined_limit": self.provider_combined_limit,
+            "requested_output_reserve": self.requested_output_reserve,
+            "safety_allowance": self.safety_allowance,
+            "working_headroom": self.working_headroom,
+            "auto_gate_limit": self.auto_gate_limit,
+            "active_evidence_budget": self.active_evidence_budget,
+            "fine_timeline_budget": self.fine_timeline_budget,
+            "uncompressed_tail_budget": self.uncompressed_tail_budget,
+            "retained_target": self.retained_target,
+            "retained_hard_cap": self.retained_hard_cap,
+            "compaction_input_budget": self.compaction_input_budget,
+            "compaction_output_reserve": self.compaction_output_reserve,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GateDecision:
+    """One transparent Pressure/Preflight result for a final request."""
+
+    input_tokens: int
+    count_source: str
+    requested_output_reserve: int
+    safety_allowance: int
+    preflight_input_usage: int
+    auto_pressure: bool
+    hard_safe: bool
+    auto_gate_limit: int
+    effective_input_limit: int
+    provider_output_limit: int | None
+    provider_combined_limit: int | None
+    input_safe: bool
+    output_safe: bool
+    combined_safe: bool
+    reason: str
+    framing_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "input_tokens",
+            "requested_output_reserve",
+            "safety_allowance",
+            "preflight_input_usage",
+            "auto_gate_limit",
+            "effective_input_limit",
+            "framing_tokens",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        for field_name in (
+            "auto_pressure",
+            "hard_safe",
+            "input_safe",
+            "output_safe",
+            "combined_safe",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+        if self.provider_output_limit is not None and self.provider_output_limit <= 0:
+            raise ValueError("provider_output_limit must be positive or None")
+        if self.provider_combined_limit is not None and self.provider_combined_limit <= 0:
+            raise ValueError("provider_combined_limit must be positive or None")
+        if not isinstance(self.count_source, str) or not self.count_source:
+            raise ValueError("count_source must be a non-empty string")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("reason must be a non-empty string")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "input_tokens": self.input_tokens,
+            "count_source": self.count_source,
+            "requested_output_reserve": self.requested_output_reserve,
+            "safety_allowance": self.safety_allowance,
+            "preflight_input_usage": self.preflight_input_usage,
+            "auto_pressure": self.auto_pressure,
+            "hard_safe": self.hard_safe,
+            "auto_gate_limit": self.auto_gate_limit,
+            "effective_input_limit": self.effective_input_limit,
+            "provider_output_limit": self.provider_output_limit,
+            "provider_combined_limit": self.provider_combined_limit,
+            "input_safe": self.input_safe,
+            "output_safe": self.output_safe,
+            "combined_safe": self.combined_safe,
+            "reason": self.reason,
+            "framing_tokens": self.framing_tokens,
+        }
 
 
 class CompactionError(ValueError):
@@ -162,6 +471,293 @@ class DeterministicTokenEstimator:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestAccounting:
+    """Deterministic accounting for the complete Provider-visible input.
+
+    The fields are deliberately structural rather than Provider billing facts.
+    They make it possible for Application diagnostics and tests to prove that
+    instruction, messages, tools, and known framing were all considered.
+    """
+
+    instruction_tokens: int
+    messages_tokens: int
+    tools_tokens: int
+    framing_tokens: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "instruction_tokens",
+            "messages_tokens",
+            "tools_tokens",
+            "framing_tokens",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+
+    @property
+    def input_tokens(self) -> int:
+        return (
+            self.instruction_tokens
+            + self.messages_tokens
+            + self.tools_tokens
+            + self.framing_tokens
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "instruction_tokens": self.instruction_tokens,
+            "messages_tokens": self.messages_tokens,
+            "tools_tokens": self.tools_tokens,
+            "framing_tokens": self.framing_tokens,
+            "input_tokens": self.input_tokens,
+        }
+
+
+def account_generation_request(
+    request: GenerationRequest,
+    *,
+    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+) -> RequestAccounting:
+    """Count one complete request using a stable local serialization.
+
+    This is an estimate, not a claim about Provider tokenizer exactness.  The
+    serialization includes the same UthCode-owned instruction, message, and
+    tool structures that the integrations receive, plus explicit role/schema
+    framing.  Provider integrations may replace the numeric estimate with a
+    structured count while retaining the same Gate contract.
+    """
+
+    if not isinstance(request, GenerationRequest):
+        raise TypeError("request must be a GenerationRequest")
+    estimator = token_estimator or DeterministicTokenEstimator()
+
+    def estimate(text: str) -> int:
+        value = (
+            estimator.estimate(text)
+            if hasattr(estimator, "estimate")
+            else estimator(text)  # type: ignore[operator]
+        )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("token estimator must return a non-negative integer")
+        return value
+
+    instruction = request.system_prompt or ""
+    messages = json.dumps(
+        [message.to_dict() for message in request.messages],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    tools = json.dumps(
+        [tool.to_dict() for tool in request.tools],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    framing = json.dumps(
+        {
+            "instruction_channel": "system" if request.system_prompt else "none",
+            "message_roles": [message.role for message in request.messages],
+            "message_count": len(request.messages),
+            "tool_count": len(request.tools),
+            "markers": ["request_start", "role", "part", "request_end"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return RequestAccounting(
+        instruction_tokens=estimate(instruction),
+        messages_tokens=estimate(messages),
+        tools_tokens=estimate(tools),
+        framing_tokens=estimate(framing),
+    )
+
+
+def _count_estimate(
+    value: ContextCountEstimate | int | None,
+    *,
+    kind: str,
+    source: str,
+    effective_input_limit: int,
+    fallback_request: GenerationRequest | None = None,
+    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+) -> ContextCountEstimate:
+    if isinstance(value, ContextCountEstimate):
+        input_tokens = value.input_tokens
+        count_source = value.source
+    elif value is None:
+        if fallback_request is None:
+            raise ContextBudgetError("a preflight count or final request is required")
+        input_tokens = account_generation_request(
+            fallback_request,
+            token_estimator=token_estimator,
+        ).input_tokens
+        count_source = source
+    elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError("token count must be ContextCountEstimate, non-negative int, or None")
+    else:
+        input_tokens = value
+        count_source = source
+    return ContextCountEstimate(
+        input_tokens=input_tokens,
+        source=count_source,
+        kind=kind,
+        safety_allowance=safety_allowance_for(
+            effective_input_limit,
+            kind=kind,
+        ),
+    )
+
+
+def pressure_estimate(
+    request: GenerationRequest,
+    budget: ContextBudget,
+    *,
+    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+) -> ContextCountEstimate:
+    """Return the proactive Auto Gate estimate for a final request."""
+
+    if not isinstance(budget, ContextBudget):
+        raise TypeError("budget must be a ContextBudget")
+    return _count_estimate(
+        None,
+        kind="pressure_estimate",
+        source="local.pressure_estimate",
+        effective_input_limit=budget.effective_input_limit,
+        fallback_request=request,
+        token_estimator=token_estimator,
+    )
+
+
+def preflight_safety_count(
+    request: GenerationRequest,
+    budget: ContextBudget,
+    *,
+    provider_count: ContextCountEstimate | int | None = None,
+    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+) -> ContextCountEstimate:
+    """Count the final request for the fail-closed Hard Gate."""
+
+    if not isinstance(budget, ContextBudget):
+        raise TypeError("budget must be a ContextBudget")
+    return _count_estimate(
+        provider_count,
+        kind=(
+            "preflight_provider_count"
+            if provider_count is not None
+            else "preflight_local_estimate"
+        ),
+        source=(
+            "provider.preflight_count"
+            if provider_count is not None
+            else "local.preflight_estimate"
+        ),
+        effective_input_limit=budget.effective_input_limit,
+        fallback_request=request,
+        token_estimator=token_estimator,
+    )
+
+
+def evaluate_gates(
+    budget: ContextBudget,
+    count: ContextCountEstimate,
+    *,
+    accounting: RequestAccounting | None = None,
+    pressure_count: ContextCountEstimate | None = None,
+) -> GateDecision:
+    """Evaluate independent Auto and Hard decisions for one request."""
+
+    if not isinstance(budget, ContextBudget):
+        raise TypeError("budget must be a ContextBudget")
+    if not isinstance(count, ContextCountEstimate):
+        raise TypeError("count must be a ContextCountEstimate")
+    if pressure_count is not None and not isinstance(
+        pressure_count, ContextCountEstimate
+    ):
+        raise TypeError("pressure_count must be a ContextCountEstimate or None")
+    allowance = max(budget.safety_allowance, count.safety_allowance)
+    preflight_usage = count.input_tokens + allowance
+    input_safe = preflight_usage <= budget.effective_input_limit
+    output_safe = (
+        budget.provider_max_output is None
+        or budget.requested_output_reserve <= budget.provider_max_output
+    )
+    combined_safe = (
+        budget.provider_combined_limit is None
+        or preflight_usage + budget.requested_output_reserve
+        <= budget.provider_combined_limit
+    )
+    pressure = count if pressure_count is None else pressure_count
+    pressure_allowance = max(budget.safety_allowance, pressure.safety_allowance)
+    auto_pressure = (
+        pressure.input_tokens + pressure_allowance > budget.auto_gate_limit
+    )
+    reasons: list[str] = []
+    if not input_safe:
+        reasons.append("input_limit_exceeded")
+    if not output_safe:
+        reasons.append("output_limit_exceeded")
+    if not combined_safe:
+        reasons.append("combined_limit_exceeded")
+    if not reasons:
+        reasons.append("auto_pressure" if auto_pressure else "safe")
+    return GateDecision(
+        input_tokens=count.input_tokens,
+        count_source=count.source,
+        requested_output_reserve=budget.requested_output_reserve,
+        safety_allowance=allowance,
+        preflight_input_usage=preflight_usage,
+        auto_pressure=auto_pressure,
+        hard_safe=input_safe and output_safe and combined_safe,
+        auto_gate_limit=budget.auto_gate_limit,
+        effective_input_limit=budget.effective_input_limit,
+        provider_output_limit=budget.provider_max_output,
+        provider_combined_limit=budget.provider_combined_limit,
+        input_safe=input_safe,
+        output_safe=output_safe,
+        combined_safe=combined_safe,
+        reason="+".join(reasons),
+        framing_tokens=(accounting.framing_tokens if accounting is not None else 0),
+    )
+
+
+def preflight_gate(
+    budget: ContextBudget,
+    count: ContextCountEstimate,
+    *,
+    accounting: RequestAccounting | None = None,
+    pressure_count: ContextCountEstimate | None = None,
+) -> GateDecision:
+    """Named alias for the final Preflight Hard Gate calculation."""
+
+    return evaluate_gates(
+        budget,
+        count,
+        accounting=accounting,
+        pressure_count=pressure_count,
+    )
+
+
+def resolve_context_budget(
+    *,
+    configured_input_limit: int | None,
+    provider_limits: ModelLimits | None,
+    requested_output_reserve: int = 0,
+    safety_allowance: int = 0,
+) -> ContextBudget:
+    """Build the one dynamic budget authority used by Application."""
+
+    return ContextBudget.from_limits(
+        configured_input_limit=configured_input_limit,
+        provider_limits=provider_limits,
+        requested_output_reserve=requested_output_reserve,
+        safety_allowance=safety_allowance,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ContextSourceBundle:
     """The complete provider-independent input to one compilation.
 
@@ -217,20 +813,26 @@ class ContextUsage:
     """Safe usage projection for later Application/UI consumers."""
 
     used_tokens: int
-    budget_tokens: int = UTHCODE_CONTEXT_BUDGET_TOKENS
+    budget_tokens: int | None = None
     available: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.used_tokens, bool) or not isinstance(self.used_tokens, int) or self.used_tokens < 0:
             raise ValueError("used_tokens must be a non-negative integer")
-        if self.budget_tokens != UTHCODE_CONTEXT_BUDGET_TOKENS:
-            raise ValueError("Context usage must use the fixed 258K Operating Budget")
+        if self.budget_tokens is not None and (
+            isinstance(self.budget_tokens, bool)
+            or not isinstance(self.budget_tokens, int)
+            or self.budget_tokens <= 0
+        ):
+            raise ValueError("budget_tokens must be a positive integer or None")
         if not isinstance(self.available, bool):
             raise TypeError("available must be a boolean")
 
     @property
     def ratio(self) -> float | None:
         if not self.available:
+            return None
+        if self.budget_tokens is None:
             return None
         return self.used_tokens / self.budget_tokens
 
@@ -247,7 +849,7 @@ class ContextUsage:
 class ContextSnapshot:
     """Immutable result of one deterministic Context compilation."""
 
-    budget_tokens: int
+    budget_tokens: int | None
     token_estimate: int
     selected_blocks: tuple[ContextBlock, ...]
     omitted_blocks: tuple[ContextBlock, ...]
@@ -264,8 +866,12 @@ class ContextSnapshot:
     over_budget: bool = False
 
     def __post_init__(self) -> None:
-        if self.budget_tokens != UTHCODE_CONTEXT_BUDGET_TOKENS:
-            raise ValueError("ContextSnapshot must use the fixed 258K Operating Budget")
+        if self.budget_tokens is not None and (
+            isinstance(self.budget_tokens, bool)
+            or not isinstance(self.budget_tokens, int)
+            or self.budget_tokens <= 0
+        ):
+            raise ValueError("budget_tokens must be a positive integer or None")
         if isinstance(self.token_estimate, bool) or not isinstance(self.token_estimate, int) or self.token_estimate < 0:
             raise ValueError("token_estimate must be a non-negative integer")
         selected = tuple(self.selected_blocks)
@@ -303,7 +909,7 @@ class ContextSnapshot:
         return self.token_estimate
 
     @property
-    def budget(self) -> int:
+    def budget(self) -> int | None:
         return self.budget_tokens
 
     @property
@@ -328,7 +934,11 @@ class ContextSnapshot:
 
     @property
     def usage(self) -> ContextUsage:
-        return ContextUsage(self.token_estimate)
+        return ContextUsage(
+            self.token_estimate,
+            self.budget_tokens,
+            available=self.budget_tokens is not None,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -799,17 +1409,27 @@ def instruction_text_from_context_snapshot(snapshot: ContextSnapshot) -> str:
 
 
 class ContextCompiler:
-    """Compile a deterministic Working Set under the fixed 258K budget."""
+    """Compile a deterministic Working Set under an optional input budget.
+
+    ``None`` means that this provider-independent compiler has no operating
+    limit yet and therefore does not omit sources on its own.  The formal
+    Application request path resolves a ``ContextBudget`` before it sends a
+    Provider request; the compiler never invents a model window.
+    """
 
     def __init__(
         self,
         *,
-        budget_tokens: int = UTHCODE_CONTEXT_BUDGET_TOKENS,
+        budget_tokens: int | None = None,
         token_estimator: TokenEstimator | Callable[[str], int] | None = None,
     ) -> None:
-        if budget_tokens != UTHCODE_CONTEXT_BUDGET_TOKENS:
-            raise ValueError("T09 Context Compiler uses the fixed 258K Operating Budget")
-        self.budget_tokens = UTHCODE_CONTEXT_BUDGET_TOKENS
+        if budget_tokens is not None and (
+            isinstance(budget_tokens, bool)
+            or not isinstance(budget_tokens, int)
+            or budget_tokens <= 0
+        ):
+            raise ValueError("budget_tokens must be a positive integer or None")
+        self.budget_tokens = budget_tokens
         self.token_estimator = token_estimator or DeterministicTokenEstimator()
         if not callable(getattr(self.token_estimator, "estimate", None)) and not callable(self.token_estimator):
             raise TypeError("token_estimator must be callable or provide estimate()")
@@ -919,7 +1539,7 @@ class ContextCompiler:
             if identifier in selected_ids:
                 return True
             estimate = self._estimate_block(block)
-            if required or total + estimate <= self.budget_tokens:
+            if required or self.budget_tokens is None or total + estimate <= self.budget_tokens:
                 selected.append(block)
                 selected_ids.add(identifier)
                 composition_order[identifier] = composition_key
@@ -1026,7 +1646,9 @@ class ContextCompiler:
             tool_schema_fingerprint=tool_fingerprint,
             tool_schema_estimated_tokens=tool_tokens,
             tool_definitions=tool_definitions,
-            over_budget=total > self.budget_tokens,
+            over_budget=(
+                self.budget_tokens is not None and total > self.budget_tokens
+            ),
         )
 
     def _instruction_plane(
@@ -1193,22 +1815,34 @@ def _conversation_block(raw: object) -> ContextBlock:
 
 
 __all__ = [
-    "UTHCODE_CONTEXT_BUDGET_TOKENS",
     "CompactionBatch",
     "CompactionError",
     "CompactionInProgress",
     "CompactionPolicy",
     "CompactionResult",
     "ContextBlock",
+    "ContextBudget",
+    "ContextBudgetError",
     "ContextCompilationError",
     "ContextCompactor",
     "ContextCompiler",
+    "ContextRequestSafetyError",
     "ContextSnapshot",
     "ContextSourceBundle",
     "ContextUsage",
     "DeterministicTokenEstimator",
+    "GateDecision",
+    "RequestAccounting",
     "TokenEstimator",
+    "account_generation_request",
     "context_block_id",
+    "evaluate_gates",
     "instruction_text_from_context_snapshot",
     "messages_from_context_snapshot",
+    "preflight_gate",
+    "preflight_safety_count",
+    "pressure_estimate",
+    "resolve_context_budget",
+    "safety_allowance_for",
+    "adaptive_working_headroom",
 ]

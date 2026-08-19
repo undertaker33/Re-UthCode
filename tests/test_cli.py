@@ -30,6 +30,7 @@ from uthcode.core.provider import (
     FinishReason,
     GenerationCancelled,
     GenerationRequest,
+    ModelLimits,
     NetworkError,
     ProviderError,
     RateLimitError,
@@ -41,6 +42,9 @@ from uthcode.core.provider import (
 from uthcode.core.tool import ToolExecutionResult
 from uthcode.interfaces.cli import main
 from uthcode.integrations.providers.fake import FakeProvider
+
+
+TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
 
 
 def _completed(
@@ -63,6 +67,7 @@ def _config(model: str = "fake/ref") -> EffectiveConfig:
         provider_profile_id="fake",
         provider_kind=ProviderKind.FAKE,
         remote_id="fake-model",
+        context_window=1_000_000,
     )
 
 
@@ -75,13 +80,14 @@ def _application(
         FakeProvider(
             events=events,  # type: ignore[arg-type]
             error=error,
+            model_limits=TEST_LIMITS,
         )
     )
 
 
 class _ScriptedProvider(FakeProvider):
     def __init__(self, scripts: Iterable[Iterable[ProviderEvent]]) -> None:
-        super().__init__()
+        super().__init__(model_limits=TEST_LIMITS)
         self._scripts = tuple(tuple(script) for script in scripts)
 
     async def stream(
@@ -99,6 +105,9 @@ class _ScriptedProvider(FakeProvider):
 
 
 class _CancelledProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__(model_limits=TEST_LIMITS)
+
     async def stream(
         self,
         request: GenerationRequest,
@@ -385,7 +394,9 @@ def test_exec_cancels_turn_when_provider_pauses(
 
     monkeypatch.setattr(TurnHandle, "cancel", record_cancel)
     application = UthCodeApplication(
-        FakeProvider(events=(), error=error),  # type: ignore[arg-type]
+        FakeProvider(
+            events=(), error=error, model_limits=TEST_LIMITS
+        ),  # type: ignore[arg-type]
     )
 
     result, stdout, stderr = _injected_main(["exec", "hello"], application)
@@ -492,7 +503,9 @@ def test_exec_uses_one_normalized_workdir_for_config_and_prompt(
         runtime_context,
     ) -> UthCodeApplication:
         captured_contexts.append(runtime_context)
-        provider = FakeProvider(events=(_completed("response"),))
+        provider = FakeProvider(
+            events=(_completed("response"),), model_limits=TEST_LIMITS
+        )
         providers.append(provider)
         return UthCodeApplication(provider, runtime_context=runtime_context)
 
@@ -556,7 +569,9 @@ import sys
 from uthcode.application import EffectiveConfig, ProviderKind, create_application
 from uthcode.interfaces.cli import main
 
-configuration = EffectiveConfig.single_model('fake/ref', provider_kind=ProviderKind.FAKE)
+configuration = EffectiveConfig.single_model(
+    'fake/ref', provider_kind=ProviderKind.FAKE, context_window=1_000_000
+)
 result = main(
     ['exec', 'hello'],
     config_loader=lambda _options: configuration,
@@ -594,7 +609,7 @@ def _write_fake_user_config(home: Path) -> Path:
     path = home / ".uthcode" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        '''default_model = "local/echo"\n\n[providers.local]\nkind = "fake"\n\n[models."local/echo"]\nprovider = "local"\nremote_id = "echo"\n''',
+        '''default_model = "local/echo"\n\n[providers.local]\nkind = "fake"\n\n[models."local/echo"]\nprovider = "local"\nremote_id = "echo"\ncontext_window = 1000000\n''',
         encoding="utf-8",
     )
     return path
