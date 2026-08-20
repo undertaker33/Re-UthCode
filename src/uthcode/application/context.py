@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import inspect
+from asyncio import CancelledError
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 from uthcode.core.context import (
     ContextBudget,
+    CompactionEpoch,
     CompactionResult,
     ContextCompactor,
     ContextCompiler,
@@ -42,6 +45,8 @@ from uthcode.core.prompt import (
     build_runtime_prompt_section,
 )
 from uthcode.core.provider import (
+    CancellationToken,
+    GenerationCancelled,
     GenerationRequest,
     Message,
     ModelLimits,
@@ -51,7 +56,6 @@ from uthcode.core.provider import (
     ToolResultPart,
     TextPart,
 )
-from uthcode.core.provider import CancellationToken
 
 from .instructions import InstructionLoader
 from .history import transcript_entries_for_message
@@ -228,6 +232,274 @@ class ApplicationContextService:
             }
         )
         return result
+
+    async def compact_async(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline | None = None,
+        session_id: str | None = None,
+        summarize: Callable[[CompactionEpoch], object | Awaitable[object]],
+        commit: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ] | None = None,
+        should_continue: Callable[
+            [Timeline],
+            bool | Mapping[str, object] | Awaitable[bool | Mapping[str, object]],
+        ] | None = None,
+        cancellation: CancellationToken | None = None,
+        max_epochs: int = 4,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+        summary_hard_cap: int | None = None,
+    ) -> CompactionResult:
+        """Run bounded tool-free L4 epochs in one Application call stack.
+
+        Each successful epoch is committed before the next epoch is derived.
+        ``should_continue`` is called with the freshly committed Timeline so
+        the caller can rebuild the ordinary request and re-run Auto/Hard Gate.
+        No loop cursor is written to Session or RuntimeLog.
+        """
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if timeline is not None and (
+            not isinstance(timeline, Timeline)
+            or timeline.session_id != transcript.session_id
+        ):
+            raise ValueError("transcript and timeline must belong to the same Session")
+        if not callable(summarize):
+            raise TypeError("summarize must be callable")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        if (
+            isinstance(max_epochs, bool)
+            or not isinstance(max_epochs, int)
+            or max_epochs <= 0
+        ):
+            raise ValueError("max_epochs must be a positive integer")
+
+        owner = transcript.session_id if session_id is None else session_id
+        if owner != transcript.session_id:
+            raise ValueError("Compaction Session does not own the supplied Transcript")
+        lock = self._compactor._acquire_single_flight(owner)
+        self._compact_count += 1
+        orchestration_attempt = self._compact_count
+        current_timeline = timeline
+        committed_any = False
+        last_success: CompactionResult | None = None
+        last_failure: str | None = None
+        previous_sequence_end = current_timeline.sequence_end if current_timeline is not None else 0
+        failure_streak = 0
+
+        def outcome(
+            *,
+            result: CompactionResult | None,
+            failure: str | None,
+            epoch: int,
+            attempt: int = 0,
+        ) -> None:
+            coverage_count = 0 if result is None else len(result.batches)
+            self._record_compaction(
+                {
+                    "attempt": orchestration_attempt,
+                    "epoch": epoch,
+                    "epoch_limit": max_epochs,
+                    "epoch_attempt": attempt,
+                    "status": "failed" if failure is not None else "completed",
+                    "changed": False if result is None else result.changed,
+                    "failure": failure,
+                    "coverage_count": coverage_count,
+                    "input_tokens": 0 if result is None else result.input_tokens,
+                    "output_tokens": 0 if result is None else result.output_tokens,
+                }
+            )
+
+        try:
+            for epoch_number in range(1, max_epochs + 1):
+                if cancellation is not None and cancellation.cancelled:
+                    last_failure = "compaction_cancelled"
+                    outcome(result=last_success, failure=last_failure, epoch=epoch_number)
+                    break
+
+                epoch = self._compactor.plan_epoch(
+                    transcript,
+                    timeline=current_timeline,
+                    session_id=owner,
+                    input_budget=input_budget,
+                    output_reserve=output_reserve,
+                )
+                if epoch is None:
+                    last_failure = "no_safe_epoch"
+                    outcome(result=last_success, failure=last_failure, epoch=epoch_number)
+                    break
+
+                candidate_result: CompactionResult | None = None
+                failure_streak = 0
+                for epoch_attempt in range(1, 3):
+                    if cancellation is not None and cancellation.cancelled:
+                        last_failure = "compaction_cancelled"
+                        break
+                    try:
+                        generated = summarize(epoch)
+                        if inspect.isawaitable(generated):
+                            generated = await generated
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            break
+                        parsed = self._compactor.parse_epoch_result(
+                            generated,
+                            epoch=epoch,
+                            summary_hard_cap=summary_hard_cap,
+                        )
+                        candidate_result = self._compactor.build_epoch_candidate(
+                            transcript,
+                            epoch=epoch,
+                            result=parsed,
+                            timeline=current_timeline,
+                        )
+                        break
+                    except GenerationCancelled:
+                        # Provider cancellation is a control-flow exit, not
+                        # an invalid structured compaction result.  Let the
+                        # existing Application/AgentRun cancellation path
+                        # handle it without retrying this epoch.
+                        raise
+                    except CancelledError:
+                        # Preserve asyncio cancellation even when the shared
+                        # Core token has not been marked cancelled yet.
+                        raise
+                    except Exception as exc:
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            break
+                        failure_streak += 1
+                        if epoch_attempt == 2:
+                            # Keep the public reason stable; exception text may
+                            # contain provider payload or other sensitive data.
+                            del exc
+                            last_failure = "repeated_failure"
+                        else:
+                            last_failure = "compaction_result_invalid"
+                if candidate_result is None:
+                    outcome(
+                        result=last_success,
+                        failure=last_failure or "repeated_failure",
+                        epoch=epoch_number,
+                        attempt=failure_streak,
+                    )
+                    break
+
+                if cancellation is not None and cancellation.cancelled:
+                    last_failure = "compaction_cancelled"
+                    outcome(
+                        result=last_success,
+                        failure=last_failure,
+                        epoch=epoch_number,
+                        attempt=epoch_attempt,
+                    )
+                    break
+
+                if candidate_result.timeline is None or not candidate_result.changed:
+                    last_failure = "no_progress"
+                    outcome(
+                        result=candidate_result,
+                        failure=last_failure,
+                        epoch=epoch_number,
+                        attempt=epoch_attempt,
+                    )
+                    break
+
+                committed_result = candidate_result
+                if commit is not None:
+                    committed = commit(candidate_result)
+                    if inspect.isawaitable(committed):
+                        committed = await committed
+                    if isinstance(committed, CompactionResult):
+                        committed_result = committed
+                        committed_ok = (
+                            committed.changed
+                            and committed.failure is None
+                            and committed.timeline is not None
+                        )
+                    elif isinstance(committed, bool):
+                        committed_ok = committed
+                    else:
+                        committed_ok = False
+                    if not committed_ok:
+                        last_failure = "timeline_commit_failed"
+                        outcome(
+                            result=committed_result,
+                            failure=last_failure,
+                            epoch=epoch_number,
+                        )
+                        break
+
+                next_timeline = committed_result.timeline or candidate_result.timeline
+                if next_timeline is None or next_timeline.sequence_end <= previous_sequence_end:
+                    last_failure = "no_progress"
+                    outcome(
+                        result=committed_result,
+                        failure=last_failure,
+                        epoch=epoch_number,
+                    )
+                    break
+
+                current_timeline = next_timeline
+                previous_sequence_end = current_timeline.sequence_end
+                committed_any = True
+                last_success = replace(
+                    committed_result,
+                    timeline=current_timeline,
+                    changed=True,
+                    failure=None,
+                )
+                outcome(
+                    result=last_success,
+                    failure=None,
+                    epoch=epoch_number,
+                    attempt=epoch_attempt,
+                )
+
+                if should_continue is None:
+                    break
+                decision = should_continue(current_timeline)
+                if inspect.isawaitable(decision):
+                    decision = await decision
+                if isinstance(decision, Mapping):
+                    continue_value = decision.get("continue", False)
+                elif isinstance(decision, bool):
+                    continue_value = decision
+                else:
+                    raise TypeError("should_continue must return bool or a mapping")
+                if not isinstance(continue_value, bool):
+                    raise TypeError("should_continue mapping must contain boolean 'continue'")
+                if not continue_value:
+                    break
+            else:
+                last_failure = "epoch_limit_reached"
+                outcome(
+                    result=last_success,
+                    failure=last_failure,
+                    epoch=max_epochs,
+                )
+        finally:
+            lock.release()
+
+        if last_success is not None:
+            # Preserve a bounded terminal reason even when earlier epochs
+            # committed successfully.  The durable Timeline remains the
+            # successful result, while callers can distinguish a complete
+            # catch-up from a partial one that stopped at no-safe-epoch,
+            # no-progress, cancellation, or the epoch breaker.
+            return replace(last_success, failure=last_failure)
+        return CompactionResult(
+            timeline=current_timeline,
+            summary=current_timeline.summary if current_timeline is not None else None,
+            changed=committed_any,
+            failure=last_failure or "no_safe_epoch",
+        )
 
     def public_diagnostics(self) -> dict[str, object]:
         """Return a bounded diagnostics projection without Context content."""

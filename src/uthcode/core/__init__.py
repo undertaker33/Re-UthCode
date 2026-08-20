@@ -31,10 +31,14 @@ from .context import (
     ContextBudget,
     ContextBudgetError,
     CompactionBatch,
+    CompactionEntry,
+    CompactionEpoch,
     CompactionError,
     CompactionInProgress,
     CompactionPolicy,
     CompactionResult,
+    CompactionStructuredResult,
+    CompactionValidationError,
     ContextCompilationError,
     ContextCompactor,
     ContextCompiler,
@@ -58,6 +62,7 @@ from .context import (
     safety_allowance_for,
     adaptive_working_headroom,
 )
+from .compaction import parse_compaction_result
 from .planning import (
     BehaviorMode,
     PlanState,
@@ -297,10 +302,14 @@ __all__ = [
     "ContextStability",
     "ContextUsage",
     "CompactionBatch",
+    "CompactionEntry",
+    "CompactionEpoch",
     "CompactionError",
     "CompactionInProgress",
     "CompactionPolicy",
     "CompactionResult",
+    "CompactionStructuredResult",
+    "CompactionValidationError",
     "CoreRuntimeContractSource",
     "CancellationToken",
     "ContextOverflowError",
@@ -484,4 +493,5 @@ __all__ = [
     "task_completion_hook",
     "validated_provider_stream",
     "context_block_id",
+    "parse_compaction_result",
 ]

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from asyncio import CancelledError
+import json
 import inspect
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -39,6 +40,7 @@ from uthcode.core.provider import (
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
+    TextPart,
     Usage,
     validated_provider_stream,
 )
@@ -59,8 +61,13 @@ from uthcode.core.context import (
     ContextCountEstimate,
     ContextRequestSafetyError,
     ContextUsage,
+    account_generation_request,
+    evaluate_gates,
+    preflight_safety_count,
+    pressure_estimate,
     resolve_context_budget,
 )
+from uthcode.core.compaction import CompactionEpoch
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
@@ -144,6 +151,119 @@ def _request_reduction_levels(request: GenerationRequest) -> tuple[str, ...]:
     if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
         return ()
     return tuple(value for value in raw if isinstance(value, str) and value)
+
+
+_COMPACTION_SYSTEM_PROMPT = (
+    "You are UthCode's bounded Context compactor. Return only a JSON object with "
+    "entries and coverage. Produce exactly one entry for every covered Turn, in "
+    "the supplied order. Each entry must contain turn_id and a short summary. "
+    "Do not add Turns, refs, or facts that are not present in the raw evidence."
+)
+
+
+def _compaction_input_payload(epoch: CompactionEpoch) -> str:
+    """Add an explicit output contract without exposing a second state model."""
+
+    coverage = [
+        {
+            "turn_id": unit.turn_id,
+            "refs": [ref.to_dict()],
+        }
+        for unit, ref in zip(epoch.units, epoch.refs, strict=True)
+    ]
+    return (
+        f"{epoch.input_text}\n\nRequired coverage (copy only these Turn IDs):\n"
+        + json.dumps(coverage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+
+async def _prepare_compaction_request_async(
+    provider: ProviderPort,
+    request: GenerationRequest,
+    budget: ContextBudget,
+    *,
+    cancellation: CancellationToken,
+) -> GenerationRequest:
+    """Hard-gate an independent tool-free L4 request before sending it."""
+
+    output_reserve = budget.compaction_output_reserve
+    if budget.provider_max_output is not None:
+        output_reserve = min(output_reserve, budget.provider_max_output)
+    if output_reserve <= 0:
+        raise ContextRequestSafetyError("compact output reserve is not provider-safe")
+    compact_budget = replace(
+        budget,
+        requested_output_reserve=output_reserve,
+        safety_allowance=0,
+    )
+    current = request
+    for _ in range(8):
+        cancellation.raise_if_cancelled()
+        resolution = await _count_input_tokens_async(provider, current)
+        count = resolution.value
+        fallback_reason = resolution.fallback_reason
+        counted = preflight_safety_count(
+            current,
+            compact_budget,
+            provider_count=count,
+        )
+        accounting = account_generation_request(current)
+        pressure = pressure_estimate(current, compact_budget)
+        gate = evaluate_gates(
+            compact_budget,
+            counted,
+            accounting=accounting,
+            pressure_count=pressure,
+        )
+        if not gate.hard_safe:
+            raise ContextRequestSafetyError(
+                "compact request failed the preflight Hard Gate: " + gate.reason
+            )
+        metadata = {
+            **dict(current.metadata),
+            "context_compaction_request": True,
+            "context_gate": gate.to_dict(),
+            "context_pressure": pressure.to_dict(),
+            "context_count_source": gate.count_source,
+            "context_count_fallback": fallback_reason,
+        }
+        annotated = replace(current, metadata=metadata)
+        if annotated == current:
+            return current
+        current = annotated
+    raise ContextRequestSafetyError(
+        "compact request count did not stabilize for the final request"
+    )
+
+
+async def _run_compaction_provider(
+    provider: ProviderPort,
+    request: GenerationRequest,
+    *,
+    cancellation: CancellationToken,
+) -> str:
+    """Run one validated tool-free Provider stream and return text only."""
+
+    terminal: GenerationCompleted | None = None
+    async for event in validated_provider_stream(
+        provider,
+        request,
+        cancellation=cancellation,
+    ):
+        if isinstance(event, GenerationCompleted):
+            terminal = event
+    if terminal is None:  # pragma: no cover - validated_provider_stream guards this
+        raise InvalidProviderResponseError("compact Provider response is incomplete")
+    if terminal.response.message.role != "assistant":
+        raise InvalidProviderResponseError("compact Provider response is not assistant text")
+    text = "\n".join(
+        part.text
+        for part in terminal.response.message.parts
+        if isinstance(part, TextPart)
+    ).strip()
+    if not text:
+        raise InvalidProviderResponseError("compact Provider response has no text")
+    return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,8 +398,20 @@ async def _prepare_counted_request_async(
         [GenerationRequest, ContextCountEstimate | int | None, bool, str | None],
         GenerationRequest,
     ],
+    *,
+    on_counted_request: Callable[
+        [GenerationRequest, ContextCountEstimate | int | None],
+        bool | Awaitable[bool],
+    ]
+    | None = None,
 ) -> GenerationRequest:
-    """Async counterpart of the exact final-request count/re-gate loop."""
+    """Async counterpart of the exact final-request count/re-gate loop.
+
+    ``on_counted_request`` is an Application-owned catch-up hook.  It runs
+    only after an exact Provider count has been attached to a rebuilt request;
+    returning ``True`` restarts the count loop from the current sources.  The
+    hook is deliberately outside Core and cannot bypass the final Hard Gate.
+    """
 
     counted_request = compose(None, True, None)
     resolution = await _count_input_tokens_async(provider, counted_request)
@@ -298,6 +430,19 @@ async def _prepare_counted_request_async(
                     return compose(None, False, resolution.fallback_reason)
                 provider_count = resolution.value
             rebuild_from_sources = False
+
+        if on_counted_request is not None:
+            retry = on_counted_request(counted_request, provider_count)
+            if inspect.isawaitable(retry):
+                retry = await retry
+            if not isinstance(retry, bool):
+                raise TypeError("on_counted_request must return a boolean")
+            if retry:
+                # The hook may have committed a fresh Timeline.  Rebuild from
+                # authoritative sources and obtain a new exact Provider count
+                # before the request is allowed to reach ``finalize``.
+                rebuild_from_sources = True
+                continue
 
         final_request = finalize(counted_request, provider_count, False, None)
         if final_request == counted_request:
@@ -1226,6 +1371,17 @@ class UthCodeApplication:
         limits_ready = False
         frozen_provider_limits: ModelLimits | None = None
         frozen_budget: ContextBudget | None = None
+        compaction_note: dict[str, object] = {
+            "attempted": False,
+            "status": "not_needed",
+            "epochs": 0,
+            "provider_attempts": 0,
+            "epoch_limit": 4,
+            "failure": None,
+            "auto_pressure_unresolved": False,
+            "previous_estimate": None,
+        }
+        compaction_orchestration_started = False
 
         async def prepare(
             messages: tuple[Message, ...],
@@ -1269,7 +1425,13 @@ class UthCodeApplication:
                     defer_hard_gate=defer_hard_gate,
                     count_fallback=count_fallback,
                 )
-                return request
+                return replace(
+                    request,
+                    metadata={
+                        **dict(request.metadata),
+                        "context_compaction": dict(compaction_note),
+                    },
+                )
 
             def finalize(
                 candidate: GenerationRequest,
@@ -1298,10 +1460,223 @@ class UthCodeApplication:
                     disable_reductions=True,
                     reduction_levels=_request_reduction_levels(candidate),
                 )
-                return request
+                return replace(
+                    request,
+                    metadata={
+                        **dict(request.metadata),
+                        "context_compaction": dict(compaction_note),
+                    },
+                )
+
+            def gate_from_request(request: GenerationRequest) -> Mapping[str, object] | None:
+                value = request.metadata.get("context_gate")
+                return value if isinstance(value, Mapping) else None
+
+            async def summarize_epoch(epoch: CompactionEpoch) -> str:
+                if frozen_budget is None:  # pragma: no cover - limits_ready guards this
+                    raise ContextBudgetError("compact request has no frozen ContextBudget")
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                output_reserve = frozen_budget.compaction_output_reserve
+                if frozen_budget.provider_max_output is not None:
+                    output_reserve = min(output_reserve, frozen_budget.provider_max_output)
+                compact_request = GenerationRequest(
+                    messages=(
+                        Message(
+                            "user",
+                            (TextPart(_compaction_input_payload(epoch)),),
+                        ),
+                    ),
+                    system_prompt=_COMPACTION_SYSTEM_PROMPT,
+                    model=remote_model_id,
+                    tools=(),
+                    reasoning=None,
+                    max_output_tokens=output_reserve,
+                    temperature=0.0,
+                    metadata={
+                        "context_compaction_request": True,
+                        "context_compaction_epoch_turns": list(epoch.turn_ids),
+                    },
+                )
+                prepared = await _prepare_compaction_request_async(
+                    provider,
+                    compact_request,
+                    frozen_budget,
+                    cancellation=cancellation,
+                )
+                return await _run_compaction_provider(
+                    provider,
+                    prepared,
+                    cancellation=cancellation,
+                )
+
+            async def commit_epoch(candidate: CompactionResult) -> CompactionResult:
+                active = (
+                    self._session_service.active_session
+                    if self._session_service is not None
+                    else None
+                )
+                if active is None:
+                    return replace(
+                        candidate,
+                        changed=False,
+                        failure="timeline_commit_failed",
+                    )
+                committed = self._commit_timeline_candidate(active, candidate)
+                if committed.changed:
+                    compaction_note["epochs"] = int(compaction_note["epochs"]) + 1
+                return committed
+
+            async def rebuild_after_epoch(timeline: object) -> Mapping[str, object]:
+                del timeline
+                rebuilt = compose(None, True, None)
+                gate = gate_from_request(rebuilt)
+                if gate is None:
+                    return {"continue": False, "reason": "gate_unavailable"}
+                auto_pressure = bool(gate.get("auto_pressure", False))
+                hard_safe = bool(gate.get("hard_safe", False))
+                effective = gate.get("effective_input_limit")
+                usage = gate.get("preflight_input_usage")
+                if isinstance(effective, int) and isinstance(usage, int):
+                    compaction_note["headroom"] = max(0, effective - usage)
+                return {
+                    "continue": auto_pressure or not hard_safe,
+                    "auto_pressure": auto_pressure,
+                    "hard_safe": hard_safe,
+                    "reason": gate.get("reason", "unknown"),
+                }
+
+            async def run_l4_if_needed(
+                trigger_gate: Mapping[str, object] | None,
+            ) -> bool:
+                """Run the single bounded L4 catch-up for this active Turn."""
+
+                nonlocal compaction_orchestration_started
+                if trigger_gate is None:
+                    return False
+                needs_compaction = bool(
+                    trigger_gate.get("auto_pressure", False)
+                    or not bool(trigger_gate.get("hard_safe", False))
+                )
+                if not needs_compaction or compaction_orchestration_started:
+                    return False
+                compaction_orchestration_started = True
+                compaction_note["attempted"] = True
+                previous_estimate = trigger_gate.get("preflight_input_usage")
+                if not isinstance(previous_estimate, int):
+                    previous_estimate = trigger_gate.get("input_tokens")
+                if isinstance(previous_estimate, int):
+                    compaction_note["previous_estimate"] = previous_estimate
+                active = (
+                    self._session_service.active_session
+                    if self._session_service is not None
+                    else None
+                )
+                if active is None:
+                    compaction_note.update(
+                        {
+                            "status": "unresolved",
+                            "failure": "no_active_session",
+                            "auto_pressure_unresolved": bool(
+                                trigger_gate.get("auto_pressure", False)
+                            ),
+                        }
+                    )
+                    return False
+
+                result = await self._context_service.compact_async(
+                    active.transcript,
+                    timeline=active.timeline,
+                    session_id=active.session_id,
+                    summarize=summarize_epoch,
+                    commit=commit_epoch,
+                    should_continue=rebuild_after_epoch,
+                    cancellation=cancellation,
+                    max_epochs=4,
+                    input_budget=frozen_budget.compaction_input_budget
+                    if frozen_budget is not None
+                    else None,
+                    output_reserve=(
+                        min(
+                            frozen_budget.compaction_output_reserve,
+                            frozen_budget.provider_max_output,
+                        )
+                        if frozen_budget is not None
+                        and frozen_budget.provider_max_output is not None
+                        else (
+                            frozen_budget.compaction_output_reserve
+                            if frozen_budget is not None
+                            else None
+                        )
+                    ),
+                    summary_hard_cap=(
+                        min(
+                            frozen_budget.compaction_output_reserve,
+                            frozen_budget.provider_max_output,
+                        )
+                        if frozen_budget is not None
+                        and frozen_budget.provider_max_output is not None
+                        else (
+                            frozen_budget.compaction_output_reserve
+                            if frozen_budget is not None
+                            else None
+                        )
+                    ),
+                )
+                final_gate = gate_from_request(compose(None, True, None))
+                final_auto = bool(
+                    final_gate is not None
+                    and final_gate.get("auto_pressure", False)
+                )
+                final_hard = bool(
+                    final_gate is not None
+                    and final_gate.get("hard_safe", False)
+                )
+                compaction_note.update(
+                    {
+                        "status": (
+                            "completed"
+                            if result.changed and result.failure is None
+                            else "unresolved"
+                        ),
+                        "failure": result.failure,
+                        "auto_pressure_unresolved": final_auto,
+                        "gate_after_compaction": (
+                            None if final_gate is None else dict(final_gate)
+                        ),
+                    }
+                )
+                if final_auto:
+                    compaction_note["failure"] = (
+                        result.failure or "auto_pressure_unresolved"
+                    )
+                if result.failure is not None and not final_hard:
+                    # Let the final counted ordinary request fail closed.  A
+                    # Hard-safe request remains sendable with the reason kept
+                    # in the bounded compaction note.
+                    compaction_note["status"] = "unresolved"
+                return result.changed
+
+            async def on_counted_request(
+                counted_request: GenerationRequest,
+                _provider_count: ContextCountEstimate | int | None,
+            ) -> bool:
+                """Catch exact-count Pressure/Hard failures before finalize."""
+
+                return await run_l4_if_needed(gate_from_request(counted_request))
 
             try:
-                return await _prepare_counted_request_async(provider, compose, finalize)
+                initial_request = compose(None, True, None)
+                await run_l4_if_needed(gate_from_request(initial_request))
+                if cancellation.cancelled:
+                    raise CancelledError()
+                return await _prepare_counted_request_async(
+                    provider,
+                    compose,
+                    finalize,
+                    on_counted_request=on_counted_request,
+                )
             except GenerationCancelled:
                 # AgentLoop treats asyncio cancellation as the cooperative
                 # cancellation channel around request preparation.  A
