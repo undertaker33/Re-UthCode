@@ -14,7 +14,7 @@ from eval.reporting import aggregate_experiment, compare_experiments
 from uthcode.application import ApplicationContextService, UthCodeApplication
 from uthcode.application.instructions import InstructionLoader
 from uthcode.application.provider_usage import public_usage_diagnostics
-from uthcode.core.history import CanonicalHistory, Projection
+from uthcode.core.history import Timeline, Transcript
 from uthcode.core.planning import BehaviorMode
 from uthcode.core.prompt import RuntimePromptContext
 from uthcode.core.prompt import (
@@ -381,18 +381,18 @@ def _instruction_loader(tmp_path: Path) -> tuple[InstructionLoader, Path, Path]:
 def test_epoch_prefix_projection_runtime_scope_and_resume_diagnostics(tmp_path: Path) -> None:
     loader, user_root, project_root = _instruction_loader(tmp_path)
     service = ApplicationContextService()
-    history = CanonicalHistory("resume-session")
-    projection = Projection("resume-session", 1, 1, 1, ())
+    transcript = Transcript("resume-session")
+    timeline = Timeline("resume-session")
 
     initial = service.compile(
         instruction_loader=loader,
-        history=history,
+        transcript=transcript,
         runtime_context=RuntimePromptContext(),
     )
     runtime_changed = service.compile(
         instruction_loader=loader,
-        history=history,
-        projection=projection,
+        transcript=transcript,
+        timeline=timeline,
         runtime_context=RuntimePromptContext(behavior_mode=BehaviorMode.PLAN),
     )
     assert runtime_changed.instruction_epoch == initial.instruction_epoch
@@ -406,8 +406,8 @@ def test_epoch_prefix_projection_runtime_scope_and_resume_diagnostics(tmp_path: 
     loader.load_for_path(target)
     scoped = service.compile(
         instruction_loader=loader,
-        history=history,
-        projection=projection,
+        transcript=transcript,
+        timeline=timeline,
     )
     assert scoped.instruction_epoch == initial.instruction_epoch + 1
     assert scoped.prefix_changed is True
@@ -425,8 +425,8 @@ def test_epoch_prefix_projection_runtime_scope_and_resume_diagnostics(tmp_path: 
     assert stable_result.change_reason == "stable"
     stable = service.compile(
         instruction_loader=stable_loader,
-        history=history,
-        projection=projection,
+        transcript=transcript,
+        timeline=timeline,
     )
     assert stable.instruction_epoch == scoped.instruction_epoch
     assert stable.stable_prefix_fingerprint == scoped.stable_prefix_fingerprint
@@ -443,8 +443,8 @@ def test_epoch_prefix_projection_runtime_scope_and_resume_diagnostics(tmp_path: 
     assert removed_result.change_reason == "instruction_source_removed"
     removed = service.compile(
         instruction_loader=removed_loader,
-        history=history,
-        projection=projection,
+        transcript=transcript,
+        timeline=timeline,
     )
     assert removed.instruction_epoch == scoped.instruction_epoch + 1
     assert removed.prefix_changed is True

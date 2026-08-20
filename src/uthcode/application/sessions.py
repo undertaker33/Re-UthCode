@@ -6,10 +6,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from uthcode.core.history import HistoryEntry, HistoryKind, Projection, RuntimeLogEntry
+from uthcode.core.history import ActiveCheckpoint, RuntimeLogEntry, SemanticEntry, EpochMacroSummary, TranscriptEntry, TranscriptKind
 from uthcode.integrations.session_files import (
-    HistoryAppendOutcome,
-    ProjectionAppendOutcome,
+    TimelineAppendOutcome,
+    TranscriptAppendOutcome,
     SessionFileStore,
     SessionFileError,
     SessionMetadata,
@@ -43,8 +43,8 @@ class SessionCatalogEntry:
     project_key: str
     last_used_at: str
     preview: str = ""
-    projection_revision: int | None = None
-    history_entries: int = 0
+    timeline_checkpoint_id: str | None = None
+    transcript_entries: int = 0
     corrupt: bool = False
 
 
@@ -92,12 +92,12 @@ class ApplicationSession:
         return self.snapshot.metadata
 
     @property
-    def history(self):
-        return self.snapshot.history
+    def transcript(self):
+        return self.snapshot.transcript
 
     @property
-    def projection(self):
-        return self.snapshot.projection
+    def timeline(self):
+        return self.snapshot.timeline
 
     @property
     def runtime_log(self):
@@ -126,16 +126,24 @@ class ApplicationSession:
         self._require_open()
         self._writer.quarantine_unknown_durability()
 
-    def append_history(
+    def append_transcript(
         self,
-        entries: HistoryEntry | Sequence[HistoryEntry],
-    ) -> HistoryAppendOutcome:
+        entries: TranscriptEntry | Sequence[TranscriptEntry],
+    ) -> TranscriptAppendOutcome:
         self._require_writable()
-        return self._writer.append_history(entries)
+        return self._writer.append_transcript(entries)
 
-    def append_projection(self, projection: Projection) -> ProjectionAppendOutcome:
+    def append_timeline_transaction(
+        self,
+        derived: Sequence[SemanticEntry | EpochMacroSummary],
+        checkpoint: ActiveCheckpoint,
+    ) -> TimelineAppendOutcome:
         self._require_writable()
-        return self._writer.append_projection(projection)
+        return self._writer.append_timeline_transaction(derived, checkpoint)
+
+    def append_timeline(self, timeline) -> TimelineAppendOutcome:
+        self._require_writable()
+        return self._writer.append_timeline(timeline)
 
     def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
         self._require_writable()
@@ -377,12 +385,12 @@ class ApplicationSessionService:
                     project_key=metadata.project_key,
                     last_used_at=metadata.last_used_at,
                     preview=_first_user_preview(snapshot),
-                    projection_revision=(
-                        snapshot.projection.revision
-                        if snapshot.projection is not None
+                    timeline_checkpoint_id=(
+                        snapshot.timeline.active_checkpoint.turn_id
+                        if snapshot.timeline.active_checkpoint is not None
                         else None
                     ),
-                    history_entries=len(snapshot.history.entries),
+                    transcript_entries=len(snapshot.transcript.entries),
                 )
             )
         return tuple(entries)
@@ -534,8 +542,8 @@ class ApplicationSessionService:
 __all__ = [
     "ApplicationSession",
     "ApplicationSessionService",
-    "HistoryAppendOutcome",
-    "ProjectionAppendOutcome",
+    "TimelineAppendOutcome",
+    "TranscriptAppendOutcome",
     "SessionCatalogEntry",
     "SessionActiveError",
     "SessionOperationError",
@@ -545,8 +553,8 @@ __all__ = [
 def _first_user_preview(snapshot: SessionSnapshot, *, limit: int = 160) -> str:
     """Extract only the first User Message and keep it to one display line."""
 
-    for entry in snapshot.history.entries:
-        if entry.kind is not HistoryKind.USER_MESSAGE:
+    for entry in snapshot.transcript.entries:
+        if entry.kind is not TranscriptKind.USER_MESSAGE:
             continue
         value = _preview_value(entry.payload)
         if value:
@@ -585,12 +593,13 @@ def _session_operation_error(
     from uthcode.integrations.session_files import (
         SessionBusyError,
         SessionCorruptError,
+        SessionIncompatibleError,
         SessionNotFoundError,
     )
 
     if isinstance(exc, SessionBusyError):
         return SessionOperationError("busy", session_id=session_id)
-    if isinstance(exc, SessionCorruptError):
+    if isinstance(exc, (SessionCorruptError, SessionIncompatibleError)):
         return SessionOperationError("corrupt", session_id=session_id)
     if isinstance(exc, SessionNotFoundError):
         return SessionOperationError("unknown", session_id=session_id)

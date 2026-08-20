@@ -25,7 +25,7 @@ from uthcode.core.context import (
     pressure_estimate,
     resolve_context_budget,
 )
-from uthcode.core.history import CanonicalHistory, Projection
+from uthcode.core.history import Timeline, Transcript
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -54,7 +54,7 @@ from uthcode.core.provider import (
 from uthcode.core.provider import CancellationToken
 
 from .instructions import InstructionLoader
-from .history import history_entries_for_message
+from .history import transcript_entries_for_message
 
 
 class ApplicationContextService:
@@ -91,8 +91,8 @@ class ApplicationContextService:
         self,
         *,
         instruction_loader: InstructionLoader | None = None,
-        history: CanonicalHistory | None = None,
-        projection: Projection | None = None,
+        transcript: Transcript | None = None,
+        timeline: Timeline | None = None,
         current_turn: Sequence[object] = (),
         current_user: str | Message | None = None,
         current_turn_deltas: Sequence[object] = (),
@@ -146,8 +146,8 @@ class ApplicationContextService:
         bundle = ContextSourceBundle(
             instruction_sources=(PromptAssetSource(), CoreRuntimeContractSource()),
             project_instruction_source=project_source,
-            history=history,
-            projection=projection,
+            transcript=transcript,
+            timeline=timeline,
             protected_context=tuple(protected_context),
             protocol_blocks=tuple(protocol_blocks),
             current_turn=normalized_current_turn,
@@ -182,21 +182,21 @@ class ApplicationContextService:
 
     def compact(
         self,
-        history: CanonicalHistory,
+        transcript: Transcript,
         *,
-        projection: Projection | None = None,
+        timeline: Timeline | None = None,
         session_id: str | None = None,
         summarize=None,
         cancellation: CancellationToken | None = None,
     ) -> CompactionResult:
-        """Return a safe Projection candidate without mutating History."""
+        """Return a safe Timeline candidate without mutating Transcript."""
 
         self._compact_count += 1
         attempt = self._compact_count
         try:
             result = self._compactor.compact(
-                history,
-                projection=projection,
+                transcript,
+                timeline=timeline,
                 session_id=session_id,
                 summarize=summarize,
                 cancellation=cancellation,
@@ -249,7 +249,7 @@ class ApplicationContextService:
                     {"block_id": block_id, "reason": reason}
                     for block_id, reason in snapshot.omitted_reasons
                 ],
-                "projection_revision": snapshot.projection_revision,
+                "timeline_checkpoint_id": snapshot.timeline_checkpoint_id,
                 "instruction_epoch": snapshot.instruction_epoch,
                 "stable_prefix_estimated_tokens": snapshot.stable_prefix_estimated_tokens,
                 "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
@@ -278,14 +278,14 @@ class ApplicationContextService:
             ),
             "count_fallback": self._last_count_fallback,
             "compaction": {
-                # A resumed Session may already carry a durable Projection
+                # A resumed Session may already carry a durable Timeline
                 # revision before this process performs a compaction.  Keep
                 # the public count compatible with that durable fact while
                 # still counting current-process attempts.
                 "count": max(
                     self._compact_count,
                     (
-                        snapshot.projection_revision or 0
+                        1 if snapshot is not None and snapshot.timeline_checkpoint is not None else 0
                         if snapshot is not None
                         else 0
                     ),
@@ -304,7 +304,7 @@ class ApplicationContextService:
         """Reconcile diagnostics with the final persistence outcome.
 
         ``compact()`` records the in-memory candidate before Application
-        persists its Projection.  A failed append must replace that provisional
+        persists its Timeline.  A failed append must replace that provisional
         completed event so public diagnostics describe the same result callers
         receive.
         """
@@ -336,10 +336,10 @@ class ApplicationContextService:
         *,
         run_id: str,
         session_id: str | None = None,
-        canonical_history: CanonicalHistory | None = None,
+        transcript: Transcript | None = None,
         instruction_loader: InstructionLoader | None = None,
         runtime_context: RuntimePromptContext | None = None,
-        projection: Projection | None = None,
+        timeline: Timeline | None = None,
         tool_definitions: Sequence[ToolDefinition] = (),
         environment_sources: Sequence[object] = (),
         model: str | None = None,
@@ -373,28 +373,25 @@ class ApplicationContextService:
             raise ValueError("run_id must be a non-empty string")
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise ValueError("session_id must be a non-empty string or None")
-        if canonical_history is not None and not isinstance(canonical_history, CanonicalHistory):
-            raise TypeError("canonical_history must be a CanonicalHistory or None")
+        if transcript is not None and not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript or None")
         history_session_id = (
             session_id
             if session_id is not None
             else (
-                projection.session_id
-                if projection is not None
+                timeline.session_id
+                if timeline is not None
                 else (
-                    canonical_history.session_id
-                    if canonical_history is not None
+                    transcript.session_id
+                    if transcript is not None
                     else f"run:{run_id}"
                 )
             )
         )
-        if projection is not None and history_session_id != projection.session_id:
-            raise ValueError("session_id must match the supplied Projection")
-        if (
-            canonical_history is not None
-            and history_session_id != canonical_history.session_id
-        ):
-            raise ValueError("session_id must match the supplied Canonical History")
+        if timeline is not None and history_session_id != timeline.session_id:
+            raise ValueError("session_id must match the supplied Timeline")
+        if transcript is not None and history_session_id != transcript.session_id:
+            raise ValueError("session_id must match the supplied Transcript")
         ordinary_tools = tuple(tool_definitions)
         if not all(isinstance(item, ToolDefinition) for item in ordinary_tools):
             raise TypeError("tool_definitions must contain ToolDefinition values")
@@ -435,12 +432,12 @@ class ApplicationContextService:
         if values and values[-1].role == "user":
             current_user = values[-1]
             history_messages = values[:-1]
-        process_history = _history_for_messages(history_session_id, history_messages)
-        history = _merge_canonical_history(canonical_history, process_history)
+        process_transcript = _transcript_for_messages(history_session_id, history_messages)
+        merged_transcript = _merge_transcript(transcript, process_transcript)
         snapshot = self.compile(
             instruction_loader=instruction_loader,
-            history=history,
-            projection=projection,
+            transcript=merged_transcript,
+            timeline=timeline,
             current_user=current_user,
             runtime_context=runtime_context,
             environment_sources=environment_sources,
@@ -459,7 +456,7 @@ class ApplicationContextService:
             "context_token_estimate": snapshot.token_estimate,
             "context_selected_block_ids": list(snapshot.selected_block_ids),
             "context_omitted_block_ids": list(snapshot.omitted_block_ids),
-            "projection_revision": snapshot.projection_revision,
+            "timeline_checkpoint_id": snapshot.timeline_checkpoint_id,
             "instruction_epoch": snapshot.instruction_epoch,
             "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
             "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
@@ -673,50 +670,49 @@ def _shrink_inactive_previews(
     return _ReductionResult(tuple(result), changed)
 
 
-def _history_for_messages(session_id: str, messages: Sequence[Message]) -> CanonicalHistory:
-    history = CanonicalHistory(session_id)
+def _transcript_for_messages(session_id: str, messages: Sequence[Message]) -> Transcript:
+    transcript = Transcript(session_id)
     sequence = 1
     for index, message in enumerate(messages):
         turn_id = f"runtime-{index + 1}"
-        entries = history_entries_for_message(session_id, turn_id, sequence, message)
+        entries = transcript_entries_for_message(session_id, turn_id, sequence, message)
         for entry in entries:
             # These entries are a deterministic, process-local projection of
             # the messages supplied to request preparation.  Wall-clock
             # timestamps here would make an otherwise identical rebuild
             # Provider-visible only through diagnostics/block IDs, defeating
             # exact count -> rebuild -> re-gate verification.
-            history = history.append(
+            transcript = transcript.append(
                 replace(entry, created_at=f"runtime:{entry.sequence:08d}")
             )
         sequence += len(entries)
-    return history
+    return transcript
 
 
-def _merge_canonical_history(
-    canonical_history: CanonicalHistory | None,
-    process_history: CanonicalHistory,
-) -> CanonicalHistory:
-    """Join durable History with this Run's ordered process-local delta.
+def _merge_transcript(
+    transcript: Transcript | None,
+    process_transcript: Transcript,
+) -> Transcript:
+    """Join durable Transcript with this Run's ordered process-local delta.
 
-    The compiler needs one Canonical History so Projection can filter its
-    covered range and leave the raw tail visible.  The two inputs are separate
-    ownership domains: durable History is the restored base, while
-    ``process_history`` contains only this process's Run/Turn delta.  Its
+    The two inputs are separate ownership domains: durable Transcript is the
+    restored base, while ``process_transcript`` contains only this process's
+    Run/Turn delta.  Its
     entries are always appended, including equal payloads, because message
     content cannot identify whether two same-text Turns are the same fact.
     """
 
-    if canonical_history is None:
-        return process_history
-    if canonical_history.session_id != process_history.session_id:
-        raise ValueError("Canonical History and process messages belong to different Sessions")
-    if not process_history.entries:
-        return canonical_history
-    if not canonical_history.entries:
-        return process_history
+    if transcript is None:
+        return process_transcript
+    if transcript.session_id != process_transcript.session_id:
+        raise ValueError("Transcript and process messages belong to different Sessions")
+    if not process_transcript.entries:
+        return transcript
+    if not transcript.entries:
+        return process_transcript
 
-    merged = canonical_history
-    for entry in process_history.entries:
+    merged = transcript
+    for entry in process_transcript.entries:
         merged = merged.append(
             replace(
                 entry,

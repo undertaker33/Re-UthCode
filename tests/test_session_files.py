@@ -1,536 +1,512 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import time
 from pathlib import Path
 
 import pytest
 
-from uthcode.core.history import CanonicalHistory, HistoryKind, RuntimeLogEntry
+from uthcode.core.history import ActiveCheckpoint, SemanticEntry, TranscriptEntry, TranscriptKind, RuntimeLogEntry, TranscriptRef
+from uthcode.integrations import session_files
 from uthcode.integrations.session_files import (
-    HistoryAppendOutcome,
-    ProjectionAppendOutcome,
     SessionBusyError,
     SessionCorruptError,
     SessionDurabilityUnknownError,
     SessionFileError,
     SessionFileStore,
-    SessionWriter,
+    SessionIncompatibleError,
+    SessionMetadata,
+    SessionNotFoundError,
 )
 
 
-def _entries() -> tuple:
-    history = CanonicalHistory("session-1")
-    history = history.append(
-        turn_id="turn-1",
-        kind=HistoryKind.USER_MESSAGE,
-        payload={"text": "inspect"},
+def _entries(session_id: str = "session-1") -> tuple[TranscriptEntry, ...]:
+    return (
+        TranscriptEntry(session_id, 1, "turn-1", TranscriptKind.USER_MESSAGE, {"text": "hello"}, semantic_unit_id="turn-1"),
+        TranscriptEntry(session_id, 2, "turn-2", TranscriptKind.TOOL_CALL, {"type": "tool_call", "tool_call_id": "call-1", "name": "read"}, semantic_unit_id="turn-2"),
+        TranscriptEntry(session_id, 3, "turn-2", TranscriptKind.TOOL_RESULT, {"type": "tool_result", "tool_call_id": "call-1", "content": "done"}, semantic_unit_id="turn-2"),
     )
-    history = history.append(
-        turn_id="turn-1",
-        kind=HistoryKind.TOOL_CALL,
-        payload={"tool_call_id": "call-1", "name": "ReadFile"},
-    )
-    history = history.append(
-        turn_id="turn-1",
-        kind=HistoryKind.TOOL_RESULT,
-        payload={"tool_call_id": "call-1", "content": "ok"},
-    )
-    return history.entries, history
 
 
-def _entry_after(entries: tuple, *, kind: HistoryKind, payload: dict) -> object:
-    history = CanonicalHistory("session-1", entries)
-    return history.append(turn_id="turn-2", kind=kind, payload=payload).entries[-1]
-
-
-def test_session_layout_durable_append_projection_and_runtime_boundary(tmp_path: Path) -> None:
+def test_session_v2_layout_and_transcript_timeline_runtime_are_separate(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    metadata = store.create_session(
-        "session-1",
-        project_key="project-1",
-        instruction_state={
-            "activated_directory_scopes": [str(tmp_path / "project" / "src")],
-            "instruction_epoch": 2,
-            "stable_prefix_fingerprint": "hash",
-            "source_fingerprints": [["id", "path", "directory", "content-hash"]],
-            "change_reason": "instruction_scope_added",
-        },
-    )
-    assert metadata.session_id == "session-1"
-    session_dir = tmp_path / "sessions" / "session-1"
-    assert {"metadata.json", "history.jsonl", "runtime.jsonl", "writer.lock", "tool-results"} <= {
-        item.name for item in session_dir.iterdir()
-    }
-
-    entries, history = _entries()
-    with store.open_writer("session-1", expected_project_key="project-1") as writer:
-        writer.append_history(entries)
-        writer.append_projection(history.project(revision=1))
-        writer.append_runtime(RuntimeLogEntry("stream_delta", {"text": "partial"}))
-
-    recovered = store.read_session("session-1", expected_project_key="project-1")
-    assert recovered.history.entries == entries
-    assert recovered.projection is not None
-    assert recovered.runtime_log.entries[0].kind == "stream_delta"
-    assert recovered.last_record_sequence == 4
-    assert "AGENTS" not in json.dumps(recovered.metadata.to_dict(), ensure_ascii=False)
-
-    (session_dir / "runtime.jsonl").unlink()
-    without_runtime = store.read_session("session-1", expected_project_key="project-1")
-    assert without_runtime.history == recovered.history
-    assert without_runtime.projection == recovered.projection
-    assert without_runtime.runtime_log.entries == ()
+    store.create_session("session-1", project_key="project")
+    path = store.session_path("session-1")
+    assert {item.name for item in path.iterdir()} >= {"metadata.json", "transcript.jsonl", "timeline.jsonl", "runtime.jsonl", "writer.lock", "tool-results"}
+    assert not (path / "history.jsonl").exists()
+    entries = _entries()
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        transcript_outcome = writer.append_transcript(entries)
+        assert transcript_outcome.transcript_appended is True
+        fine = SemanticEntry("turn-2", "tool work complete", (writer.snapshot.transcript.reference(2, 3),), session_id="session-1")
+        timeline_outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("turn-2", ("turn-2",), session_id="session-1"))
+        assert timeline_outcome.timeline_appended is True
+        writer.append_runtime(RuntimeLogEntry("session-1", 1, "turn_completed", {"ok": True}))
+    recovered = store.read_session("session-1", expected_project_key="project")
+    assert recovered.transcript.entries == entries
+    assert recovered.timeline.fine_entries[0].summary == "tool work complete"
+    assert recovered.timeline.active_checkpoint is not None
+    assert recovered.runtime_log.entries[0].event == "turn_completed"
 
 
-def test_append_history_reports_durable_when_post_append_touch_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_timeline_trailing_derived_record_is_not_logically_committed(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    touch_calls = 0
-    original_touch = SessionWriter.touch
-
-    def fail_first_touch(self: SessionWriter):
-        nonlocal touch_calls
-        touch_calls += 1
-        if touch_calls == 1:
-            raise OSError("injected post-append metadata touch failure")
-        return original_touch(self)
-
-    monkeypatch.setattr(SessionWriter, "touch", fail_first_touch)
+    store.create_session("session-1", project_key="project")
+    entries = _entries()
     with store.open_writer("session-1") as writer:
-        outcome = writer.append_history(entries[:1])
-        assert isinstance(outcome, HistoryAppendOutcome)
-        assert outcome.history_appended is True
-        assert outcome.durability == "durable"
-        assert outcome.reload_succeeded is True
-        assert outcome.metadata_synced is False
-        assert outcome.failure_stage == "history_metadata_sync"
-        assert outcome.snapshot.history.entries == entries[:1]
-        assert writer.snapshot.history.entries == entries[:1]
+        writer.append_transcript(entries)
+        fine = SemanticEntry("turn-1", "first", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        writer.append_timeline_transaction((fine,), ActiveCheckpoint("turn-1", ("turn-1",), session_id="session-1"))
+    trailing = SemanticEntry("turn-2", "crashed before checkpoint", (store.read_session("session-1").transcript.reference(2, 3),), session_id="session-1")
+    session_files._append_jsonl(path := store.session_path("session-1") / "timeline.jsonl", ({"schema_version": 2, "kind": "timeline", "sequence": 3, "record": trailing.to_dict()},))
+    recovered = store.read_session("session-1")
+    assert recovered.timeline.trailing_records == (trailing,)
+    assert recovered.timeline.committed_records[-1].record_type == "active_checkpoint"
+    before_committed = tuple(record.summary for record in recovered.timeline.committed_records if isinstance(record, SemanticEntry))
 
-    assert store.read_session("session-1").history.entries == entries[:1]
-
-
-def test_append_history_reconciles_post_append_reload_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    reload_calls = 0
-    original_reload = SessionWriter._reload
-
-    def fail_first_reload(self: SessionWriter, *, touch: bool):
-        nonlocal reload_calls
-        reload_calls += 1
-        if reload_calls == 1:
-            raise OSError("injected post-append reload failure")
-        return original_reload(self, touch=touch)
-
-    monkeypatch.setattr(SessionWriter, "_reload", fail_first_reload)
     with store.open_writer("session-1") as writer:
-        outcome = writer.append_history(entries[:1])
-        assert outcome.history_appended is True
-        assert outcome.durability == "durable"
-        assert outcome.reload_succeeded is False
-        assert outcome.metadata_synced is True
-        assert outcome.failure_stage == "history_reload"
-        assert writer.snapshot.history.entries == entries[:1]
+        fresh = SemanticEntry(
+            "turn-3",
+            "fresh",
+            (writer.snapshot.transcript.reference(1, 1),),
+            session_id="session-1",
+        )
+        outcome = writer.append_timeline_transaction(
+            (fresh,),
+            ActiveCheckpoint("turn-3", ("turn-3",), session_id="session-1"),
+        )
+        assert outcome.timeline_appended is True
 
-    assert store.read_session("session-1").history.entries == entries[:1]
+    after = store.read_session("session-1")
+    assert tuple(record.summary for record in after.timeline.committed_records if isinstance(record, SemanticEntry)) == (*before_committed, "fresh")
+    assert after.timeline.trailing_records == (trailing,)
+    with store.open_writer("session-1"):
+        reopened = store.read_session("session-1")
+    assert tuple(record.summary for record in reopened.timeline.committed_records if isinstance(record, SemanticEntry)) == (*before_committed, "fresh")
+    assert reopened.timeline.trailing_records == (trailing,)
 
 
-def test_append_history_reports_unknown_when_post_append_reconciliation_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_old_v1_session_is_explicitly_incompatible(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-
-    def fail_reload(self: SessionWriter, *, touch: bool):
-        raise OSError("injected reload failure")
-
-    def fail_load(*args: object, **kwargs: object):
-        raise OSError("injected reconciliation read failure")
-
-    monkeypatch.setattr(SessionWriter, "_reload", fail_reload)
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with store.open_writer("session-1") as writer:
-        monkeypatch.setattr(store, "_load_snapshot", fail_load)
-        outcome = writer.append_history(entries[:1])
-        assert outcome.history_appended is False
-        assert outcome.durability == "unknown"
-        assert outcome.failure_stage == "history_durability_unknown"
-        assert writer.durability_unknown is True
-        with pytest.raises(SessionFileError, match="durability is unknown"):
-            writer.append_history(entries[:1])
-        with pytest.raises(SessionFileError, match="durability is unknown"):
-            writer.append_projection(_history.project(revision=1))
-    assert history_path.read_bytes().splitlines()
+    store.create_session("old", project_key="project")
+    metadata_path = store.session_path("old") / "metadata.json"
+    metadata_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    with pytest.raises(SessionIncompatibleError, match="incompatible"):
+        store.read_session("old")
 
 
-def test_append_projection_reports_durable_when_post_append_touch_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unknown_durability_quarantines_writer_until_reopen(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, history = _entries()
+    store.create_session("session-1", project_key="project")
     with store.open_writer("session-1") as writer:
-        writer.append_history(entries)
-        touch_calls = 0
-        original_touch = SessionWriter.touch
-
-        def fail_first_projection_touch(self: SessionWriter):
-            nonlocal touch_calls
-            touch_calls += 1
-            if touch_calls == 1:
-                raise OSError("injected Projection metadata touch failure")
-            return original_touch(self)
-
-        monkeypatch.setattr(SessionWriter, "touch", fail_first_projection_touch)
-        outcome = writer.append_projection(history.project(revision=1))
-
-        assert isinstance(outcome, ProjectionAppendOutcome)
-        assert outcome.projection_appended is True
-        assert outcome.durability == "durable"
-        assert outcome.reload_succeeded is True
-        assert outcome.metadata_synced is False
-        assert outcome.failure_stage == "projection_metadata_sync"
-        assert outcome.snapshot.projection is not None
-        assert outcome.snapshot.projection.revision == 1
+        writer.quarantine_unknown_durability()
+        with pytest.raises(SessionDurabilityUnknownError):
+            writer.append_transcript(_entries()[:1])
+    with store.open_writer("session-1") as writer:
         assert writer.durability_unknown is False
-
-    recovered = store.read_session("session-1")
-    assert recovered.projection is not None
-    assert recovered.projection.revision == 1
+        assert writer.append_transcript(_entries()[:1]).transcript_appended is True
 
 
-def test_append_projection_reconciles_post_append_reload_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_non_tool_open_continuation_is_rejected_before_any_write(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, history = _entries()
+    store.create_session("session-1", project_key="project")
+    open_message = TranscriptEntry(
+        "session-1",
+        1,
+        "turn-open",
+        TranscriptKind.USER_MESSAGE,
+        {"text": "partial"},
+        commit_boundary=False,
+        semantic_unit_id="turn-open",
+    )
+    path = store.session_path("session-1") / "transcript.jsonl"
     with store.open_writer("session-1") as writer:
-        writer.append_history(entries)
-        reload_calls = 0
-        original_reload = SessionWriter._reload
+        before = writer.snapshot
+        with pytest.raises(SessionFileError, match="incomplete"):
+            writer.append_transcript(open_message)
+        assert writer.snapshot.transcript == before.transcript
+        assert path.read_bytes() == b""
+    assert store.read_session("session-1").transcript.entries == ()
 
-        def fail_first_projection_reload(self: SessionWriter, *, touch: bool):
-            nonlocal reload_calls
-            reload_calls += 1
-            if reload_calls == 1:
-                raise OSError("injected Projection reload failure")
-            return original_reload(self, touch=touch)
 
-        monkeypatch.setattr(SessionWriter, "_reload", fail_first_projection_reload)
-        outcome = writer.append_projection(history.project(revision=1))
+def test_non_tool_open_continuation_cannot_hide_in_a_matching_tool_pair(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    entries = (
+        TranscriptEntry("session-1", 1, "turn-mixed", TranscriptKind.ASSISTANT_MESSAGE, {"text": "partial"}, commit_boundary=False, semantic_unit_id="turn-mixed"),
+        TranscriptEntry("session-1", 2, "turn-mixed", TranscriptKind.TOOL_CALL, {"type": "tool_call", "tool_call_id": "call-1", "name": "read"}, semantic_unit_id="turn-mixed"),
+        TranscriptEntry("session-1", 3, "turn-mixed", TranscriptKind.TOOL_RESULT, {"type": "tool_result", "tool_call_id": "call-1", "content": "done"}, semantic_unit_id="turn-mixed"),
+    )
+    path = store.session_path("session-1") / "transcript.jsonl"
+    with store.open_writer("session-1") as writer:
+        before = writer.snapshot
+        with pytest.raises(SessionFileError, match="incomplete"):
+            writer.append_transcript(entries)
+        assert writer.snapshot.transcript == before.transcript
+        assert path.read_bytes() == b""
+    assert store.read_session("session-1").transcript.entries == ()
 
-        assert outcome.projection_appended is True
+
+def test_closed_normal_message_is_persisted(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    message = _entries()[:1]
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_transcript(message)
+        assert outcome.transcript_appended is True
+        assert outcome.durability == "durable"
+    assert store.read_session("session-1").transcript.entries == message
+
+
+def test_unmatched_tool_call_can_close_after_writer_reopen_and_mismatch_is_not_written(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    call = TranscriptEntry("session-1", 1, "turn-2", TranscriptKind.TOOL_CALL, {"type": "tool_call", "tool_call_id": "call-1", "name": "read"}, semantic_unit_id="turn-2")
+    result = TranscriptEntry("session-1", 2, "turn-2", TranscriptKind.TOOL_RESULT, {"type": "tool_result", "tool_call_id": "call-1", "content": "done"}, semantic_unit_id="turn-2")
+    with store.open_writer("session-1") as writer:
+        assert writer.append_transcript(call).transcript_appended is True
+    with store.open_writer("session-1") as writer:
+        assert writer.snapshot.transcript.entries == (call,)
+        with pytest.raises(Exception, match="matching ToolResult"):
+            writer.append_transcript(_entries()[:1])
+        assert writer.append_transcript(result).transcript_appended is True
+    recovered = store.read_session("session-1")
+    assert recovered.transcript.last_sequence == 2
+    assert recovered.transcript.semantic_units(complete_only=True)[0].complete is True
+
+
+def test_transcript_append_reconciles_when_append_reports_failure_after_data_is_durable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    original_append = session_files._append_jsonl
+
+    def append_then_fail(path: Path, values: object) -> None:
+        original_append(path, values)  # type: ignore[arg-type]
+        raise OSError("post-fsync failure")
+
+    monkeypatch.setattr(session_files, "_append_jsonl", append_then_fail)
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_transcript(_entries()[:1])
+        assert outcome.transcript_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is True
+        assert outcome.metadata_synced is True
+        assert outcome.failure_stage == "transcript_append_reconciled"
+    assert store.read_session("session-1").transcript.last_sequence == 1
+
+
+def test_timeline_append_reconciles_when_append_reports_failure_after_data_is_durable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    original_append = session_files._append_jsonl
+
+    def append_then_fail(path: Path, values: object) -> None:
+        original_append(path, values)  # type: ignore[arg-type]
+        raise OSError("post-fsync failure")
+
+    with store.open_writer("session-1") as writer:
+        writer.append_transcript(_entries()[:1])
+        monkeypatch.setattr(session_files, "_append_jsonl", append_then_fail)
+        fine = SemanticEntry("timeline-turn", "durable", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("timeline-turn", ("timeline-turn",), session_id="session-1"))
+        assert outcome.timeline_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is True
+        assert outcome.metadata_synced is True
+        assert outcome.failure_stage == "timeline_append_reconciled"
+    assert store.read_session("session-1").timeline.summary == "durable"
+
+
+def test_transcript_metadata_sync_failure_still_reports_durable_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    writer = store.open_writer("session-1")
+    writer.__enter__()
+    original_touch = writer.touch
+
+    def fail_touch() -> object:
+        raise OSError("metadata sync failed")
+
+    monkeypatch.setattr(writer, "touch", fail_touch)
+    try:
+        outcome = writer.append_transcript(_entries()[:1])
+        assert outcome.transcript_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.metadata_synced is False
+        assert outcome.reload_succeeded is True
+        assert outcome.failure_stage == "transcript_metadata_sync"
+    finally:
+        monkeypatch.setattr(writer, "touch", original_touch)
+        writer.close()
+    assert store.read_session("session-1").transcript.last_sequence == 1
+
+
+def test_timeline_metadata_sync_failure_still_reports_durable_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    writer = store.open_writer("session-1")
+    writer.__enter__()
+    writer.append_transcript(_entries()[:1])
+    original_touch = writer.touch
+
+    def fail_touch() -> object:
+        raise OSError("metadata sync failed")
+
+    monkeypatch.setattr(writer, "touch", fail_touch)
+    try:
+        fine = SemanticEntry("timeline-turn", "durable", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("timeline-turn", ("timeline-turn",), session_id="session-1"))
+        assert outcome.timeline_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.metadata_synced is False
+        assert outcome.reload_succeeded is True
+        assert outcome.failure_stage == "timeline_metadata_sync"
+    finally:
+        monkeypatch.setattr(writer, "touch", original_touch)
+        writer.close()
+    assert store.read_session("session-1").timeline.summary == "durable"
+
+
+def test_transcript_reload_failure_reconciles_from_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1") as writer:
+        original_reload = writer._reload
+        calls = 0
+
+        def fail_once(*, touch: bool) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("reload failed")
+            original_reload(touch=touch)
+
+        monkeypatch.setattr(writer, "_reload", fail_once)
+        outcome = writer.append_transcript(_entries()[:1])
+        assert outcome.transcript_appended is True
         assert outcome.durability == "durable"
         assert outcome.reload_succeeded is False
         assert outcome.metadata_synced is True
-        assert outcome.failure_stage == "projection_reload"
-        assert writer.snapshot.projection is not None
-        assert writer.snapshot.last_record_sequence == 4
-
-    recovered = store.read_session("session-1")
-    assert recovered.projection is not None
-    assert recovered.projection.revision == 1
-    assert recovered.last_record_sequence == 4
+        assert outcome.failure_stage == "transcript_reload"
+    assert store.read_session("session-1").transcript.last_sequence == 1
 
 
-def test_append_projection_unknown_durability_quarantines_all_writes_until_reopen(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_timeline_reload_failure_reconciles_from_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, history = _entries()
+    store.create_session("session-1", project_key="project")
     with store.open_writer("session-1") as writer:
-        writer.append_history(entries)
+        writer.append_transcript(_entries()[:1])
+        original_reload = writer._reload
+        calls = 0
 
-        def fail_reload(self: SessionWriter, *, touch: bool):
-            raise OSError("injected Projection reload failure")
+        def fail_once(*, touch: bool) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("reload failed")
+            original_reload(touch=touch)
 
-        def fail_load(*args: object, **kwargs: object):
-            raise OSError("injected Projection reconciliation read failure")
+        monkeypatch.setattr(writer, "_reload", fail_once)
+        fine = SemanticEntry("timeline-turn", "reloaded", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("timeline-turn", ("timeline-turn",), session_id="session-1"))
+        assert outcome.timeline_appended is True
+        assert outcome.durability == "durable"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is True
+        assert outcome.failure_stage == "timeline_reload"
+    assert store.read_session("session-1").timeline.summary == "reloaded"
 
-        monkeypatch.setattr(SessionWriter, "_reload", fail_reload)
-        monkeypatch.setattr(store, "_load_snapshot", fail_load)
-        outcome = writer.append_projection(history.project(revision=1))
 
-        assert outcome.projection_appended is False
+def test_transcript_not_durable_outcome_is_distinguished_from_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+
+    def fail_without_write(path: Path, values: object) -> None:
+        raise OSError("append did not reach disk")
+
+    monkeypatch.setattr(session_files, "_append_jsonl", fail_without_write)
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_transcript(_entries()[:1])
+        assert outcome.transcript_appended is False
+        assert outcome.durability == "not_durable"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "transcript_append"
+        assert writer.durability_unknown is False
+        assert writer.snapshot.transcript.entries == ()
+
+
+def test_timeline_not_durable_outcome_is_distinguished_from_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+
+    def fail_without_write(path: Path, values: object) -> None:
+        raise OSError("append did not reach disk")
+
+    with store.open_writer("session-1") as writer:
+        writer.append_transcript(_entries()[:1])
+        monkeypatch.setattr(session_files, "_append_jsonl", fail_without_write)
+        fine = SemanticEntry("timeline-turn", "not durable", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("timeline-turn", ("timeline-turn",), session_id="session-1"))
+        assert outcome.timeline_appended is False
+        assert outcome.durability == "not_durable"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "timeline_append"
+        assert writer.durability_unknown is False
+        assert writer.snapshot.timeline.records == ()
+
+
+def test_transcript_unknown_durability_is_reached_from_an_ambiguous_real_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    original_append = session_files._append_jsonl
+
+    def append_extra_then_fail(path: Path, values: object) -> None:
+        batch = tuple(values)  # type: ignore[arg-type]
+        original_append(path, batch)
+        extra = dict(batch[-1])
+        extra_entry = dict(extra["entry"])
+        extra["sequence"] = int(extra["sequence"]) + 1
+        extra_entry["sequence"] = int(extra_entry["sequence"]) + 1
+        extra_entry["turn_id"] = "ambiguous"
+        extra_entry["semantic_unit_id"] = "ambiguous"
+        extra["entry"] = extra_entry
+        original_append(path, (extra,))
+        raise OSError("append outcome is ambiguous")
+
+    monkeypatch.setattr(session_files, "_append_jsonl", append_extra_then_fail)
+    with store.open_writer("session-1") as writer:
+        outcome = writer.append_transcript(_entries()[:1])
+        assert outcome.transcript_appended is False
         assert outcome.durability == "unknown"
-        assert outcome.failure_stage == "projection_durability_unknown"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "transcript_durability_unknown"
         assert writer.durability_unknown is True
-        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
-            writer.append_history(entries[:1])
-        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
-            writer.append_projection(history.project(revision=1))
-        with pytest.raises(SessionDurabilityUnknownError, match="durability is unknown"):
-            writer.append_runtime(RuntimeLogEntry("projection-unknown"))
+        with pytest.raises(SessionDurabilityUnknownError):
+            writer.append_transcript(
+                TranscriptEntry("session-1", 2, "later", TranscriptKind.USER_MESSAGE, {"text": "later"}, semantic_unit_id="later")
+            )
+    monkeypatch.setattr(session_files, "_append_jsonl", original_append)
 
-    # The record is recoverable after the process-held quarantined writer is
-    # closed, and a fresh writer can continue with the next Projection
-    # revision without duplicating the durable record.
-    monkeypatch.undo()
     with store.open_writer("session-1") as writer:
-        assert writer.snapshot.projection is not None
-        assert writer.snapshot.projection.revision == 1
-        next_projection = history.project(revision=2)
-        outcome = writer.append_projection(next_projection)
-        assert outcome.projection_appended is True
-        assert outcome.snapshot.projection is not None
-        assert outcome.snapshot.projection.revision == 2
-    recovered = store.read_session("session-1")
-    assert recovered.projection is not None
-    assert recovered.projection.revision == 2
-    assert recovered.last_record_sequence == 5
+        assert writer.durability_unknown is False
+        assert writer.snapshot.transcript.last_sequence == 2
+        next_entry = TranscriptEntry("session-1", 3, "later", TranscriptKind.USER_MESSAGE, {"text": "later"}, semantic_unit_id="later")
+        assert writer.append_transcript(next_entry).transcript_appended is True
+    assert store.read_session("session-1").transcript.last_sequence == 3
 
 
-def test_tail_recovery_repairs_before_next_append_and_middle_damage_fails_closed(tmp_path: Path) -> None:
+def test_timeline_unknown_durability_is_reconciled_after_close_and_reopen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:1])
+    store.create_session("session-1", project_key="project")
+    original_append = session_files._append_jsonl
 
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with history_path.open("ab") as handle:
-        handle.write(b'{"schema_version":1,"kind":"interaction"')
+    def append_extra_then_fail(path: Path, values: object) -> None:
+        batch = tuple(values)  # type: ignore[arg-type]
+        original_append(path, batch)
+        extra_record = dict(batch[0]["record"])
+        extra_record["turn_id"] = "ambiguous"
+        extra_record["summary"] = "ambiguous"
+        extra_record["transaction_id"] = "ambiguous-tx"
+        extra = {
+            "schema_version": 2,
+            "kind": "timeline",
+            "sequence": int(batch[-1]["sequence"]) + 1,
+            "record": extra_record,
+        }
+        original_append(path, (extra,))
+        raise OSError("append outcome is ambiguous")
+
+    with store.open_writer("session-1") as writer:
+        writer.append_transcript(_entries()[:1])
+        monkeypatch.setattr(session_files, "_append_jsonl", append_extra_then_fail)
+        fine = SemanticEntry("timeline-turn", "expected", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("timeline-turn", ("timeline-turn",), session_id="session-1"))
+        assert outcome.timeline_appended is False
+        assert outcome.durability == "unknown"
+        assert outcome.reload_succeeded is False
+        assert outcome.metadata_synced is False
+        assert outcome.failure_stage == "timeline_durability_unknown"
+        assert writer.durability_unknown is True
+        with pytest.raises(SessionDurabilityUnknownError):
+            writer.append_timeline_transaction(
+                (SemanticEntry("later", "blocked", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1"),),
+                ActiveCheckpoint("later", ("later",), session_id="session-1"),
+            )
+    monkeypatch.setattr(session_files, "_append_jsonl", original_append)
+
+    with store.open_writer("session-1") as writer:
+        assert writer.durability_unknown is False
+        assert writer.snapshot.timeline.trailing_records
+        fresh = SemanticEntry("later", "fresh", (writer.snapshot.transcript.reference(1, 1),), session_id="session-1")
+        outcome = writer.append_timeline_transaction((fresh,), ActiveCheckpoint("later", ("later",), session_id="session-1"))
+        assert outcome.timeline_appended is True
     recovered = store.read_session("session-1")
-    assert recovered.history.last_sequence == 1
-    assert "ignored_incomplete_tail" in recovered.recovery_diagnostics
+    assert "fresh" in tuple(record.summary for record in recovered.timeline.committed_records if isinstance(record, SemanticEntry))
+    assert "ambiguous" in tuple(record.summary for record in recovered.timeline.trailing_records if isinstance(record, SemanticEntry))
 
+
+def test_incomplete_byte_tail_is_recovered_and_repaired_by_writer_open(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
     with store.open_writer("session-1") as writer:
-        writer.append_history(entries[1:])
-    assert store.read_session("session-1").history.last_sequence == 3
+        writer.append_transcript(_entries()[:1])
+    path = store.session_path("session-1") / "transcript.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b'{"schema_version":2')
+    recovered = store.read_session("session-1")
+    assert "ignored_incomplete_tail" in recovered.recovery_diagnostics
+    with store.open_writer("session-1"):
+        pass
+    repaired = store.read_session("session-1")
+    assert repaired.transcript.last_sequence == 1
+    assert "ignored_incomplete_tail" not in repaired.recovery_diagnostics
 
-    lines = history_path.read_bytes().splitlines(keepends=True)
-    lines[1] = b"not-json\n"
-    history_path.write_bytes(b"".join(lines))
+
+def test_middle_corruption_fails_closed(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1") as writer:
+        writer.append_transcript(_entries()[:1])
+    path = store.session_path("session-1") / "transcript.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b"not-json\n")
     with pytest.raises(SessionCorruptError, match="corrupt middle record"):
         store.read_session("session-1")
 
 
-def test_incomplete_semantic_unit_in_middle_fails_closed_without_truncation(tmp_path: Path) -> None:
+def test_single_writer_identity_sequence_and_project_checks_fail_closed(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-
-    later_user = _entry_after(
-        entries[:2],
-        kind=HistoryKind.USER_MESSAGE,
-        payload={"text": "later user"},
-    )
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with history_path.open("ab") as handle:
-        handle.write(
-            (
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "kind": "interaction",
-                        "sequence": 3,
-                        "entry": later_user.to_dict(),
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
-        )
-    before = history_path.read_bytes()
-
-    with pytest.raises(SessionCorruptError, match="incomplete semantic unit in the middle"):
-        store.read_session("session-1")
-    writer = store.open_writer("session-1")
+    store.create_session("session-1", project_key="project")
+    first = store.open_writer("session-1", expected_project_key="project")
+    first.__enter__()
     try:
-        with pytest.raises(SessionCorruptError, match="incomplete semantic unit in the middle"):
-            writer.__enter__()
-    finally:
-        writer.close()
-    assert history_path.read_bytes() == before
-
-
-def test_incomplete_semantic_tail_is_diagnosed_and_writer_repairs_only_the_tail(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    recovered = store.read_session("session-1")
-    assert recovered.history.last_sequence == 1
-    assert "ignored_incomplete_semantic_tail" in recovered.recovery_diagnostics
-
-    with store.open_writer("session-1"):
-        pass
-    assert len(history_path.read_bytes().splitlines()) == 1
-    assert store.read_session("session-1").history.last_sequence == 1
-
-
-def test_append_rejects_unrelated_entry_after_pending_tool_call_without_writing(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    later_user = _entry_after(
-        entries[:2],
-        kind=HistoryKind.USER_MESSAGE,
-        payload={"text": "unrelated"},
-    )
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-        before = history_path.read_bytes()
-        with pytest.raises(SessionFileError, match="matching ToolResult"):
-            writer.append_history(later_user)
-        assert history_path.read_bytes() == before
-
-
-def test_append_rejects_mismatched_tool_result_without_writing_then_accepts_matching_result(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    mismatched = _entry_after(
-        entries[:2],
-        kind=HistoryKind.TOOL_RESULT,
-        payload={"tool_call_id": "call-2", "content": "wrong"},
-    )
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-        before = history_path.read_bytes()
-        with pytest.raises(SessionFileError, match="does not match"):
-            writer.append_history(mismatched)
-        assert history_path.read_bytes() == before
-        writer.append_history(entries[2])
-        assert writer.snapshot.history.last_sequence == 3
-
-
-def test_projection_after_incomplete_unit_fails_closed_without_truncation(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-
-    projection = CanonicalHistory("session-1", entries[:1]).project(revision=1)
-    history_path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    with history_path.open("ab") as handle:
-        handle.write(
-            (
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "kind": "projection",
-                        "sequence": 3,
-                        "projection": projection.to_dict(),
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
-        )
-    before = history_path.read_bytes()
-
-    with pytest.raises(SessionCorruptError, match="Projection follows"):
-        store.read_session("session-1")
-    assert history_path.read_bytes() == before
-
-
-def test_writer_can_append_a_tool_pair_across_one_process_boundary(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    entries, _history = _entries()
-    with store.open_writer("session-1") as writer:
-        writer.append_history(entries[:2])
-        assert writer.snapshot.history.last_sequence == 2
-        assert not any(unit.contains_tool_pair for unit in writer.snapshot.history.complete_semantic_units())
-        writer.append_history(entries[2])
-    recovered = store.read_session("session-1")
-    assert recovered.history.last_sequence == 3
-    assert recovered.history.complete_semantic_units()
-
-
-def test_unknown_record_kind_and_busy_writer_fail_closed(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    writer = store.open_writer("session-1")
-    writer.__enter__()
-    try:
-        competing = store.open_writer("session-1")
-        with pytest.raises(SessionBusyError, match="session busy"):
-            competing.__enter__()
-        competing.close()
-    finally:
-        writer.close()
-
-    entries, _history = _entries()
-    with store.open_writer("session-1") as handle:
-        handle.append_history(entries[:1])
-    path = tmp_path / "sessions" / "session-1" / "history.jsonl"
-    value = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
-    value["kind"] = "future_kind"
-    path.write_text(json.dumps(value) + "\n", encoding="utf-8")
-    with pytest.raises(SessionCorruptError, match="unknown Session record kind"):
-        store.read_session("session-1")
-
-
-def test_second_process_cannot_resume_same_session(tmp_path: Path) -> None:
-    store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("session-1", project_key="project-1")
-    script = (
-        "import sys,time; "
-        "from uthcode.integrations.session_files import SessionFileStore; "
-        "s=SessionFileStore(sys.argv[1]); "
-        "w=s.open_writer('session-1', expected_project_key='project-1'); "
-        "w.__enter__(); print('ready', flush=True); time.sleep(2); w.close()"
-    )
-    child = subprocess.Popen(
-        [sys.executable, "-c", script, str(tmp_path / "sessions")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert child.stdout is not None
-        deadline = time.time() + 10
-        line = ""
-        while time.time() < deadline and line.strip() != "ready":
-            line = child.stdout.readline()
-        assert line.strip() == "ready"
+        second = store.open_writer("session-1", expected_project_key="project")
         with pytest.raises(SessionBusyError):
-            with store.open_writer("session-1", expected_project_key="project-1"):
-                pass
+            second.__enter__()
     finally:
-        child.wait(timeout=10)
-    assert child.returncode == 0, (child.stderr.read() if child.stderr is not None else "")
+        first.close()
+    with pytest.raises(SessionNotFoundError):
+        with store.open_writer("session-1", expected_project_key="other"):
+            pass
+    with store.open_writer("session-1") as writer:
+        wrong_session = TranscriptEntry("other", 1, "wrong", TranscriptKind.USER_MESSAGE, {"text": "wrong"}, semantic_unit_id="wrong")
+        with pytest.raises(SessionFileError):
+            writer.append_transcript(wrong_session)
+        wrong_sequence = TranscriptEntry("session-1", 2, "wrong", TranscriptKind.USER_MESSAGE, {"text": "wrong"}, semantic_unit_id="wrong")
+        with pytest.raises(SessionFileError):
+            writer.append_transcript(wrong_sequence)
+        assert writer.snapshot.transcript.entries == ()
 
 
-def test_catalog_filters_project_and_uses_durable_last_used_not_mtime(tmp_path: Path) -> None:
+def test_timeline_ref_ownership_is_enforced(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    store.create_session("old", project_key="project-1")
-    time.sleep(0.01)
-    store.create_session("new", project_key="project-1")
-    store.create_session("other", project_key="project-2")
-    metadata_path = tmp_path / "sessions" / "old" / "metadata.json"
-    os.utime(metadata_path, (time.time() + 1000, time.time() + 1000))
-
-    values = store.list_metadata(project_key="project-1")
-    assert [item.session_id for item in values] == ["new", "old"]
-    assert all(item.project_key == "project-1" for item in values)
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1") as writer:
+        writer.append_transcript(_entries()[:1])
+        foreign_ref = TranscriptRef("other-session", 1, 1)
+        fine = SemanticEntry("turn-1", "foreign", (foreign_ref,), session_id="session-1")
+        with pytest.raises(SessionFileError, match="another Session"):
+            writer.append_timeline_transaction((fine,), ActiveCheckpoint("turn-1", ("turn-1",), session_id="session-1"))
+        assert writer.snapshot.timeline.records == ()

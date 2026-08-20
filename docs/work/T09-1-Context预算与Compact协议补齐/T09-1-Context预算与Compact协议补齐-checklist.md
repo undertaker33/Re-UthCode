@@ -14,13 +14,13 @@
 
 ## T02：Transcript、Timeline 与 Session v2 一次性硬切
 
-- [ ] 执行 `python -m pytest tests/test_history_contract.py tests/test_timeline_contract.py tests/test_context_compiler.py tests/test_context_compaction.py tests/test_session_files.py tests/test_application_runtime.py tests/test_application_runs.py tests/test_w04_session_commands.py -q`，全部通过。
-- [ ] fresh Session 只创建 `transcript.jsonl`、`timeline.jsonl`、`runtime.jsonl`、`metadata.json`、`writer.lock`、`tool-results/`。
-- [ ] Transcript strict sequence、Session ownership、closed fact 与完整 ToolCall/ToolResult group 校验通过。
-- [ ] Timeline 只接受 Fine、Macro、Active checkpoint；模拟 checkpoint 前崩溃时 trailing transaction 不生效。
-- [ ] Context compiler、Application generation/history/session、Integration store 与生产测试在同一任务迁移到新 authority。
-- [ ] old v1 `history.jsonl` 明确 incompatible；无 migration、dual read/write、`CanonicalHistory`、`Projection` 或兼容 alias。
-- [ ] append/reload/半失败、identity reconciliation、unknown durability quarantine、close/reopen 回归通过。
+- [x] 执行 `python -m pytest tests/test_history_contract.py tests/test_timeline_contract.py tests/test_context_compiler.py tests/test_context_compaction.py tests/test_session_files.py tests/test_application_runtime.py tests/test_application_runs.py tests/test_w04_session_commands.py -q`，全部通过。
+- [x] fresh Session 只创建 `transcript.jsonl`、`timeline.jsonl`、`runtime.jsonl`、`metadata.json`、`writer.lock`、`tool-results/`。
+- [x] Transcript strict sequence、Session ownership、closed fact 与完整 ToolCall/ToolResult group 校验通过。
+- [x] Timeline 只接受 Fine、Macro、Active checkpoint；模拟 checkpoint 前崩溃时 trailing transaction 不生效。
+- [x] Context compiler、Application generation/history/session、Integration store 与生产测试在同一任务迁移到新 authority。
+- [x] old v1 `history.jsonl` 明确 incompatible；无 migration、dual read/write、`CanonicalHistory`、`Projection` 或兼容 alias。
+- [x] append/reload/半失败、identity reconciliation、unknown durability quarantine、close/reopen 回归通过。
 
 ## T03：生产 L4 与 bounded catch-up
 

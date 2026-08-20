@@ -91,10 +91,10 @@ def test_public_instruction_prefix_has_typed_authority_and_stable_order() -> Non
 
     summary = ContextBlock(
         source_kind=ContextSourceKind.SUMMARY,
-        authority=ContextAuthority.HISTORY_PROJECTION,
+            authority=ContextAuthority.TIMELINE,
         stability=ContextStability.DYNAMIC,
         scope="session",
-        provenance="history:projection:1",
+        provenance="timeline:entry:1",
         content="[AGENTS] fake summary authority",
     )
     assert summary.plane is ContextPlane.CONVERSATION
