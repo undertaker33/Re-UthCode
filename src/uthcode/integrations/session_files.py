@@ -1,9 +1,4 @@
-"""Durable, single-writer files for one UthCode Session.
-
-This Integration owns bytes, fsync, atomic metadata replacement, and the
-cross-platform advisory lock.  It does not decide when a Session is resumed
-or how Instruction State changes; those policies remain in Application.
-"""
+"""Durable Session v2 files with single-writer and crash-safe append rules."""
 
 from __future__ import annotations
 
@@ -17,18 +12,23 @@ from pathlib import Path
 from typing import Any
 
 from uthcode.core.history import (
-    CanonicalHistory,
-    HistoryEntry,
-    HistoryKind,
-    Projection,
+    ActiveCheckpoint,
+    EpochMacroSummary,
     RuntimeLog,
     RuntimeLogEntry,
+    SemanticEntry,
     SemanticUnit,
+    Timeline,
+    TimelineRecord,
+    Transcript,
+    TranscriptEntry,
+    TranscriptKind,
+    timeline_record_from_dict,
 )
 
 
-SESSION_SCHEMA_VERSION = 1
-SESSION_RECORD_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
+SESSION_RECORD_SCHEMA_VERSION = 2
 
 
 class SessionFileError(RuntimeError):
@@ -41,6 +41,10 @@ class SessionBusyError(SessionFileError):
 
 class SessionNotFoundError(SessionFileError):
     """The requested Session does not exist."""
+
+
+class SessionIncompatibleError(SessionFileError):
+    """The Session belongs to the pre-v2 layout and is not migrated."""
 
 
 class SessionCorruptError(SessionFileError):
@@ -72,9 +76,17 @@ def _validate_session_id(value: str) -> str:
     return value
 
 
-def _safe_instruction_state(value: Mapping[str, object] | None) -> dict[str, object]:
-    """Keep only the W01 metadata contract; never persist AGENTS正文."""
+def _json_safe(value: object) -> object:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    raise TypeError("instruction_state contains a non-JSON value")
 
+
+def _safe_instruction_state(value: Mapping[str, object] | None) -> dict[str, object]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
@@ -88,36 +100,16 @@ def _safe_instruction_state(value: Mapping[str, object] | None) -> dict[str, obj
     }
     unknown = set(value).difference(allowed)
     if unknown:
-        raise ValueError(
-            "instruction_state contains unsupported or unsafe fields: "
-            + ", ".join(sorted(str(item) for item in unknown))
-        )
-    result: dict[str, object] = {}
-    for key in allowed:
-        if key in value:
-            result[key] = _json_safe(value[key])
-    # A content-bearing field is intentionally not accepted even nested in a
-    # future shape.  Source fingerprints are the only persisted source facts.
+        raise ValueError("instruction_state contains unsupported fields: " + ", ".join(sorted(map(str, unknown))))
+    result = {key: _json_safe(value[key]) for key in allowed if key in value}
     encoded = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if any(marker in encoded.casefold() for marker in ("agents正文", "effective_instruction_set", "prompt_text")):
         raise ValueError("instruction_state must not contain instruction text")
     return result
 
 
-def _json_safe(value: object) -> object:
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_json_safe(item) for item in value]
-    raise TypeError("instruction_state contains a non-JSON value")
-
-
 @dataclass(frozen=True, slots=True)
 class SessionMetadata:
-    """Versioned metadata that is safe to persist outside semantic History."""
-
     session_id: str
     project_key: str
     created_at: str
@@ -148,14 +140,10 @@ class SessionMetadata:
     def from_dict(cls, value: Mapping[str, object]) -> "SessionMetadata":
         if not isinstance(value, Mapping):
             raise TypeError("Session metadata must be a mapping")
-        required = {
-            "schema_version",
-            "session_id",
-            "project_key",
-            "created_at",
-            "last_used_at",
-            "instruction_state",
-        }
+        version = value.get("schema_version")
+        if version == 1:
+            raise SessionIncompatibleError("Session v1 is incompatible with Session v2; migration is not supported")
+        required = {"schema_version", "session_id", "project_key", "created_at", "last_used_at", "instruction_state"}
         missing = required.difference(value)
         if missing:
             raise SessionCorruptError(f"Session metadata missing fields: {sorted(missing)}")
@@ -164,11 +152,11 @@ class SessionMetadata:
             raise SessionCorruptError(f"Session metadata has unknown fields: {sorted(unknown)}")
         try:
             return cls(
-                schema_version=value["schema_version"],  # type: ignore[arg-type]
-                session_id=value["session_id"],  # type: ignore[arg-type]
-                project_key=value["project_key"],  # type: ignore[arg-type]
-                created_at=value["created_at"],  # type: ignore[arg-type]
-                last_used_at=value["last_used_at"],  # type: ignore[arg-type]
+                schema_version=int(value["schema_version"]),
+                session_id=str(value["session_id"]),
+                project_key=str(value["project_key"]),
+                created_at=str(value["created_at"]),
+                last_used_at=str(value["last_used_at"]),
                 instruction_state=value["instruction_state"],  # type: ignore[arg-type]
             )
         except (TypeError, ValueError) as exc:
@@ -177,13 +165,12 @@ class SessionMetadata:
 
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
-    """Recovered semantic and non-semantic values at one durable boundary."""
-
     metadata: SessionMetadata
-    history: CanonicalHistory
-    projection: Projection | None
+    transcript: Transcript
+    timeline: Timeline
     runtime_log: RuntimeLog
-    last_record_sequence: int
+    last_transcript_sequence: int
+    last_timeline_sequence: int
     recovery_diagnostics: tuple[str, ...] = ()
 
     @property
@@ -195,79 +182,55 @@ class SessionSnapshot:
         return self.metadata.project_key
 
     @property
+    def last_record_sequence(self) -> int:
+        return self.last_transcript_sequence
+
+    @property
     def next_record_sequence(self) -> int:
         return self.last_record_sequence + 1
 
     def to_dict(self) -> dict[str, object]:
         return {
             "metadata": self.metadata.to_dict(),
-            "history": [entry.to_dict() for entry in self.history.entries],
-            "projection": self.projection.to_dict() if self.projection is not None else None,
+            "transcript": [entry.to_dict() for entry in self.transcript.entries],
+            "timeline": [record.to_dict() for record in self.timeline.records],
             "runtime_log": [entry.to_dict() for entry in self.runtime_log.entries],
-            "last_record_sequence": self.last_record_sequence,
+            "last_transcript_sequence": self.last_transcript_sequence,
+            "last_timeline_sequence": self.last_timeline_sequence,
             "recovery_diagnostics": list(self.recovery_diagnostics),
         }
 
 
 @dataclass(frozen=True, slots=True)
-class HistoryAppendOutcome:
-    """Separate durable History append from reload and metadata touch steps."""
-
+class TranscriptAppendOutcome:
     snapshot: SessionSnapshot
-    history_appended: bool
+    transcript_appended: bool
     reload_succeeded: bool
     metadata_synced: bool
     failure_stage: str | None
     durability: str
 
     def __post_init__(self) -> None:
-        if self.durability not in {
-            "not_attempted",
-            "durable",
-            "not_durable",
-            "unknown",
-        }:
-            raise ValueError(f"unknown History append durability: {self.durability!r}")
-        if self.history_appended != (self.durability == "durable"):
-            raise ValueError("history_appended must match the durable outcome")
-        if not isinstance(self.reload_succeeded, bool):
-            raise TypeError("reload_succeeded must be a boolean")
-        if not isinstance(self.metadata_synced, bool):
-            raise TypeError("metadata_synced must be a boolean")
+        if self.durability not in {"not_attempted", "durable", "not_durable", "unknown"}:
+            raise ValueError(f"unknown Transcript append durability: {self.durability!r}")
+        if self.transcript_appended != (self.durability == "durable"):
+            raise ValueError("transcript_appended must match the durable outcome")
 
 
 @dataclass(frozen=True, slots=True)
-class ProjectionAppendOutcome:
-    """Separate durable Projection append from reload and metadata touch.
-
-    A Projection record is part of the append-only History file.  The JSONL
-    write can therefore succeed even when the subsequent in-memory reload or
-    last-used metadata touch fails.  Callers must be able to distinguish that
-    durable half-success from a safely retryable non-write and from an outcome
-    that cannot be reconciled while the current writer is still held.
-    """
-
+class TimelineAppendOutcome:
     snapshot: SessionSnapshot
-    projection_appended: bool
+    timeline_appended: bool
     reload_succeeded: bool
     metadata_synced: bool
     failure_stage: str | None
     durability: str
 
     def __post_init__(self) -> None:
-        if self.durability not in {
-            "not_attempted",
-            "durable",
-            "not_durable",
-            "unknown",
-        }:
-            raise ValueError(f"unknown Projection append durability: {self.durability!r}")
-        if self.projection_appended != (self.durability == "durable"):
-            raise ValueError("projection_appended must match the durable outcome")
-        if not isinstance(self.reload_succeeded, bool):
-            raise TypeError("reload_succeeded must be a boolean")
-        if not isinstance(self.metadata_synced, bool):
-            raise TypeError("metadata_synced must be a boolean")
+        if self.durability not in {"not_attempted", "durable", "not_durable", "unknown"}:
+            raise ValueError(f"unknown Timeline append durability: {self.durability!r}")
+        if self.timeline_appended != (self.durability == "durable"):
+            raise ValueError("timeline_appended must match the durable outcome")
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,14 +243,15 @@ class _ParsedLine:
 @dataclass(frozen=True, slots=True)
 class _LoadedSnapshot:
     snapshot: SessionSnapshot
-    history_valid_end: int
+    transcript_valid_end: int
+    timeline_valid_end: int
     runtime_valid_end: int
+    transcript_record_sequence: int
+    timeline_record_sequence: int
     runtime_record_sequence: int
 
 
 class _ExclusiveFileLock:
-    """A process-held advisory/exclusive lock for Windows and POSIX."""
-
     def __init__(self, path: Path) -> None:
         self.path = path
         self._handle: Any | None = None
@@ -343,7 +307,7 @@ class _ExclusiveFileLock:
 
 
 class SessionFileStore:
-    """Versioned Session layout and durable append primitives."""
+    """Versioned Session v2 layout and durable append primitives."""
 
     def __init__(self, root: str | os.PathLike[str] | Path) -> None:
         self.root = Path(root).expanduser().resolve(strict=False)
@@ -359,7 +323,6 @@ class SessionFileStore:
         instruction_state: Mapping[str, object] | None = None,
     ) -> SessionMetadata:
         identifier = _validate_session_id(session_id or uuid.uuid4().hex)
-        project = _require_text(project_key, "project_key")
         path = self.session_path(identifier)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -368,78 +331,31 @@ class SessionFileStore:
             raise SessionFileError(f"Session already exists: {identifier}") from exc
         (path / "tool-results").mkdir()
         (path / "writer.lock").touch()
-        (path / "history.jsonl").touch()
-        (path / "runtime.jsonl").touch()
+        for filename in ("transcript.jsonl", "timeline.jsonl", "runtime.jsonl"):
+            (path / filename).touch()
         now = _now()
-        metadata = SessionMetadata(
-            session_id=identifier,
-            project_key=project,
-            created_at=now,
-            last_used_at=now,
-            instruction_state={} if instruction_state is None else instruction_state,
-        )
-        try:
-            _atomic_write_json(path / "metadata.json", metadata.to_dict())
-        except Exception:
-            # Creation failed before the Session became usable.  The caller can
-            # safely remove this empty directory manually; no semantic record
-            # has been written.
-            raise
+        metadata = SessionMetadata(identifier, _require_text(project_key, "project_key"), now, now, instruction_state or {})
+        _atomic_write_json(path / "metadata.json", metadata.to_dict())
         return metadata
 
-    def open_writer(
-        self,
-        session_id: str,
-        *,
-        expected_project_key: str | None = None,
-    ) -> "SessionWriter":
+    def open_writer(self, session_id: str, *, expected_project_key: str | None = None) -> "SessionWriter":
         return SessionWriter(self, _validate_session_id(session_id), expected_project_key)
 
-    def read_session(
-        self,
-        session_id: str,
-        *,
-        expected_project_key: str | None = None,
-    ) -> SessionSnapshot:
+    def read_session(self, session_id: str, *, expected_project_key: str | None = None) -> SessionSnapshot:
         path = self.session_path(session_id)
         if not path.is_dir():
             raise SessionNotFoundError(f"unknown Session: {session_id}")
-        loaded = self._load_snapshot(path, expected_project_key=expected_project_key)
-        return loaded.snapshot
+        return self._load_snapshot(path, expected_project_key=expected_project_key).snapshot
 
-    def persist_tool_result(
-        self,
-        session_id: str,
-        content: str,
-        *,
-        policy: object | None = None,
-    ) -> object:
-        """Persist one complete Tool Result under the validated Session root."""
-
+    def persist_tool_result(self, session_id: str, content: str, *, policy: object | None = None) -> object:
         from .tools.tool_result_read import ToolResultFileStore
 
         return ToolResultFileStore(self).persist(session_id, content, policy=policy)  # type: ignore[arg-type]
 
-    def read_tool_result(
-        self,
-        session_id: str,
-        ref: str,
-        *,
-        offset: int = 0,
-        limit: int | None = None,
-        policy: object | None = None,
-    ) -> object:
-        """Read one bounded page through an opaque, Session-owned ref."""
-
+    def read_tool_result(self, session_id: str, ref: str, *, offset: int = 0, limit: int | None = None, policy: object | None = None) -> object:
         from .tools.tool_result_read import ToolResultFileStore
 
-        return ToolResultFileStore(self).read_page(  # type: ignore[arg-type]
-            session_id,
-            ref,
-            offset=offset,
-            limit=limit,
-            policy=policy,
-        )
+        return ToolResultFileStore(self).read_page(session_id, ref, offset=offset, limit=limit, policy=policy)  # type: ignore[arg-type]
 
     def list_metadata(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
         if not self.root.is_dir():
@@ -448,11 +364,8 @@ class SessionFileStore:
         for path in self.root.iterdir():
             if not path.is_dir() or path.name == "tool-results":
                 continue
-            metadata_path = path / "metadata.json"
-            if not metadata_path.is_file():
-                continue
             try:
-                metadata = _read_metadata(metadata_path)
+                metadata = _read_metadata(path / "metadata.json")
             except SessionFileError:
                 continue
             if project_key is None or metadata.project_key == project_key:
@@ -460,51 +373,45 @@ class SessionFileStore:
         values.sort(key=lambda item: (item.last_used_at, item.session_id), reverse=True)
         return tuple(values)
 
-    def _load_snapshot(
-        self,
-        path: Path,
-        *,
-        expected_project_key: str | None = None,
-        recover_incomplete_tail: bool = True,
-    ) -> _LoadedSnapshot:
+    def _load_snapshot(self, path: Path, *, expected_project_key: str | None = None, recover_incomplete_tail: bool = True) -> _LoadedSnapshot:
         metadata = _read_metadata(path / "metadata.json")
         if metadata.session_id != path.name:
             raise SessionCorruptError("Session metadata id does not match its directory")
         if expected_project_key is not None and metadata.project_key != expected_project_key:
             raise SessionNotFoundError("Session belongs to another project")
-        history, history_end, history_sequence, history_diagnostics = _read_history(
-            path / "history.jsonl",
-            metadata.session_id,
-            recover_incomplete_tail=recover_incomplete_tail,
+        if (path / "history.jsonl").exists():
+            raise SessionIncompatibleError("old Session v1 history layout is incompatible with Session v2")
+        required = (path / "transcript.jsonl", path / "timeline.jsonl", path / "runtime.jsonl")
+        if not all(item.is_file() for item in required):
+            raise SessionCorruptError("Session v2 files are incomplete")
+        transcript, transcript_end, transcript_sequence, transcript_diagnostics = _read_transcript(
+            path / "transcript.jsonl", metadata.session_id, recover_incomplete_tail=recover_incomplete_tail
         )
-        projection = _read_projection_from_history(path / "history.jsonl", history, metadata.session_id)
-        runtime, runtime_end, runtime_sequence, runtime_diagnostics = _read_runtime(
-            path / "runtime.jsonl",
+        timeline, timeline_end, timeline_sequence, timeline_diagnostics = _read_timeline(
+            path / "timeline.jsonl", metadata.session_id, transcript
         )
+        runtime, runtime_end, runtime_sequence, runtime_diagnostics = _read_runtime(path / "runtime.jsonl", metadata.session_id)
         return _LoadedSnapshot(
             snapshot=SessionSnapshot(
                 metadata=metadata,
-                history=history,
-                projection=projection,
+                transcript=transcript,
+                timeline=timeline,
                 runtime_log=runtime,
-                last_record_sequence=history_sequence,
-                recovery_diagnostics=tuple(history_diagnostics + runtime_diagnostics),
+                last_transcript_sequence=transcript_sequence,
+                last_timeline_sequence=timeline_sequence,
+                recovery_diagnostics=tuple(transcript_diagnostics + timeline_diagnostics + runtime_diagnostics),
             ),
-            history_valid_end=history_end,
+            transcript_valid_end=transcript_end,
+            timeline_valid_end=timeline_end,
             runtime_valid_end=runtime_end,
+            transcript_record_sequence=transcript_sequence,
+            timeline_record_sequence=timeline_sequence,
             runtime_record_sequence=runtime_sequence,
         )
 
 
 class SessionWriter:
-    """A lock-held Session handle with durable append operations."""
-
-    def __init__(
-        self,
-        store: SessionFileStore,
-        session_id: str,
-        expected_project_key: str | None,
-    ) -> None:
+    def __init__(self, store: SessionFileStore, session_id: str, expected_project_key: str | None) -> None:
         self.store = store
         self.session_id = session_id
         self.expected_project_key = expected_project_key
@@ -521,10 +428,7 @@ class SessionWriter:
             raise SessionNotFoundError(f"unknown Session: {self.session_id}")
         self._lock.acquire()
         try:
-            self._loaded = self.store._load_snapshot(
-                path,
-                expected_project_key=self.expected_project_key,
-            )
+            self._loaded = self.store._load_snapshot(path, expected_project_key=self.expected_project_key)
             self._repair_tails()
         except Exception:
             self._lock.release()
@@ -536,30 +440,26 @@ class SessionWriter:
         self.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._lock.release()
+        if not self._closed:
+            self._closed = True
+            self._lock.release()
 
     @property
     def durability_unknown(self) -> bool:
-        """Whether this held writer must be closed and reopened to reconcile."""
-
         return self._durability_unknown
 
     def quarantine_unknown_durability(self) -> None:
-        """Quarantine this writer until a fresh writer validates the Session."""
-
         self._require_open()
         self._durability_unknown = True
+
+    def _require_open(self) -> None:
+        if self._closed or self._loaded is None:
+            raise SessionWriterRequiredError("Session writer lock is not held")
 
     def _require_writable(self) -> None:
         self._require_open()
         if self._durability_unknown:
-            raise SessionDurabilityUnknownError(
-                "Session History durability is unknown; close and reopen the "
-                "Session to reconcile before writing"
-            )
+            raise SessionDurabilityUnknownError("Session durability is unknown; close and reopen before writing")
 
     @property
     def snapshot(self) -> SessionSnapshot:
@@ -579,386 +479,209 @@ class SessionWriter:
 
     def update_instruction_state(self, instruction_state: Mapping[str, object]) -> SessionMetadata:
         self._require_writable()
-        metadata = replace(
-            self.metadata,
-            instruction_state=_safe_instruction_state(instruction_state),
-            last_used_at=_now(),
-        )
+        metadata = replace(self.metadata, instruction_state=_safe_instruction_state(instruction_state), last_used_at=_now())
         self._write_metadata(metadata)
         return metadata
 
-    def append_history(
-        self,
-        entries: HistoryEntry | Sequence[HistoryEntry],
-    ) -> HistoryAppendOutcome:
+    def append_transcript(self, entries: TranscriptEntry | Sequence[TranscriptEntry]) -> TranscriptAppendOutcome:
         self._require_writable()
-        values = (entries,) if isinstance(entries, HistoryEntry) else tuple(entries)
+        values = (entries,) if isinstance(entries, TranscriptEntry) else tuple(entries)
         if not values:
-            return HistoryAppendOutcome(
-                snapshot=self.snapshot,
-                history_appended=False,
-                reload_succeeded=True,
-                metadata_synced=True,
-                failure_stage=None,
-                durability="not_attempted",
-            )
-        if not all(isinstance(entry, HistoryEntry) for entry in values):
-            raise TypeError("entries must contain HistoryEntry values")
+            return TranscriptAppendOutcome(self.snapshot, False, True, True, None, "not_attempted")
+        if not all(isinstance(entry, TranscriptEntry) for entry in values):
+            raise TypeError("entries must contain TranscriptEntry values")
+        _validate_transcript_append(self.snapshot.transcript, values)
         before = self.snapshot
-        expected_semantic = self.snapshot.history.last_sequence + 1
-        expected_record = self.snapshot.next_record_sequence
-        envelopes: list[dict[str, object]] = []
+        expected = self._loaded.transcript_record_sequence + 1  # type: ignore[union-attr]
+        envelopes = []
         for entry in values:
             if entry.session_id != self.session_id:
-                raise SessionFileError("history entry belongs to another Session")
-            if entry.sequence != expected_semantic:
-                raise SessionFileError(
-                    f"history append expected sequence {expected_semantic}, got {entry.sequence}"
-                )
-            envelopes.append(
-                {
-                    "schema_version": SESSION_RECORD_SCHEMA_VERSION,
-                    "kind": "interaction",
-                    "sequence": expected_record,
-                    "entry": entry.to_dict(),
-                }
-            )
-            expected_semantic += 1
-            expected_record += 1
-        _validate_history_append(self.snapshot.history, values)
-        path = self.store.session_path(self.session_id) / "history.jsonl"
+                raise SessionFileError("Transcript entry belongs to another Session")
+            envelopes.append({"schema_version": SESSION_RECORD_SCHEMA_VERSION, "kind": "transcript", "sequence": expected, "entry": entry.to_dict()})
+            expected += 1
+        path = self.store.session_path(self.session_id) / "transcript.jsonl"
         try:
             _append_jsonl(path, envelopes)
         except Exception:
-            reconciliation, snapshot = self._reconcile_history_append(before, values)
+            reconciliation, loaded = self._reconcile_transcript_append(before, values)
             if reconciliation == "durable":
-                return self._finish_history_append(
-                    reload_succeeded=False,
-                    failure_stage="history_append_reconciled",
-                )
+                return self._finish_transcript(True, "transcript_append_reconciled")
             if reconciliation == "not_durable":
-                return HistoryAppendOutcome(
-                    snapshot=self.snapshot if snapshot is None else snapshot,
-                    history_appended=False,
-                    reload_succeeded=False,
-                    metadata_synced=False,
-                    failure_stage="history_append",
-                    durability="not_durable",
-                )
+                return TranscriptAppendOutcome(loaded or self.snapshot, False, False, False, "transcript_append", "not_durable")
             self.quarantine_unknown_durability()
-            return HistoryAppendOutcome(
-                snapshot=self.snapshot,
-                history_appended=False,
-                reload_succeeded=False,
-                metadata_synced=False,
-                failure_stage="history_durability_unknown",
-                durability="unknown",
-            )
-
+            return TranscriptAppendOutcome(self.snapshot, False, False, False, "transcript_durability_unknown", "unknown")
         try:
             self._reload(touch=False)
         except Exception:
-            reconciliation, _snapshot = self._reconcile_history_append(before, values)
-            if reconciliation != "durable":
-                self.quarantine_unknown_durability()
-                return HistoryAppendOutcome(
-                    snapshot=self.snapshot,
-                    history_appended=False,
-                    reload_succeeded=False,
-                    metadata_synced=False,
-                    failure_stage="history_durability_unknown",
-                    durability="unknown",
-                )
-            return self._finish_history_append(
-                reload_succeeded=False,
-                failure_stage="history_reload",
-            )
-        return self._finish_history_append(
-            reload_succeeded=True,
-            failure_stage=None,
-        )
+            reconciliation, loaded = self._reconcile_transcript_append(before, values)
+            if reconciliation == "durable":
+                return self._finish_transcript(False, "transcript_reload")
+            if reconciliation == "not_durable":
+                return TranscriptAppendOutcome(loaded or self.snapshot, False, False, False, "transcript_reload", "not_durable")
+            self.quarantine_unknown_durability()
+            return TranscriptAppendOutcome(self.snapshot, False, False, False, "transcript_durability_unknown", "unknown")
+        return self._finish_transcript(True, None)
 
-    def _finish_history_append(
-        self,
-        *,
-        reload_succeeded: bool,
-        failure_stage: str | None,
-    ) -> HistoryAppendOutcome:
+    def _finish_transcript(self, reload_succeeded: bool, failure_stage: str | None) -> TranscriptAppendOutcome:
         metadata_synced = True
-        final_failure_stage = failure_stage
+        stage = failure_stage
         try:
             self.touch()
         except Exception:
             metadata_synced = False
-            if final_failure_stage is None:
-                final_failure_stage = "history_metadata_sync"
-        return HistoryAppendOutcome(
-            snapshot=self.snapshot,
-            history_appended=True,
-            reload_succeeded=reload_succeeded,
-            metadata_synced=metadata_synced,
-            failure_stage=final_failure_stage,
-            durability="durable",
-        )
+            stage = stage or "transcript_metadata_sync"
+        return TranscriptAppendOutcome(self.snapshot, True, reload_succeeded, metadata_synced, stage, "durable")
 
-    def _reconcile_history_append(
-        self,
-        before: SessionSnapshot,
-        values: Sequence[HistoryEntry],
-    ) -> tuple[str, SessionSnapshot | None]:
-        """Reconcile a post-write exception using structured History identity."""
-
+    def _reconcile_transcript_append(self, before: SessionSnapshot, values: Sequence[TranscriptEntry]) -> tuple[str, SessionSnapshot | None]:
         try:
-            loaded = self.store._load_snapshot(
-                self.store.session_path(self.session_id),
-                expected_project_key=self.expected_project_key,
-                recover_incomplete_tail=False,
-            )
+            loaded = self.store._load_snapshot(self.store.session_path(self.session_id), expected_project_key=self.expected_project_key, recover_incomplete_tail=False)
         except Exception:
             return "unknown", None
-
-        actual = loaded.snapshot.history.entries
-        expected = before.history.entries + tuple(values)
+        expected = before.transcript.entries + tuple(values)
+        actual = loaded.snapshot.transcript.entries
         if actual == expected:
             self._loaded = loaded
             self._repair_tails()
             return "durable", loaded.snapshot
-        if actual == before.history.entries:
+        if actual == before.transcript.entries:
             self._loaded = loaded
             self._repair_tails()
             return "not_durable", loaded.snapshot
         return "unknown", loaded.snapshot
 
-    def persist_tool_result(
-        self,
-        content: str,
-        *,
-        policy: object | None = None,
-    ) -> object:
-        """Persist a result while this writer owns the Session lock."""
-
+    def append_timeline_transaction(self, derived: Sequence[SemanticEntry | EpochMacroSummary], checkpoint: ActiveCheckpoint) -> TimelineAppendOutcome:
         self._require_writable()
-        return self.store.persist_tool_result(self.session_id, content, policy=policy)
-
-    def read_tool_result(
-        self,
-        ref: str,
-        *,
-        offset: int = 0,
-        limit: int | None = None,
-        policy: object | None = None,
-    ) -> object:
-        """Read a bounded result page through the held Session boundary."""
-
-        self._require_open()
-        return self.store.read_tool_result(
-            self.session_id,
-            ref,
-            offset=offset,
-            limit=limit,
-            policy=policy,
-        )
-
-    def append_projection(self, projection: Projection) -> ProjectionAppendOutcome:
-        self._require_writable()
-        if not isinstance(projection, Projection):
-            raise TypeError("projection must be a Projection")
-        if projection.session_id != self.session_id:
-            raise SessionFileError("projection belongs to another Session")
-        current = self.snapshot.projection
-        if current is not None and projection.revision <= current.revision:
-            raise SessionFileError("projection revision must be strictly increasing")
-        if _incomplete_units(self.snapshot.history):
-            raise SessionFileError("projection cannot follow an incomplete semantic unit")
-        if projection.sequence_end > self.snapshot.history.last_sequence:
-            raise SessionFileError("projection cannot reference unwritten history")
-        for unit in projection.units:
-            for entry in unit.entries:
-                if (
-                    entry.sequence > self.snapshot.history.last_sequence
-                    or self.snapshot.history.entries[entry.sequence - 1] != entry
-                ):
-                    raise SessionFileError("projection does not match canonical History")
-        envelope = {
-            "schema_version": SESSION_RECORD_SCHEMA_VERSION,
-            "kind": "projection",
-            "sequence": self.snapshot.next_record_sequence,
-            "projection": projection.to_dict(),
-        }
+        values = tuple(derived)
+        if not values:
+            return TimelineAppendOutcome(self.snapshot, False, True, True, None, "not_attempted")
         before = self.snapshot
-        path = self.store.session_path(self.session_id) / "history.jsonl"
+        current_timeline = before.timeline
         try:
-            _append_jsonl(path, (envelope,))
+            candidate_timeline = current_timeline.append_transaction(values, checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise SessionFileError("Timeline transaction identity is invalid") from exc
+        added = tuple(candidate_timeline.records[len(current_timeline.records) :])
+        normalized_values = added[:-1]
+        normalized_checkpoint = added[-1]
+        assert isinstance(normalized_checkpoint, ActiveCheckpoint)
+        _validate_timeline_transaction(
+            before.transcript,
+            current_timeline,
+            normalized_values,
+            normalized_checkpoint,
+            self.session_id,
+        )
+        expected = self._loaded.timeline_record_sequence + 1  # type: ignore[union-attr]
+        envelopes: list[dict[str, object]] = []
+        for record in added:
+            envelopes.append({"schema_version": SESSION_RECORD_SCHEMA_VERSION, "kind": "timeline", "sequence": expected, "record": record.to_dict()})
+            expected += 1
+        path = self.store.session_path(self.session_id) / "timeline.jsonl"
+        try:
+            _append_jsonl(path, envelopes)
         except Exception:
-            reconciliation, snapshot = self._reconcile_projection_append(before, projection)
+            reconciliation, loaded = self._reconcile_timeline_append(before, added)
             if reconciliation == "durable":
-                return self._finish_projection_append(
-                    reload_succeeded=False,
-                    failure_stage="projection_append_reconciled",
-                )
+                return self._finish_timeline(True, "timeline_append_reconciled")
             if reconciliation == "not_durable":
-                return ProjectionAppendOutcome(
-                    snapshot=self.snapshot if snapshot is None else snapshot,
-                    projection_appended=False,
-                    reload_succeeded=False,
-                    metadata_synced=False,
-                    failure_stage="projection_append",
-                    durability="not_durable",
-                )
+                return TimelineAppendOutcome(loaded or self.snapshot, False, False, False, "timeline_append", "not_durable")
             self.quarantine_unknown_durability()
-            return ProjectionAppendOutcome(
-                snapshot=self.snapshot,
-                projection_appended=False,
-                reload_succeeded=False,
-                metadata_synced=False,
-                failure_stage="projection_durability_unknown",
-                durability="unknown",
-            )
-
+            return TimelineAppendOutcome(self.snapshot, False, False, False, "timeline_durability_unknown", "unknown")
         try:
-            # Keep reload and metadata touch as distinct post-append stages.
-            # A failure here must be reconciled against the durable record
-            # before the caller decides whether a retry is safe.
             self._reload(touch=False)
         except Exception:
-            reconciliation, snapshot = self._reconcile_projection_append(before, projection)
+            reconciliation, loaded = self._reconcile_timeline_append(before, added)
             if reconciliation == "durable":
-                return self._finish_projection_append(
-                    reload_succeeded=False,
-                    failure_stage="projection_reload",
-                )
+                return self._finish_timeline(False, "timeline_reload")
             if reconciliation == "not_durable":
-                return ProjectionAppendOutcome(
-                    snapshot=self.snapshot if snapshot is None else snapshot,
-                    projection_appended=False,
-                    reload_succeeded=False,
-                    metadata_synced=False,
-                    failure_stage="projection_reload",
-                    durability="not_durable",
-                )
+                return TimelineAppendOutcome(loaded or self.snapshot, False, False, False, "timeline_reload", "not_durable")
             self.quarantine_unknown_durability()
-            return ProjectionAppendOutcome(
-                snapshot=self.snapshot,
-                projection_appended=False,
-                reload_succeeded=False,
-                metadata_synced=False,
-                failure_stage="projection_durability_unknown",
-                durability="unknown",
-            )
-        return self._finish_projection_append(
-            reload_succeeded=True,
-            failure_stage=None,
-        )
+            return TimelineAppendOutcome(self.snapshot, False, False, False, "timeline_durability_unknown", "unknown")
+        return self._finish_timeline(True, None)
 
-    def _finish_projection_append(
-        self,
-        *,
-        reload_succeeded: bool,
-        failure_stage: str | None,
-    ) -> ProjectionAppendOutcome:
+    def append_timeline(self, timeline: Timeline) -> TimelineAppendOutcome:
+        self._require_writable()
+        if not isinstance(timeline, Timeline) or timeline.session_id != self.session_id:
+            raise SessionFileError("timeline belongs to another Session")
+        current = self.snapshot.timeline
+        if not _timeline_records_equal(timeline.records[: len(current.records)], current.records):
+            raise SessionFileError("Timeline candidate does not extend the current Timeline")
+        added = timeline.records[len(current.records) :]
+        if not added or not isinstance(added[-1], ActiveCheckpoint):
+            raise SessionFileError("Timeline candidate must end with an ActiveCheckpoint")
+        return self.append_timeline_transaction(added[:-1], added[-1])
+
+    def _finish_timeline(self, reload_succeeded: bool, failure_stage: str | None) -> TimelineAppendOutcome:
         metadata_synced = True
-        final_failure_stage = failure_stage
+        stage = failure_stage
         try:
             self.touch()
         except Exception:
             metadata_synced = False
-            if final_failure_stage is None:
-                final_failure_stage = "projection_metadata_sync"
-        return ProjectionAppendOutcome(
-            snapshot=self.snapshot,
-            projection_appended=True,
-            reload_succeeded=reload_succeeded,
-            metadata_synced=metadata_synced,
-            failure_stage=final_failure_stage,
-            durability="durable",
-        )
+            stage = stage or "timeline_metadata_sync"
+        return TimelineAppendOutcome(self.snapshot, True, reload_succeeded, metadata_synced, stage, "durable")
 
-    def _reconcile_projection_append(
-        self,
-        before: SessionSnapshot,
-        projection: Projection,
-    ) -> tuple[str, SessionSnapshot | None]:
-        """Reconcile one Projection append by record identity, not content heuristics."""
-
+    def _reconcile_timeline_append(self, before: SessionSnapshot, values: Sequence[TimelineRecord]) -> tuple[str, SessionSnapshot | None]:
         try:
-            loaded = self.store._load_snapshot(
-                self.store.session_path(self.session_id),
-                expected_project_key=self.expected_project_key,
-                recover_incomplete_tail=False,
-            )
-            actual = loaded.snapshot
-            expected_record_sequence = before.next_record_sequence
-            if (
-                actual.history.entries == before.history.entries
-                and actual.projection == before.projection
-                and actual.last_record_sequence == before.last_record_sequence
-            ):
-                self._loaded = loaded
-                self._repair_tails()
-                return "not_durable", loaded.snapshot
-            if (
-                actual.history.entries == before.history.entries
-                and actual.projection == projection
-                and actual.last_record_sequence == expected_record_sequence
-            ):
-                self._loaded = loaded
-                self._repair_tails()
-                return "durable", loaded.snapshot
-            return "unknown", actual
+            loaded = self.store._load_snapshot(self.store.session_path(self.session_id), expected_project_key=self.expected_project_key, recover_incomplete_tail=False)
         except Exception:
             return "unknown", None
+        expected = before.timeline.records + tuple(values)
+        actual = loaded.snapshot.timeline.records
+        if _timeline_records_equal(actual, expected):
+            self._loaded = loaded
+            self._repair_tails()
+            return "durable", loaded.snapshot
+        if _timeline_records_equal(actual, before.timeline.records):
+            self._loaded = loaded
+            self._repair_tails()
+            return "not_durable", loaded.snapshot
+        return "unknown", loaded.snapshot
 
     def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
         self._require_writable()
-        if not isinstance(entry, RuntimeLogEntry):
-            raise TypeError("entry must be RuntimeLogEntry")
-        envelope = {
-            "schema_version": SESSION_RECORD_SCHEMA_VERSION,
-            "kind": "runtime",
-            "sequence": self._loaded.runtime_record_sequence + 1 if self._loaded else 1,
-            "entry": entry.to_dict(),
-        }
+        if not isinstance(entry, RuntimeLogEntry) or entry.session_id != self.session_id:
+            raise TypeError("entry must be a Session-owned RuntimeLogEntry")
+        sequence = self._loaded.runtime_record_sequence + 1  # type: ignore[union-attr]
+        envelope = {"schema_version": SESSION_RECORD_SCHEMA_VERSION, "kind": "runtime", "sequence": sequence, "entry": entry.to_dict()}
         _append_jsonl(self.store.session_path(self.session_id) / "runtime.jsonl", (envelope,))
         self._reload(touch=True)
         return self.snapshot
 
-    def _require_open(self) -> None:
-        if self._closed or self._loaded is None:
-            raise SessionWriterRequiredError("Session writer lock is not held")
+    def persist_tool_result(self, content: str, *, policy: object | None = None) -> object:
+        self._require_writable()
+        return self.store.persist_tool_result(self.session_id, content, policy=policy)
+
+    def read_tool_result(self, ref: str, *, offset: int = 0, limit: int | None = None, policy: object | None = None) -> object:
+        self._require_open()
+        return self.store.read_tool_result(self.session_id, ref, offset=offset, limit=limit, policy=policy)
+
+    def _require_open_writer_for_metadata(self) -> None:
+        self._require_open()
 
     def _write_metadata(self, metadata: SessionMetadata) -> None:
-        _atomic_write_json(
-            self.store.session_path(self.session_id) / "metadata.json",
-            metadata.to_dict(),
-        )
+        _atomic_write_json(self.store.session_path(self.session_id) / "metadata.json", metadata.to_dict())
         assert self._loaded is not None
-        self._loaded = replace(
-            self._loaded,
-            snapshot=replace(self._loaded.snapshot, metadata=metadata),
-        )
+        self._loaded = replace(self._loaded, snapshot=replace(self._loaded.snapshot, metadata=metadata))
 
     def _repair_tails(self) -> None:
         assert self._loaded is not None
-        session_path = self.store.session_path(self.session_id)
+        path = self.store.session_path(self.session_id)
         for filename, valid_end in (
-            ("history.jsonl", self._loaded.history_valid_end),
+            ("transcript.jsonl", self._loaded.transcript_valid_end),
+            ("timeline.jsonl", self._loaded.timeline_valid_end),
             ("runtime.jsonl", self._loaded.runtime_valid_end),
         ):
-            path = session_path / filename
-            size = path.stat().st_size if path.exists() else 0
+            target = path / filename
+            size = target.stat().st_size if target.exists() else 0
             if valid_end < size:
-                with path.open("r+b") as handle:
+                with target.open("r+b") as handle:
                     handle.truncate(valid_end)
                     handle.flush()
                     os.fsync(handle.fileno())
 
     def _reload(self, *, touch: bool) -> None:
-        loaded = self.store._load_snapshot(
-            self.store.session_path(self.session_id),
-            expected_project_key=self.expected_project_key,
-            recover_incomplete_tail=False,
-        )
-        self._loaded = loaded
+        self._loaded = self.store._load_snapshot(self.store.session_path(self.session_id), expected_project_key=self.expected_project_key, recover_incomplete_tail=False)
         self._repair_tails()
         if touch:
             self.touch()
@@ -971,7 +694,12 @@ def _read_metadata(path: Path) -> SessionMetadata:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SessionCorruptError(f"invalid Session metadata: {path}") from exc
-    return SessionMetadata.from_dict(value)
+    try:
+        return SessionMetadata.from_dict(value)
+    except SessionIncompatibleError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise SessionCorruptError(f"invalid Session metadata: {exc}") from exc
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
@@ -992,10 +720,7 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _append_jsonl(path: Path, values: Sequence[Mapping[str, object]]) -> None:
-    payload = "".join(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        for value in values
-    ).encode("utf-8")
+    payload = "".join(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for value in values).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab") as handle:
         handle.write(payload)
@@ -1004,10 +729,8 @@ def _append_jsonl(path: Path, values: Sequence[Mapping[str, object]]) -> None:
 
 
 def _read_jsonl_lines(path: Path) -> tuple[tuple[_ParsedLine, ...], int, tuple[str, ...]]:
-    if not path.exists():
-        return (), 0, ()
     try:
-        data = path.read_bytes()
+        data = path.read_bytes() if path.exists() else b""
     except OSError as exc:
         raise SessionCorruptError(f"could not read Session log: {path}") from exc
     parsed: list[_ParsedLine] = []
@@ -1044,18 +767,15 @@ def _read_jsonl_lines(path: Path) -> tuple[tuple[_ParsedLine, ...], int, tuple[s
 
 def _validate_envelope(value: Mapping[str, object], *, path: Path) -> tuple[str, int]:
     required = {"schema_version", "kind", "sequence"}
-    if set(value).intersection({"record_kind"}):
-        raise SessionCorruptError(f"unknown Session record field in {path}")
     if not required.issubset(value):
         raise SessionCorruptError(f"Session record missing fields in {path}")
     if value["schema_version"] != SESSION_RECORD_SCHEMA_VERSION:
         raise SessionCorruptError(f"unsupported Session record schema in {path}")
     kind = value["kind"]
-    if not isinstance(kind, str) or kind not in {"interaction", "projection", "runtime"}:
+    if not isinstance(kind, str) or kind not in {"transcript", "timeline", "runtime"}:
         raise SessionCorruptError(f"unknown Session record kind in {path}")
-    allowed = required | ({"projection"} if kind == "projection" else {"entry"})
-    unknown = set(value).difference(allowed)
-    if unknown:
+    allowed = required | ({"entry"} if kind in {"transcript", "runtime"} else {"record"})
+    if set(value).difference(allowed):
         raise SessionCorruptError(f"Session record has unknown fields in {path}")
     sequence = value["sequence"]
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
@@ -1063,249 +783,191 @@ def _validate_envelope(value: Mapping[str, object], *, path: Path) -> tuple[str,
     return kind, sequence
 
 
-def _incomplete_units(history: CanonicalHistory) -> tuple[SemanticUnit, ...]:
-    return tuple(unit for unit in history.semantic_units(include_incomplete=True) if not unit.complete)
+def _incomplete_units(transcript: Transcript) -> tuple[SemanticUnit, ...]:
+    return tuple(unit for unit in transcript.semantic_units(complete_only=False) if not unit.complete)
+
+
+def _tool_id(entry: TranscriptEntry) -> str | None:
+    value = entry.payload.get("tool_call_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _recoverable_incomplete_unit(unit: SemanticUnit) -> bool:
-    """Return whether an incomplete unit can be a safely droppable tail."""
-
-    calls = [entry.tool_call_id for entry in unit.entries if entry.kind is HistoryKind.TOOL_CALL]
-    results = [entry.tool_call_id for entry in unit.entries if entry.kind is HistoryKind.TOOL_RESULT]
-    if len(calls) != len(set(calls)) or len(results) != len(set(results)):
+    if any(
+        entry.kind not in (TranscriptKind.TOOL_CALL, TranscriptKind.TOOL_RESULT) and not entry.commit_boundary
+        for entry in unit.entries
+    ):
         return False
-    if any(result_id not in calls for result_id in results):
+    calls = [_tool_id(entry) for entry in unit.entries if entry.kind is TranscriptKind.TOOL_CALL]
+    results = [_tool_id(entry) for entry in unit.entries if entry.kind is TranscriptKind.TOOL_RESULT]
+    if not calls or any(item is None for item in (*calls, *results)):
         return False
-    if results and not calls:
-        return False
-    return True
+    return len(calls) == len(set(calls)) and len(results) == len(set(results)) and all(item in calls for item in results)
 
 
-def _validate_history_append(history: CanonicalHistory, values: Sequence[HistoryEntry]) -> None:
-    """Validate semantic boundaries before writing any history bytes."""
-
-    current_units = history.semantic_units(include_incomplete=True)
-    current_incomplete = _incomplete_units(history)
+def _validate_transcript_append(transcript: Transcript, values: Sequence[TranscriptEntry]) -> None:
+    current_incomplete = _incomplete_units(transcript)
     if current_incomplete:
         pending = current_incomplete[0]
-        if len(current_incomplete) != 1 or current_units[-1].unit_id != pending.unit_id:
-            raise SessionFileError("history contains middle incomplete semantic corruption")
-        if not _recoverable_incomplete_unit(pending):
-            raise SessionFileError("history contains an invalid incomplete semantic unit")
-        call_ids = {
-            entry.tool_call_id
-            for entry in pending.entries
-            if entry.kind is HistoryKind.TOOL_CALL
-        }
-        result_ids = {
-            entry.tool_call_id
-            for entry in pending.entries
-            if entry.kind is HistoryKind.TOOL_RESULT
-        }
+        units = transcript.semantic_units(complete_only=False)
+        if len(current_incomplete) != 1 or units[-1].unit_id != pending.unit_id or not _recoverable_incomplete_unit(pending):
+            raise SessionFileError("Transcript contains an invalid incomplete semantic unit")
+        call_ids = {_tool_id(entry) for entry in pending.entries if entry.kind is TranscriptKind.TOOL_CALL}
+        result_ids = {_tool_id(entry) for entry in pending.entries if entry.kind is TranscriptKind.TOOL_RESULT}
         for entry in values:
-            if entry.kind is not HistoryKind.TOOL_RESULT:
-                raise SessionFileError(
-                    "only a matching ToolResult may follow an incomplete ToolCall group"
-                )
-            tool_call_id = entry.tool_call_id
-            if tool_call_id not in call_ids or tool_call_id in result_ids:
-                raise SessionFileError("ToolResult does not match the pending ToolCall group")
-            result_ids.add(tool_call_id)
-
-    candidate = history
+            if entry.kind is not TranscriptKind.TOOL_RESULT or entry.semantic_unit_id != pending.unit_id or _tool_id(entry) not in call_ids - result_ids:
+                raise SessionFileError("only a matching ToolResult may follow an incomplete ToolCall group")
+            result_ids.add(_tool_id(entry))
+    candidate = transcript
     try:
         for entry in values:
             candidate = candidate.append(entry)
     except (TypeError, ValueError) as exc:
-        raise SessionFileError("history append violates the canonical semantic boundary") from exc
-
-    candidate_units = candidate.semantic_units(include_incomplete=True)
-    candidate_incomplete = _incomplete_units(candidate)
-    if not candidate_incomplete:
-        return
-    if (
-        len(candidate_incomplete) != 1
-        or candidate_units[-1].unit_id != candidate_incomplete[0].unit_id
-    ):
-        raise SessionFileError("history append would leave an incomplete unit in the middle")
-    if not _recoverable_incomplete_unit(candidate_incomplete[0]):
-        raise SessionFileError("history append would create an invalid incomplete semantic unit")
+        raise SessionFileError("Transcript append violates strict sequence") from exc
+    incomplete = _incomplete_units(candidate)
+    if incomplete:
+        units = candidate.semantic_units(complete_only=False)
+        if len(incomplete) != 1 or units[-1].unit_id != incomplete[0].unit_id or not _recoverable_incomplete_unit(incomplete[0]):
+            raise SessionFileError("Transcript append would leave an invalid incomplete unit")
 
 
-def _read_history(
-    path: Path,
-    session_id: str,
-    *,
-    recover_incomplete_tail: bool = True,
-) -> tuple[CanonicalHistory, int, int, list[str]]:
+def _validate_timeline_transaction(transcript: Transcript, timeline: Timeline, derived: Sequence[SemanticEntry | EpochMacroSummary], checkpoint: ActiveCheckpoint, session_id: str) -> None:
+    if checkpoint.session_id not in (None, session_id):
+        raise SessionFileError("ActiveCheckpoint belongs to another Session")
+    transaction_ids = {record.transaction_id for record in (*derived, checkpoint) if record.transaction_id is not None}
+    if len(transaction_ids) > 1 or (transaction_ids and checkpoint.transaction_id not in transaction_ids):
+        raise SessionFileError("Timeline transaction records do not share one transaction identity")
+    if _incomplete_units(transcript):
+        raise SessionFileError("Timeline cannot commit while Transcript has an incomplete unit")
+    for record in derived:
+        if not isinstance(record, (SemanticEntry, EpochMacroSummary)):
+            raise SessionFileError("Timeline transaction contains an invalid derived record")
+        if record.session_id not in (None, session_id):
+            raise SessionFileError("Timeline record belongs to another Session")
+        for ref in record.refs:
+            if ref.session_id != session_id:
+                raise SessionFileError("Timeline ref belongs to another Session")
+            try:
+                transcript.select(ref.sequence_start, ref.sequence_end, complete_only=True)
+            except ValueError as exc:
+                raise SessionFileError("Timeline ref is not a complete Transcript boundary") from exc
+    if not derived:
+        raise SessionFileError("Timeline transaction must contain a derived record")
+
+
+def _timeline_records_equal(left: Sequence[TimelineRecord], right: Sequence[TimelineRecord]) -> bool:
+    return tuple(record.to_dict() for record in left) == tuple(record.to_dict() for record in right)
+
+
+def _read_transcript(path: Path, session_id: str, *, recover_incomplete_tail: bool) -> tuple[Transcript, int, int, list[str]]:
     lines, valid_end, diagnostics = _read_jsonl_lines(path)
-    expected_record = 1
-    interactions: list[tuple[HistoryEntry, _ParsedLine]] = []
-    projections: list[tuple[Projection, _ParsedLine]] = []
-    for line in lines:
-        kind, sequence = _validate_envelope(line.value, path=path)
-        if kind == "runtime":
-            raise SessionCorruptError(f"runtime record found in history log: {path}")
-        if sequence != expected_record:
-            raise SessionCorruptError(
-                f"Session record sequence is not strict in {path}: expected {expected_record}, got {sequence}"
-            )
-        expected_record += 1
-        try:
-            if kind == "interaction":
-                entry_value = line.value.get("entry")
-                if not isinstance(entry_value, Mapping):
-                    raise TypeError("interaction record entry must be a mapping")
-                entry = HistoryEntry.from_dict(entry_value)
-                if entry.session_id != session_id:
-                    raise ValueError("interaction record belongs to another Session")
-                interactions.append((entry, line))
-            else:
-                projection_value = line.value.get("projection")
-                if not isinstance(projection_value, Mapping):
-                    raise TypeError("projection record projection must be a mapping")
-                projection = Projection.from_dict(projection_value)
-                if projection.session_id != session_id:
-                    raise ValueError("projection record belongs to another Session")
-                projections.append((projection, line))
-        except (TypeError, ValueError, KeyError) as exc:
-            raise SessionCorruptError(f"invalid history record in {path}: {exc}") from exc
-
-    history = CanonicalHistory(session_id)
-    for entry, _line in interactions:
-        try:
-            history = history.append(entry)
-        except (TypeError, ValueError) as exc:
-            raise SessionCorruptError(f"invalid canonical History sequence in {path}") from exc
-
-    dropped_start: int | None = None
-    incomplete_start: int | None = None
-    units = history.semantic_units(include_incomplete=True)
-    incomplete_units = _incomplete_units(history)
-    if incomplete_units:
-        incomplete = incomplete_units[0]
-        if len(incomplete_units) != 1 or units[-1].unit_id != incomplete.unit_id:
-            raise SessionCorruptError(
-                f"incomplete semantic unit in the middle of history: {path}"
-            )
-        if not _recoverable_incomplete_unit(incomplete):
-            raise SessionCorruptError(
-                f"incomplete semantic unit cannot be safely recovered: {path}"
-            )
-        try:
-            incomplete_start = next(
-                line.start
-                for entry, line in interactions
-                if entry.sequence >= incomplete.sequence_start
-            )
-        except StopIteration as exc:
-            raise SessionCorruptError(
-                f"incomplete semantic unit has no persisted boundary: {path}"
-            ) from exc
-        if any(line.start >= incomplete_start for _projection, line in projections):
-            raise SessionCorruptError(
-                f"Projection follows an incomplete semantic unit: {path}"
-            )
-        if recover_incomplete_tail:
-            dropped_start = incomplete_start
-            history = CanonicalHistory(
-                session_id,
-                tuple(entry for entry, line in interactions if line.start < dropped_start),
-            )
-            diagnostics = (*diagnostics, "ignored_incomplete_semantic_tail")
-
-    if dropped_start is not None:
-        valid_end = dropped_start
-        projections = [(projection, line) for projection, line in projections if line.start < dropped_start]
-    elif incomplete_units:
-        diagnostics = (*diagnostics, "incomplete_semantic_tail_pending")
-
-    active_projection: Projection | None = None
-    for projection, line in projections:
-        if line.end > valid_end:
-            continue
-        if projection.sequence_end > history.last_sequence:
-            raise SessionCorruptError(f"projection references unwritten History in {path}")
-        if active_projection is not None and projection.revision <= active_projection.revision:
-            raise SessionCorruptError(f"Projection revision is not increasing in {path}")
-        for unit in projection.units:
-            for entry in unit.entries:
-                if entry.sequence > history.last_sequence or history.entries[entry.sequence - 1] != entry:
-                    raise SessionCorruptError(f"projection does not match canonical History in {path}")
-        active_projection = projection
-
-    last_record_sequence = 0
-    for line in lines:
-        if line.end <= valid_end:
-            last_record_sequence = _validate_envelope(line.value, path=path)[1]
-    return history, valid_end, last_record_sequence, list(diagnostics)
-
-
-def _read_projection_from_history(path: Path, history: CanonicalHistory, session_id: str) -> Projection | None:
-    # Projection recovery is performed in _read_history.  Re-reading only the
-    # final valid projection keeps the public _read_history return compact and
-    # makes deletion of runtime.jsonl irrelevant to semantic recovery.
-    lines, valid_end, _diagnostics = _read_jsonl_lines(path)
-    active: Projection | None = None
     expected = 1
+    transcript = Transcript(session_id)
+    parsed: list[tuple[TranscriptEntry, _ParsedLine]] = []
     for line in lines:
         kind, sequence = _validate_envelope(line.value, path=path)
-        if line.end > valid_end:
-            break
+        if kind != "transcript":
+            raise SessionCorruptError(f"non-Transcript record found in transcript log: {path}")
         if sequence != expected:
-            break
+            raise SessionCorruptError(f"Transcript record sequence is not strict in {path}")
         expected += 1
-        if kind != "projection":
-            continue
-        value = line.value.get("projection")
+        value = line.value.get("entry")
         if not isinstance(value, Mapping):
-            raise SessionCorruptError(f"projection record projection must be a mapping: {path}")
+            raise SessionCorruptError(f"Transcript record entry must be a mapping: {path}")
         try:
-            candidate = Projection.from_dict(value)
+            entry = TranscriptEntry.from_dict(value)
+            if entry.session_id != session_id:
+                raise ValueError("entry belongs to another Session")
+            transcript = transcript.append(entry)
+            parsed.append((entry, line))
         except (TypeError, ValueError, KeyError) as exc:
-            raise SessionCorruptError(f"invalid projection record in {path}") from exc
-        if candidate.session_id != session_id or candidate.sequence_end > history.last_sequence:
-            raise SessionCorruptError(f"projection references unwritten History in {path}")
-        for unit in candidate.units:
-            for entry in unit.entries:
-                if entry.sequence > history.last_sequence or history.entries[entry.sequence - 1] != entry:
-                    raise SessionCorruptError(f"projection does not match canonical History in {path}")
-        active = candidate
-    return active
+            raise SessionCorruptError(f"invalid Transcript record in {path}: {exc}") from exc
+    incomplete = _incomplete_units(transcript)
+    if incomplete:
+        units = transcript.semantic_units(complete_only=False)
+        pending = incomplete[0]
+        if len(incomplete) != 1 or units[-1].unit_id != pending.unit_id or not _recoverable_incomplete_unit(pending):
+            raise SessionCorruptError(f"incomplete semantic unit cannot be recovered: {path}")
+        start = next((line.start for entry, line in parsed if entry.sequence >= pending.sequence_start), None)
+        if start is None:
+            raise SessionCorruptError(f"incomplete semantic unit has no persisted boundary: {path}")
+        if recover_incomplete_tail and any(entry.kind is TranscriptKind.TOOL_CALL for entry in pending.entries):
+            diagnostics = [*diagnostics, "preserved_incomplete_tool_semantic_tail"]
+        elif recover_incomplete_tail:
+            transcript = Transcript(session_id, tuple(entry for entry, line in parsed if line.start < start))
+            valid_end = start
+            diagnostics = [*diagnostics, "ignored_incomplete_semantic_tail"]
+    record_sequence = sum(1 for line in lines if line.end <= valid_end)
+    return transcript, valid_end, record_sequence, list(diagnostics)
 
 
-def _read_runtime(path: Path) -> tuple[RuntimeLog, int, int, list[str]]:
+def _read_timeline(path: Path, session_id: str, transcript: Transcript) -> tuple[Timeline, int, int, list[str]]:
     lines, valid_end, diagnostics = _read_jsonl_lines(path)
     expected = 1
-    values: list[RuntimeLogEntry] = []
+    records: list[TimelineRecord] = []
     for line in lines:
         kind, sequence = _validate_envelope(line.value, path=path)
-        if kind != "runtime":
-            raise SessionCorruptError(f"non-runtime record found in runtime log: {path}")
+        if kind != "timeline":
+            raise SessionCorruptError(f"non-Timeline record found in timeline log: {path}")
         if sequence != expected:
-            raise SessionCorruptError(
-                f"runtime record sequence is not strict in {path}: expected {expected}, got {sequence}"
-            )
+            raise SessionCorruptError(f"Timeline record sequence is not strict in {path}")
+        expected += 1
+        value = line.value.get("record")
+        if not isinstance(value, Mapping):
+            raise SessionCorruptError(f"Timeline record must be a mapping: {path}")
+        try:
+            record = timeline_record_from_dict(value)
+            if record.session_id not in (None, session_id):
+                raise ValueError("record belongs to another Session")
+            if not isinstance(record, ActiveCheckpoint):
+                for ref in record.refs:
+                    transcript.select(ref.sequence_start, ref.sequence_end, complete_only=True)
+            records.append(record)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise SessionCorruptError(f"invalid Timeline record in {path}: {exc}") from exc
+    try:
+        timeline = Timeline(session_id, tuple(records))
+    except (TypeError, ValueError) as exc:
+        raise SessionCorruptError(f"invalid Timeline transaction structure in {path}: {exc}") from exc
+    uncommitted_groups = False
+    for group in timeline.transaction_groups():
+        if group and isinstance(group[-1], ActiveCheckpoint):
+            _validate_timeline_transaction(transcript, timeline, group[:-1], group[-1], session_id)
+        else:
+            uncommitted_groups = uncommitted_groups or bool(group)
+    if uncommitted_groups:
+        diagnostics = [*diagnostics, "ignored_uncommitted_timeline_tail"]
+    record_sequence = sum(1 for line in lines if line.end <= valid_end)
+    return timeline, valid_end, record_sequence, list(diagnostics)
+
+
+def _read_runtime(path: Path, session_id: str) -> tuple[RuntimeLog, int, int, list[str]]:
+    lines, valid_end, diagnostics = _read_jsonl_lines(path)
+    expected = 1
+    log = RuntimeLog(session_id)
+    for line in lines:
+        kind, sequence = _validate_envelope(line.value, path=path)
+        if kind != "runtime" or sequence != expected:
+            raise SessionCorruptError(f"runtime record sequence is not strict in {path}")
         expected += 1
         value = line.value.get("entry")
         if not isinstance(value, Mapping):
             raise SessionCorruptError(f"runtime record entry must be a mapping: {path}")
         try:
-            values.append(
-                RuntimeLogEntry(
-                    kind=value["kind"],
-                    payload=value.get("payload", {}),
-                    created_at=value["created_at"],
-                )
+            entry = RuntimeLogEntry(
+                session_id=session_id,
+                sequence=int(value.get("sequence", sequence)),
+                event=str(value["event"]),
+                payload=value.get("payload", {}),
+                created_at=str(value.get("created_at") or _now()),
             )
+            log = log.append(entry)
         except (TypeError, ValueError, KeyError) as exc:
-            raise SessionCorruptError(f"invalid runtime record in {path}") from exc
-    return RuntimeLog(tuple(values)), valid_end, expected - 1, list(diagnostics)
+            raise SessionCorruptError(f"invalid runtime record in {path}: {exc}") from exc
+    return log, valid_end, expected - 1, list(diagnostics)
 
 
 __all__ = [
-    "HistoryAppendOutcome",
-    "ProjectionAppendOutcome",
     "SESSION_RECORD_SCHEMA_VERSION",
     "SESSION_SCHEMA_VERSION",
     "SessionBusyError",
@@ -1313,9 +975,12 @@ __all__ = [
     "SessionDurabilityUnknownError",
     "SessionFileError",
     "SessionFileStore",
+    "SessionIncompatibleError",
     "SessionMetadata",
     "SessionNotFoundError",
     "SessionSnapshot",
     "SessionWriter",
     "SessionWriterRequiredError",
+    "TimelineAppendOutcome",
+    "TranscriptAppendOutcome",
 ]

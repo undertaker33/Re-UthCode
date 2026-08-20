@@ -182,7 +182,7 @@ def _status(context: CommandContext) -> str:
             f"config sources: {source_text}",
             f"state: {getattr(status, 'state', 'unknown')}",
             f"{usage_line} dynamic input operating limit",
-            f"projection revision: {getattr(status, 'projection_revision', None)}",
+            f"Timeline checkpoint: {getattr(status, 'timeline_checkpoint_id', None)}",
             f"instruction epoch: {getattr(status, 'instruction_epoch', 0)}",
             f"compact count: {getattr(status, 'compact_count', 0)}",
             f"cache diagnostics: {cache_text}",
@@ -219,11 +219,12 @@ def _compact(context: CommandContext) -> str:
     if not bool(getattr(result, "changed", False)):
         reason = getattr(result, "failure", None) or "no_compaction_candidate"
         raise CommandExecutionError(f"上下文压缩失败：{reason}")
-    projection = getattr(result, "projection", None)
-    revision = getattr(projection, "revision", None)
+    timeline = getattr(result, "timeline", None)
+    checkpoint = getattr(timeline, "active_checkpoint", None)
+    checkpoint_id = getattr(checkpoint, "turn_id", None)
     return (
-        "上下文已压缩；canonical History 未改写；"
-        f"Projection revision: {revision if revision is not None else 'unknown'}"
+        "上下文已压缩；Transcript 未改写；"
+        f"Timeline checkpoint: {checkpoint_id if checkpoint_id is not None else 'unknown'}"
     )
 
 

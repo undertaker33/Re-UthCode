@@ -1,62 +1,64 @@
-"""Application-owned history conversion and in-memory orchestration."""
+"""Application-owned conversion from provider messages to durable Transcript."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from uthcode.core.history import (
-    CanonicalHistory,
-    HistoryEntry,
-    HistoryKind,
-    Projection,
+    ActiveCheckpoint,
     RuntimeLog,
     RuntimeLogEntry,
-    history_entries_from_message,
+    SemanticEntry,
+    Timeline,
+    Transcript,
+    TranscriptEntry,
+    TranscriptKind,
+    transcript_entries_from_message,
 )
 from uthcode.core.provider import JsonPayload, Message
 
 
 @dataclass(frozen=True, slots=True)
 class ApplicationHistory:
-    """Coordinate one append-only semantic history and its active projection."""
+    """Coordinate a Session's raw Transcript and derived Timeline in memory."""
 
     session_id: str
-    canonical: CanonicalHistory | None = None
-    projection: Projection | None = None
-    runtime_log: RuntimeLog = RuntimeLog()
+    transcript: Transcript | None = None
+    timeline: Timeline | None = None
+    runtime_log: RuntimeLog | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
             raise ValueError("session_id must be a non-empty string")
-        canonical = self.canonical or CanonicalHistory(self.session_id)
-        if not isinstance(canonical, CanonicalHistory):
-            raise TypeError("canonical must be CanonicalHistory or None")
-        if canonical.session_id != self.session_id:
-            raise ValueError("canonical history belongs to another session")
-        if self.projection is not None:
-            if not isinstance(self.projection, Projection):
-                raise TypeError("projection must be Projection or None")
-            if self.projection.session_id != self.session_id:
-                raise ValueError("projection belongs to another session")
-        if not isinstance(self.runtime_log, RuntimeLog):
-            raise TypeError("runtime_log must be RuntimeLog")
-        object.__setattr__(self, "canonical", canonical)
+        transcript = self.transcript or Transcript(self.session_id)
+        timeline = self.timeline
+        runtime_log = self.runtime_log or RuntimeLog(self.session_id)
+        if transcript.session_id != self.session_id:
+            raise ValueError("transcript belongs to another session")
+        if timeline is not None and timeline.session_id != self.session_id:
+            raise ValueError("timeline belongs to another session")
+        if runtime_log.session_id != self.session_id:
+            raise ValueError("runtime log belongs to another session")
+        object.__setattr__(self, "transcript", transcript)
+        object.__setattr__(self, "runtime_log", runtime_log)
 
     @property
-    def history(self) -> CanonicalHistory:
-        assert self.canonical is not None
-        return self.canonical
+    def history(self) -> Transcript:
+        """Current raw facts; retained as a descriptive property, not a legacy type."""
+
+        assert self.transcript is not None
+        return self.transcript
 
     @property
-    def active_projection(self) -> Projection | None:
-        return self.projection
+    def active_timeline(self) -> Timeline | None:
+        return self.timeline
 
-    def append(self, entry: HistoryEntry) -> "ApplicationHistory":
+    def append(self, entry: TranscriptEntry) -> "ApplicationHistory":
         return ApplicationHistory(
-            session_id=self.session_id,
-            canonical=self.history.append(entry),
-            projection=self.projection,
+            self.session_id,
+            transcript=self.history.append(entry),
+            timeline=self.timeline,
             runtime_log=self.runtime_log,
         )
 
@@ -64,96 +66,75 @@ class ApplicationHistory:
         self,
         *,
         turn_id: str,
-        kind: HistoryKind | str,
+        kind: TranscriptKind | str,
         payload: Mapping[str, Any] | JsonPayload | None = None,
         semantic_unit_id: str | None = None,
     ) -> "ApplicationHistory":
-        return ApplicationHistory(
+        entry = TranscriptEntry(
             session_id=self.session_id,
-            canonical=self.history.append(
-                turn_id=turn_id,
-                kind=kind,
-                payload=payload,
-                semantic_unit_id=semantic_unit_id,
-            ),
-            projection=self.projection,
-            runtime_log=self.runtime_log,
+            sequence=self.history.last_sequence + 1,
+            turn_id=turn_id,
+            kind=TranscriptKind(kind),
+            payload=payload or {},
+            semantic_unit_id=semantic_unit_id,
         )
+        return self.append(entry)
 
-    def append_message(
-        self,
-        *,
-        turn_id: str,
-        message: Message,
-    ) -> "ApplicationHistory":
-        """Append a Message's provider-independent semantic parts in order."""
-
+    def append_message(self, *, turn_id: str, message: Message) -> "ApplicationHistory":
         result = self
-        for entry in history_entries_for_message(
-            self.session_id,
-            turn_id,
-            self.history.last_sequence + 1,
-            message,
+        for entry in transcript_entries_for_message(
+            self.session_id, turn_id, self.history.last_sequence + 1, message
         ):
             result = result.append(entry)
         return result
 
-    def replace_projection(self, projection: Projection) -> "ApplicationHistory":
-        """Set a new immutable view without changing canonical records."""
-
-        if not isinstance(projection, Projection):
-            raise TypeError("projection must be a Projection")
-        if projection.session_id != self.session_id:
-            raise ValueError("projection belongs to another session")
+    def replace_timeline(self, timeline: Timeline) -> "ApplicationHistory":
+        if not isinstance(timeline, Timeline) or timeline.session_id != self.session_id:
+            raise ValueError("timeline belongs to another session")
         return ApplicationHistory(
-            session_id=self.session_id,
-            canonical=self.history,
-            projection=projection,
+            self.session_id,
+            transcript=self.history,
+            timeline=timeline,
             runtime_log=self.runtime_log,
         )
 
     def append_runtime(self, entry: RuntimeLogEntry) -> "ApplicationHistory":
         return ApplicationHistory(
-            session_id=self.session_id,
-            canonical=self.history,
-            projection=self.projection,
+            self.session_id,
+            transcript=self.history,
+            timeline=self.timeline,
             runtime_log=self.runtime_log.append(entry),
         )
 
-    def project(
-        self,
-        *,
-        revision: int,
-        sequence_start: int | None = None,
-        sequence_end: int | None = None,
-        previous_revision: int | None = None,
-        summary: str | None = None,
-    ) -> "ApplicationHistory":
-        projection = self.history.project(
-            revision=revision,
-            sequence_start=sequence_start,
-            sequence_end=sequence_end,
-            previous_revision=previous_revision,
-            summary=summary,
-        )
-        return self.replace_projection(projection)
 
-
-def history_entries_for_message(
+def transcript_entries_for_message(
     session_id: str,
     turn_id: str,
     sequence: int,
     message: Message,
-) -> tuple[HistoryEntry, ...]:
-    """Convert one Message while retaining its identity-local reconstruction."""
+) -> tuple[TranscriptEntry, ...]:
+    """Persist one complete Message as an identity-local semantic unit."""
 
-    entries = history_entries_from_message(session_id, turn_id, sequence, message)
-    converted: list[HistoryEntry] = []
+    entries = transcript_entries_from_message(session_id, turn_id, sequence, message)
+    message_id = f"{turn_id}:{sequence}"
+    converted: list[TranscriptEntry] = []
     for entry in entries:
         payload = dict(entry.payload)
         payload["message"] = message.to_dict()
-        converted.append(replace(entry, payload=payload))
+        payload["message_id"] = message_id
+        converted.append(
+            TranscriptEntry(
+                session_id=entry.session_id,
+                sequence=entry.sequence,
+                turn_id=entry.turn_id,
+                kind=entry.kind,
+                payload=payload,
+                created_at=entry.created_at,
+                commit_boundary=entry.commit_boundary,
+                semantic_unit_id=entry.semantic_unit_id,
+            )
+        )
     return tuple(converted)
 
 
-__all__ = ["ApplicationHistory", "history_entries_for_message"]
+__all__ = ["ApplicationHistory", "transcript_entries_for_message"]

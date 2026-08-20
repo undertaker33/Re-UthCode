@@ -31,7 +31,7 @@ class ContextAuthority(str, Enum):
     PROJECT_INSTRUCTION = "project_instruction"
     DIRECTORY_INSTRUCTION = "directory_instruction"
     HISTORY = "history"
-    HISTORY_PROJECTION = "history_projection"
+    TIMELINE = "timeline"
     RUNTIME = "runtime"
     ENVIRONMENT = "environment"
     TOOL_SYSTEM = "tool_system"
@@ -52,7 +52,8 @@ class ContextSourceKind(str, Enum):
     USER_INSTRUCTION = "user_instruction"
     PROJECT_INSTRUCTION = "project_instruction"
     DIRECTORY_INSTRUCTION = "directory_instruction"
-    PROJECTION = "projection"
+    TIMELINE_ENTRY = "timeline_entry"
+    TIMELINE_MACRO = "timeline_macro"
     USER_MESSAGE = "user_message"
     ASSISTANT_MESSAGE = "assistant_message"
     TOOL_CALL = "tool_call"
@@ -89,8 +90,9 @@ _SOURCE_AUTHORITY = {
     ContextSourceKind.USER_INSTRUCTION: ContextAuthority.USER_INSTRUCTION,
     ContextSourceKind.PROJECT_INSTRUCTION: ContextAuthority.PROJECT_INSTRUCTION,
     ContextSourceKind.DIRECTORY_INSTRUCTION: ContextAuthority.DIRECTORY_INSTRUCTION,
-    ContextSourceKind.PROJECTION: ContextAuthority.HISTORY_PROJECTION,
-    ContextSourceKind.SUMMARY: ContextAuthority.HISTORY_PROJECTION,
+    ContextSourceKind.TIMELINE_ENTRY: ContextAuthority.TIMELINE,
+    ContextSourceKind.TIMELINE_MACRO: ContextAuthority.TIMELINE,
+    ContextSourceKind.SUMMARY: ContextAuthority.TIMELINE,
     ContextSourceKind.USER_MESSAGE: ContextAuthority.HISTORY,
     ContextSourceKind.ASSISTANT_MESSAGE: ContextAuthority.HISTORY,
     ContextSourceKind.TOOL_CALL: ContextAuthority.HISTORY,
@@ -197,7 +199,7 @@ def _plane_for_authority(authority: ContextAuthority) -> ContextPlane:
         return ContextPlane.INSTRUCTION
     if authority in {
         ContextAuthority.HISTORY,
-        ContextAuthority.HISTORY_PROJECTION,
+        ContextAuthority.TIMELINE,
     }:
         return ContextPlane.CONVERSATION
     return ContextPlane.CONTEXTUAL
@@ -510,10 +512,10 @@ class CoreRuntimeContractSource(_TextContextSource):
 
 
 @dataclass(frozen=True, slots=True)
-class HistoryProjectionSource(_TextContextSource):
-    """Projection text that remains in the history-authority plane."""
+class TimelineSource(_TextContextSource):
+    """Derived Timeline text that remains in the conversation plane."""
 
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.PROJECTION
+    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.TIMELINE_ENTRY
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,7 +850,7 @@ __all__ = [
     "ContextSourceKind",
     "ContextStability",
     "EnvironmentSource",
-    "HistoryProjectionSource",
+    "TimelineSource",
     "InstructionPrefix",
     "PromptSection",
     "PromptAssetSource",

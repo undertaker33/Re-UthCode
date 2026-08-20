@@ -101,5 +101,5 @@ interfaces -> application -> core
 - 工作包规则：`docs/rules/WorkPackageRules.md`
 - 能力欠账：`docs/OutstandingDebtList.md`
 - 历史设计参考：`D:\project\UthCode`、`D:\project\MewCode`
-- 外部参考：[OpenAI Codex](https://github.com/openai/codex)、[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)、[Claude Code](https://github.com/anthropics/claude-code)
+- 外部参考：[OpenAI Codex](https://github.com/openai/codex)、[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)、[Claude Code](https://github.com/anthropics/claude-code)、[Deepseek Harness]((https://github.com/deepseek-ai/deepseek-harness/))
 - TUI 参考：[FirstCoder](https://github.com/KomorGiaoGiao/FirstCoder)

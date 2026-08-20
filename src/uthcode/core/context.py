@@ -15,7 +15,18 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .history import CanonicalHistory, HistoryEntry, Projection, SemanticUnit
+from .history import (
+    ActiveCheckpoint,
+    EpochMacroSummary,
+    SemanticEntry,
+    SemanticUnit,
+    Timeline,
+    TimelineRecord,
+    Transcript,
+    TranscriptEntry,
+    TranscriptKind,
+    timeline_record_from_dict,
+)
 from .prompt import (
     ContextAuthority,
     ContextBlock,
@@ -25,7 +36,7 @@ from .prompt import (
     ContextStability,
     CoreRuntimeContractSource,
     EnvironmentSource,
-    HistoryProjectionSource,
+    TimelineSource,
     ProjectInstructionSource,
     PromptAssetSource,
     RuntimeStateSource,
@@ -355,7 +366,7 @@ class GateDecision:
 
 
 class CompactionError(ValueError):
-    """A bounded Compaction request could not produce a safe Projection."""
+    """A bounded Compaction request could not produce a safe Timeline."""
 
 
 class CompactionInProgress(CompactionError):
@@ -407,9 +418,9 @@ class CompactionBatch:
 
 @dataclass(frozen=True, slots=True)
 class CompactionResult:
-    """A Compaction candidate; failed candidates retain the old Projection."""
+    """A bounded Timeline candidate; failed candidates retain old records."""
 
-    projection: Projection | None
+    timeline: Timeline | None
     summary: str | None
     batches: tuple[CompactionBatch, ...] = ()
     changed: bool = False
@@ -418,8 +429,8 @@ class CompactionResult:
     output_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if self.projection is not None and not isinstance(self.projection, Projection):
-            raise TypeError("projection must be a Projection or None")
+        if self.timeline is not None and not isinstance(self.timeline, Timeline):
+            raise TypeError("timeline must be a Timeline or None")
         if self.summary is not None and not isinstance(self.summary, str):
             raise TypeError("summary must be a string or None")
         if not isinstance(self.changed, bool):
@@ -769,8 +780,8 @@ class ContextSourceBundle:
 
     instruction_sources: tuple[object, ...] = ()
     project_instruction_source: ProjectInstructionSource | None = None
-    history: CanonicalHistory | None = None
-    projection: Projection | None = None
+    transcript: Transcript | None = None
+    timeline: Timeline | None = None
     protected_context: tuple[object, ...] = ()
     protocol_blocks: tuple[object, ...] = ()
     current_turn: tuple[object, ...] = ()
@@ -797,15 +808,15 @@ class ContextSourceBundle:
             self.project_instruction_source, ProjectInstructionSource
         ):
             raise TypeError("project_instruction_source must be ProjectInstructionSource or None")
-        if self.history is not None and not isinstance(self.history, CanonicalHistory):
-            raise TypeError("history must be CanonicalHistory or None")
-        if self.projection is not None and not isinstance(self.projection, Projection):
-            raise TypeError("projection must be Projection or None")
+        if self.transcript is not None and not isinstance(self.transcript, Transcript):
+            raise TypeError("transcript must be Transcript or None")
+        if self.timeline is not None and not isinstance(self.timeline, Timeline):
+            raise TypeError("timeline must be Timeline or None")
         if self.tool_source is not None and not isinstance(self.tool_source, ToolDefinitionSource):
             raise TypeError("tool_source must be ToolDefinitionSource or None")
-        if self.history is not None and self.projection is not None:
-            if self.history.session_id != self.projection.session_id:
-                raise ContextCompilationError("history and projection belong to different sessions")
+        if self.transcript is not None and self.timeline is not None:
+            if self.transcript.session_id != self.timeline.session_id:
+                raise ContextCompilationError("transcript and timeline belong to different sessions")
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,7 +865,7 @@ class ContextSnapshot:
     selected_blocks: tuple[ContextBlock, ...]
     omitted_blocks: tuple[ContextBlock, ...]
     omitted_reasons: tuple[tuple[str, str], ...]
-    projection_revision: int | None
+    timeline_checkpoint: ActiveCheckpoint | None
     instruction_epoch: int
     stable_prefix_estimated_tokens: int
     stable_prefix_fingerprint: str
@@ -895,6 +906,8 @@ class ContextSnapshot:
             raise TypeError("tool_definitions must contain ToolDefinition values")
         if not isinstance(self.over_budget, bool):
             raise TypeError("over_budget must be a boolean")
+        if self.timeline_checkpoint is not None and not isinstance(self.timeline_checkpoint, ActiveCheckpoint):
+            raise TypeError("timeline_checkpoint must be ActiveCheckpoint or None")
         object.__setattr__(self, "selected_blocks", selected)
         object.__setattr__(self, "omitted_blocks", omitted)
         object.__setattr__(self, "omitted_reasons", tuple((str(key), str(value)) for key, value in self.omitted_reasons))
@@ -911,6 +924,10 @@ class ContextSnapshot:
     @property
     def budget(self) -> int | None:
         return self.budget_tokens
+
+    @property
+    def timeline_checkpoint_id(self) -> str | None:
+        return self.timeline_checkpoint.turn_id if self.timeline_checkpoint is not None else None
 
     @property
     def selected_block_ids(self) -> tuple[str, ...]:
@@ -951,7 +968,11 @@ class ContextSnapshot:
                 {"block_id": block_id, "reason": reason}
                 for block_id, reason in self.omitted_reasons
             ],
-            "projection_revision": self.projection_revision,
+            "timeline_checkpoint": (
+                self.timeline_checkpoint.to_dict()
+                if self.timeline_checkpoint is not None
+                else None
+            ),
             "instruction_epoch": self.instruction_epoch,
             "stable_prefix_estimated_tokens": self.stable_prefix_estimated_tokens,
             "stable_prefix_fingerprint": self.stable_prefix_fingerprint,
@@ -984,7 +1005,7 @@ def context_block_id(block: ContextBlock) -> str:
 
 
 class ContextCompactor:
-    """Create bounded Projection candidates without Provider or Tool access."""
+    """Create bounded Timeline candidates without Provider or Tool access."""
 
     def __init__(
         self,
@@ -1016,39 +1037,39 @@ class ContextCompactor:
 
     def compact(
         self,
-        history: CanonicalHistory,
+        transcript: Transcript,
         *,
-        projection: Projection | None = None,
+        timeline: Timeline | None = None,
         session_id: str | None = None,
         summarize: SummaryFunction | None = None,
         cancellation: CancellationToken | None = None,
     ) -> CompactionResult:
         """Compact complete units in chronological bounded rolling batches.
 
-        The method returns a failed candidate with the previous Projection
+        The method returns a failed candidate with the previous Timeline
         untouched when the summary callback or budget contract fails.  The
-        caller is responsible for the later durable ``append_projection``.
+        caller is responsible for the later durable Timeline append.
         """
 
-        if not isinstance(history, CanonicalHistory):
-            raise TypeError("history must be a CanonicalHistory")
-        if projection is not None and not isinstance(projection, Projection):
-            raise TypeError("projection must be a Projection or None")
-        if projection is not None and projection.session_id != history.session_id:
-            raise CompactionError("history and projection belong to different Sessions")
-        owner = history.session_id if session_id is None else session_id
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if timeline is not None and not isinstance(timeline, Timeline):
+            raise TypeError("timeline must be a Timeline or None")
+        if timeline is not None and timeline.session_id != transcript.session_id:
+            raise CompactionError("transcript and timeline belong to different Sessions")
+        owner = transcript.session_id if session_id is None else session_id
         if not isinstance(owner, str) or not owner:
             raise ValueError("session_id must be a non-empty string")
-        if owner != history.session_id:
-            raise CompactionError("Compaction Session does not own the supplied History")
+        if owner != transcript.session_id:
+            raise CompactionError("Compaction Session does not own the supplied Transcript")
         if cancellation is not None and not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
 
         lock = self._acquire_single_flight(owner)
         try:
             return self._compact_locked(
-                history,
-                projection=projection,
+                transcript,
+                timeline=timeline,
                 summarize=summarize,
                 cancellation=cancellation,
             )
@@ -1064,34 +1085,34 @@ class ContextCompactor:
 
     def _compact_locked(
         self,
-        history: CanonicalHistory,
+        transcript: Transcript,
         *,
-        projection: Projection | None,
+        timeline: Timeline | None,
         summarize: SummaryFunction | None,
         cancellation: CancellationToken | None,
     ) -> CompactionResult:
         if cancellation is not None and cancellation.cancelled:
             return self._failed_result(
-                projection,
-                projection.summary if projection is not None else "",
+                timeline,
+                timeline.summary if timeline is not None else "",
                 "compaction_cancelled",
                 (),
                 0,
             )
-        previous_summary = projection.summary if projection is not None else ""
-        units = list(history.complete_semantic_units())
-        if projection is not None:
-            units = [unit for unit in units if unit.sequence_end > projection.sequence_end]
+        previous_summary = timeline.summary if timeline is not None else ""
+        units = list(transcript.semantic_units(complete_only=True))
+        if timeline is not None:
+            units = [unit for unit in units if unit.sequence_end > timeline.sequence_end]
         if not units:
             return CompactionResult(
-                projection=projection,
+                timeline=timeline,
                 summary=previous_summary or None,
                 changed=False,
             )
 
         if summarize is None:
             return self._failed_result(
-                projection,
+                timeline,
                 previous_summary,
                 "summarizer_unavailable",
                 (),
@@ -1145,7 +1166,7 @@ class ContextCompactor:
         for unit in units:
             if cancellation is not None and cancellation.cancelled:
                 return self._failed_result(
-                    projection,
+                    timeline,
                     previous_summary,
                     "compaction_cancelled",
                     batches,
@@ -1159,11 +1180,11 @@ class ContextCompactor:
                 continue
             failure = flush_pending()
             if failure is not None:
-                return self._failed_result(projection, previous_summary, failure, batches, input_tokens)
+                return self._failed_result(timeline, previous_summary, failure, batches, input_tokens)
             single_text = _compaction_input_text(rolling_summary, (unit,))
             if self._estimate(single_text) > self.policy.available_input_budget:
                 return self._failed_result(
-                    projection,
+                    timeline,
                     previous_summary,
                     "single_semantic_unit_exceeds_compaction_budget",
                     batches,
@@ -1172,33 +1193,42 @@ class ContextCompactor:
             pending.append(unit)
         failure = flush_pending()
         if failure is not None:
-            return self._failed_result(projection, previous_summary, failure, batches, input_tokens)
+            return self._failed_result(timeline, previous_summary, failure, batches, input_tokens)
         if not batches:
-            return CompactionResult(projection, previous_summary or None)
+            return CompactionResult(timeline, previous_summary or None)
 
-        all_units = tuple(unit for batch in batches for unit in units if unit.unit_id in batch.unit_ids)
-        revision = 1 if projection is None else projection.revision + 1
         try:
-            candidate_projection = Projection(
-                session_id=history.session_id,
-                revision=revision,
-                sequence_start=all_units[0].sequence_start,
-                sequence_end=all_units[-1].sequence_end,
-                units=all_units,
-                previous_revision=(projection.revision if projection is not None else None),
-                summary=rolling_summary,
+            derived: list[SemanticEntry] = []
+            for batch in batches:
+                reference = transcript.reference(batch.sequence_start, batch.sequence_end)
+                covered = tuple(unit for unit in units if unit.unit_id in batch.unit_ids)
+                derived.append(
+                    SemanticEntry(
+                        turn_id=covered[-1].turn_id,
+                        summary=batch.output_summary,
+                        refs=(reference,),
+                        session_id=transcript.session_id,
+                    )
+                )
+            checkpoint = ActiveCheckpoint(
+                turn_id=derived[-1].turn_id,
+                active_turns=tuple(record.turn_id for record in derived),
+                session_id=transcript.session_id,
+            )
+            candidate_timeline = (timeline or Timeline(transcript.session_id)).append_transaction(
+                derived, checkpoint
             )
         except (TypeError, ValueError):
             return self._failed_result(
-                projection,
+                timeline,
                 previous_summary,
-                "projection_boundary_invalid",
+                "timeline_boundary_invalid",
                 batches,
                 input_tokens,
             )
         output_tokens = self._estimate(rolling_summary)
         return CompactionResult(
-            projection=candidate_projection,
+            timeline=candidate_timeline,
             summary=rolling_summary,
             batches=tuple(batches),
             changed=True,
@@ -1208,14 +1238,14 @@ class ContextCompactor:
 
     def _failed_result(
         self,
-        projection: Projection | None,
+        timeline: Timeline | None,
         previous_summary: str,
         failure: str,
         batches: Sequence[CompactionBatch],
         input_tokens: int,
     ) -> CompactionResult:
         return CompactionResult(
-            projection=projection,
+            timeline=timeline,
             summary=previous_summary or None,
             batches=tuple(batches),
             changed=False,
@@ -1257,9 +1287,9 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
     def append(message: Message) -> None:
         result.append(message)
 
-    def append_history_entry(entry: HistoryEntry) -> None:
+    def append_transcript_entry(entry: TranscriptEntry) -> None:
         nonlocal last_history_identity, last_history_was_full_message
-        identity, message, is_full_message = _history_entry_message(entry)
+        identity, message, is_full_message = _transcript_entry_message(entry)
         if identity == last_history_identity:
             if last_history_was_full_message or is_full_message:
                 # _history_for_messages may persist the complete Message on
@@ -1287,22 +1317,27 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
     for block in snapshot.selected_blocks:
         if block.plane is ContextPlane.INSTRUCTION:
             continue
-        if block.source_kind is ContextSourceKind.PROJECTION:
+        if block.source_kind in {
+            ContextSourceKind.TIMELINE_ENTRY,
+            ContextSourceKind.TIMELINE_MACRO,
+        }:
             break_history_identity()
             try:
-                projection = Projection.from_dict(json.loads(block.content))
+                record = timeline_record_from_dict(json.loads(block.content))
             except (TypeError, ValueError, json.JSONDecodeError):
-                raise ContextCompilationError("selected Projection block is malformed") from None
-            summary = projection.summary or f"Projection revision {projection.revision}"
-            append(Message("user", (TextPart(f"[Compacted history summary]\n{summary}"),)))
+                raise ContextCompilationError("selected Timeline block is malformed") from None
+            if isinstance(record, ActiveCheckpoint):
+                continue
+            label = "Timeline macro" if isinstance(record, EpochMacroSummary) else "Timeline entry"
+            append(Message("user", (TextPart(f"[{label}]\n{record.summary}"),)))
             continue
-        if block.provenance.startswith("history:unit:"):
+        if block.provenance.startswith("transcript:unit:"):
             try:
                 unit = SemanticUnit.from_dict(json.loads(block.content))
             except (TypeError, ValueError, json.JSONDecodeError):
                 raise ContextCompilationError("selected semantic unit block is malformed") from None
             for entry in unit.entries:
-                append_history_entry(entry)
+                append_transcript_entry(entry)
             continue
         if block.provenance.startswith("message:") or block.provenance == "current:user":
             break_history_identity()
@@ -1343,11 +1378,11 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
     return tuple(result)
 
 
-def _history_entry_message(
-    entry: HistoryEntry,
+def _transcript_entry_message(
+    entry: TranscriptEntry,
 ) -> tuple[tuple[str, ...], Message, bool]:
     if not hasattr(entry, "payload") or not hasattr(entry, "kind"):
-        raise ContextCompilationError("history entry is malformed")
+        raise ContextCompilationError("Transcript entry is malformed")
     payload = entry.payload
     if isinstance(payload, Mapping):
         def identity_for(message: Message) -> tuple[str, ...]:
@@ -1441,8 +1476,8 @@ class ContextCompiler:
         previous_snapshot: ContextSnapshot | None = None,
         instruction_sources: Sequence[object] | object = _MISSING,
         project_instruction_source: ProjectInstructionSource | None | object = _MISSING,
-        history: CanonicalHistory | None | object = _MISSING,
-        projection: Projection | None | object = _MISSING,
+        transcript: Transcript | None | object = _MISSING,
+        timeline: Timeline | None | object = _MISSING,
         protected_context: Sequence[object] | object = _MISSING,
         protocol_blocks: Sequence[object] | object = _MISSING,
         current_turn: Sequence[object] | object = _MISSING,
@@ -1455,8 +1490,8 @@ class ContextCompiler:
         individual_inputs = (
             instruction_sources,
             project_instruction_source,
-            history,
-            projection,
+            transcript,
+            timeline,
             protected_context,
             protocol_blocks,
             current_turn,
@@ -1480,8 +1515,8 @@ class ContextCompiler:
                 project_instruction_source=(
                     None if project_instruction_source is _MISSING else project_instruction_source
                 ),
-                history=None if history is _MISSING else history,
-                projection=None if projection is _MISSING else projection,
+                transcript=None if transcript is _MISSING else transcript,
+                timeline=None if timeline is _MISSING else timeline,
                 protected_context=tuple(() if protected_context is _MISSING else protected_context),
                 protocol_blocks=tuple(() if protocol_blocks is _MISSING else protocol_blocks),
                 current_turn=normalized_current_turn,
@@ -1551,7 +1586,7 @@ class ContextCompiler:
 
         # Selection priority and final composition order are deliberately
         # separate.  Protected sources are selected first, while the final
-        # snapshot keeps Projection/history before runtime facts and the
+        # snapshot keeps Timeline/Transcript before runtime facts and the
         # current user turn at the conversation tail.
         for index, block in enumerate(prefix.blocks):
             add_selected(block, required=True, composition_key=(0, index))
@@ -1574,8 +1609,8 @@ class ContextCompiler:
                 composition_key=(7, index),
             )
 
-        if sources.history is not None:
-            for unit in sources.history.semantic_units(include_incomplete=True):
+        if sources.transcript is not None:
+            for unit in sources.transcript.semantic_units(complete_only=False):
                 if not unit.complete:
                     add_selected(
                         _semantic_unit_block(unit),
@@ -1583,20 +1618,27 @@ class ContextCompiler:
                         composition_key=(3, unit.sequence_start),
                     )
 
-        if sources.projection is not None:
-            add_selected(
-                _projection_block(sources.projection),
-                required=True,
-                composition_key=(2, 0),
-            )
+        if sources.timeline is not None:
+            for index, record in enumerate(sources.timeline.committed_records):
+                if isinstance(record, ActiveCheckpoint):
+                    continue
+                add_selected(
+                    _timeline_block(record),
+                    required=True,
+                    composition_key=(2, index),
+                )
 
-        complete_units = () if sources.history is None else sources.history.complete_semantic_units()
-        if sources.projection is not None and sources.projection.summary is not None:
-            complete_units = tuple(
-                unit
-                for unit in complete_units
-                if unit.sequence_end > sources.projection.sequence_end
-            )
+        complete_units = () if sources.transcript is None else sources.transcript.semantic_units(complete_only=True)
+        covered_ranges = () if sources.timeline is None else tuple(
+            (ref.sequence_start, ref.sequence_end)
+            for record in sources.timeline.committed_records
+            if isinstance(record, (SemanticEntry, EpochMacroSummary))
+            for ref in record.refs
+        )
+        complete_units = tuple(
+            unit for unit in complete_units
+            if not any(start <= unit.sequence_start and unit.sequence_end <= end for start, end in covered_ranges)
+        )
         remaining_units = list(reversed(complete_units))
         for position, unit in enumerate(remaining_units):
             if add_selected(
@@ -1637,7 +1679,7 @@ class ContextCompiler:
             selected_blocks=tuple(selected),
             omitted_blocks=tuple(omitted),
             omitted_reasons=tuple(omission_reasons),
-            projection_revision=(sources.projection.revision if sources.projection is not None else None),
+            timeline_checkpoint=(sources.timeline.active_checkpoint if sources.timeline is not None else None),
             instruction_epoch=instruction_epoch,
             stable_prefix_estimated_tokens=stable_prefix_estimated_tokens,
             stable_prefix_fingerprint=stable_fingerprint,
@@ -1747,7 +1789,7 @@ def _semantic_unit_block(unit: SemanticUnit) -> ContextBlock:
         authority=ContextAuthority.HISTORY,
         stability=ContextStability.DYNAMIC,
         scope=ContextScope.TURN,
-        provenance=f"history:unit:{unit.unit_id}",
+        provenance=f"transcript:unit:{unit.unit_id}",
         content=json.dumps(unit.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         semantic_unit_id=unit.unit_id,
     )
@@ -1759,20 +1801,25 @@ def _unit_source_kind(unit: SemanticUnit) -> ContextSourceKind:
     if any(entry.is_tool_call for entry in unit.entries):
         return ContextSourceKind.TOOL_CALL
     first = unit.entries[0]
-    if first.kind.value == "assistant_message":
+    if first.kind is TranscriptKind.ASSISTANT_MESSAGE:
         return ContextSourceKind.ASSISTANT_MESSAGE
     return ContextSourceKind.USER_MESSAGE
 
 
-def _projection_block(projection: Projection) -> ContextBlock:
-    return HistoryProjectionSource(
+def _timeline_block(record: SemanticEntry | EpochMacroSummary) -> ContextBlock:
+    source_kind = (
+        ContextSourceKind.TIMELINE_MACRO
+        if isinstance(record, EpochMacroSummary)
+        else ContextSourceKind.TIMELINE_ENTRY
+    )
+    return TimelineSource(
         ContextBlock(
-            source_kind=ContextSourceKind.PROJECTION,
-            authority=ContextAuthority.HISTORY_PROJECTION,
+            source_kind=source_kind,
+            authority=ContextAuthority.TIMELINE,
             stability=ContextStability.DYNAMIC,
             scope=ContextScope.SESSION,
-            provenance=f"projection:{projection.revision}",
-            content=projection.to_json(),
+            provenance=f"timeline:{record.record_type}:{record.turn_id}",
+            content=json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
     ).to_context_block()
 
@@ -1809,7 +1856,7 @@ def _conversation_block(raw: object) -> ContextBlock:
             provenance="current:user",
             content=raw,
         )
-    if isinstance(raw, (RuntimeStateSource, EnvironmentSource, HistoryProjectionSource)):
+    if isinstance(raw, (RuntimeStateSource, EnvironmentSource, TimelineSource)):
         return raw.to_context_block()
     raise TypeError(f"unsupported conversation/context source: {type(raw).__name__}")
 

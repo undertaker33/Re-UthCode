@@ -42,7 +42,7 @@ from uthcode.core.provider import (
     Usage,
     validated_provider_stream,
 )
-from uthcode.core.history import HistoryEntry
+from uthcode.core.history import TranscriptEntry
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -66,13 +66,13 @@ from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService
 from .instructions import InstructionLoader
-from .history import history_entries_for_message
+from .history import transcript_entries_for_message
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
     ApplicationSession,
     ApplicationSessionService,
-    HistoryAppendOutcome,
-    ProjectionAppendOutcome,
+    TimelineAppendOutcome,
+    TranscriptAppendOutcome,
     SessionCatalogEntry,
 )
 from .tools import ApplicationToolService
@@ -323,7 +323,7 @@ class ApplicationStatus:
     configuration_sources: tuple[ConfigSource, ...]
     state: str = "ready"
     context_usage: ContextUsage = ContextUsage(0, available=False)
-    projection_revision: int | None = None
+    timeline_checkpoint_id: str | None = None
     instruction_epoch: int = 0
     compact_count: int = 0
     stable_prefix_fingerprint: str | None = None
@@ -346,7 +346,7 @@ class ApplicationStatus:
             ],
             "state": self.state,
             "context_usage": self.context_usage.to_dict(),
-            "projection_revision": self.projection_revision,
+            "timeline_checkpoint_id": self.timeline_checkpoint_id,
             "instruction_epoch": self.instruction_epoch,
             "compact_count": self.compact_count,
             "stable_prefix_fingerprint": self.stable_prefix_fingerprint,
@@ -358,29 +358,29 @@ class ApplicationStatus:
 
 
 @dataclass(frozen=True, slots=True)
-class HistoryPersistenceOutcome:
+class TranscriptPersistenceOutcome:
     """Describe the two durable boundaries of one terminal Run delta."""
 
-    history_appended: bool
+    transcript_appended: bool
     instruction_state_synced: bool
     failure_stage: str | None
     persisted_message_count: int
-    history_metadata_synced: bool = True
-    history_reload_succeeded: bool = True
-    history_durability: str = "durable"
+    transcript_metadata_synced: bool = True
+    transcript_reload_succeeded: bool = True
+    transcript_durability: str = "durable"
     failure_stages: tuple[str, ...] = ()
 
     @property
     def status(self) -> str:
         if (
-            self.history_appended
+            self.transcript_appended
             and self.instruction_state_synced
-            and self.history_metadata_synced
-            and self.history_durability == "durable"
+            and self.transcript_metadata_synced
+            and self.transcript_durability == "durable"
             and not self.failure_stages
         ):
             return "committed"
-        if self.history_appended:
+        if self.transcript_appended:
             return "partial"
         if self.failure_stage is None:
             return "not_available"
@@ -389,11 +389,11 @@ class HistoryPersistenceOutcome:
     @property
     def error_code(self) -> str | None:
         return {
-            "history_append": "history_persistence_failed",
-            "history_append_reconciled": "history_append_reconciled",
-            "history_reload": "history_reload_failed",
-            "history_metadata_sync": "history_metadata_sync_failed",
-            "history_durability_unknown": "history_durability_unknown",
+            "transcript_append": "transcript_persistence_failed",
+            "transcript_append_reconciled": "transcript_append_reconciled",
+            "transcript_reload": "transcript_reload_failed",
+            "transcript_metadata_sync": "transcript_metadata_sync_failed",
+            "transcript_durability_unknown": "transcript_durability_unknown",
             "instruction_state_sync": "instruction_state_sync_failed",
             "session_boundary": "session_boundary",
             "invalid_message": "invalid_message",
@@ -498,11 +498,11 @@ class UthCodeApplication:
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
         self._history_persistence_diagnostics: dict[str, object] = {
             "status": "not_available",
-            "history_appended": False,
+            "transcript_appended": False,
             "instruction_state_synced": False,
-            "history_metadata_synced": False,
-            "history_reload_succeeded": False,
-            "history_durability": "not_available",
+            "transcript_metadata_synced": False,
+            "transcript_reload_succeeded": False,
+            "transcript_durability": "not_available",
             "failure_stage": None,
             "failure_stages": [],
             "persisted_message_count": 0,
@@ -642,7 +642,7 @@ class UthCodeApplication:
         *,
         summarize: Callable[[str], str] | None = None,
     ) -> CompactionResult:
-        """Compact the active Session without mutating canonical History."""
+        """Compact the active Session without mutating its Transcript."""
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
@@ -650,66 +650,66 @@ class UthCodeApplication:
         if session is None:
             raise RuntimeError("no active Session")
         result = self._context_service.compact(
-            session.history,
-            projection=session.projection,
+            session.transcript,
+            timeline=session.timeline,
             session_id=session.session_id,
             summarize=summarize,
         )
-        if result.changed and result.projection is not None:
-            result = self._commit_projection_candidate(session, result)
+        if result.changed and result.timeline is not None:
+            result = self._commit_timeline_candidate(session, result)
         return result
 
-    def _commit_projection_candidate(
+    def _commit_timeline_candidate(
         self,
         session: ApplicationSession,
         result: CompactionResult,
     ) -> CompactionResult:
-        """Commit a Projection candidate without confusing persistence failure with success."""
+        """Commit a Timeline candidate without confusing persistence failure with success."""
 
         def finish(final: CompactionResult) -> CompactionResult:
             self._context_service.finalize_compaction(final)
             return final
 
-        candidate = result.projection
+        candidate = result.timeline
         if candidate is None:
             return finish(result)
         try:
-            outcome = session.append_projection(candidate)
+            outcome = session.append_timeline(candidate)
         except Exception:
-            # Validation or a pre-append failure means no Projection was
+            # Validation or a pre-append failure means no Timeline was
             # committed.  The writer remains the authority for whether a
             # retry is safe; do not expose the in-memory candidate as active.
             return finish(replace(
                 result,
-                projection=session.projection,
-                summary=(session.projection.summary if session.projection is not None else None),
+                timeline=session.timeline,
+                summary=(session.timeline.summary if session.timeline is not None else None),
                 changed=False,
-                failure="projection_append_failed",
+                failure="timeline_append_failed",
             ))
-        if not isinstance(outcome, ProjectionAppendOutcome):
+        if not isinstance(outcome, TimelineAppendOutcome):
             session._quarantine_unknown_durability()
             return finish(replace(
                 result,
-                projection=session.projection,
-                summary=(session.projection.summary if session.projection is not None else None),
+                timeline=session.timeline,
+                summary=(session.timeline.summary if session.timeline is not None else None),
                 changed=False,
-                failure="projection_durability_unknown",
+                failure="timeline_durability_unknown",
             ))
         if outcome.durability == "unknown":
             return finish(replace(
                 result,
-                projection=session.projection,
-                summary=(session.projection.summary if session.projection is not None else None),
+                timeline=session.timeline,
+                summary=(session.timeline.summary if session.timeline is not None else None),
                 changed=False,
-                failure="projection_durability_unknown",
+                failure="timeline_durability_unknown",
             ))
-        if not outcome.projection_appended:
+        if not outcome.timeline_appended:
             return finish(replace(
                 result,
-                projection=session.projection,
-                summary=(session.projection.summary if session.projection is not None else None),
+                timeline=session.timeline,
+                summary=(session.timeline.summary if session.timeline is not None else None),
                 changed=False,
-                failure=outcome.failure_stage or "projection_append_failed",
+                failure=outcome.failure_stage or "timeline_append_failed",
             ))
         self._refresh_context_for_session(session)
         return finish(result)
@@ -835,63 +835,63 @@ class UthCodeApplication:
         *,
         session_id: str | None,
         turn_id: str,
-    ) -> HistoryPersistenceOutcome:
+    ) -> TranscriptPersistenceOutcome:
         """Commit one terminal Run delta through separate durable boundaries."""
 
         if session_id is None or self._session_service is None:
-            return HistoryPersistenceOutcome(
+            return TranscriptPersistenceOutcome(
                 False,
                 False,
                 None,
                 0,
-                history_durability="not_available",
+                transcript_durability="not_available",
             )
         active = self._session_service.active_session
         if active is None or active.session_id != session_id:
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
                 "session_boundary",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=False,
-                history_durability="not_durable",
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="not_durable",
                 failure_stages=("session_boundary",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
         if active.durability_unknown:
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
-                "history_durability_unknown",
+                "transcript_durability_unknown",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=False,
-                history_durability="unknown",
-                failure_stages=("history_durability_unknown",),
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="unknown",
+                failure_stages=("transcript_durability_unknown",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
         if not all(isinstance(message, Message) for message in messages):
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
                 "invalid_message",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=False,
-                history_durability="not_durable",
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="not_durable",
                 failure_stages=("invalid_message",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
 
-        entries: list[HistoryEntry] = []
+        entries: list[TranscriptEntry] = []
         try:
-            sequence = active.history.last_sequence + 1
+            sequence = active.transcript.last_sequence + 1
             for message in messages:
-                converted = history_entries_for_message(
+                converted = transcript_entries_for_message(
                     active.session_id,
                     turn_id,
                     sequence,
@@ -900,62 +900,62 @@ class UthCodeApplication:
                 entries.extend(converted)
                 sequence += len(converted)
             if entries:
-                append_outcome = active.append_history(tuple(entries))
+                append_outcome = active.append_transcript(tuple(entries))
         except Exception:
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
-                "history_append",
+                "transcript_append",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=False,
-                history_durability="not_durable",
-                failure_stages=("history_append",),
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="not_durable",
+                failure_stages=("transcript_append",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
 
-        if not isinstance(append_outcome, HistoryAppendOutcome):
+        if not isinstance(append_outcome, TranscriptAppendOutcome):
             active._quarantine_unknown_durability()
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
-                "history_durability_unknown",
+                "transcript_durability_unknown",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=False,
-                history_durability="unknown",
-                failure_stages=("history_durability_unknown",),
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="unknown",
+                failure_stages=("transcript_durability_unknown",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
         if append_outcome.durability == "unknown":
             active._quarantine_unknown_durability()
-            outcome = HistoryPersistenceOutcome(
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
-                "history_durability_unknown",
+                "transcript_durability_unknown",
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=append_outcome.reload_succeeded,
-                history_durability="unknown",
-                failure_stages=("history_durability_unknown",),
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=append_outcome.reload_succeeded,
+                transcript_durability="unknown",
+                failure_stages=("transcript_durability_unknown",),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
-        if not append_outcome.history_appended:
-            failure_stage = append_outcome.failure_stage or "history_append"
-            outcome = HistoryPersistenceOutcome(
+        if not append_outcome.transcript_appended:
+            failure_stage = append_outcome.failure_stage or "transcript_append"
+            outcome = TranscriptPersistenceOutcome(
                 False,
                 False,
                 failure_stage,
                 0,
-                history_metadata_synced=False,
-                history_reload_succeeded=append_outcome.reload_succeeded,
-                history_durability=append_outcome.durability,
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=append_outcome.reload_succeeded,
+                transcript_durability=append_outcome.durability,
                 failure_stages=(failure_stage,),
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
 
         append_failures = (
@@ -963,14 +963,14 @@ class UthCodeApplication:
             if append_outcome.failure_stage is not None
             else ()
         )
-        history_outcome = HistoryPersistenceOutcome(
+        transcript_outcome = TranscriptPersistenceOutcome(
             True,
             False,
             append_outcome.failure_stage or "instruction_state_sync",
             len(messages),
-            history_metadata_synced=append_outcome.metadata_synced,
-            history_reload_succeeded=append_outcome.reload_succeeded,
-            history_durability=append_outcome.durability,
+            transcript_metadata_synced=append_outcome.metadata_synced,
+            transcript_reload_succeeded=append_outcome.reload_succeeded,
+            transcript_durability=append_outcome.durability,
             failure_stages=append_failures,
         )
         try:
@@ -978,39 +978,39 @@ class UthCodeApplication:
         except Exception:
             failure_stages = append_failures + ("instruction_state_sync",)
             outcome = replace(
-                history_outcome,
+                transcript_outcome,
                 failure_stage=append_outcome.failure_stage or "instruction_state_sync",
                 failure_stages=failure_stages,
             )
-            self._record_history_persistence(outcome)
+            self._record_transcript_persistence(outcome)
             return outcome
 
         outcome = replace(
-            history_outcome,
+            transcript_outcome,
             instruction_state_synced=True,
             failure_stage=append_outcome.failure_stage,
             failure_stages=append_failures,
         )
-        self._record_history_persistence(outcome)
+        self._record_transcript_persistence(outcome)
         return outcome
 
-    def _record_history_persistence(
+    def _record_transcript_persistence(
         self,
-        outcome: HistoryPersistenceOutcome,
+        outcome: TranscriptPersistenceOutcome,
     ) -> None:
         self._history_persistence_diagnostics = {
             "status": outcome.status,
-            "history_appended": outcome.history_appended,
+            "transcript_appended": outcome.transcript_appended,
             "instruction_state_synced": outcome.instruction_state_synced,
-            "history_metadata_synced": outcome.history_metadata_synced,
-            "history_reload_succeeded": outcome.history_reload_succeeded,
-            "history_durability": outcome.history_durability,
+            "transcript_metadata_synced": outcome.transcript_metadata_synced,
+            "transcript_reload_succeeded": outcome.transcript_reload_succeeded,
+            "transcript_durability": outcome.transcript_durability,
             "failure_stage": outcome.failure_stage,
             "failure_stages": list(outcome.failure_stages),
             "persisted_message_count": outcome.persisted_message_count,
             "committed_turns": int(
                 self._history_persistence_diagnostics.get("committed_turns", 0)
-            ) + (1 if outcome.history_appended and outcome.persisted_message_count else 0),
+            ) + (1 if outcome.transcript_appended and outcome.persisted_message_count else 0),
             "error_code": outcome.error_code,
         }
 
@@ -1043,10 +1043,14 @@ class UthCodeApplication:
             if self._session_service is not None
             else None
         )
-        projection_revision = (
-            snapshot.projection_revision
+        timeline_checkpoint_id = (
+            snapshot.timeline_checkpoint_id
             if snapshot is not None
-            else (active.projection.revision if active and active.projection else None)
+            else (
+                active.timeline.active_checkpoint.turn_id
+                if active and active.timeline.active_checkpoint is not None
+                else None
+            )
         )
         instruction_epoch = (
             snapshot.instruction_epoch
@@ -1086,7 +1090,7 @@ class UthCodeApplication:
             provider_identity=self._provider.identity,
             configuration_sources=sources,
             context_usage=usage,
-            projection_revision=projection_revision,
+            timeline_checkpoint_id=timeline_checkpoint_id,
             instruction_epoch=instruction_epoch,
             compact_count=compact_count if isinstance(compact_count, int) else 0,
             stable_prefix_fingerprint=stable_prefix_fingerprint,
@@ -1101,8 +1105,8 @@ class UthCodeApplication:
 
         self._context_service.compile(
             instruction_loader=self._instruction_loader,
-            history=session.history,
-            projection=session.projection,
+            transcript=session.transcript,
+            timeline=session.timeline,
             tool_definitions=self.tool_definitions(),
         )
 
@@ -1185,11 +1189,11 @@ class UthCodeApplication:
         tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
         tool_definitions += (PROPOSE_PLAN_TOOL_DEFINITION,)
 
-        def active_projection():
+        def active_timeline():
             if self._session_service is None:
                 return None
             active = self._session_service.active_session
-            return None if active is None else active.projection
+            return None if active is None else active.timeline
 
         def active_session_id():
             if self._session_service is None:
@@ -1197,11 +1201,11 @@ class UthCodeApplication:
             active = self._session_service.active_session
             return None if active is None else active.session_id
 
-        def active_history():
+        def active_transcript():
             if self._session_service is None:
                 return None
             active = self._session_service.active_session
-            return None if active is None else active.history
+            return None if active is None else active.transcript
 
         def handle_provider_overflow() -> bool:
             """Perform one bounded compaction attempt, never window discovery."""
@@ -1210,12 +1214,12 @@ class UthCodeApplication:
                 active = self._session_service.active_session
                 if active is not None:
                     candidate = self._context_service.compact(
-                        active.history,
-                        projection=active.projection,
+                        active.transcript,
+                        timeline=active.timeline,
                         session_id=active.session_id,
                     )
-                    if candidate.changed and candidate.projection is not None:
-                        committed = self._commit_projection_candidate(active, candidate)
+                    if candidate.changed and candidate.timeline is not None:
+                        committed = self._commit_timeline_candidate(active, candidate)
                         return committed.changed
             return False
 
@@ -1251,10 +1255,10 @@ class UthCodeApplication:
                     process_messages,
                     run_id=state.run_id,
                     session_id=active_session_id(),
-                    canonical_history=active_history(),
+                    transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
                     runtime_context=runtime_context,
-                    projection=active_projection(),
+                    timeline=active_timeline(),
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
                     model=remote_model_id,
@@ -1277,10 +1281,10 @@ class UthCodeApplication:
                     process_messages,
                     run_id=state.run_id,
                     session_id=active_session_id(),
-                    canonical_history=active_history(),
+                    transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
                     runtime_context=runtime_context,
-                    projection=active_projection(),
+                    timeline=active_timeline(),
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
                     model=remote_model_id,
