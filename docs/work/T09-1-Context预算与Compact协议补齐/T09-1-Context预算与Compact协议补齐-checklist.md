@@ -24,13 +24,13 @@
 
 ## T03：生产 L4 与 bounded catch-up
 
-- [ ] 执行 `python -m pytest tests/test_context_compaction.py tests/test_context_budget_gate.py tests/test_application_runs.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
-- [ ] L4 使用 frozen provider/model/分维 limits，`tools=()`；Compact request 自身 Hard-gated 且不递归 Auto compact。
-- [ ] one entry per covered Turn、refs/coverage/summary 校验失败不 append；成功 transaction checkpoint-last。
-- [ ] one/multi-epoch 每批 commit 后 rebuild/re-gate；retained target 产生 headroom。
-- [ ] no-progress、repeated failure、no-safe-epoch、cancellation 有限停止且不产生伪 checkpoint。
-- [ ] Auto unresolved + Hard-safe 可发送并记录原因；Hard-unsafe Provider call count 为 0。
-- [ ] `rg -n "CompactState|CompactionJob|next_epoch_pointer|COMPACTING_BATCH" src tests` 不存在持久 Compact FSM/Job/pointer。
+- [x] 执行 `python -m pytest tests/test_context_compaction.py tests/test_context_budget_gate.py tests/test_application_runs.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
+- [x] L4 使用 frozen provider/model/分维 limits，`tools=()`；Compact request 自身 Hard-gated 且不递归 Auto compact。
+- [x] one entry per covered Turn、refs/coverage/summary 校验失败不 append；成功 transaction checkpoint-last。
+- [x] one/multi-epoch 每批 commit 后 rebuild/re-gate；retained target 产生 headroom。
+- [x] no-progress、repeated failure、no-safe-epoch、cancellation 有限停止且不产生伪 checkpoint。
+- [x] Auto unresolved + Hard-safe 可发送并记录原因；Hard-unsafe Provider call count 为 0。
+- [x] `rg -n "CompactState|CompactionJob|next_epoch_pointer|COMPACTING_BATCH" src tests` 不存在持久 Compact FSM/Job/pointer。
 
 ## T04：L5 Timeline Aging 与 HistoryRead
 

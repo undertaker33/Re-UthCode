@@ -30,7 +30,7 @@ def test_compactor_no_summary_is_controlled_and_does_not_mutate_transcript() -> 
     before = transcript
     result = ContextCompactor().compact(transcript)
     assert result.changed is False
-    assert result.failure == "summarizer_unavailable"
+    assert result.failure == "summary_function_required"
     assert result.timeline is None
     assert transcript == before
 

@@ -27,6 +27,13 @@ from .history import (
     TranscriptKind,
     timeline_record_from_dict,
 )
+from .compaction import (
+    CompactionEntry,
+    CompactionEpoch,
+    CompactionStructuredResult,
+    CompactionValidationError,
+    parse_compaction_result,
+)
 from .prompt import (
     ContextAuthority,
     ContextBlock,
@@ -1076,6 +1083,181 @@ class ContextCompactor:
         finally:
             lock.release()
 
+    def plan_epoch(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline | None = None,
+        session_id: str | None = None,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+    ) -> CompactionEpoch | None:
+        """Derive the next bounded complete raw epoch.
+
+        This is intentionally a pure derivation from the current Transcript
+        and committed Timeline.  It does not allocate a durable pointer and
+        it never includes an earlier Fine summary as model evidence.
+        """
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if timeline is not None and not isinstance(timeline, Timeline):
+            raise TypeError("timeline must be a Timeline or None")
+        if timeline is not None and timeline.session_id != transcript.session_id:
+            raise CompactionError("transcript and timeline belong to different Sessions")
+        owner = transcript.session_id if session_id is None else session_id
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("session_id must be a non-empty string")
+        if owner != transcript.session_id:
+            raise CompactionError("Compaction Session does not own the supplied Transcript")
+
+        selected_input_budget = self.policy.input_budget if input_budget is None else input_budget
+        selected_output_reserve = (
+            self.policy.output_reserve if output_reserve is None else output_reserve
+        )
+        if (
+            isinstance(selected_input_budget, bool)
+            or not isinstance(selected_input_budget, int)
+            or selected_input_budget <= 0
+            or isinstance(selected_output_reserve, bool)
+            or not isinstance(selected_output_reserve, int)
+            or selected_output_reserve <= 0
+            or selected_output_reserve >= selected_input_budget
+        ):
+            raise ValueError("epoch compaction budgets are invalid")
+
+        covered_end = timeline.sequence_end if timeline is not None else 0
+        pending_units: list[SemanticUnit] = []
+        for unit in transcript.semantic_units():
+            if unit.sequence_end <= covered_end:
+                continue
+            # A later complete unit must not leap over an open unit: doing so
+            # would advance the Timeline checkpoint past uncovered evidence.
+            if not unit.complete:
+                break
+            pending_units.append(unit)
+        units = tuple(pending_units)
+        if not units:
+            return None
+
+        available = selected_input_budget - selected_output_reserve
+        selected: list[SemanticUnit] = []
+        for unit in units:
+            candidate = (*selected, unit)
+            candidate_text = _compaction_input_text("", candidate)
+            candidate_tokens = self._estimate(candidate_text)
+            if not selected and candidate_tokens > available:
+                return None
+            if candidate_tokens > available:
+                break
+            selected.append(unit)
+        if not selected:
+            return None
+        input_text = _compaction_input_text("", selected)
+        input_tokens = self._estimate(input_text)
+        return CompactionEpoch(
+            session_id=transcript.session_id,
+            units=tuple(selected),
+            input_text=input_text,
+            input_tokens=input_tokens,
+            input_budget=selected_input_budget,
+            output_reserve=selected_output_reserve,
+            sequence_start=selected[0].sequence_start,
+            sequence_end=selected[-1].sequence_end,
+        )
+
+    def build_epoch_candidate(
+        self,
+        transcript: Transcript,
+        *,
+        epoch: CompactionEpoch,
+        result: CompactionStructuredResult,
+        timeline: Timeline | None = None,
+    ) -> CompactionResult:
+        """Validate one structured L4 result and build a checkpoint candidate."""
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if not isinstance(epoch, CompactionEpoch):
+            raise TypeError("epoch must be a CompactionEpoch")
+        if epoch.session_id != transcript.session_id:
+            raise CompactionError("Compaction epoch belongs to another Session")
+        if timeline is not None and (
+            not isinstance(timeline, Timeline) or timeline.session_id != transcript.session_id
+        ):
+            raise CompactionError("transcript and timeline belong to different Sessions")
+        if not isinstance(result, CompactionStructuredResult):
+            raise TypeError("result must be a CompactionStructuredResult")
+        if tuple(result.coverage) != epoch.turn_ids:
+            raise CompactionValidationError("compaction coverage does not match the raw epoch")
+
+        derived: list[SemanticEntry] = []
+        batches: list[CompactionBatch] = []
+        for entry, unit, expected_ref in zip(result.entries, epoch.units, epoch.refs, strict=True):
+            if (
+                not isinstance(entry, CompactionEntry)
+                or entry.turn_id != unit.turn_id
+                or entry.refs != (expected_ref,)
+            ):
+                raise CompactionValidationError("compaction entry does not match raw evidence")
+            derived.append(
+                SemanticEntry(
+                    turn_id=entry.turn_id,
+                    summary=entry.summary,
+                    refs=entry.refs,
+                    session_id=transcript.session_id,
+                )
+            )
+            batches.append(
+                CompactionBatch(
+                    unit_ids=(unit.unit_id,),
+                    sequence_start=unit.sequence_start,
+                    sequence_end=unit.sequence_end,
+                    input_text=epoch.input_text,
+                    input_tokens=epoch.input_tokens,
+                    output_summary=entry.summary,
+                )
+            )
+        checkpoint = ActiveCheckpoint(
+            turn_id=derived[-1].turn_id,
+            active_turns=tuple(entry.turn_id for entry in derived),
+            session_id=transcript.session_id,
+        )
+        candidate_timeline = (timeline or Timeline(transcript.session_id)).append_transaction(
+            tuple(derived), checkpoint
+        )
+        output_tokens = sum(self._estimate(entry.summary) for entry in result.entries)
+        return CompactionResult(
+            timeline=candidate_timeline,
+            summary=result.summary or result.entries[-1].summary,
+            batches=tuple(batches),
+            changed=True,
+            input_tokens=epoch.input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def parse_epoch_result(
+        self,
+        value: object,
+        *,
+        epoch: CompactionEpoch,
+        summary_hard_cap: int | None = None,
+    ) -> CompactionStructuredResult:
+        """Validate a provider response using this Compactor's estimator."""
+
+        if not isinstance(epoch, CompactionEpoch):
+            raise TypeError("epoch must be a CompactionEpoch")
+        return parse_compaction_result(
+            value,
+            epoch,
+            summary_hard_cap=(
+                self.policy.summary_hard_cap
+                if summary_hard_cap is None
+                else summary_hard_cap
+            ),
+            token_estimator=self._estimate,
+        )
+
     def _acquire_single_flight(self, session_id: str) -> threading.Lock:
         with self._locks_guard:
             lock = self._locks.setdefault(session_id, threading.Lock())
@@ -1114,7 +1296,7 @@ class ContextCompactor:
             return self._failed_result(
                 timeline,
                 previous_summary,
-                "summarizer_unavailable",
+                "summary_function_required",
                 (),
                 0,
             )
@@ -1200,16 +1382,24 @@ class ContextCompactor:
         try:
             derived: list[SemanticEntry] = []
             for batch in batches:
-                reference = transcript.reference(batch.sequence_start, batch.sequence_end)
                 covered = tuple(unit for unit in units if unit.unit_id in batch.unit_ids)
-                derived.append(
-                    SemanticEntry(
-                        turn_id=covered[-1].turn_id,
-                        summary=batch.output_summary,
-                        refs=(reference,),
-                        session_id=transcript.session_id,
+                if not covered:
+                    return self._failed_result(
+                        timeline,
+                        previous_summary,
+                        "compaction_coverage_invalid",
+                        batches,
+                        input_tokens,
                     )
-                )
+                for unit in covered:
+                    derived.append(
+                        SemanticEntry(
+                            turn_id=unit.turn_id,
+                            summary=batch.output_summary,
+                            refs=(transcript.reference(unit.sequence_start, unit.sequence_end),),
+                            session_id=transcript.session_id,
+                        )
+                    )
             checkpoint = ActiveCheckpoint(
                 turn_id=derived[-1].turn_id,
                 active_turns=tuple(record.turn_id for record in derived),
@@ -1863,10 +2053,14 @@ def _conversation_block(raw: object) -> ContextBlock:
 
 __all__ = [
     "CompactionBatch",
+    "CompactionEntry",
+    "CompactionEpoch",
     "CompactionError",
     "CompactionInProgress",
     "CompactionPolicy",
     "CompactionResult",
+    "CompactionStructuredResult",
+    "CompactionValidationError",
     "ContextBlock",
     "ContextBudget",
     "ContextBudgetError",
