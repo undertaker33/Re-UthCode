@@ -115,6 +115,32 @@ def test_dispatcher_produces_distinct_local_ui_and_prompt_results() -> None:
     assert prompt.output is None and prompt.ui_action is None
 
 
+@pytest.mark.asyncio
+async def test_async_dispatch_awaits_handlers_and_sync_dispatch_keeps_async_boundary() -> None:
+    async def handler(_context):  # type: ignore[no-untyped-def]
+        return "awaited"
+
+    registry = CommandRegistry()
+    registry.register(
+        CommandDefinition(
+            canonical="async",
+            description="async",
+            kind=CommandKind.LOCAL,
+            handler=handler,
+        )
+    )
+    dispatcher = CommandDispatcher(registry)
+
+    sync_outcome = dispatcher.dispatch_text("/async")
+    async_outcome = await dispatcher.dispatch_text_async("/async")
+
+    assert sync_outcome is not None
+    assert sync_outcome.status is OutcomeStatus.EXECUTION_ERROR
+    assert async_outcome is not None
+    assert async_outcome.status is OutcomeStatus.SUCCESS
+    assert async_outcome.output == "awaited"
+
+
 def test_plain_text_and_bare_slash_never_enter_dispatch() -> None:
     registry = CommandRegistry()
     registry.register(

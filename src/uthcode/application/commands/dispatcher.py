@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import inspect
 
 from .models import (
     CommandDefinition,
@@ -92,6 +93,77 @@ class CommandDispatcher:
         )
         try:
             result = self._run_handler(definition, context)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise CommandExecutionError("命令需要异步调度")
+            return self._wrap_result(definition, invocation, result)
+        except CommandExecutionError as exc:
+            return CommandOutcome(
+                OutcomeStatus.EXECUTION_ERROR,
+                error=str(exc),
+                invocation=invocation,
+            )
+
+        except Exception:  # unknown failures must not expose exception text
+            return CommandOutcome(
+                OutcomeStatus.EXECUTION_ERROR,
+                error="命令执行失败",
+                invocation=invocation,
+            )
+
+    async def dispatch_async(
+        self,
+        invocation: CommandInvocation,
+        *,
+        application: object | None = None,
+    ) -> CommandOutcome | None:
+        """Dispatch one command while awaiting an async Application handler."""
+
+        if not isinstance(invocation, CommandInvocation):
+            raise TypeError("invocation must be CommandInvocation")
+        if not invocation.is_slash or invocation.is_bare_slash:
+            return None
+        if invocation.unknown:
+            return CommandOutcome(
+                OutcomeStatus.UNKNOWN_COMMAND,
+                error=invocation.error or f"未知命令：/{invocation.raw_name.lower()}",
+                invocation=invocation,
+            )
+        if invocation.usage_error:
+            return CommandOutcome(
+                OutcomeStatus.USAGE_ERROR,
+                error=invocation.error or "用法错误",
+                invocation=invocation,
+            )
+        if not invocation.is_executable or invocation.definition is None:
+            return CommandOutcome(
+                OutcomeStatus.EXECUTION_ERROR,
+                error="命令解析结果不可执行",
+                invocation=invocation,
+            )
+
+        definition = invocation.definition
+        if not definition.implemented:
+            return CommandOutcome(
+                OutcomeStatus.NOT_IMPLEMENTED,
+                output=f"功能未实现：/{definition.canonical}",
+                invocation=invocation,
+            )
+
+        selected_application = (
+            self._application if application is None else application
+        )
+        context = CommandContext(
+            registry=self._registry,
+            invocation=invocation,
+            application=selected_application,
+        )
+        try:
+            result = self._run_handler(definition, context)
+            if inspect.isawaitable(result):
+                result = await result
             return self._wrap_result(definition, invocation, result)
         except CommandExecutionError as exc:
             return CommandOutcome(
@@ -115,6 +187,19 @@ class CommandDispatcher:
         """Parse and dispatch one input for small headless callers."""
 
         return self.dispatch(
+            self._parser.parse(text),
+            application=application,
+        )
+
+    async def dispatch_text_async(
+        self,
+        text: str,
+        *,
+        application: object | None = None,
+    ) -> CommandOutcome | None:
+        """Parse and dispatch one input through the awaitable path."""
+
+        return await self.dispatch_async(
             self._parser.parse(text),
             application=application,
         )

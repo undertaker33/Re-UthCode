@@ -44,21 +44,21 @@
 
 ## T05：Application Compact 生命周期与 overflow recovery
 
-- [ ] 执行 `python -m pytest tests/test_application_runtime.py tests/test_application_runs.py tests/test_session_files.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
-- [ ] first call 前、complete tool batch 后/next call 前、terminal tail 三边界 durable append closed facts；不写 open continuation。
-- [ ] durable cursor 不重复 append；确定失败保持 identity/FIFO retry；unknown durability quarantine 新语义写入。
-- [ ] active Turn 冻结 provider/model/input/output/combined limits/tools；切换模型只影响下一 Turn。
-- [ ] direct Application/Headless manual compact 在低 pressure 可执行；无候选 success no-op 且 Timeline 无垃圾。
-- [ ] ordinary overflow 只执行一次 reduce→rebuild→re-gate→retry；二次 overflow 停止且不修改 limits。
-- [ ] ordinary、post-tool、post-resume、manual、L4、L5、retry 每次真实 model call 前均有 Hard Gate 证据。
+- [x] 执行 `python -m pytest tests/test_application_runtime.py tests/test_application_runs.py tests/test_session_files.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
+- [x] first call 前、complete tool batch 后/next call 前、terminal tail 三边界 durable append closed facts；不写 open continuation。
+- [x] durable cursor 不重复 append；确定失败保持 identity/FIFO retry；unknown durability quarantine 新语义写入。
+- [x] active Turn 冻结 provider/model/input/output/combined limits/tools；切换模型只影响下一 Turn。
+- [x] direct Application/Headless manual compact 在低 pressure 可执行；无候选 success no-op 且 Timeline 无垃圾。
+- [x] ordinary overflow 只执行一次 reduce→rebuild→re-gate→retry；二次 overflow 停止且不修改 limits。
+- [x] ordinary、post-tool、post-resume、manual、L4、L5、retry 每次真实 model call 前均有 Hard Gate 证据。
 
 ## T06：[接入主流程] 命令、TUI 与正式入口收口
 
 - [ ] 执行 `python -m pytest tests/test_command_dispatcher.py tests/test_w04_session_commands.py tests/test_cli.py tests/test_tui.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
-- [ ] `/compact` await T05 同一 Application orchestrator；`/status` 使用分维 limits/Auto/Hard/Timeline diagnostics。
-- [ ] sync commands 不回退，TUI 只 await command outcome；CLI/TUI/Headless 不包含独立 Context 编排。
-- [ ] 现有 request preparer 与 overflow handler sync/awaitable 行为、取消和错误测试继续通过；没有第二套 protocol。
-- [ ] bootstrap/正式 generation 入口全部接通，旧 synchronous-only compact 和重复入口在本任务删除。
+- [x] `/compact` await T05 同一 Application orchestrator；`/status` 使用分维 limits/Auto/Hard/Timeline diagnostics。
+- [x] sync commands 不回退，TUI 只 await command outcome；CLI/TUI/Headless 不包含独立 Context 编排。
+- [x] 现有 request preparer 与 overflow handler sync/awaitable 行为、取消和错误测试继续通过；没有第二套 protocol。
+- [x] bootstrap/正式 generation 入口全部接通，旧 synchronous-only compact 和重复入口在本任务删除。
 
 ## T07：[端到端验证] Diagnostics、Eval、文档与回归
 

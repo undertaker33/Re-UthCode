@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,6 +34,7 @@ from uthcode.core.history import (
 )
 from uthcode.core.provider import (
     CancellationToken,
+    ContextOverflowError,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -41,6 +43,7 @@ from uthcode.core.provider import (
     ProviderEvent,
     ProviderIdentity,
     ProviderResponse,
+    ToolCallPart,
     Usage,
 )
 
@@ -61,16 +64,22 @@ class _L4Provider:
         *,
         safe_ordinary_count: bool = False,
         compaction_failure: BaseException | None = None,
+        compaction_summary: str | None = None,
+        max_input_tokens: int = 6_000,
+        pressure_extra: int = 4_000,
     ) -> None:
         self.identity = ProviderIdentity("fake", "l4", "provider-model")
         self.requests: list[GenerationRequest] = []
         self._safe_ordinary_count = safe_ordinary_count
         self._compaction_failure = compaction_failure
+        self._compaction_summary = compaction_summary
+        self._max_input_tokens = max_input_tokens
+        self._pressure_extra = pressure_extra
         self.compaction_token_cancelled: list[bool] = []
 
     def resolve_model_limits(self, _model: str) -> ModelLimits:
         return ModelLimits(
-            max_input_tokens=6_000,
+            max_input_tokens=self._max_input_tokens,
             max_output_tokens=2_048,
             source="test.l4",
         )
@@ -82,7 +91,7 @@ class _L4Provider:
         if self._safe_ordinary_count:
             return 1
         if request.metadata.get("timeline_checkpoint_id") is None:
-            return estimate + 4_000
+            return estimate + self._pressure_extra
         return estimate
 
     async def stream(
@@ -103,9 +112,13 @@ class _L4Provider:
                 for value in request.metadata.get("context_compaction_epoch_turns", ())
                 if isinstance(value, str)
             )
+            summary = self._compaction_summary
             payload = {
                 "entries": [
-                    {"turn_id": turn_id, "summary": f"summary for {turn_id}"}
+                    {
+                        "turn_id": turn_id,
+                        "summary": summary or f"summary for {turn_id}",
+                    }
                     for turn_id in turn_ids
                 ],
                 "coverage": list(turn_ids),
@@ -147,6 +160,173 @@ class _L5Provider:
         yield _completed("ordinary answer")
 
 
+class _SessionAwareScriptedProvider:
+    def __init__(self, session_service: ApplicationSessionService) -> None:
+        self.identity = ProviderIdentity("fake", "session-aware", "provider-model")
+        self.session_service = session_service
+        self.requests: list[GenerationRequest] = []
+        self.observed_transcript_lengths: list[int] = []
+        self.scripts = (
+            (
+                GenerationCompleted(
+                    ProviderResponse(
+                        message=Message(
+                            "assistant",
+                            (ToolCallPart("unknown-1", "UnknownTool", {}),),
+                        ),
+                        usage=Usage(),
+                        finish_reason=FinishReason.TOOL_CALLS,
+                    )
+                ),
+            ),
+            (_completed("terminal answer"),),
+        )
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=1_000_000, source="test.session-aware")
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        active = self.session_service.active_session
+        assert active is not None
+        self.observed_transcript_lengths.append(len(active.transcript.entries))
+        cancellation.raise_if_cancelled()
+        index = min(len(self.requests) - 1, len(self.scripts) - 1)
+        for event in self.scripts[index]:
+            cancellation.raise_if_cancelled()
+            yield event
+
+
+class _OverflowRecoveryProvider:
+    def __init__(
+        self,
+        *,
+        ordinary_overflows: int,
+        compaction_summary: str | None = None,
+        max_input_tokens: int = 6_000,
+    ) -> None:
+        self.identity = ProviderIdentity("fake", "overflow", "provider-model")
+        self.ordinary_overflows = ordinary_overflows
+        self.compaction_summary = compaction_summary
+        self.max_input_tokens = max_input_tokens
+        self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(
+            max_input_tokens=self.max_input_tokens,
+            max_output_tokens=2_048,
+            source="test.overflow",
+        )
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        return account_generation_request(request).input_tokens
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        cancellation.raise_if_cancelled()
+        if request.metadata.get("context_compaction_request") is True:
+            turn_ids = tuple(
+                value
+                for value in request.metadata.get("context_compaction_epoch_turns", ())
+                if isinstance(value, str)
+            )
+            payload = {
+                "entries": [
+                    {
+                        "turn_id": turn_id,
+                        "summary": self.compaction_summary or f"summary for {turn_id}",
+                    }
+                    for turn_id in turn_ids
+                ],
+                "coverage": list(turn_ids),
+            }
+            yield _completed(json.dumps(payload, ensure_ascii=False))
+            return
+        ordinary_calls = sum(
+            1
+            for item in self.requests
+            if item.metadata.get("context_compaction_request") is not True
+        )
+        if ordinary_calls <= self.ordinary_overflows:
+            raise ContextOverflowError()
+        yield _completed("overflow recovered")
+
+
+class _PostToolOverflowProvider:
+    def __init__(self, session_service: ApplicationSessionService) -> None:
+        self.identity = ProviderIdentity("fake", "post-tool-overflow", "provider-model")
+        self.session_service = session_service
+        self.requests: list[GenerationRequest] = []
+        self.observed_transcript_entries: list[tuple[TranscriptEntry, ...]] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(
+            max_input_tokens=1_000_000,
+            max_output_tokens=2_048,
+            source="test.post-tool-overflow",
+        )
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        return account_generation_request(request).input_tokens
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        active = self.session_service.active_session
+        assert active is not None
+        self.observed_transcript_entries.append(tuple(active.transcript.entries))
+        cancellation.raise_if_cancelled()
+        if request.metadata.get("context_compaction_request") is True:
+            turn_ids = tuple(
+                value
+                for value in request.metadata.get("context_compaction_epoch_turns", ())
+                if isinstance(value, str)
+            )
+            payload = {
+                "entries": [
+                    {"turn_id": turn_id, "summary": f"summary for {turn_id}"}
+                    for turn_id in turn_ids
+                ],
+                "coverage": list(turn_ids),
+            }
+            yield _completed(json.dumps(payload, ensure_ascii=False))
+            return
+        ordinary_calls = sum(
+            1
+            for item in self.requests
+            if item.metadata.get("context_compaction_request") is not True
+        )
+        if ordinary_calls == 1:
+            yield GenerationCompleted(
+                ProviderResponse(
+                    message=Message(
+                        "assistant",
+                        (ToolCallPart("unknown-post-tool", "UnknownTool", {}),),
+                    ),
+                    usage=Usage(),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            )
+            return
+        if ordinary_calls == 2:
+            raise ContextOverflowError()
+        yield _completed("post-tool overflow recovered")
+
+
 def _seed_session(application: UthCodeApplication, *, count: int = 70):
     session = application.create_session("l4-session")
     for index in range(1, count + 1):
@@ -160,6 +340,288 @@ def _seed_session(application: UthCodeApplication, *, count: int = 70):
         outcome = session.append_transcript(entries)
         assert outcome.durability == "durable"
     return session
+
+
+def _assert_timeline_refs_are_complete(session) -> None:
+    for record in session.timeline.records:
+        for ref in getattr(record, "refs", ()):
+            assert session.transcript.select(
+                ref.sequence_start,
+                ref.sequence_end,
+                complete_only=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_w05_persists_closed_facts_before_provider_and_appends_terminal_tail(tmp_path) -> None:
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-persistence",
+        instruction_loader=None,
+    )
+    provider = _SessionAwareScriptedProvider(session_service)
+    application = UthCodeApplication(provider, session_service=session_service)
+    session = application.create_session("w05-persistence-session")
+
+    result = await application.create_run().start_turn("first request").result()
+
+    assert result.status.value == "completed"
+    assert len(provider.observed_transcript_lengths) == 2
+    assert provider.observed_transcript_lengths[0] > 0
+    assert provider.observed_transcript_lengths[1] > provider.observed_transcript_lengths[0]
+    final_entries = session.transcript.entries
+    message_ids = tuple(
+        entry.payload.get("message_id")
+        for entry in final_entries
+        if isinstance(entry.payload.get("message_id"), str)
+    )
+    assert len(message_ids) == len(set(message_ids))
+    assert len(final_entries) > provider.observed_transcript_lengths[-1]
+
+
+@pytest.mark.asyncio
+async def test_w05_manual_compact_is_async_low_pressure_and_noop_without_candidate(tmp_path) -> None:
+    provider = _L4Provider(safe_ordinary_count=True)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-manual-compact",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    first = await application.compact_session()
+    records_after_first = session.timeline.records
+    second = await application.compact_session()
+
+    assert first.changed is True
+    assert first.failure is None
+    assert second.changed is False
+    assert second.failure is None
+    assert session.timeline.records == records_after_first
+    assert len(
+        [
+            request
+            for request in provider.requests
+            if request.metadata.get("context_compaction_request") is True
+        ]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_w05_context_overflow_recovers_once_then_retries_with_frozen_limits(tmp_path) -> None:
+    provider = _OverflowRecoveryProvider(ordinary_overflows=1)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-overflow",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("overflow once").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status.value == "completed"
+    assert len(ordinary) == 2
+    assert len(compact) == 1
+    assert compact[0].tools == ()
+    assert compact[0].metadata["context_gate"]["hard_safe"] is True
+    assert ordinary[0].metadata["context_budget"] == ordinary[1].metadata["context_budget"]
+    assert result.turn_id not in compact[0].metadata["context_compaction_epoch_turns"]
+    assert compact[0].metadata["context_compaction_epoch_turns"] == ["turn-1"]
+
+    application.close()
+    reopened = application.resume_session("l4-session")
+    _assert_timeline_refs_are_complete(reopened)
+    assert result.turn_id not in {
+        entry.turn_id for entry in reopened.timeline.fine_entries
+    }
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_w05_post_tool_overflow_excludes_whole_active_turn_and_reloads(tmp_path) -> None:
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-post-tool-overflow",
+        instruction_loader=None,
+    )
+    provider = _PostToolOverflowProvider(session_service)
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=1_000_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("post-tool overflow").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status is RunStatus.COMPLETED
+    assert len(ordinary) == 3
+    assert len(compact) == 1
+    assert provider.observed_transcript_entries[1]
+    active_entries = tuple(
+        entry
+        for entry in provider.observed_transcript_entries[1]
+        if entry.turn_id == result.turn_id
+    )
+    assert {entry.kind for entry in active_entries} >= {
+        TranscriptKind.TOOL_CALL,
+        TranscriptKind.TOOL_RESULT,
+    }
+    assert compact[0].metadata["context_compaction_epoch_turns"] == ["turn-1"]
+    assert result.turn_id not in compact[0].metadata["context_compaction_epoch_turns"]
+
+    application.close()
+    reopened = application.resume_session("l4-session")
+    _assert_timeline_refs_are_complete(reopened)
+    assert result.turn_id not in {
+        entry.turn_id for entry in reopened.timeline.fine_entries
+    }
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_w05_second_context_overflow_stops_without_mutating_limits(tmp_path) -> None:
+    provider = _OverflowRecoveryProvider(ordinary_overflows=2)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-overflow-twice",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("overflow twice").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status.value != "completed"
+    assert len(ordinary) == 2
+    assert len(compact) == 1
+    assert ordinary[0].metadata["context_budget"] == ordinary[1].metadata["context_budget"]
+
+
+@pytest.mark.asyncio
+async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo_order(tmp_path, monkeypatch) -> None:
+    provider = _L4Provider(safe_ordinary_count=True)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-persistence-retry",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(provider, session_service=session_service)
+    application.create_session("w05-persistence-retry-session")
+    real_persist = application._persist_run_messages
+    calls: list[tuple[tuple[Message, ...], str | None, str]] = []
+
+    def flaky_persist(messages, *, session_id, turn_id):  # type: ignore[no-untyped-def]
+        calls.append((tuple(messages), session_id, turn_id))
+        if len(calls) == 1:
+            return SimpleNamespace(
+                persisted_message_count=0,
+                transcript_durability="not_durable",
+            )
+        return real_persist(messages, session_id=session_id, turn_id=turn_id)
+
+    monkeypatch.setattr(application, "_persist_run_messages", flaky_persist)
+    result = await application.create_run().start_turn("retry this closed fact").result()
+
+    assert result.status.value != "completed"
+    assert len(provider.requests) == 0
+    assert len(calls) == 2
+    assert calls[0][1:] == calls[1][1:]
+    assert calls[0][0] == calls[1][0]
+    assert application.diagnostics()["history_persistence"]["status"] == "committed"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_w05_unknown_transcript_durability_quarantines_session_and_blocks_new_run(tmp_path, monkeypatch) -> None:
+    provider = _L4Provider(safe_ordinary_count=True)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-persistence-unknown",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(provider, session_service=session_service)
+    session = application.create_session("w05-persistence-unknown-session")
+
+    def unknown_persist(messages, *, session_id, turn_id):  # type: ignore[no-untyped-def]
+        del messages, session_id, turn_id
+        session._quarantine_unknown_durability()
+        return SimpleNamespace(
+            persisted_message_count=0,
+            transcript_durability="unknown",
+        )
+
+    monkeypatch.setattr(application, "_persist_run_messages", unknown_persist)
+    result = await application.create_run().start_turn("unknown durability").result()
+
+    assert result.status.value != "completed"
+    assert len(provider.requests) == 0
+    assert session.durability_unknown is True
+    with pytest.raises(RuntimeError, match="durability is unknown"):
+        application.create_run().start_turn("must not start")
 
 
 @pytest.mark.asyncio
@@ -223,6 +685,15 @@ async def test_l4_is_tool_free_bounded_and_commits_one_fine_entry_per_turn(tmp_p
     assert isinstance(compaction_note["previous_estimate"], int)
     assert isinstance(compaction_note["headroom"], int)
     assert compaction_note["headroom"] > 0
+    assert result.turn_id not in covered_turns
+
+    application.close()
+    reopened = application.resume_session("l4-session")
+    _assert_timeline_refs_are_complete(reopened)
+    assert result.turn_id not in {
+        entry.turn_id for entry in reopened.timeline.fine_entries
+    }
+    application.close()
 
 
 @pytest.mark.asyncio
@@ -268,6 +739,7 @@ async def test_l5_ages_fine_timeline_before_ordinary_request_at_low_pressure(tmp
     aging_request, ordinary_request = provider.requests
     assert aging_request.metadata["context_compaction_level"] == "L5"
     assert aging_request.metadata["context_timeline_aging_request"] is True
+    assert result.turn_id not in aging_request.metadata["context_timeline_aging_epoch_turns"]
     assert aging_request.tools == ()
     assert aging_request.model == "frozen-model"
     assert "fine-" not in aging_request.messages[0].parts[0].text
@@ -564,7 +1036,7 @@ async def test_l4_no_progress_does_not_create_a_pseudo_checkpoint() -> None:
         ),
     )
     service = ApplicationContextService(
-        compactor=ContextCompactor(token_estimator=lambda _text: 1)
+        compactor=ContextCompactor(token_estimator=len)
     )
     commit_calls = 0
 
@@ -591,6 +1063,146 @@ async def test_l4_no_progress_does_not_create_a_pseudo_checkpoint() -> None:
     assert result.changed is False
     assert result.failure == "no_progress"
     assert result.timeline is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_tokens", [0, 1])
+async def test_l4_equal_or_larger_output_is_a_non_committing_no_reduction(
+    extra_tokens: int,
+) -> None:
+    transcript = Transcript(
+        "non-reducing",
+        (
+            TranscriptEntry(
+                "non-reducing",
+                1,
+                "turn-1",
+                TranscriptKind.USER_MESSAGE,
+                {"text": "fact"},
+                semantic_unit_id="turn-1",
+            ),
+        ),
+    )
+    timeline = Timeline(transcript.session_id)
+    service = ApplicationContextService(
+        compactor=ContextCompactor(token_estimator=len)
+    )
+    commits = 0
+
+    async def summarize(epoch: CompactionEpoch) -> str:
+        summary = "x" * (epoch.input_tokens + extra_tokens)
+        return json.dumps(
+            {
+                "entries": [{"turn_id": "turn-1", "summary": summary}],
+                "coverage": ["turn-1"],
+            }
+        )
+
+    def commit(_candidate: CompactionResult) -> bool:
+        nonlocal commits
+        commits += 1
+        return True
+
+    result = await service.compact_async(
+        transcript,
+        timeline=timeline,
+        session_id=transcript.session_id,
+        summarize=summarize,
+        commit=commit,
+        summary_hard_cap=100_000,
+    )
+
+    assert result.changed is False
+    assert result.failure == "no_reduction"
+    assert result.timeline == timeline
+    assert commits == 0
+    assert timeline.records == ()
+
+
+@pytest.mark.asyncio
+async def test_w05_auto_non_reduction_is_not_recovered_or_committed(tmp_path) -> None:
+    provider = _L4Provider(
+        max_input_tokens=1_000_000,
+        pressure_extra=1_000_000,
+        compaction_summary="x" * 8_000,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-auto-non-reducing",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=1_000_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("auto non-reducing").result()
+
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status is not RunStatus.COMPLETED
+    assert len(compact) == 1
+    assert session.timeline.records == ()
+    assert any(
+        event.get("failure") == "no_reduction"
+        for event in application.diagnostics()["compaction"]["events"]  # type: ignore[index]
+    )
+
+
+@pytest.mark.asyncio
+async def test_w05_overflow_non_reduction_does_not_retry_or_commit(tmp_path) -> None:
+    provider = _OverflowRecoveryProvider(
+        ordinary_overflows=1,
+        max_input_tokens=1_000_000,
+        compaction_summary="x" * 8_000,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-overflow-non-reducing",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=1_000_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("overflow non-reducing").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status is not RunStatus.COMPLETED
+    assert len(ordinary) == 1
+    assert len(compact) == 1
+    assert session.timeline.records == ()
+    assert any(
+        event.get("failure") == "no_reduction"
+        for event in application.diagnostics()["compaction"]["events"]  # type: ignore[index]
+    )
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ import ntpath
 import posixpath
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -58,6 +58,7 @@ class _PendingPersistenceBatch:
     turn_id: str
     messages: tuple[Message, ...]
     blocked: bool = False
+    terminal: bool = False
 
 
 def _new_identifier(value: str | None, field_name: str) -> str:
@@ -126,6 +127,7 @@ class AgentRun:
         "_behavior_mode",
         "_persisted_message_count",
         "_pending_persistence_batches",
+        "_last_flush_committed_terminal",
         "_turn_message_start",
         "_turn_session_id",
     )
@@ -153,6 +155,7 @@ class AgentRun:
         self._behavior_mode = BehaviorMode.DEFAULT
         self._persisted_message_count = 0
         self._pending_persistence_batches: list[_PendingPersistenceBatch] = []
+        self._last_flush_committed_terminal = False
         self._turn_message_start: int | None = None
         self._turn_session_id: str | None = None
 
@@ -243,6 +246,10 @@ class AgentRun:
             raise RuntimeError(
                 "History persistence durability is unknown; the pending batch must be reconciled"
             )
+        if self._pending_persistence_batches and not self._flush_pending_persistence():
+            raise RuntimeError(
+                "History persistence retry failed; the pending batch remains queued"
+            )
         self._application._require_run_start_allowed()
 
         message_start = len(self._state.messages)
@@ -258,6 +265,7 @@ class AgentRun:
             permission_resolver=self._resolve_permission,
             session_grant_sink=self._store_session_grant,
             process_message_start=self._persisted_message_count,
+            persist_closed_messages=self._persist_closed_messages,
         )
         self._state = execution.state
         self._turn_message_start = message_start
@@ -266,6 +274,120 @@ class AgentRun:
         driver.attach(handle)
         self._active_turn = handle
         return handle
+
+    def _queue_pending_persistence_batch(
+        self,
+        *,
+        session_id: str | None,
+        turn_id: str,
+        messages: Sequence[Message],
+        blocked: bool = False,
+        terminal: bool = False,
+    ) -> None:
+        """Keep one exact FIFO retry unit without duplicating a failed append."""
+
+        if session_id is None:
+            return
+        values = tuple(messages)
+        if not values:
+            return
+        for index, batch in enumerate(self._pending_persistence_batches):
+            if batch.session_id != session_id or batch.turn_id != turn_id:
+                continue
+            if batch.messages == values and (batch.blocked or not blocked):
+                if terminal and not batch.terminal:
+                    self._pending_persistence_batches[index] = replace(
+                        batch,
+                        terminal=True,
+                    )
+                return
+            if (
+                len(batch.messages) <= len(values)
+                and values[: len(batch.messages)] == batch.messages
+            ):
+                self._pending_persistence_batches[index] = replace(
+                    batch,
+                    messages=values,
+                    blocked=batch.blocked or blocked,
+                    terminal=batch.terminal or terminal,
+                )
+            return
+        self._pending_persistence_batches.append(
+            _PendingPersistenceBatch(
+                session_id=session_id,
+                turn_id=turn_id,
+                messages=values,
+                blocked=blocked,
+                terminal=terminal,
+            )
+        )
+
+    def _flush_pending_persistence(self) -> bool:
+        """Retry queued closed facts in original FIFO order."""
+
+        self._last_flush_committed_terminal = False
+        while self._pending_persistence_batches:
+            batch = self._pending_persistence_batches[0]
+            if batch.blocked:
+                return False
+            outcome = self._application._persist_run_messages(
+                batch.messages,
+                session_id=batch.session_id,
+                turn_id=batch.turn_id,
+            )
+            if outcome.persisted_message_count:
+                self._persisted_message_count += outcome.persisted_message_count
+                del self._pending_persistence_batches[0]
+                if batch.terminal:
+                    self._application._record_committed_turn()
+                    self._last_flush_committed_terminal = True
+                continue
+            if getattr(outcome, "transcript_durability", None) == "unknown":
+                self._pending_persistence_batches[0] = replace(
+                    batch,
+                    blocked=True,
+                )
+            return False
+        return True
+
+    def _persist_closed_messages(
+        self,
+        messages: Sequence[Message],
+        turn_id: str,
+    ) -> int | None:
+        """Persist every newly closed message before its next Provider call.
+
+        ``None`` means this Run has no durable Session and the caller should
+        retain the complete in-memory message sequence for context assembly.
+        An integer is the durable message cursor.  A failed append leaves the
+        cursor unchanged and queues the exact batch for FIFO retry.
+        """
+
+        if self._turn_session_id is None:
+            return None
+        if not self._flush_pending_persistence():
+            return self._persisted_message_count
+        values = tuple(messages)
+        pending = values[self._persisted_message_count :]
+        if not pending:
+            return self._persisted_message_count
+        outcome = self._application._persist_run_messages(
+            pending,
+            session_id=self._turn_session_id,
+            turn_id=turn_id,
+        )
+        if outcome.persisted_message_count:
+            self._persisted_message_count += outcome.persisted_message_count
+            return self._persisted_message_count
+        self._queue_pending_persistence_batch(
+            session_id=self._turn_session_id,
+            turn_id=turn_id,
+            messages=pending,
+            blocked=(
+                getattr(outcome, "transcript_durability", None) == "unknown"
+            ),
+        )
+        return self._persisted_message_count
 
     def snapshot(self) -> RunSnapshot:
         """Return a safe snapshot without exposing conversation content."""
@@ -296,34 +418,32 @@ class AgentRun:
             if turn_message_start is not None
             else ()
         )
-        if current_messages:
-            self._pending_persistence_batches.append(
-                _PendingPersistenceBatch(
-                    session_id=self._turn_session_id,
-                    turn_id=result.turn_id,
-                    messages=current_messages,
-                )
+        turn_session_id = self._turn_session_id
+        if current_messages and turn_session_id is not None:
+            persisted_in_turn = max(
+                0,
+                self._persisted_message_count
+                - (turn_message_start or 0),
+            )
+            self._queue_pending_persistence_batch(
+                session_id=turn_session_id,
+                turn_id=result.turn_id,
+                messages=current_messages[persisted_in_turn:],
+                terminal=True,
             )
         self._turn_message_start = None
         self._turn_session_id = None
-        while self._pending_persistence_batches:
-            batch = self._pending_persistence_batches[0]
-            if batch.blocked:
-                break
-            outcome = self._application._persist_run_messages(
-                batch.messages,
-                session_id=batch.session_id,
-                turn_id=batch.turn_id,
-            )
-            if not outcome.persisted_message_count:
-                if getattr(outcome, "history_durability", None) == "unknown":
-                    self._pending_persistence_batches[0] = replace(
-                        batch,
-                        blocked=True,
-                    )
-                break
-            self._persisted_message_count += outcome.persisted_message_count
-            del self._pending_persistence_batches[0]
+        flushed = self._flush_pending_persistence()
+        if (
+            flushed
+            and current_messages
+            and turn_session_id is not None
+            and turn_message_start is not None
+            and self._persisted_message_count
+            >= turn_message_start + len(current_messages)
+            and not self._last_flush_committed_terminal
+        ):
+            self._application._record_committed_turn()
         # Application owns the public diagnostics projection.  The value is
         # the cumulative Usage of this terminal Turn (including all Provider
         # iterations/tool continuations), not a second Provider request.

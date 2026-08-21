@@ -678,7 +678,7 @@ class UthCodeTUI:
                     f"生成进行中不能执行 /{invocation.canonical}"
                 )
                 return
-            outcome = self.dispatcher.dispatch(invocation)
+            outcome = await self.dispatcher.dispatch_async(invocation)
             if outcome is not None:
                 await self._apply_command_outcome(text, outcome)
             return

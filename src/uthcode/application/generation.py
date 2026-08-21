@@ -290,6 +290,65 @@ async def _run_compaction_provider(
     return text
 
 
+async def _summarize_compaction_epoch_with_provider(
+    provider: ProviderPort,
+    remote_model_id: str,
+    budget: ContextBudget,
+    epoch: CompactionEpoch | TimelineAgingEpoch,
+    *,
+    cancellation: CancellationToken,
+    aging: bool = False,
+    diagnostics: ApplicationContextService | None = None,
+) -> str:
+    """Run the one shared, tool-free, hard-gated Context model call."""
+
+    output_reserve = budget.compaction_output_reserve
+    if budget.provider_max_output is not None:
+        output_reserve = min(output_reserve, budget.provider_max_output)
+    if output_reserve <= 0:
+        raise ContextRequestSafetyError("compact output reserve is not provider-safe")
+    is_aging = aging or isinstance(epoch, TimelineAgingEpoch)
+    if is_aging:
+        payload = _timeline_aging_input_payload(epoch)  # type: ignore[arg-type]
+        system_prompt = _TIMELINE_AGING_SYSTEM_PROMPT
+        metadata = {
+            "context_compaction_request": True,
+            "context_compaction_level": "L5",
+            "context_timeline_aging_request": True,
+            "context_timeline_aging_epoch_turns": list(epoch.turn_ids),
+        }
+    else:
+        payload = _compaction_input_payload(epoch)  # type: ignore[arg-type]
+        system_prompt = _COMPACTION_SYSTEM_PROMPT
+        metadata = {
+            "context_compaction_request": True,
+            "context_compaction_epoch_turns": list(epoch.turn_ids),
+        }
+    compact_request = GenerationRequest(
+        messages=(Message("user", (TextPart(payload),)),),
+        system_prompt=system_prompt,
+        model=remote_model_id,
+        tools=(),
+        reasoning=None,
+        max_output_tokens=output_reserve,
+        temperature=0.0,
+        metadata=metadata,
+    )
+    prepared = await _prepare_compaction_request_async(
+        provider,
+        compact_request,
+        budget,
+        cancellation=cancellation,
+    )
+    if diagnostics is not None:
+        diagnostics.record_request_diagnostics(prepared, budget)
+    return await _run_compaction_provider(
+        provider,
+        prepared,
+        cancellation=cancellation,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _CountResolution:
     value: ContextCountEstimate | int | None
@@ -566,6 +625,7 @@ class TranscriptPersistenceOutcome:
             "instruction_state_sync": "instruction_state_sync_failed",
             "session_boundary": "session_boundary",
             "invalid_message": "invalid_message",
+            "open_continuation": "open_continuation_not_persisted",
         }.get(self.failure_stage)
 
 
@@ -806,26 +866,90 @@ class UthCodeApplication:
         self._refresh_context_for_session(session)
         return session
 
-    def compact_session(
-        self,
-        *,
-        summarize: Callable[[str], str] | None = None,
-    ) -> CompactionResult:
-        """Compact the active Session without mutating its Transcript."""
+    async def compact_session(self) -> CompactionResult:
+        """Run one manual L4 epoch through the active Turn's Context path."""
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
         session = self._session_service.active_session
         if session is None:
             raise RuntimeError("no active Session")
-        result = self._context_service.compact(
+        if session.durability_unknown:
+            raise RuntimeError(
+                "Session History durability is unknown; reconcile before compacting"
+            )
+
+        provider = self._provider
+        model_profile = self.current_model
+        remote_model_id = (
+            model_profile.remote_id
+            if model_profile is not None
+            else provider.identity.model
+        )
+        configured_input_limit = (
+            model_profile.context_window if model_profile is not None else None
+        )
+        max_output_tokens = (
+            model_profile.max_output_tokens if model_profile is not None else None
+        )
+        provider_limits = await _resolve_model_limits_async(provider, remote_model_id)
+        budget = resolve_context_budget(
+            configured_input_limit=configured_input_limit,
+            provider_limits=provider_limits,
+            requested_output_reserve=(max_output_tokens or 0),
+        )
+        cancellation = CancellationToken()
+
+        async def summarize_epoch(epoch: CompactionEpoch) -> str:
+            return await _summarize_compaction_epoch_with_provider(
+                provider,
+                remote_model_id,
+                budget,
+                epoch,
+                cancellation=cancellation,
+                diagnostics=self._context_service,
+            )
+
+        async def commit(candidate: CompactionResult) -> CompactionResult:
+            active = self._session_service.active_session
+            if active is None:
+                return replace(
+                    candidate,
+                    changed=False,
+                    failure="timeline_commit_failed",
+                )
+            return self._commit_timeline_candidate(active, candidate)
+
+        result = await self._context_service.compact_async(
             session.transcript,
             timeline=session.timeline,
             session_id=session.session_id,
-            summarize=summarize,
+            summarize=summarize_epoch,
+            commit=commit,
+            cancellation=cancellation,
+            max_epochs=1,
+            input_budget=budget.compaction_input_budget,
+            output_reserve=(
+                min(budget.compaction_output_reserve, budget.provider_max_output)
+                if budget.provider_max_output is not None
+                else budget.compaction_output_reserve
+            ),
+            summary_hard_cap=(
+                min(budget.compaction_output_reserve, budget.provider_max_output)
+                if budget.provider_max_output is not None
+                else budget.compaction_output_reserve
+            ),
         )
-        if result.changed and result.timeline is not None:
-            result = self._commit_timeline_candidate(session, result)
+        if not result.changed and result.failure in {"no_safe_epoch", "no_reduction"}:
+            # A low-pressure/manual no-op is a successful no-change outcome;
+            # do not fabricate a Timeline candidate or expose a retry error.
+            result = replace(
+                result,
+                timeline=session.timeline,
+                summary=(session.timeline.summary if session.timeline is not None else None),
+                failure=None,
+            )
+            self._context_service.finalize_compaction(result)
         return result
 
     def _commit_timeline_candidate(
@@ -983,6 +1107,11 @@ class UthCodeApplication:
         return {
             "schema_version": 1,
             "context": context.get("context", {"status": "not_available"}),
+            "context_budget": context.get("budget"),
+            "context_request_accounting": context.get("request_accounting"),
+            "context_gate": context.get("gate"),
+            "context_pressure": context.get("pressure"),
+            "context_count_fallback": context.get("count_fallback"),
             "compaction": context.get("compaction", {"count": 0, "events": []}),
             "externalization": tools.get(
                 "externalization", {"status": "not_available"}
@@ -1068,6 +1197,19 @@ class UthCodeApplication:
                 )
                 entries.extend(converted)
                 sequence += len(converted)
+            if any(not entry.commit_boundary for entry in entries):
+                outcome = TranscriptPersistenceOutcome(
+                    False,
+                    False,
+                    "open_continuation",
+                    0,
+                    transcript_metadata_synced=False,
+                    transcript_reload_succeeded=False,
+                    transcript_durability="not_durable",
+                    failure_stages=("open_continuation",),
+                )
+                self._record_transcript_persistence(outcome)
+                return outcome
             if entries:
                 append_outcome = active.append_transcript(tuple(entries))
         except Exception:
@@ -1179,9 +1321,16 @@ class UthCodeApplication:
             "persisted_message_count": outcome.persisted_message_count,
             "committed_turns": int(
                 self._history_persistence_diagnostics.get("committed_turns", 0)
-            ) + (1 if outcome.transcript_appended and outcome.persisted_message_count else 0),
+            ),
             "error_code": outcome.error_code,
         }
+
+    def _record_committed_turn(self) -> None:
+        """Increment the durable-turn metric after the whole delta is closed."""
+
+        self._history_persistence_diagnostics["committed_turns"] = int(
+            self._history_persistence_diagnostics.get("committed_turns", 0)
+        ) + 1
 
     def _record_formal_run_usage(self, usage: Usage) -> None:
         """Project one terminal AgentRun's observed cumulative Usage.
@@ -1277,6 +1426,7 @@ class UthCodeApplication:
             transcript=session.transcript,
             timeline=session.timeline,
             tool_definitions=self.tool_definitions(),
+            preserve_request_diagnostics=True,
         )
 
     def select_model(self, model_ref: str) -> ModelProfile:
@@ -1329,6 +1479,8 @@ class UthCodeApplication:
         permission_resolver: PermissionResolver,
         session_grant_sink: SessionGrantSink,
         process_message_start: int = 0,
+        persist_closed_messages: Callable[[Sequence[Message], str], int | None]
+        | None = None,
     ) -> AgentTurnExecution:
         """Start a Core Turn with Application-owned snapshots.
 
@@ -1376,21 +1528,85 @@ class UthCodeApplication:
             active = self._session_service.active_session
             return None if active is None else active.transcript
 
-        def handle_provider_overflow() -> bool:
-            """Perform one bounded compaction attempt, never window discovery."""
+        async def handle_provider_overflow() -> bool:
+            """Perform one bounded async L4 recovery, never window discovery."""
 
-            if self._session_service is not None:
-                active = self._session_service.active_session
-                if active is not None:
-                    candidate = self._context_service.compact(
-                        active.transcript,
-                        timeline=active.timeline,
-                        session_id=active.session_id,
+            if self._session_service is None or frozen_budget is None:
+                return False
+            active = self._session_service.active_session
+            if active is None:
+                return False
+            compaction_note["overflow_recovery_attempted"] = True
+            compaction_note["attempted"] = True
+
+            async def summarize(epoch: CompactionEpoch) -> str:
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                return await _summarize_compaction_epoch_with_provider(
+                    provider,
+                    remote_model_id,
+                    frozen_budget,
+                    epoch,
+                    cancellation=cancellation,
+                    diagnostics=self._context_service,
+                )
+
+            async def commit(candidate: CompactionResult) -> CompactionResult:
+                current = self._session_service.active_session
+                if current is None:
+                    return replace(
+                        candidate,
+                        changed=False,
+                        failure="timeline_commit_failed",
                     )
-                    if candidate.changed and candidate.timeline is not None:
-                        committed = self._commit_timeline_candidate(active, candidate)
-                        return committed.changed
-            return False
+                committed = self._commit_timeline_candidate(current, candidate)
+                if committed.changed:
+                    compaction_note["epochs"] = int(compaction_note["epochs"]) + 1
+                return committed
+
+            result = await self._context_service.compact_async(
+                active.transcript,
+                timeline=active.timeline,
+                session_id=active.session_id,
+                summarize=summarize,
+                commit=commit,
+                cancellation=cancellation,
+                max_epochs=1,
+                active_turn_id=turn_id,
+                input_budget=frozen_budget.compaction_input_budget,
+                output_reserve=(
+                    min(
+                        frozen_budget.compaction_output_reserve,
+                        frozen_budget.provider_max_output,
+                    )
+                    if frozen_budget.provider_max_output is not None
+                    else frozen_budget.compaction_output_reserve
+                ),
+                summary_hard_cap=(
+                    min(
+                        frozen_budget.compaction_output_reserve,
+                        frozen_budget.provider_max_output,
+                    )
+                    if frozen_budget.provider_max_output is not None
+                    else frozen_budget.compaction_output_reserve
+                ),
+            )
+            compaction_note.update(
+                {
+                    "status": (
+                        "completed"
+                        if result.changed and result.failure is None
+                        else "unresolved"
+                    ),
+                    "failure": result.failure,
+                    "overflow_recovery_status": (
+                        "recovered" if result.changed and result.failure is None else "failed"
+                    ),
+                    "overflow_recovery_failure": result.failure,
+                }
+            )
+            return result.changed and result.failure is None
 
         limits_ready = False
         frozen_provider_limits: ModelLimits | None = None
@@ -1404,6 +1620,9 @@ class UthCodeApplication:
             "failure": None,
             "auto_pressure_unresolved": False,
             "previous_estimate": None,
+            "overflow_recovery_attempted": False,
+            "overflow_recovery_status": "not_needed",
+            "overflow_recovery_failure": None,
             "timeline_aging": {
                 "attempted": False,
                 "status": "not_needed",
@@ -1434,6 +1653,26 @@ class UthCodeApplication:
                 )
                 limits_ready = True
             process_messages = messages[process_message_start:]
+            if persist_closed_messages is not None:
+                persisted_cursor = persist_closed_messages(messages, turn_id)
+                if persisted_cursor is not None:
+                    if (
+                        isinstance(persisted_cursor, bool)
+                        or not isinstance(persisted_cursor, int)
+                        or persisted_cursor < 0
+                        or persisted_cursor > len(messages)
+                    ):
+                        raise TypeError(
+                            "persist_closed_messages returned an invalid cursor"
+                        )
+                    if persisted_cursor < len(messages):
+                        raise RuntimeError(
+                            "closed Transcript facts could not be durably persisted"
+                        )
+                    # Keep the active Turn as the current conversation tail.
+                    # The Context service removes its durable copy before
+                    # merging this process-local projection.
+                    process_messages = messages[process_message_start:]
 
             def compose(
                 provider_count: ContextCountEstimate | int | None,
@@ -1457,6 +1696,7 @@ class UthCodeApplication:
                     provider_count=provider_count,
                     defer_hard_gate=defer_hard_gate,
                     count_fallback=count_fallback,
+                    current_turn_id=turn_id if active_session_id() is not None else None,
                 )
                 return replace(
                     request,
@@ -1492,6 +1732,7 @@ class UthCodeApplication:
                     candidate_messages=candidate.messages,
                     disable_reductions=True,
                     reduction_levels=_request_reduction_levels(candidate),
+                    current_turn_id=turn_id if active_session_id() is not None else None,
                 )
                 return replace(
                     request,
@@ -1511,37 +1752,13 @@ class UthCodeApplication:
                 compaction_note["provider_attempts"] = int(
                     compaction_note["provider_attempts"]
                 ) + 1
-                output_reserve = frozen_budget.compaction_output_reserve
-                if frozen_budget.provider_max_output is not None:
-                    output_reserve = min(output_reserve, frozen_budget.provider_max_output)
-                compact_request = GenerationRequest(
-                    messages=(
-                        Message(
-                            "user",
-                            (TextPart(_compaction_input_payload(epoch)),),
-                        ),
-                    ),
-                    system_prompt=_COMPACTION_SYSTEM_PROMPT,
-                    model=remote_model_id,
-                    tools=(),
-                    reasoning=None,
-                    max_output_tokens=output_reserve,
-                    temperature=0.0,
-                    metadata={
-                        "context_compaction_request": True,
-                        "context_compaction_epoch_turns": list(epoch.turn_ids),
-                    },
-                )
-                prepared = await _prepare_compaction_request_async(
+                return await _summarize_compaction_epoch_with_provider(
                     provider,
-                    compact_request,
+                    remote_model_id,
                     frozen_budget,
+                    epoch,
                     cancellation=cancellation,
-                )
-                return await _run_compaction_provider(
-                    provider,
-                    prepared,
-                    cancellation=cancellation,
+                    diagnostics=self._context_service,
                 )
 
             async def summarize_aging_epoch(epoch: TimelineAgingEpoch) -> str:
@@ -1553,39 +1770,14 @@ class UthCodeApplication:
                 aging_note["provider_attempts"] = int(
                     aging_note["provider_attempts"]
                 ) + 1
-                output_reserve = frozen_budget.compaction_output_reserve
-                if frozen_budget.provider_max_output is not None:
-                    output_reserve = min(output_reserve, frozen_budget.provider_max_output)
-                compact_request = GenerationRequest(
-                    messages=(
-                        Message(
-                            "user",
-                            (TextPart(_timeline_aging_input_payload(epoch)),),
-                        ),
-                    ),
-                    system_prompt=_TIMELINE_AGING_SYSTEM_PROMPT,
-                    model=remote_model_id,
-                    tools=(),
-                    reasoning=None,
-                    max_output_tokens=output_reserve,
-                    temperature=0.0,
-                    metadata={
-                        "context_compaction_request": True,
-                        "context_compaction_level": "L5",
-                        "context_timeline_aging_request": True,
-                        "context_timeline_aging_epoch_turns": list(epoch.turn_ids),
-                    },
-                )
-                prepared = await _prepare_compaction_request_async(
+                return await _summarize_compaction_epoch_with_provider(
                     provider,
-                    compact_request,
+                    remote_model_id,
                     frozen_budget,
+                    epoch,
                     cancellation=cancellation,
-                )
-                return await _run_compaction_provider(
-                    provider,
-                    prepared,
-                    cancellation=cancellation,
+                    aging=True,
+                    diagnostics=self._context_service,
                 )
 
             async def commit_epoch(candidate: CompactionResult) -> CompactionResult:
@@ -1685,6 +1877,7 @@ class UthCodeApplication:
                     should_continue=rebuild_after_epoch,
                     cancellation=cancellation,
                     max_epochs=4,
+                    active_turn_id=turn_id,
                     input_budget=frozen_budget.compaction_input_budget
                     if frozen_budget is not None
                     else None,
@@ -1747,7 +1940,7 @@ class UthCodeApplication:
                     # Hard-safe request remains sendable with the reason kept
                     # in the bounded compaction note.
                     compaction_note["status"] = "unresolved"
-                return result.changed
+                return result.changed and result.failure is None
 
             async def run_l5_if_needed() -> bool:
                 """Run one independent Fine Timeline aging attempt."""
@@ -1797,6 +1990,7 @@ class UthCodeApplication:
                         commit=commit_aging_epoch,
                         cancellation=cancellation,
                         fine_budget=fine_budget,
+                        active_turn_id=turn_id,
                         input_budget=frozen_budget.compaction_input_budget,
                         output_reserve=(
                             min(
@@ -1829,7 +2023,7 @@ class UthCodeApplication:
                         "failure": result.failure,
                     }
                 )
-                return result.changed
+                return result.changed and result.failure is None
 
             async def on_counted_request(
                 counted_request: GenerationRequest,
