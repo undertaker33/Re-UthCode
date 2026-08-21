@@ -36,6 +36,14 @@ from uthcode.integrations.tools.tool_result_read import (
     ToolResultTooLarge,
     format_externalized_preview,
 )
+from uthcode.integrations.tools.history_read import (
+    HistoryReadBoundaryError,
+    HistoryReadPage,
+    HistoryReadPolicy,
+    HistoryReadSessionError,
+    HistoryReadTool,
+    decode_history_ref,
+)
 
 
 _MAX_SUMMARY_CHARS = 240
@@ -181,6 +189,7 @@ class ApplicationToolService:
         "_runtime_hooks",
         "_session_provider",
         "_tool_result_policy",
+        "_history_read_policy",
         "_workdir",
         "_externalization_stats",
     )
@@ -194,6 +203,7 @@ class ApplicationToolService:
         secret_values: Sequence[SecretValue] = (),
         session_provider: Callable[[], object | None] | None = None,
         tool_result_policy: ToolResultPolicy | None = None,
+        history_read_policy: HistoryReadPolicy | None = None,
     ) -> None:
         tool_values = tuple(tools)
         reserved_names = {
@@ -201,6 +211,7 @@ class ApplicationToolService:
             TODO_WRITE_TOOL_DEFINITION.name,
             PROPOSE_PLAN_TOOL_DEFINITION.name,
             "ToolResultRead",
+            "HistoryRead",
         }
         if any(tool.definition.name in reserved_names for tool in tool_values):
             raise ValueError(
@@ -215,6 +226,11 @@ class ApplicationToolService:
         )
         if not isinstance(self._tool_result_policy, ToolResultPolicy):
             raise TypeError("tool_result_policy must be a ToolResultPolicy or None")
+        self._history_read_policy = (
+            HistoryReadPolicy() if history_read_policy is None else history_read_policy
+        )
+        if not isinstance(self._history_read_policy, HistoryReadPolicy):
+            raise TypeError("history_read_policy must be a HistoryReadPolicy or None")
         if session_provider is not None:
             tool_values = (
                 *tool_values,
@@ -222,6 +238,11 @@ class ApplicationToolService:
                     self._read_tool_result_page,
                     session_provider,
                     policy=self._tool_result_policy,
+                ),
+                HistoryReadTool(
+                    self._read_history_page,
+                    session_provider,
+                    policy=self._history_read_policy,
                 ),
             )
         self._registry = ToolRegistry(tool_values)
@@ -312,6 +333,11 @@ class ApplicationToolService:
                 offset = arguments.get("offset", 0)
                 limit = arguments.get("limit", self._tool_result_policy.read_page_limit_bytes)
                 summary = f"ToolResultRead ref={ref} offset={offset} limit={limit}"
+            elif call.name == "HistoryRead":
+                ref = _safe_text(arguments.get("ref"), "<ref unavailable>")
+                offset = arguments.get("offset", 0)
+                limit = arguments.get("limit", self._history_read_policy.page_entry_limit)
+                summary = f"HistoryRead ref={ref} offset={offset} limit={limit}"
             else:
                 # A custom Tool may have arbitrary argument names.  Its name
                 # is useful, while its argument payload is not safe to echo.
@@ -365,7 +391,7 @@ class ApplicationToolService:
 
         # ToolResultRead is already a bounded page.  Never recursively
         # externalize the only reader for an externalized result.
-        if outcome.tool_name == "ToolResultRead" or size_bytes <= self._tool_result_policy.inline_threshold_bytes:
+        if outcome.tool_name in {"ToolResultRead", "HistoryRead"} or size_bytes <= self._tool_result_policy.inline_threshold_bytes:
             self._record_materialization("inline", size_bytes)
             return ToolResultMaterialization(
                 execution=outcome,
@@ -527,6 +553,51 @@ class ApplicationToolService:
         if not isinstance(page, ToolResultPage):
             raise ToolResultError("Session returned an invalid Tool Result page")
         return page
+
+    def _read_history_page(
+        self,
+        session_id: str,
+        ref_token: str,
+        offset: int,
+        limit: int,
+    ) -> HistoryReadPage:
+        session = self._session_provider() if self._session_provider is not None else None
+        if session is None or getattr(session, "session_id", None) != session_id:
+            raise HistoryReadSessionError(
+                "HistoryRead ref is not owned by the active Session"
+            )
+        ref = decode_history_ref(ref_token)
+        if ref.session_id != session_id:
+            raise HistoryReadSessionError(
+                "HistoryRead ref is not owned by the active Session"
+            )
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise HistoryReadBoundaryError("HistoryRead offset is invalid")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= self._history_read_policy.page_entry_limit
+        ):
+            raise HistoryReadBoundaryError("HistoryRead limit is invalid")
+        try:
+            entries = tuple(session.read_transcript(ref))
+        except HistoryReadBoundaryError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise HistoryReadBoundaryError("HistoryRead ref is not a complete boundary") from exc
+        total_entries = len(entries)
+        if offset > total_entries:
+            raise HistoryReadBoundaryError("HistoryRead offset is outside the ref")
+        page_entries = entries[offset : offset + limit]
+        next_offset = offset + len(page_entries)
+        return HistoryReadPage(
+            ref=ref.to_token(),
+            entries=page_entries,
+            offset=offset,
+            next_offset=next_offset,
+            total_entries=total_entries,
+            eof=next_offset >= total_entries,
+        )
 
 
 def _safe_text(value: object, fallback: str) -> str:

@@ -6,7 +6,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from uthcode.core.history import ActiveCheckpoint, RuntimeLogEntry, SemanticEntry, EpochMacroSummary, TranscriptEntry, TranscriptKind
+from uthcode.core.history import (
+    ActiveCheckpoint,
+    EpochMacroSummary,
+    RuntimeLogEntry,
+    SemanticEntry,
+    TranscriptBoundaryError,
+    TranscriptEntry,
+    TranscriptKind,
+    TranscriptRef,
+)
 from uthcode.integrations.session_files import (
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
@@ -167,6 +176,18 @@ class ApplicationSession:
             offset=offset,
             limit=limit,
             policy=policy,
+        )
+
+    def read_transcript(self, ref: TranscriptRef) -> tuple[TranscriptEntry, ...]:
+        """Read one exact complete raw Transcript reference without mutation."""
+
+        self._require_open()
+        if not isinstance(ref, TranscriptRef) or ref.session_id != self.session_id:
+            raise TranscriptBoundaryError("Transcript ref does not belong to this Session")
+        return self.snapshot.transcript.select(
+            ref.sequence_start,
+            ref.sequence_end,
+            complete_only=True,
         )
 
     def persist_instruction_state(self) -> SessionMetadata:

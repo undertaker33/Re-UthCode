@@ -24,6 +24,8 @@ from uthcode.core.context import (
 )
 from uthcode.core.history import (
     ActiveCheckpoint,
+    EpochMacroSummary,
+    SemanticEntry,
     Timeline,
     Transcript,
     TranscriptEntry,
@@ -113,6 +115,38 @@ class _L4Provider:
         yield _completed("ordinary answer")
 
 
+class _L5Provider:
+    def __init__(self) -> None:
+        self.identity = ProviderIdentity("fake", "l5", "provider-model")
+        self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=6_000, max_output_tokens=2_048, source="test.l5")
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        if request.metadata.get("context_compaction_request") is True:
+            return account_generation_request(request).input_tokens
+        return 1
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        cancellation.raise_if_cancelled()
+        if request.metadata.get("context_compaction_level") == "L5":
+            turns = tuple(
+                value
+                for value in request.metadata.get("context_timeline_aging_epoch_turns", ())
+                if isinstance(value, str)
+            )
+            yield _completed(json.dumps({"summary": "macro summary", "coverage": list(turns)}))
+            return
+        yield _completed("ordinary answer")
+
+
 def _seed_session(application: UthCodeApplication, *, count: int = 70):
     session = application.create_session("l4-session")
     for index in range(1, count + 1):
@@ -189,6 +223,60 @@ async def test_l4_is_tool_free_bounded_and_commits_one_fine_entry_per_turn(tmp_p
     assert isinstance(compaction_note["previous_estimate"], int)
     assert isinstance(compaction_note["headroom"], int)
     assert compaction_note["headroom"] > 0
+
+
+@pytest.mark.asyncio
+async def test_l5_ages_fine_timeline_before_ordinary_request_at_low_pressure(tmp_path) -> None:
+    provider = _L5Provider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="test-project",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = application.create_session("l5-session")
+    entries = transcript_entries_for_message(
+        session.session_id,
+        "turn-1",
+        session.transcript.last_sequence + 1,
+        Message("user", (TextPart("raw fact"),)),
+    )
+    assert session.append_transcript(entries).durability == "durable"
+    fine = SemanticEntry(
+        "turn-1",
+        "fine-" + "x" * 2_000,
+        (session.transcript.reference(1, 1),),
+        session_id=session.session_id,
+    )
+    assert session.append_timeline_transaction(
+        (fine,),
+        ActiveCheckpoint("turn-1", ("turn-1",), session_id=session.session_id),
+    ).durability == "durable"
+
+    result = await application.create_run().start_turn("current fact").result()
+    assert result.status is RunStatus.COMPLETED
+    assert len(provider.requests) == 2
+    aging_request, ordinary_request = provider.requests
+    assert aging_request.metadata["context_compaction_level"] == "L5"
+    assert aging_request.metadata["context_timeline_aging_request"] is True
+    assert aging_request.tools == ()
+    assert aging_request.model == "frozen-model"
+    assert "fine-" not in aging_request.messages[0].parts[0].text
+    assert "raw fact" in aging_request.messages[0].parts[0].text
+    assert ordinary_request.metadata["context_compaction"]["timeline_aging"]["status"] == "completed"
+    assert session.timeline.fine_entries == ()
+    assert session.timeline.physical_fine_entries == (fine,)
+    assert len(session.timeline.macro_summaries) == 1
+    assert isinstance(session.timeline.logical_records[-2], EpochMacroSummary)
 
 
 @pytest.mark.asyncio

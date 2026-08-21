@@ -27,7 +27,9 @@ from uthcode.core.context import (
     preflight_safety_count,
     pressure_estimate,
     resolve_context_budget,
+    fine_timeline_usage,
 )
+from uthcode.core.compaction import TimelineAgingEpoch
 from uthcode.core.history import Timeline, Transcript
 from uthcode.core.prompt import (
     ContextAuthority,
@@ -500,6 +502,217 @@ class ApplicationContextService:
             changed=committed_any,
             failure=last_failure or "no_safe_epoch",
         )
+
+    async def age_timeline_async(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline,
+        session_id: str | None = None,
+        summarize: Callable[[TimelineAgingEpoch], object | Awaitable[object]],
+        commit: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ] | None = None,
+        cancellation: CancellationToken | None = None,
+        fine_budget: int,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+        summary_hard_cap: int | None = None,
+    ) -> CompactionResult:
+        """Run at most one tool-free L5 Fine-to-Macro aging epoch.
+
+        The method deliberately has no durable cursor and never loops over
+        multiple epochs.  Every retry revalidates the same raw epoch; a failed
+        or ambiguous boundary leaves the previous Timeline untouched.
+        """
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if not isinstance(timeline, Timeline) or timeline.session_id != transcript.session_id:
+            raise ValueError("transcript and timeline must belong to the same Session")
+        if not callable(summarize):
+            raise TypeError("summarize must be callable")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        if isinstance(fine_budget, bool) or not isinstance(fine_budget, int) or fine_budget <= 0:
+            raise ValueError("fine_budget must be a positive integer")
+        owner = transcript.session_id if session_id is None else session_id
+        if owner != transcript.session_id:
+            raise ValueError("Timeline aging Session does not own the supplied Transcript")
+
+        def record(
+            *,
+            status: str,
+            failure: str | None,
+            changed: bool,
+            usage: int,
+            epoch: TimelineAgingEpoch | None = None,
+            attempt: int = 0,
+        ) -> None:
+            self._record_compaction(
+                {
+                    "level": "L5",
+                    "status": status,
+                    "changed": changed,
+                    "failure": failure,
+                    "fine_usage": usage,
+                    "fine_budget": fine_budget,
+                    "coverage_count": 0 if epoch is None else len(epoch.turn_ids),
+                    "epoch_attempt": attempt,
+                }
+            )
+
+        usage = fine_timeline_usage(timeline, self._compiler.token_estimator)
+        if usage <= fine_budget:
+            record(status="no_change", failure=None, changed=False, usage=usage)
+            return CompactionResult(
+                timeline=timeline,
+                summary=timeline.summary or None,
+                changed=False,
+            )
+        if cancellation is not None and cancellation.cancelled:
+            record(status="failed", failure="compaction_cancelled", changed=False, usage=usage)
+            return CompactionResult(
+                timeline=timeline,
+                summary=timeline.summary or None,
+                changed=False,
+                failure="compaction_cancelled",
+            )
+
+        lock = self._compactor._acquire_single_flight(owner)
+        try:
+            epoch = self._compactor.plan_timeline_aging_epoch(
+                transcript,
+                timeline=timeline,
+                session_id=owner,
+                input_budget=input_budget,
+                output_reserve=output_reserve,
+            )
+            if epoch is None:
+                record(status="failed", failure="no_safe_epoch", changed=False, usage=usage)
+                return CompactionResult(
+                    timeline=timeline,
+                    summary=timeline.summary or None,
+                    changed=False,
+                    failure="no_safe_epoch",
+                )
+
+            candidate: CompactionResult | None = None
+            failure = "repeated_failure"
+            failure_attempt = 0
+            for attempt in range(1, 3):
+                failure_attempt = attempt
+                if cancellation is not None and cancellation.cancelled:
+                    raise CancelledError()
+                try:
+                    generated = summarize(epoch)
+                    if inspect.isawaitable(generated):
+                        generated = await generated
+                    if cancellation is not None and cancellation.cancelled:
+                        raise CancelledError()
+                    parsed = self._compactor.parse_timeline_aging_result(
+                        generated,
+                        epoch=epoch,
+                        summary_hard_cap=summary_hard_cap,
+                    )
+                    candidate = self._compactor.build_timeline_aging_candidate(
+                        transcript,
+                        epoch=epoch,
+                        result=parsed,
+                        timeline=timeline,
+                    )
+                    failure = ""
+                    break
+                except (GenerationCancelled, CancelledError):
+                    raise
+                except Exception:
+                    failure = "repeated_failure" if attempt == 2 else "compaction_result_invalid"
+
+            if candidate is None:
+                record(
+                    status="failed",
+                    failure=failure,
+                    changed=False,
+                    usage=usage,
+                    epoch=epoch,
+                    attempt=failure_attempt,
+                )
+                return CompactionResult(
+                    timeline=timeline,
+                    summary=timeline.summary or None,
+                    changed=False,
+                    failure=failure,
+                )
+
+            committed_result = candidate
+            if commit is not None:
+                try:
+                    committed = commit(candidate)
+                    if inspect.isawaitable(committed):
+                        committed = await committed
+                    if isinstance(committed, CompactionResult):
+                        committed_result = committed
+                        committed_ok = (
+                            committed.changed
+                            and committed.failure is None
+                            and committed.timeline is not None
+                        )
+                    elif isinstance(committed, bool):
+                        committed_ok = committed
+                    else:
+                        committed_ok = False
+                except (GenerationCancelled, CancelledError):
+                    raise
+                except Exception:
+                    committed_ok = False
+                if not committed_ok:
+                    record(
+                        status="failed",
+                        failure="timeline_commit_failed",
+                        changed=False,
+                        usage=usage,
+                        epoch=epoch,
+                    )
+                    return CompactionResult(
+                        timeline=timeline,
+                        summary=timeline.summary or None,
+                        changed=False,
+                        failure="timeline_commit_failed",
+                    )
+
+            next_timeline = committed_result.timeline or candidate.timeline
+            if next_timeline is None or len(next_timeline.records) <= len(timeline.records):
+                record(
+                    status="failed",
+                    failure="no_progress",
+                    changed=False,
+                    usage=usage,
+                    epoch=epoch,
+                )
+                return CompactionResult(
+                    timeline=timeline,
+                    summary=timeline.summary or None,
+                    changed=False,
+                    failure="no_progress",
+                )
+            result = replace(
+                committed_result,
+                timeline=next_timeline,
+                changed=True,
+                failure=None,
+            )
+            record(
+                status="completed",
+                failure=None,
+                changed=True,
+                usage=usage,
+                epoch=epoch,
+                attempt=failure_attempt,
+            )
+            return result
+        finally:
+            lock.release()
 
     def public_diagnostics(self) -> dict[str, object]:
         """Return a bounded diagnostics projection without Context content."""

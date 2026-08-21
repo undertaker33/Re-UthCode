@@ -1368,6 +1368,7 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
             "Grep",
             "Bash",
             "ToolResultRead",
+            "HistoryRead",
             "AskUserQuestion",
             "ProposePlan",
         ]
@@ -1379,6 +1380,7 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
@@ -1509,6 +1511,7 @@ async def test_t08_application_plan_review_revise_approve_uses_same_handle_and_t
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
@@ -1693,6 +1696,7 @@ async def test_t08_application_plan_generation_accepts_steering_but_review_pause
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "ProposePlan",
     ]
@@ -1773,6 +1777,7 @@ async def test_t08_plan_approval_updates_active_run_and_next_turn_keeps_default_
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "TodoWrite",
     ]
