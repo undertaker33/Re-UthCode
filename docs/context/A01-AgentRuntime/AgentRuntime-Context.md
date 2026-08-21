@@ -19,7 +19,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
-- `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造固定 258K Operating Budget 的 Instruction Plane、Conversation Plane 与 `GenerationRequest.tools`；Provider Integration 只负责原生协议映射。
+- `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造包含 dynamic configured/provider/effective limits、Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的最终请求；每次 Provider call 前都经过 Preflight Hard Gate，Provider Integration 只负责原生协议映射。
 - `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；Application 在 AgentRun 与 direct generation 两条路径都将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
 - `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
 - `[FACT]` terminal History persistence 将 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State metadata sync 分开记录 outcome；只有可判定 `durability=durable` 的 History append 才按 `persisted_message_count` 推进 Run 的 process cursor。append 后的 reload/touch 失败会保留 durable 事实并显示 partial diagnostics；无法通过结构化 History identity reconciliation 判定时，active Session writer 进入 quarantine，所有新 Run 与语义写入 fail closed，不重试未知批次。必须显式关闭 writer，再由 fresh writer 重新打开并验证/恢复后才解除 quarantine。真正未落盘的 append 失败则 cursor 不推进；失败批次在进程内保留原始 Session/Turn identity 并按 FIFO 重试。
@@ -110,9 +110,10 @@ tool:
 - `[ABSENT]` 并行 Tool Batch、DAG、通用工作流引擎。
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
-- `[FACT]` Context Compiler、固定 258K Operating Budget、Projection 数据模型、Compactor 有界分批/校验机制与 Session History 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产组合未提供 summarizer，因此 `/compact` 和 Provider overflow compaction 当前返回 `summarizer_unavailable`，不会生成新 Projection。
-- `[BOUNDARY]` Session 只恢复已完整提交的 History、Projection、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
-- `[DEFER]` 生产 tool-free summarizer、Memory、retrieval 与真实模型窗口解析仍不属于当前执行层。
+- `[FACT]` Context Compiler、Transcript/Timeline、Compactor 有界分批/校验机制与 Session persistence 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产 tool-free L4/L5 summarizer 与 manual `/compact` 共用 bounded request，Timeline commit 采用 derived records first、`ActiveCheckpoint` last；overflow recovery 最多 retry 一次。
+- `[FACT]` 用户显式 `context_window` 与可靠 Provider runtime `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 是当前 limits 来源；有效预算按已知分维限制收紧，两者都未知时在 Provider call 前 fail closed，不使用 bundled metadata、型号名称推断或固定窗口 fallback。
+- `[BOUNDARY]` Session 只恢复已完整提交的 Transcript、committed Timeline、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
+- `[DEFER]` Memory、retrieval 等真实后置能力仍不属于当前执行层。
 
 ## 修改路由
 

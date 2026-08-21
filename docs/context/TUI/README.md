@@ -140,7 +140,7 @@ Slash Command 使用 Application 的正式 Completion 数据源。候选随草�
 
 Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 和旧 Prompt `/do` 不再存在。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
 
-`/new`、`/resume [session-id]` 通过 Application 完成 Session 切换和当前文件系统 Instruction State 重建；`/compact` 也进入 Application/Session 路径，但当前没有生产 summarizer，只会显示受控错误 `summarizer_unavailable`，不会生成 Projection。TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个固定 258K Operating Budget 投影，不把它解释为远端模型物理窗口。
+`/new`、`/resume [session-id]` 通过 Application 完成 Session 切换和当前文件系统 Instruction State 重建；`/compact` 进入同一 Application/Session Context orchestrator，低 pressure 也可执行，无候选时返回成功 no-op。TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个 dynamic Context usage projection，并同时展示分维 limits、Auto/Hard Gate 和 Timeline outcome，不把本地预算解释为远端模型窗口猜测。
 
 `/model` 打开模型候选时保存原草稿；按 `Esc` 后关闭选择器并恢复原对话输入。命令定义、参数提示和模型目录都来自 Application，TUI 不维护副本。
 
@@ -162,7 +162,7 @@ active Turn 接受 Steering 后，用户文本立即作为一条新的 user reco
 
 Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resume 通道。选择修订时只收集非空修改点并提交精确 revision response；选择批准后同一 handle 恢复，TUI 不自行改写 Run/Plan/Task 状态。选择 Cancel 仍走当前 Turn 的既有取消收口。
 
-`Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，但会通过 `/resume` 读取已完整提交的 Session History/Projection/Instruction State，不恢复暂停协程或 Runtime checkpoint。
+`Esc` 在模型选择、Slash 候选、暂停动作和问题临时层中先由当前层消费；关闭层会清空双 Esc arm，不能因为关闭 picker/modal 而意外暂停根页面。`Ctrl+C`、关闭 TUI、异常、进程退出或重启都只执行当前 Turn 的取消收口；任务、pending 问题和答案不会保存，下一次启动创建全新 Run，但会通过 `/resume` 读取已完整提交的 Session Transcript/Timeline/Instruction State，不恢复暂停协程或 Runtime checkpoint。
 
 ## 启动、`/clear` 与退出
 

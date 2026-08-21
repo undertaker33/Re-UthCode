@@ -199,7 +199,7 @@ Session History
 Context
 Todo
 Plan
-Projection
+Timeline
 Compact
 ```
 

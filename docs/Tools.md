@@ -1,6 +1,6 @@
 # UthCode 可用 Tool
 
-UthCode 当前共实现 **10 个 Tool 名称**：6 个默认执行工具、1 个当前 Session 作用域的结果读取工具和 3 个由 Core 处理的控制工具。实际向模型提供哪些 Tool，取决于当前行为模式。
+UthCode 当前共实现 **11 个 Tool 名称**：6 个默认执行工具、2 个当前 Session 作用域的证据读取工具和 3 个由 Core 处理的控制工具。实际向模型提供哪些 Tool，取决于当前行为模式。
 
 ## 默认执行工具
 
@@ -20,6 +20,7 @@ UthCode 当前共实现 **10 个 Tool 名称**：6 个默认执行工具、1 个
 | Tool | 用途 |
 | --- | --- |
 | `ToolResultRead` | 使用当前 Session 的 opaque ref 读取大 Tool Result 的有界页 |
+| `HistoryRead` | 使用当前 Session 的 opaque Transcript ref 读取原始历史的有界页 |
 
 `ToolResultRead` 只接受当前 Session 发出的 ref、offset 和 limit；它不能读取任意文件路径，也不会把上一 Session 的 ref 带入当前 Session。大结果仍保留完整内容，模型先收到 bounded preview，再按需调用该 Tool。
 
@@ -37,9 +38,11 @@ UthCode 当前共实现 **10 个 Tool 名称**：6 个默认执行工具、1 个
 
 | 模式 | 向模型提供的 Tool | 数量 |
 | --- | --- | ---: |
-| 默认执行模式 | 6 个默认执行工具、`ToolResultRead`、`AskUserQuestion`、`TodoWrite` | 9 |
-| Plan Mode | `ReadFile`、`Glob`、`Grep`、`Bash`、`ToolResultRead`、`AskUserQuestion`、`ProposePlan` | 7 |
+| 默认执行模式 | 6 个默认执行工具、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`TodoWrite` | 10 |
+| Plan Mode | `ReadFile`、`Glob`、`Grep`、`Bash`、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`ProposePlan` | 8 |
 
 Plan Mode 中的 `Bash` 仅允许通过只读检查的命令；写入类操作会在执行前被 Runtime Hook 阻止。
+
+`HistoryRead` 只接受当前 Session 的精确 opaque Transcript ref 和有界分页参数；它不搜索、不跨 Session，也不把原始历史递归外置。它与 `ToolResultRead` 使用独立的 ref namespace、权限资源和错误边界。
 
 > `Bash` 不是 OS Sandbox。即使工具对模型可见，具体调用仍需经过参数校验、运行模式限制和权限判断。

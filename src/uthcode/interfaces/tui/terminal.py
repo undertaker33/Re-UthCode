@@ -241,6 +241,7 @@ class RichTerminalRenderer:
             file=buffer,
             force_terminal=True,
             color_system="truecolor",
+            no_color=False,
             width=max(20, width or self.width),
             soft_wrap=False,
             theme=Theme(

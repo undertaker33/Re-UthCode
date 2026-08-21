@@ -15,12 +15,12 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
-- `[FACT]` Application 在 terminal Turn 边界把新增 Message 转换为 Canonical History，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 History identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、History、Projection、Runtime 和 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
-- `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/History/Projection/Runtime/Tool Schema 组成固定 258K Context Snapshot；Projection 变化不改变 Instruction Epoch 或 stable prefix，AGENTS scope/content 变化才创建新 epoch。
-- `[BOUNDARY]` `ContextCompactor` 能生成并校验 Projection candidate，但生产 Application 没有注入 summarizer；当前手动 `/compact` 与 overflow path 都不会提交新的 Projection，只返回 `summarizer_unavailable`。
+- `[FACT]` Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal Turn 边界把新增 Message 转换为 Transcript，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、Transcript、Timeline、Runtime 和 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
+- `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/Transcript/Timeline/Runtime/Tool Schema 组成动态 Context Snapshot；configured/provider/effective limits、Pressure/Preflight Count、Auto/Hard Gate 与每次 request 的最终 accounting 一起记录安全诊断。Instruction scope/content 变化才创建新的 instruction epoch。
+- `[FACT]` L4/L5、manual `/compact` 和 ordinary overflow recovery 复用同一 Application Context orchestrator；Compact request tool-free、bounded、使用冻结或当前模型，并在 commit 前通过 Hard Gate。成功 transaction 先写 Fine/Macro，最后写 `ActiveCheckpoint`；失败、取消、无 safe epoch 和 unknown durability 不产生伪提交。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
-- `[BOUNDARY]` Session Store、Canonical History、Projection、Tool Result ref 和 Instruction State metadata 已持久化；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
+- `[BOUNDARY]` Session Store、Transcript、Timeline、Tool Result ref 和 Instruction State metadata 已持久化；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## 权威源码索引
 
@@ -40,13 +40,13 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 | 事实 | 唯一权威所有者 | 生命周期 | 对外暴露 |
 | --- | --- | --- | --- |
 | `workdir/platform/date` | `ApplicationRuntimeContext` | Application | 只读属性 |
-| 当前 Provider/model ref | `UthCodeApplication` | Application；切换影响下一 Turn | `status`, model catalog |
+| 当前 Provider/model ref | `UthCodeApplication` | Application；切换影响下一 Turn | `status`, configured model profiles |
 | Permission RuleSet | `PermissionEvaluator` | AgentRun 创建时快照 | 只暴露决策，不暴露可变规则 |
 | permission mode | `AgentRun` + `UthCodeApplication` | 当前 Run；安全默认值为用户配置偏好 | Run-local `set_permission_mode`；Application 默认仅允许 `default|auto` |
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
-| committed History | active `ApplicationSession` / `SessionWriter` | terminal Turn 后追加；resume 读取当前 Session | `ApplicationSession.history`、Context Compiler |
-| Projection | `ApplicationSession` / `SessionWriter` | 仅在合法 Compaction candidate 成功持久化后追加 revision；当前生产 summarizer 缺失，正常入口不会产生新 revision | Context diagnostics、Conversation Plane |
+| committed Transcript | active `ApplicationSession` / `SessionWriter` | request preparation、complete tool batch 和 terminal tail 边界追加；resume 读取当前 Session | `ApplicationSession.transcript`、Context Compiler、HistoryRead |
+| committed Timeline | active `ApplicationSession` / `SessionWriter` | L4/L5 合法 candidate 先写派生 record、最后写 checkpoint；物理记录 append-only，logical view 按最新有效 checkpoint 计算 | Context Compiler、Context diagnostics |
 | Instruction State metadata | `InstructionLoader` + Session metadata | Session create/resume/terminal close 边界 | epoch/fingerprint/reason diagnostics |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |
 | behavior mode | `RunState` / `AgentRun` idle selection | 当前 Turn；批准 Plan 后切回 DEFAULT，下一 Turn 继承最终 mode | `BehaviorModeChanged`, `Run.behavior_mode` |
@@ -137,9 +137,11 @@ turn_completed | turn_failed | turn_cancelled
 implemented context:
   ApplicationRuntimeContext = workdir + platform + current_date
   Instruction Plane         = Prompt Asset + Core Contract + current AGENTS State
-  Conversation Plane        = Projection + committed History + current Run delta
+  Conversation Plane        = Timeline logical view + Transcript recent facts + current Run delta
   Tool System               = Application Tool definitions -> GenerationRequest.tools
-  Context Budget            = fixed 258K Operating Budget
+  Context Budget            = configured/provider/effective limits + adaptive working profile
+  Context Gates              = Pressure Estimate/Auto Gate + Preflight Safety Count/Hard Gate
+  Compact                    = bounded L4/L5, manual no-op/success, one overflow retry
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
@@ -156,7 +158,7 @@ not implemented context:
 - `RunSnapshot` 不得新增 conversation、Tool result 或秘密正文。
 - 同一 Run 同时最多一个 active Turn；终态必须释放 active slot。
 - Pause 不是 `RunStatus`；不要新增第二套 paused state 与 Core continuation 竞争权威性。
-- JSON 方法不等于 Runtime checkpoint；只有 Application Session lifecycle 明确调用时才执行 durable append，不由 Core 或 Interface 隐式写盘。
+- JSON 方法不等于 Runtime checkpoint；只有 Application Session lifecycle 明确调用时才执行 durable Transcript/Timeline append，不由 Core 或 Interface 隐式写盘。
 
 ## 修改路由
 
