@@ -4,7 +4,7 @@ import pytest
 
 from uthcode.application.context import ApplicationContextService
 from uthcode.core.context import CompactionPolicy, ContextCompactor
-from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind
+from uthcode.core.history import ActiveCheckpoint, EpochMacroSummary, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind, TranscriptRef
 
 
 def _transcript() -> Transcript:
@@ -65,3 +65,87 @@ def test_context_compactor_single_flight_rejects_reentrant_lock() -> None:
             compactor.compact(transcript, summarize=lambda _text: "summary")
     finally:
         lock.release()
+
+
+@pytest.mark.asyncio
+async def test_timeline_aging_uses_raw_transcript_and_logically_supersedes_fine() -> None:
+    transcript = _transcript()
+    fine = tuple(
+        SemanticEntry(
+            f"turn-{index}",
+            f"Fine summary {index}",
+            (transcript.reference(index, index),),
+            session_id=transcript.session_id,
+        )
+        for index in range(1, 5)
+    )
+    timeline = Timeline(transcript.session_id).append_transaction(
+        fine,
+        ActiveCheckpoint("turn-4", tuple(entry.turn_id for entry in fine), session_id=transcript.session_id),
+    )
+    compactor = ContextCompactor(
+        policy=CompactionPolicy(input_budget=500, output_reserve=50, summary_hard_cap=100),
+        token_estimator=lambda text: max(1, len(text) // 20),
+    )
+    service = ApplicationContextService(compactor=compactor)
+    captured: list[str] = []
+
+    async def summarize(epoch):
+        captured.append(epoch.input_text)
+        return {"summary": "one macro", "coverage": list(epoch.turn_ids)}
+
+    result = await service.age_timeline_async(
+        transcript,
+        timeline=timeline,
+        summarize=summarize,
+        fine_budget=1,
+        input_budget=500,
+        output_reserve=50,
+        summary_hard_cap=100,
+    )
+
+    assert result.changed is True
+    assert result.timeline is not None
+    assert len(captured) == 1
+    assert "Fine summary" not in captured[0]
+    assert "fact-1" in captured[0]
+    assert result.timeline.physical_fine_entries == fine
+    assert result.timeline.fine_entries == ()
+    assert len(result.timeline.macro_summaries) == 1
+    assert isinstance(result.timeline.logical_records[-2], EpochMacroSummary)
+    assert result.timeline.records[-1].record_type == "active_checkpoint"
+    assert service.public_diagnostics()["compaction"]["last"]["level"] == "L5"
+
+
+@pytest.mark.asyncio
+async def test_timeline_aging_rejects_an_unsafe_oldest_fine_epoch_without_model_call() -> None:
+    transcript = _transcript()
+    malformed = SemanticEntry(
+        "turn-1",
+        "Fine summary",
+        (TranscriptRef(transcript.session_id, 1, 2),),
+        session_id=transcript.session_id,
+    )
+    timeline = Timeline(transcript.session_id).append_transaction(
+        (malformed,),
+        ActiveCheckpoint("turn-1", ("turn-1",), session_id=transcript.session_id),
+    )
+    service = ApplicationContextService(
+        compactor=ContextCompactor(token_estimator=lambda text: max(1, len(text) // 20))
+    )
+    called = False
+
+    async def summarize(_epoch):
+        nonlocal called
+        called = True
+        return {"summary": "must not run"}
+
+    result = await service.age_timeline_async(
+        transcript,
+        timeline=timeline,
+        summarize=summarize,
+        fine_budget=1,
+    )
+    assert result.changed is False
+    assert result.failure == "no_safe_epoch"
+    assert called is False

@@ -157,6 +157,7 @@ async def test_default_tools_are_ordered_and_not_injected_into_generation() -> N
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
     ]
     assert all(
         "effect" not in definition.parameters
@@ -245,6 +246,7 @@ async def test_explicit_tools_replace_defaults_and_use_application_core_results(
     assert [definition.name for definition in application.tool_definitions()] == [
         "Echo",
         "ToolResultRead",
+        "HistoryRead",
     ]
     service = ToolExecutor(ToolRegistry((fake_tool,)))
     results = await _execute_prepared_calls(

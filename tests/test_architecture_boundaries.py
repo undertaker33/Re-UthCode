@@ -119,6 +119,9 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
             allowed_integration_imports.add(
                 "uthcode.integrations.tools.tool_result_read"
             )
+            allowed_integration_imports.add(
+                "uthcode.integrations.tools.history_read"
+            )
         for value in values:
             if value.startswith("uthcode.integrations"):
                 assert value in allowed_integration_imports, source_path

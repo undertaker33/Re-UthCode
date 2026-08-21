@@ -12,7 +12,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .history import SemanticUnit, TranscriptRef
+from .history import (
+    SemanticEntry,
+    SemanticUnit,
+    TranscriptRef,
+)
 
 
 class CompactionValidationError(ValueError):
@@ -137,6 +141,197 @@ class CompactionStructuredResult:
             raise CompactionValidationError("compaction summary must be non-empty text")
         object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "coverage", coverage)
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineAgingEpoch:
+    """One bounded raw-evidence epoch selected for L5 Timeline aging.
+
+    The Fine records are selection metadata only.  ``input_text`` is built
+    exclusively from the corresponding complete raw Transcript units; it must
+    never contain a Fine or Macro summary as model evidence.
+    """
+
+    session_id: str
+    fine_entries: tuple[SemanticEntry, ...]
+    units: tuple[SemanticUnit, ...]
+    input_text: str
+    input_tokens: int
+    input_budget: int
+    output_reserve: int
+    sequence_start: int
+    sequence_end: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError("session_id must be a non-empty string")
+        fine_entries = tuple(self.fine_entries)
+        units = tuple(self.units)
+        if not units or len(fine_entries) != len(units):
+            raise CompactionValidationError("TimelineAgingEpoch coverage is invalid")
+        if not all(isinstance(entry, SemanticEntry) for entry in fine_entries):
+            raise CompactionValidationError("TimelineAgingEpoch contains an invalid Fine record")
+        if not all(isinstance(unit, SemanticUnit) and unit.complete for unit in units):
+            raise CompactionValidationError("TimelineAgingEpoch contains an incomplete unit")
+        if len({unit.unit_id for unit in units}) != len(units):
+            raise CompactionValidationError("TimelineAgingEpoch unit IDs must be unique")
+        if len({unit.turn_id for unit in units}) != len(units):
+            raise CompactionValidationError("TimelineAgingEpoch Turn IDs must be unique")
+        for entry, unit in zip(fine_entries, units, strict=True):
+            expected = TranscriptRef(self.session_id, unit.sequence_start, unit.sequence_end)
+            if (
+                entry.session_id not in (None, self.session_id)
+                or entry.turn_id != unit.turn_id
+                or entry.refs != (expected,)
+            ):
+                raise CompactionValidationError("TimelineAgingEpoch Fine ownership is invalid")
+        if any(
+            transcript_entry.session_id != self.session_id
+            for unit in units
+            for transcript_entry in unit.entries
+        ):
+            raise CompactionValidationError("TimelineAgingEpoch raw ownership is invalid")
+        if not isinstance(self.input_text, str) or not self.input_text:
+            raise ValueError("input_text must be a non-empty string")
+        for field_name in (
+            "input_tokens",
+            "input_budget",
+            "output_reserve",
+            "sequence_start",
+            "sequence_end",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if self.input_budget <= 0 or self.output_reserve <= 0:
+            raise ValueError("TimelineAgingEpoch budgets must be positive")
+        if self.output_reserve >= self.input_budget:
+            raise ValueError("output_reserve must be smaller than input_budget")
+        if self.sequence_start != units[0].sequence_start:
+            raise ValueError("sequence_start does not match the first unit")
+        if self.sequence_end != units[-1].sequence_end:
+            raise ValueError("sequence_end does not match the last unit")
+        if self.sequence_start < 1 or self.sequence_end < self.sequence_start:
+            raise ValueError("TimelineAgingEpoch sequence range is invalid")
+        object.__setattr__(self, "fine_entries", fine_entries)
+        object.__setattr__(self, "units", units)
+
+    @property
+    def unit_ids(self) -> tuple[str, ...]:
+        return tuple(unit.unit_id for unit in self.units)
+
+    @property
+    def turn_ids(self) -> tuple[str, ...]:
+        return tuple(unit.turn_id for unit in self.units)
+
+    @property
+    def refs(self) -> tuple[TranscriptRef, ...]:
+        return tuple(
+            TranscriptRef(self.session_id, unit.sequence_start, unit.sequence_end)
+            for unit in self.units
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineAgingResult:
+    """One Macro-only result returned by the L5 summarizer."""
+
+    summary: str
+    coverage: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.summary, str) or not self.summary.strip():
+            raise CompactionValidationError("Timeline aging summary is empty")
+        coverage = tuple(self.coverage)
+        if not coverage or any(not isinstance(turn_id, str) or not turn_id for turn_id in coverage):
+            raise CompactionValidationError("Timeline aging coverage is invalid")
+        if len(set(coverage)) != len(coverage):
+            raise CompactionValidationError("Timeline aging coverage contains duplicate Turns")
+        object.__setattr__(self, "coverage", coverage)
+
+
+def parse_timeline_aging_result(
+    value: object,
+    epoch: TimelineAgingEpoch,
+    *,
+    summary_hard_cap: int,
+    token_estimator: Callable[[str], int],
+) -> TimelineAgingResult:
+    """Parse a Macro-only L5 response against one raw Fine epoch."""
+
+    if not isinstance(epoch, TimelineAgingEpoch):
+        raise TypeError("epoch must be a TimelineAgingEpoch")
+    if (
+        isinstance(summary_hard_cap, bool)
+        or not isinstance(summary_hard_cap, int)
+        or summary_hard_cap <= 0
+    ):
+        raise ValueError("summary_hard_cap must be a positive integer")
+    if not callable(token_estimator):
+        raise TypeError("token_estimator must be callable")
+
+    payload: Mapping[str, Any]
+    if isinstance(value, TimelineAgingResult):
+        result = value
+        if result.coverage != epoch.turn_ids:
+            raise CompactionValidationError("Timeline aging coverage does not match raw evidence")
+        _validate_timeline_aging_summary(result, summary_hard_cap, token_estimator)
+        return result
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise CompactionValidationError("Timeline aging response is empty")
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            result = TimelineAgingResult(text, epoch.turn_ids)
+            _validate_timeline_aging_summary(result, summary_hard_cap, token_estimator)
+            return result
+        if not isinstance(decoded, Mapping):
+            raise CompactionValidationError("Timeline aging JSON must be an object")
+        payload = decoded
+    elif isinstance(value, Mapping):
+        payload = value
+    else:
+        raise CompactionValidationError("Timeline aging response must be text or an object")
+
+    if "entries" in payload or "fine_entries" in payload:
+        raise CompactionValidationError("Timeline aging accepts one Macro summary only")
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise CompactionValidationError("Timeline aging response has no summary")
+    raw_coverage = payload.get("coverage")
+    if raw_coverage is None:
+        coverage = epoch.turn_ids
+    elif isinstance(raw_coverage, Sequence) and not isinstance(raw_coverage, (str, bytes, bytearray)):
+        values: list[str] = []
+        for item in raw_coverage:
+            if isinstance(item, str):
+                values.append(item)
+            elif isinstance(item, Mapping) and isinstance(item.get("turn_id"), str):
+                values.append(item["turn_id"])
+            else:
+                raise CompactionValidationError("Timeline aging coverage contains an invalid Turn")
+        coverage = tuple(values)
+    else:
+        raise CompactionValidationError("Timeline aging coverage must be a sequence")
+    result = TimelineAgingResult(summary, tuple(coverage))
+    if result.coverage != epoch.turn_ids:
+        raise CompactionValidationError("Timeline aging coverage does not match raw evidence")
+    _validate_timeline_aging_summary(result, summary_hard_cap, token_estimator)
+    return result
+
+
+def _validate_timeline_aging_summary(
+    result: TimelineAgingResult,
+    summary_hard_cap: int,
+    token_estimator: Callable[[str], int],
+) -> None:
+    estimate = token_estimator(result.summary)
+    if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 0:
+        raise ValueError("token estimator must return a non-negative integer")
+    if estimate > summary_hard_cap:
+        raise CompactionValidationError("summary_hard_cap_exceeded")
 
 
 def parse_compaction_result(
@@ -316,5 +511,8 @@ __all__ = [
     "CompactionEpoch",
     "CompactionStructuredResult",
     "CompactionValidationError",
+    "TimelineAgingEpoch",
+    "TimelineAgingResult",
     "parse_compaction_result",
+    "parse_timeline_aging_result",
 ]

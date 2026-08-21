@@ -66,8 +66,9 @@ from uthcode.core.context import (
     preflight_safety_count,
     pressure_estimate,
     resolve_context_budget,
+    fine_timeline_usage,
 )
-from uthcode.core.compaction import CompactionEpoch
+from uthcode.core.compaction import CompactionEpoch, TimelineAgingEpoch
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
@@ -160,6 +161,13 @@ _COMPACTION_SYSTEM_PROMPT = (
     "Do not add Turns, refs, or facts that are not present in the raw evidence."
 )
 
+_TIMELINE_AGING_SYSTEM_PROMPT = (
+    "You are UthCode's bounded Timeline aging compactor. Return only a JSON "
+    "object with summary and coverage. Produce exactly one Macro summary for "
+    "all supplied Turns in order. Use only the complete raw Transcript evidence; "
+    "never summarize a Fine or Macro summary and never invent refs or Turns."
+)
+
 
 def _compaction_input_payload(epoch: CompactionEpoch) -> str:
     """Add an explicit output contract without exposing a second state model."""
@@ -173,6 +181,22 @@ def _compaction_input_payload(epoch: CompactionEpoch) -> str:
     ]
     return (
         f"{epoch.input_text}\n\nRequired coverage (copy only these Turn IDs):\n"
+        + json.dumps(coverage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _timeline_aging_input_payload(epoch: TimelineAgingEpoch) -> str:
+    """Add the L5 Macro contract while keeping evidence raw-only."""
+
+    coverage = [
+        {
+            "turn_id": unit.turn_id,
+            "refs": [ref.to_dict()],
+        }
+        for unit, ref in zip(epoch.units, epoch.refs, strict=True)
+    ]
+    return (
+        f"{epoch.input_text}\n\nRequired Macro coverage (copy only these Turn IDs):\n"
         + json.dumps(coverage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
@@ -1380,8 +1404,17 @@ class UthCodeApplication:
             "failure": None,
             "auto_pressure_unresolved": False,
             "previous_estimate": None,
+            "timeline_aging": {
+                "attempted": False,
+                "status": "not_needed",
+                "provider_attempts": 0,
+                "failure": None,
+                "previous_fine_usage": None,
+                "fine_budget": None,
+            },
         }
         compaction_orchestration_started = False
+        timeline_aging_started = False
 
         async def prepare(
             messages: tuple[Message, ...],
@@ -1511,6 +1544,50 @@ class UthCodeApplication:
                     cancellation=cancellation,
                 )
 
+            async def summarize_aging_epoch(epoch: TimelineAgingEpoch) -> str:
+                if frozen_budget is None:  # pragma: no cover - limits_ready guards this
+                    raise ContextBudgetError("timeline aging request has no frozen ContextBudget")
+                aging_note = compaction_note["timeline_aging"]
+                if not isinstance(aging_note, dict):  # pragma: no cover - local invariant
+                    raise ContextBudgetError("timeline aging diagnostics are invalid")
+                aging_note["provider_attempts"] = int(
+                    aging_note["provider_attempts"]
+                ) + 1
+                output_reserve = frozen_budget.compaction_output_reserve
+                if frozen_budget.provider_max_output is not None:
+                    output_reserve = min(output_reserve, frozen_budget.provider_max_output)
+                compact_request = GenerationRequest(
+                    messages=(
+                        Message(
+                            "user",
+                            (TextPart(_timeline_aging_input_payload(epoch)),),
+                        ),
+                    ),
+                    system_prompt=_TIMELINE_AGING_SYSTEM_PROMPT,
+                    model=remote_model_id,
+                    tools=(),
+                    reasoning=None,
+                    max_output_tokens=output_reserve,
+                    temperature=0.0,
+                    metadata={
+                        "context_compaction_request": True,
+                        "context_compaction_level": "L5",
+                        "context_timeline_aging_request": True,
+                        "context_timeline_aging_epoch_turns": list(epoch.turn_ids),
+                    },
+                )
+                prepared = await _prepare_compaction_request_async(
+                    provider,
+                    compact_request,
+                    frozen_budget,
+                    cancellation=cancellation,
+                )
+                return await _run_compaction_provider(
+                    provider,
+                    prepared,
+                    cancellation=cancellation,
+                )
+
             async def commit_epoch(candidate: CompactionResult) -> CompactionResult:
                 active = (
                     self._session_service.active_session
@@ -1527,6 +1604,20 @@ class UthCodeApplication:
                 if committed.changed:
                     compaction_note["epochs"] = int(compaction_note["epochs"]) + 1
                 return committed
+
+            async def commit_aging_epoch(candidate: CompactionResult) -> CompactionResult:
+                active = (
+                    self._session_service.active_session
+                    if self._session_service is not None
+                    else None
+                )
+                if active is None:
+                    return replace(
+                        candidate,
+                        changed=False,
+                        failure="timeline_commit_failed",
+                    )
+                return self._commit_timeline_candidate(active, candidate)
 
             async def rebuild_after_epoch(timeline: object) -> Mapping[str, object]:
                 del timeline
@@ -1658,6 +1749,88 @@ class UthCodeApplication:
                     compaction_note["status"] = "unresolved"
                 return result.changed
 
+            async def run_l5_if_needed() -> bool:
+                """Run one independent Fine Timeline aging attempt."""
+
+                nonlocal timeline_aging_started
+                aging_note = compaction_note["timeline_aging"]
+                if not isinstance(aging_note, dict):  # pragma: no cover - local invariant
+                    return False
+                if timeline_aging_started:
+                    return False
+                active = (
+                    self._session_service.active_session
+                    if self._session_service is not None
+                    else None
+                )
+                if active is None or frozen_budget is None:
+                    aging_note.update({"status": "no_change", "failure": "no_active_session"})
+                    timeline_aging_started = True
+                    return False
+                fine_budget = frozen_budget.fine_timeline_budget
+                if fine_budget is None:
+                    aging_note.update({"status": "no_change", "failure": "fine_budget_unavailable"})
+                    timeline_aging_started = True
+                    return False
+                usage = fine_timeline_usage(
+                    active.timeline,
+                    self._context_service.compiler.token_estimator,
+                )
+                aging_note.update(
+                    {
+                        "previous_fine_usage": usage,
+                        "fine_budget": fine_budget,
+                    }
+                )
+                if usage <= fine_budget:
+                    aging_note["status"] = "no_change"
+                    timeline_aging_started = True
+                    return False
+                timeline_aging_started = True
+                aging_note["attempted"] = True
+                try:
+                    result = await self._context_service.age_timeline_async(
+                        active.transcript,
+                        timeline=active.timeline,
+                        session_id=active.session_id,
+                        summarize=summarize_aging_epoch,
+                        commit=commit_aging_epoch,
+                        cancellation=cancellation,
+                        fine_budget=fine_budget,
+                        input_budget=frozen_budget.compaction_input_budget,
+                        output_reserve=(
+                            min(
+                                frozen_budget.compaction_output_reserve,
+                                frozen_budget.provider_max_output,
+                            )
+                            if frozen_budget.provider_max_output is not None
+                            else frozen_budget.compaction_output_reserve
+                        ),
+                        summary_hard_cap=(
+                            min(
+                                frozen_budget.compaction_output_reserve,
+                                frozen_budget.provider_max_output,
+                            )
+                            if frozen_budget.provider_max_output is not None
+                            else frozen_budget.compaction_output_reserve
+                        ),
+                    )
+                except ContextRequestSafetyError:
+                    aging_note.update(
+                        {
+                            "status": "unresolved",
+                            "failure": "provider_request_unsafe",
+                        }
+                    )
+                    return False
+                aging_note.update(
+                    {
+                        "status": "completed" if result.changed and result.failure is None else "unresolved",
+                        "failure": result.failure,
+                    }
+                )
+                return result.changed
+
             async def on_counted_request(
                 counted_request: GenerationRequest,
                 _provider_count: ContextCountEstimate | int | None,
@@ -1668,6 +1841,9 @@ class UthCodeApplication:
 
             try:
                 initial_request = compose(None, True, None)
+                aged = await run_l5_if_needed()
+                if aged:
+                    initial_request = compose(None, True, None)
                 await run_l4_if_needed(gate_from_request(initial_request))
                 if cancellation.cancelled:
                     raise CancelledError()

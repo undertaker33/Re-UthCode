@@ -39,6 +39,8 @@ from .context import (
     CompactionResult,
     CompactionStructuredResult,
     CompactionValidationError,
+    TimelineAgingEpoch,
+    TimelineAgingResult,
     ContextCompilationError,
     ContextCompactor,
     ContextCompiler,
@@ -61,8 +63,9 @@ from .context import (
     resolve_context_budget,
     safety_allowance_for,
     adaptive_working_headroom,
+    fine_timeline_usage,
 )
-from .compaction import parse_compaction_result
+from .compaction import parse_compaction_result, parse_timeline_aging_result
 from .planning import (
     BehaviorMode,
     PlanState,

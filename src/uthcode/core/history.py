@@ -347,7 +347,12 @@ class EpochMacroSummary:
         if self.transaction_id is not None and not self.transaction_id.strip():
             raise TimelineError("EpochMacroSummary transaction_id is invalid")
         object.__setattr__(self, "refs", _refs(self.refs))
-        object.__setattr__(self, "coverage", tuple(self.coverage))
+        coverage = tuple(self.coverage)
+        if not coverage or any(not isinstance(turn_id, str) or not turn_id for turn_id in coverage):
+            raise TimelineError("EpochMacroSummary coverage is invalid")
+        if len(set(coverage)) != len(coverage):
+            raise TimelineError("EpochMacroSummary coverage contains duplicate Turns")
+        object.__setattr__(self, "coverage", coverage)
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema_version": self.schema_version, "record_type": self.record_type, "turn_id": self.turn_id, "summary": self.summary, "refs": [ref.to_dict() for ref in self.refs], "coverage": list(self.coverage), **({"session_id": self.session_id} if self.session_id else {}), **({"transaction_id": self.transaction_id} if self.transaction_id else {})}
@@ -470,8 +475,38 @@ class Timeline:
         return tuple(record for group in self.transaction_groups() if not group or not isinstance(group[-1], ActiveCheckpoint) for record in group)
 
     @property
-    def fine_entries(self) -> tuple[SemanticEntry, ...]:
+    def physical_fine_entries(self) -> tuple[SemanticEntry, ...]:
+        """Return every committed Fine record, including superseded history."""
+
         return tuple(record for record in self.committed_records if isinstance(record, SemanticEntry))
+
+    @property
+    def logical_records(self) -> tuple[TimelineRecord, ...]:
+        """Return the append-only Timeline's current logical projection.
+
+        Fine records remain physically present for audit/recovery.  A committed
+        Macro supersedes only the Fine records whose Turn IDs it explicitly
+        covers; unrelated and newer Fine records stay visible.
+        """
+
+        committed = self.committed_records
+        superseded_turns = {
+            turn_id
+            for record in committed
+            if isinstance(record, EpochMacroSummary)
+            for turn_id in record.coverage
+        }
+        return tuple(
+            record
+            for record in committed
+            if not isinstance(record, SemanticEntry) or record.turn_id not in superseded_turns
+        )
+
+    @property
+    def fine_entries(self) -> tuple[SemanticEntry, ...]:
+        """Return logical Fine records after committed Macro supersession."""
+
+        return tuple(record for record in self.logical_records if isinstance(record, SemanticEntry))
 
     @property
     def macro_summaries(self) -> tuple[EpochMacroSummary, ...]:
@@ -479,7 +514,7 @@ class Timeline:
 
     @property
     def summary(self) -> str:
-        derived = tuple(record for record in self.committed_records if isinstance(record, (SemanticEntry, EpochMacroSummary)))
+        derived = tuple(record for record in self.logical_records if isinstance(record, (SemanticEntry, EpochMacroSummary)))
         return derived[-1].summary if derived else ""
 
     @property

@@ -535,6 +535,7 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "ProposePlan",
     )
@@ -547,6 +548,7 @@ async def test_t08_formal_application_e2e_plan_execution_steering_and_reset(
         "Bash",
         "WaitForSteering",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "TodoWrite",
     )
@@ -707,6 +709,7 @@ async def test_t08_plan_full_access_rejects_hidden_write_before_permission(
         "Grep",
         "Bash",
         "ToolResultRead",
+        "HistoryRead",
         "AskUserQuestion",
         "ProposePlan",
     )

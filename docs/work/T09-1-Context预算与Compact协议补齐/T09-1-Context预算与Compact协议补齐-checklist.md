@@ -34,13 +34,13 @@
 
 ## T04：L5 Timeline Aging 与 HistoryRead
 
-- [ ] 执行 `python -m pytest tests/test_timeline_contract.py tests/test_context_compaction.py tests/test_history_read_tool.py tests/test_application_tools.py tests/test_tool_result_persistence.py -q`，全部通过。
-- [ ] Fine Timeline 超预算且普通请求低 pressure 时仍可独立触发 L5。
-- [ ] L5 只选 old complete epoch，证据来自 raw Transcript refs；不以 Fine/Macro 做 summary-of-summary。
-- [ ] macro 先写、checkpoint 最后写；logical supersede 不删除物理 Timeline。
-- [ ] 无 safe epoch 时 fail closed，不换模型、不递归、不生成伪 checkpoint。
-- [ ] HistoryRead 只允许 active Session exact opaque ref bounded page；malformed/cross-session/invalid boundary 均失败。
-- [ ] HistoryRead output 不递归 externalize，与 ToolResultRead 权限边界独立。
+- [x] 执行 `python -m pytest tests/test_timeline_contract.py tests/test_context_compaction.py tests/test_history_read_tool.py tests/test_application_tools.py tests/test_tool_result_persistence.py -q`，全部通过。
+- [x] Fine Timeline 超预算且普通请求低 pressure 时仍可独立触发 L5。
+- [x] L5 只选 old complete epoch，证据来自 raw Transcript refs；不以 Fine/Macro 做 summary-of-summary。
+- [x] macro 先写、checkpoint 最后写；logical supersede 不删除物理 Timeline。
+- [x] 无 safe epoch 时 fail closed，不换模型、不递归、不生成伪 checkpoint。
+- [x] HistoryRead 只允许 active Session exact opaque ref bounded page；malformed/cross-session/invalid boundary 均失败。
+- [x] HistoryRead output 不递归 externalize，与 ToolResultRead 权限边界独立。
 
 ## T05：Application Compact 生命周期与 overflow recovery
 

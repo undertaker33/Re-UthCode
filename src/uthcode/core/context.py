@@ -32,7 +32,10 @@ from .compaction import (
     CompactionEpoch,
     CompactionStructuredResult,
     CompactionValidationError,
+    TimelineAgingEpoch,
+    TimelineAgingResult,
     parse_compaction_result,
+    parse_timeline_aging_result,
 )
 from .prompt import (
     ContextAuthority,
@@ -1236,6 +1239,215 @@ class ContextCompactor:
             output_tokens=output_tokens,
         )
 
+    def plan_timeline_aging_epoch(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline | None = None,
+        session_id: str | None = None,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+    ) -> TimelineAgingEpoch | None:
+        """Select the oldest safe committed Fine epoch for L5 aging.
+
+        Selection is fail-closed.  A malformed or oversized oldest Fine
+        transaction returns ``None`` instead of skipping ahead to a later
+        epoch, and the model receives only the raw Transcript units resolved
+        from each Fine reference.
+        """
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if timeline is None:
+            return None
+        if not isinstance(timeline, Timeline) or timeline.session_id != transcript.session_id:
+            raise CompactionError("transcript and timeline belong to different Sessions")
+        owner = transcript.session_id if session_id is None else session_id
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("session_id must be a non-empty string")
+        if owner != transcript.session_id:
+            raise CompactionError("Timeline aging Session does not own the supplied Transcript")
+
+        selected_input_budget = self.policy.input_budget if input_budget is None else input_budget
+        selected_output_reserve = (
+            self.policy.output_reserve if output_reserve is None else output_reserve
+        )
+        if (
+            isinstance(selected_input_budget, bool)
+            or not isinstance(selected_input_budget, int)
+            or selected_input_budget <= 0
+            or isinstance(selected_output_reserve, bool)
+            or not isinstance(selected_output_reserve, int)
+            or selected_output_reserve <= 0
+            or selected_output_reserve >= selected_input_budget
+        ):
+            raise ValueError("timeline aging budgets are invalid")
+
+        active_fine = timeline.fine_entries
+        active_by_turn = {entry.turn_id: entry for entry in active_fine}
+        if not active_by_turn or len(active_by_turn) != len(active_fine):
+            return None
+        units_by_range = {
+            (unit.sequence_start, unit.sequence_end): unit
+            for unit in transcript.semantic_units(complete_only=True)
+        }
+        available = selected_input_budget - selected_output_reserve
+
+        for group in timeline.transaction_groups():
+            if not group or not isinstance(group[-1], ActiveCheckpoint):
+                continue
+            derived = tuple(record for record in group[:-1] if isinstance(record, (SemanticEntry, EpochMacroSummary)))
+            if not derived:
+                continue
+            # Macro transactions are already aged.  A mixed or partially
+            # superseded transaction is not safe evidence for a new Macro.
+            if any(isinstance(record, EpochMacroSummary) for record in derived):
+                continue
+            fine_records = tuple(record for record in derived if isinstance(record, SemanticEntry))
+            if len(fine_records) != len(derived):
+                return None
+            if len({record.turn_id for record in fine_records}) != len(fine_records):
+                return None
+            active_flags = tuple(
+                record.turn_id in active_by_turn and active_by_turn[record.turn_id] == record
+                for record in fine_records
+            )
+            if not any(active_flags):
+                # This physical Fine transaction has already been fully
+                # superseded by a committed Macro; retain it for audit but do
+                # not select it again.
+                continue
+            if not all(active_flags):
+                return None
+
+            units: list[SemanticUnit] = []
+            for fine in fine_records:
+                if len(fine.refs) != 1:
+                    return None
+                ref = fine.refs[0]
+                if ref.session_id != transcript.session_id or fine.session_id not in (None, owner):
+                    return None
+                unit = units_by_range.get((ref.sequence_start, ref.sequence_end))
+                if unit is None or unit.turn_id != fine.turn_id:
+                    return None
+                try:
+                    transcript.select(ref.sequence_start, ref.sequence_end, complete_only=True)
+                except (TypeError, ValueError):
+                    return None
+                units.append(unit)
+            if not units:
+                continue
+            if tuple(unit.sequence_start for unit in units) != tuple(sorted(unit.sequence_start for unit in units)):
+                return None
+            if any(
+                current.sequence_start != previous.sequence_end + 1
+                for previous, current in zip(units, units[1:], strict=False)
+            ):
+                return None
+            raw_units = tuple(units)
+            input_text = _timeline_aging_input_text(raw_units)
+            input_tokens = self._estimate(input_text)
+            if input_tokens > available:
+                return None
+            try:
+                return TimelineAgingEpoch(
+                    session_id=owner,
+                    fine_entries=fine_records,
+                    units=raw_units,
+                    input_text=input_text,
+                    input_tokens=input_tokens,
+                    input_budget=selected_input_budget,
+                    output_reserve=selected_output_reserve,
+                    sequence_start=raw_units[0].sequence_start,
+                    sequence_end=raw_units[-1].sequence_end,
+                )
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def parse_timeline_aging_result(
+        self,
+        value: object,
+        *,
+        epoch: TimelineAgingEpoch,
+        summary_hard_cap: int | None = None,
+    ) -> TimelineAgingResult:
+        """Validate one Macro-only L5 result using this Compactor's estimator."""
+
+        if not isinstance(epoch, TimelineAgingEpoch):
+            raise TypeError("epoch must be a TimelineAgingEpoch")
+        return parse_timeline_aging_result(
+            value,
+            epoch,
+            summary_hard_cap=(
+                self.policy.summary_hard_cap
+                if summary_hard_cap is None
+                else summary_hard_cap
+            ),
+            token_estimator=self._estimate,
+        )
+
+    def build_timeline_aging_candidate(
+        self,
+        transcript: Transcript,
+        *,
+        epoch: TimelineAgingEpoch,
+        result: TimelineAgingResult,
+        timeline: Timeline,
+    ) -> CompactionResult:
+        """Build one append-only Macro transaction with a last checkpoint."""
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if not isinstance(epoch, TimelineAgingEpoch):
+            raise TypeError("epoch must be a TimelineAgingEpoch")
+        if not isinstance(result, TimelineAgingResult):
+            raise TypeError("result must be a TimelineAgingResult")
+        if not isinstance(timeline, Timeline) or timeline.session_id != transcript.session_id:
+            raise CompactionError("transcript and timeline belong to different Sessions")
+        if epoch.session_id != transcript.session_id or result.coverage != epoch.turn_ids:
+            raise CompactionValidationError("Timeline aging result does not match raw evidence")
+        active_fine = timeline.fine_entries
+        if any(entry not in active_fine for entry in epoch.fine_entries):
+            raise CompactionValidationError("Timeline aging Fine evidence is no longer active")
+        for fine, unit, ref in zip(epoch.fine_entries, epoch.units, epoch.refs, strict=True):
+            if fine.turn_id != unit.turn_id or fine.refs != (ref,):
+                raise CompactionValidationError("Timeline aging Fine evidence is not exact")
+            try:
+                transcript.select(ref.sequence_start, ref.sequence_end, complete_only=True)
+            except (TypeError, ValueError) as exc:
+                raise CompactionValidationError("Timeline aging raw evidence is invalid") from exc
+
+        macro = EpochMacroSummary(
+            turn_id=epoch.turn_ids[-1],
+            summary=result.summary,
+            refs=epoch.refs,
+            coverage=result.coverage,
+            session_id=transcript.session_id,
+        )
+        checkpoint = ActiveCheckpoint(
+            turn_id=epoch.turn_ids[-1],
+            active_turns=epoch.turn_ids,
+            session_id=transcript.session_id,
+        )
+        candidate_timeline = timeline.append_transaction((macro,), checkpoint)
+        batch = CompactionBatch(
+            unit_ids=epoch.unit_ids,
+            sequence_start=epoch.sequence_start,
+            sequence_end=epoch.sequence_end,
+            input_text=epoch.input_text,
+            input_tokens=epoch.input_tokens,
+            output_summary=result.summary,
+        )
+        return CompactionResult(
+            timeline=candidate_timeline,
+            summary=result.summary,
+            batches=(batch,),
+            changed=True,
+            input_tokens=epoch.input_tokens,
+            output_tokens=self._estimate(result.summary),
+        )
+
     def parse_epoch_result(
         self,
         value: object,
@@ -1450,6 +1662,38 @@ class ContextCompactor:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError("token estimator must return a non-negative integer")
         return value
+
+
+def _timeline_aging_input_text(units: Sequence[SemanticUnit]) -> str:
+    """Serialize only raw complete Transcript units for an L5 request."""
+
+    encoded_units = "\n".join(
+        json.dumps(unit.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for unit in units
+    )
+    return f"Complete raw semantic units:\n{encoded_units}"
+
+
+def fine_timeline_usage(
+    timeline: Timeline,
+    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+) -> int:
+    """Estimate the current logical Fine Timeline payload in tokens."""
+
+    if not isinstance(timeline, Timeline):
+        raise TypeError("timeline must be a Timeline")
+    estimator = token_estimator or DeterministicTokenEstimator()
+    if not callable(getattr(estimator, "estimate", None)) and not callable(estimator):
+        raise TypeError("token_estimator must be callable or provide estimate()")
+    text = "\n".join(
+        json.dumps(entry.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for entry in timeline.fine_entries
+    )
+    value = estimator.estimate(text) if hasattr(estimator, "estimate") else estimator(text)  # type: ignore[operator]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("token estimator must return a non-negative integer")
+    return value
+
 
 def _compaction_input_text(summary: str, units: Sequence[SemanticUnit]) -> str:
     previous = summary or "(no prior summary)"
@@ -1809,7 +2053,7 @@ class ContextCompiler:
                     )
 
         if sources.timeline is not None:
-            for index, record in enumerate(sources.timeline.committed_records):
+            for index, record in enumerate(sources.timeline.logical_records):
                 if isinstance(record, ActiveCheckpoint):
                     continue
                 add_selected(
@@ -1821,7 +2065,7 @@ class ContextCompiler:
         complete_units = () if sources.transcript is None else sources.transcript.semantic_units(complete_only=True)
         covered_ranges = () if sources.timeline is None else tuple(
             (ref.sequence_start, ref.sequence_end)
-            for record in sources.timeline.committed_records
+            for record in sources.timeline.logical_records
             if isinstance(record, (SemanticEntry, EpochMacroSummary))
             for ref in record.refs
         )
@@ -2002,16 +2246,17 @@ def _timeline_block(record: SemanticEntry | EpochMacroSummary) -> ContextBlock:
         if isinstance(record, EpochMacroSummary)
         else ContextSourceKind.TIMELINE_ENTRY
     )
-    return TimelineSource(
-        ContextBlock(
-            source_kind=source_kind,
-            authority=ContextAuthority.TIMELINE,
-            stability=ContextStability.DYNAMIC,
-            scope=ContextScope.SESSION,
-            provenance=f"timeline:{record.record_type}:{record.turn_id}",
-            content=json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        )
-    ).to_context_block()
+    block = ContextBlock(
+        source_kind=source_kind,
+        authority=ContextAuthority.TIMELINE,
+        stability=ContextStability.DYNAMIC,
+        scope=ContextScope.SESSION,
+        provenance=f"timeline:{record.record_type}:{record.turn_id}",
+        content=json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+    if isinstance(record, SemanticEntry):
+        return TimelineSource(block).to_context_block()
+    return block
 
 
 def _conversation_block(raw: object) -> ContextBlock:
@@ -2061,6 +2306,8 @@ __all__ = [
     "CompactionResult",
     "CompactionStructuredResult",
     "CompactionValidationError",
+    "TimelineAgingEpoch",
+    "TimelineAgingResult",
     "ContextBlock",
     "ContextBudget",
     "ContextBudgetError",
@@ -2086,4 +2333,5 @@ __all__ = [
     "resolve_context_budget",
     "safety_allowance_for",
     "adaptive_working_headroom",
+    "fine_timeline_usage",
 ]
