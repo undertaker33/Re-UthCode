@@ -21,6 +21,7 @@ api_key = "env:MY_PROVIDER_API_KEY"
 provider = "my-provider"
 remote_id = "your-model-id"
 display_name = "My Chat Model"
+context_window = 128000
 max_output_tokens = 4096
 reasoning_effort = "medium"
 ```
@@ -45,6 +46,12 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 用户配置中的 `default_permission_mode` 只能是 `default` 或 `auto`；`full_access` 只能在当前运行中选择。项目配置可以选择用户已信任的 Provider、模型和非敏感模型参数，但不能定义 Provider、修改端点或密钥来源，也不能设置默认权限模式。
 
 模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
+
+### Context Window 与 Provider 限制
+
+`models.<model-ref>.context_window` 是用户显式配置的输入运行上限，必须是正整数。项目配置只能在用户配置已经存在该值时保持或收紧，不能补造缺失值或放大用户值。Provider 可以在运行时提供更小的可靠 `max_input_tokens`，最终请求使用两者中更紧的上限；`max_output_tokens` 和可选的 combined-context 限制分别校验，未知维度不会被猜测或伪造。
+
+如果用户没有配置 `context_window`，且 Provider 也没有可靠输入上限，当前模型会在发送前 fail closed；UthCode 不使用固定窗口、型号名称推断或官方随包窗口表作为回退。每次普通请求、工具续环、手动 Compact、L4/L5 和 overflow retry 都会按最终 Provider-visible request 重新执行 Hard Gate。
 
 ## `permissions.toml`
 

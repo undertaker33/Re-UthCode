@@ -21,15 +21,15 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 | `/permission <default\|auto\|full_access>` | 切换当前运行的权限模式 |
 | `/plan` | 进入 Plan Mode |
 | `/do` | 返回默认执行模式 |
-| `/compact` | 当前会进入 Session 压缩路径，但因生产 summarizer 尚未接通而返回 `summarizer_unavailable`；不会修改 Canonical History 或生成新 Projection |
+| `/compact` | 通过 Application 的同一 Compact orchestrator 执行手动压缩；低 pressure 也可执行，无候选时返回成功 no-op，不创建垃圾 Timeline record |
 | `/new` | 创建新的空 Session，并切换当前 Run |
-| `/resume [session-id]` | 从当前项目的 Session Picker 或指定 ID 恢复已提交 History、Projection、Tool Result ref 和 Instruction State，并从新的 Run/Turn 开始 |
-| `/status` | 显示当前模型、Provider、配置来源、Instruction epoch、固定 258K Operating Budget 使用量和 History persistence outcome |
+| `/resume [session-id]` | 从当前项目的 Session Picker 或指定 ID 恢复已提交 Transcript、Timeline、Tool Result ref 和 Instruction State，并从新的 Run/Turn 开始；不恢复 active Runtime continuation |
+| `/status` | 显示当前模型、Provider、配置来源、分维 configured/provider/effective limits、Pressure/Preflight、Auto/Hard Gate、Timeline checkpoint、Compact outcome 和 History persistence outcome |
 | `/quit` | 退出 UthCode |
 
 常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q`、`/exit`。
 
-界面可能展示尚未实现的规划命令（例如 `/config`、`/login`、`/memory`、`/dream`、`/review`）；调用时会明确提示未实现，不会静默执行。`/new`、`/resume` 已可用；`/compact` 已接入正式 Session 路径，但生产压缩能力仍不可用。
+界面可能展示尚未实现的规划命令（例如 `/config`、`/login`、`/memory`、`/dream`、`/review`）；调用时会明确提示未实现，不会静默执行。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
 
 ## `exec` 退出码
 

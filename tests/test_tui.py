@@ -774,6 +774,22 @@ def test_renderer_restores_roles_surfaces_markdown_and_code_colours() -> None:
     assert "38;2;0;0;0" not in agent
 
 
+def test_renderer_keeps_truecolor_when_no_color_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    renderer = RichTerminalRenderer(width=80)
+    user = renderer.user_message("你好")
+    agent = renderer.agent_message(
+        "回答\n\n```python\nprint('ok')\n```",
+    )
+    tool = renderer.tool(status="finished", name="Bash", command="dir")
+
+    assert "48;2;36;47;56m" in user
+    assert "38;2;224;224;224m" in agent
+    assert "48;2;18;18;18m" in agent
+    assert "38;2;78;191;113m" in tool
+    assert "\x1b[38;2;154;154;154m┃" in tool
+
+
 def test_tool_rows_keep_status_text_and_semantic_colour() -> None:
     renderer = RichTerminalRenderer(width=80)
     success = renderer.tool(status="finished", name="Bash", command="dir")

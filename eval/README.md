@@ -88,7 +88,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner run `
 
 每个 attempt 还保存 `diagnostic_facts`，并在聚合报告的 `facts` 节中比较以下观察值：`success`、`tokens`、`tool_calls`、`compact_count`、`rediscovery`、`repeated_exploration`、`externalization`、`prefix_stability` 和 `cache_reuse`。`compare` 会在兼容指纹与样本集合上给出 `delta.facts`，但不会把候选必须优于 baseline 作为 pytest 或报告兼容条件。
 
-Provider cache read/write 只有在现有 Usage mapper 明确提供字段时才标记为 `available`，并记录安全的字段路径 provenance；Provider 不支持或未提供字段时为 `not_available`，默认的数值 `0` 不视为测量值。Application diagnostics 也不会额外复制 Runtime credential、完整大型 Tool Result、Provider native payload 或未脱敏异常。固定 258K Operating Budget 仍不是远端模型物理上下文窗口；本 Eval 不执行 128K/1M/unknown-model window 或 258K 阈值专项优化。
+Provider cache read/write 只有在现有 Usage mapper 明确提供字段时才标记为 `available`，并记录安全的字段路径 provenance；Provider 不支持或未提供字段时为 `not_available`，默认的数值 `0` 不视为测量值。Application diagnostics 也不会额外复制 Runtime credential、完整大型 Tool Result、Provider native payload 或未脱敏异常。Context diagnostics 记录 configured/provider/effective limits、Pressure/Preflight、Auto/Hard、Timeline 与 Compact outcome；Eval 保持 success、tokens、tool calls、compaction 和 pressure 等并列观察值，不把任一 tuning default 变成产品成功阈值。
 
 ## 清理与回滚
 

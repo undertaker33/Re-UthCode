@@ -54,7 +54,7 @@
 
 ## T06：[接入主流程] 命令、TUI 与正式入口收口
 
-- [ ] 执行 `python -m pytest tests/test_command_dispatcher.py tests/test_w04_session_commands.py tests/test_cli.py tests/test_tui.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
+- [x] 执行 `python -m pytest tests/test_command_dispatcher.py tests/test_w04_session_commands.py tests/test_cli.py tests/test_tui.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py -q`，全部通过。
 - [x] `/compact` await T05 同一 Application orchestrator；`/status` 使用分维 limits/Auto/Hard/Timeline diagnostics。
 - [x] sync commands 不回退，TUI 只 await command outcome；CLI/TUI/Headless 不包含独立 Context 编排。
 - [x] 现有 request preparer 与 overflow handler sync/awaitable 行为、取消和错误测试继续通过；没有第二套 protocol。
@@ -62,20 +62,20 @@
 
 ## T07：[端到端验证] Diagnostics、Eval、文档与回归
 
-- [ ] 执行 `python -m pytest tests/test_w05_diagnostics.py tests/test_w06_integration_delivery.py tests/test_t09_1_context_protocol_e2e.py tests/test_architecture_boundaries.py -q`，全部通过。
-- [ ] 正式 Headless Application 完成 ordinary、tool loop、L4/catch-up、L5、HistoryRead、manual no-op/success、overflow once 与 hard-fail e2e。
-- [ ] diagnostics/status 只含分维 limits、count source、allowance、Auto/Hard、Timeline id/coverage/reason/outcome，不含 Transcript/summary/Tool Result/API key/异常正文。
-- [ ] Eval 保持并列指标，不新增总分，不把 tuning default 写成产品成功阈值。
-- [ ] `docs/Tools.md`、用户手册、Core Design、A03/A04、`docs/Context-Index.md` 与 `src/ + tests/` 一致。
-- [ ] 执行任务书列出的 T05/T06/T08 回归集合与 `python -m pytest -q`；精确命令、passed/failed/skipped 写入 Feedback，真实网络不作为必过条件。
+- [x] 执行 `python -m pytest tests/test_w05_diagnostics.py tests/test_w06_integration_delivery.py tests/test_t09_1_context_protocol_e2e.py tests/test_architecture_boundaries.py -q`，全部通过。
+- [x] 正式 Headless Application 完成 ordinary、tool loop、L4/catch-up、L5、HistoryRead、manual no-op/success、overflow once 与 hard-fail e2e。
+- [x] diagnostics/status 只含分维 limits、count source、allowance、Auto/Hard、Timeline id/coverage/reason/outcome，不含 Transcript/summary/Tool Result/API key/异常正文。
+- [x] Eval 保持并列指标，不新增总分，不把 tuning default 写成产品成功阈值。
+- [x] `docs/Tools.md`、用户手册、Core Design、A03/A04、`docs/Context-Index.md` 与 `src/ + tests/` 一致。
+- [x] 执行任务书列出的 T05/T06/T08 回归集合与 `python -m pytest -q`；精确命令、passed/failed/skipped 写入 Feedback，真实网络不作为必过条件。
 
 ## T08：[遗留负担清理] 删除阶段性与兼容逻辑
 
-- [ ] `rg -n "UTHCODE_CONTEXT_BUDGET_TOKENS|fixed 258K|固定 258K|before T09-1|summarizer_unavailable" src tests eval docs` 只剩冻结历史/归档证据；生产代码与当前事实文档旧 authority 为 0。
-- [ ] `rg -n "\bProjection\b|\bCanonicalHistory\b|history\.jsonl" src/uthcode tests` 不存在生产 contract、旧 writer 或兼容 alias；old-v1 fixture 的唯一保留原因写入 Feedback。
-- [ ] `rg -n "bundled.*model|model.*catalog|hard.?coded.*context" src/uthcode tests docs` 确认 bundled metadata / model catalog / hardcoded official model window 路线在源码、测试、当前事实文档和 `docs/OutstandingDebtList.md` 中均保持不存在，且未重新登记为 future debt。
-- [ ] Timeline 产品 record 仍只有三类；无持久 FSM/Job/pointer、独立 compaction model、跨 Provider fallback、无调用方 Manager/Registry/Scheduler。
-- [ ] Permission、Plan/Todo、Runtime Hook、其它 Slash Commands 与 TUI rendering 无范围外重构。
-- [ ] 清理后重跑最小定向、`tests/test_architecture_boundaries.py` 与全量测试，精确结果写入 `feedback/W06-delivery-regression-cleanup-feedback.md`。
-- [ ] 逐条复核 `docs/OutstandingDebtList.md` 中所有被 T09-1 实际改变的条目：`T02 Slash Command / TUI` 只移除已回补的 `/compact` 部分并保留 `/memory`、`/dream`；`B01 私有测试集 v0` 按真实 Compaction 结果删除或更新相关部分；三条 T09 Context 欠账只有实现、Checklist、Feedback 证据齐全才删除；其它条目按“完全回补删除、部分改变更新、仍成立保留、用户取消删除且不转登记”处理。
-- [ ] `docs/Context-Index.md` 在全部实现与反馈完成后更新为 `implemented_unarchived`；工作包留在 `docs/work/` 等待用户手动归档。
+- [x] `rg -n "UTHCODE_CONTEXT_BUDGET_TOKENS|fixed 258K|固定 258K|before T09-1|summarizer_unavailable" src tests eval docs` 只剩冻结历史/归档证据；生产代码与当前事实文档旧 authority 为 0。
+- [x] `rg -n "\bProjection\b|\bCanonicalHistory\b|history\.jsonl" src/uthcode tests` 不存在生产 contract、旧 writer 或兼容 alias；old-v1 fixture 的唯一保留原因写入 Feedback。
+- [x] `rg -n "bundled.*model|model.*catalog|hard.?coded.*context" src/uthcode tests docs` 确认 bundled metadata / model catalog / hardcoded official model window 路线在源码、测试、当前事实文档和 `docs/OutstandingDebtList.md` 中均保持不存在，且未重新登记为 future debt。
+- [x] Timeline 产品 record 仍只有三类；无持久 FSM/Job/pointer、独立 compaction model、跨 Provider fallback、无调用方 Manager/Registry/Scheduler。
+- [x] Permission、Plan/Todo、Runtime Hook、其它 Slash Commands 与 TUI rendering 无范围外重构。
+- [x] 清理后重跑最小定向、`tests/test_architecture_boundaries.py` 与全量测试，精确结果写入 `feedback/W06-delivery-regression-cleanup-feedback.md`。
+- [x] 逐条复核 `docs/OutstandingDebtList.md` 中所有被 T09-1 实际改变的条目：`T02 Slash Command / TUI` 只移除已回补的 `/compact` 部分并保留 `/memory`、`/dream`；`B01 私有测试集 v0` 按真实 Compaction 结果删除或更新相关部分；三条 T09 Context 欠账只有实现、Checklist、Feedback 证据齐全才删除；其它条目按“完全回补删除、部分改变更新、仍成立保留、用户取消删除且不转登记”处理。
+- [x] `docs/Context-Index.md` 在全部实现与反馈完成后更新为 `implemented_unarchived`；工作包留在 `docs/work/` 等待用户手动归档。
