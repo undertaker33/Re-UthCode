@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import inspect
+from collections.abc import Callable, Iterable, Mapping
 
 from uthcode.core.permission import PermissionMode
 from uthcode.core.planning import BehaviorMode
@@ -174,6 +175,51 @@ def _status(context: CommandContext) -> str:
         f"reason={prefix_reason}; tool_schema="
         f"{getattr(status, 'tool_schema_fingerprint', None) or 'unavailable'}"
     )
+    diagnostics = getattr(status, "diagnostics", {})
+    if not isinstance(diagnostics, Mapping):
+        diagnostics = {}
+    context_budget = diagnostics.get("context_budget")
+    if not isinstance(context_budget, Mapping):
+        context_budget = {}
+    context_gate = diagnostics.get("context_gate")
+    if not isinstance(context_gate, Mapping):
+        context_gate = {}
+    context_pressure = diagnostics.get("context_pressure")
+    if not isinstance(context_pressure, Mapping):
+        context_pressure = {}
+    limits_text = (
+        "configured={configured}; provider_input={provider_input}; "
+        "effective={effective}; provider_output={provider_output}; "
+        "combined={combined}"
+    ).format(
+        configured=context_budget.get("configured_input_limit", "?"),
+        provider_input=context_budget.get("provider_max_input", "?"),
+        effective=context_budget.get("effective_input_limit", "?"),
+        provider_output=context_budget.get("provider_max_output", "?"),
+        combined=context_budget.get("provider_combined_limit", "?"),
+    )
+    gate_text = (
+        f"hard_safe={context_gate.get('hard_safe', '?')}; "
+        f"auto_pressure={context_gate.get('auto_pressure', '?')}; "
+        f"count_source={context_gate.get('count_source', '?')}; "
+        f"reason={context_gate.get('reason', '?')}"
+    )
+    pressure_text = (
+        f"input={context_pressure.get('input_tokens', '?')}; "
+        f"source={context_pressure.get('source', '?')}"
+    )
+    compaction = diagnostics.get("compaction")
+    last_compaction = (
+        compaction.get("last")
+        if isinstance(compaction, Mapping)
+        and isinstance(compaction.get("last"), Mapping)
+        else {}
+    )
+    outcome_text = (
+        f"status={last_compaction.get('status', '?')}; "
+        f"changed={last_compaction.get('changed', '?')}; "
+        f"failure={last_compaction.get('failure', '?')}"
+    )
     return "\n".join(
         (
             f"model: {getattr(status, 'current_model', 'unknown')}",
@@ -185,6 +231,10 @@ def _status(context: CommandContext) -> str:
             f"Timeline checkpoint: {getattr(status, 'timeline_checkpoint_id', None)}",
             f"instruction epoch: {getattr(status, 'instruction_epoch', 0)}",
             f"compact count: {getattr(status, 'compact_count', 0)}",
+            f"context limits: {limits_text}",
+            f"context gate: {gate_text}",
+            f"context pressure: {pressure_text}",
+            f"context outcome: {outcome_text}",
             f"cache diagnostics: {cache_text}",
         )
     )
@@ -205,20 +255,24 @@ def _session_error(
     return CommandExecutionError("Session storage error")
 
 
-def _compact(context: CommandContext) -> str:
+async def _compact(context: CommandContext) -> str:
     application = context.application
     compact = getattr(application, "compact_session", None)
     if not callable(compact):
         raise CommandExecutionError("/compact 需要 Application Session")
     try:
         result = compact()
+        if inspect.isawaitable(result):
+            result = await result
     except SessionOperationError as exc:
         raise _session_error(exc) from None
     except Exception:
         raise CommandExecutionError("上下文压缩失败") from None
     if not bool(getattr(result, "changed", False)):
-        reason = getattr(result, "failure", None) or "no_compaction_candidate"
-        raise CommandExecutionError(f"上下文压缩失败：{reason}")
+        failure = getattr(result, "failure", None)
+        if failure is None:
+            return "上下文无需压缩；Transcript 未改写；Timeline 未变化"
+        raise CommandExecutionError(f"上下文压缩失败：{failure}")
     timeline = getattr(result, "timeline", None)
     checkpoint = getattr(timeline, "active_checkpoint", None)
     checkpoint_id = getattr(checkpoint, "turn_id", None)

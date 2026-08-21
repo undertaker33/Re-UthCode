@@ -7,7 +7,7 @@ to its own presentation technology.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -51,7 +51,7 @@ class OutcomeStatus(str, Enum):
 
 
 CandidateProvider = Callable[[object | None], Iterable[str]]
-CommandHandler = Callable[[object], object]
+CommandHandler = Callable[[object], object | Awaitable[object]]
 
 
 @dataclass(frozen=True, slots=True)

@@ -109,6 +109,7 @@ class ApplicationContextService:
         tool_definitions: Sequence[ToolDefinition] = (),
         previous_snapshot: ContextSnapshot | None = None,
         context_budget: ContextBudget | None = None,
+        preserve_request_diagnostics: bool = False,
     ) -> ContextSnapshot:
         if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
             raise TypeError("instruction_loader must be InstructionLoader or None")
@@ -173,7 +174,8 @@ class ApplicationContextService:
             previous_snapshot=(self._last_snapshot if previous_snapshot is None else previous_snapshot),
         )
         self._last_snapshot = snapshot
-        self._last_budget = context_budget
+        if not preserve_request_diagnostics:
+            self._last_budget = context_budget
         return snapshot
 
     def usage(self, snapshot: ContextSnapshot | None = None) -> ContextUsage:
@@ -181,6 +183,101 @@ class ApplicationContextService:
         if value is None:
             return ContextUsage(0, available=False)
         return value.usage
+
+    def stable_transcript_for_compaction(
+        self,
+        transcript: Transcript,
+        *,
+        active_turn_id: str | None = None,
+    ) -> Transcript:
+        """Return only the stable Transcript prefix for one compaction pass.
+
+        Closed facts from the active Turn are durably appended before ordinary
+        Provider calls, but that Turn is still an open semantic unit until its
+        terminal assistant message is persisted.  Compaction therefore removes
+        the whole active Turn by its stable identity, and only when that
+        identity forms the Transcript suffix expected by the single-writer
+        lifecycle.  It never guesses from roles, message positions, or the
+        final entry alone.
+        """
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("transcript must be a Transcript")
+        if active_turn_id is None:
+            return transcript
+        if not isinstance(active_turn_id, str) or not active_turn_id:
+            raise ValueError("active_turn_id must be a non-empty string or None")
+
+        matching_indexes = tuple(
+            index
+            for index, entry in enumerate(transcript.entries)
+            if entry.turn_id == active_turn_id
+        )
+        if not matching_indexes:
+            return transcript
+        first_index = matching_indexes[0]
+        if any(
+            entry.turn_id != active_turn_id
+            for entry in transcript.entries[first_index:]
+        ):
+            raise ContextRequestSafetyError(
+                "active Turn is not a stable Transcript suffix"
+            )
+        return Transcript(
+            transcript.session_id,
+            transcript.entries[:first_index],
+            transcript.schema_version,
+        )
+
+    @staticmethod
+    def _non_reducing_result(
+        candidate: CompactionResult,
+        previous_timeline: Timeline | None,
+    ) -> CompactionResult | None:
+        """Turn an equal-or-larger candidate into an uncommittable result."""
+
+        if candidate.output_tokens < candidate.input_tokens:
+            return None
+        return replace(
+            candidate,
+            timeline=previous_timeline,
+            summary=(
+                previous_timeline.summary
+                if previous_timeline is not None
+                else None
+            ),
+            batches=(),
+            changed=False,
+            failure="no_reduction",
+        )
+
+    def record_request_diagnostics(
+        self,
+        request: GenerationRequest,
+        budget: ContextBudget,
+    ) -> None:
+        """Project one already-gated request into safe status dimensions."""
+
+        if not isinstance(request, GenerationRequest):
+            raise TypeError("request must be a GenerationRequest")
+        if not isinstance(budget, ContextBudget):
+            raise TypeError("budget must be a ContextBudget")
+        self._last_budget = budget
+        self._last_accounting = account_generation_request(request)
+        gate = request.metadata.get("context_gate")
+        self._last_gate = dict(gate) if isinstance(gate, Mapping) else None
+        pressure = request.metadata.get("context_pressure")
+        if isinstance(pressure, Mapping):
+            self._last_pressure = ContextCountEstimate(
+                input_tokens=pressure.get("input_tokens", 0),
+                source=pressure.get("source", "local.pressure_estimate"),
+                kind=pressure.get("kind", "pressure_estimate"),
+                safety_allowance=pressure.get("safety_allowance", 0),
+            )
+        else:
+            self._last_pressure = None
+        fallback = request.metadata.get("context_count_fallback")
+        self._last_count_fallback = fallback if isinstance(fallback, str) else None
 
     @property
     def compactor(self) -> ContextCompactor:
@@ -194,9 +291,14 @@ class ApplicationContextService:
         session_id: str | None = None,
         summarize=None,
         cancellation: CancellationToken | None = None,
+        active_turn_id: str | None = None,
     ) -> CompactionResult:
         """Return a safe Timeline candidate without mutating Transcript."""
 
+        transcript = self.stable_transcript_for_compaction(
+            transcript,
+            active_turn_id=active_turn_id,
+        )
         self._compact_count += 1
         attempt = self._compact_count
         try:
@@ -207,6 +309,9 @@ class ApplicationContextService:
                 summarize=summarize,
                 cancellation=cancellation,
             )
+            non_reducing = self._non_reducing_result(result, timeline)
+            if non_reducing is not None:
+                result = non_reducing
         except Exception:
             self._record_compaction(
                 {
@@ -255,6 +360,7 @@ class ApplicationContextService:
         input_budget: int | None = None,
         output_reserve: int | None = None,
         summary_hard_cap: int | None = None,
+        active_turn_id: str | None = None,
     ) -> CompactionResult:
         """Run bounded tool-free L4 epochs in one Application call stack.
 
@@ -281,6 +387,11 @@ class ApplicationContextService:
             or max_epochs <= 0
         ):
             raise ValueError("max_epochs must be a positive integer")
+
+        transcript = self.stable_transcript_for_compaction(
+            transcript,
+            active_turn_id=active_turn_id,
+        )
 
         owner = transcript.session_id if session_id is None else session_id
         if owner != transcript.session_id:
@@ -403,6 +514,20 @@ class ApplicationContextService:
                     )
                     break
 
+                non_reducing = self._non_reducing_result(
+                    candidate_result,
+                    current_timeline,
+                )
+                if non_reducing is not None:
+                    last_failure = "no_reduction"
+                    outcome(
+                        result=non_reducing,
+                        failure=last_failure,
+                        epoch=epoch_number,
+                        attempt=epoch_attempt,
+                    )
+                    break
+
                 if candidate_result.timeline is None or not candidate_result.changed:
                     last_failure = "no_progress"
                     outcome(
@@ -519,6 +644,7 @@ class ApplicationContextService:
         input_budget: int | None = None,
         output_reserve: int | None = None,
         summary_hard_cap: int | None = None,
+        active_turn_id: str | None = None,
     ) -> CompactionResult:
         """Run at most one tool-free L5 Fine-to-Macro aging epoch.
 
@@ -540,6 +666,10 @@ class ApplicationContextService:
         owner = transcript.session_id if session_id is None else session_id
         if owner != transcript.session_id:
             raise ValueError("Timeline aging Session does not own the supplied Transcript")
+        transcript = self.stable_transcript_for_compaction(
+            transcript,
+            active_turn_id=active_turn_id,
+        )
 
         def record(
             *,
@@ -644,6 +774,18 @@ class ApplicationContextService:
                     changed=False,
                     failure=failure,
                 )
+
+            non_reducing = self._non_reducing_result(candidate, timeline)
+            if non_reducing is not None:
+                record(
+                    status="failed",
+                    failure="no_reduction",
+                    changed=False,
+                    usage=usage,
+                    epoch=epoch,
+                    attempt=failure_attempt,
+                )
+                return non_reducing
 
             committed_result = candidate
             if commit is not None:
@@ -841,6 +983,7 @@ class ApplicationContextService:
         candidate_messages: Sequence[Message] | None = None,
         disable_reductions: bool = False,
         reduction_levels: Sequence[str] = (),
+        current_turn_id: str | None = None,
     ) -> tuple[GenerationRequest, ContextSnapshot]:
         """Compile and, when limits are supplied, preflight one final request.
 
@@ -896,6 +1039,10 @@ class ApplicationContextService:
             candidate_messages = tuple(candidate_messages)
             if not all(isinstance(message, Message) for message in candidate_messages):
                 raise TypeError("candidate_messages must contain Message values")
+        if current_turn_id is not None and (
+            not isinstance(current_turn_id, str) or not current_turn_id
+        ):
+            raise ValueError("current_turn_id must be a non-empty string or None")
         reduction_levels = tuple(reduction_levels)
         if any(not isinstance(level, str) or not level for level in reduction_levels):
             raise ValueError("reduction_levels must contain non-empty strings")
@@ -918,7 +1065,16 @@ class ApplicationContextService:
             current_user = values[-1]
             history_messages = values[:-1]
         process_transcript = _transcript_for_messages(history_session_id, history_messages)
-        merged_transcript = _merge_transcript(transcript, process_transcript)
+        context_transcript = transcript
+        if context_transcript is not None and current_turn_id is not None:
+            # The active Turn is durably appended incrementally, but it must
+            # remain the current conversation tail rather than become a
+            # second history copy (or an optional budget candidate).
+            context_transcript = self.stable_transcript_for_compaction(
+                context_transcript,
+                active_turn_id=current_turn_id,
+            )
+        merged_transcript = _merge_transcript(context_transcript, process_transcript)
         snapshot = self.compile(
             instruction_loader=instruction_loader,
             transcript=merged_transcript,

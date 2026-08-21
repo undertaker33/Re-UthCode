@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,20 +138,81 @@ def test_resume_busy_and_unknown_are_user_visible(tmp_path: Path) -> None:
         contender.close()
 
 
-def test_compact_command_surfaces_noop_and_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_compact_command_surfaces_success_and_noop(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
-    application = _application(tmp_path, store)
+    provider = FakeProvider(
+        events=(
+            _completed(
+                json.dumps(
+                    {
+                        "entries": [{"turn_id": "turn-1", "summary": "bounded summary"}],
+                        "coverage": ["turn-1"],
+                    }
+                )
+            ),
+        ),
+        model_limits=TEST_LIMITS,
+    )
+    application = _application(tmp_path, store, provider=provider)
     try:
         _seed(application, "compact")
         application.resume_session("compact")
-        first = CommandDispatcher(create_builtin_registry(), application).dispatch_text("/compact")
-        assert first is not None and first.status is OutcomeStatus.EXECUTION_ERROR
-        real = application.compact_session
-        monkeypatch.setattr(application, "compact_session", lambda: real(summarize=lambda _text: "bounded summary"))
-        second = CommandDispatcher(create_builtin_registry(), application).dispatch_text("/compact")
+        dispatcher = CommandDispatcher(create_builtin_registry(), application)
+        first = await dispatcher.dispatch_text_async("/compact")
+        second = await dispatcher.dispatch_text_async("/compact")
+        assert first is not None and first.status is OutcomeStatus.SUCCESS
+        assert first.output is not None and "Timeline checkpoint" in first.output
         assert second is not None and second.status is OutcomeStatus.SUCCESS
-        assert second.output is not None and "Timeline checkpoint" in second.output
+        assert second.output is not None and "无需压缩" in second.output
+        status = await dispatcher.dispatch_text_async("/status")
+        assert status is not None and status.output is not None
+        assert "context limits:" in status.output
+        assert "effective=1000000" in status.output
+        assert "context gate:" in status.output and "hard_safe=True" in status.output
+        assert "context outcome:" in status.output
         assert application.session_service.active_session.timeline.active_checkpoint is not None  # type: ignore[union-attr]
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_reports_non_reducing_candidate_as_successful_noop(
+    tmp_path: Path,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    non_reducing_summary = "x" * 3_000
+    provider = FakeProvider(
+        events=(
+            _completed(
+                json.dumps(
+                    {
+                        "entries": [
+                            {"turn_id": "turn-1", "summary": non_reducing_summary}
+                        ],
+                        "coverage": ["turn-1"],
+                    }
+                )
+            ),
+        ),
+        model_limits=TEST_LIMITS,
+    )
+    application = _application(tmp_path, store, provider=provider)
+    try:
+        _seed(application, "compact-non-reducing")
+        active = application.resume_session("compact-non-reducing")
+        before_records = active.timeline.records
+        dispatcher = CommandDispatcher(create_builtin_registry(), application)
+
+        outcome = await dispatcher.dispatch_text_async("/compact")
+
+        assert outcome is not None and outcome.status is OutcomeStatus.SUCCESS
+        assert outcome.output is not None and "无需压缩" in outcome.output
+        assert active.timeline.records == before_records
+        assert active.timeline.fine_entries == ()
+        assert active.timeline.macro_summaries == ()
+        assert active.timeline.active_checkpoint is None
+        assert len(provider.recorded_requests) == 1
     finally:
         application.close()
 
