@@ -31,6 +31,8 @@ from anthropic.types.beta import (
     BetaRawMessageStopEvent,
 )
 
+from uthcode.application import UthCodeApplication
+from uthcode.core.context import ContextRequestSafetyError
 from uthcode.core.provider import (
     AuthenticationError,
     CancellationToken,
@@ -264,6 +266,44 @@ async def test_anthropic_public_stream_maps_text_usage_and_closes() -> None:
     assert "system" not in client.calls[0]
     assert all(message["role"] != "system" for message in client.calls[0]["messages"])
     assert client.stream.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_max_output", "expect_stream"),
+    ((8_192, True), (128, False)),
+)
+async def test_anthropic_async_limits_are_awaited_before_direct_application_stream(
+    provider_max_output: int,
+    expect_stream: bool,
+) -> None:
+    client = _AnthropicClient(_events())
+    retrieved: list[str] = []
+
+    async def retrieve(model: str) -> SimpleNamespace:
+        retrieved.append(model)
+        return SimpleNamespace(
+            max_input_tokens=32_000,
+            max_tokens=provider_max_output,
+        )
+
+    client.models = SimpleNamespace(retrieve=retrieve)
+    provider = build_anthropic_provider("claude-test", client=client)
+    application = UthCodeApplication(provider)
+
+    request = _request(Message("user", (TextPart("hello"),)))
+    if expect_stream:
+        events = [event async for event in application.stream_generation(request)]
+        assert any(isinstance(event, GenerationCompleted) for event in events)
+    else:
+        handle = application.start_generation(request)
+        with pytest.raises(ContextRequestSafetyError, match="output"):
+            await handle
+
+    assert retrieved == ["claude-test"]
+    assert len(client.calls) == (1 if expect_stream else 0)
+    if expect_stream:
+        assert client.calls[0]["max_tokens"] == 4_096
 
 
 @pytest.mark.asyncio

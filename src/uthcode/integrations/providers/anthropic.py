@@ -23,6 +23,7 @@ from uthcode.core.provider import (
     CancellationToken,
     ContextCountEstimate,
     ContextOverflowError,
+    DEFAULT_OUTPUT_RESERVE,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -60,9 +61,6 @@ from .common import (
     require_json_object,
     usage_int,
 )
-
-
-_DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
 @dataclass(slots=True)
@@ -367,7 +365,7 @@ class AnthropicProvider:
                 if request.max_output_tokens is not None
                 else self._max_output_tokens
                 if self._max_output_tokens is not None
-                else _DEFAULT_MAX_OUTPUT_TOKENS
+                else DEFAULT_OUTPUT_RESERVE
             )
             kwargs: dict[str, object] = {
                 "model": request.model or self._model_name,
@@ -384,7 +382,7 @@ class AnthropicProvider:
             if request.reasoning is not None and request.reasoning.enabled:
                 budget = request.reasoning.budget_tokens
                 if budget is None:
-                    budget = min(4096, max(1, max_output_tokens - 1))
+                    budget = min(DEFAULT_OUTPUT_RESERVE, max(1, max_output_tokens - 1))
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
 
             messages_api = getattr(self._client, "messages", None)

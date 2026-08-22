@@ -51,6 +51,10 @@ def _application_request(text: str = "hello") -> GenerationRequest:
     )
 
 
+def _request_without_output_reserve(text: str = "hello") -> GenerationRequest:
+    return GenerationRequest(messages=(Message("user", (TextPart(text),)),))
+
+
 def _completed() -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
@@ -85,6 +89,29 @@ class _CancelledCountProvider:
     async def count_input_tokens(self, request: GenerationRequest) -> None:
         self.counted.append(request)
         raise GenerationCancelled()
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ):
+        self.requests.append(request)
+        cancellation.raise_if_cancelled()
+        yield _completed()
+
+
+class _AsyncLimitsProvider:
+    identity = ProviderIdentity("fake", "async-limits", "fake-model")
+
+    def __init__(self, limits: ModelLimits) -> None:
+        self._limits = limits
+        self.resolved_models: list[str] = []
+        self.requests: list[GenerationRequest] = []
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        self.resolved_models.append(model)
+        return self._limits
 
     async def stream(
         self,
@@ -176,7 +203,8 @@ def test_output_and_combined_limits_are_hard_checked_independently() -> None:
     assert decision.hard_safe is False
 
 
-def test_missing_limits_fail_closed_before_provider_call() -> None:
+@pytest.mark.asyncio
+async def test_missing_limits_fail_closed_before_provider_call() -> None:
     count_calls: list[GenerationRequest] = []
 
     def count(request: GenerationRequest) -> int:
@@ -187,15 +215,112 @@ def test_missing_limits_fail_closed_before_provider_call() -> None:
     application = UthCodeApplication(provider)
 
     with pytest.raises(ContextBudgetError, match="limit"):
-        application.start_generation(
+        await _consume(application.start_generation(
             GenerationRequest(messages=(Message("user", (TextPart("hello"),)),))
-        )
+        ))
 
     assert provider.recorded_requests == ()
     assert count_calls == []
 
 
-def test_required_current_fact_overflow_has_zero_provider_calls() -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_limits",
+    (
+        ModelLimits(
+            max_input_tokens=100_000,
+            max_output_tokens=1_024,
+            source="test.output-limit",
+        ),
+        ModelLimits(
+            max_input_tokens=100_000,
+            max_combined_tokens=8_000,
+            source="test.combined-limit",
+        ),
+    ),
+)
+async def test_unconfigured_output_reserve_is_hard_gated_before_direct_provider_call(
+    provider_limits: ModelLimits,
+) -> None:
+    provider = FakeProvider(events=(_completed(),), model_limits=provider_limits)
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "fake/ref",
+            remote_id="fake-model",
+            context_window=100_000,
+        ),
+    )
+
+    with pytest.raises(ContextRequestSafetyError, match="output|combined"):
+        await _consume(application.start_generation(_request_without_output_reserve()))
+
+    assert provider.recorded_requests == ()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_output_reserve_is_hard_gated_before_formal_turn_provider_call() -> None:
+    provider = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(
+            max_input_tokens=100_000,
+            max_output_tokens=1_024,
+            source="test.output-limit",
+        ),
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "fake/ref",
+            remote_id="fake-model",
+            context_window=100_000,
+        ),
+    )
+
+    result = await application.create_run().start_turn("hello").result()
+
+    assert result.status.value == "failed"
+    assert provider.recorded_requests == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_limits",
+    (
+        ModelLimits(
+            max_input_tokens=100_000,
+            max_output_tokens=1_024,
+            source="test.async-output-limit",
+        ),
+        ModelLimits(
+            max_input_tokens=100_000,
+            max_combined_tokens=8_000,
+            source="test.async-combined-limit",
+        ),
+    ),
+)
+async def test_async_limits_output_or_combined_gate_blocks_before_stream(
+    provider_limits: ModelLimits,
+) -> None:
+    provider = _AsyncLimitsProvider(provider_limits)
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "fake/ref",
+            remote_id="fake-model",
+            context_window=100_000,
+        ),
+    )
+
+    with pytest.raises(ContextRequestSafetyError, match="output|combined"):
+        await _consume(application.start_generation(_request_without_output_reserve()))
+
+    assert provider.resolved_models == ["fake-model"]
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_required_current_fact_overflow_has_zero_provider_calls() -> None:
     provider = FakeProvider(
         model_limits=ModelLimits(max_input_tokens=64),
     )
@@ -206,7 +331,7 @@ def test_required_current_fact_overflow_has_zero_provider_calls() -> None:
     )
 
     try:
-        application.start_generation(request)
+        await _consume(application.start_generation(request))
     except ContextRequestSafetyError:
         pass
     else:  # pragma: no cover - the assertion is the safety contract
@@ -355,7 +480,8 @@ async def test_l1_l2_recount_rebuild_and_regate_the_changed_request(
     ).to_dict()
 
 
-def test_provider_count_capability_missing_uses_local_conservative_preflight() -> None:
+@pytest.mark.asyncio
+async def test_provider_count_capability_missing_uses_local_conservative_preflight() -> None:
     application = UthCodeApplication(
         _NoCountProvider(),
         configuration=EffectiveConfig.single_model(
@@ -365,7 +491,10 @@ def test_provider_count_capability_missing_uses_local_conservative_preflight() -
         ),
     )
 
-    request = application.start_generation(_application_request())._request
+    handle = application.start_generation(_application_request())
+    assert await handle is handle
+    request = handle._request
+    assert request is not None
     gate = request.metadata["context_gate"]
 
     assert request.metadata["context_count_source"] == "local.preflight_estimate"
@@ -427,7 +556,8 @@ async def test_provider_count_cancellation_does_not_enter_local_fallback() -> No
     assert application.diagnostics()["context"].get("count_fallback") is None
 
 
-def test_provider_configuration_count_error_is_not_treated_as_count_outage() -> None:
+@pytest.mark.asyncio
+async def test_provider_configuration_count_error_is_not_treated_as_count_outage() -> None:
     from uthcode.core.provider import ProviderConfigurationError
 
     def fail(_request: GenerationRequest) -> None:
@@ -447,4 +577,4 @@ def test_provider_configuration_count_error_is_not_treated_as_count_outage() -> 
     )
 
     with pytest.raises(ProviderConfigurationError):
-        application.start_generation(_application_request())
+        await _consume(application.start_generation(_application_request()))

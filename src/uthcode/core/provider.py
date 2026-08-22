@@ -20,6 +20,12 @@ from typing import Any, Awaitable, ClassVar, Protocol, TypeAlias, runtime_checka
 
 JsonValue: TypeAlias = Any
 
+# All current SDK adapters use this same request fallback when the caller does
+# not supply an output limit.  Application resolves it into every
+# GenerationRequest before gating so budget accounting and SDK serialization
+# cannot disagree about the requested output reserve.
+DEFAULT_OUTPUT_RESERVE = 4_096
+
 
 class FrozenList(Sequence[Any]):
     """An immutable JSON array representation backed by a private tuple.
@@ -1085,6 +1091,7 @@ __all__ = [
     "CancellationToken",
     "ContextCountEstimate",
     "ContextOverflowError",
+    "DEFAULT_OUTPUT_RESERVE",
     "FinishReason",
     "GenerationCancelled",
     "GenerationCompleted",

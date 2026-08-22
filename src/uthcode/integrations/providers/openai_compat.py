@@ -21,6 +21,7 @@ from uthcode.core.provider import (
     AuthenticationError,
     CancellationToken,
     ContextOverflowError,
+    DEFAULT_OUTPUT_RESERVE,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -342,7 +343,7 @@ class OpenAICompatProvider:
                 if request.max_output_tokens is not None
                 else self._max_output_tokens
                 if self._max_output_tokens is not None
-                else 4096
+                else DEFAULT_OUTPUT_RESERVE
             )
             kwargs: dict[str, object] = {
                 "model": request.model or self._model_name,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 from pathlib import Path
+import warnings
 
 import pytest
 
@@ -11,6 +13,7 @@ from uthcode.application import (
     ConfigSource,
     EffectiveConfig,
     GenerationHandle,
+    InstructionLoader,
     ModelProfile,
     ProviderKind,
     ProviderProfile,
@@ -31,6 +34,7 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.integrations.providers.fake import FakeProvider
+from uthcode.integrations.instruction_files import InstructionFileReader
 
 
 TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
@@ -61,6 +65,72 @@ def _completed(text: str = "done") -> GenerationCompleted:
 
 async def _collect(handle: GenerationHandle) -> list[object]:
     return [event async for event in handle.events()]
+
+
+async def _await_handle(handle: GenerationHandle) -> GenerationHandle:
+    return await handle
+
+
+class _AsyncLimitsProvider(FakeProvider):
+    def __init__(self, identity: ProviderIdentity, limits: ModelLimits) -> None:
+        super().__init__(
+            identity=identity,
+            events=(_completed(identity.model),),
+        )
+        self._async_limits = limits
+        self.resolved_models: list[str] = []
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        self.resolved_models.append(model)
+        await asyncio.sleep(0)
+        return self._async_limits
+
+
+class _BlockingAsyncLimitsProvider(_AsyncLimitsProvider):
+    def __init__(self, identity: ProviderIdentity, limits: ModelLimits) -> None:
+        super().__init__(identity, limits)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled_count = 0
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        self.resolved_models.append(model)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled_count += 1
+            raise
+        return self._async_limits
+
+
+class _FailingAsyncLimitsProvider(_AsyncLimitsProvider):
+    def __init__(
+        self,
+        identity: ProviderIdentity,
+        limits: ModelLimits,
+        failure: BaseException,
+    ) -> None:
+        super().__init__(identity, limits)
+        self._failure = failure
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        self.resolved_models.append(model)
+        raise self._failure
+
+
+def _async_limits_config() -> EffectiveConfig:
+    return EffectiveConfig(
+        default_model="one/ref",
+        providers={
+            "first": ProviderProfile("first", ProviderKind.FAKE),
+            "second": ProviderProfile("second", ProviderKind.FAKE),
+        },
+        models={
+            "one/ref": ModelProfile("one/ref", "first", "remote-one"),
+            "two/ref": ModelProfile("two/ref", "second", "remote-two"),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -403,6 +473,229 @@ async def test_generation_handle_binds_provider_snapshot_across_model_switch(
     assert "模型选择：two/ref" in _request_text(new_request)
     assert "Provider 协议：protocol-two/ref" in _request_text(new_request)
     assert "远端模型：remote-two" in _request_text(new_request)
+
+
+@pytest.mark.asyncio
+async def test_async_limits_handle_binds_model_snapshot_across_model_switch() -> None:
+    config = _async_limits_config()
+    providers: dict[str, _AsyncLimitsProvider] = {}
+
+    def builder(provider: ProviderProfile, model: ModelProfile) -> _AsyncLimitsProvider:
+        instance = _AsyncLimitsProvider(
+            ProviderIdentity(
+                provider.provider_profile_id,
+                f"protocol-{model.model_ref}",
+                model.remote_id,
+            ),
+            TEST_LIMITS,
+        )
+        providers[model.model_ref] = instance
+        return instance
+
+    application = create_application(
+        config,
+        provider_builder=builder,
+        model_writer=lambda _model_ref: None,
+    )
+
+    old_handle = application.start_generation(_request("old"))
+    application.select_model("two/ref")
+    old_events = await _collect(old_handle)
+
+    assert isinstance(old_events[-1], GenerationCompleted)
+    old_provider = providers["one/ref"]
+    assert old_provider.resolved_models == ["remote-one"]
+    assert len(old_provider.recorded_requests) == 1
+    old_request = old_provider.recorded_requests[0]
+    assert old_request.model == "remote-one"
+    assert "模型选择：one/ref" in _request_text(old_request)
+    assert "远端模型：remote-one" in _request_text(old_request)
+    assert providers["two/ref"].resolved_models == []
+    assert providers["two/ref"].recorded_requests == ()
+
+
+@pytest.mark.asyncio
+async def test_async_limits_handle_binds_instruction_snapshot_across_adopt_session_state(
+    tmp_path: Path,
+) -> None:
+    user_root = tmp_path / "home"
+    project_root = tmp_path / "project"
+    user_root.mkdir(exist_ok=True)
+    project_root.mkdir(exist_ok=True)
+    project_agents = project_root / "AGENTS.md"
+    project_agents.write_text("old instruction epoch", encoding="utf-8")
+    loader = InstructionLoader(
+        user_root=user_root,
+        project_root=project_root,
+        reader=InstructionFileReader(),
+    )
+    loader.load_session(strict=True)
+
+    provider = _AsyncLimitsProvider(
+        ProviderIdentity("first", "protocol-old", "remote-old"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider, instruction_loader=loader)
+    old_epoch = loader.instruction_epoch
+    old_fingerprint = loader.stable_prefix_fingerprint
+    old_reason = loader.change_reason
+    old_state = loader.instruction_state
+    handle = application.start_generation(_request("old instruction"))
+
+    project_agents.write_text("new instruction epoch", encoding="utf-8")
+    new_loader = InstructionLoader(
+        user_root=user_root,
+        project_root=project_root,
+        reader=InstructionFileReader(),
+    )
+    new_loader.rebuild_from_metadata(old_state, strict=True)
+    assert new_loader.instruction_epoch != old_epoch
+    loader.adopt_session_state(new_loader)
+    assert loader.instruction_epoch == new_loader.instruction_epoch
+
+    events = await _collect(handle)
+
+    assert isinstance(events[-1], GenerationCompleted)
+    assert provider.resolved_models == ["remote-old"]
+    assert len(provider.recorded_requests) == 1
+    request = provider.recorded_requests[0]
+    assert request.model == "remote-old"
+    assert request.system_prompt is not None
+    assert "old instruction epoch" in request.system_prompt
+    assert "new instruction epoch" not in request.system_prompt
+    assert request.metadata["instruction_epoch"] == old_epoch
+    assert request.metadata["stable_prefix_fingerprint"] == old_fingerprint
+    assert request.metadata["prefix_change_reason"] == old_reason
+
+
+def test_unconsumed_async_limits_handle_does_not_leak_coroutine() -> None:
+    provider = _AsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        handle = application.start_generation(_request("discard"))
+        del handle
+        gc.collect()
+
+    assert provider.resolved_models == []
+    assert not any("never awaited" in str(item.message) for item in caught)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_async_limits_handle_does_not_resolve_or_stream() -> None:
+    provider = _AsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider)
+    handle = application.start_generation(_request("cancel"))
+
+    assert handle.cancel() is True
+    with pytest.raises(GenerationCancelled):
+        await _collect(handle)
+
+    assert provider.resolved_models == []
+    assert provider.recorded_requests == ()
+
+
+@pytest.mark.asyncio
+async def test_async_limits_handle_resolves_once_when_prepared_then_streamed() -> None:
+    provider = _AsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider)
+    handle = application.start_generation(_request("once"))
+
+    assert await asyncio.gather(handle, handle) == [handle, handle]
+    events = await _collect(handle)
+
+    assert isinstance(events[-1], GenerationCompleted)
+    assert provider.resolved_models == ["remote-one"]
+    assert len(provider.recorded_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_cancel_cancels_owned_async_limits_preparation() -> None:
+    provider = _BlockingAsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider)
+    handle = application.start_generation(_request("cancel-preparation"))
+    consumer = asyncio.create_task(_collect(handle))
+
+    await provider.started.wait()
+    assert handle.cancel() is True
+
+    with pytest.raises(GenerationCancelled):
+        await asyncio.wait_for(consumer, timeout=1)
+
+    assert provider.cancelled_count == 1
+    assert provider.recorded_requests == ()
+    assert handle._preparation_task is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_waiter_cancellation_does_not_cancel_shared_preparation_or_events() -> None:
+    provider = _BlockingAsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider)
+    handle = application.start_generation(_request("waiter-cancel"))
+    events_task = asyncio.create_task(_collect(handle))
+    await provider.started.wait()
+
+    waiter_task = asyncio.create_task(_await_handle(handle))
+    await asyncio.sleep(0)
+    assert not waiter_task.done()
+    waiter_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter_task
+
+    assert handle.cancelled is False
+    provider.release.set()
+    events = await events_task
+
+    assert isinstance(events[-1], GenerationCompleted)
+    assert provider.resolved_models == ["remote-one"]
+    assert len(provider.recorded_requests) == 1
+    assert handle.cancelled is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [("provider", RuntimeError), ("cancelled", GenerationCancelled)],
+)
+async def test_async_limits_preparation_closes_resolver_failures(
+    failure: str,
+    expected: type[BaseException],
+) -> None:
+    error: BaseException = (
+        RuntimeError("limits failed")
+        if failure == "provider"
+        else asyncio.CancelledError()
+    )
+    provider = _FailingAsyncLimitsProvider(
+        ProviderIdentity("first", "protocol", "remote-one"),
+        TEST_LIMITS,
+        error,
+    )
+    application = UthCodeApplication(provider)
+    handle = application.start_generation(_request("resolver-error"))
+
+    with pytest.raises(expected):
+        await _collect(handle)
+
+    assert provider.resolved_models == ["remote-one"]
+    assert provider.recorded_requests == ()
+    assert handle._preparation_task is None  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

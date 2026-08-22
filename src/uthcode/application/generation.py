@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from asyncio import CancelledError
 import json
 import inspect
@@ -25,6 +26,7 @@ from uthcode.core.planning import (
 from uthcode.core.provider import (
     CancellationToken,
     ContextOverflowError,
+    DEFAULT_OUTPUT_RESERVE,
     GenerationCompleted,
     GenerationCancelled,
     GenerationRequest,
@@ -52,6 +54,7 @@ from uthcode.core.prompt import (
     ContextSourceKind,
     ContextStability,
     EnvironmentSource,
+    ProjectInstructionSource,
     RuntimePromptContext,
 )
 from uthcode.core.context import (
@@ -105,23 +108,47 @@ def _validate_model_limits(value: object) -> ModelLimits | None:
     return value
 
 
-def _resolve_model_limits_sync(
+def _effective_output_reserve(
+    request_max_output_tokens: int | None,
+    model_max_output_tokens: int | None,
+) -> int:
+    """Resolve the one output reserve used by budget, request, and adapters."""
+
+    if request_max_output_tokens is not None:
+        return request_max_output_tokens
+    if model_max_output_tokens is not None:
+        return model_max_output_tokens
+    return DEFAULT_OUTPUT_RESERVE
+
+
+def _resolve_model_limits_value(
     provider: ProviderPort,
     model: str,
-) -> ModelLimits | None:
+) -> ModelLimits | None | Awaitable[ModelLimits | None]:
     resolver = getattr(provider, "resolve_model_limits", None)
     if not callable(resolver):
         return None
     value = resolver(model)
     if inspect.isawaitable(value):
-        # A synchronous start_generation cannot safely run an async metadata
-        # operation.  Close coroutine objects to avoid an un-awaited warning;
-        # the configured limit, if present, remains usable for this path.
-        close = getattr(value, "close", None)
-        if callable(close):
-            close()
-        return None
+        # Preserve the awaitable for the direct async preparation path.  An
+        # async metadata capability is not equivalent to an unknown limit.
+        return value
     return _validate_model_limits(value)
+
+
+def _instruction_source_snapshot(
+    loader: InstructionLoader | None,
+) -> ProjectInstructionSource | None:
+    """Freeze the public instruction source at Handle creation time."""
+
+    if loader is None:
+        return None
+    return ProjectInstructionSource(
+        effective_instruction_set=loader.effective_instruction_set,
+        instruction_epoch=loader.instruction_epoch,
+        stable_prefix_fingerprint=loader.stable_prefix_fingerprint,
+        change_reason=loader.change_reason,
+    )
 
 
 async def _resolve_model_limits_async(
@@ -636,6 +663,9 @@ class GenerationHandle:
         "_application",
         "_provider",
         "_request",
+        "_prepare",
+        "_preparation_task",
+        "_preparation_error",
         "_cancellation",
         "_started",
     )
@@ -644,12 +674,16 @@ class GenerationHandle:
         self,
         application: UthCodeApplication,
         provider: ProviderPort,
-        request: GenerationRequest,
+        request: GenerationRequest | None,
         cancellation: CancellationToken,
+        prepare: Callable[[], Awaitable[GenerationRequest]] | None = None,
     ) -> None:
         self._application = application
         self._provider = provider
         self._request = request
+        self._prepare = prepare
+        self._preparation_task: asyncio.Task[GenerationRequest] | None = None
+        self._preparation_error: BaseException | None = None
         self._cancellation = cancellation
         self._started = False
 
@@ -660,15 +694,91 @@ class GenerationHandle:
     def cancel(self) -> bool:
         """Cancel this handle once; repeated calls are harmless."""
 
-        return self._cancellation.cancel()
+        changed = self._cancellation.cancel()
+        if changed:
+            preparation = self._preparation_task
+            if preparation is not None and not preparation.done():
+                # The preparation Task is owned by this Handle.  A consumer
+                # Task may be cancelled independently, but Handle.cancel()
+                # must terminate the resolver it started.
+                preparation.cancel()
+        return changed
+
+    def _finish_preparation_task(
+        self,
+        preparation: asyncio.Task[GenerationRequest],
+    ) -> None:
+        """Collect terminal preparation state even without a live waiter."""
+
+        if self._preparation_task is not preparation:
+            # A defensive path for an already-replaced task: still retrieve
+            # its exception so asyncio never reports an unretrieved failure.
+            if not preparation.cancelled():
+                preparation.exception()
+            return
+        self._preparation_task = None
+        self._prepare = None
+        if preparation.cancelled():
+            self._preparation_error = GenerationCancelled()
+            return
+        try:
+            self._request = preparation.result()
+        except asyncio.CancelledError:
+            self._preparation_error = GenerationCancelled()
+        except BaseException as error:
+            self._preparation_error = error
+
+    async def _ensure_prepared(self) -> GenerationRequest:
+        self._cancellation.raise_if_cancelled()
+        if self._request is None:
+            if self._preparation_error is not None:
+                raise self._preparation_error
+            preparation = self._preparation_task
+            if preparation is None:
+                prepare = self._prepare
+                if prepare is None:  # pragma: no cover - defensive invariant
+                    raise RuntimeError("GenerationHandle has no request preparation")
+                preparation = asyncio.create_task(prepare())
+                self._preparation_task = preparation
+                preparation.add_done_callback(self._finish_preparation_task)
+            try:
+                prepared = await asyncio.shield(preparation)
+            except asyncio.CancelledError as error:
+                if self._cancellation.cancelled or preparation.cancelled():
+                    if self._preparation_error is None:
+                        self._preparation_error = GenerationCancelled()
+                    raise self._preparation_error from error
+                # This is cancellation of only the current consumer Task;
+                # the shared Handle preparation remains owned by the Handle.
+                raise
+            except BaseException as error:
+                if self._preparation_error is None:
+                    self._preparation_error = error
+                raise
+            else:
+                if self._request is None:
+                    self._request = prepared
+                self._prepare = None
+        self._cancellation.raise_if_cancelled()
+        return self._request
+
+    async def _await_prepared(self) -> GenerationHandle:
+        await self._ensure_prepared()
+        return self
+
+    def __await__(self):
+        """Allow callers to explicitly await async model-limit preparation."""
+
+        return self._await_prepared().__await__()
 
     async def events(self) -> AsyncIterator[ProviderEvent]:
         if self._started:
             raise RuntimeError("GenerationHandle.events() can only be consumed once")
         self._started = True
+        request = await self._ensure_prepared()
         async for event in self._application._stream_with_token(
             self._provider,
-            self._request,
+            request,
             self._cancellation,
         ):
             yield event
@@ -889,14 +999,15 @@ class UthCodeApplication:
         configured_input_limit = (
             model_profile.context_window if model_profile is not None else None
         )
-        max_output_tokens = (
-            model_profile.max_output_tokens if model_profile is not None else None
+        max_output_tokens = _effective_output_reserve(
+            None,
+            model_profile.max_output_tokens if model_profile is not None else None,
         )
         provider_limits = await _resolve_model_limits_async(provider, remote_model_id)
         budget = resolve_context_budget(
             configured_input_limit=configured_input_limit,
             provider_limits=provider_limits,
-            requested_output_reserve=(max_output_tokens or 0),
+            requested_output_reserve=max_output_tokens,
         )
         cancellation = CancellationToken()
 
@@ -1459,13 +1570,60 @@ class UthCodeApplication:
     ) -> GenerationHandle:
         """Create one request handle with an independently owned token."""
 
+        if not isinstance(request, GenerationRequest):
+            raise TypeError("request must be GenerationRequest")
+        if request.system_prompt is not None:
+            raise ValueError(
+                "Application owns system_prompt; caller must leave it unset"
+            )
+        if request.model is not None:
+            raise ValueError("Application owns model; caller must leave it unset")
+
         provider = self._provider
-        prepared_request = self._prepare_request(request, provider)
+        frozen_model_ref = self._current_model_ref
+        frozen_instruction_source = _instruction_source_snapshot(
+            self._instruction_loader
+        )
+        selected_profile = (
+            self._configuration.models.get(frozen_model_ref)
+            if self._configuration is not None
+            else None
+        )
+        remote_model_id = (
+            selected_profile.remote_id
+            if selected_profile is not None
+            else provider.identity.model
+        )
+        cancellation = CancellationToken()
+
+        async def prepare_async() -> GenerationRequest:
+            """Resolve limits only when this Handle is actually consumed."""
+
+            try:
+                cancellation.raise_if_cancelled()
+                resolved = _resolve_model_limits_value(provider, remote_model_id)
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+                cancellation.raise_if_cancelled()
+                return self._prepare_request(
+                    request,
+                    provider,
+                    model_ref=frozen_model_ref,
+                    instruction_source=frozen_instruction_source,
+                    provider_limits=_validate_model_limits(resolved),
+                )
+            except asyncio.CancelledError as error:
+                # A resolver may use asyncio cancellation as its own
+                # cooperative signal.  The public Handle contract exposes
+                # one stable Application cancellation error instead.
+                raise GenerationCancelled() from error
+
         return GenerationHandle(
             self,
             provider,
-            prepared_request,
-            CancellationToken(),
+            None,
+            cancellation,
+            prepare=prepare_async,
         )
 
     def _start_agent_turn(
@@ -1499,8 +1657,9 @@ class UthCodeApplication:
         reasoning = _reasoning_options(
             model_profile.reasoning_effort if model_profile is not None else None
         )
-        max_output_tokens = (
-            model_profile.max_output_tokens if model_profile is not None else None
+        max_output_tokens = _effective_output_reserve(
+            None,
+            model_profile.max_output_tokens if model_profile is not None else None,
         )
         configured_input_limit = (
             model_profile.context_window if model_profile is not None else None
@@ -1649,7 +1808,7 @@ class UthCodeApplication:
                 frozen_budget = resolve_context_budget(
                     configured_input_limit=configured_input_limit,
                     provider_limits=frozen_provider_limits,
-                    requested_output_reserve=(max_output_tokens or 0),
+                    requested_output_reserve=max_output_tokens,
                 )
                 limits_ready = True
             process_messages = messages[process_message_start:]
@@ -2079,7 +2238,9 @@ class UthCodeApplication:
         provider: ProviderPort,
         *,
         model_ref: str | None = None,
+        instruction_source: ProjectInstructionSource | None = None,
         runtime_context: RuntimePromptContext | None = None,
+        provider_limits: ModelLimits | None = None,
     ) -> GenerationRequest:
         if not isinstance(request, GenerationRequest):
             raise TypeError("request must be GenerationRequest")
@@ -2109,21 +2270,17 @@ class UthCodeApplication:
             if selected_profile is not None and selected_profile.reasoning_effort is not None
             else request.reasoning
         )
-        max_output_tokens = (
-            request.max_output_tokens
-            if request.max_output_tokens is not None
-            else selected_profile.max_output_tokens
-            if selected_profile is not None
-            else None
+        max_output_tokens = _effective_output_reserve(
+            request.max_output_tokens,
+            selected_profile.max_output_tokens if selected_profile is not None else None,
         )
         configured_input_limit = (
             selected_profile.context_window if selected_profile is not None else None
         )
-        provider_limits = _resolve_model_limits_sync(provider, remote_model_id)
         budget = resolve_context_budget(
             configured_input_limit=configured_input_limit,
             provider_limits=provider_limits,
-            requested_output_reserve=(max_output_tokens or 0),
+            requested_output_reserve=max_output_tokens,
         )
         def compose(
             provider_count: ContextCountEstimate | int | None,
@@ -2133,7 +2290,11 @@ class UthCodeApplication:
             compiled_request, _snapshot = self._context_service.compose_generation_request(
                 request.messages,
                 run_id="generation",
-                instruction_loader=self._instruction_loader,
+                instruction_loader=(
+                    instruction_source
+                    if instruction_source is not None
+                    else self._instruction_loader
+                ),
                 runtime_context=runtime_context,
                 tool_definitions=request.tools,
                 environment_sources=self._environment_sources(selected_model_ref, identity),
@@ -2157,7 +2318,11 @@ class UthCodeApplication:
             compiled_request, _snapshot = self._context_service.compose_generation_request(
                 request.messages,
                 run_id="generation",
-                instruction_loader=self._instruction_loader,
+                instruction_loader=(
+                    instruction_source
+                    if instruction_source is not None
+                    else self._instruction_loader
+                ),
                 runtime_context=runtime_context,
                 tool_definitions=request.tools,
                 environment_sources=self._environment_sources(selected_model_ref, identity),

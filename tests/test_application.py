@@ -253,7 +253,8 @@ def test_application_rejects_caller_model_before_provider_call() -> None:
     assert provider.recorded_requests == ()
 
 
-def test_prompt_build_failure_rejects_request_before_provider_call(
+@pytest.mark.asyncio
+async def test_prompt_build_failure_rejects_request_before_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = FakeProvider(model_limits=TEST_LIMITS)
@@ -265,6 +266,7 @@ def test_prompt_build_failure_rejects_request_before_provider_call(
     monkeypatch.setattr(ApplicationContextService, "compose_generation_request", fail)
 
     with pytest.raises(RuntimeError, match="prompt build failed"):
-        application.start_generation(_request())
+        async for _event in application.start_generation(_request()).events():
+            pass
 
     assert provider.recorded_requests == ()
