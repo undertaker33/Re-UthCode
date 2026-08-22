@@ -96,7 +96,7 @@ class ApplicationContextService:
     def compile(
         self,
         *,
-        instruction_loader: InstructionLoader | None = None,
+        instruction_loader: InstructionLoader | ProjectInstructionSource | None = None,
         transcript: Transcript | None = None,
         timeline: Timeline | None = None,
         current_turn: Sequence[object] = (),
@@ -111,8 +111,14 @@ class ApplicationContextService:
         context_budget: ContextBudget | None = None,
         preserve_request_diagnostics: bool = False,
     ) -> ContextSnapshot:
-        if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
-            raise TypeError("instruction_loader must be InstructionLoader or None")
+        if instruction_loader is not None and not isinstance(
+            instruction_loader,
+            (InstructionLoader, ProjectInstructionSource),
+        ):
+            raise TypeError(
+                "instruction_loader must be an InstructionLoader, "
+                "ProjectInstructionSource, or None"
+            )
         if runtime_context is not None and not isinstance(runtime_context, RuntimePromptContext):
             raise TypeError("runtime_context must be RuntimePromptContext or None")
         ordinary_tools = tuple(tool_definitions)
@@ -122,7 +128,9 @@ class ApplicationContextService:
             raise TypeError("context_budget must be a ContextBudget or None")
 
         project_source = None
-        if instruction_loader is not None:
+        if isinstance(instruction_loader, ProjectInstructionSource):
+            project_source = instruction_loader
+        elif instruction_loader is not None:
             project_source = ProjectInstructionSource(
                 effective_instruction_set=instruction_loader.effective_instruction_set,
                 instruction_epoch=instruction_loader.instruction_epoch,
@@ -964,7 +972,7 @@ class ApplicationContextService:
         run_id: str,
         session_id: str | None = None,
         transcript: Transcript | None = None,
-        instruction_loader: InstructionLoader | None = None,
+        instruction_loader: InstructionLoader | ProjectInstructionSource | None = None,
         runtime_context: RuntimePromptContext | None = None,
         timeline: Timeline | None = None,
         tool_definitions: Sequence[ToolDefinition] = (),
@@ -1092,6 +1100,11 @@ class ApplicationContextService:
             else messages_from_context_snapshot(snapshot)
         )
         prompt = instruction_text_from_context_snapshot(snapshot)
+        instruction_change_reason = (
+            instruction_loader.change_reason
+            if isinstance(instruction_loader, (InstructionLoader, ProjectInstructionSource))
+            else snapshot.prefix_change_reason
+        )
         base_metadata: dict[str, object] = {
             "context_budget_tokens": snapshot.budget_tokens,
             "context_token_estimate": snapshot.token_estimate,
@@ -1100,6 +1113,7 @@ class ApplicationContextService:
             "timeline_checkpoint_id": snapshot.timeline_checkpoint_id,
             "instruction_epoch": snapshot.instruction_epoch,
             "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
+            "prefix_change_reason": instruction_change_reason,
             "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
         }
 
