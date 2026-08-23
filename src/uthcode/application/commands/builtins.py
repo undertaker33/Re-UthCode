@@ -13,7 +13,6 @@ from .models import (
     ArgumentSpec,
     BehaviorModeSelected,
     ClearTranscript,
-    CommandAvailability,
     CommandDefinition,
     CommandKind,
     ModelSelected,
@@ -54,8 +53,7 @@ def _format_definition(definition: CommandDefinition) -> str:
     aliases = ""
     if definition.aliases:
         aliases = "；别名：" + ", ".join(f"/{alias}" for alias in definition.aliases)
-    state = "已实现" if definition.implemented else "未实现"
-    return f"{definition.usage_text} — {definition.description} [{state}]{aliases}"
+    return f"{definition.usage_text} — {definition.description}{aliases}"
 
 
 def _clear(_context: CommandContext) -> ClearTranscript:
@@ -376,12 +374,6 @@ def create_builtin_registry() -> CommandRegistry:
             handler=lambda _context: QuitInterface(),
         ),
         CommandDefinition(
-            canonical="config",
-            description="查看或编辑配置",
-            kind=CommandKind.LOCAL,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
-        ),
-        CommandDefinition(
             canonical="compact",
             aliases=("c",),
             description="压缩上下文",
@@ -408,35 +400,11 @@ def create_builtin_registry() -> CommandRegistry:
             handler=_resume_session,
         ),
         CommandDefinition(
-            canonical="login",
-            description="登录 Provider",
-            kind=CommandKind.LOCAL,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
-        ),
-        CommandDefinition(
-            canonical="memory",
-            description="管理记忆",
-            kind=CommandKind.LOCAL,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
-        ),
-        CommandDefinition(
-            canonical="dream",
-            description="执行 Dream Prompt",
-            kind=CommandKind.PROMPT,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
-        ),
-        CommandDefinition(
             canonical="do",
             aliases=("build",),
             description="进入默认执行模式",
             kind=CommandKind.LOCAL_UI,
             handler=_select_behavior_mode(BehaviorMode.DEFAULT),
-        ),
-        CommandDefinition(
-            canonical="review",
-            description="执行 Review Prompt",
-            kind=CommandKind.PROMPT,
-            availability=CommandAvailability.NOT_IMPLEMENTED,
         ),
     )
     for definition in definitions:

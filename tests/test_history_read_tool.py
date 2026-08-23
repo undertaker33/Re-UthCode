@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from uthcode.application.history import transcript_entries_for_message
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.tools import ApplicationToolService
 from uthcode.core.history import Transcript, TranscriptRef
 from uthcode.core.provider import CancellationToken, Message, TextPart
@@ -24,7 +24,7 @@ def _transcript(session_id: str = "session-a", count: int = 3) -> Transcript:
     entries = []
     sequence = 1
     for index in range(count):
-        message_entries = transcript_entries_for_message(
+        message_entries = _transcript_entries_for_message(
             session_id,
             f"turn-{index + 1}",
             sequence,

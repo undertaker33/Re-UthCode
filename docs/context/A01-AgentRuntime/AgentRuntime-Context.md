@@ -14,13 +14,13 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
 - `[FACT]` 默认工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`。
 - `[FACT]` `AskUserQuestion` 是 Core 特殊工具协议：随 Turn 暴露给 Provider，但不进入普通 `ToolRegistry` 执行路径。
-- `[FACT]` `RuntimeHookSet` 为 Agent Loop 提供固定的 `before_tool_execution` 与 `before_completion` 两个生命周期点：前者执行 PLAN 只读策略，后者只执行 unfinished-task completion block；普通 PLAN final 正常完成。
+- `[FACT]` Agent Loop 直接执行固定控制检查：trusted preflight 后、Permission 前拒绝 PLAN 的非 `READ` Tool；usage accounting 后、assistant final 提交前阻断 DEFAULT 模式的 unfinished Task。普通 PLAN final 正常完成。
 - `[FACT]` `ProposePlan` 是仅在 PLAN 可见的 Core 控制 Tool；必须独占 Provider ToolCall batch，合法调用创建/替换 `PlanState` 并进入 typed Plan Review，混合 batch 整批受控拒绝。
 - `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
 - `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造包含 dynamic configured/provider/effective limits、Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的最终请求；每次 Provider call 前都经过 Preflight Hard Gate，Provider Integration 只负责原生协议映射。
-- `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；Application 在 AgentRun 与 direct generation 两条路径都将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
+- `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；唯一的 `create_application -> create_run -> start_turn` 链路将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
 - `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
 - `[FACT]` terminal History persistence 将 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State metadata sync 分开记录 outcome；只有可判定 `durability=durable` 的 History append 才按 `persisted_message_count` 推进 Run 的 process cursor。append 后的 reload/touch 失败会保留 durable 事实并显示 partial diagnostics；无法通过结构化 History identity reconciliation 判定时，active Session writer 进入 quarantine，所有新 Run 与语义写入 fail closed，不重试未知批次。必须显式关闭 writer，再由 fresh writer 重新打开并验证/恢复后才解除 quarantine。真正未落盘的 append 失败则 cursor 不推进；失败批次在进程内保留原始 Session/Turn identity 并按 FIFO 重试。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。
@@ -35,7 +35,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 | ReAct Runtime | `src/uthcode/core/agent.py` | `AgentLoop`, `AgentTurnExecution`, `AgentExecutionSegment`, `AgentLoopConfig` |
 | Application Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService`, `_SecretRedactor`, `describe_tool_call`, `_create_agent_loop` |
 | Turn 依赖快照与 Prompt 注入 | `src/uthcode/application/generation.py` | `_start_agent_turn`, `_prepare_request` |
-| Context/History 组合 | `src/uthcode/application/context.py`, `src/uthcode/application/history.py` | `compose_generation_request`, `history_entries_for_message` |
+| Context/History 组合 | `src/uthcode/application/context.py`, `src/uthcode/application/history.py` | `compose_generation_request`、内部 Message→Transcript 转换 |
 | Session 结果与 History 边界 | `src/uthcode/application/sessions.py`, `src/uthcode/integrations/session_files.py` | `ApplicationSession`, `SessionWriter`, `ToolResultRead` |
 | Provider 适配 | `src/uthcode/integrations/providers/` | `anthropic.py`, `openai_responses.py`, `openai_compat.py`, `fake.py`, `factory.py` |
 | Tool 适配 | `src/uthcode/integrations/tools/` | `factory.py`, `file_tools.py`, `search_tools.py`, `process_tools.py`, `workspace.py` |
@@ -56,15 +56,15 @@ AgentRun.start_turn(user_input)
         -> 验证唯一终态与完整 ProviderResponse
      -> candidate final:
         -> usage accounting
-        -> before_completion Hook
+        -> fixed unfinished-task check
            -> ordinary PLAN final: normal completion
-           -> unfinished TaskState: completion block + one-shot feedback
+           -> DEFAULT unfinished TaskState: completion block + one-shot feedback
            -> accepted completion: TurnCompleted
      -> 有 ToolCall: ToolBatchStarted
         -> 对每个 ToolCall 严格 FIFO:
            ToolStarted
            -> trusted preflight
-           -> before_tool Hook
+           -> fixed PLAN non-READ check
            -> Control 层 PermissionDecision
            -> execute 或受控错误 ToolResultPart
            -> ToolFinished

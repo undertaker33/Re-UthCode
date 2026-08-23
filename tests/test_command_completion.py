@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from uthcode.application import (
     ArgumentSpec,
-    CommandAvailability,
     CommandDefinition,
     CommandKind,
     CommandRegistry,
@@ -26,12 +25,16 @@ class _CatalogApplication:
         return self._models
 
 
+def _handler(_context: object) -> str:
+    return "ok"
+
+
 def test_root_completion_returns_all_visible_commands_and_help_last() -> None:
     registry = create_builtin_registry()
     candidates = CompletionEngine(registry).complete("/")
     names = [candidate.canonical for candidate in candidates]
 
-    assert len(names) == 16
+    assert len(names) == 11
     assert len(names) == len(set(names))
     assert names[-1] == "help"
     assert names.count("help") == 1
@@ -42,7 +45,7 @@ def test_root_completion_returns_all_visible_commands_and_help_last() -> None:
     }
 
 
-def test_prefix_completion_matches_canonical_and_aliases_and_marks_implemented() -> None:
+def test_prefix_completion_matches_canonical_and_aliases() -> None:
     registry = create_builtin_registry()
     engine = CompletionEngine(registry)
 
@@ -56,8 +59,7 @@ def test_prefix_completion_matches_canonical_and_aliases_and_marks_implemented()
     assert len(names) == len(set(names))
     assert any(
         candidate.canonical == "compact"
-        and candidate.availability is CommandAvailability.IMPLEMENTED
-        and "未实现" not in candidate.display
+        and candidate.display == "/compact — 压缩上下文"
         for candidate in candidates
     )
 
@@ -72,6 +74,7 @@ def test_usage_and_static_argument_candidates_come_from_definition() -> None:
         canonical="format",
         description="format",
         kind=CommandKind.LOCAL,
+        handler=_handler,
         arguments=(
             ArgumentSpec(
                 "style",
@@ -115,6 +118,7 @@ def test_completion_candidates_follow_registry_changes_without_a_second_list() -
             canonical="custom",
             description="custom",
             kind=CommandKind.LOCAL,
+            handler=_handler,
         )
     )
 
@@ -131,8 +135,6 @@ def test_behavior_mode_help_and_completion_come_from_the_final_registry_entries(
     plan = next(candidate for candidate in engine.complete("/plan") if candidate.canonical == "plan")
     build = next(candidate for candidate in engine.complete("/build") if candidate.canonical == "do")
 
-    assert plan.implemented
     assert plan.usage == "/plan"
-    assert build.implemented
     assert build.matched_alias == "build"
     assert build.usage == "/do"

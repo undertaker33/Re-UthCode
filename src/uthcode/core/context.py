@@ -13,7 +13,7 @@ import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 from .history import (
     ActiveCheckpoint,
@@ -44,12 +44,7 @@ from .prompt import (
     ContextScope,
     ContextSourceKind,
     ContextStability,
-    CoreRuntimeContractSource,
-    EnvironmentSource,
-    TimelineSource,
     ProjectInstructionSource,
-    PromptAssetSource,
-    RuntimeStateSource,
     ToolDefinitionSource,
     build_instruction_prefix,
     core_runtime_contract_source,
@@ -66,10 +61,6 @@ from .provider import (
     ToolDefinition,
     ToolResultPart,
 )
-
-
-_MISSING = object()
-
 
 class ContextCompilationError(ValueError):
     """A Context source or compiler input violates the Core contract."""
@@ -457,13 +448,6 @@ class CompactionResult:
 SummaryFunction = Callable[[str], str]
 
 
-class TokenEstimator(Protocol):
-    """Provider-independent token estimate port."""
-
-    def estimate(self, text: str) -> int:
-        """Return a deterministic non-negative estimate for ``text``."""
-
-
 @dataclass(frozen=True, slots=True)
 class DeterministicTokenEstimator:
     """Stable fallback estimator used when no tokenizer is injected.
@@ -483,12 +467,28 @@ class DeterministicTokenEstimator:
         ):
             raise ValueError("bytes_per_token must be a positive integer")
 
-    def estimate(self, text: str) -> int:
+    def __call__(self, text: str) -> int:
         if not isinstance(text, str):
             raise TypeError("token estimator input must be a string")
         if not text:
             return 0
         return max(1, (len(text.encode("utf-8")) + self.bytes_per_token - 1) // self.bytes_per_token)
+
+
+def _resolve_token_estimator(
+    value: Callable[[str], int] | None,
+) -> Callable[[str], int]:
+    estimator = DeterministicTokenEstimator() if value is None else value
+    if not callable(estimator):
+        raise TypeError("token_estimator must be callable")
+    return estimator
+
+
+def _estimate_tokens(estimator: Callable[[str], int], text: str) -> int:
+    value = estimator(text)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("token estimator must return a non-negative integer")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,7 +538,7 @@ class RequestAccounting:
 def account_generation_request(
     request: GenerationRequest,
     *,
-    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+    token_estimator: Callable[[str], int] | None = None,
 ) -> RequestAccounting:
     """Count one complete request using a stable local serialization.
 
@@ -551,17 +551,7 @@ def account_generation_request(
 
     if not isinstance(request, GenerationRequest):
         raise TypeError("request must be a GenerationRequest")
-    estimator = token_estimator or DeterministicTokenEstimator()
-
-    def estimate(text: str) -> int:
-        value = (
-            estimator.estimate(text)
-            if hasattr(estimator, "estimate")
-            else estimator(text)  # type: ignore[operator]
-        )
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("token estimator must return a non-negative integer")
-        return value
+    estimator = _resolve_token_estimator(token_estimator)
 
     instruction = request.system_prompt or ""
     messages = json.dumps(
@@ -589,10 +579,10 @@ def account_generation_request(
         separators=(",", ":"),
     )
     return RequestAccounting(
-        instruction_tokens=estimate(instruction),
-        messages_tokens=estimate(messages),
-        tools_tokens=estimate(tools),
-        framing_tokens=estimate(framing),
+        instruction_tokens=_estimate_tokens(estimator, instruction),
+        messages_tokens=_estimate_tokens(estimator, messages),
+        tools_tokens=_estimate_tokens(estimator, tools),
+        framing_tokens=_estimate_tokens(estimator, framing),
     )
 
 
@@ -603,7 +593,7 @@ def _count_estimate(
     source: str,
     effective_input_limit: int,
     fallback_request: GenerationRequest | None = None,
-    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+    token_estimator: Callable[[str], int] | None = None,
 ) -> ContextCountEstimate:
     if isinstance(value, ContextCountEstimate):
         input_tokens = value.input_tokens
@@ -636,7 +626,7 @@ def pressure_estimate(
     request: GenerationRequest,
     budget: ContextBudget,
     *,
-    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+    token_estimator: Callable[[str], int] | None = None,
 ) -> ContextCountEstimate:
     """Return the proactive Auto Gate estimate for a final request."""
 
@@ -657,7 +647,7 @@ def preflight_safety_count(
     budget: ContextBudget,
     *,
     provider_count: ContextCountEstimate | int | None = None,
-    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+    token_estimator: Callable[[str], int] | None = None,
 ) -> ContextCountEstimate:
     """Count the final request for the fail-closed Hard Gate."""
 
@@ -780,40 +770,91 @@ def resolve_context_budget(
 
 @dataclass(frozen=True, slots=True)
 class ContextSourceBundle:
-    """The complete provider-independent input to one compilation.
+    """The complete, strongly typed input to one Context compilation."""
 
-    The fields use the named W01 source contracts where a source has a
-    dedicated value type.  ``ContextBlock`` values are accepted for the
-    dynamic conversation/contextual sources so Core remains independent of
-    Application orchestration.
-    """
-
-    instruction_sources: tuple[object, ...] = ()
+    instruction_sources: tuple[ContextBlock, ...] = ()
     project_instruction_source: ProjectInstructionSource | None = None
     transcript: Transcript | None = None
     timeline: Timeline | None = None
-    protected_context: tuple[object, ...] = ()
-    protocol_blocks: tuple[object, ...] = ()
-    current_turn: tuple[object, ...] = ()
-    current_turn_deltas: tuple[object, ...] = ()
-    runtime_sources: tuple[object, ...] = ()
-    environment_sources: tuple[object, ...] = ()
+    protected_context: tuple[ContextBlock, ...] = ()
+    protocol_blocks: tuple[ContextBlock, ...] = ()
+    current_turn: tuple[ContextBlock | Message | str, ...] = ()
+    current_turn_deltas: tuple[ContextBlock | Message | str, ...] = ()
+    runtime_sources: tuple[ContextBlock, ...] = ()
+    environment_sources: tuple[ContextBlock, ...] = ()
     tool_source: ToolDefinitionSource | None = None
 
     def __post_init__(self) -> None:
-        for name in (
-            "instruction_sources",
-            "protected_context",
-            "protocol_blocks",
-            "current_turn",
-            "current_turn_deltas",
-            "runtime_sources",
-            "environment_sources",
-        ):
+        def values_for(name: str) -> tuple[object, ...]:
             value = getattr(self, name)
             if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
                 raise TypeError(f"{name} must be a sequence")
-            object.__setattr__(self, name, tuple(value))
+            return tuple(value)
+
+        def context_blocks(
+            name: str,
+            *,
+            authority: ContextAuthority | None = None,
+        ) -> tuple[ContextBlock, ...]:
+            values = values_for(name)
+            if not all(isinstance(item, ContextBlock) for item in values):
+                raise TypeError(f"{name} must contain ContextBlock values")
+            blocks = tuple(values)
+            if any(block.plane is ContextPlane.INSTRUCTION for block in blocks):
+                raise ContextCompilationError(
+                    f"{name} cannot contain Instruction Plane blocks"
+                )
+            if authority is not None and any(
+                block.authority is not authority for block in blocks
+            ):
+                raise ContextCompilationError(
+                    f"{name} must contain {authority.value} ContextBlock values"
+                )
+            return blocks
+
+        instruction_sources = values_for("instruction_sources")
+        if not all(isinstance(item, ContextBlock) for item in instruction_sources):
+            raise TypeError("instruction_sources must contain ContextBlock values")
+        if any(not item.is_instruction for item in instruction_sources):
+            raise ContextCompilationError(
+                "instruction_sources must contain Instruction Plane blocks"
+            )
+        object.__setattr__(self, "instruction_sources", tuple(instruction_sources))
+        object.__setattr__(
+            self,
+            "protected_context",
+            context_blocks("protected_context"),
+        )
+        object.__setattr__(
+            self,
+            "protocol_blocks",
+            context_blocks("protocol_blocks"),
+        )
+        for name in ("current_turn", "current_turn_deltas"):
+            values = values_for(name)
+            if not all(isinstance(item, (ContextBlock, Message, str)) for item in values):
+                raise TypeError(
+                    f"{name} must contain ContextBlock, Message, or string values"
+                )
+            if any(
+                isinstance(item, ContextBlock)
+                and item.plane is ContextPlane.INSTRUCTION
+                for item in values
+            ):
+                raise ContextCompilationError(
+                    f"{name} cannot contain Instruction Plane blocks"
+                )
+            object.__setattr__(self, name, tuple(values))
+        object.__setattr__(
+            self,
+            "runtime_sources",
+            context_blocks("runtime_sources", authority=ContextAuthority.RUNTIME),
+        )
+        object.__setattr__(
+            self,
+            "environment_sources",
+            context_blocks("environment_sources", authority=ContextAuthority.ENVIRONMENT),
+        )
         if self.project_instruction_source is not None and not isinstance(
             self.project_instruction_source, ProjectInstructionSource
         ):
@@ -1021,27 +1062,12 @@ class ContextCompactor:
         self,
         policy: CompactionPolicy | None = None,
         *,
-        input_budget: int | None = None,
-        output_reserve: int | None = None,
-        summary_hard_cap: int | None = None,
-        token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+        token_estimator: Callable[[str], int] | None = None,
     ) -> None:
-        if policy is not None and any(
-            value is not None for value in (input_budget, output_reserve, summary_hard_cap)
-        ):
-            raise TypeError("pass a CompactionPolicy or individual Compaction limits, not both")
-        self.policy = policy or CompactionPolicy(
-            input_budget=64_000 if input_budget is None else input_budget,
-            output_reserve=4_096 if output_reserve is None else output_reserve,
-            summary_hard_cap=2_048 if summary_hard_cap is None else summary_hard_cap,
-        )
+        self.policy = policy or CompactionPolicy()
         if not isinstance(self.policy, CompactionPolicy):
             raise TypeError("policy must be a CompactionPolicy or None")
-        self.token_estimator = token_estimator or DeterministicTokenEstimator()
-        if not callable(getattr(self.token_estimator, "estimate", None)) and not callable(
-            self.token_estimator
-        ):
-            raise TypeError("token_estimator must be callable or provide estimate()")
+        self.token_estimator = _resolve_token_estimator(token_estimator)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -1657,11 +1683,7 @@ class ContextCompactor:
         )
 
     def _estimate(self, text: str) -> int:
-        estimator = self.token_estimator
-        value = estimator.estimate(text) if hasattr(estimator, "estimate") else estimator(text)  # type: ignore[operator]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("token estimator must return a non-negative integer")
-        return value
+        return _estimate_tokens(self.token_estimator, text)
 
 
 def _timeline_aging_input_text(units: Sequence[SemanticUnit]) -> str:
@@ -1676,23 +1698,18 @@ def _timeline_aging_input_text(units: Sequence[SemanticUnit]) -> str:
 
 def fine_timeline_usage(
     timeline: Timeline,
-    token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+    token_estimator: Callable[[str], int] | None = None,
 ) -> int:
     """Estimate the current logical Fine Timeline payload in tokens."""
 
     if not isinstance(timeline, Timeline):
         raise TypeError("timeline must be a Timeline")
-    estimator = token_estimator or DeterministicTokenEstimator()
-    if not callable(getattr(estimator, "estimate", None)) and not callable(estimator):
-        raise TypeError("token_estimator must be callable or provide estimate()")
+    estimator = _resolve_token_estimator(token_estimator)
     text = "\n".join(
         json.dumps(entry.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         for entry in timeline.fine_entries
     )
-    value = estimator.estimate(text) if hasattr(estimator, "estimate") else estimator(text)  # type: ignore[operator]
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("token estimator must return a non-negative integer")
-    return value
+    return _estimate_tokens(estimator, text)
 
 
 def _compaction_input_text(summary: str, units: Sequence[SemanticUnit]) -> str:
@@ -1890,7 +1907,7 @@ class ContextCompiler:
         self,
         *,
         budget_tokens: int | None = None,
-        token_estimator: TokenEstimator | Callable[[str], int] | None = None,
+        token_estimator: Callable[[str], int] | None = None,
     ) -> None:
         if budget_tokens is not None and (
             isinstance(budget_tokens, bool)
@@ -1899,68 +1916,16 @@ class ContextCompiler:
         ):
             raise ValueError("budget_tokens must be a positive integer or None")
         self.budget_tokens = budget_tokens
-        self.token_estimator = token_estimator or DeterministicTokenEstimator()
-        if not callable(getattr(self.token_estimator, "estimate", None)) and not callable(self.token_estimator):
-            raise TypeError("token_estimator must be callable or provide estimate()")
+        self.token_estimator = _resolve_token_estimator(token_estimator)
 
     def compile(
         self,
-        sources: ContextSourceBundle | None = None,
+        sources: ContextSourceBundle,
         *,
         previous_snapshot: ContextSnapshot | None = None,
-        instruction_sources: Sequence[object] | object = _MISSING,
-        project_instruction_source: ProjectInstructionSource | None | object = _MISSING,
-        transcript: Transcript | None | object = _MISSING,
-        timeline: Timeline | None | object = _MISSING,
-        protected_context: Sequence[object] | object = _MISSING,
-        protocol_blocks: Sequence[object] | object = _MISSING,
-        current_turn: Sequence[object] | object = _MISSING,
-        current_user: object = _MISSING,
-        current_turn_deltas: Sequence[object] | object = _MISSING,
-        runtime_sources: Sequence[object] | object = _MISSING,
-        environment_sources: Sequence[object] | object = _MISSING,
-        tool_source: ToolDefinitionSource | None | object = _MISSING,
     ) -> ContextSnapshot:
-        individual_inputs = (
-            instruction_sources,
-            project_instruction_source,
-            transcript,
-            timeline,
-            protected_context,
-            protocol_blocks,
-            current_turn,
-            current_user,
-            current_turn_deltas,
-            runtime_sources,
-            environment_sources,
-            tool_source,
-        )
-        if sources is not None and any(value is not _MISSING for value in individual_inputs):
-            raise TypeError("pass ContextSourceBundle or individual compiler inputs, not both")
-        if sources is None:
-            normalized_instruction_sources = _sequence_or_single(
-                None if instruction_sources is _MISSING else instruction_sources
-            )
-            normalized_current_turn = tuple(() if current_turn is _MISSING else current_turn)
-            if current_user is not _MISSING and current_user is not None:
-                normalized_current_turn = (*normalized_current_turn, current_user)
-            sources = ContextSourceBundle(
-                instruction_sources=normalized_instruction_sources,
-                project_instruction_source=(
-                    None if project_instruction_source is _MISSING else project_instruction_source
-                ),
-                transcript=None if transcript is _MISSING else transcript,
-                timeline=None if timeline is _MISSING else timeline,
-                protected_context=tuple(() if protected_context is _MISSING else protected_context),
-                protocol_blocks=tuple(() if protocol_blocks is _MISSING else protocol_blocks),
-                current_turn=normalized_current_turn,
-                current_turn_deltas=tuple(() if current_turn_deltas is _MISSING else current_turn_deltas),
-                runtime_sources=tuple(() if runtime_sources is _MISSING else runtime_sources),
-                environment_sources=tuple(() if environment_sources is _MISSING else environment_sources),
-                tool_source=None if tool_source is _MISSING else tool_source,
-            )
-        elif not isinstance(sources, ContextSourceBundle):
-            raise TypeError("sources must be ContextSourceBundle or None")
+        if not isinstance(sources, ContextSourceBundle):
+            raise TypeError("sources must be ContextSourceBundle")
         if previous_snapshot is not None and not isinstance(previous_snapshot, ContextSnapshot):
             raise TypeError("previous_snapshot must be ContextSnapshot or None")
 
@@ -2131,23 +2096,10 @@ class ContextCompiler:
         self,
         sources: ContextSourceBundle,
     ) -> tuple[tuple[ContextBlock, ...], int, str]:
-        values: list[ContextBlock] = []
+        values = list(sources.instruction_sources)
         project = sources.project_instruction_source
-        for raw in (*sources.instruction_sources, *( (project,) if project is not None else () )):
-            if isinstance(raw, ProjectInstructionSource):
-                project = raw
-                values.extend(raw.blocks)
-            elif isinstance(raw, (PromptAssetSource, CoreRuntimeContractSource)):
-                values.append(raw.to_context_block())
-            elif isinstance(raw, ContextBlock):
-                values.append(raw)
-            elif hasattr(raw, "to_context_block"):
-                block = raw.to_context_block()
-                if not isinstance(block, ContextBlock):
-                    raise TypeError("instruction source to_context_block() must return ContextBlock")
-                values.append(block)
-            else:
-                raise TypeError(f"unsupported instruction source: {type(raw).__name__}")
+        if project is not None:
+            values.extend(project.blocks)
         if not any(block.source_kind is ContextSourceKind.PUBLIC_PROMPT for block in values):
             values.insert(0, public_prompt_source())
         if not any(block.source_kind is ContextSourceKind.CORE_CONTRACT for block in values):
@@ -2200,21 +2152,7 @@ class ContextCompiler:
         return self._estimate_text(payload)
 
     def _estimate_text(self, text: str) -> int:
-        estimator = self.token_estimator
-        value = estimator.estimate(text) if hasattr(estimator, "estimate") else estimator(text)  # type: ignore[operator]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("token estimator must return a non-negative integer")
-        return value
-
-
-def _sequence_or_single(value: Sequence[object] | object | None) -> tuple[object, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, (str, bytes, bytearray)):
-        return (value,)
-    if isinstance(value, Sequence):
-        return tuple(value)
-    return (value,)
+        return _estimate_tokens(self.token_estimator, text)
 
 
 def _semantic_unit_block(unit: SemanticUnit) -> ContextBlock:
@@ -2254,8 +2192,6 @@ def _timeline_block(record: SemanticEntry | EpochMacroSummary) -> ContextBlock:
         provenance=f"timeline:{record.record_type}:{record.turn_id}",
         content=json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
     )
-    if isinstance(record, SemanticEntry):
-        return TimelineSource(block).to_context_block()
     return block
 
 
@@ -2291,8 +2227,6 @@ def _conversation_block(raw: object) -> ContextBlock:
             provenance="current:user",
             content=raw,
         )
-    if isinstance(raw, (RuntimeStateSource, EnvironmentSource, TimelineSource)):
-        return raw.to_context_block()
     raise TypeError(f"unsupported conversation/context source: {type(raw).__name__}")
 
 
@@ -2321,7 +2255,6 @@ __all__ = [
     "DeterministicTokenEstimator",
     "GateDecision",
     "RequestAccounting",
-    "TokenEstimator",
     "account_generation_request",
     "context_block_id",
     "evaluate_gates",

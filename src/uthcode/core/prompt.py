@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Sequence
+from typing import Any, Sequence
 
 from uthcode.prompt_assets import read_public_coding_prompt
 
@@ -437,102 +437,6 @@ def core_runtime_contract_source() -> ContextBlock:
 
 
 @dataclass(frozen=True, slots=True)
-class _TextContextSource:
-    """Small typed wrapper used by the named Context Source contracts."""
-
-    block: ContextBlock
-    expected_source_kind: ClassVar[ContextSourceKind]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.block, ContextBlock):
-            raise TypeError("block must be a ContextBlock")
-        if self.block.source_kind is not self.expected_source_kind:
-            raise ValueError(
-                f"{type(self).__name__} requires source kind "
-                f"{self.expected_source_kind.value!r}"
-            )
-
-    @property
-    def source_kind(self) -> ContextSourceKind:
-        return self.block.source_kind
-
-    @property
-    def authority(self) -> ContextAuthority:
-        return self.block.authority
-
-    @property
-    def plane(self) -> ContextPlane:
-        return self.block.plane
-
-    @property
-    def stability(self) -> ContextStability:
-        return self.block.stability
-
-    @property
-    def scope(self) -> ContextScope | str:
-        return self.block.scope
-
-    @property
-    def provenance(self) -> str:
-        return self.block.provenance
-
-    @property
-    def content(self) -> str:
-        return self.block.content
-
-    @property
-    def estimated_tokens(self) -> int:
-        return self.block.estimated_tokens
-
-    @property
-    def semantic_unit_id(self) -> str | None:
-        return self.block.semantic_unit_id
-
-    def to_context_block(self) -> ContextBlock:
-        return self.block
-
-    def to_dict(self) -> dict[str, object]:
-        return self.block.to_dict()
-
-
-@dataclass(frozen=True, slots=True)
-class PromptAssetSource(_TextContextSource):
-    """Public editable prompt asset source."""
-
-    block: ContextBlock = field(default_factory=public_prompt_source)
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.PUBLIC_PROMPT
-
-
-@dataclass(frozen=True, slots=True)
-class CoreRuntimeContractSource(_TextContextSource):
-    """Core-owned, non-editable runtime contract source."""
-
-    block: ContextBlock = field(default_factory=core_runtime_contract_source)
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.CORE_CONTRACT
-
-
-@dataclass(frozen=True, slots=True)
-class TimelineSource(_TextContextSource):
-    """Derived Timeline text that remains in the conversation plane."""
-
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.TIMELINE_ENTRY
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeStateSource(_TextContextSource):
-    """Current runtime facts; never a stable instruction source."""
-
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.RUNTIME_FACT
-
-
-@dataclass(frozen=True, slots=True)
-class EnvironmentSource(_TextContextSource):
-    """Environment facts kept in the contextual plane."""
-
-    expected_source_kind: ClassVar[ContextSourceKind] = ContextSourceKind.ENVIRONMENT_FACT
-
-
-@dataclass(frozen=True, slots=True)
 class ProjectInstructionSource:
     """Application-produced ordered instruction set and epoch facts."""
 
@@ -842,21 +746,16 @@ def build_system_prompt(
 
 
 __all__ = [
-    "CoreRuntimeContractSource",
     "ContextAuthority",
     "ContextBlock",
     "ContextPlane",
     "ContextScope",
     "ContextSourceKind",
     "ContextStability",
-    "EnvironmentSource",
-    "TimelineSource",
     "InstructionPrefix",
     "PromptSection",
-    "PromptAssetSource",
     "ProjectInstructionSource",
     "RuntimePromptContext",
-    "RuntimeStateSource",
     "StableInstructionPrefixEpoch",
     "SystemPromptContext",
     "ToolDefinitionSource",

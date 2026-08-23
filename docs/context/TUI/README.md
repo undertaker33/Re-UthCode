@@ -138,7 +138,7 @@ Windows 直接读取带修饰键的原生 Unicode 控制台事件，从而在 Wi
 
 Slash Command 使用 Application 的正式 Completion 数据源。候选随草稿实时过滤，字符输入、Backspace 和左右编辑继续作用于同一份草稿。上下键只在当前可见窗口中移动，`Tab` 补全，`Enter` 执行，`Esc` 关闭。
 
-Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 和旧 Prompt `/do` 不再存在。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
+Behavior Mode 命令的最终定义同样只来自这一 Registry：`/plan` 无参数选择 `PLAN`，`/do` 无参数选择 `DEFAULT`，`/build` 只是 `/do` alias。旧 `/p` 不存在，`/do` 只选择模式而不携带另一条文本输入语义。命令只返回 interface-neutral mode action；TUI 仅在 Run idle 时调用 `set_behavior_mode`，active Turn 不允许通过 Slash Command 直接切模。
 
 `/new`、`/resume [session-id]` 通过 Application 完成 Session 切换和当前文件系统 Instruction State 重建；`/compact` 进入同一 Application/Session Context orchestrator，低 pressure 也可执行，无候选时返回成功 no-op。TUI 只保存 Picker 页码、选择项和输入草稿。`/status` 与底部 ring 读取同一个 dynamic Context usage projection，并同时展示分维 limits、Auto/Hard Gate 和 Timeline outcome，不把本地预算解释为远端模型窗口猜测。
 

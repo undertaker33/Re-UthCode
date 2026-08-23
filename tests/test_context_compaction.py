@@ -46,14 +46,19 @@ def test_compactor_respects_existing_committed_timeline() -> None:
     assert result.timeline.sequence_end == transcript.last_sequence
 
 
-def test_application_context_compact_records_bounded_diagnostics() -> None:
+@pytest.mark.asyncio
+async def test_application_context_compact_records_bounded_diagnostics() -> None:
     transcript = _transcript()
     service = ApplicationContextService()
-    result = service.compact(transcript, summarize=lambda _text: "summary")
+
+    async def summarize(epoch):
+        return {"summary": "summary", "coverage": list(epoch.turn_ids)}
+
+    result = await service.compact_async(transcript, summarize=summarize)
     assert result.timeline is not None
     diagnostics = service.public_diagnostics()
     assert diagnostics["compaction"]["count"] == 1
-    assert diagnostics["compaction"]["last"]["batch_count"] >= 1
+    assert diagnostics["compaction"]["last"]["coverage_count"] >= 1
 
 
 def test_context_compactor_single_flight_rejects_reentrant_lock() -> None:

@@ -47,13 +47,6 @@ from uthcode.core.agent_events import (
     UserInputRequested,
     agent_event_from_json,
 )
-from uthcode.core.hooks import (
-    BeforeCompletionContinue,
-    BeforeToolExecutionContinue,
-    RuntimeHookSet,
-    create_default_runtime_hooks,
-    plan_tool_policy,
-)
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
@@ -525,7 +518,6 @@ async def test_completion_feedback_survives_async_preparer_pause_until_real_prov
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=create_default_runtime_hooks(),
         permission_resolver=lambda action: evaluator.evaluate(
             action,
             mode=PermissionMode.FULL_ACCESS,
@@ -604,7 +596,6 @@ async def test_completion_feedback_is_not_consumed_when_cancelled_during_async_p
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=create_default_runtime_hooks(),
         permission_resolver=lambda action: PermissionEvaluator().evaluate(
             action,
             mode=PermissionMode.FULL_ACCESS,
@@ -735,7 +726,6 @@ async def test_plan_revision_feedback_survives_async_preparer_pause_until_real_p
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=create_default_runtime_hooks(),
     )
     execution = loop.start_turn(
         RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
@@ -1329,7 +1319,6 @@ async def test_t08_dynamic_tool_view_uses_mode_and_structured_runtime_context() 
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=RuntimeHookSet(),
         permission_resolver=lambda action: PermissionEvaluator().evaluate(
             action,
             mode=PermissionMode.FULL_ACCESS,
@@ -1355,12 +1344,15 @@ async def test_t08_dynamic_tool_view_uses_mode_and_structured_runtime_context() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hook_shape", ("omitted", "empty", "custom_only"))
-async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
-    hook_shape: str,
+@pytest.mark.parametrize(
+    "effect",
+    (Effect.WRITE, Effect.DESTRUCTIVE, Effect.EXTERNAL, Effect.UNKNOWN),
+)
+async def test_t08_plan_non_read_is_fail_closed_before_permission(
+    effect: Effect,
 ) -> None:
     trace: list[str] = []
-    write = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.HIDDEN, trace)
+    write = PolicyTool("Write", effect, ToolPlanningAccess.HIDDEN, trace)
     registry = ToolRegistry((write,))
     provider = ScriptedProvider(
         [
@@ -1374,23 +1366,9 @@ async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
         ]
     )
     permission_calls: list[PermissionAction] = []
-    custom_calls: list[str] = []
-
-    def custom_hook(_context):
-        custom_calls.append("custom")
-        return BeforeToolExecutionContinue()
-
     def permission(action):
         permission_calls.append(action)
         return PermissionEvaluator().evaluate(action, mode=PermissionMode.FULL_ACCESS)
-
-    kwargs: dict[str, object] = {}
-    if hook_shape == "empty":
-        kwargs["runtime_hooks"] = RuntimeHookSet()
-    elif hook_shape == "custom_only":
-        kwargs["runtime_hooks"] = RuntimeHookSet(
-            before_tool_execution=(custom_hook,),
-        )
 
     loop = AgentLoop(
         provider,
@@ -1401,7 +1379,6 @@ async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
             tools=definitions,
         ),
         permission_resolver=permission,
-        **kwargs,
     )
     execution = loop.start_turn(
         RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
@@ -1422,27 +1399,12 @@ async def test_t08_plan_write_is_fail_closed_for_every_public_hook_shape(
     )
     assert trace == ["preflight"]
     assert permission_calls == []
-    assert custom_calls == []
     assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hook_shape", ("omitted", "empty", "custom_only"))
-async def test_t08_plan_ordinary_final_completes_for_every_public_hook_shape(
-    hook_shape: str,
-) -> None:
+async def test_t08_plan_ordinary_final_completes() -> None:
     provider = ScriptedProvider([[_response(TextPart("candidate"))]])
-    custom_calls: list[str] = []
-
-    def custom_hook(_context):
-        custom_calls.append("custom")
-        return BeforeCompletionContinue()
-
-    kwargs: dict[str, object] = {}
-    if hook_shape == "empty":
-        kwargs["runtime_hooks"] = RuntimeHookSet()
-    elif hook_shape == "custom_only":
-        kwargs["runtime_hooks"] = RuntimeHookSet(before_completion=(custom_hook,))
 
     loop = AgentLoop(
         provider,
@@ -1452,7 +1414,6 @@ async def test_t08_plan_ordinary_final_completes_for_every_public_hook_shape(
             messages=messages,
             tools=definitions,
         ),
-        **kwargs,
     )
     execution = loop.start_turn(
         RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
@@ -1467,11 +1428,10 @@ async def test_t08_plan_ordinary_final_completes_for_every_public_hook_shape(
     assert segment.result.final_text == "candidate"
     assert not any(isinstance(event, PlanProposed) for event in segment.events)
     assert sum(isinstance(event, TurnCompleted) for event in segment.events) == 1
-    assert custom_calls == (["custom"] if hook_shape == "custom_only" else [])
 
 
 @pytest.mark.asyncio
-async def test_t08_pre_tool_order_is_preflight_hook_permission_execute() -> None:
+async def test_t08_plan_read_is_preflight_permission_execute() -> None:
     trace: list[str] = []
     tool = PolicyTool("Read", Effect.READ, ToolPlanningAccess.READ_ONLY, trace)
     registry = ToolRegistry((tool,))
@@ -1479,10 +1439,6 @@ async def test_t08_pre_tool_order_is_preflight_hook_permission_execute() -> None
     provider = ScriptedProvider(
         [[_response(call, finish_reason=FinishReason.TOOL_CALLS)], [_response(TextPart("done"))]]
     )
-
-    def hook(_context):
-        trace.append("hook")
-        return BeforeToolExecutionContinue()
 
     def permission(action):
         trace.append("permission")
@@ -1497,13 +1453,20 @@ async def test_t08_pre_tool_order_is_preflight_hook_permission_execute() -> None
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=RuntimeHookSet(before_tool_execution=(hook,)),
         permission_resolver=permission,
     )
-    events, result, _ = await _drive(_start(loop))
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=registry.definitions()
+        + (ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+    events, result, _ = await _drive(execution)
 
     assert result.status is RunStatus.COMPLETED
-    assert trace == ["preflight", "hook", "permission", "execute"]
+    assert trace == ["preflight", "permission", "execute"]
     assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
         "call-1"
     ]
@@ -1539,7 +1502,6 @@ async def test_t08_plan_non_read_and_todo_calls_fail_closed_before_permission() 
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=RuntimeHookSet(before_tool_execution=(plan_tool_policy,)),
         permission_resolver=permission,
     )
     execution = loop.start_turn(
@@ -1629,7 +1591,6 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=create_default_runtime_hooks(),
         permission_resolver=lambda action: evaluator.evaluate(
             action,
             mode=PermissionMode.FULL_ACCESS,
@@ -1818,7 +1779,6 @@ async def test_t08_todo_replace_all_blocks_candidate_until_tasks_are_completed()
         registry,
         ToolExecutor(registry),
         prepare,
-        runtime_hooks=create_default_runtime_hooks(),
         permission_resolver=permission,
     )
     execution = loop.start_turn(
@@ -1895,7 +1855,6 @@ async def test_t08_invalid_todo_is_controlled_and_does_not_change_task_state() -
             messages=messages,
             tools=definitions,
         ),
-        runtime_hooks=create_default_runtime_hooks(),
         permission_resolver=lambda action: permission_calls.append(action),
     )
     execution = loop.start_turn(
@@ -2030,45 +1989,6 @@ async def test_t08_cancel_wins_over_pending_tool_steering() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t08_completion_hook_exception_fails_closed_after_usage_without_candidate_commit() -> None:
-    provider = ScriptedProvider(
-        [[TextDelta("hidden"), _response(TextPart("candidate"), usage=Usage(2, 3))]]
-    )
-    registry = ToolRegistry()
-
-    def explode(_context):
-        raise RuntimeError("synthetic hook failure")
-
-    loop = AgentLoop(
-        provider,
-        registry,
-        ToolExecutor(registry),
-        lambda messages, definitions, _runtime: GenerationRequest(
-            messages=messages,
-            tools=definitions,
-        ),
-        runtime_hooks=RuntimeHookSet(before_completion=(explode,)),
-    )
-    execution = loop.start_turn(
-        RunState.initial("run-1"),
-        "work",
-        turn_id="turn-1",
-    )
-
-    segment = await execution.run_segment(pause_signal=CancellationToken())
-
-    assert segment.terminal and segment.result is not None
-    assert segment.result.status is RunStatus.FAILED
-    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
-    assert segment.result.usage == Usage(2, 3)
-    assert [message.role for message in execution.state.messages] == ["user"]
-    assert not any(
-        isinstance(event, (AssistantMessageCompleted, TurnCompleted))
-        for event in segment.events
-    )
-
-
-@pytest.mark.asyncio
 async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_iterations() -> None:
     pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
     provider = ScriptedProvider(
@@ -2093,7 +2013,6 @@ async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_itera
             tools=definitions,
         ),
         config=AgentLoopConfig(max_iterations=3),
-        runtime_hooks=create_default_runtime_hooks(),
     )
     execution = loop.start_turn(
         RunState.initial("run-1"),
@@ -2148,7 +2067,6 @@ async def test_t08_todo_empty_replace_explicitly_clears_completion_gate() -> Non
             messages=messages,
             tools=definitions,
         ),
-        runtime_hooks=create_default_runtime_hooks(),
     )
     execution = loop.start_turn(
         RunState.initial("run-1"),
@@ -2162,71 +2080,3 @@ async def test_t08_todo_empty_replace_explicitly_clears_completion_gate() -> Non
     assert result.status is RunStatus.COMPLETED and result.final_text == "done"
     states = [event.task_state for event in events if isinstance(event, TaskStateChanged)]
     assert len(states) == 2 and states[0].has_unfinished and states[1].is_empty
-
-
-@pytest.mark.asyncio
-async def test_t08_pre_tool_hook_exception_closes_original_batch_without_side_effects() -> None:
-    trace: list[str] = []
-    tool = PolicyTool("Work", Effect.WRITE, ToolPlanningAccess.HIDDEN, trace)
-    registry = ToolRegistry((tool,))
-    calls = (
-        ToolCallPart("hook-1", "Work", {"value": "one"}),
-        ToolCallPart("hook-2", "Work", {"value": "two"}),
-    )
-    provider = ScriptedProvider(
-        [[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]]
-    )
-    hook_calls: list[str] = []
-    permission_calls: list[PermissionAction] = []
-
-    def explode(context):
-        hook_calls.append(context.prepared_call.call.tool_call_id)
-        raise RuntimeError("synthetic pre-tool hook failure")
-
-    loop = AgentLoop(
-        provider,
-        registry,
-        ToolExecutor(registry),
-        lambda messages, definitions, _runtime: GenerationRequest(
-            messages=messages,
-            tools=definitions,
-        ),
-        runtime_hooks=RuntimeHookSet(before_tool_execution=(explode,)),
-        permission_resolver=lambda action: permission_calls.append(action),
-    )
-    execution = _start(loop)
-
-    segment = await execution.run_segment(pause_signal=CancellationToken())
-
-    assert segment.terminal and segment.result is not None
-    assert segment.result.status is RunStatus.FAILED
-    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
-    assert hook_calls == ["hook-1"]
-    assert trace == ["preflight"]
-    assert permission_calls == []
-    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolStarted)] == [
-        "hook-1",
-        "hook-2",
-    ]
-    assert [event.tool_call_id for event in segment.events if isinstance(event, ToolFinished)] == [
-        "hook-1",
-        "hook-2",
-    ]
-    assert [event.status for event in segment.events if isinstance(event, ToolFinished)] == [
-        "failed",
-        "failed",
-    ]
-    batches = [event for event in segment.events if isinstance(event, ToolBatchFinished)]
-    assert len(batches) == 1
-    assert batches[0].tool_call_ids == ("hook-1", "hook-2")
-    assert batches[0].status == "failed"
-    assert sum(isinstance(event, TurnFailed) for event in segment.events) == 1
-    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
-    assert [message.role for message in execution.state.messages] == ["user", "assistant", "tool"]
-    tool_results = execution.state.messages[-1].parts
-    assert [part.tool_call_id for part in tool_results] == ["hook-1", "hook-2"]
-    assert [part.content for part in tool_results] == [
-        "Error: pre-tool hook failed",
-        "Error: pre-tool hook failed",
-    ]
-    assert all(part.is_error for part in tool_results)

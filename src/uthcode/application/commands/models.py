@@ -16,18 +16,10 @@ from uthcode.core.planning import BehaviorMode
 
 
 class CommandKind(str, Enum):
-    """The three command semantics understood by the Application layer."""
+    """The command semantics understood by the Application layer."""
 
     LOCAL = "local"
     LOCAL_UI = "local_ui"
-    PROMPT = "prompt"
-
-
-class CommandAvailability(str, Enum):
-    """Whether a command has an implementation in the current release."""
-
-    IMPLEMENTED = "implemented"
-    NOT_IMPLEMENTED = "not_implemented"
 
 
 class InvocationStatus(str, Enum):
@@ -46,7 +38,6 @@ class OutcomeStatus(str, Enum):
     SUCCESS = "success"
     USAGE_ERROR = "usage_error"
     UNKNOWN_COMMAND = "unknown_command"
-    NOT_IMPLEMENTED = "not_implemented"
     EXECUTION_ERROR = "execution_error"
 
 
@@ -100,12 +91,9 @@ class CommandDefinition:
     description: str
     kind: CommandKind
     aliases: tuple[str, ...] = ()
-    availability: CommandAvailability = CommandAvailability.IMPLEMENTED
     arguments: tuple[ArgumentSpec, ...] = ()
     handler: CommandHandler | None = None
     hidden: bool = False
-    query_required: bool = False
-    accepts_query: bool | None = None
     usage: str | None = None
 
     def __post_init__(self) -> None:
@@ -115,18 +103,10 @@ class CommandDefinition:
         if not isinstance(kind, CommandKind):
             kind = CommandKind(str(kind).strip().lower())
             object.__setattr__(self, "kind", kind)
-        availability = self.availability
-        if not isinstance(availability, CommandAvailability):
-            availability = CommandAvailability(str(availability).strip().lower())
-            object.__setattr__(self, "availability", availability)
         object.__setattr__(self, "aliases", tuple(self.aliases))
         object.__setattr__(self, "arguments", tuple(self.arguments))
-        if self.accepts_query is None:
-            object.__setattr__(self, "accepts_query", kind is CommandKind.PROMPT)
-
-    @property
-    def implemented(self) -> bool:
-        return self.availability is CommandAvailability.IMPLEMENTED
+        if not callable(self.handler):
+            raise TypeError("command handler must be callable")
 
     @property
     def usage_text(self) -> str:
@@ -157,8 +137,6 @@ class CommandInvocation:
     canonical: str | None = None
     alias: str | None = None
     args: tuple[str, ...] = ()
-    query: str = ""
-    separator_seen: bool = False
     definition: CommandDefinition | None = None
     error: str | None = None
 
@@ -268,7 +246,6 @@ class CommandOutcome:
     status: OutcomeStatus
     output: str | None = None
     ui_action: UiAction | None = None
-    prompt: str | None = None
     error: str | None = None
     invocation: CommandInvocation | None = None
 
@@ -290,15 +267,6 @@ class CommandOutcome:
     ) -> CommandOutcome:
         return cls(OutcomeStatus.SUCCESS, ui_action=action, invocation=invocation)
 
-    @classmethod
-    def success_prompt(
-        cls,
-        prompt: str,
-        *,
-        invocation: CommandInvocation | None = None,
-    ) -> CommandOutcome:
-        return cls(OutcomeStatus.SUCCESS, prompt=prompt, invocation=invocation)
-
     @property
     def message(self) -> str | None:
         """The user-facing text, when this outcome has one."""
@@ -314,7 +282,6 @@ class CompletionCandidate:
     display: str
     description: str
     aliases: tuple[str, ...]
-    availability: CommandAvailability
     usage: str
     argument_prompt: str
     matched_alias: str | None = None
@@ -324,17 +291,11 @@ class CompletionCandidate:
     def value(self) -> str:
         return f"/{self.canonical}"
 
-    @property
-    def implemented(self) -> bool:
-        return self.availability is CommandAvailability.IMPLEMENTED
-
-
 __all__ = [
     "ArgumentSpec",
     "BehaviorModeSelected",
     "CandidateProvider",
     "ClearTranscript",
-    "CommandAvailability",
     "CommandDefinition",
     "CommandHandler",
     "CommandInvocation",

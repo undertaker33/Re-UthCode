@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from uthcode.application import ApplicationContextService, CommandDispatcher, ContextUsage, EffectiveConfig, OpenSessionPicker, OutcomeStatus, SessionChanged, SessionOperationError, create_application, create_builtin_registry
-from uthcode.application.history import transcript_entries_for_message
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.instructions import InstructionLoader
 from uthcode.application.runtime_context import ApplicationRuntimeContext
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Transcript, TranscriptEntry, TranscriptKind
@@ -40,7 +40,7 @@ def _message_transcript(session_id: str, messages: tuple[Message, ...]) -> Trans
     transcript = Transcript(session_id)
     sequence = 1
     for index, message in enumerate(messages, start=1):
-        entries = transcript_entries_for_message(session_id, f"turn-{index}", sequence, message)
+        entries = _transcript_entries_for_message(session_id, f"turn-{index}", sequence, message)
         for entry in entries:
             transcript = transcript.append(entry)
         sequence += len(entries)
@@ -59,16 +59,18 @@ def _request_text(request) -> str:
     return "\n".join(part.text for message in request.messages for part in message.parts if isinstance(part, TextPart))
 
 
-def test_w04_commands_are_implemented_and_compact_rejects_focus() -> None:
+@pytest.mark.asyncio
+async def test_w04_commands_are_registered_and_compact_rejects_extra_arguments() -> None:
     registry = create_builtin_registry()
     dispatcher = CommandDispatcher(registry)
-    assert registry.resolve("compact").implemented  # type: ignore[union-attr]
-    assert isinstance(dispatcher.dispatch_text("/resume").ui_action, OpenSessionPicker)  # type: ignore[union-attr]
-    rejected = dispatcher.dispatch_text("/compact -- focus")
+    assert callable(registry.resolve("compact").handler)  # type: ignore[union-attr]
+    assert isinstance((await dispatcher.dispatch_text_async("/resume")).ui_action, OpenSessionPicker)  # type: ignore[union-attr]
+    rejected = await dispatcher.dispatch_text_async("/compact -- focus")
     assert rejected is not None and rejected.status is OutcomeStatus.USAGE_ERROR
 
 
-def test_new_resume_restore_transcript_timeline_instruction_state_and_status(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_new_resume_restore_transcript_timeline_instruction_state_and_status(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store)
     try:
@@ -76,7 +78,7 @@ def test_new_resume_restore_transcript_timeline_instruction_state_and_status(tmp
         active = application.resume_session("session-1")
         assert active.transcript.entries == transcript.entries
         assert active.timeline.active_checkpoint is None
-        status = CommandDispatcher(create_builtin_registry(), application).dispatch_text("/status")
+        status = await CommandDispatcher(create_builtin_registry(), application).dispatch_text_async("/status")
         assert status is not None and status.output is not None
         assert "Timeline checkpoint:" in status.output
         assert "dynamic input operating limit" in status.output
@@ -108,12 +110,13 @@ def test_same_text_process_turn_is_not_deduplicated_against_durable_transcript()
     assert len(repeats) == 3
 
 
-def test_new_command_releases_old_writer_and_opens_fresh_session(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_new_command_releases_old_writer_and_opens_fresh_session(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     application = _application(tmp_path, store)
     try:
         _seed(application)
-        outcome = CommandDispatcher(create_builtin_registry(), application).dispatch_text("/new")
+        outcome = await CommandDispatcher(create_builtin_registry(), application).dispatch_text_async("/new")
         assert outcome is not None and outcome.status is OutcomeStatus.SUCCESS
         assert isinstance(outcome.ui_action, SessionChanged)
         assert outcome.ui_action.restored is False
@@ -121,17 +124,18 @@ def test_new_command_releases_old_writer_and_opens_fresh_session(tmp_path: Path)
         application.close()
 
 
-def test_resume_busy_and_unknown_are_user_visible(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resume_busy_and_unknown_are_user_visible(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     owner = _application(tmp_path, store)
     contender = _application(tmp_path, store)
     try:
         _seed(owner, "busy")
         held = owner.resume_session("busy")
-        busy = CommandDispatcher(create_builtin_registry(), contender).dispatch_text("/resume busy")
+        busy = await CommandDispatcher(create_builtin_registry(), contender).dispatch_text_async("/resume busy")
         assert busy is not None and busy.status is OutcomeStatus.EXECUTION_ERROR and "Session busy" in (busy.error or "")
         held.close()
-        unknown = CommandDispatcher(create_builtin_registry(), contender).dispatch_text("/resume missing")
+        unknown = await CommandDispatcher(create_builtin_registry(), contender).dispatch_text_async("/resume missing")
         assert unknown is not None and unknown.error == "unknown Session: missing"
     finally:
         owner.close()

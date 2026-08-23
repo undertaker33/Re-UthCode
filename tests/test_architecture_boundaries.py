@@ -268,16 +268,17 @@ def test_forbidden_future_modules_and_graph_dependencies_are_absent() -> None:
         for path in SRC.rglob("*")
         if path.name in {"hooks", "hooks.py"}
     }
-    assert hook_paths == {"core/hooks.py"}
+    assert not hook_paths
 
 
-def test_t08_core_contracts_stay_pure_and_hooks_have_only_two_sync_points() -> None:
+def test_t09_2_fixed_runtime_controls_stay_in_core_agent() -> None:
     planning_path = SRC / "core" / "planning.py"
-    hooks_path = SRC / "core" / "hooks.py"
+    agent_path = SRC / "core" / "agent.py"
     assert planning_path.is_file()
-    assert hooks_path.is_file()
+    assert agent_path.is_file()
+    assert not (SRC / "core" / "hooks.py").exists()
 
-    for source_path in (planning_path, hooks_path):
+    for source_path in (planning_path, agent_path):
         imports = _imports(source_path)
         assert not any(
             value.startswith("uthcode.application")
@@ -286,18 +287,11 @@ def test_t08_core_contracts_stay_pure_and_hooks_have_only_two_sync_points() -> N
             for value in imports
         ), source_path
 
-    hooks_source = hooks_path.read_text(encoding="utf-8")
-    hooks_tree = ast.parse(hooks_source)
-    assert not any(isinstance(node, (ast.AsyncFunctionDef, ast.Await)) for node in ast.walk(hooks_tree))
-    assert "before_tool_execution" in hooks_source
-    assert "before_completion" in hooks_source
-    assert "after_tool" not in hooks_source
-    assert "after_completion" not in hooks_source
-    assert "create_task" not in hooks_source
-    assert "ToolExecutor" not in hooks_source
-    assert "ProviderPort" not in hooks_source
-    assert "RunState" not in hooks_source
-    assert "registry" not in hooks_source.lower()
+    agent_source = agent_path.read_text(encoding="utf-8")
+    assert "BehaviorMode.PLAN" in agent_source
+    assert "Effect.READ" in agent_source
+    assert "CompletionBlocked" in agent_source
+    assert "RuntimeFeedbackKind.COMPLETION_BLOCKED" in agent_source
 
 
 def test_interfaces_only_depend_on_application_and_their_ui_toolkit() -> None:
@@ -324,15 +318,14 @@ def test_headless_application_runs_without_importing_the_interface_tree() -> Non
     script = """
 import asyncio
 import sys
-from uthcode.application import EffectiveConfig, GenerationRequest, Message, TextPart, create_application
+from uthcode.application import EffectiveConfig, create_application
 
 async def main():
     application = create_application(
         EffectiveConfig.single_model('fake/ref', context_window=1_000_000)
     )
-    request = GenerationRequest(messages=(Message('user', (TextPart('hello'),)),))
-    events = [event async for event in application.stream_generation(request)]
-    assert events
+    result = await application.create_run().start_turn('hello').result()
+    assert result.status.value == 'completed'
     assert 'uthcode.interfaces' not in sys.modules
 
 asyncio.run(main())
@@ -399,7 +392,6 @@ def test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path() -> None
     application_tools = (SRC / "application" / "tools.py").read_text(encoding="utf-8")
     generation = (SRC / "application" / "generation.py").read_text(encoding="utf-8")
     assert "AskUserQuestion is reserved for the Application Agent path" in application_tools
-    assert "manual Tool execution is disabled" in generation
     assert "async def execute_calls" not in application_tools
     assert "ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)" in generation
 

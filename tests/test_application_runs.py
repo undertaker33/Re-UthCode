@@ -51,7 +51,6 @@ from uthcode.core.agent_events import (
     TurnStarted,
 )
 from uthcode.core.agent import AgentTurnExecution
-from uthcode.core.hooks import RuntimeHookSet
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
@@ -665,6 +664,92 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     assert tool_message.parts == (ToolResultPart("read-call", f"1\t{hidden_content}"),)
     assert result.final_text == "The note says exactly what was requested."
     assert "I have the result." not in (result.final_text or "")
+
+
+@pytest.mark.asyncio
+async def test_t09_2_formal_headless_run_turn_keeps_tool_plan_todo_gate_and_final_answer(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "evidence.txt").write_text("verified fact\n", encoding="utf-8")
+    pending_todo = {"todos": [{"content": "verify the fact", "status": "in_progress"}]}
+    completed_todo = {"todos": [{"content": "verify the fact", "status": "completed"}]}
+    provider = _ScriptedProvider(
+        (
+            (
+                _response(
+                    ToolCallPart("read-evidence", "ReadFile", {"path": "evidence.txt"}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (
+                _response(
+                    ToolCallPart("plan-1", "ProposePlan", {"plan": "Read, verify, answer."}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (
+                _response(
+                    ToolCallPart("todo-pending", "TodoWrite", pending_todo),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (_response(TextPart("premature answer")),),
+            (
+                _response(
+                    ToolCallPart("todo-complete", "TodoWrite", completed_todo),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (_response(TextPart("final verified answer")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+    )
+    run = application.create_run(run_id="t09-2-headless")
+    assert run.set_behavior_mode(BehaviorMode.PLAN) is BehaviorMode.PLAN
+    handle = run.start_turn("read, plan, and verify")
+    events_task = asyncio.create_task(_collect(handle))
+
+    for _ in range(100):
+        if handle.pending_pause is not None:
+            break
+        await asyncio.sleep(0)
+    plan_pause = handle.pending_pause
+    assert plan_pause is not None and plan_pause.plan_review_request is not None
+    assert handle.resume(
+        PlanReviewResponse(
+            plan_pause.pause_id,
+            plan_pause.run_id,
+            plan_pause.turn_id,
+            1,
+            PlanReviewChoice.APPROVE,
+        )
+    ) is True
+
+    events = await asyncio.wait_for(events_task, timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "final verified answer"
+    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
+        "read-evidence",
+        "plan-1",
+        "todo-pending",
+        "todo-complete",
+    ]
+    assert [event.unfinished_count for event in events if isinstance(event, CompletionBlocked)] == [1]
+    assert [event.task_state.has_unfinished for event in events if isinstance(event, TaskStateChanged)] == [
+        True,
+        False,
+    ]
+    assert "一次性运行反馈类型：completion_blocked" in _latest_user_text(provider.requests[4])
+    completed_result = provider.requests[-1].messages[-1].parts[0]
+    assert isinstance(completed_result, ToolResultPart)
+    assert completed_result.tool_call_id == "todo-complete"
+    assert '"status": "completed"' in completed_result.content
 
 
 @pytest.mark.asyncio
@@ -1968,63 +2053,6 @@ async def test_t08_steering_preserves_task_state_until_model_explicitly_rewrites
     steering_prompt = _latest_user_text(provider.requests[2])
     assert "[in_progress] old goal" in steering_prompt
     assert "一次性运行反馈类型：user_steering" in steering_prompt
-
-
-@pytest.mark.asyncio
-async def test_t08_application_hook_exception_closes_all_call_ids_before_turn_failure() -> None:
-    tool = _ApplicationGateTool()
-    service = ApplicationToolService((tool,))
-    hook_calls: list[str] = []
-
-    def explode(context):
-        hook_calls.append(context.prepared_call.call.tool_call_id)
-        raise RuntimeError("synthetic pre-tool hook failure")
-
-    service._runtime_hooks = RuntimeHookSet(before_tool_execution=(explode,))
-    calls = (
-        ToolCallPart("hook-1", "Work", {"value": "one"}),
-        ToolCallPart("hook-2", "Work", {"value": "two"}),
-    )
-    provider = _ScriptedProvider(
-        ((_response(*calls, finish_reason=FinishReason.TOOL_CALLS),),)
-    )
-    application = UthCodeApplication(provider, tool_service=service)
-    evaluator = _RecordingPermissionEvaluator()
-    run = AgentRun(application, run_id="hook-failure", permission_evaluator=evaluator)
-    run.set_permission_mode(PermissionMode.FULL_ACCESS)
-    handle = run.start_turn("run both")
-
-    events = await _collect(handle)
-    result = await handle.result()
-
-    assert result.status is RunStatus.FAILED
-    assert result.termination_reason is TerminationReason.INTERNAL_ERROR
-    assert hook_calls == ["hook-1"]
-    assert tool.trace == ["preflight:one"]
-    assert evaluator.calls == []
-    assert [event.tool_call_id for event in events if isinstance(event, ToolStarted)] == [
-        "hook-1",
-        "hook-2",
-    ]
-    assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
-        "hook-1",
-        "hook-2",
-    ]
-    assert [event.status for event in events if isinstance(event, ToolFinished)] == [
-        "failed",
-        "failed",
-    ]
-    batches = [event for event in events if isinstance(event, ToolBatchFinished)]
-    assert len(batches) == 1
-    assert batches[0].tool_call_ids == ("hook-1", "hook-2")
-    assert batches[0].status == "failed"
-    assert sum(isinstance(event, TurnFailed) for event in events) == 1
-    assert not any(isinstance(event, TurnCompleted) for event in events)
-    messages = handle._driver.execution.state.messages
-    assert [message.role for message in messages] == ["user", "assistant", "tool"]
-    assert [part.tool_call_id for part in messages[-1].parts] == ["hook-1", "hook-2"]
-    assert all(part.is_error for part in messages[-1].parts)
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first_outcome", ["cancelled", "error", "completed"])

@@ -562,33 +562,6 @@ class Timeline:
         return result
 
 
-@dataclass(frozen=True)
-class RuntimeLogEntry:
-    session_id: str
-    sequence: int
-    event: str
-    payload: JsonPayload
-    created_at: str = field(default_factory=_now)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"session_id": self.session_id, "sequence": self.sequence, "event": self.event, "payload": _json_plain(self.payload), "created_at": self.created_at}
-
-
-@dataclass(frozen=True)
-class RuntimeLog:
-    session_id: str
-    entries: tuple[RuntimeLogEntry, ...] = ()
-
-    @property
-    def last_sequence(self) -> int:
-        return self.entries[-1].sequence if self.entries else 0
-
-    def append(self, entry: RuntimeLogEntry) -> "RuntimeLog":
-        if entry.session_id != self.session_id or entry.sequence != self.last_sequence + 1:
-            raise ValueError("RuntimeLog sequence is invalid")
-        return RuntimeLog(self.session_id, self.entries + (entry,))
-
-
 def transcript_entries_from_message(session_id: str, turn_id: str, sequence_start: int, message: Message) -> tuple[TranscriptEntry, ...]:
     entries: list[TranscriptEntry] = []
     sequence = sequence_start

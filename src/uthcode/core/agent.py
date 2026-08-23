@@ -40,15 +40,6 @@ from .agent_events import (
     UserSteeringApplied,
     UserSteeringRequested,
 )
-from .hooks import (
-    BeforeCompletionBlock,
-    BeforeCompletionContinue,
-    BeforeCompletionContext,
-    BeforeToolExecutionContext,
-    BeforeToolExecutionReject,
-    RuntimeHookSet,
-    compose_runtime_hooks,
-)
 from .provider import (
     CancellationToken,
     ContextOverflowError,
@@ -90,7 +81,7 @@ from .interaction import (
     UserInputRequest,
     UserInputResponse,
 )
-from .permission import Decision, PermissionAction, PermissionDecision
+from .permission import Decision, Effect, PermissionAction, PermissionDecision
 from .planning import (
     BehaviorMode,
     PlanState,
@@ -122,6 +113,12 @@ OverflowHandler = Callable[[], bool | Awaitable[bool]]
 _STEERING_FEEDBACK_TEXT = (
     "用户已更新当前任务要求；在继续执行前重新审查当前目标、已批准 Plan 与 "
     "TaskState，按需更新执行计划。"
+)
+
+_PLAN_READ_ONLY_ERROR = "Error: PLAN mode allows only trusted read actions"
+_UNFINISHED_TASKS_FEEDBACK = (
+    "Known execution tasks remain unfinished. Continue the work or replace "
+    "the complete task state before submitting a final answer."
 )
 
 
@@ -761,7 +758,6 @@ class AgentLoop:
         request_preparer: RequestPreparer,
         *,
         config: AgentLoopConfig | None = None,
-        runtime_hooks: RuntimeHookSet | None = None,
         tool_call_describer: ToolCallDescriber | None = None,
         permission_resolver: PermissionResolver | None = None,
         session_grant_sink: SessionGrantSink | None = None,
@@ -780,9 +776,6 @@ class AgentLoop:
             config = AgentLoopConfig()
         if not isinstance(config, AgentLoopConfig):
             raise TypeError("config must be AgentLoopConfig")
-        if not isinstance(runtime_hooks, RuntimeHookSet):
-            if runtime_hooks is not None:
-                raise TypeError("runtime_hooks must be RuntimeHookSet or None")
         if tool_call_describer is not None and not callable(tool_call_describer):
             raise TypeError("tool_call_describer must be callable or None")
         if permission_resolver is not None and not callable(permission_resolver):
@@ -798,7 +791,6 @@ class AgentLoop:
         self._tool_executor = tool_executor
         self._request_preparer = request_preparer
         self._config = config
-        self._runtime_hooks = compose_runtime_hooks(runtime_hooks)
         self._tool_call_describer = tool_call_describer
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
@@ -1320,37 +1312,28 @@ class AgentTurnExecution:
                 else:
                     kind = AssistantMessageKind.FINAL
 
-                if kind is AssistantMessageKind.FINAL:
-                    candidate_text = _message_text(provider_response.message)
-                    completion_result = self._loop._runtime_hooks.run_before_completion(
-                        BeforeCompletionContext(
-                            self._state.run_id,
-                            self._state.turn_id,
-                            self._state.behavior_mode,
-                            candidate_text,
-                            self._state.task_state,
-                            self._state.plan_state,
+                if (
+                    kind is AssistantMessageKind.FINAL
+                    and self._state.behavior_mode is BehaviorMode.DEFAULT
+                    and self._state.task_state.has_unfinished
+                ):
+                    self._set_state(
+                        runtime_feedback=RuntimeFeedback(
+                            RuntimeFeedbackKind.COMPLETION_BLOCKED,
+                            _UNFINISHED_TASKS_FEEDBACK,
                         )
                     )
-                    if isinstance(completion_result, BeforeCompletionBlock):
-                        if not self._state.task_state.has_unfinished:
-                            raise ValueError(
-                                "completion hook blocked without unfinished tasks"
-                            )
-                        self._set_state(runtime_feedback=completion_result.feedback)
-                        self._append(
-                            events,
-                            CompletionBlocked(
-                                self._state.run_id,
-                                self._state.turn_id,
-                                iteration,
-                                self._state.task_state.unfinished_count,
-                            ),
-                        )
-                        self._continuation = None
-                        continue
-                    if not isinstance(completion_result, BeforeCompletionContinue):
-                        raise TypeError("completion hook returned an invalid result")
+                    self._append(
+                        events,
+                        CompletionBlocked(
+                            self._state.run_id,
+                            self._state.turn_id,
+                            iteration,
+                            self._state.task_state.unfinished_count,
+                        ),
+                    )
+                    self._continuation = None
+                    continue
 
                 for delta_text in buffered_text_deltas:
                     self._append(
@@ -2039,68 +2022,6 @@ class AgentTurnExecution:
         )
         self._close_tool_batch(events, status="cancelled")
 
-    def _fail_remaining_tools_after_hook(
-        self,
-        events: list[AgentEvent],
-        *,
-        reason: str,
-    ) -> None:
-        """Close the current and untouched original calls after a Hook crash."""
-
-        continuation = self._continuation
-        if continuation is None or continuation.stage != "tool_batch":
-            raise RuntimeError("Hook failure has no active Tool batch")
-        results = list(continuation.completed_tool_results)
-        index = continuation.next_tool_index
-        batch_id = self._require_batch_id()
-        while index < len(continuation.tool_calls):
-            call = continuation.tool_calls[index]
-            known = (
-                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
-            ) or (
-                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
-            ) or (
-                call.name == PROPOSE_PLAN_TOOL_DEFINITION.name
-            ) or self._loop._tool_registry.get(call.name) is not None
-            command = self._safe_command(call, known=known)
-            if index != continuation.next_tool_index:
-                self._append(
-                    events,
-                    ToolStarted(
-                        self._state.run_id,
-                        self._state.turn_id,
-                        continuation.iteration,
-                        batch_id,
-                        call.tool_call_id,
-                        call.name,
-                        command,
-                    ),
-                )
-            result = _controlled_tool_result(call, reason)
-            results.append(result)
-            self._append(
-                events,
-                ToolFinished(
-                    self._state.run_id,
-                    self._state.turn_id,
-                    continuation.iteration,
-                    batch_id,
-                    call.tool_call_id,
-                    call.name,
-                    command,
-                    "failed",
-                    True,
-                ),
-            )
-            index += 1
-        self._continuation = replace(
-            continuation,
-            completed_tool_results=tuple(results),
-            next_tool_index=index,
-            pending_pause=None,
-        )
-        self._close_tool_batch(events, status="failed")
-
     async def _execute_prepared(
         self,
         prepared: PreparedToolCall,
@@ -2440,23 +2361,11 @@ class AgentTurnExecution:
                         controlled = True
                         status = "failed" if result.is_error else "finished"
                     else:
-                        try:
-                            hook_result = self._loop._runtime_hooks.run_before_tool_execution(
-                                BeforeToolExecutionContext(
-                                    self._state.run_id,
-                                    self._state.turn_id,
-                                    self._state.behavior_mode,
-                                    prepared_or_result,
-                                )
-                            )
-                        except Exception:
-                            self._fail_remaining_tools_after_hook(
-                                events,
-                                reason="Error: pre-tool hook failed",
-                            )
-                            return "internal_error"
-                        if isinstance(hook_result, BeforeToolExecutionReject):
-                            result = _controlled_tool_result(call, hook_result.error_text)
+                        if (
+                            self._state.behavior_mode is BehaviorMode.PLAN
+                            and prepared_or_result.action.effect is not Effect.READ
+                        ):
+                            result = _controlled_tool_result(call, _PLAN_READ_ONLY_ERROR)
                             controlled = True
                             status = "failed"
                         else:

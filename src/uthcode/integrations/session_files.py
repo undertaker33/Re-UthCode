@@ -1,4 +1,4 @@
-"""Durable Session v2 files with single-writer and crash-safe append rules."""
+"""Durable Session v3 files with single-writer and crash-safe append rules."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ from typing import Any
 from uthcode.core.history import (
     ActiveCheckpoint,
     EpochMacroSummary,
-    RuntimeLog,
-    RuntimeLogEntry,
     SemanticEntry,
     SemanticUnit,
     Timeline,
@@ -27,7 +25,7 @@ from uthcode.core.history import (
 )
 
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 SESSION_RECORD_SCHEMA_VERSION = 2
 
 
@@ -44,7 +42,7 @@ class SessionNotFoundError(SessionFileError):
 
 
 class SessionIncompatibleError(SessionFileError):
-    """The Session belongs to the pre-v2 layout and is not migrated."""
+    """The Session belongs to an unsupported layout and is not migrated."""
 
 
 class SessionCorruptError(SessionFileError):
@@ -141,8 +139,8 @@ class SessionMetadata:
         if not isinstance(value, Mapping):
             raise TypeError("Session metadata must be a mapping")
         version = value.get("schema_version")
-        if version == 1:
-            raise SessionIncompatibleError("Session v1 is incompatible with Session v2; migration is not supported")
+        if version in {1, 2}:
+            raise SessionIncompatibleError("Session v1/v2 is incompatible with Session v3; migration is not supported")
         required = {"schema_version", "session_id", "project_key", "created_at", "last_used_at", "instruction_state"}
         missing = required.difference(value)
         if missing:
@@ -168,7 +166,6 @@ class SessionSnapshot:
     metadata: SessionMetadata
     transcript: Transcript
     timeline: Timeline
-    runtime_log: RuntimeLog
     last_transcript_sequence: int
     last_timeline_sequence: int
     recovery_diagnostics: tuple[str, ...] = ()
@@ -194,7 +191,6 @@ class SessionSnapshot:
             "metadata": self.metadata.to_dict(),
             "transcript": [entry.to_dict() for entry in self.transcript.entries],
             "timeline": [record.to_dict() for record in self.timeline.records],
-            "runtime_log": [entry.to_dict() for entry in self.runtime_log.entries],
             "last_transcript_sequence": self.last_transcript_sequence,
             "last_timeline_sequence": self.last_timeline_sequence,
             "recovery_diagnostics": list(self.recovery_diagnostics),
@@ -245,10 +241,8 @@ class _LoadedSnapshot:
     snapshot: SessionSnapshot
     transcript_valid_end: int
     timeline_valid_end: int
-    runtime_valid_end: int
     transcript_record_sequence: int
     timeline_record_sequence: int
-    runtime_record_sequence: int
 
 
 class _ExclusiveFileLock:
@@ -307,7 +301,7 @@ class _ExclusiveFileLock:
 
 
 class SessionFileStore:
-    """Versioned Session v2 layout and durable append primitives."""
+    """Versioned Session v3 layout and durable append primitives."""
 
     def __init__(self, root: str | os.PathLike[str] | Path) -> None:
         self.root = Path(root).expanduser().resolve(strict=False)
@@ -331,7 +325,7 @@ class SessionFileStore:
             raise SessionFileError(f"Session already exists: {identifier}") from exc
         (path / "tool-results").mkdir()
         (path / "writer.lock").touch()
-        for filename in ("transcript.jsonl", "timeline.jsonl", "runtime.jsonl"):
+        for filename in ("transcript.jsonl", "timeline.jsonl"):
             (path / filename).touch()
         now = _now()
         metadata = SessionMetadata(identifier, _require_text(project_key, "project_key"), now, now, instruction_state or {})
@@ -380,33 +374,29 @@ class SessionFileStore:
         if expected_project_key is not None and metadata.project_key != expected_project_key:
             raise SessionNotFoundError("Session belongs to another project")
         if (path / "history.jsonl").exists():
-            raise SessionIncompatibleError("old Session v1 history layout is incompatible with Session v2")
-        required = (path / "transcript.jsonl", path / "timeline.jsonl", path / "runtime.jsonl")
+            raise SessionIncompatibleError("old Session v1 history layout is incompatible with Session v3")
+        required = (path / "transcript.jsonl", path / "timeline.jsonl")
         if not all(item.is_file() for item in required):
-            raise SessionCorruptError("Session v2 files are incomplete")
+            raise SessionCorruptError("Session v3 files are incomplete")
         transcript, transcript_end, transcript_sequence, transcript_diagnostics = _read_transcript(
             path / "transcript.jsonl", metadata.session_id, recover_incomplete_tail=recover_incomplete_tail
         )
         timeline, timeline_end, timeline_sequence, timeline_diagnostics = _read_timeline(
             path / "timeline.jsonl", metadata.session_id, transcript
         )
-        runtime, runtime_end, runtime_sequence, runtime_diagnostics = _read_runtime(path / "runtime.jsonl", metadata.session_id)
         return _LoadedSnapshot(
             snapshot=SessionSnapshot(
                 metadata=metadata,
                 transcript=transcript,
                 timeline=timeline,
-                runtime_log=runtime,
                 last_transcript_sequence=transcript_sequence,
                 last_timeline_sequence=timeline_sequence,
-                recovery_diagnostics=tuple(transcript_diagnostics + timeline_diagnostics + runtime_diagnostics),
+                recovery_diagnostics=tuple(transcript_diagnostics + timeline_diagnostics),
             ),
             transcript_valid_end=transcript_end,
             timeline_valid_end=timeline_end,
-            runtime_valid_end=runtime_end,
             transcript_record_sequence=transcript_sequence,
             timeline_record_sequence=timeline_sequence,
-            runtime_record_sequence=runtime_sequence,
         )
 
 
@@ -638,16 +628,6 @@ class SessionWriter:
             return "not_durable", loaded.snapshot
         return "unknown", loaded.snapshot
 
-    def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
-        self._require_writable()
-        if not isinstance(entry, RuntimeLogEntry) or entry.session_id != self.session_id:
-            raise TypeError("entry must be a Session-owned RuntimeLogEntry")
-        sequence = self._loaded.runtime_record_sequence + 1  # type: ignore[union-attr]
-        envelope = {"schema_version": SESSION_RECORD_SCHEMA_VERSION, "kind": "runtime", "sequence": sequence, "entry": entry.to_dict()}
-        _append_jsonl(self.store.session_path(self.session_id) / "runtime.jsonl", (envelope,))
-        self._reload(touch=True)
-        return self.snapshot
-
     def persist_tool_result(self, content: str, *, policy: object | None = None) -> object:
         self._require_writable()
         return self.store.persist_tool_result(self.session_id, content, policy=policy)
@@ -670,7 +650,6 @@ class SessionWriter:
         for filename, valid_end in (
             ("transcript.jsonl", self._loaded.transcript_valid_end),
             ("timeline.jsonl", self._loaded.timeline_valid_end),
-            ("runtime.jsonl", self._loaded.runtime_valid_end),
         ):
             target = path / filename
             size = target.stat().st_size if target.exists() else 0
@@ -772,9 +751,9 @@ def _validate_envelope(value: Mapping[str, object], *, path: Path) -> tuple[str,
     if value["schema_version"] != SESSION_RECORD_SCHEMA_VERSION:
         raise SessionCorruptError(f"unsupported Session record schema in {path}")
     kind = value["kind"]
-    if not isinstance(kind, str) or kind not in {"transcript", "timeline", "runtime"}:
+    if not isinstance(kind, str) or kind not in {"transcript", "timeline"}:
         raise SessionCorruptError(f"unknown Session record kind in {path}")
-    allowed = required | ({"entry"} if kind in {"transcript", "runtime"} else {"record"})
+    allowed = required | ({"entry"} if kind == "transcript" else {"record"})
     if set(value).difference(allowed):
         raise SessionCorruptError(f"Session record has unknown fields in {path}")
     sequence = value["sequence"]
@@ -939,32 +918,6 @@ def _read_timeline(path: Path, session_id: str, transcript: Transcript) -> tuple
         diagnostics = [*diagnostics, "ignored_uncommitted_timeline_tail"]
     record_sequence = sum(1 for line in lines if line.end <= valid_end)
     return timeline, valid_end, record_sequence, list(diagnostics)
-
-
-def _read_runtime(path: Path, session_id: str) -> tuple[RuntimeLog, int, int, list[str]]:
-    lines, valid_end, diagnostics = _read_jsonl_lines(path)
-    expected = 1
-    log = RuntimeLog(session_id)
-    for line in lines:
-        kind, sequence = _validate_envelope(line.value, path=path)
-        if kind != "runtime" or sequence != expected:
-            raise SessionCorruptError(f"runtime record sequence is not strict in {path}")
-        expected += 1
-        value = line.value.get("entry")
-        if not isinstance(value, Mapping):
-            raise SessionCorruptError(f"runtime record entry must be a mapping: {path}")
-        try:
-            entry = RuntimeLogEntry(
-                session_id=session_id,
-                sequence=int(value.get("sequence", sequence)),
-                event=str(value["event"]),
-                payload=value.get("payload", {}),
-                created_at=str(value.get("created_at") or _now()),
-            )
-            log = log.append(entry)
-        except (TypeError, ValueError, KeyError) as exc:
-            raise SessionCorruptError(f"invalid runtime record in {path}: {exc}") from exc
-    return log, valid_end, expected - 1, list(diagnostics)
 
 
 __all__ = [

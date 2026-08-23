@@ -186,6 +186,68 @@ def test_application_exposes_core_tool_values_without_integration_runtime_types(
     assert not hasattr(application, "RunState")
 
 
+def test_t09_2_public_exports_keep_used_facades_and_remove_converged_symbols() -> None:
+    import uthcode.application as application
+    import uthcode.application.commands as commands
+    import uthcode.core as core
+    from uthcode.application import (
+        AgentEvent,
+        ApplicationRuntimeContext,
+        CommandDispatcher,
+        CompletionCandidate,
+        EffectiveConfig,
+        PauseKind,
+        ProviderKind,
+        TurnResult,
+        UthCodeApplication,
+        UserInputResponse,
+        create_application,
+    )
+
+    assert all(
+        value is not None
+        for value in (
+            AgentEvent,
+            ApplicationRuntimeContext,
+            CommandDispatcher,
+            CompletionCandidate,
+            EffectiveConfig,
+            PauseKind,
+            ProviderKind,
+            TurnResult,
+            UthCodeApplication,
+            UserInputResponse,
+            create_application,
+        )
+    )
+
+    removed_core = {
+        "Before" + "CompletionHook",
+        "Before" + "ToolExecutionHook",
+        "Runtime" + "HookSet",
+        "Runtime" + "Log",
+        "Runtime" + "LogEntry",
+        "Token" + "Estimator",
+        "Supports" + "InputTokenCount",
+        "Supports" + "ModelLimits",
+        "Tool" + "Preflight",
+    }
+    removed_command_availability = "Command" + "Availability"
+    removed_application = {
+        "Application" + "History",
+        removed_command_availability,
+        "Generation" + "Handle",
+        "transcript" + "_entries_for_message",
+    }
+
+    assert removed_core.isdisjoint(core.__all__)
+    assert removed_application.isdisjoint(application.__all__)
+    assert {removed_command_availability}.isdisjoint(commands.__all__)
+    assert all(not hasattr(core, name) for name in removed_core)
+    assert all(not hasattr(application, name) for name in removed_application)
+    assert not hasattr(commands, removed_command_availability)
+
+
 def test_t08_public_exports_expose_mode_and_control_projection_only() -> None:
     import uthcode.application as application
     import uthcode.core as core
@@ -194,7 +256,6 @@ def test_t08_public_exports_expose_mode_and_control_projection_only() -> None:
     from uthcode.core import (
         CompletionBlocked,
         PlanProposed,
-        RuntimeHookSet,
         TaskState,
         TaskStateChanged,
         UserSteeringApplied,
@@ -207,17 +268,15 @@ def test_t08_public_exports_expose_mode_and_control_projection_only() -> None:
             BehaviorModeSelected,
             CompletionBlocked,
             PlanProposed,
-            RuntimeHookSet,
             TaskState,
             TaskStateChanged,
             UserSteeringApplied,
             create_application,
         )
     )
-    assert "RuntimeHookSet" not in application.__all__
     assert "ToolRegistry" not in application.__all__
     assert "AgentLoop" not in application.__all__
-    assert "RuntimeHookSet" in core.__all__
+    assert "ToolRegistry" in core.__all__
 
 
 def _restart_process_environment(home: Path) -> dict[str, str]:

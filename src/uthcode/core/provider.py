@@ -632,28 +632,6 @@ class ContextCountEstimate(_JsonModel):
         return self.input_tokens + self.safety_allowance
 
 
-@runtime_checkable
-class SupportsModelLimits(Protocol):
-    """Optional Provider capability for reliable runtime model limits."""
-
-    def resolve_model_limits(
-        self,
-        model: str,
-    ) -> ModelLimits | None | Awaitable[ModelLimits | None]:
-        ...
-
-
-@runtime_checkable
-class SupportsInputTokenCount(Protocol):
-    """Optional Provider capability for final-request input estimates."""
-
-    def count_input_tokens(
-        self,
-        request: GenerationRequest,
-    ) -> ContextCountEstimate | int | None | Awaitable[ContextCountEstimate | int | None]:
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class Usage(_JsonModel):
     input_tokens: int = 0
@@ -1112,8 +1090,6 @@ __all__ = [
     "ProviderIdentity",
     "ProviderPort",
     "ProviderResponse",
-    "SupportsInputTokenCount",
-    "SupportsModelLimits",
     "provider_event_from_dict",
     "provider_event_from_json",
     "RateLimitError",

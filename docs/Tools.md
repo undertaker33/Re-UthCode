@@ -41,7 +41,7 @@ UthCode 当前共实现 **11 个 Tool 名称**：6 个默认执行工具、2 个
 | 默认执行模式 | 6 个默认执行工具、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`TodoWrite` | 10 |
 | Plan Mode | `ReadFile`、`Glob`、`Grep`、`Bash`、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`ProposePlan` | 8 |
 
-Plan Mode 中的 `Bash` 仅允许通过只读检查的命令；写入类操作会在执行前被 Runtime Hook 阻止。
+Plan Mode 中的 `Bash` 仅允许通过只读检查的命令；写入类操作会在 trusted preflight 后、Permission 前由 Agent Loop 的固定检查受控拒绝。
 
 `HistoryRead` 只接受当前 Session 的精确 opaque Transcript ref 和有界分页参数；它不搜索、不跨 Session，也不把原始历史递归外置。它与 `ToolResultRead` 使用独立的 ref namespace、权限资源和错误边界。
 

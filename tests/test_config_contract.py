@@ -287,7 +287,7 @@ def _completed() -> GenerationCompleted:
 
 
 @pytest.mark.asyncio
-async def test_direct_and_agent_run_use_remote_id_and_reasoning_snapshot() -> None:
+async def test_agent_run_uses_remote_id_and_reasoning_snapshot() -> None:
     config = EffectiveConfig(
         default_model="logic/one",
         providers={
@@ -311,12 +311,6 @@ async def test_direct_and_agent_run_use_remote_id_and_reasoning_snapshot() -> No
         return provider
 
     application = create_application(config, provider_builder=builder)
-    request = GenerationRequest(messages=(Message("user", (TextPart("hello"),)),))
-    await _collect_direct(application, request)
-    assert providers["logic/one"].recorded_requests[0].model == "remote-one"
-    assert providers["logic/one"].recorded_requests[0].reasoning is not None
-    assert providers["logic/one"].recorded_requests[0].reasoning.effort == "high"
-
     run = application.create_run()
     active = run.start_turn("snapshot")
     application.select_model("logic/two")
@@ -329,11 +323,6 @@ async def test_direct_and_agent_run_use_remote_id_and_reasoning_snapshot() -> No
     request_two = providers["logic/two"].recorded_requests[-1]
     assert request_two.model == "remote-two"
     assert request_two.reasoning is not None and request_two.reasoning.effort == "low"
-
-
-async def _collect_direct(application: object, request: GenerationRequest) -> None:
-    async for _event in application.stream_generation(request):  # type: ignore[attr-defined]
-        pass
 
 
 def test_secret_value_never_serializes_or_leaks_through_tool_summary(tmp_path: Path) -> None:

@@ -114,13 +114,8 @@ async def test_application_diagnostics_are_json_safe_and_do_not_copy_payloads() 
         )
     )
 
-    events = [
-        event
-        async for event in application.stream_generation(
-            GenerationRequest(messages=(Message("user", (TextPart("hello"),)),))
-        )
-    ]
-    assert isinstance(events[-1], GenerationCompleted)
+    result = await application.create_run().start_turn("hello").result()
+    assert result.final_text == "done"
 
     diagnostics = application.diagnostics()
     json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)

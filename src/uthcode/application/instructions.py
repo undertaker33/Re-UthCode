@@ -187,16 +187,6 @@ class InstructionBlock:
             InstructionScope.DIRECTORY: ContextAuthority.DIRECTORY_INSTRUCTION,
         }[InstructionScope(self.scope)]
 
-    def to_context_block(self) -> ContextBlock:
-        return ContextBlock(
-            source_kind=self.source_kind,
-            authority=self.authority,
-            stability=ContextStability.STABLE,
-            scope=self.scope,
-            provenance=str(self.source_path),
-            content=self.content,
-        )
-
     def to_dict(self) -> dict[str, object]:
         return {
             "source_path": str(self.source_path),
@@ -620,7 +610,17 @@ class InstructionLoader:
             )
 
         segments = tuple(graph.loaded.values())
-        blocks = tuple(segment.to_context_block() for segment in segments)
+        blocks = tuple(
+            ContextBlock(
+                source_kind=segment.source_kind,
+                authority=segment.authority,
+                stability=ContextStability.STABLE,
+                scope=segment.scope,
+                provenance=str(segment.source_path),
+                content=segment.content,
+            )
+            for segment in segments
+        )
         prefix = build_instruction_prefix(
             (public_prompt_source(), core_runtime_contract_source(), *blocks),
             instruction_epoch=max(1, self._instruction_epoch),

@@ -37,14 +37,12 @@ from uthcode.core.prompt import (
     ContextScope,
     ContextSourceKind,
     ContextStability,
-    CoreRuntimeContractSource,
-    EnvironmentSource,
     ProjectInstructionSource,
-    PromptAssetSource,
     RuntimePromptContext,
-    RuntimeStateSource,
     ToolDefinitionSource,
     build_runtime_prompt_section,
+    core_runtime_contract_source,
+    public_prompt_source,
 )
 from uthcode.core.provider import (
     CancellationToken,
@@ -60,7 +58,7 @@ from uthcode.core.provider import (
 )
 
 from .instructions import InstructionLoader
-from .history import transcript_entries_for_message
+from .history import _transcript_entries_for_message
 
 
 class ApplicationContextService:
@@ -99,13 +97,13 @@ class ApplicationContextService:
         instruction_loader: InstructionLoader | ProjectInstructionSource | None = None,
         transcript: Transcript | None = None,
         timeline: Timeline | None = None,
-        current_turn: Sequence[object] = (),
+        current_turn: Sequence[ContextBlock | Message | str] = (),
         current_user: str | Message | None = None,
-        current_turn_deltas: Sequence[object] = (),
+        current_turn_deltas: Sequence[ContextBlock | Message | str] = (),
         runtime_context: RuntimePromptContext | None = None,
-        protected_context: Sequence[object] = (),
-        protocol_blocks: Sequence[object] = (),
-        environment_sources: Sequence[object] = (),
+        protected_context: Sequence[ContextBlock] = (),
+        protocol_blocks: Sequence[ContextBlock] = (),
+        environment_sources: Sequence[ContextBlock] = (),
         tool_definitions: Sequence[ToolDefinition] = (),
         previous_snapshot: ContextSnapshot | None = None,
         context_budget: ContextBudget | None = None,
@@ -138,19 +136,17 @@ class ApplicationContextService:
                 change_reason=instruction_loader.change_reason,
             )
 
-        runtime_sources: list[object] = []
+        runtime_sources: list[ContextBlock] = []
         if runtime_context is not None:
             section = build_runtime_prompt_section(runtime_context)
             runtime_sources.append(
-                RuntimeStateSource(
-                    ContextBlock(
-                        source_kind=ContextSourceKind.RUNTIME_FACT,
-                        authority=ContextAuthority.RUNTIME,
-                        stability=ContextStability.DYNAMIC,
-                        scope=ContextScope.TURN,
-                        provenance="application:runtime-state",
-                        content=section.content,
-                    )
+                ContextBlock(
+                    source_kind=ContextSourceKind.RUNTIME_FACT,
+                    authority=ContextAuthority.RUNTIME,
+                    stability=ContextStability.DYNAMIC,
+                    scope=ContextScope.TURN,
+                    provenance="application:runtime-state",
+                    content=section.content,
                 )
             )
 
@@ -159,7 +155,7 @@ class ApplicationContextService:
         if current_user is not None:
             normalized_current_turn = (*normalized_current_turn, current_user)
         bundle = ContextSourceBundle(
-            instruction_sources=(PromptAssetSource(), CoreRuntimeContractSource()),
+            instruction_sources=(public_prompt_source(), core_runtime_contract_source()),
             project_instruction_source=project_source,
             transcript=transcript,
             timeline=timeline,
@@ -291,63 +287,6 @@ class ApplicationContextService:
     def compactor(self) -> ContextCompactor:
         return self._compactor
 
-    def compact(
-        self,
-        transcript: Transcript,
-        *,
-        timeline: Timeline | None = None,
-        session_id: str | None = None,
-        summarize=None,
-        cancellation: CancellationToken | None = None,
-        active_turn_id: str | None = None,
-    ) -> CompactionResult:
-        """Return a safe Timeline candidate without mutating Transcript."""
-
-        transcript = self.stable_transcript_for_compaction(
-            transcript,
-            active_turn_id=active_turn_id,
-        )
-        self._compact_count += 1
-        attempt = self._compact_count
-        try:
-            result = self._compactor.compact(
-                transcript,
-                timeline=timeline,
-                session_id=session_id,
-                summarize=summarize,
-                cancellation=cancellation,
-            )
-            non_reducing = self._non_reducing_result(result, timeline)
-            if non_reducing is not None:
-                result = non_reducing
-        except Exception:
-            self._record_compaction(
-                {
-                    "attempt": attempt,
-                    "status": "failed",
-                    "changed": False,
-                    "failure": "compaction_error",
-                    "batch_count": 0,
-                }
-            )
-            raise
-        self._record_compaction(
-            {
-                "attempt": attempt,
-                "status": (
-                    "failed"
-                    if result.failure is not None
-                    else ("completed" if result.changed else "no_change")
-                ),
-                "changed": result.changed,
-                "failure": result.failure,
-                "input_tokens": result.input_tokens,
-                "output_tokens": result.output_tokens,
-                "batch_count": len(result.batches),
-            }
-        )
-        return result
-
     async def compact_async(
         self,
         transcript: Transcript,
@@ -375,7 +314,7 @@ class ApplicationContextService:
         Each successful epoch is committed before the next epoch is derived.
         ``should_continue`` is called with the freshly committed Timeline so
         the caller can rebuild the ordinary request and re-run Auto/Hard Gate.
-        No loop cursor is written to Session or RuntimeLog.
+        No loop cursor is written to durable Session state.
         """
 
         if not isinstance(transcript, Transcript):
@@ -976,7 +915,7 @@ class ApplicationContextService:
         runtime_context: RuntimePromptContext | None = None,
         timeline: Timeline | None = None,
         tool_definitions: Sequence[ToolDefinition] = (),
-        environment_sources: Sequence[object] = (),
+        environment_sources: Sequence[ContextBlock] = (),
         model: str | None = None,
         reasoning: ReasoningOptions | None = None,
         max_output_tokens: int | None = None,
@@ -1330,7 +1269,7 @@ def _transcript_for_messages(session_id: str, messages: Sequence[Message]) -> Tr
     sequence = 1
     for index, message in enumerate(messages):
         turn_id = f"runtime-{index + 1}"
-        entries = transcript_entries_for_message(session_id, turn_id, sequence, message)
+        entries = _transcript_entries_for_message(session_id, turn_id, sequence, message)
         for entry in entries:
             # These entries are a deterministic, process-local projection of
             # the messages supplied to request preparation.  Wall-clock
