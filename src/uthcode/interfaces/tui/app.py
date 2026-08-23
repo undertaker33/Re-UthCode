@@ -692,7 +692,7 @@ class UthCodeTUI:
             self.activity = "steering…"
             self._invalidate()
             return
-        self._start_generation(text)
+        self._start_turn(text)
 
     async def _apply_command_outcome(
         self,
@@ -757,15 +757,9 @@ class UthCodeTUI:
                 if action.restored
                 else f"new session: {action.session_id}"
             )
-        prompt = outcome.prompt
-        if prompt:
-            if self._active_handle is None:
-                self._start_generation(prompt)
-            else:
-                await self._show_error("生成进行中，请等待当前请求结束")
         self._invalidate()
 
-    def _start_generation(self, prompt: str) -> None:
+    def _start_turn(self, prompt: str) -> None:
         self._reset_stream_projection()
         self.interaction.close()
         handle = self._run.start_turn(prompt)

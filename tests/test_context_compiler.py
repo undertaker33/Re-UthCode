@@ -6,7 +6,12 @@ import pytest
 
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
-from uthcode.core.context import ContextCompiler, ContextSourceBundle, messages_from_context_snapshot
+from uthcode.core.context import (
+    ContextCompilationError,
+    ContextCompiler,
+    ContextSourceBundle,
+    messages_from_context_snapshot,
+)
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind
 from uthcode.core.prompt import ContextAuthority, ContextBlock, ContextScope, ContextSourceKind, ContextStability, ProjectInstructionSource, RuntimePromptContext, ToolDefinitionSource
 from uthcode.core.provider import Message, TextPart, ToolDefinition
@@ -28,6 +33,28 @@ def _transcript() -> Transcript:
     return Transcript("session-1", values)
 
 
+def _runtime_block(content: str) -> ContextBlock:
+    return ContextBlock(
+        ContextSourceKind.RUNTIME_FACT,
+        ContextAuthority.RUNTIME,
+        ContextStability.DYNAMIC,
+        ContextScope.TURN,
+        "test:runtime",
+        content,
+    )
+
+
+def _history_block(content: str) -> ContextBlock:
+    return ContextBlock(
+        ContextSourceKind.USER_MESSAGE,
+        ContextAuthority.HISTORY,
+        ContextStability.DYNAMIC,
+        ContextScope.TURN,
+        "test:history",
+        content,
+    )
+
+
 def test_compiler_is_deterministic_and_keeps_tool_semantic_group_atomic() -> None:
     compiler = ContextCompiler(budget_tokens=258_000, token_estimator=lambda text: 180_000 if '"sequence":' in text else max(1, len(text) // 4))
     tool_source = ToolDefinitionSource((ToolDefinition("ReadFile", "read", {"type": "object"}),))
@@ -44,7 +71,14 @@ def test_runtime_and_timeline_changes_do_not_change_stable_prefix() -> None:
     compiler = ContextCompiler()
     project = _project_source("project rule")
     first = compiler.compile(ContextSourceBundle(project_instruction_source=project, current_turn=("hello",)))
-    second = compiler.compile(ContextSourceBundle(project_instruction_source=project, current_turn=("hello",), runtime_sources=("runtime fact",)), previous_snapshot=first)
+    second = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=project,
+            current_turn=("hello",),
+            runtime_sources=(_runtime_block("runtime fact"),),
+        ),
+        previous_snapshot=first,
+    )
     changed = compiler.compile(ContextSourceBundle(project_instruction_source=_project_source("changed", 2)), previous_snapshot=second)
     assert second.stable_prefix_fingerprint == first.stable_prefix_fingerprint
     assert second.prefix_changed is False
@@ -64,14 +98,30 @@ def test_timeline_summary_is_conversation_data_and_raw_tail_remains_visible() ->
 
 
 def test_current_user_is_protected_and_remains_at_conversation_tail_over_budget() -> None:
-    snapshot = ContextCompiler(budget_tokens=2, token_estimator=lambda text: 300_000 if text == "current user" else 1).compile(transcript=_transcript(), current_turn=("other current turn",), current_user="current user")
+    snapshot = ContextCompiler(
+        budget_tokens=2,
+        token_estimator=lambda text: 300_000 if text == "current user" else 1,
+    ).compile(
+        ContextSourceBundle(
+            transcript=_transcript(),
+            current_turn=("other current turn", "current user"),
+        )
+    )
     assert snapshot.over_budget is True
     assert snapshot.selected_blocks[-1].content == "current user"
 
 
-def test_individual_bundle_inputs_are_mutually_exclusive() -> None:
-    with pytest.raises(TypeError, match="ContextSourceBundle or individual"):
-        ContextCompiler().compile(ContextSourceBundle(), transcript=_transcript())
+def test_compiler_accepts_only_bundle_and_rejects_invalid_source_boundaries() -> None:
+    compiler = ContextCompiler()
+
+    with pytest.raises(TypeError, match="sources must be ContextSourceBundle"):
+        compiler.compile(object())
+    with pytest.raises(TypeError):
+        compiler.compile()  # type: ignore[call-arg]
+    with pytest.raises(ContextCompilationError, match="Instruction Plane"):
+        ContextSourceBundle(instruction_sources=(_history_block("not instruction"),))
+    with pytest.raises(TypeError, match="runtime_sources must contain ContextBlock"):
+        ContextSourceBundle(runtime_sources=("not a block",))
 
 
 def test_application_context_service_keeps_current_user_at_tail() -> None:

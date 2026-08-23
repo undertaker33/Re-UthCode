@@ -832,7 +832,7 @@ async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access()
     output = RecordingOutput()
     tui = UthCodeTUI(_application(), terminal_output=output)
     tui.application._permission_writer = lambda _mode: None
-    outcome = tui.dispatcher.dispatch_text("/permission")
+    outcome = await tui.dispatcher.dispatch_text_async("/permission")
     assert outcome is not None
     await tui._apply_command_outcome("/permission", outcome)
     assert tui.permission_picker.open is True
@@ -844,7 +844,7 @@ async def test_tui_permission_picker_uses_run_session_and_warns_on_full_access()
     assert tui._run.permission_mode is PermissionMode.AUTO
     assert tui.application.create_run().permission_mode is PermissionMode.AUTO
 
-    outcome = tui.dispatcher.dispatch_text("/permission")
+    outcome = await tui.dispatcher.dispatch_text_async("/permission")
     assert outcome is not None
     await tui._apply_command_outcome("/permission", outcome)
     tui.permission_picker.move(1)
@@ -880,7 +880,7 @@ async def test_behavior_mode_action_updates_idle_run_separator_and_status_dimens
     run = _FakeModeRun()
     tui._run = run  # type: ignore[assignment]
 
-    plan = tui.dispatcher.dispatch_text("/plan")
+    plan = await tui.dispatcher.dispatch_text_async("/plan")
     assert plan is not None and plan.ui_action == BehaviorModeSelected(BehaviorMode.PLAN)
     await tui._apply_command_outcome("/plan", plan)
 
@@ -890,7 +890,7 @@ async def test_behavior_mode_action_updates_idle_run_separator_and_status_dimens
     assert "mode: plan" in status
     assert "permission: default" in status
 
-    execute = tui.dispatcher.dispatch_text("/do")
+    execute = await tui.dispatcher.dispatch_text_async("/do")
     assert execute is not None
     await tui._apply_command_outcome("/do", execute)
     assert run.selected == [BehaviorMode.PLAN, BehaviorMode.DEFAULT]
@@ -905,7 +905,7 @@ async def test_behavior_mode_action_does_not_switch_an_active_turn() -> None:
     tui._run = run  # type: ignore[assignment]
     tui._active_handle = _FakeSteeringHandle()  # type: ignore[assignment]
 
-    plan = tui.dispatcher.dispatch_text("/plan")
+    plan = await tui.dispatcher.dispatch_text_async("/plan")
     assert plan is not None
     await tui._apply_command_outcome("/plan", plan)
 
@@ -976,10 +976,10 @@ async def test_closed_pending_typed_pause_reopens_before_any_slash_dispatch(
 
     dispatch_calls: list[object] = []
 
-    def record_dispatch(invocation: object) -> None:
+    async def record_dispatch(invocation: object) -> None:
         dispatch_calls.append(invocation)
 
-    monkeypatch.setattr(tui.dispatcher, "dispatch", record_dispatch)
+    monkeypatch.setattr(tui.dispatcher, "dispatch_async", record_dispatch)
 
     await tui._handle_submission(slash)
 
@@ -1663,7 +1663,7 @@ async def test_tui_renderer_failure_closes_application_turn_before_dropping_hand
 
     monkeypatch.setattr(AgentEventRenderer, "push", fail_projection)
     tui = UthCodeTUI(application, terminal_output=RecordingOutput())
-    tui._start_generation("hello")
+    tui._start_turn("hello")
     handle = tui._active_handle
     task = tui._generation_task
     assert handle is not None
@@ -1702,7 +1702,7 @@ async def test_tui_periodic_flush_failure_closes_stalled_application_turn(
 
     monkeypatch.setattr(AgentEventRenderer, "flush", fail_flush)
     tui = UthCodeTUI(application, terminal_output=RecordingOutput())
-    tui._start_generation("hello")
+    tui._start_turn("hello")
     handle = tui._active_handle
     task = tui._generation_task
     assert handle is not None
@@ -1747,7 +1747,7 @@ async def test_tui_secondary_error_display_failure_still_closes_application_turn
     monkeypatch.setattr(AgentEventRenderer, "push", fail_projection)
     tui = UthCodeTUI(application, terminal_output=RecordingOutput())
     monkeypatch.setattr(tui, "_show_error", fail_error_display)
-    tui._start_generation("hello")
+    tui._start_turn("hello")
     handle = tui._active_handle
     task = tui._generation_task
     assert handle is not None
@@ -1801,7 +1801,7 @@ async def test_tui_ask_user_projection_failure_clears_pending_waiter_and_turn(
 
     monkeypatch.setattr(TuiInteractionState, "open_pause", fail_open_pause)
     tui = UthCodeTUI(application, terminal_output=RecordingOutput())
-    tui._start_generation("hello")
+    tui._start_turn("hello")
     handle = tui._active_handle
     task = tui._generation_task
     assert handle is not None
@@ -2378,7 +2378,7 @@ async def test_stalled_stream_delta_reaches_temporary_preview(
 
     monkeypatch.setattr(AgentEventRenderer, "flush", flush_with_partial)
     tui = UthCodeTUI(application, terminal_output=RecordingOutput())
-    tui._start_generation("hello")
+    tui._start_turn("hello")
     task = tui._generation_task
     assert task is not None
 
@@ -2428,7 +2428,7 @@ async def test_each_turn_discards_previous_transient_stream_projection() -> None
         open=True,
     )
 
-    tui._start_generation("new turn")
+    tui._start_turn("new turn")
     assert "old-turn" not in tui._streams
     assert tui._generation_task is not None
     await tui._generation_task

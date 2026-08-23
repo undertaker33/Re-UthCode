@@ -15,9 +15,8 @@ from .bootstrap import (
     create_application,
     load_effective_config,
 )
-from .generation import ApplicationStatus, GenerationHandle, UthCodeApplication
+from .generation import ApplicationStatus, UthCodeApplication
 from .context import ApplicationContextService
-from .history import ApplicationHistory, transcript_entries_for_message
 from .instructions import (
     InstructionAuthorization,
     InstructionBlock,
@@ -110,7 +109,6 @@ from .commands import (
     BehaviorModeSelected,
     CandidateProvider,
     ClearTranscript,
-    CommandAvailability,
     CommandContext,
     CommandDefinition,
     CommandDispatcher,
@@ -146,7 +144,6 @@ __all__ = [
     "EffectiveConfig",
     "ApplicationStatus",
     "ApplicationRuntimeContext",
-    "ApplicationHistory",
     "ApplicationContextService",
     "ApplicationSession",
     "ApplicationSessionService",
@@ -162,7 +159,6 @@ __all__ = [
     "BehaviorModeSelected",
     "CandidateProvider",
     "ClearTranscript",
-    "CommandAvailability",
     "CommandContext",
     "CommandDefinition",
     "CommandDispatcher",
@@ -184,7 +180,6 @@ __all__ = [
     "ContextOverflowError",
     "ContextUsage",
     "CompletionBlocked",
-    "GenerationHandle",
     "GenerationCancelled",
     "GenerationCompleted",
     "GenerationRequest",
@@ -201,7 +196,6 @@ __all__ = [
     "InstructionScope",
     "InstructionSourceNotFoundError",
     "InstructionStateMetadata",
-    "transcript_entries_for_message",
     "InvocationStatus",
     "LaunchOptions",
     "ModelProfile",

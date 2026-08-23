@@ -183,14 +183,6 @@ class ToolPlanningMetadata(Protocol):
         ...
 
 
-@runtime_checkable
-class ToolPreflight(Protocol):
-    """The no-side-effect preparation implemented by trusted tools."""
-
-    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class ToolPreparation:
     """Trusted Action plus the exact immutable payload reserved for execute."""
@@ -515,7 +507,6 @@ __all__ = [
     "ToolExecutor",
     "ToolPlanningAccess",
     "ToolPlanningMetadata",
-    "ToolPreflight",
     "ToolPreparation",
     "ToolResultMaterialization",
     "ToolResultMaterializer",

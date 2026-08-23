@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from uthcode.core.history import ActiveCheckpoint, SemanticEntry, TranscriptEntry, TranscriptKind, RuntimeLogEntry, TranscriptRef
+from uthcode.core.history import ActiveCheckpoint, SemanticEntry, TranscriptEntry, TranscriptKind, TranscriptRef
 from uthcode.integrations import session_files
 from uthcode.integrations.session_files import (
     SessionBusyError,
@@ -27,11 +27,12 @@ def _entries(session_id: str = "session-1") -> tuple[TranscriptEntry, ...]:
     )
 
 
-def test_session_v2_layout_and_transcript_timeline_runtime_are_separate(tmp_path: Path) -> None:
+def test_session_v3_layout_preserves_transcript_and_timeline(tmp_path: Path) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     store.create_session("session-1", project_key="project")
     path = store.session_path("session-1")
-    assert {item.name for item in path.iterdir()} >= {"metadata.json", "transcript.jsonl", "timeline.jsonl", "runtime.jsonl", "writer.lock", "tool-results"}
+    assert {item.name for item in path.iterdir()} == {"metadata.json", "transcript.jsonl", "timeline.jsonl", "writer.lock", "tool-results"}
+    assert json.loads((path / "metadata.json").read_text(encoding="utf-8"))["schema_version"] == 3
     assert not (path / "history.jsonl").exists()
     entries = _entries()
     with store.open_writer("session-1", expected_project_key="project") as writer:
@@ -40,12 +41,10 @@ def test_session_v2_layout_and_transcript_timeline_runtime_are_separate(tmp_path
         fine = SemanticEntry("turn-2", "tool work complete", (writer.snapshot.transcript.reference(2, 3),), session_id="session-1")
         timeline_outcome = writer.append_timeline_transaction((fine,), ActiveCheckpoint("turn-2", ("turn-2",), session_id="session-1"))
         assert timeline_outcome.timeline_appended is True
-        writer.append_runtime(RuntimeLogEntry("session-1", 1, "turn_completed", {"ok": True}))
     recovered = store.read_session("session-1", expected_project_key="project")
     assert recovered.transcript.entries == entries
     assert recovered.timeline.fine_entries[0].summary == "tool work complete"
     assert recovered.timeline.active_checkpoint is not None
-    assert recovered.runtime_log.entries[0].event == "turn_completed"
 
 
 def test_timeline_trailing_derived_record_is_not_logically_committed(tmp_path: Path) -> None:
@@ -85,13 +84,18 @@ def test_timeline_trailing_derived_record_is_not_logically_committed(tmp_path: P
     assert reopened.timeline.trailing_records == (trailing,)
 
 
-def test_old_v1_session_is_explicitly_incompatible(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", (1, 2))
+def test_pre_v3_session_is_explicitly_incompatible_without_migration(tmp_path: Path, version: int) -> None:
     store = SessionFileStore(tmp_path / "sessions")
     store.create_session("old", project_key="project")
     metadata_path = store.session_path("old") / "metadata.json"
-    metadata_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = version
+    fixture = json.dumps(metadata, sort_keys=True)
+    metadata_path.write_text(fixture, encoding="utf-8")
     with pytest.raises(SessionIncompatibleError, match="incompatible"):
         store.read_session("old")
+    assert metadata_path.read_text(encoding="utf-8") == fixture
 
 
 def test_unknown_durability_quarantines_writer_until_reopen(tmp_path: Path) -> None:

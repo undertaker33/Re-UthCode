@@ -36,7 +36,7 @@ class CompletionEngine:
         command_prefix = text[1:]
         if any(character.isspace() for character in command_prefix):
             return ()
-        query = command_prefix.lower()
+        name_prefix = command_prefix.lower()
 
         definitions = self._registry.list_commands(include_hidden=False)
         help_definition = next(
@@ -51,15 +51,15 @@ class CompletionEngine:
         for definition in definitions:
             if help_definition is not None and definition is help_definition:
                 continue
-            matched_alias = self._matching_alias(definition, query)
-            if query and not (
-                definition.canonical.startswith(query) or matched_alias is not None
+            matched_alias = self._matching_alias(definition, name_prefix)
+            if name_prefix and not (
+                definition.canonical.startswith(name_prefix) or matched_alias is not None
             ):
                 continue
             matches.append(self._candidate(definition, matched_alias))
 
         if help_definition is not None:
-            matches.append(self._candidate(help_definition, self._matching_alias(help_definition, query)))
+            matches.append(self._candidate(help_definition, self._matching_alias(help_definition, name_prefix)))
         return tuple(matches)
 
     def argument_candidates(
@@ -122,12 +122,12 @@ class CompletionEngine:
     @staticmethod
     def _matching_alias(
         definition: CommandDefinition,
-        query: str,
+        name_prefix: str,
     ) -> str | None:
-        if not query:
+        if not name_prefix:
             return None
         for alias in definition.aliases:
-            if alias.startswith(query):
+            if alias.startswith(name_prefix):
                 return alias
         return None
 
@@ -136,16 +136,12 @@ class CompletionEngine:
         definition: CommandDefinition,
         matched_alias: str | None,
     ) -> CompletionCandidate:
-        marker = "（未实现）" if not definition.implemented else ""
         display = f"/{definition.canonical} — {definition.description}"
-        if marker:
-            display = f"{display} {marker}"
         return CompletionCandidate(
             canonical=definition.canonical,
             display=display,
             description=definition.description,
             aliases=definition.aliases,
-            availability=definition.availability,
             usage=definition.usage_text,
             argument_prompt=definition.argument_prompt,
             matched_alias=matched_alias,

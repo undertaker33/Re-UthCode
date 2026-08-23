@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from uthcode.application.history import ApplicationHistory, transcript_entries_for_message
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.core.history import (
     Transcript,
     TranscriptBoundaryError,
@@ -73,15 +73,7 @@ def test_application_message_conversion_preserves_complete_message_identity() ->
             ToolResultPart("call-1", "done"),
         ),
     )
-    entries = transcript_entries_for_message("session-1", "turn-1", 1, message)
+    entries = _transcript_entries_for_message("session-1", "turn-1", 1, message)
     assert len(entries) == 2
     assert {entry.semantic_unit_id for entry in entries} == {"turn-1"}
     assert all(entry.payload["message"] == message.to_dict() for entry in entries)
-    state = ApplicationHistory("session-1").append_message(turn_id="turn-1", message=message)
-    assert [
-        (entry.sequence, entry.kind, entry.payload, entry.semantic_unit_id, entry.commit_boundary)
-        for entry in state.transcript.entries
-    ] == [
-        (entry.sequence, entry.kind, entry.payload, entry.semantic_unit_id, entry.commit_boundary)
-        for entry in entries
-    ]

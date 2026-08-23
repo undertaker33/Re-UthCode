@@ -29,7 +29,7 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 
 常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q`、`/exit`。
 
-界面可能展示尚未实现的规划命令（例如 `/config`、`/login`、`/memory`、`/dream`、`/review`）；调用时会明确提示未实现，不会静默执行。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
+上表就是当前 Registry 的全部命令；未列出的 Slash 名称返回“未知命令”。`/compact` 不接受额外参数（例如 `/compact -- focus` 是用法错误）。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
 
 ## `exec` 退出码
 

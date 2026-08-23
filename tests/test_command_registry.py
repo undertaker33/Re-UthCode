@@ -3,12 +3,15 @@ from __future__ import annotations
 import pytest
 
 from uthcode.application.commands import (
-    CommandAvailability,
     CommandDefinition,
     CommandKind,
     CommandRegistry,
     create_builtin_registry,
 )
+
+
+def _handler(_context: object) -> str:
+    return "ok"
 
 
 def _command(
@@ -22,6 +25,7 @@ def _command(
         aliases=aliases,
         description=name,
         kind=CommandKind.LOCAL,
+        handler=_handler,
         hidden=hidden,
     )
 
@@ -104,16 +108,21 @@ def test_invalid_aliases_are_rejected_without_partial_registration(alias: str) -
     assert registry.list_commands() == ()
 
 
-def test_definition_exposes_implementation_status_and_generated_usage() -> None:
+def test_definition_requires_a_handler_and_exposes_generated_usage() -> None:
     definition = CommandDefinition(
-        canonical="future",
-        description="future command",
+        canonical="current",
+        description="current command",
         kind=CommandKind.LOCAL,
-        availability=CommandAvailability.NOT_IMPLEMENTED,
+        handler=_handler,
     )
 
-    assert definition.implemented is False
-    assert definition.usage_text == "/future"
+    assert definition.usage_text == "/current"
+    with pytest.raises(TypeError, match="handler"):
+        CommandDefinition(
+            canonical="missing-handler",
+            description="missing handler",
+            kind=CommandKind.LOCAL,
+        )
 
 
 def test_builtin_registry_has_only_final_behavior_mode_command_names() -> None:
@@ -121,8 +130,8 @@ def test_builtin_registry_has_only_final_behavior_mode_command_names() -> None:
     plan = registry.resolve("plan")
     execute = registry.resolve("do")
 
-    assert plan is not None and plan.implemented
-    assert execute is not None and execute.implemented
+    assert plan is not None and callable(plan.handler)
+    assert execute is not None and callable(execute.handler)
     assert registry.resolve("build") is execute
     assert registry.resolve("p") is None
     assert "p" not in plan.aliases

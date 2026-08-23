@@ -14,7 +14,7 @@ from uthcode.application import (
     TextPart,
     UthCodeApplication,
 )
-from uthcode.application.history import transcript_entries_for_message
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.sessions import ApplicationSessionService
 from uthcode.core.compaction import CompactionEpoch
@@ -331,7 +331,7 @@ def _seed_session(application: UthCodeApplication, *, count: int = 70):
     session = application.create_session("l4-session")
     for index in range(1, count + 1):
         message = Message("user", (TextPart(f"fact-{index} " + "x" * 2_000),))
-        entries = transcript_entries_for_message(
+        entries = _transcript_entries_for_message(
             session.session_id,
             f"turn-{index}",
             session.transcript.last_sequence + 1,
@@ -715,7 +715,7 @@ async def test_l5_ages_fine_timeline_before_ordinary_request_at_low_pressure(tmp
         session_service=session_service,
     )
     session = application.create_session("l5-session")
-    entries = transcript_entries_for_message(
+    entries = _transcript_entries_for_message(
         session.session_id,
         "turn-1",
         session.transcript.last_sequence + 1,

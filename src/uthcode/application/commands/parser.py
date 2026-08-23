@@ -1,4 +1,4 @@
-"""Registry-aware Slash Command parsing with lossless prompt queries."""
+"""Registry-aware Slash Command parsing for implemented commands."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import shlex
 from .models import (
     CommandDefinition,
     CommandInvocation,
-    CommandKind,
     InvocationStatus,
 )
 from .registry import CommandRegistry
@@ -20,50 +19,6 @@ def _shell_tokens(value: str) -> tuple[str, ...]:
     lexer.whitespace_split = True
     lexer.commenters = ""
     return tuple(lexer)
-
-
-def _separator_span(value: str) -> tuple[int, int] | None:
-    """Find the first unquoted, unescaped token whose raw spelling is ``--``."""
-
-    length = len(value)
-    index = 0
-    while index < length:
-        while index < length and value[index].isspace():
-            index += 1
-        if index >= length:
-            return None
-
-        start = index
-        quote: str | None = None
-        escaped = False
-        while index < length:
-            character = value[index]
-            if escaped:
-                escaped = False
-                index += 1
-                continue
-            if character == "\\" and quote != "'":
-                escaped = True
-                index += 1
-                continue
-            if quote is None and character in ("'", '"'):
-                quote = character
-                index += 1
-                continue
-            if quote is not None and character == quote:
-                quote = None
-                index += 1
-                continue
-            if quote is None and character.isspace():
-                break
-            index += 1
-
-        end = index
-        if quote is None and value[start:end] == "--":
-            return start, end
-        while index < length and value[index].isspace():
-            index += 1
-    return None
 
 
 class CommandParser:
@@ -108,79 +63,19 @@ class CommandParser:
                 status=InvocationStatus.UNKNOWN_COMMAND,
                 is_slash=True,
                 raw_name=raw_name,
-                query=tail,
                 error=f"未知命令：/{lookup_name}",
             )
 
         alias = lookup_name if lookup_name != definition.canonical else None
-        # A prompt-only command has no argument region to separate; ``--`` is
-        # then ordinary prompt text.  The delimiter is meaningful when the
-        # definition declares structured positional arguments.
-        separator = _separator_span(tail) if definition.arguments else None
-        separator_seen = separator is not None
-        if separator is None:
-            argument_text = tail
-            query = ""
-        else:
-            separator_start, separator_end = separator
-            argument_text = tail[:separator_start].rstrip()
-            query = tail[separator_end:].lstrip()
-
         try:
-            if separator is not None and not definition.accepts_query and query:
-                return self._usage_error(
-                    text,
-                    raw_name,
-                    definition,
-                    alias,
-                    separator_seen,
-                    "this command does not accept a query",
-                )
-
-            if definition.arguments:
-                args = _shell_tokens(argument_text)
-                self._validate_arguments(definition, args)
-            else:
-                if separator is None and definition.accepts_query:
-                    args = ()
-                    query = tail
-                else:
-                    args = _shell_tokens(argument_text) if argument_text else ()
-                if args:
-                    return self._usage_error(
-                        text,
-                        raw_name,
-                        definition,
-                        alias,
-                        separator_seen,
-                        "unexpected arguments",
-                    )
-                if not definition.accepts_query and query:
-                    return self._usage_error(
-                        text,
-                        raw_name,
-                        definition,
-                        alias,
-                        separator_seen,
-                        "this command does not accept a query",
-                    )
-
-            if definition.query_required and not query:
-                return self._usage_error(
-                    text,
-                    raw_name,
-                    definition,
-                    alias,
-                    separator_seen,
-                    "a query is required",
-                )
+            args = _shell_tokens(tail) if tail else ()
+            self._validate_arguments(definition, args)
         except (ValueError, TypeError) as exc:
             return self._usage_error(
                 text,
                 raw_name,
                 definition,
                 alias,
-                separator_seen,
                 str(exc),
             )
 
@@ -192,8 +87,6 @@ class CommandParser:
             canonical=definition.canonical,
             alias=alias,
             args=tuple(args),
-            query=query,
-            separator_seen=separator_seen,
             definition=definition,
         )
 
@@ -203,6 +96,10 @@ class CommandParser:
         args: tuple[str, ...],
     ) -> None:
         specifications = definition.arguments
+        if not specifications:
+            if args:
+                raise ValueError(f"too many arguments for {definition.usage_text}")
+            return
         minimum = sum(1 for specification in specifications if specification.required)
         if len(args) < minimum:
             raise ValueError(
@@ -236,7 +133,6 @@ class CommandParser:
         raw_name: str,
         definition: CommandDefinition,
         alias: str | None,
-        separator_seen: bool,
         reason: str,
     ) -> CommandInvocation:
         return CommandInvocation(
@@ -246,7 +142,6 @@ class CommandParser:
             raw_name=raw_name,
             canonical=definition.canonical,
             alias=alias,
-            separator_seen=separator_seen,
             definition=definition,
             error=f"用法错误：{reason}；用法：{definition.usage_text}",
         )

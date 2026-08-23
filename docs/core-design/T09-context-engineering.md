@@ -66,7 +66,7 @@ derive raw Transcript epoch
   → rebuild ordinary request and re-gate
 ```
 
-attempt、coverage、previous estimate、epoch 和 cancellation 只存在于当前调用栈，不写入 RuntimeLog 或 Session state。无 progress、无 safe epoch、解析失败、取消和持久化未知都 fail closed，不产生伪 checkpoint。
+attempt、coverage、previous estimate、epoch 和 cancellation 只存在于当前调用栈，不写入持久 Session state。无 progress、无 safe epoch、解析失败、取消和持久化未知都 fail closed，不产生伪 checkpoint。
 
 当 Fine Timeline 独立超过其预算时，L5 可以在普通请求低 pressure 时触发。L5 只根据 Fine refs 回读当前 Session 的 raw Transcript，不能用 Fine/Macro summary-of-summary 作为证据；Macro 逻辑上 supersede 旧 Fine，但不删除物理 Timeline。
 
@@ -74,18 +74,17 @@ attempt、coverage、previous estimate、epoch 和 cancellation 只存在于当�
 
 ## Session persistence 与恢复边界
 
-Session v2 的持久文件为：
+Session v3 的持久文件为：
 
 ```text
+metadata.json
 transcript.jsonl
 timeline.jsonl
-runtime.jsonl
-metadata.json
 writer.lock
 tool-results/
 ```
 
-Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal tail 边界增量提交闭合 Transcript facts。single writer、append+fsync、identity reconciliation、unknown durability quarantine 与 close/reopen recovery 继续有效；无法确认副作用时不盲目重试。旧 v1 layout 明确 incompatible，不迁移、不双读写、不保留兼容入口。
+metadata 的 `schema_version` 为 3，Transcript/Timeline record envelope 仍为 2。Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal tail 边界增量提交闭合 Transcript facts。single writer、append+fsync、identity reconciliation、unknown durability quarantine 与 close/reopen recovery 继续有效；无法确认副作用时不盲目重试。旧 v1/v2 layout 明确 incompatible，不迁移、不双读写、不保留兼容入口。
 
 `/resume` 只加载已 durable 的 Transcript、committed Timeline、Tool Result ref 和 Instruction State，并创建新的 Run/Turn；它不恢复退出时仍 active/paused 的 Turn、pending Tool、Permission、AskUser waiter、Provider request 或 coroutine 位置。这不是 Persistent Runtime Recovery。
 

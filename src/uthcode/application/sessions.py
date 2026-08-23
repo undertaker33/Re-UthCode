@@ -9,7 +9,6 @@ from pathlib import Path
 from uthcode.core.history import (
     ActiveCheckpoint,
     EpochMacroSummary,
-    RuntimeLogEntry,
     SemanticEntry,
     TranscriptBoundaryError,
     TranscriptEntry,
@@ -109,10 +108,6 @@ class ApplicationSession:
         return self.snapshot.timeline
 
     @property
-    def runtime_log(self):
-        return self.snapshot.runtime_log
-
-    @property
     def instruction_state(self) -> InstructionStateMetadata:
         return InstructionStateMetadata.from_dict(self.metadata.instruction_state)
 
@@ -153,10 +148,6 @@ class ApplicationSession:
     def append_timeline(self, timeline) -> TimelineAppendOutcome:
         self._require_writable()
         return self._writer.append_timeline(timeline)
-
-    def append_runtime(self, entry: RuntimeLogEntry) -> SessionSnapshot:
-        self._require_writable()
-        return self._writer.append_runtime(entry)
 
     def persist_tool_result(self, content: str, *, policy: object | None = None) -> object:
         self._require_writable()
