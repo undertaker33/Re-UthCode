@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from uthcode.application import EffectiveConfig, UthCodeApplication
+from uthcode.application import (
+    ApplicationContextService,
+    ApplicationSessionService,
+    EffectiveConfig,
+    UthCodeApplication,
+)
 from uthcode.core.context import (
     ContextBudget,
     ContextBudgetError,
@@ -135,12 +140,188 @@ def test_adaptive_headroom_is_small_window_aware_and_large_window_capped() -> No
     assert small.effective_input_limit == 25_000
     assert small.working_headroom < large.working_headroom
     assert large.working_headroom <= 48_000
-    assert large.retained_hard_cap < large.effective_input_limit
+    assert large.retained_target < large.effective_input_limit
 
 
-def test_context_budget_rejects_effective_limit_without_an_authority_source() -> None:
-    with pytest.raises(ContextBudgetError, match="configured|reliable Provider"):
+def test_context_budget_rejects_retained_target_equal_to_auto_gate() -> None:
+    with pytest.raises(ValueError, match="strictly smaller than auto_gate_limit"):
+        ContextBudget(
+            configured_input_limit=10_000,
+            auto_gate_limit=8_000,
+            retained_target=8_000,
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured", "provider"),
+    (
+        (3, None),
+        (512, None),
+        (513, None),
+        (514, None),
+        (600, None),
+        (None, 3),
+        (None, 512),
+        (None, 513),
+        (None, 514),
+        (None, 600),
+    ),
+)
+def test_small_effective_limits_derive_distinct_high_and_low_water(
+    configured: int | None,
+    provider: int | None,
+) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=configured,
+        provider_limits=(
+            None
+            if provider is None
+            else ModelLimits(max_input_tokens=provider, source="test.small-window")
+        ),
+    )
+
+    assert 0 < budget.retained_target < budget.auto_gate_limit
+    assert budget.auto_gate_limit < budget.effective_input_limit
+
+
+@pytest.mark.parametrize("provider_limit", (512, 513, 514, 600))
+def test_provider_small_ceiling_is_not_expanded_by_default(provider_limit: int) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=None,
+        provider_limits=ModelLimits(
+            max_input_tokens=provider_limit,
+            source="test.small-provider-window",
+        ),
+    )
+
+    assert budget.effective_input_limit == provider_limit
+    assert budget.effective_input_source == "provider"
+    assert budget.tightened_input_sources == ("provider",)
+
+
+def test_provider_ceiling_above_default_keeps_default_operating_window() -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=None,
+        provider_limits=ModelLimits(
+            max_input_tokens=512_000,
+            source="test.large-provider-window",
+        ),
+    )
+
+    assert budget.effective_input_limit == 256_000
+    assert budget.effective_input_source == "default"
+    assert budget.tightened_input_sources == ("default",)
+
+
+@pytest.mark.parametrize(
+    ("configured", "provider"),
+    ((2, None), (None, 2)),
+)
+def test_effective_two_has_explicit_minimum_window_domain_error(
+    configured: int | None,
+    provider: int | None,
+) -> None:
+    with pytest.raises(
+        ContextBudgetError,
+        match="effective input limit must be at least 3 to separate High and Low Water",
+    ):
+        ContextBudget.from_limits(
+            configured_input_limit=configured,
+            provider_limits=(
+                None
+                if provider is None
+                else ModelLimits(max_input_tokens=provider, source="test.minimum-window")
+            ),
+        )
+
+
+def test_context_budget_rejects_an_unexplained_effective_limit() -> None:
+    with pytest.raises(ContextBudgetError, match="effective|resolved"):
         ContextBudget(effective_input_limit=10_000)
+
+
+@pytest.mark.parametrize(
+    (
+        "configured",
+        "provider",
+        "expected_effective",
+        "expected_source",
+        "expected_observed",
+        "expected_tightened",
+    ),
+    (
+        (None, None, 256_000, "default", (), ()),
+        (None, 128_000, 128_000, "provider", ("provider",), ("provider",)),
+        (None, 512_000, 256_000, "default", ("provider",), ("default",)),
+        (300_000, None, 300_000, "configured", ("configured",), ()),
+        (300_000, 400_000, 300_000, "configured", ("configured", "provider"), ()),
+        (300_000, 200_000, 200_000, "provider", ("configured", "provider"), ("provider",)),
+    ),
+)
+def test_context_limit_resolver_truth_table_and_provenance(
+    configured: int | None,
+    provider: int | None,
+    expected_effective: int,
+    expected_source: str,
+    expected_observed: tuple[str, ...],
+    expected_tightened: tuple[str, ...],
+) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=configured,
+        provider_limits=(
+            None
+            if provider is None
+            else ModelLimits(max_input_tokens=provider, source="test.runtime")
+        ),
+    )
+
+    assert budget.default_input_limit == 256_000
+    assert budget.effective_input_limit == expected_effective
+    assert budget.effective_input_source == expected_source
+    assert budget.observed_input_sources == expected_observed
+    assert budget.tightened_input_sources == expected_tightened
+    assert budget.to_dict()["default_input_limit"] == 256_000
+    assert budget.to_dict()["effective_input_source"] == expected_source
+    assert budget.to_dict()["observed_input_sources"] == list(expected_observed)
+    assert budget.to_dict()["tightened_input_sources"] == list(expected_tightened)
+
+
+def test_context_service_individual_limits_fallback_uses_shared_resolver() -> None:
+    request, _snapshot = ApplicationContextService().compose_generation_request(
+        (Message("user", (TextPart("hello"),)),),
+        run_id="individual-limits",
+        provider_limits=ModelLimits(max_input_tokens=512_000, source="test.runtime"),
+    )
+
+    assert request.metadata["context_budget"]["effective_input_limit"] == 256_000
+    assert request.metadata["context_budget"]["effective_input_source"] == "default"
+    assert request.metadata["context_budget"]["tightened_input_sources"] == ["default"]
+
+    default_request, _snapshot = ApplicationContextService().compose_generation_request(
+        (Message("user", (TextPart("hello"),)),),
+        run_id="default-individual-limits",
+    )
+    assert default_request.metadata["context_budget"]["effective_input_limit"] == 256_000
+    assert default_request.metadata["context_budget"]["effective_input_source"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_idle_manual_compact_uses_default_resolver(tmp_path) -> None:
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-default-limit",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        FakeProvider(model_limits=None),
+        session_service=session_service,
+    )
+    application.create_session("manual-default-limit")
+
+    result = await application.compact_session()
+
+    assert result.changed is False
+    assert result.failure is None
 
 
 def test_final_accounting_includes_instruction_messages_tools_and_framing() -> None:
@@ -202,21 +383,29 @@ def test_output_and_combined_limits_are_hard_checked_independently() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_limits_fail_closed_before_provider_call() -> None:
+async def test_missing_limits_use_default_operating_window_before_provider_call() -> None:
     count_calls: list[GenerationRequest] = []
 
     def count(request: GenerationRequest) -> int:
         count_calls.append(request)
         return account_generation_request(request).input_tokens
 
-    provider = FakeProvider(model_limits=None, input_token_counter=count)
+    provider = FakeProvider(
+        events=(_completed(),),
+        model_limits=None,
+        input_token_counter=count,
+    )
     application = UthCodeApplication(provider)
 
     result = await application.create_run().start_turn("hello").result()
 
-    assert result.status.value == "failed"
-    assert provider.recorded_requests == ()
-    assert count_calls == []
+    assert result.status.value == "completed"
+    assert len(provider.recorded_requests) == 1
+    assert count_calls
+    diagnostics = application.diagnostics()["context_budget"]
+    assert diagnostics["effective_input_limit"] == 256_000
+    assert diagnostics["effective_input_source"] == "default"
+    assert diagnostics["tightened_input_sources"] == []
 
 
 @pytest.mark.asyncio

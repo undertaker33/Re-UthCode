@@ -20,8 +20,10 @@ from uthcode.application.sessions import ApplicationSessionService
 from uthcode.core.compaction import CompactionEpoch
 from uthcode.core.context import (
     CompactionResult,
+    ContextBudget,
     ContextCompactor,
     account_generation_request,
+    pressure_estimate,
 )
 from uthcode.core.history import (
     ActiveCheckpoint,
@@ -34,6 +36,7 @@ from uthcode.core.history import (
 )
 from uthcode.core.provider import (
     CancellationToken,
+    ContextCountEstimate,
     ContextOverflowError,
     FinishReason,
     GenerationCancelled,
@@ -128,6 +131,31 @@ class _L4Provider:
         yield _completed("ordinary answer")
 
 
+class _HighLowProvider(_L4Provider):
+    def __init__(self, budget: ContextBudget, *, initial_count: int | None = None) -> None:
+        super().__init__(max_input_tokens=budget.effective_input_limit)
+        self._budget = budget
+        self._initial_count = initial_count
+        self.ordinary_counts: list[int] = []
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        if request.metadata.get("context_compaction_request") is True:
+            return account_generation_request(request).input_tokens
+        completed_epochs = sum(
+            1
+            for recorded in self.requests
+            if recorded.metadata.get("context_compaction_request") is True
+        )
+        if completed_epochs == 0:
+            count = self._initial_count or self._budget.effective_input_limit
+        elif completed_epochs == 1:
+            count = self._budget.auto_gate_limit - 1_000
+        else:
+            count = self._budget.retained_target - 2_048
+        self.ordinary_counts.append(count)
+        return count
+
+
 class _L5Provider:
     def __init__(self) -> None:
         self.identity = ProviderIdentity("fake", "l5", "provider-model")
@@ -209,11 +237,13 @@ class _OverflowRecoveryProvider:
         ordinary_overflows: int,
         compaction_summary: str | None = None,
         max_input_tokens: int = 6_000,
+        invalid_compaction_attempts: int = 0,
     ) -> None:
         self.identity = ProviderIdentity("fake", "overflow", "provider-model")
         self.ordinary_overflows = ordinary_overflows
         self.compaction_summary = compaction_summary
         self.max_input_tokens = max_input_tokens
+        self.invalid_compaction_attempts = invalid_compaction_attempts
         self.requests: list[GenerationRequest] = []
 
     def resolve_model_limits(self, _model: str) -> ModelLimits:
@@ -235,6 +265,16 @@ class _OverflowRecoveryProvider:
         self.requests.append(request)
         cancellation.raise_if_cancelled()
         if request.metadata.get("context_compaction_request") is True:
+            compact_calls = sum(
+                1
+                for item in self.requests
+                if item.metadata.get("context_compaction_request") is True
+            )
+            if compact_calls <= self.invalid_compaction_attempts:
+                yield _completed(
+                    json.dumps({"entries": "not-a-list", "coverage": []})
+                )
+                return
             turn_ids = tuple(
                 value
                 for value in request.metadata.get("context_compaction_epoch_turns", ())
@@ -260,6 +300,24 @@ class _OverflowRecoveryProvider:
         if ordinary_calls <= self.ordinary_overflows:
             raise ContextOverflowError()
         yield _completed("overflow recovered")
+
+
+class _PartialNoSafeProvider(_L4Provider):
+    def __init__(self, *, post_commit_count: int) -> None:
+        super().__init__(max_input_tokens=6_000)
+        self._post_commit_count = post_commit_count
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        if request.metadata.get("context_compaction_request") is True:
+            return account_generation_request(request).input_tokens
+        completed_epochs = sum(
+            1
+            for recorded in self.requests
+            if recorded.metadata.get("context_compaction_request") is True
+        )
+        if completed_epochs == 0:
+            return 6_000
+        return self._post_commit_count
 
 
 class _PostToolOverflowProvider:
@@ -465,6 +523,51 @@ async def test_w05_context_overflow_recovers_once_then_retries_with_frozen_limit
         entry.turn_id for entry in reopened.timeline.fine_entries
     }
     application.close()
+
+
+@pytest.mark.asyncio
+async def test_overflow_invalid_first_compaction_then_success_retries_ordinary_once(tmp_path) -> None:
+    provider = _OverflowRecoveryProvider(
+        ordinary_overflows=1,
+        invalid_compaction_attempts=1,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="overflow-invalid-then-success",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("overflow retry parse").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.status is RunStatus.COMPLETED
+    assert len(compact) == 2
+    assert len(ordinary) == 2
+    assert session.timeline.active_checkpoint is not None
+    assert application.diagnostics()["compaction"]["last"]["failure"] is None  # type: ignore[index]
+    note = ordinary[1].metadata["context_compaction"]
+    assert note["overflow_recovery_status"] == "recovered"
+    assert note["overflow_recovery_failure"] is None
 
 
 @pytest.mark.asyncio
@@ -1021,6 +1124,168 @@ async def test_l4_catchup_commits_multiple_epochs_and_stops_at_no_progress() -> 
 
 
 @pytest.mark.asyncio
+async def test_auto_l4_continues_below_high_until_frozen_low_water(tmp_path) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=256_000,
+        provider_limits=ModelLimits(max_input_tokens=256_000, source="test.high-low"),
+        requested_output_reserve=256,
+    )
+    provider = _HighLowProvider(budget)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="high-low-catchup",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=256_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=200)
+
+    result = await application.create_run().start_turn("current fact").result()
+
+    compact_requests = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    ordinary_requests = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert result.status is RunStatus.COMPLETED
+    assert len(compact_requests) == 2
+    assert session.timeline.fine_entries
+    assert session.timeline.active_checkpoint is not None
+    assert len(ordinary_requests) == 1
+    final_gate = ordinary_requests[0].metadata["context_gate"]
+    assert final_gate["preflight_input_usage"] <= budget.retained_target
+    note = ordinary_requests[0].metadata["context_compaction"]
+    assert note["epochs"] == 2
+    assert note["retained_target"] == budget.retained_target
+    assert note["low_water_reached"] is True
+    assert note["status"] == "completed"
+    assert note["failure"] is None
+    assert note["auto_pressure_unresolved"] is False
+    assert note["gate_after_compaction"]["count_source"] == "provider.preflight_count"
+    assert ordinary_requests[0].metadata["context_gate"]["count_source"] == "provider.preflight_count"
+    assert ordinary_requests[0].metadata["context_gate"]["hard_safe"] is True
+    assert provider.ordinary_counts.count(budget.retained_target - 2_048) >= 2
+
+
+@pytest.mark.asyncio
+async def test_provider_exact_low_water_is_not_overwritten_by_divergent_local_estimate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=20_000,
+        provider_limits=ModelLimits(max_input_tokens=20_000, source="test.exact-low"),
+        requested_output_reserve=256,
+    )
+    provider = _HighLowProvider(budget)
+    real_pressure = pressure_estimate
+
+    def divergent_local_pressure(
+        request: GenerationRequest,
+        context_budget: ContextBudget,
+    ) -> ContextCountEstimate:
+        if request.tools == ():
+            return real_pressure(request, context_budget)
+        return ContextCountEstimate(
+            input_tokens=budget.auto_gate_limit,
+            source="test.divergent_local_estimator",
+            kind="pressure_estimate",
+        )
+
+    monkeypatch.setattr(
+        "uthcode.application.context.pressure_estimate",
+        divergent_local_pressure,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="provider-exact-low",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=20_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    _seed_session(application, count=70)
+
+    result = await application.create_run().start_turn("current fact").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert result.status is RunStatus.COMPLETED
+    assert len(ordinary) == 1
+    request = ordinary[0]
+    assert request.metadata["context_pressure"]["input_tokens"] == budget.auto_gate_limit
+    assert request.metadata["context_gate"]["preflight_input_usage"] <= budget.retained_target
+    note = request.metadata["context_compaction"]
+    assert note["status"] == "completed"
+    assert note["failure"] is None
+    assert note["low_water_reached"] is True
+    assert note["auto_pressure_unresolved"] is False
+    assert note["gate_after_compaction"]["count_source"] == "provider.preflight_count"
+
+
+@pytest.mark.asyncio
+async def test_low_water_does_not_trigger_auto_l4_below_high_water(tmp_path) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=256_000,
+        provider_limits=ModelLimits(max_input_tokens=256_000, source="test.low-only"),
+        requested_output_reserve=256,
+    )
+    provider = _HighLowProvider(
+        budget,
+        initial_count=budget.auto_gate_limit - 3_048,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="low-does-not-trigger",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=256_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    _seed_session(application, count=200)
+
+    result = await application.create_run().start_turn("current fact").result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert budget.retained_target < budget.auto_gate_limit - 1_000
+    assert all(
+        request.metadata.get("context_compaction_request") is not True
+        for request in provider.requests
+    )
+    assert provider.requests[-1].metadata["context_compaction"]["attempted"] is False
+
+
+@pytest.mark.asyncio
 async def test_l4_no_progress_does_not_create_a_pseudo_checkpoint() -> None:
     transcript = Transcript(
         "no-progress",
@@ -1305,3 +1570,72 @@ async def test_auto_pressure_unresolved_but_hard_safe_still_sends_with_reason(tm
     assert note["auto_pressure_unresolved"] is True
     assert note["failure"] == "no_safe_epoch"
     assert session.timeline.active_checkpoint is None
+
+
+@pytest.mark.asyncio
+async def test_partial_l4_commit_then_no_safe_epoch_keeps_checkpoint_when_hard_safe(tmp_path) -> None:
+    provider = _PartialNoSafeProvider(post_commit_count=3_000)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="partial-hard-safe",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("partial hard safe").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert result.status is RunStatus.COMPLETED
+    assert len(ordinary) == 1
+    assert session.timeline.active_checkpoint is not None
+    note = ordinary[0].metadata["context_compaction"]
+    assert note["failure"] == "no_safe_epoch"
+    assert note["gate_after_compaction"]["hard_safe"] is True
+
+
+@pytest.mark.asyncio
+async def test_partial_l4_commit_then_no_safe_epoch_fails_closed_when_hard_unsafe(tmp_path) -> None:
+    provider = _PartialNoSafeProvider(post_commit_count=6_000)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="partial-hard-unsafe",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("partial hard unsafe").result()
+
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert result.status is RunStatus.FAILED
+    assert ordinary == []
+    assert session.timeline.active_checkpoint is not None
+    diagnostics = application.diagnostics()["compaction"]
+    assert diagnostics["last"]["failure"] == "no_safe_epoch"  # type: ignore[index]

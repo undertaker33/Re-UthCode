@@ -419,6 +419,10 @@ class ApplicationContextService:
                             result=parsed,
                             timeline=current_timeline,
                         )
+                        # A parse/validation failure from the first attempt is
+                        # transient once the retry produces a valid candidate.
+                        # Later terminal breakers still set their own reason.
+                        last_failure = None
                         break
                     except GenerationCancelled:
                         # Provider cancellation is a control-flow exit, not
@@ -997,9 +1001,7 @@ class ApplicationContextService:
             configured_input_limit is not None or provider_limits is not None
         ):
             raise TypeError("pass context_budget or individual limits, not both")
-        if context_budget is None and (
-            configured_input_limit is not None or provider_limits is not None
-        ):
+        if context_budget is None:
             context_budget = resolve_context_budget(
                 configured_input_limit=configured_input_limit,
                 provider_limits=provider_limits,

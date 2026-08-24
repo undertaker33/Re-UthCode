@@ -172,7 +172,11 @@ async def test_compact_command_surfaces_success_and_noop(tmp_path: Path) -> None
         status = await dispatcher.dispatch_text_async("/status")
         assert status is not None and status.output is not None
         assert "context limits:" in status.output
+        assert "default=256000" in status.output
         assert "effective=1000000" in status.output
+        assert "source=configured" in status.output
+        assert "observed=['configured', 'provider']" in status.output
+        assert "tightened=[]" in status.output
         assert "context gate:" in status.output and "hard_safe=True" in status.output
         assert "context outcome:" in status.output
         assert application.session_service.active_session.timeline.active_checkpoint is not None  # type: ignore[union-attr]

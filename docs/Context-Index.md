@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-23
+status_snapshot: 2026-08-24
 status_scope: docs/work/TXX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -88,7 +88,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| 无 | 无 | 无 | 当前没有未开始或部分实施的活跃工作包 |
+| T09-3 | 256K Context 工程调优与通用失败语义 | `docs/work/T09-3-256KContext工程调优与通用失败语义/` | W01 已完成 T01/T02 并经第二轮返工验收通过；Context limit resolver、High/Low Water 与有限 compact epoch 已进入正式链路；T03 及后续任务尚未实施，工作包继续标记为 `not_implemented` |
 
 ## 跨层最短链路
 

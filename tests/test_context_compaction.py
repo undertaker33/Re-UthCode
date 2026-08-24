@@ -61,6 +61,98 @@ async def test_application_context_compact_records_bounded_diagnostics() -> None
     assert diagnostics["compaction"]["last"]["coverage_count"] >= 1
 
 
+@pytest.mark.asyncio
+async def test_invalid_first_attempt_then_success_clears_transient_failure_and_commits() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService()
+    attempts = 0
+    committed = []
+
+    async def summarize(epoch):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return {"entries": "not-a-list", "coverage": []}
+        return {
+            "entries": [
+                {"turn_id": turn_id, "summary": f"summary for {turn_id}"}
+                for turn_id in epoch.turn_ids
+            ],
+            "coverage": list(epoch.turn_ids),
+        }
+
+    def commit(candidate):
+        committed.append(candidate)
+        return candidate
+
+    result = await service.compact_async(
+        transcript,
+        summarize=summarize,
+        commit=commit,
+    )
+
+    assert attempts == 2
+    assert result.changed is True
+    assert result.failure is None
+    assert len(committed) == 1
+    assert result.timeline is not None
+    assert result.timeline.active_checkpoint is not None
+
+
+@pytest.mark.asyncio
+async def test_compaction_stops_at_configured_epoch_limit_and_keeps_last_checkpoint() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService(
+        compactor=ContextCompactor(
+            token_estimator=lambda text: text.count('"unit_id"') * 10 + 1
+        )
+    )
+    summarized: list[tuple[str, ...]] = []
+    committed = []
+
+    async def summarize(epoch):
+        summarized.append(epoch.turn_ids)
+        return {
+            "entries": [
+                {"turn_id": turn_id, "summary": "ok"}
+                for turn_id in epoch.turn_ids
+            ],
+            "coverage": list(epoch.turn_ids),
+        }
+
+    def commit(candidate):
+        committed.append(candidate)
+        return candidate
+
+    result = await service.compact_async(
+        transcript,
+        summarize=summarize,
+        commit=commit,
+        should_continue=lambda _timeline: True,
+        max_epochs=2,
+        input_budget=25,
+        output_reserve=5,
+        summary_hard_cap=5,
+    )
+
+    assert summarized == [("turn-1",), ("turn-2",)]
+    assert len(committed) == 2
+    assert result.changed is True
+    assert result.failure == "epoch_limit_reached"
+    assert result.timeline is not None
+    assert [entry.turn_id for entry in result.timeline.fine_entries] == [
+        "turn-1",
+        "turn-2",
+    ]
+    assert result.timeline.active_checkpoint is not None
+    assert result.timeline.active_checkpoint.turn_id == "turn-2"
+    assert result.timeline.records[-1].record_type == "active_checkpoint"
+    assert all(
+        getattr(record, "turn_id", None) != "turn-3"
+        for record in result.timeline.records
+    )
+
+
 def test_context_compactor_single_flight_rejects_reentrant_lock() -> None:
     compactor = ContextCompactor()
     transcript = _transcript()

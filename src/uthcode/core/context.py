@@ -74,6 +74,9 @@ class ContextRequestSafetyError(ContextBudgetError):
     """A final Provider-visible request is not safe to send."""
 
 
+DEFAULT_CONTEXT_INPUT_LIMIT = 256_000
+
+
 def adaptive_working_headroom(effective_input_limit: int) -> int:
     """Return a capped proactive reserve for one effective input limit.
 
@@ -91,7 +94,10 @@ def adaptive_working_headroom(effective_input_limit: int) -> int:
     return min(
         48_000,
         max(512, effective_input_limit // 20),
-        max(1, effective_input_limit - 1),
+        # Leave two tokens for the strict High/Low pair.  With an effective
+        # limit of N >= 3 this guarantees High >= 2, so the default Low can
+        # remain a positive integer strictly below it.
+        max(1, effective_input_limit - 2),
     )
 
 
@@ -117,18 +123,19 @@ class ContextBudget:
 
     configured_input_limit: int | None = None
     provider_max_input: int | None = None
+    default_input_limit: int = field(default=DEFAULT_CONTEXT_INPUT_LIMIT, init=False)
     effective_input_limit: int | None = None
+    observed_input_sources: tuple[str, ...] = field(default=(), init=False)
+    effective_input_source: str | None = field(default=None, init=False)
+    tightened_input_sources: tuple[str, ...] = field(default=(), init=False)
     provider_max_output: int | None = None
     provider_combined_limit: int | None = None
     requested_output_reserve: int = 0
     safety_allowance: int = 0
     working_headroom: int | None = None
     auto_gate_limit: int | None = None
-    active_evidence_budget: int | None = None
     fine_timeline_budget: int | None = None
-    uncompressed_tail_budget: int | None = None
     retained_target: int | None = None
-    retained_hard_cap: int | None = None
     compaction_input_budget: int | None = None
     compaction_output_reserve: int | None = None
 
@@ -136,6 +143,7 @@ class ContextBudget:
         for field_name in (
             "configured_input_limit",
             "provider_max_input",
+            "default_input_limit",
             "provider_max_output",
             "provider_combined_limit",
         ):
@@ -144,31 +152,58 @@ class ContextBudget:
                 isinstance(value, bool) or not isinstance(value, int) or value <= 0
             ):
                 raise ValueError(f"{field_name} must be a positive integer or None")
-        effective = self.effective_input_limit
-        known_inputs = tuple(
-            value
-            for value in (self.configured_input_limit, self.provider_max_input)
+        observed_sources = tuple(
+            source
+            for source, value in (
+                ("configured", self.configured_input_limit),
+                ("provider", self.provider_max_input),
+            )
             if value is not None
         )
-        if not known_inputs:
-            raise ContextBudgetError(
-                "at least one configured or reliable Provider input limit is required"
-            )
+        if self.configured_input_limit is not None:
+            resolved_effective = self.configured_input_limit
+            resolved_source = "configured"
+            tightened_sources: tuple[str, ...] = ()
+            if (
+                self.provider_max_input is not None
+                and self.provider_max_input < resolved_effective
+            ):
+                resolved_effective = self.provider_max_input
+                resolved_source = "provider"
+                tightened_sources = ("provider",)
+        else:
+            resolved_effective = self.default_input_limit
+            resolved_source = "default"
+            tightened_sources = ()
+            if self.provider_max_input is not None:
+                if self.provider_max_input < resolved_effective:
+                    resolved_effective = self.provider_max_input
+                    resolved_source = "provider"
+                    tightened_sources = ("provider",)
+                elif self.provider_max_input > resolved_effective:
+                    tightened_sources = ("default",)
+
+        effective = self.effective_input_limit
         if effective is None:
-            effective = min(known_inputs)
+            effective = resolved_effective
             object.__setattr__(self, "effective_input_limit", effective)
+        elif effective != resolved_effective:
+            raise ContextBudgetError(
+                "effective_input_limit must equal the resolved operating limit"
+            )
+        object.__setattr__(self, "observed_input_sources", observed_sources)
+        object.__setattr__(self, "effective_input_source", resolved_source)
+        object.__setattr__(self, "tightened_input_sources", tightened_sources)
         if (
             isinstance(effective, bool)
             or not isinstance(effective, int)
             or effective <= 0
         ):
             raise ValueError("effective_input_limit must be a positive integer")
-        if effective <= 1:
+        if effective < 3:
             raise ContextBudgetError(
-                "effective input limit is too small for a request safety budget"
+                "effective input limit must be at least 3 to separate High and Low Water"
             )
-        if known_inputs and effective > min(known_inputs):
-            raise ValueError("effective_input_limit cannot exceed a known input limit")
         for field_name in ("requested_output_reserve", "safety_allowance"):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -187,42 +222,34 @@ class ContextBudget:
         if isinstance(auto_gate, bool) or not isinstance(auto_gate, int) or not 0 < auto_gate < effective:
             raise ValueError("auto_gate_limit must be positive and smaller than the input limit")
 
-        active = self.active_evidence_budget
         fine = self.fine_timeline_budget
-        tail = self.uncompressed_tail_budget
-        if active is None:
-            active = min(effective, max(1, min(48_000, max(128, effective // 5))))
-            object.__setattr__(self, "active_evidence_budget", active)
         if fine is None:
             fine = min(effective, max(1, min(16_000, max(64, effective // 16))))
             object.__setattr__(self, "fine_timeline_budget", fine)
-        if tail is None:
-            tail = min(effective, max(1, min(8_000, max(64, effective // 32))))
-            object.__setattr__(self, "uncompressed_tail_budget", tail)
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in (active, fine, tail)
-        ):
-            raise ValueError("retained context budgets must be positive integers")
+        if isinstance(fine, bool) or not isinstance(fine, int) or fine <= 0:
+            raise ValueError("fine_timeline_budget must be a positive integer")
 
         retained_target = self.retained_target
         if retained_target is None:
-            retained_target = min(effective - reserve, active + fine + tail)
+            # Preserve the existing retained-target policy while removing its
+            # three non-consumed public subdivisions.  T09-3 profile tuning
+            # remains a later Eval task rather than a public budget contract.
+            retained_target = min(
+                auto_gate - 1,
+                min(48_000, max(128, effective // 5))
+                + fine
+                + min(8_000, max(64, effective // 32)),
+            )
             object.__setattr__(self, "retained_target", retained_target)
-        retained_cap = self.retained_hard_cap
-        if retained_cap is None:
-            retained_cap = min(effective, max(retained_target, active + fine + tail))
-            object.__setattr__(self, "retained_hard_cap", retained_cap)
         if (
             isinstance(retained_target, bool)
             or not isinstance(retained_target, int)
             or retained_target <= 0
-            or isinstance(retained_cap, bool)
-            or not isinstance(retained_cap, int)
-            or retained_cap < retained_target
-            or retained_cap > effective
+            or retained_target >= auto_gate
         ):
-            raise ValueError("retained target/cap is invalid")
+            raise ValueError(
+                "retained_target must be positive and strictly smaller than auto_gate_limit"
+            )
 
         compact_input = self.compaction_input_budget
         if compact_input is None:
@@ -276,18 +303,19 @@ class ContextBudget:
         return {
             "configured_input_limit": self.configured_input_limit,
             "provider_max_input": self.provider_max_input,
+            "default_input_limit": self.default_input_limit,
             "effective_input_limit": self.effective_input_limit,
+            "observed_input_sources": list(self.observed_input_sources),
+            "effective_input_source": self.effective_input_source,
+            "tightened_input_sources": list(self.tightened_input_sources),
             "provider_max_output": self.provider_max_output,
             "provider_combined_limit": self.provider_combined_limit,
             "requested_output_reserve": self.requested_output_reserve,
             "safety_allowance": self.safety_allowance,
             "working_headroom": self.working_headroom,
             "auto_gate_limit": self.auto_gate_limit,
-            "active_evidence_budget": self.active_evidence_budget,
             "fine_timeline_budget": self.fine_timeline_budget,
-            "uncompressed_tail_budget": self.uncompressed_tail_budget,
             "retained_target": self.retained_target,
-            "retained_hard_cap": self.retained_hard_cap,
             "compaction_input_budget": self.compaction_input_budget,
             "compaction_output_reserve": self.compaction_output_reserve,
         }
