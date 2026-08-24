@@ -175,6 +175,28 @@ class _ScriptedProvider:
             yield event
 
 
+class _RefreshingLimitsProvider(_ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__(
+            (
+                (
+                    _response(
+                        ToolCallPart("unknown-1", "MissingTool", {}),
+                        finish_reason=FinishReason.TOOL_CALLS,
+                    ),
+                ),
+                (_response(TextPart("first turn done")),),
+                (_response(TextPart("second turn done")),),
+            )
+        )
+        self.limit_resolutions: list[str] = []
+
+    def resolve_model_limits(self, model: str) -> ModelLimits:
+        self.limit_resolutions.append(model)
+        limit = 300_000 if len(self.limit_resolutions) == 1 else 100_000
+        return ModelLimits(max_input_tokens=limit, source="test.refreshing")
+
+
 class _GatedProvider:
     def __init__(self, responses: Iterable[GenerationCompleted]) -> None:
         self.identity = ProviderIdentity("fake", "gated", "fake-model")
@@ -338,6 +360,29 @@ class _RecordingPermissionEvaluator(PermissionEvaluator):
     def evaluate(self, action, mode=PermissionMode.DEFAULT, session_grants=()):
         self.calls.append(action)
         return super().evaluate(action, mode=mode, session_grants=session_grants)
+
+
+@pytest.mark.asyncio
+async def test_context_limits_resolve_once_per_turn_and_refresh_next_turn() -> None:
+    provider = _RefreshingLimitsProvider()
+    application = UthCodeApplication(provider)
+    run = application.create_run(run_id="frozen-context-limits")
+
+    first = await run.start_turn("first").result()
+    second = await run.start_turn("second").result()
+
+    assert first.status is RunStatus.COMPLETED
+    assert second.status is RunStatus.COMPLETED
+    assert provider.limit_resolutions == ["fake-model", "fake-model"]
+    assert len(provider.requests) == 3
+    assert [
+        request.metadata["context_gate"]["effective_input_limit"]
+        for request in provider.requests
+    ] == [256_000, 256_000, 100_000]
+    assert [
+        request.metadata["context_budget"]["effective_input_source"]
+        for request in provider.requests
+    ] == ["default", "default", "provider"]
 
 
 async def _collect(handle: TurnHandle) -> list[AgentEvent]:

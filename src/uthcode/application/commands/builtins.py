@@ -186,13 +186,17 @@ def _status(context: CommandContext) -> str:
     if not isinstance(context_pressure, Mapping):
         context_pressure = {}
     limits_text = (
-        "configured={configured}; provider_input={provider_input}; "
-        "effective={effective}; provider_output={provider_output}; "
-        "combined={combined}"
+        "configured={configured}; provider_input={provider_input}; default={default}; "
+        "effective={effective}; source={source}; observed={observed}; "
+        "tightened={tightened}; provider_output={provider_output}; combined={combined}"
     ).format(
         configured=context_budget.get("configured_input_limit", "?"),
         provider_input=context_budget.get("provider_max_input", "?"),
+        default=context_budget.get("default_input_limit", "?"),
         effective=context_budget.get("effective_input_limit", "?"),
+        source=context_budget.get("effective_input_source", "?"),
+        observed=context_budget.get("observed_input_sources", "?"),
+        tightened=context_budget.get("tightened_input_sources", "?"),
         provider_output=context_budget.get("provider_max_output", "?"),
         combined=context_budget.get("provider_combined_limit", "?"),
     )

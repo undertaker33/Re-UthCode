@@ -114,7 +114,7 @@ async def test_application_diagnostics_are_json_safe_and_do_not_copy_payloads() 
         )
     )
 
-    result = await application.create_run().start_turn("hello").result()
+    result = await application.create_run().start_turn("PUBLIC_PAYLOAD_MUST_NOT_LEAK").result()
     assert result.final_text == "done"
 
     diagnostics = application.diagnostics()
@@ -126,6 +126,16 @@ async def test_application_diagnostics_are_json_safe_and_do_not_copy_payloads() 
     assert "selected_blocks" not in context
     assert "tool_definitions" not in context
     assert "provider_secret" not in json.dumps(diagnostics, ensure_ascii=False)
+    serialized = json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)
+    assert "PUBLIC_PAYLOAD_MUST_NOT_LEAK" not in serialized
+    assert "must-not-leak" not in serialized
+    budget = diagnostics["context_budget"]
+    assert isinstance(budget, Mapping)
+    assert budget["default_input_limit"] == 256_000
+    assert budget["effective_input_limit"] == 256_000
+    assert budget["effective_input_source"] == "default"
+    assert budget["observed_input_sources"] == ["provider"]
+    assert budget["tightened_input_sources"] == ["default"]
 
     provider_usage = diagnostics["provider_usage"]
     assert isinstance(provider_usage, Mapping)

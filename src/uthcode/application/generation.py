@@ -1455,6 +1455,8 @@ class UthCodeApplication:
             "failure": None,
             "auto_pressure_unresolved": False,
             "previous_estimate": None,
+            "retained_target": None,
+            "low_water_reached": False,
             "overflow_recovery_attempted": False,
             "overflow_recovery_status": "not_needed",
             "overflow_recovery_failure": None,
@@ -1486,8 +1488,11 @@ class UthCodeApplication:
                     provider_limits=frozen_provider_limits,
                     requested_output_reserve=max_output_tokens,
                 )
+                compaction_note["retained_target"] = frozen_budget.retained_target
                 limits_ready = True
             process_messages = messages[process_message_start:]
+            authoritative_gate_after_compaction: dict[str, object] | None = None
+            authoritative_low_water_reached = False
             if persist_closed_messages is not None:
                 persisted_cursor = persist_closed_messages(messages, turn_id)
                 if persisted_cursor is not None:
@@ -1647,21 +1652,46 @@ class UthCodeApplication:
                 return self._commit_timeline_candidate(active, candidate)
 
             async def rebuild_after_epoch(timeline: object) -> Mapping[str, object]:
+                nonlocal authoritative_gate_after_compaction
+                nonlocal authoritative_low_water_reached
                 del timeline
                 rebuilt = compose(None, True, None)
+                resolution = await _count_input_tokens_async(provider, rebuilt)
+                rebuilt = compose(
+                    resolution.value,
+                    True,
+                    resolution.fallback_reason,
+                )
                 gate = gate_from_request(rebuilt)
                 if gate is None:
                     return {"continue": False, "reason": "gate_unavailable"}
+                authoritative_gate_after_compaction = dict(gate)
                 auto_pressure = bool(gate.get("auto_pressure", False))
                 hard_safe = bool(gate.get("hard_safe", False))
                 effective = gate.get("effective_input_limit")
                 usage = gate.get("preflight_input_usage")
+                retained_target = (
+                    frozen_budget.retained_target
+                    if frozen_budget is not None
+                    else None
+                )
                 if isinstance(effective, int) and isinstance(usage, int):
                     compaction_note["headroom"] = max(0, effective - usage)
+                low_water_reached = bool(
+                    isinstance(usage, int)
+                    and isinstance(retained_target, int)
+                    and usage <= retained_target
+                )
+                authoritative_low_water_reached = low_water_reached
+                compaction_note["low_water_reached"] = low_water_reached
+                compaction_note["post_epoch_input_usage"] = usage
                 return {
-                    "continue": auto_pressure or not hard_safe,
+                    "continue": not low_water_reached,
                     "auto_pressure": auto_pressure,
                     "hard_safe": hard_safe,
+                    "preflight_input_usage": usage,
+                    "retained_target": retained_target,
+                    "low_water_reached": low_water_reached,
                     "reason": gate.get("reason", "unknown"),
                 }
 
@@ -1743,10 +1773,14 @@ class UthCodeApplication:
                         )
                     ),
                 )
-                final_gate = gate_from_request(compose(None, True, None))
+                final_gate = authoritative_gate_after_compaction
+                if final_gate is None:
+                    fallback_gate = gate_from_request(compose(None, True, None))
+                    final_gate = None if fallback_gate is None else dict(fallback_gate)
                 final_auto = bool(
                     final_gate is not None
                     and final_gate.get("auto_pressure", False)
+                    and not authoritative_low_water_reached
                 )
                 final_hard = bool(
                     final_gate is not None
@@ -1775,7 +1809,7 @@ class UthCodeApplication:
                     # Hard-safe request remains sendable with the reason kept
                     # in the bounded compaction note.
                     compaction_note["status"] = "unresolved"
-                return result.changed and result.failure is None
+                return result.changed
 
             async def run_l5_if_needed() -> bool:
                 """Run one independent Fine Timeline aging attempt."""
