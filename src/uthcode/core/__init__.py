@@ -114,6 +114,7 @@ from .agent import (
     RunState,
     RunStatus,
     ExecutionBoundary,
+    PersistenceUnavailableError,
     TerminationReason,
     TurnResult,
 )
@@ -146,6 +147,7 @@ from .agent_events import (
     UserSteeringRequested,
     agent_event_from_dict,
     agent_event_from_json,
+    FailureReason,
 )
 from .interaction import (
     ASK_USER_TOOL_DEFINITION,
@@ -192,6 +194,7 @@ from .provider import (
     NetworkError,
     ProviderConfigurationError,
     ProviderError,
+    ProviderTimeoutError,
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
@@ -282,6 +285,7 @@ __all__ = [
     "DecisionReason",
     "Effect",
     "ExecutionBoundary",
+    "FailureReason",
     "FinishReason",
     "GateDecision",
     "GenerationCancelled",
@@ -335,6 +339,7 @@ __all__ = [
     "ProjectInstructionSource",
     "ProviderConfigurationError",
     "ProviderError",
+    "ProviderTimeoutError",
     "ProviderEvent",
     "ProviderIdentity",
     "ProviderPort",
@@ -404,6 +409,7 @@ __all__ = [
     "TurnCancelled",
     "TurnCompleted",
     "TurnFailed",
+    "PersistenceUnavailableError",
     "TurnPaused",
     "TurnPausing",
     "TurnResumed",

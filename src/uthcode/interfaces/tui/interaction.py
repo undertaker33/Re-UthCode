@@ -21,6 +21,7 @@ from uthcode.application import (
     ResumeTurnResponse,
     UserInputResponse,
     UserQuestion,
+    pause_message,
 )
 
 
@@ -400,6 +401,10 @@ class TuiInteractionState:
         if self.mode is InteractionMode.PAUSE_ACTION:
             lines: list[tuple[str, str]] = [
                 ("class:interaction.title", "已暂停：选择下一步\n"),
+                (
+                    "class:interaction.question",
+                    f"{pause_message(pause.reason)}\n",
+                ),
                 ("class:interaction.hint", "↑/↓ 选择 · Enter 确认 · Esc 返回\n"),
             ]
             for index, action in enumerate(self.actions):

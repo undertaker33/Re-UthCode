@@ -42,8 +42,10 @@ from uthcode.core.provider import (
     Message,
     NativeItemCompleted,
     NetworkError,
+    ProviderConfigurationError,
     ProviderIdentity,
     ProviderError,
+    ProviderTimeoutError,
     RateLimitError,
     ReasoningPart,
     TextDelta,
@@ -669,8 +671,10 @@ async def test_anthropic_official_errors_map_without_sdk_text() -> None:
         (SDKPermissionDeniedError("secret-permission-text", response=httpx.Response(403, request=request), body={}), AuthenticationError),
         (SDKRateLimitError("secret-rate-text", response=httpx.Response(429, request=request), body={}), RateLimitError),
         (SDKAPIConnectionError(request=request), NetworkError),
-        (SDKAPITimeoutError(request), NetworkError),
+        (SDKAPITimeoutError(request), ProviderTimeoutError),
         (SDKAPIStatusError("secret-status-text", response=httpx.Response(500, request=request), body={}), ProviderError),
+        (SDKAPIStatusError("secret-timeout-text", response=httpx.Response(408, request=request), body={}), ProviderTimeoutError),
+        (SDKAPIStatusError("secret-request-text", response=httpx.Response(400, request=request), body={}), ProviderConfigurationError),
     ]
     for error, expected in cases:
         client = _AnthropicClient(_events())

@@ -50,12 +50,12 @@ from uthcode.application import (
     OpenSessionPicker,
     PermissionMode,
     PermissionModeSelected,
-    ProviderError,
     QuitInterface,
     SessionChanged,
     TurnHandle,
     UthCodeApplication,
     create_builtin_registry,
+    failure_message as project_failure_message,
 )
 
 from .completion import CompletionMenuItem, CompletionMenuState
@@ -202,9 +202,9 @@ class UthCodeTUI:
             )
         except (EOFError, KeyboardInterrupt):
             self._closing = True
-        except Exception as exc:
+        except Exception:
             await self._emit(self._renderer.system(
-                f"界面输入错误：{type(exc).__name__}；终端状态已恢复",
+                "界面输入错误；终端状态已恢复",
                 error=True,
             ))
             self._closing = True
@@ -826,10 +826,8 @@ class UthCodeTUI:
                 self.activity = "ready"
         except asyncio.CancelledError:
             cancelled = True
-        except ProviderError:
-            failure_message = "生成失败"
-        except Exception as exc:
-            failure_message = f"生成失败：{type(exc).__name__}"
+        except Exception:
+            failure_message = project_failure_message(None)
         finally:
             if event_task is not None:
                 event_task.cancel()
@@ -935,7 +933,12 @@ class UthCodeTUI:
             elif batch.terminal == "cancelled":
                 self.activity = "cancelled"
             else:
-                writes.append(self._renderer.system("生成失败", error=True))
+                writes.append(
+                    self._renderer.system(
+                        batch.terminal_message or project_failure_message(None),
+                        error=True,
+                    )
+                )
                 self.activity = "error"
         output = "".join(writes)
         if output:
@@ -1207,10 +1210,8 @@ class UthCodeTUI:
             await awaitable
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            await self._show_error(
-                f"界面操作失败：{type(exc).__name__}；可以继续输入"
-            )
+        except Exception:
+            await self._show_error("界面操作失败；可以继续输入")
 
     def _has_preview(self) -> bool:
         return bool(self._pending_text()) and self._preview_height() > 0

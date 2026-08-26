@@ -14,6 +14,7 @@ from uthcode.core.agent import (
     AgentLoopConfig,
     AssistantMessageKind,
     ExecutionBoundary,
+    PersistenceUnavailableError,
     RunSnapshot,
     RunState,
     RunStatus,
@@ -47,6 +48,8 @@ from uthcode.core.agent_events import (
     UserInputRequested,
     agent_event_from_json,
 )
+from uthcode.core.agent_events import FailureReason
+from uthcode.core.context import ContextCompilationError
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
@@ -72,6 +75,7 @@ from uthcode.core.provider import (
     NetworkError,
     ProviderConfigurationError,
     ProviderError,
+    ProviderTimeoutError,
     ProviderIdentity,
     ProviderResponse,
     RateLimitError,
@@ -1042,26 +1046,60 @@ async def test_tool_pause_waits_for_current_call_and_continues_fifo() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure, expected_reason",
+    "failure, expected_reason, expected_failure_reason",
     (
-        (AuthenticationError("bad credentials"), TerminationReason.PROVIDER_ERROR),
-        (ProviderConfigurationError("bad configuration"), TerminationReason.PROVIDER_ERROR),
-        (MissingSecretError("secret"), TerminationReason.PROVIDER_ERROR),
-        (InvalidProviderResponseError("invalid"), TerminationReason.INVALID_PROVIDER_RESPONSE),
-        (ProviderError("other"), TerminationReason.PROVIDER_ERROR),
+        (
+            AuthenticationError("bad credentials"),
+            TerminationReason.PROVIDER_ERROR,
+            FailureReason.AUTHENTICATION,
+        ),
+        (
+            ProviderConfigurationError("bad configuration"),
+            TerminationReason.PROVIDER_ERROR,
+            FailureReason.PROVIDER_REQUEST,
+        ),
+        (
+            MissingSecretError("secret"),
+            TerminationReason.PROVIDER_ERROR,
+            FailureReason.PROVIDER_REQUEST,
+        ),
+        (
+            InvalidProviderResponseError("invalid"),
+            TerminationReason.INVALID_PROVIDER_RESPONSE,
+            FailureReason.INVALID_PROVIDER_RESPONSE,
+        ),
+        (
+            ProviderError("other"),
+            TerminationReason.PROVIDER_ERROR,
+            FailureReason.INTERNAL,
+        ),
     ),
 )
-async def test_non_recoverable_provider_errors_fail_without_pause(failure, expected_reason) -> None:
+async def test_non_recoverable_provider_errors_fail_without_pause(
+    failure,
+    expected_reason,
+    expected_failure_reason,
+) -> None:
     provider = ScriptedProvider([failure])
     segment = await _start(_loop(provider)).run_segment(pause_signal=CancellationToken())
 
     assert segment.result is not None
     assert segment.result.termination_reason is expected_reason
+    assert segment.result.failure_reason is expected_failure_reason
+    failed_event = next(event for event in segment.events if isinstance(event, TurnFailed))
+    assert failed_event.failure_reason is expected_failure_reason
     assert not any(isinstance(event, TurnPaused) for event in segment.events)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure, reason", ((NetworkError("offline"), "network_error"), (RateLimitError("busy"), "rate_limited")))
+@pytest.mark.parametrize(
+    "failure, reason",
+    (
+        (NetworkError("offline"), "network_error"),
+        (RateLimitError("busy"), "rate_limited"),
+        (ProviderTimeoutError("slow"), "timeout"),
+    ),
+)
 async def test_network_and_rate_limit_return_retry_pause_without_new_iteration(failure, reason) -> None:
     provider = ScriptedProvider([failure, [_response(TextPart("done"), usage=Usage(1, 1))]])
     execution = _start(_loop(provider))
@@ -1081,6 +1119,36 @@ async def test_network_and_rate_limit_return_retry_pause_without_new_iteration(f
     all_events = paused.events + resumed.events
     assert [event.iteration for event in all_events if isinstance(event, IterationStarted)] == [1]
     assert len([event for event in all_events if isinstance(event, UsageUpdated)]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fact, expected_failure_reason",
+    (
+        (ContextCompilationError("context-secret"), FailureReason.CONTEXT_UNRESOLVABLE),
+        (
+            PersistenceUnavailableError("persistence-secret"),
+            FailureReason.PERSISTENCE_UNAVAILABLE,
+        ),
+    ),
+)
+async def test_request_preparation_facts_preserve_context_and_persistence_reason(
+    fact,
+    expected_failure_reason,
+) -> None:
+    provider = ScriptedProvider([[_response(TextPart("must not run"))]])
+    loop = _loop(provider)
+
+    def prepare(*_args):
+        raise fact
+
+    loop._request_preparer = prepare
+    segment = await _start(loop).run_segment(pause_signal=CancellationToken())
+
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INTERNAL_ERROR
+    assert segment.result.failure_reason is expected_failure_reason
+    assert provider.call_count == 0
 
 
 @pytest.mark.asyncio

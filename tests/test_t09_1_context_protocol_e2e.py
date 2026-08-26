@@ -18,6 +18,7 @@ from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.sessions import ApplicationSessionService
 from uthcode.core.compaction import CompactionEpoch
+from uthcode.core.agent_events import FailureReason
 from uthcode.core.context import (
     CompactionResult,
     ContextBudget,
@@ -691,6 +692,7 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
     result = await application.create_run().start_turn("retry this closed fact").result()
 
     assert result.status.value != "completed"
+    assert result.failure_reason is FailureReason.PERSISTENCE_UNAVAILABLE
     assert len(provider.requests) == 0
     assert len(calls) == 2
     assert calls[0][1:] == calls[1][1:]
@@ -721,6 +723,7 @@ async def test_w05_unknown_transcript_durability_quarantines_session_and_blocks_
     result = await application.create_run().start_turn("unknown durability").result()
 
     assert result.status.value != "completed"
+    assert result.failure_reason is FailureReason.PERSISTENCE_UNAVAILABLE
     assert len(provider.requests) == 0
     assert session.durability_unknown is True
     with pytest.raises(RuntimeError, match="durability is unknown"):

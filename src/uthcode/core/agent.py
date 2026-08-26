@@ -18,6 +18,7 @@ from .agent_events import (
     AssistantMessageKind,
     BehaviorModeChanged,
     CompletionBlocked,
+    FailureReason,
     IterationStarted,
     PlanProposed,
     ReasoningDelta as AgentReasoningDelta,
@@ -43,6 +44,7 @@ from .agent_events import (
 from .provider import (
     CancellationToken,
     ContextOverflowError,
+    AuthenticationError,
     FinishReason,
     GenerationCancelled,
     GenerationCompleted,
@@ -50,9 +52,11 @@ from .provider import (
     InvalidProviderResponseError,
     Message,
     NetworkError,
+    ProviderConfigurationError,
     ProviderError,
     ProviderPort,
     RateLimitError,
+    ProviderTimeoutError,
     ReasoningDelta as ProviderReasoningDelta,
     ReasoningPart,
     TextDelta,
@@ -62,6 +66,11 @@ from .provider import (
     ToolResultPart,
     Usage,
     validated_provider_stream,
+)
+from .context import (
+    ContextBudgetError,
+    ContextCompilationError,
+    ContextRequestSafetyError,
 )
 from .interaction import (
     ASK_USER_TOOL_DEFINITION,
@@ -162,6 +171,10 @@ def _encode(value: object) -> object:
 
 class AgentLoopConfigError(ValueError):
     """Invalid Agent policy configuration."""
+
+
+class PersistenceUnavailableError(RuntimeError):
+    """A stable Application fact that closed Turn state is not durable."""
 
 
 class _ResponseRejected(ValueError):
@@ -489,6 +502,7 @@ class TurnResult:
     usage: Usage
     iteration_count: int
     tool_call_count: int
+    failure_reason: FailureReason | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.run_id, "run_id")
@@ -519,6 +533,15 @@ class TurnResult:
             raise ValueError("completed TurnResult must use final_answer")
         if status is RunStatus.CANCELLED and reason is not TerminationReason.USER_CANCELLED:
             raise ValueError("cancelled TurnResult must use user_cancelled")
+        failure_reason = self.failure_reason
+        if failure_reason is not None and not isinstance(failure_reason, FailureReason):
+            try:
+                failure_reason = FailureReason(failure_reason)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown failure reason: {self.failure_reason!r}") from exc
+            object.__setattr__(self, "failure_reason", failure_reason)
+        if status is not RunStatus.FAILED and failure_reason is not None:
+            raise ValueError("only failed TurnResult may contain a failure reason")
         if not isinstance(self.usage, Usage):
             raise TypeError("usage must be Usage")
         _require_non_negative_int(self.iteration_count, "iteration_count")
@@ -534,6 +557,9 @@ class TurnResult:
             "usage": self.usage.to_dict(),
             "iteration_count": self.iteration_count,
             "tool_call_count": self.tool_call_count,
+            "failure_reason": (
+                self.failure_reason.value if self.failure_reason is not None else None
+            ),
         }
 
     def to_json(self) -> str:
@@ -552,6 +578,7 @@ class TurnResult:
             usage=Usage.from_dict(value.get("usage", {})),  # type: ignore[arg-type]
             iteration_count=value.get("iteration_count", 0),  # type: ignore[arg-type]
             tool_call_count=value.get("tool_call_count", 0),  # type: ignore[arg-type]
+            failure_reason=value.get("failure_reason"),  # type: ignore[arg-type]
         )
 
     @classmethod
@@ -560,6 +587,30 @@ class TurnResult:
         if not isinstance(parsed, Mapping):
             raise TypeError("TurnResult JSON must contain an object")
         return cls.from_dict(parsed)
+
+
+def _failure_reason_for_exception(error: BaseException) -> FailureReason:
+    """Map only stable Core/Application facts to the public failure enum."""
+
+    if isinstance(error, AuthenticationError):
+        return FailureReason.AUTHENTICATION
+    if isinstance(error, ProviderConfigurationError):
+        return FailureReason.PROVIDER_REQUEST
+    if isinstance(error, InvalidProviderResponseError):
+        return FailureReason.INVALID_PROVIDER_RESPONSE
+    if isinstance(
+        error,
+        (
+            ContextOverflowError,
+            ContextBudgetError,
+            ContextCompilationError,
+            ContextRequestSafetyError,
+        ),
+    ):
+        return FailureReason.CONTEXT_UNRESOLVABLE
+    if isinstance(error, PersistenceUnavailableError):
+        return FailureReason.PERSISTENCE_UNAVAILABLE
+    return FailureReason.INTERNAL
 
 
 RequestPreparer = Callable[
@@ -1167,8 +1218,12 @@ class AgentTurnExecution:
                     )
                     if not isinstance(request, GenerationRequest):
                         raise TypeError("request_preparer must return GenerationRequest")
-                except Exception:
-                    return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+                except Exception as error:
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.INTERNAL_ERROR,
+                        _failure_reason_for_exception(error),
+                    )
 
                 # A preparer may yield after pause/cancel was requested.  This
                 # is the safe boundary before any Provider attempt exists.
@@ -1224,6 +1279,18 @@ class AgentTurnExecution:
                         return self._pause_user_segment(events, iteration)
                     self._set_provider_continuation(iteration, provider_retry_pending=True)
                     return self._pause_provider_segment(events, iteration, PauseReason.NETWORK_ERROR)
+                except ProviderTimeoutError:
+                    if self._cancellation.cancelled:
+                        return self._cancel_segment(events)
+                    if self._pending_steering is not None:
+                        self._apply_pending_steering(events)
+                        pause_signal = self._renew_pause_signal_after_steering()
+                        continue
+                    if pause_signal.cancelled:
+                        self._set_provider_continuation(iteration)
+                        return self._pause_user_segment(events, iteration)
+                    self._set_provider_continuation(iteration, provider_retry_pending=True)
+                    return self._pause_provider_segment(events, iteration, PauseReason.TIMEOUT)
                 except RateLimitError:
                     if self._cancellation.cancelled:
                         return self._cancel_segment(events)
@@ -1248,7 +1315,11 @@ class AgentTurnExecution:
                         pause_signal = self._renew_pause_signal_after_steering()
                         continue
                     if self._overflow_retry_used or self._loop._overflow_handler is None:
-                        return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                        return self._fail_segment(
+                            events,
+                            TerminationReason.PROVIDER_ERROR,
+                            FailureReason.CONTEXT_UNRESOLVABLE,
+                        )
                     self._overflow_retry_used = True
                     try:
                         retry_value = self._loop._overflow_handler()
@@ -1260,20 +1331,32 @@ class AgentTurnExecution:
                     except Exception:
                         can_retry = False
                     if not isinstance(can_retry, bool) or not can_retry:
-                        return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                        return self._fail_segment(
+                            events,
+                            TerminationReason.PROVIDER_ERROR,
+                            FailureReason.CONTEXT_UNRESOLVABLE,
+                        )
                     self._continuation = None
                     continue
-                except ProviderError:
+                except ProviderError as error:
                     if self._pending_steering is not None:
                         self._apply_pending_steering(events)
                         pause_signal = self._renew_pause_signal_after_steering()
                         continue
-                    return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.PROVIDER_ERROR,
+                        _failure_reason_for_exception(error),
+                    )
                 except CancelledError:
                     self._cancellation.cancel()
                     return self._cancel_segment(events)
                 except Exception:
-                    return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.INTERNAL_ERROR,
+                        FailureReason.INTERNAL,
+                    )
                 finally:
                     if self._active_segment_signal is pause_signal:
                         self._active_segment_signal = None
@@ -1299,7 +1382,11 @@ class AgentTurnExecution:
 
                 finish_reason = provider_response.finish_reason
                 if finish_reason is FinishReason.ERROR:
-                    return self._fail_segment(events, TerminationReason.PROVIDER_ERROR)
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.PROVIDER_ERROR,
+                        FailureReason.INTERNAL,
+                    )
                 if finish_reason is FinishReason.CANCELLED:
                     return self._cancel_segment(events)
                 if finish_reason is FinishReason.UNKNOWN:
@@ -2502,9 +2589,23 @@ class AgentTurnExecution:
         self,
         events: list[AgentEvent],
         reason: TerminationReason,
+        failure_reason: FailureReason | None = None,
     ) -> AgentExecutionSegment:
-        self._set_terminal(RunStatus.FAILED, reason, None)
-        self._append(events, TurnFailed(self._state.run_id, self._state.turn_id, reason))
+        if failure_reason is None:
+            if reason is TerminationReason.INTERNAL_ERROR:
+                failure_reason = FailureReason.INTERNAL
+            elif reason is TerminationReason.INVALID_PROVIDER_RESPONSE:
+                failure_reason = FailureReason.INVALID_PROVIDER_RESPONSE
+        self._set_terminal(RunStatus.FAILED, reason, None, failure_reason)
+        self._append(
+            events,
+            TurnFailed(
+                self._state.run_id,
+                self._state.turn_id,
+                reason,
+                failure_reason,
+            ),
+        )
         return self._terminal_segment(events)
 
     def _cancel_segment(self, events: list[AgentEvent]) -> AgentExecutionSegment:
@@ -2522,6 +2623,7 @@ class AgentTurnExecution:
         status: RunStatus,
         reason: TerminationReason,
         final_text: str | None,
+        failure_reason: FailureReason | None = None,
     ) -> None:
         if self._terminal_result is not None:
             return
@@ -2535,6 +2637,7 @@ class AgentTurnExecution:
             usage=self._state.usage,
             iteration_count=self._state.iteration_count,
             tool_call_count=self._state.tool_call_count,
+            failure_reason=failure_reason,
         )
         self._continuation = None
         self._batch_id = None

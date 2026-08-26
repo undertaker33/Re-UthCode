@@ -13,9 +13,11 @@ import pytest
 from uthcode.application import (
     ApplicationRuntimeContext,
     EffectiveConfig,
+    FailureReason,
     GenerationCompleted,
     LaunchOptions,
     Message,
+    PauseReason,
     ProviderKind,
     ProviderResponse,
     create_application,
@@ -24,8 +26,11 @@ from uthcode.application import (
     TurnHandle,
     UthCodeApplication,
     Usage,
+    failure_message,
+    pause_message,
 )
 from uthcode.core.provider import (
+    AuthenticationError,
     CancellationToken,
     FinishReason,
     GenerationCancelled,
@@ -248,7 +253,7 @@ def test_exec_classifies_provider_errors_and_cancellation() -> None:
     result, stdout, stderr = _injected_main(["exec", "hello"], failed)
     assert result == 1
     assert stdout == ""
-    assert "provider" in stderr
+    assert pause_message(PauseReason.NETWORK_ERROR) in stderr
     assert secret not in stderr
 
     cancelled = UthCodeApplication(_CancelledProvider())
@@ -256,6 +261,24 @@ def test_exec_classifies_provider_errors_and_cancellation() -> None:
     assert result == 130
     assert stdout == ""
     assert "cancelled" in stderr
+
+
+def test_exec_uses_application_failure_projection_for_authentication() -> None:
+    secret = "sk-auth-secret"
+    failed = UthCodeApplication(
+        FakeProvider(
+            events=(),
+            error=AuthenticationError(secret),
+            model_limits=TEST_LIMITS,
+        )
+    )
+
+    result, stdout, stderr = _injected_main(["exec", "hello"], failed)
+
+    assert result == 1
+    assert stdout == ""
+    assert failure_message(FailureReason.AUTHENTICATION) in stderr
+    assert secret not in stderr
 
 
 def test_exec_projects_reasoning_and_unclassified_text_only_to_stderr_or_terminal() -> None:
@@ -287,7 +310,7 @@ def test_exec_projects_incomplete_message_to_stderr_and_fails() -> None:
     assert result == 1
     assert stdout == ""
     assert "incomplete answer" in stderr
-    assert "max_output_tokens" in stderr
+    assert failure_message(None) in stderr
 
 
 def test_exec_cancels_permission_pause_without_auto_approval_or_secret_leak(
@@ -375,8 +398,8 @@ def test_exec_cancels_turn_when_agent_pauses(
 @pytest.mark.parametrize(
     ("error", "diagnostic"),
     [
-        (NetworkError("network-secret"), "provider temporarily unavailable"),
-        (RateLimitError("rate-secret"), "provider temporarily unavailable"),
+        (NetworkError("network-secret"), pause_message(PauseReason.NETWORK_ERROR)),
+        (RateLimitError("rate-secret"), pause_message(PauseReason.RATE_LIMITED)),
     ],
 )
 def test_exec_cancels_turn_when_provider_pauses(

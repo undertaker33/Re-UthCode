@@ -27,8 +27,10 @@ from uthcode.core.provider import (
     Message,
     NativeItemCompleted,
     NetworkError,
+    ProviderConfigurationError,
     ProviderIdentity,
     ProviderError,
+    ProviderTimeoutError,
     RateLimitError,
     ReasoningDelta,
     ReasoningPart,
@@ -592,8 +594,10 @@ async def test_responses_official_errors_are_safe() -> None:
         (SDKPermissionDeniedError("secret-permission", response=httpx.Response(403, request=request), body={}), AuthenticationError),
         (SDKRateLimitError("secret-rate", response=httpx.Response(429, request=request), body={}), RateLimitError),
         (SDKAPIConnectionError(request=request), NetworkError),
-        (SDKAPITimeoutError(request), NetworkError),
+        (SDKAPITimeoutError(request), ProviderTimeoutError),
         (SDKAPIStatusError("secret-status", response=httpx.Response(500, request=request), body={}), ProviderError),
+        (SDKAPIStatusError("secret-timeout", response=httpx.Response(408, request=request), body={}), ProviderTimeoutError),
+        (SDKAPIStatusError("secret-request", response=httpx.Response(400, request=request), body={}), ProviderConfigurationError),
     ]
     for error, expected in cases:
         client = _OpenAIClient(_item_events())

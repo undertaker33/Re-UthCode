@@ -38,16 +38,16 @@
 
 ## T04：稳定 FailureReason 与 PauseReason 保真
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_agent_events.py tests/test_agent_loop.py tests/test_application_runs.py tests/test_cli.py tests/test_tui.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py tests/test_openai_compat_integration.py -q`，全部通过。
-- [ ] `FailureReason` 是小而稳定、Provider-independent、JSON-safe 的 machine semantic；认证、可靠 provider request/configuration、invalid response、context unresolvable、稳定 persistence unavailable 与 internal 的现有可辨识链路各有定向测试。
-- [ ] `TurnFailed` 与 failed `TurnResult` JSON round-trip 保留 failure reason；successful/cancelled result 没有伪造 failure reason，`TerminationReason` 不被具体错误分类替代。
-- [ ] native SDK exception 在 Integration 内转换；Core/Application public contract 与 Interface 不导入 SDK exception 类型或按 HTTP status 猜测。
-- [ ] network、rate limit、timeout 的 recoverable 场景仍产生 typed Pause/Retry，不被改成 terminal failure；可可靠区分的 timeout 不再被错误投影为普通 network，取消/恢复与 stale response 回归通过。
-- [ ] Application 对同一 FailureReason/PauseReason只生成一套 one-line projection；CLI、TUI、Headless 测试观察到一致语义，Interface 不维护 exception classifier。
-- [ ] 注入含假 secret、SDK class name、traceback 和 raw body 的异常后，public event/result/message 均不包含这些内容。
-- [ ] `rg -n "isinstance\(.*(OpenAI|Anthropic)|APIStatusError|AuthenticationError|RateLimitError" src/uthcode/interfaces src/uthcode/application` 的命中均不构成 Interface SDK 分类或 Application Provider-native 分类；结果在 Feedback 逐条说明。
-- [ ] `rg -n "ErrorManager|ErrorRegistry|FailureManager|FailureRegistry" src tests` 返回 0 条。
-- [ ] D-T09-3-07 在 T04 Core contract、Application projection、cross-interface tests 与 W03 Feedback 中均有证据。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_agent_events.py tests/test_agent_loop.py tests/test_application_runs.py tests/test_cli.py tests/test_tui.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py tests/test_openai_compat_integration.py -q`，全部通过。
+- [x] `FailureReason` 是小而稳定、Provider-independent、JSON-safe 的 machine semantic；认证、可靠 provider request/configuration、invalid response、context unresolvable、稳定 persistence unavailable 与 internal 的现有可辨识链路各有定向测试。
+- [x] `TurnFailed` 与 failed `TurnResult` JSON round-trip 保留 failure reason；successful/cancelled result 没有伪造 failure reason，`TerminationReason` 不被具体错误分类替代。
+- [x] native SDK exception 在 Integration 内转换；Core/Application public contract 与 Interface 不导入 SDK exception 类型或按 HTTP status 猜测。
+- [x] network、rate limit、timeout 的 recoverable 场景仍产生 typed Pause/Retry，不被改成 terminal failure；可可靠区分的 timeout 不再被错误投影为普通 network，取消/恢复与 stale response 回归通过。
+- [x] Application 对同一 FailureReason/PauseReason只生成一套 one-line projection；CLI、TUI、Headless 测试观察到一致语义，Interface 不维护 exception classifier。
+- [x] 注入含假 secret、SDK class name、traceback 和 raw body 的异常后，public event/result/message 均不包含这些内容。
+- [x] `rg -n "isinstance\(.*(OpenAI|Anthropic)|APIStatusError|AuthenticationError|RateLimitError" src/uthcode/interfaces src/uthcode/application` 的命中均不构成 Interface SDK 分类或 Application Provider-native 分类；结果在 Feedback 逐条说明。
+- [x] `rg -n "ErrorManager|ErrorRegistry|FailureManager|FailureRegistry" src tests` 返回 0 条。
+- [x] D-T09-3-07 在 T04 Core contract、Application projection、cross-interface tests 与 W03 Feedback 中均有证据。
 
 ## T05：256K profile、cache 与 failure Eval 调优
 

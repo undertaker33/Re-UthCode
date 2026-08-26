@@ -107,6 +107,7 @@ def test_enums_and_pause_combinations_are_fixed() -> None:
         "user_input_required",
         "network_error",
         "rate_limited",
+        "timeout",
         "permission_required",
         "plan_review_required",
     ]
@@ -135,6 +136,15 @@ def test_enums_and_pause_combinations_are_fixed() -> None:
         "turn-1",
         PauseKind.PROVIDER_UNAVAILABLE,
         PauseReason.RATE_LIMITED,
+        1,
+        "now",
+    )
+    PauseRequest(
+        "pause-timeout",
+        "run-1",
+        "turn-1",
+        PauseKind.PROVIDER_UNAVAILABLE,
+        PauseReason.TIMEOUT,
         1,
         "now",
     )
