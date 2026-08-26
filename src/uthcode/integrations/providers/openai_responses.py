@@ -33,11 +33,13 @@ from uthcode.core.provider import (
     NativeItemCompleted,
     NetworkError,
     ProviderError,
+    ProviderConfigurationError,
     ProviderEvent,
     ProviderIdentity,
     ProviderPort,
     ProviderResponse,
     RateLimitError,
+    ProviderTimeoutError,
     ReasoningDelta,
     ReasoningPart,
     TextDelta,
@@ -466,19 +468,27 @@ def _map_error(error: BaseException) -> ProviderError:
         return error
     if isinstance(error, InvalidProviderResponseError):
         return InvalidProviderResponseError()
+    if isinstance(error, ProviderError):
+        return error
     if isinstance(error, (SDKAuthenticationError, PermissionDeniedError)):
         return AuthenticationError()
     if isinstance(error, SDKRateLimitError):
         return RateLimitError()
-    if isinstance(error, (APIConnectionError, APITimeoutError, TimeoutError, OSError)):
+    if isinstance(error, (APITimeoutError, TimeoutError)):
+        return ProviderTimeoutError()
+    if isinstance(error, (APIConnectionError, OSError)):
         return NetworkError()
     if isinstance(error, APIStatusError):
         if error.status_code in {401, 403}:
             return AuthenticationError()
         if error.status_code == 429:
             return RateLimitError()
+        if error.status_code in {408, 504}:
+            return ProviderTimeoutError()
         if error.status_code == 413:
             return ContextOverflowError()
+        if error.status_code in {400, 422}:
+            return ProviderConfigurationError()
         return ProviderError()
     return ProviderError()
 

@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from uthcode.core.agent import AssistantMessageKind, TerminationReason
+from uthcode.core.agent import (
+    AssistantMessageKind,
+    RunStatus,
+    TerminationReason,
+    TurnResult,
+)
 from uthcode.core.agent_events import (
     AgentEvent,
     AssistantMessageCompleted,
@@ -26,12 +31,15 @@ from uthcode.core.agent_events import (
     TurnCompleted,
     TurnFailed,
     TurnStarted,
+    FailureReason,
     UsageUpdated,
     UserSteeringApplied,
     UserSteeringRequested,
     agent_event_from_dict,
     agent_event_from_json,
+    TurnPausing,
 )
+from uthcode.core.interaction import PauseKind, PauseReason
 from uthcode.core.planning import BehaviorMode, TaskItem, TaskState, TaskStatus
 from uthcode.core.provider import Message, NativeItem, TextPart, ToolCallPart, ToolResultPart, Usage
 
@@ -89,7 +97,12 @@ def _events() -> tuple[AgentEvent, ...]:
         ),
         ToolBatchFinished("run-1", "turn-1", 1, "batch-1", ("call-1",), "finished"),
         TurnCompleted("run-1", "turn-1", "answer"),
-        TurnFailed("run-1", "turn-2", TerminationReason.PROVIDER_ERROR),
+        TurnFailed(
+            "run-1",
+            "turn-2",
+            TerminationReason.PROVIDER_ERROR,
+            FailureReason.AUTHENTICATION,
+        ),
         TurnCancelled("run-1", "turn-3"),
     )
 
@@ -100,6 +113,81 @@ def test_all_agent_events_are_frozen_and_json_round_trip() -> None:
         assert restored == event
         assert json.loads(event.to_json())["type"] == event.event_type
         assert isinstance(restored, AgentEvent)
+
+
+def test_timeout_provider_pause_event_is_public_and_round_trips() -> None:
+    event = TurnPausing(
+        "run-1",
+        "turn-1",
+        "pause-1",
+        PauseKind.PROVIDER_UNAVAILABLE,
+        PauseReason.TIMEOUT,
+        1,
+    )
+
+    payload = event.to_dict()
+    assert payload["kind"] == "provider_unavailable"
+    assert payload["reason"] == "timeout"
+    assert agent_event_from_json(event.to_json()) == event
+
+    with pytest.raises(ValueError):
+        TurnPausing(
+            "run-1",
+            "turn-1",
+            "pause-1",
+            PauseKind.PROVIDER_UNAVAILABLE,
+            PauseReason.USER_REQUESTED,
+            1,
+        )
+
+
+def test_failure_reason_is_distinct_from_termination_and_round_trips() -> None:
+    failed_event = TurnFailed(
+        "run-1",
+        "turn-2",
+        TerminationReason.PROVIDER_ERROR,
+        FailureReason.AUTHENTICATION,
+    )
+    assert agent_event_from_json(failed_event.to_json()) == failed_event
+    assert failed_event.to_dict()["termination_reason"] == "provider_error"
+    assert failed_event.to_dict()["failure_reason"] == "authentication"
+
+    failed_result = TurnResult(
+        run_id="run-1",
+        turn_id="turn-2",
+        status=RunStatus.FAILED,
+        termination_reason=TerminationReason.PROVIDER_ERROR,
+        final_text=None,
+        usage=Usage(),
+        iteration_count=1,
+        tool_call_count=0,
+        failure_reason=FailureReason.AUTHENTICATION,
+    )
+    assert TurnResult.from_json(failed_result.to_json()) == failed_result
+
+    cancelled_result = TurnResult(
+        run_id="run-1",
+        turn_id="turn-3",
+        status=RunStatus.CANCELLED,
+        termination_reason=TerminationReason.USER_CANCELLED,
+        final_text=None,
+        usage=Usage(),
+        iteration_count=0,
+        tool_call_count=0,
+    )
+    assert cancelled_result.failure_reason is None
+    with pytest.raises(ValueError):
+        TurnResult(
+            run_id="run-1",
+            turn_id="turn-4",
+            status=RunStatus.COMPLETED,
+            termination_reason=TerminationReason.FINAL_ANSWER,
+            final_text="done",
+            usage=Usage(),
+            iteration_count=1,
+            tool_call_count=0,
+            failure_reason=FailureReason.INTERNAL,
+        )
 
 
 def test_reasoning_events_can_represent_multiple_ordered_segments() -> None:

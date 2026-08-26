@@ -138,6 +138,7 @@ class PauseReason(str, Enum):
     USER_INPUT_REQUIRED = "user_input_required"
     NETWORK_ERROR = "network_error"
     RATE_LIMITED = "rate_limited"
+    TIMEOUT = "timeout"
     PERMISSION_REQUIRED = "permission_required"
     PLAN_REVIEW_REQUIRED = "plan_review_required"
 
@@ -623,6 +624,7 @@ class PauseRequest(_JsonModel):
             PauseKind.PROVIDER_UNAVAILABLE: {
                 PauseReason.NETWORK_ERROR,
                 PauseReason.RATE_LIMITED,
+                PauseReason.TIMEOUT,
             },
             PauseKind.PERMISSION_REQUIRED: {PauseReason.PERMISSION_REQUIRED},
             PauseKind.PLAN_REVIEW_REQUIRED: {PauseReason.PLAN_REVIEW_REQUIRED},

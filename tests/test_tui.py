@@ -21,6 +21,7 @@ from uthcode.application import (
     BehaviorModeChanged,
     BehaviorModeSelected,
     CompletionBlocked,
+    FailureReason,
     GenerationCompleted,
     GenerationRequest,
     Message,
@@ -55,6 +56,8 @@ from uthcode.application import (
     UserSteeringRequested,
     UserInputRequest,
     UserQuestion,
+    failure_message,
+    pause_message,
 )
 from uthcode.core.provider import (
     CancellationToken,
@@ -64,6 +67,8 @@ from uthcode.core.provider import (
     ProviderEvent,
     RateLimitError,
 )
+from uthcode.core.agent import TerminationReason
+from uthcode.core.agent_events import TurnFailed
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.interfaces.tui.app import (
@@ -714,6 +719,34 @@ def test_t08_events_project_plan_task_mode_steering_and_completion_control() -> 
     assert blocked.activity == "continuing · 2 unfinished tasks"
     assert blocked.text == () and blocked.final_text is None
     assert mode is not None and mode.activity == "mode: default"
+
+
+@pytest.mark.asyncio
+async def test_tui_consumes_application_failure_projection_without_native_details() -> None:
+    renderer = AgentEventRenderer(clock=lambda: 10.0)
+    event = TurnFailed(
+        "run",
+        "turn",
+        TerminationReason.PROVIDER_ERROR,
+        FailureReason.AUTHENTICATION,
+    )
+    batch = renderer.push(event)
+
+    assert batch is not None
+    assert batch.terminal == "failed"
+    assert batch.terminal_message == failure_message(FailureReason.AUTHENTICATION)
+
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    await tui._apply_batch(batch)
+    rendered = output.getvalue()
+    assert failure_message(FailureReason.AUTHENTICATION) in rendered
+    assert "AuthenticationError" not in rendered
+    assert "traceback" not in rendered
+
+
+def test_tui_pause_projection_uses_the_application_owner() -> None:
+    assert pause_message(PauseReason.TIMEOUT) == "provider request timed out; retry available"
 
 
 @pytest.mark.asyncio
@@ -2397,7 +2430,7 @@ async def test_interaction_error_is_visible_and_input_can_continue() -> None:
 
     tui._spawn(fail())
     await _wait_until(lambda: not tui._background_tasks)
-    assert "界面操作失败：ValueError；可以继续输入" in output.getvalue()
+    assert "界面操作失败；可以继续输入" in output.getvalue()
     assert not tui._closing
 
 

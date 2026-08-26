@@ -15,7 +15,12 @@ from .bootstrap import (
     create_application,
     load_effective_config,
 )
-from .generation import ApplicationStatus, UthCodeApplication
+from .generation import (
+    ApplicationStatus,
+    UthCodeApplication,
+    failure_message,
+    pause_message,
+)
 from .context import ApplicationContextService
 from .instructions import (
     InstructionAuthorization,
@@ -76,6 +81,7 @@ from uthcode.core import (
     CompactionResult,
     ContextOverflowError,
     CompletionBlocked,
+    FailureReason,
     GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
@@ -180,6 +186,7 @@ __all__ = [
     "ContextOverflowError",
     "ContextUsage",
     "CompletionBlocked",
+    "FailureReason",
     "GenerationCancelled",
     "GenerationCompleted",
     "GenerationRequest",
@@ -256,8 +263,10 @@ __all__ = [
     "UiAction",
     "complete_commands",
     "create_application",
+    "failure_message",
     "create_builtin_registry",
     "load_effective_config",
     "parse_command",
+    "pause_message",
     "parse_instruction_references",
 ]

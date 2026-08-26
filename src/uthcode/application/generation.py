@@ -13,11 +13,13 @@ from typing import Any
 from uthcode.core.agent import (
     AgentLoop,
     AgentTurnExecution,
+    PersistenceUnavailableError,
     PermissionResolver,
     RunState,
     SessionGrantSink,
 )
-from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
+from uthcode.core.agent_events import FailureReason
+from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION, PauseReason
 from uthcode.core.planning import (
     BehaviorMode,
     PROPOSE_PLAN_TOOL_DEFINITION,
@@ -89,6 +91,52 @@ ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
 PermissionWriter = Callable[[PermissionMode], object]
 PermissionRulesLoader = Callable[[], RuleSet]
+
+
+def failure_message(reason: FailureReason | None) -> str:
+    """Return the sole safe one-line projection for a terminal failure fact."""
+
+    try:
+        if reason is not None and not isinstance(reason, FailureReason):
+            reason = FailureReason(reason)
+    except (TypeError, ValueError):
+        reason = None
+    if reason is FailureReason.AUTHENTICATION:
+        return "Provider 认证失败，请检查凭据或配置。"
+    if reason is FailureReason.PROVIDER_REQUEST:
+        return "Provider 请求或配置无效，请检查模型和请求设置。"
+    if reason is FailureReason.INVALID_PROVIDER_RESPONSE:
+        return "Provider 返回了无法处理的响应，请稍后重试。"
+    if reason is FailureReason.CONTEXT_UNRESOLVABLE:
+        return "当前会话内容无法安全整理，请缩短请求或重试。"
+    if reason is FailureReason.PERSISTENCE_UNAVAILABLE:
+        return "会话无法安全保存，请检查存储后重试。"
+    return "生成失败，请稍后重试。"
+
+
+def pause_message(reason: PauseReason | None) -> str:
+    """Return the sole safe one-line projection for a pause fact."""
+
+    try:
+        if reason is not None and not isinstance(reason, PauseReason):
+            reason = PauseReason(reason)
+    except (TypeError, ValueError):
+        reason = None
+    if reason is PauseReason.USER_REQUESTED:
+        return "generation paused; resume or cancel"
+    if reason is PauseReason.USER_INPUT_REQUIRED:
+        return "generation requires interactive input"
+    if reason is PauseReason.NETWORK_ERROR:
+        return "provider temporarily unavailable"
+    if reason is PauseReason.RATE_LIMITED:
+        return "provider temporarily unavailable"
+    if reason is PauseReason.TIMEOUT:
+        return "provider request timed out; retry available"
+    if reason is PauseReason.PERMISSION_REQUIRED:
+        return "permission approval required; non-interactive execution was cancelled"
+    if reason is PauseReason.PLAN_REVIEW_REQUIRED:
+        return "plan review required before continuing"
+    return "generation paused and cannot continue non-interactively"
 
 
 def _reasoning_options(effort: str | None) -> ReasoningOptions | None:
@@ -1506,7 +1554,7 @@ class UthCodeApplication:
                             "persist_closed_messages returned an invalid cursor"
                         )
                     if persisted_cursor < len(messages):
-                        raise RuntimeError(
+                        raise PersistenceUnavailableError(
                             "closed Transcript facts could not be durably persisted"
                         )
                     # Keep the active Turn as the current conversation tail.

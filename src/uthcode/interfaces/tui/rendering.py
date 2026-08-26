@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from uthcode.application import AgentEvent, ContextUsage, TextPart
+from uthcode.application import AgentEvent, ContextUsage, TextPart, failure_message
 
 
 _STREAM_RENDER_INTERVAL_SECONDS = 0.2
@@ -110,6 +110,7 @@ class RenderBatch:
     text: tuple[TextUpdate, ...] = ()
     tools: tuple[ToolUpdate, ...] = ()
     terminal: str | None = None
+    terminal_message: str | None = None
     final_text: str | None = None
     activity: str | None = None
 
@@ -122,6 +123,7 @@ class RenderBatch:
             or self.text
             or self.tools
             or self.terminal
+            or self.terminal_message
             or self.activity
         )
 
@@ -337,7 +339,13 @@ class AgentEventRenderer:
                 final_text=_text_value(event, "final_text"),
             )
         if event_type == "turn_failed":
-            return replace(self.flush(), terminal="failed")
+            return replace(
+                self.flush(),
+                terminal="failed",
+                terminal_message=failure_message(
+                    getattr(event, "failure_reason", None)
+                ),
+            )
         if event_type == "turn_cancelled":
             return replace(self.flush(), terminal="cancelled")
         return None

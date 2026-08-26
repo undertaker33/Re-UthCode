@@ -17,7 +17,8 @@ from uthcode.application import (
     ConfigurationInitializationRequired,
     EffectiveConfig,
     LaunchOptions,
-    PauseKind,
+    failure_message,
+    pause_message,
     ProviderError,
     TextPart,
     TurnHandle,
@@ -177,8 +178,8 @@ class _ExecProjection:
             return 130
 
         if event_type == "turn_failed":
-            reason = _enum_value(_event_value(event, "termination_reason", "internal_error"))
-            _write_diagnostic(stderr, f"generation failed: {reason}")
+            reason = _event_value(event, "failure_reason")
+            _write_diagnostic(stderr, failure_message(reason))
             return 1
 
         return None
@@ -186,14 +187,7 @@ class _ExecProjection:
 
 def _pause_diagnostic(event: AgentEvent) -> str:
     pause = _event_value(event, "pause")
-    kind = _enum_value(_event_value(pause, "kind", ""))
-    if kind == PauseKind.USER_INPUT_REQUIRED.value:
-        return "generation requires interactive input"
-    if kind == PauseKind.PROVIDER_UNAVAILABLE.value:
-        return "provider temporarily unavailable"
-    if kind == PauseKind.PERMISSION_REQUIRED.value:
-        return "permission approval required; non-interactive execution was cancelled"
-    return "generation paused and cannot continue non-interactively"
+    return pause_message(_event_value(pause, "reason"))
 
 
 async def _stream_exec(
@@ -229,9 +223,6 @@ async def _stream_exec(
     except asyncio.CancelledError:
         _write_diagnostic(stderr, "generation cancelled")
         return 130
-    except ProviderError:
-        _write_diagnostic(stderr, "provider error: request failed")
-        return 1
     except Exception:
         _write_diagnostic(stderr, "provider error: generation failed")
         return 1

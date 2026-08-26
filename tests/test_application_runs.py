@@ -49,7 +49,9 @@ from uthcode.core.agent_events import (
     UserSteeringApplied,
     UserSteeringRequested,
     TurnStarted,
+    FailureReason,
 )
+from uthcode.core.context import ContextCompilationError
 from uthcode.core.agent import AgentTurnExecution
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
@@ -383,6 +385,34 @@ async def test_context_limits_resolve_once_per_turn_and_refresh_next_turn() -> N
         request.metadata["context_budget"]["effective_input_source"]
         for request in provider.requests
     ] == ["default", "default", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_context_compilation_failure_is_projected_without_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(((_response(TextPart("must not run")),),))
+    application = UthCodeApplication(provider)
+
+    def fail_compose(*_args: object, **_kwargs: object) -> object:
+        raise ContextCompilationError(
+            "context-secret traceback and raw provider body must stay private"
+        )
+
+    monkeypatch.setattr(
+        application._context_service,
+        "compose_generation_request",
+        fail_compose,
+    )
+    result = await application.create_run().start_turn("context failure").result()
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure_reason is FailureReason.CONTEXT_UNRESOLVABLE
+    assert provider.requests == []
+    serialized = result.to_json()
+    assert "context-secret" not in serialized
+    assert "traceback" not in serialized
+    assert "raw provider body" not in serialized
 
 
 async def _collect(handle: TurnHandle) -> list[AgentEvent]:

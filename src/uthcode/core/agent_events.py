@@ -394,6 +394,7 @@ class TurnPausing(AgentEvent):
             PauseKind.PROVIDER_UNAVAILABLE: {
                 PauseReason.NETWORK_ERROR,
                 PauseReason.RATE_LIMITED,
+                PauseReason.TIMEOUT,
             },
             PauseKind.PERMISSION_REQUIRED: {PauseReason.PERMISSION_REQUIRED},
             PauseKind.PLAN_REVIEW_REQUIRED: {PauseReason.PLAN_REVIEW_REQUIRED},
@@ -551,6 +552,17 @@ class ToolBatchFinished(AgentEvent):
         _require_text(self.status, "status")
 
 
+class FailureReason(str, Enum):
+    """Small, Provider-independent facts for terminal Turn failures."""
+
+    AUTHENTICATION = "authentication"
+    PROVIDER_REQUEST = "provider_request"
+    INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
+    CONTEXT_UNRESOLVABLE = "context_unresolvable"
+    PERSISTENCE_UNAVAILABLE = "persistence_unavailable"
+    INTERNAL = "internal"
+
+
 class TerminationReason(str, Enum):
     FINAL_ANSWER = "final_answer"
     MAX_ITERATIONS = "max_iterations"
@@ -578,6 +590,7 @@ class TurnCompleted(AgentEvent):
 class TurnFailed(AgentEvent):
     event_type: ClassVar[str] = "turn_failed"
     termination_reason: TerminationReason
+    failure_reason: FailureReason | None = None
 
     def __post_init__(self) -> None:
         AgentEvent.__post_init__(self)
@@ -588,6 +601,13 @@ class TurnFailed(AgentEvent):
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"unknown termination reason: {self.termination_reason!r}") from exc
             object.__setattr__(self, "termination_reason", reason)
+        failure_reason = self.failure_reason
+        if failure_reason is not None and not isinstance(failure_reason, FailureReason):
+            try:
+                failure_reason = FailureReason(failure_reason)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unknown failure reason: {self.failure_reason!r}") from exc
+            object.__setattr__(self, "failure_reason", failure_reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,8 +951,17 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
         _expect_keys(payload, {"type", "run_id", "turn_id", "final_text"})
         return TurnCompleted(run_id, turn_id, _required(payload, "final_text"))  # type: ignore[arg-type]
     if event_type == TurnFailed.event_type:
-        _expect_keys(payload, {"type", "run_id", "turn_id", "termination_reason"})
-        return TurnFailed(run_id, turn_id, _required(payload, "termination_reason"))  # type: ignore[arg-type]
+        _expect_keys(
+            payload,
+            {"type", "run_id", "turn_id", "termination_reason", "failure_reason"},
+        )
+        failure_reason = payload.get("failure_reason")
+        return TurnFailed(
+            run_id,
+            turn_id,
+            _required(payload, "termination_reason"),  # type: ignore[arg-type]
+            failure_reason,  # type: ignore[arg-type]
+        )
 
     _expect_keys(payload, {"type", "run_id", "turn_id", "termination_reason"})
     return TurnCancelled(run_id, turn_id, _required(payload, "termination_reason"))  # type: ignore[arg-type]
@@ -953,6 +982,7 @@ __all__ = [
     "AssistantMessageDelta",
     "BehaviorModeChanged",
     "CompletionBlocked",
+    "FailureReason",
     "IterationStarted",
     "PlanProposed",
     "ReasoningDelta",

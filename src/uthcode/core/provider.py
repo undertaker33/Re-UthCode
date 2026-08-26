@@ -931,6 +931,12 @@ class NetworkError(ProviderError):
     code = "network_error"
 
 
+class ProviderTimeoutError(ProviderError):
+    """A Provider request exceeded its timeout without becoming terminal."""
+
+    code = "timeout_error"
+
+
 class InvalidProviderResponseError(ProviderError):
     code = "invalid_provider_response"
 
@@ -1084,6 +1090,7 @@ __all__ = [
     "NativeItem",
     "NativeItemCompleted",
     "NetworkError",
+    "ProviderTimeoutError",
     "ProviderConfigurationError",
     "ProviderError",
     "ProviderEvent",
