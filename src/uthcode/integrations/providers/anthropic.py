@@ -228,8 +228,40 @@ def _request_messages(
     return messages
 
 
-def _request_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
+def _stable_cache_breakpoint(request: GenerationRequest) -> bool:
+    stable_prefix = request.metadata.get("stable_prefix_fingerprint")
+    if not isinstance(stable_prefix, str) or not stable_prefix.strip():
+        return False
+    tool_schema = request.metadata.get("tool_schema_fingerprint")
+    return not request.tools or (
+        isinstance(tool_schema, str) and bool(tool_schema.strip())
+    )
+
+
+def _request_system(
+    request: GenerationRequest,
+    *,
+    cache_breakpoint: bool,
+) -> str | list[dict[str, object]] | None:
+    if request.system_prompt is None:
+        return None
+    if not cache_breakpoint:
+        return request.system_prompt
     return [
+        {
+            "type": "text",
+            "text": request.system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def _request_tools(
+    tools: Sequence[ToolDefinition],
+    *,
+    cache_breakpoint: bool = False,
+) -> list[dict[str, object]]:
+    values = [
         {
             "name": tool.name,
             "description": tool.description or "",
@@ -237,6 +269,9 @@ def _request_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
         }
         for tool in tools
     ]
+    if cache_breakpoint and values:
+        values[-1]["cache_control"] = {"type": "ephemeral"}
+    return values
 
 
 def _finish_reason(value: str) -> FinishReason:
@@ -332,10 +367,15 @@ class AnthropicProvider:
             "model": request.model or self._model_name,
             "messages": _request_messages(request, self._identity),
         }
-        if request.system_prompt is not None:
-            kwargs["system"] = request.system_prompt
+        cache_breakpoint = _stable_cache_breakpoint(request)
+        system = _request_system(request, cache_breakpoint=cache_breakpoint)
+        if system is not None:
+            kwargs["system"] = system
         if request.tools:
-            kwargs["tools"] = _request_tools(request.tools)
+            kwargs["tools"] = _request_tools(
+                request.tools,
+                cache_breakpoint=cache_breakpoint and request.system_prompt is None,
+            )
         value = count_tokens(**kwargs)
         if inspect.isawaitable(value):
             value = await value
@@ -373,10 +413,15 @@ class AnthropicProvider:
                 "max_tokens": max_output_tokens,
                 "stream": True,
             }
-            if request.system_prompt is not None:
-                kwargs["system"] = request.system_prompt
+            cache_breakpoint = _stable_cache_breakpoint(request)
+            system = _request_system(request, cache_breakpoint=cache_breakpoint)
+            if system is not None:
+                kwargs["system"] = system
             if request.tools:
-                kwargs["tools"] = _request_tools(request.tools)
+                kwargs["tools"] = _request_tools(
+                    request.tools,
+                    cache_breakpoint=cache_breakpoint and request.system_prompt is None,
+                )
             if request.temperature is not None:
                 kwargs["temperature"] = request.temperature
             if request.reasoning is not None and request.reasoning.enabled:

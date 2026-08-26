@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -66,6 +67,8 @@ _NATIVE_ITEM_TYPES = {
     "function_call",
     "function_call_output",
 }
+_PROMPT_CACHE_KEY_NAMESPACE = "uthcode:"
+_PROMPT_CACHE_KEY_DIGEST_LENGTH = 64 - len(_PROMPT_CACHE_KEY_NAMESPACE)
 _PUBLIC_FIELDS = (
     "type",
     "id",
@@ -431,6 +434,33 @@ def _request_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
     ]
 
 
+def _prompt_cache_key(request: GenerationRequest, model: str) -> str | None:
+    """Build the bounded Responses routing key from verified stable facts only."""
+
+    stable_prefix = request.metadata.get("stable_prefix_fingerprint")
+    if not isinstance(stable_prefix, str) or not stable_prefix.strip():
+        return None
+    tool_schema: str | None = None
+    if request.tools:
+        value = request.metadata.get("tool_schema_fingerprint")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        tool_schema = value
+    payload = {
+        "model": model,
+        "stable_prefix_fingerprint": stable_prefix,
+        "tool_schema_fingerprint": tool_schema if isinstance(tool_schema, str) else None,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return _PROMPT_CACHE_KEY_NAMESPACE + digest[:_PROMPT_CACHE_KEY_DIGEST_LENGTH]
+
+
 def _map_error(error: BaseException) -> ProviderError:
     if isinstance(error, GenerationCancelled):
         return error
@@ -515,6 +545,7 @@ class OpenAIResponsesProvider:
         completed: ProviderResponse | None = None
         try:
             input_values = _request_input(request, self._identity)
+            model = request.model or self._model_name
             max_output_tokens = (
                 request.max_output_tokens
                 if request.max_output_tokens is not None
@@ -523,11 +554,14 @@ class OpenAIResponsesProvider:
                 else DEFAULT_OUTPUT_RESERVE
             )
             kwargs: dict[str, object] = {
-                "model": request.model or self._model_name,
+                "model": model,
                 "input": input_values,
                 "max_output_tokens": max_output_tokens,
                 "stream": True,
             }
+            cache_key = _prompt_cache_key(request, model)
+            if cache_key is not None:
+                kwargs["prompt_cache_key"] = cache_key
             if request.system_prompt is not None:
                 kwargs["instructions"] = request.system_prompt
             if request.tools:

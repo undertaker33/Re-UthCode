@@ -39,6 +39,7 @@ from uthcode.core.provider import (
     ToolDefinition,
     ToolResultPart,
 )
+from uthcode.core.prompt import ToolDefinitionSource
 from uthcode.integrations.providers.openai_responses import build_openai_responses_provider
 
 
@@ -239,11 +240,15 @@ def _request(
     *messages: Message,
     system_prompt: str | None = None,
     tools: tuple[ToolDefinition, ...] = (),
+    metadata: dict[str, object] | None = None,
+    model: str | None = None,
 ) -> GenerationRequest:
     return GenerationRequest(
         messages=messages,
         system_prompt=system_prompt,
         tools=tools,
+        metadata=metadata or {},
+        model=model,
     )
 
 
@@ -284,8 +289,120 @@ async def test_responses_public_stream_preserves_items_indices_usage_and_reasoni
     assert sum(isinstance(event, NativeItemCompleted) for event in events) == 4
     assert sum(isinstance(event, ToolCallCompleted) for event in events) == 2
     assert "instructions" not in client.calls[0]
+    assert "prompt_cache_key" not in client.calls[0]
     assert all(item.get("role") != "system" for item in client.calls[0]["input"])
     assert client.stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_responses_prompt_cache_key_uses_stable_facts_not_conversation_body() -> None:
+    tool = ToolDefinition(
+        "search",
+        "Search docs",
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    )
+    tool_source = ToolDefinitionSource((tool,))
+    metadata = {
+        "stable_prefix_fingerprint": "prefix-v1",
+        "tool_schema_fingerprint": tool_source.tool_schema_fingerprint,
+        "secret": "fixture-secret",
+    }
+    client = _OpenAIClient(_item_events())
+    provider = build_openai_responses_provider("gpt-test", client=client)
+
+    async def invoke(request: GenerationRequest) -> dict[str, object]:
+        client.stream = _AsyncStream(_item_events())
+        await _collect(provider, request)
+        return client.calls[-1]
+
+    first = await invoke(
+        _request(
+            Message("user", (TextPart("first conversation"),)),
+            tools=(tool,),
+            metadata=metadata,
+        )
+    )
+    second = await invoke(
+        _request(
+            Message("user", (TextPart("different conversation"),)),
+            tools=(tool,),
+            metadata=metadata,
+        )
+    )
+    changed_prefix = dict(metadata)
+    changed_prefix["stable_prefix_fingerprint"] = "prefix-v2"
+    third = await invoke(
+        _request(
+            Message("user", (TextPart("first conversation"),)),
+            tools=(tool,),
+            metadata=changed_prefix,
+        )
+    )
+    changed_tool = ToolDefinition(
+        "search",
+        "Search the changed docs",
+        {"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    changed_tool_source = ToolDefinitionSource((changed_tool,))
+    changed_tool_schema = {
+        "stable_prefix_fingerprint": "prefix-v1",
+        "tool_schema_fingerprint": changed_tool_source.tool_schema_fingerprint,
+    }
+    fourth = await invoke(
+        _request(
+            Message("user", (TextPart("first conversation"),)),
+            tools=(changed_tool,),
+            metadata=changed_tool_schema,
+        )
+    )
+    changed_model = await invoke(
+        _request(
+            Message("user", (TextPart("first conversation"),)),
+            tools=(tool,),
+            metadata=metadata,
+            model="gpt-other",
+        )
+    )
+    missing_tool_fingerprint = await invoke(
+        _request(
+            Message("user", (TextPart("first conversation"),)),
+            tools=(tool,),
+            metadata={"stable_prefix_fingerprint": "prefix-v1"},
+        )
+    )
+
+    first_key = first["prompt_cache_key"]
+    assert isinstance(first_key, str)
+    assert first_key.startswith("uthcode:")
+    assert len(first_key) <= 64
+    assert second["prompt_cache_key"] == first_key
+    assert third["prompt_cache_key"] != first_key
+    assert fourth["prompt_cache_key"] != first_key
+    assert changed_model["prompt_cache_key"] != first_key
+    assert "prompt_cache_key" not in missing_tool_fingerprint
+    assert "first conversation" not in first_key
+    assert "prefix-v1" not in first_key
+    assert "gpt-test" not in first_key
+    assert "fixture-secret" not in first_key
+    assert "prompt_cache_options" not in first
+    assert "prompt_cache_retention" not in first
+
+    no_tools = await invoke(
+        _request(
+            Message("user", (TextPart("no tools"),)),
+            metadata={"stable_prefix_fingerprint": "prefix-v1"},
+        )
+    )
+    no_tools_with_unrelated_fingerprint = await invoke(
+        _request(
+            Message("user", (TextPart("different no tools"),)),
+            metadata={
+                "stable_prefix_fingerprint": "prefix-v1",
+                "tool_schema_fingerprint": "unrelated-tool-metadata",
+            },
+        )
+    )
+    assert no_tools_with_unrelated_fingerprint["prompt_cache_key"] == no_tools["prompt_cache_key"]
 
 
 @pytest.mark.asyncio

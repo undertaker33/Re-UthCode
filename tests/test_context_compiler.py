@@ -7,16 +7,20 @@ import pytest
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
 from uthcode.core.context import (
+    CompactionPolicy,
+    ContextCompactor,
     ContextCompilationError,
     ContextCompiler,
     ContextSourceBundle,
+    ContextSnapshot,
     messages_from_context_snapshot,
 )
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind
 from uthcode.core.prompt import ContextAuthority, ContextBlock, ContextScope, ContextSourceKind, ContextStability, ProjectInstructionSource, RuntimePromptContext, ToolDefinitionSource
-from uthcode.core.provider import Message, TextPart, ToolDefinition
+from uthcode.core.provider import GenerationRequest, Message, TextPart, ToolDefinition
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import SessionFileStore
+from uthcode.integrations.providers.openai_responses import _prompt_cache_key
 
 
 def _project_source(content: str, epoch: int = 1) -> ProjectInstructionSource:
@@ -83,6 +87,140 @@ def test_runtime_and_timeline_changes_do_not_change_stable_prefix() -> None:
     assert second.stable_prefix_fingerprint == first.stable_prefix_fingerprint
     assert second.prefix_changed is False
     assert changed.prefix_changed is True
+
+
+def test_compact_and_conversation_growth_preserve_provider_cache_prefix() -> None:
+    transcript = Transcript(
+        "cache-session",
+        tuple(
+            TranscriptEntry(
+                "cache-session",
+                index,
+                f"turn-{index}",
+                TranscriptKind.USER_MESSAGE,
+                {
+                    "role": "user",
+                    "part": {"type": "text", "text": f"fact-{index}"},
+                },
+                semantic_unit_id=f"turn-{index}",
+            )
+            for index in range(1, 5)
+        ),
+    )
+    project = _project_source("project rule")
+    tool = ToolDefinition(
+        "ReadFile",
+        "read files",
+        {"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    tool_source = ToolDefinitionSource((tool,))
+    compiler = ContextCompiler(token_estimator=lambda text: max(1, len(text) // 20))
+
+    def cache_key(snapshot: ContextSnapshot, model: str = "gpt-test") -> str | None:
+        assert snapshot.tool_schema_fingerprint is not None
+        request = GenerationRequest(
+            messages=messages_from_context_snapshot(snapshot),
+            model=model,
+            tools=snapshot.tool_definitions,
+            metadata={
+                "stable_prefix_fingerprint": snapshot.stable_prefix_fingerprint,
+                "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
+            },
+        )
+        return _prompt_cache_key(request, model)
+
+    before = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=project,
+            transcript=transcript,
+            current_turn=("current user",),
+            tool_source=tool_source,
+        )
+    )
+    before_key = cache_key(before)
+    assert before_key is not None
+
+    grown_transcript = transcript.append(
+        TranscriptEntry(
+            "cache-session",
+            5,
+            "turn-5",
+            TranscriptKind.USER_MESSAGE,
+            {
+                "role": "user",
+                "part": {"type": "text", "text": "ordinary conversation growth"},
+            },
+            semantic_unit_id="turn-5",
+        )
+    )
+    grown = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=project,
+            transcript=grown_transcript,
+            current_turn=("new current user",),
+            tool_source=tool_source,
+        ),
+        previous_snapshot=before,
+    )
+    assert grown.stable_prefix_fingerprint == before.stable_prefix_fingerprint
+    assert grown.prefix_changed is False
+    assert cache_key(grown) == before_key
+
+    compaction = ContextCompactor(
+        policy=CompactionPolicy(input_budget=500, output_reserve=50, summary_hard_cap=100),
+        token_estimator=lambda text: max(1, len(text) // 20),
+    ).compact(transcript, summarize=lambda _text: "bounded summary")
+    assert compaction.changed is True
+    assert compaction.timeline is not None
+    assert compaction.timeline.active_checkpoint is not None
+    compacted = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=project,
+            transcript=transcript,
+            timeline=compaction.timeline,
+            current_turn=("current user",),
+            tool_source=tool_source,
+        ),
+        previous_snapshot=before,
+    )
+    assert compacted.timeline_checkpoint_id == compaction.timeline.active_checkpoint.turn_id
+    assert compacted.stable_prefix_fingerprint == before.stable_prefix_fingerprint
+    assert compacted.prefix_changed is False
+    assert compacted.tool_schema_fingerprint == before.tool_schema_fingerprint
+    assert cache_key(compacted) == before_key
+
+    changed_instruction = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=_project_source("changed project rule", 2),
+            transcript=transcript,
+            timeline=compaction.timeline,
+            current_turn=("current user",),
+            tool_source=tool_source,
+        ),
+        previous_snapshot=compacted,
+    )
+    assert changed_instruction.stable_prefix_fingerprint != before.stable_prefix_fingerprint
+    assert changed_instruction.prefix_changed is True
+    assert cache_key(changed_instruction) != before_key
+
+    changed_tool = ToolDefinition(
+        "ReadFile",
+        "read changed files",
+        {"type": "object", "properties": {"filename": {"type": "string"}}},
+    )
+    changed_tool_snapshot = compiler.compile(
+        ContextSourceBundle(
+            project_instruction_source=project,
+            transcript=transcript,
+            timeline=compaction.timeline,
+            current_turn=("current user",),
+            tool_source=ToolDefinitionSource((changed_tool,)),
+        ),
+        previous_snapshot=compacted,
+    )
+    assert changed_tool_snapshot.tool_schema_fingerprint != before.tool_schema_fingerprint
+    assert cache_key(changed_tool_snapshot) != before_key
+    assert cache_key(compacted, model="gpt-other") != before_key
 
 
 def test_timeline_summary_is_conversation_data_and_raw_tail_remains_visible() -> None:
