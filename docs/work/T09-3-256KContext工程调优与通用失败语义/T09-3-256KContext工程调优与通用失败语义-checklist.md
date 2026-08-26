@@ -25,16 +25,16 @@
 
 ## T03：Provider Prefix Cache hints 与可观察 usage
 
-- [ ] W02 Feedback 记录实施时核对的 OpenAI/Anthropic官方文档、当前 SDK 版本/signature 与选择的 wire 参数；无法可靠确认的参数没有发送。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_openai_responses_integration.py tests/test_anthropic_integration.py tests/test_openai_compat_integration.py tests/test_w05_diagnostics.py -q`，全部通过。
-- [ ] OpenAI Responses request fixture 证明 cache routing/hint 只由稳定 UthCode request facts 派生；相同 stable facts 得到稳定值，真实 instruction/tool change 产生预期变化。
-- [ ] Anthropic request fixture 证明 cache control/breakpoint 位于正确 Integration wire boundary，且 system prompt 未复制 Tool Schema。
-- [ ] OpenAI-compatible 默认请求未发送 OpenAI Responses 专有缓存字段；如发送任何 cache 字段，测试能指出现有显式 capability/config authority。
-- [ ] ordinary conversation growth 与 Timeline compact 不改变 stable instruction/tool prefix；AGENTS/instruction/tool schema 真变化产生 expected invalidation reason。
-- [ ] Provider 报告 cache read/write 时 value 与 provenance 为 available；未报告时 status 为 `not_available` 且不是数值 0，派生 ratio 同样不可用。
-- [ ] `rg -n "prompt_cache_key|cache_control" src/uthcode/core src/uthcode/interfaces` 返回 0 条；Provider-specific cache wire type 不穿透 Core/Application public contract 或 Interface。
-- [ ] tests 使用 fake client/request fixture，执行期间未访问网络、未读取真实 API key。
-- [ ] D-T09-3-04、06 在 T03 request shape、架构边界与 W02 Feedback 中均有证据。
+- [x] W02 Feedback 记录实施时核对的 OpenAI/Anthropic官方文档、当前 SDK 版本/signature 与选择的 wire 参数；无法可靠确认的参数没有发送。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_openai_responses_integration.py tests/test_anthropic_integration.py tests/test_openai_compat_integration.py tests/test_w05_diagnostics.py -q`，全部通过。
+- [x] OpenAI Responses request fixture 证明 cache routing/hint 只由稳定 UthCode request facts 派生；相同 stable facts 得到稳定值，真实 instruction/tool change 产生预期变化。
+- [x] Anthropic request fixture 证明 cache control/breakpoint 位于正确 Integration wire boundary，且 system prompt 未复制 Tool Schema。
+- [x] OpenAI-compatible 默认请求未发送 OpenAI Responses 专有缓存字段；如发送任何 cache 字段，测试能指出现有显式 capability/config authority。
+- [x] ordinary conversation growth 与 Timeline compact 不改变 stable instruction/tool prefix；AGENTS/instruction/tool schema 真变化产生 expected invalidation reason。
+- [x] Provider 报告 cache read/write 时 value 与 provenance 为 available；未报告时 status 为 `not_available` 且不是数值 0，派生 ratio 同样不可用。
+- [x] `rg -n "prompt_cache_key|cache_control" src/uthcode/core src/uthcode/interfaces` 返回 0 条；Provider-specific cache wire type 不穿透 Core/Application public contract 或 Interface。
+- [x] tests 使用 fake client/request fixture，执行期间未访问网络、未读取真实 API key。
+- [x] D-T09-3-04、06 在 T03 request shape、架构边界与 W02 Feedback 中均有证据。
 
 ## T04：稳定 FailureReason 与 PauseReason 保真
 

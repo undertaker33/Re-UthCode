@@ -164,11 +164,15 @@ def _request(
     *messages: Message,
     system_prompt: str | None = None,
     tools: tuple[ToolDefinition, ...] = (),
+    metadata: dict[str, object] | None = None,
+    model: str | None = None,
 ) -> GenerationRequest:
     return GenerationRequest(
         messages=messages,
         system_prompt=system_prompt,
         tools=tools,
+        metadata=metadata or {},
+        model=model,
     )
 
 
@@ -225,6 +229,39 @@ async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_or
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_chat_compat_does_not_send_responses_or_anthropic_cache_fields() -> None:
+    client = _OpenAICompatClient(_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    request = _request(
+        Message("user", (TextPart("hi"),)),
+        system_prompt="rules",
+        tools=(
+            ToolDefinition(
+                "search",
+                "Search docs",
+                {"type": "object", "properties": {"q": {"type": "string"}}},
+            ),
+        ),
+        metadata={
+            "stable_prefix_fingerprint": "prefix-v1",
+            "tool_schema_fingerprint": "tools-v1",
+        },
+    )
+
+    await _collect(provider, request)
+    call = client.calls[0]
+    assert {
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "cache_control",
+    }.isdisjoint(call)
+    assert "cache_control" not in repr(call)
 
 
 @pytest.mark.asyncio

@@ -81,14 +81,22 @@ class _AnthropicClient:
     def __init__(self, events: list[object], *, delay: float = 0.0) -> None:
         self.stream = _AsyncStream(events, delay=delay)
         self.calls: list[dict[str, object]] = []
+        self.count_calls: list[dict[str, object]] = []
         self.error: BaseException | None = None
-        self.messages = SimpleNamespace(create=self.create)
+        self.messages = SimpleNamespace(
+            create=self.create,
+            count_tokens=self.count_tokens,
+        )
 
     async def create(self, **kwargs: object) -> _AsyncStream:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
         return self.stream
+
+    async def count_tokens(self, **kwargs: object) -> SimpleNamespace:
+        self.count_calls.append(kwargs)
+        return SimpleNamespace(input_tokens=42)
 
 
 def _events(*, include_stop: bool = True, include_tool: bool = False) -> list[object]:
@@ -229,11 +237,15 @@ def _request(
     *messages: Message,
     system_prompt: str | None = None,
     tools: tuple[ToolDefinition, ...] = (),
+    metadata: dict[str, object] | None = None,
+    model: str | None = None,
 ) -> GenerationRequest:
     return GenerationRequest(
         messages=messages,
         system_prompt=system_prompt,
         tools=tools,
+        metadata=metadata or {},
+        model=model,
     )
 
 
@@ -307,6 +319,61 @@ async def test_anthropic_system_prompt_maps_only_to_top_level_system() -> None:
     call = client.calls[0]
     assert call["system"] == "rules"
     assert all(message["role"] != "system" for message in call["messages"])
+
+
+@pytest.mark.asyncio
+async def test_anthropic_explicit_cache_breakpoint_matches_count_shape_and_order() -> None:
+    metadata = {
+        "stable_prefix_fingerprint": "prefix-v1",
+        "tool_schema_fingerprint": "tools-v1",
+    }
+    tool = ToolDefinition(
+        "search",
+        "Search docs",
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    )
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+    request = _request(
+        Message("user", (TextPart("hi"),)),
+        system_prompt="rules",
+        tools=(tool,),
+        metadata=metadata,
+    )
+
+    await _collect(provider, request)
+    call = client.calls[-1]
+    system = call["system"]
+    assert system == [
+        {
+            "type": "text",
+            "text": "rules",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert call["tools"][-1].get("cache_control") is None
+    assert system[0]["text"] == "rules"
+    assert "input_schema" not in system[0]
+
+    counted = await provider.count_input_tokens(request)
+    assert counted is not None
+    assert counted.input_tokens == 42
+    assert client.count_calls[-1]["system"] == call["system"]
+    assert client.count_calls[-1]["tools"] == call["tools"]
+    assert client.count_calls[-1]["messages"] == call["messages"]
+
+    client.stream = _AsyncStream(_events())
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("hi"),)),
+            tools=(tool,),
+            metadata=metadata,
+        ),
+    )
+    tool_only_call = client.calls[-1]
+    assert tool_only_call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "system" not in tool_only_call
 
 
 @pytest.mark.asyncio
