@@ -25,6 +25,7 @@ from uthcode.core.context import (
     ContextCompactor,
     account_generation_request,
     pressure_estimate,
+    safety_allowance_for,
 )
 from uthcode.core.history import (
     ActiveCheckpoint,
@@ -152,7 +153,13 @@ class _HighLowProvider(_L4Provider):
         elif completed_epochs == 1:
             count = self._budget.auto_gate_limit - 1_000
         else:
-            count = self._budget.retained_target - 2_048
+            count = self._budget.retained_target - max(
+                self._budget.safety_allowance,
+                safety_allowance_for(
+                    self._budget.effective_input_limit,
+                    kind="preflight_provider_count",
+                ),
+            )
         self.ordinary_counts.append(count)
         return count
 
@@ -1180,7 +1187,14 @@ async def test_auto_l4_continues_below_high_until_frozen_low_water(tmp_path) -> 
     assert note["gate_after_compaction"]["count_source"] == "provider.preflight_count"
     assert ordinary_requests[0].metadata["context_gate"]["count_source"] == "provider.preflight_count"
     assert ordinary_requests[0].metadata["context_gate"]["hard_safe"] is True
-    assert provider.ordinary_counts.count(budget.retained_target - 2_048) >= 2
+    expected_low_water_count = budget.retained_target - max(
+        budget.safety_allowance,
+        safety_allowance_for(
+            budget.effective_input_limit,
+            kind="preflight_provider_count",
+        ),
+    )
+    assert provider.ordinary_counts.count(expected_low_water_count) >= 2
 
 
 @pytest.mark.asyncio

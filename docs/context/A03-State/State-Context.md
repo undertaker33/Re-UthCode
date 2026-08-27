@@ -16,7 +16,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；failed `TurnResult`/`TurnFailed` 可携带 JSON-safe `FailureReason`，successful/cancelled 终态不伪造该字段；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
 - `[FACT]` Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal Turn 边界把新增 Message 转换为 Transcript，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、Transcript、Timeline、Context 与 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
-- `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/Transcript/Timeline/Application runtime facts/Tool Schema 组成动态 Context Snapshot；default/configured/provider/effective limits、tightened sources、Pressure/Preflight Count、Auto/Hard Gate 与每次 request 的最终 accounting 一起记录安全诊断，Provider cache usage 只在有明确 usage 字段时标记 available。Active Turn 使用冻结的 ContextBudget，Instruction scope/content 变化才创建新的 instruction epoch。
+- `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/Transcript/Timeline/Application runtime facts/Tool Schema 组成动态 Context Snapshot；default/configured/provider/effective limits、tightened sources、Pressure/Preflight Count、Auto/Hard Gate 与每次 request 的最终 accounting 一起记录安全诊断，Provider cache usage 只在有明确 usage 字段时标记 available。effective input 为 `256_000` 时，冻结的 `ContextBudget` 使用已采纳的 `balanced-208k` 工程 profile（High `208_000`、retained/Low `96_000`、working headroom `48_000`、compaction `64_000/4_096`、count allowance `8_192`）；其它窗口继续使用有界自适应派生并服从 configured/provider 收紧。Active Turn 使用冻结的 ContextBudget，Instruction scope/content 变化才创建新的 instruction epoch。
 - `[FACT]` L4/L5、manual `/compact` 和 ordinary overflow recovery 复用同一 Application Context orchestrator；Compact request tool-free、bounded、使用冻结或当前模型，并在 commit 前通过 Hard Gate。成功 transaction 先写 Fine/Macro，最后写 `ActiveCheckpoint`；失败、取消、无 safe epoch 和 unknown durability 不产生伪提交。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
@@ -139,7 +139,7 @@ implemented context:
   Instruction Plane         = Prompt Asset + Core Contract + current AGENTS State
   Conversation Plane        = Timeline logical view + Transcript recent facts + current Run delta
   Tool System               = Application Tool definitions -> GenerationRequest.tools
-  Context Budget            = default/configured/provider/effective limits + provenance + adaptive working profile
+  Context Budget            = default/configured/provider/effective limits + provenance + 256K balanced-208k / other-window adaptive profile
   Context Gates              = Pressure Estimate/Auto Gate + Preflight Safety Count/Hard Gate
   Compact                    = bounded L4/L5, manual no-op/success, one overflow retry
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback

@@ -367,3 +367,35 @@ tests/eval/test_eval_profile.py 的 test_profile_prefix_probe_uses_production_fa
 - repo-root clean 拒绝验证：`conda run --no-capture-output -n re-uthcode python -m eval.runner clean --eval-root D:\project\Re-UthCode` 返回 exit `2`，错误为 `clean requires a dedicated Eval root`，未删除仓库内容。
 - live Provider、远端 cache/latency/billing、真实远端长上下文和 live 费用仍未验证；本轮未读取 API key、未联网。
 - 本轮没有修改生产默认、产品配置、`src/**`、公共 FailureReason、Provider cache wire、Interface、CI/依赖/正式 CLI 或 T06+；没有触碰 `docs/core-design/**`、`临时目录/**`；没有执行 Git commit、push、PR、merge、rebase、tag、release 或归档。
+
+## 返工第二轮：将 balanced-208k 接入 256K 生产默认（2026-08-27）
+
+### 返工原因与边界
+
+包级审核发现 W04 的历史结论把 `balanced-208k` 仅作为 Eval 候选，生产 `ContextBudget` 仍按历史公式得到 `243200/72000/12800/4000/0`，没有满足冻结 Tasks 对“选定初始工程默认进入正式生产链”的要求。本轮只关闭该 P1：不修改 Spec、Tasks、Prompt、Checklist、候选比较结论或公共配置/API，不新增 Context policy/Manager/Registry，不触碰真实 Provider、网络、费用、`docs/core-design/**` 或 `临时目录/**`，不执行 Git 写操作。
+
+### 实际修改
+
+- `src/uthcode/core/context.py`：effective input 为 `256_000` 时，正式 resolver 使用已选 `balanced-208k` 的 working headroom `48_000`、High Water `208_000`、retained/Low Water `96_000`、fine timeline `16_000`、compaction input/output `64_000/4_096`、count allowance `8_192`。`ContextBudget.from_limits` 的未指定 allowance 只对该 256K Operating Window采用 `8_192`；显式 allowance 及 compact 内部归零仍保持原语义。其它 effective window 继续使用原有有界自适应派生，因此 configured/provider 小窗口不会被 balanced 常量放大。
+- `tests/test_context_budget_gate.py`：新增 Core 精确 profile 合同、正式 `UthCodeApplication -> AgentRun -> Turn` 请求/diagnostics 精确 profile 断言和非 256K 窗口合法性断言（`0 < retained < auto < effective`、compact budget 合法）。
+- `tests/test_t09_1_context_protocol_e2e.py`：High→Low fake provider 的低水位 raw count 按实际 provider/budget safety allowance 计算，保留 epoch 2 到 Low Water 的既有迟滞合同；该调整只修正测试夹具对新选定 allowance 的计数预期。
+- `eval/t09-3-256k-profile-tuning-summary.md`、`eval/README.md`：把历史 `production-default` 明确标为采纳前公式 baseline，并追加 balanced 已接入正式 256K resolver 的事实与参数。
+- `docs/context/A01-AgentRuntime/AgentRuntime-Context.md`、`A03-State/State-Context.md`、`A04-Orchestration/Orchestration-Context.md`、`docs/Context-Index.md`：同步当前生产 profile 与非 256K 收紧事实。
+
+`eval/profile.py` 的 `production-default` candidate id/历史参数没有删除或改写，以保留 W04 原始报告 compare 的可复核 baseline；它不再被当作当前生产 resolver 的代表。正式生产默认的事实来源是 `balanced-208k` 的冻结 Eval 选择及本轮 Core resolver 实现。
+
+### 验证结果
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_context_budget_gate.py tests/test_context_compaction.py tests/test_t09_1_context_protocol_e2e.py tests/test_application_runs.py tests/test_w05_diagnostics.py -q`：`139 passed`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/eval -q`：`87 passed in 121.82s`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`：`23 passed`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q`：`1251 passed, 3 skipped in 232.37s`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`：exit `0`，无输出。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`
+- `git diff --check`：exit `0`；仅有 Windows `core.autocrlf` 的 LF→CRLF 提示，无 whitespace error。
+
+未授权的真实 Provider cache/latency/billing、远端 tokenizer、远端长上下文和 live 结果仍为 `NOT VERIFIED (authorization required)`；本轮未读取 API key、未联网。Checklist 未改写或重新勾选，冻结 Spec/Tasks/Prompt/Checklist 未修改。
+
+### 文档编码补充
+
+对本轮修改的 8 个 Markdown 文件执行 `uth-utf8-guard`：`OK: 8 file(s) passed UTF-8 guard`，UTF-8、replacement character、常见 mojibake 与 Markdown fence parity 均通过。

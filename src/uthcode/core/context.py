@@ -75,14 +75,19 @@ class ContextRequestSafetyError(ContextBudgetError):
 
 
 DEFAULT_CONTEXT_INPUT_LIMIT = 256_000
+_DEFAULT_CONTEXT_WORKING_HEADROOM = 48_000
+_DEFAULT_CONTEXT_RETAINED_TARGET = 96_000
+_DEFAULT_CONTEXT_COMPACTION_OUTPUT_RESERVE = 4_096
+_DEFAULT_CONTEXT_SAFETY_ALLOWANCE = 8_192
 
 
 def adaptive_working_headroom(effective_input_limit: int) -> int:
-    """Return a capped proactive reserve for one effective input limit.
+    """Return the proactive reserve for one effective input limit.
 
-    The reserve is intentionally a small-window adaptive value with an
-    absolute ceiling.  It is a policy input to Auto Gate, never a Provider
-    safety proof and never a percentage-only rule.
+    The selected 256K Operating Profile uses its measured fixed reserve;
+    other windows use the bounded adaptive policy.  The reserve is a policy
+    input to Auto Gate, never a Provider safety proof or a percentage-only
+    rule.
     """
 
     if (
@@ -91,6 +96,8 @@ def adaptive_working_headroom(effective_input_limit: int) -> int:
         or effective_input_limit <= 0
     ):
         raise ValueError("effective_input_limit must be a positive integer")
+    if effective_input_limit == DEFAULT_CONTEXT_INPUT_LIMIT:
+        return _DEFAULT_CONTEXT_WORKING_HEADROOM
     return min(
         48_000,
         max(512, effective_input_limit // 20),
@@ -231,15 +238,17 @@ class ContextBudget:
 
         retained_target = self.retained_target
         if retained_target is None:
-            # Preserve the existing retained-target policy while removing its
-            # three non-consumed public subdivisions.  T09-3 profile tuning
-            # remains a later Eval task rather than a public budget contract.
-            retained_target = min(
-                auto_gate - 1,
-                min(48_000, max(128, effective // 5))
-                + fine
-                + min(8_000, max(64, effective // 32)),
-            )
+            if effective == DEFAULT_CONTEXT_INPUT_LIMIT:
+                retained_target = _DEFAULT_CONTEXT_RETAINED_TARGET
+            else:
+                # Keep the bounded adaptive policy for configured/provider
+                # windows that are smaller or larger than the 256K target.
+                retained_target = min(
+                    auto_gate - 1,
+                    min(48_000, max(128, effective // 5))
+                    + fine
+                    + min(8_000, max(64, effective // 32)),
+                )
             object.__setattr__(self, "retained_target", retained_target)
         if (
             isinstance(retained_target, bool)
@@ -257,10 +266,13 @@ class ContextBudget:
             object.__setattr__(self, "compaction_input_budget", compact_input)
         compact_output = self.compaction_output_reserve
         if compact_output is None:
-            compact_output = min(
-                max(1, compact_input - 1),
-                min(4_096, max(32, effective // 64)),
-            )
+            if effective == DEFAULT_CONTEXT_INPUT_LIMIT:
+                compact_output = _DEFAULT_CONTEXT_COMPACTION_OUTPUT_RESERVE
+            else:
+                compact_output = min(
+                    max(1, compact_input - 1),
+                    min(4_096, max(32, effective // 64)),
+                )
             object.__setattr__(self, "compaction_output_reserve", compact_output)
         if (
             isinstance(compact_input, bool)
@@ -280,11 +292,13 @@ class ContextBudget:
         configured_input_limit: int | None,
         provider_limits: ModelLimits | None,
         requested_output_reserve: int = 0,
-        safety_allowance: int = 0,
+        safety_allowance: int | None = None,
     ) -> "ContextBudget":
         if provider_limits is not None and not isinstance(provider_limits, ModelLimits):
             raise TypeError("provider_limits must be ModelLimits or None")
-        return cls(
+        # An omitted allowance selects the tuned default only for the 256K
+        # operating window; callers that need a zero allowance pass 0.
+        budget = cls(
             configured_input_limit=configured_input_limit,
             provider_max_input=(
                 provider_limits.max_input_tokens if provider_limits is not None else None
@@ -296,8 +310,14 @@ class ContextBudget:
                 provider_limits.max_combined_tokens if provider_limits is not None else None
             ),
             requested_output_reserve=requested_output_reserve,
-            safety_allowance=safety_allowance,
+            safety_allowance=(0 if safety_allowance is None else safety_allowance),
         )
+        if (
+            safety_allowance is None
+            and budget.effective_input_limit == DEFAULT_CONTEXT_INPUT_LIMIT
+        ):
+            object.__setattr__(budget, "safety_allowance", _DEFAULT_CONTEXT_SAFETY_ALLOWANCE)
+        return budget
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -784,7 +804,7 @@ def resolve_context_budget(
     configured_input_limit: int | None,
     provider_limits: ModelLimits | None,
     requested_output_reserve: int = 0,
-    safety_allowance: int = 0,
+    safety_allowance: int | None = None,
 ) -> ContextBudget:
     """Build the one dynamic budget authority used by Application."""
 

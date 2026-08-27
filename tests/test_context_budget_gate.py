@@ -143,6 +143,51 @@ def test_adaptive_headroom_is_small_window_aware_and_large_window_capped() -> No
     assert large.retained_target < large.effective_input_limit
 
 
+def test_default_256k_budget_uses_the_selected_balanced_profile() -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=None,
+        provider_limits=None,
+    )
+
+    assert budget.to_dict() == {
+        "configured_input_limit": None,
+        "provider_max_input": None,
+        "default_input_limit": 256_000,
+        "effective_input_limit": 256_000,
+        "observed_input_sources": [],
+        "effective_input_source": "default",
+        "tightened_input_sources": [],
+        "provider_max_output": None,
+        "provider_combined_limit": None,
+        "requested_output_reserve": 0,
+        "safety_allowance": 8_192,
+        "working_headroom": 48_000,
+        "auto_gate_limit": 208_000,
+        "fine_timeline_budget": 16_000,
+        "retained_target": 96_000,
+        "compaction_input_budget": 64_000,
+        "compaction_output_reserve": 4_096,
+    }
+
+
+@pytest.mark.parametrize("effective_limit", (20_000, 64_000, 128_000))
+def test_non_default_effective_limits_keep_derived_profile_values_legal(
+    effective_limit: int,
+) -> None:
+    budget = ContextBudget.from_limits(
+        configured_input_limit=effective_limit,
+        provider_limits=ModelLimits(
+            max_input_tokens=effective_limit,
+            source="test.constrained-window",
+        ),
+    )
+
+    assert 0 < budget.retained_target < budget.auto_gate_limit < budget.effective_input_limit
+    assert budget.working_headroom == budget.effective_input_limit - budget.auto_gate_limit
+    assert 0 < budget.compaction_output_reserve < budget.compaction_input_budget <= budget.effective_input_limit
+    assert budget.safety_allowance == 0
+
+
 def test_context_budget_rejects_retained_target_equal_to_auto_gate() -> None:
     with pytest.raises(ValueError, match="strictly smaller than auto_gate_limit"):
         ContextBudget(
@@ -403,9 +448,21 @@ async def test_missing_limits_use_default_operating_window_before_provider_call(
     assert len(provider.recorded_requests) == 1
     assert count_calls
     diagnostics = application.diagnostics()["context_budget"]
-    assert diagnostics["effective_input_limit"] == 256_000
-    assert diagnostics["effective_input_source"] == "default"
-    assert diagnostics["tightened_input_sources"] == []
+    expected_profile = {
+        "effective_input_limit": 256_000,
+        "effective_input_source": "default",
+        "tightened_input_sources": [],
+        "safety_allowance": 8_192,
+        "working_headroom": 48_000,
+        "auto_gate_limit": 208_000,
+        "fine_timeline_budget": 16_000,
+        "retained_target": 96_000,
+        "compaction_input_budget": 64_000,
+        "compaction_output_reserve": 4_096,
+    }
+    assert {key: diagnostics[key] for key in expected_profile} == expected_profile
+    request_budget = provider.recorded_requests[0].metadata["context_budget"]
+    assert {key: request_budget[key] for key in expected_profile} == expected_profile
 
 
 @pytest.mark.asyncio
