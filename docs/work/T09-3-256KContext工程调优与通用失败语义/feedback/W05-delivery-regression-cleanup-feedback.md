@@ -148,3 +148,33 @@ exit 0
 - Checklist 最终为 `checked=77`、`unchecked=0`；仅把 T06～T08 的 checkbox 从 `[ ]` 改为 `[x]`，没有改写条目文字或顺序。
 - 最终 `git diff --check` 返回 exit 0。Windows `core.autocrlf` 对原有 LF 风格 Checklist 输出换行提示，但不存在 whitespace error。
 - 最终 `git status --short` 只包含本 Feedback、Checklist、已映射文档修改，以及开工前已有的 `docs/core-design/T09-context-engineering.md` 删除、A01 新文档/图片和 `临时目录/`；`src/`、`tests/` 没有本轮变更。
+
+## 返工追加：关闭包级 P1，将 selected profile 接入正式生产链（2026-08-27）
+
+### 原因与实际变更
+
+包级审核发现 W04 选定的 `balanced-208k` 尚未成为生产 256K 默认：生产 resolver 仍生成历史的 High `243200`、Low `72000`、working headroom `12800`、compaction output `4000`、count allowance `0`。本轮只处理该实施遗漏，不改变冻结 Spec/Tasks/Prompt/Checklist，不新增产品配置字段、公共 `create_application` API、Manager/Registry/兼容层，不扩大 Provider/cache/failure 语义，也没有触碰用户既有 `docs/core-design/**` 删除/新增文件或 `临时目录/**`。
+
+- `src/uthcode/core/context.py` 的正式 `ContextBudget` resolver 在 effective input `256_000` 时采用 `balanced-208k`：High `208_000`、retained/Low `96_000`、working headroom `48_000`、fine timeline `16_000`、compaction input/output `64_000/4_096`、count allowance `8_192`；Application L4 的既有 epoch 上限 `4` 与该 profile 一致。
+- 对 effective input 小于或大于 `256_000` 的 configured/provider 窗口，保留原有有界自适应派生；不会把 256K profile 参数写入更小 effective window。Provider `max_output_tokens`、combined limit、input/output/combined Hard Gate、Active Turn freeze、manual/L4/L5/overflow 均未改写。
+- `tests/test_context_budget_gate.py` 新增 Core 精确默认、正式 Application Turn request/diagnostics 精确默认及收紧窗口合法性覆盖；`tests/test_t09_1_context_protocol_e2e.py` 只调整 High→Low fake provider 的低水位计数以计入新的 budget safety allowance，仍验证 epoch 1 低于 High 但高于 Low 时继续、epoch 2 到 Low 后停止。
+- `eval/t09-3-256k-profile-tuning-summary.md` 与 `eval/README.md` 已把旧 `production-default` 说明限定为历史比较 baseline，并记录 balanced 已接入生产；A01/A03/A04 与 `docs/Context-Index.md` 已同步当前事实。W04/W05 Feedback 均按规则在原文件末尾追加本返工记录。
+
+### 返工验证
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_context_budget_gate.py tests/test_context_compaction.py tests/test_t09_1_context_protocol_e2e.py tests/test_application_runs.py tests/test_w05_diagnostics.py -q`：`139 passed`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/eval -q`：`87 passed in 121.82s`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`：`23 passed`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q`：`1251 passed, 3 skipped in 232.37s`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`：exit `0`、无输出。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`
+- `git diff --check`：exit `0`；仅有 Windows `core.autocrlf` LF→CRLF 提示，无 diff error。
+- `uth-utf8-guard`：待本轮所有 Markdown 修改完成后，对本轮修改 Markdown 统一执行；结果记录在本 Feedback 后续交付检查中。
+
+真实 Provider/cache/latency/billing、远端 tokenizer、远端长上下文和费用仍未授权验证；本轮未读取 API key、未联网、未执行 Git commit/push/merge/rebase/tag/release 或工作包归档。用户既有 dirty files 保持原样。
+
+## 返工验证补充：文档编码检查（2026-08-27）
+
+执行：`conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py eval\README.md eval\t09-3-256k-profile-tuning-summary.md docs\Context-Index.md docs\context\A01-AgentRuntime\AgentRuntime-Context.md docs\context\A03-State\State-Context.md docs\context\A04-Orchestration\Orchestration-Context.md docs\work\T09-3-256KContext工程调优与通用失败语义\feedback\W04-256k-eval-tuning-feedback.md docs\work\T09-3-256KContext工程调优与通用失败语义\feedback\W05-delivery-regression-cleanup-feedback.md`
+
+结果：`OK: 8 file(s) passed UTF-8 guard`；UTF-8、replacement character、常见 mojibake 与 Markdown fence parity 全部通过。此前“待检查”记录对应本节最终结果。

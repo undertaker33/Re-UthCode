@@ -111,7 +111,7 @@ tool:
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
 - `[FACT]` Context Compiler、Transcript/Timeline、Compactor 有界分批/校验机制与 Session persistence 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产 tool-free L4/L5 summarizer 与 manual `/compact` 共用 bounded request，Timeline commit 采用 derived records first、`ActiveCheckpoint` last；overflow recovery 最多 retry 一次。
-- `[FACT]` 用户显式 `context_window`、可靠 Provider runtime `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 与固定 `256_000` default input operating window 是当前 limits 来源；有效预算按 configured/provider/default 收紧并记录 provenance，Provider call 前按 input、output、combined 三个维度执行 Hard Gate，不使用 bundled metadata 或型号名称推断。
+- `[FACT]` 用户显式 `context_window`、可靠 Provider runtime `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 与固定 `256_000` default input operating window 是当前 limits 来源；当 effective input 为 `256_000` 时，正式 resolver 使用 Eval 选定的 `balanced-208k` 工程 profile（High `208_000`、retained/Low `96_000`、working headroom `48_000`、compaction `64_000/4_096`、count allowance `8_192`，L4 最多 `4` 个 epoch）。其它 effective window 继续按有界自适应派生，并按 configured/provider/default 收紧、记录 provenance；Provider call 前按 input、output、combined 三个维度执行 Hard Gate，不使用 bundled metadata 或型号名称推断。
 - `[FACT]` `FailureReason` 是 Core 的小型、Provider-independent、JSON-safe 终态事实；Application 将它与 `PauseReason` 投影为安全文案，Interface 不按 SDK 异常或 HTTP 状态自行分类。
 - `[BOUNDARY]` Session 只恢复已完整提交的 Transcript、committed Timeline、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
 - `[DEFER]` Memory、retrieval 等真实后置能力仍不属于当前执行层。

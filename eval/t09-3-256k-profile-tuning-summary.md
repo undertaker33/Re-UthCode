@@ -4,7 +4,7 @@
 
 `D:\project\Re-UthCode-Eval-T09-3`
 
-本汇总不生成跨维度总分，也不把候选值写成 `create_application` 公共 API 或产品配置。W04 未修改 `src/` 的生产默认；生产默认候选只是把现有 256K 公式作为 Eval 轴的基线，正式入口收口留给后续工作包。
+本汇总不生成跨维度总分，也不把候选值写成 `create_application` 公共 API 或产品配置。W04 原始运行未修改 `src/` 的生产默认；该轮的 `production-default` 记录是采用调优结果前的历史公式基线。后续返工已将 Eval 选定的 `balanced-208k` 接入 256K 正式生产 resolver，历史候选数据仍保留用于可复核比较。
 
 ## 固定控制与候选轴
 
@@ -34,7 +34,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner profile --cand
 
 两组触发 compact 的候选均产生 3 个 L4 compaction epoch；`compact_count` 是一次 compaction orchestration，不能代替 epoch 明细。两组的 `work_distance` 均为 `provider_requests_after_compaction=22`、`tool_result_read_calls=16`；没有观察到 compact 后立即 thrash。`repeated_exploration=4`，外部化为 `attempts=26, externalized=1, failed=0, inline=25`，稳定前缀为 true、`instruction_epoch=1`。具体整数会随离线编译边界出现 1 token 的正常离散差异，因此汇总用近似值，原始报告保留精确值。
 
-生产默认的 `count_allowance=0` 保留现有生产公式，控制负载仍完成且不触发 L4。balanced 以更大的 post-compact headroom 和更低的 post usage 完成同样工作；compact 的 post usage 更高、headroom 更小，未显示出质量或安全收益。因此初始工程调优候选选择 `balanced-208k`。这是 Eval 选择，不是 public API 或生产配置回写；是否把它接入正式默认由后续工作包依据更广的验证决定。
+W04 原始运行中的 `production-default` 使用 `count_allowance=0` 的历史生产公式，控制负载仍完成且不触发 L4。balanced 以更大的 post-compact headroom 和更低的 post usage 完成同样工作；compact 的 post usage 更高、headroom 更小，未显示出质量或安全收益。因此初始工程调优候选选择 `balanced-208k`。本汇总末尾的返工记录已说明该选择随后成为 256K 正式生产默认；它仍不是 public API 或生产配置字段。
 
 \* Efficiency 由本机 attempt duration 参与计算，属于运行环境敏感的可用观察值；它不作为跨候选总分，也不单独决定选择。完整数值保存在对应外部报告。
 
@@ -89,7 +89,7 @@ prefix_stability 在四份报告中均 available 且 stable=true。真实 Applic
 
 报告精度已固定：成功 workload source 的 failure_correctness 是 not_applicable；标准 report diagnostic fact 的 status 是 not_available，source_status=not_applicable，并保留 successful workload; failure matrix is verified separately reason。cache_reuse 是 not_available，reason=offline Fake Provider has no provider cache telemetry；HistoryRead 是 not_available，原因是 offline profile workload has no valid HistoryRead ref。没有修改公共 FailureReason 或新增 cache/prefix 系统。
 
-production 到 balanced、balanced 到 compact、balanced 到 repeat-balanced 三个 CLI compare 均 exit=0、compatible=true、incompatibilities=[]、delta 非空，六维 delta 全为 0。相关 usage/headroom delta 分别为 +6144/+32026/-32026、+4096/+23508/-23508、0/+2/-2。使用既有 final-smoke 作为负向控制时 exit=0、compatible=false、delta=null，明确列出 code/prompt/run_args/runtime/task、task_ids、task_sample_counts 和对应 fingerprint_variants 不兼容。根据新的 v5 事实，仍选择 balanced-208k 作为 Eval 候选：它在 production 的更激进压缩与 compact 的更高 post usage 之间取得参数和保留量折中；这不是 overall/weighted score，也没有改变生产默认。
+production 到 balanced、balanced 到 compact、balanced 到 repeat-balanced 三个 CLI compare 均 exit=0、compatible=true、incompatibilities=[]、delta 非空，六维 delta 全为 0。相关 usage/headroom delta 分别为 +6144/+32026/-32026、+4096/+23508/-23508、0/+2/-2。使用既有 final-smoke 作为负向控制时 exit=0、compatible=false、delta=null，明确列出 code/prompt/run_args/runtime/task、task_ids、task_sample_counts 和对应 fingerprint_variants 不兼容。根据新的 v5 事实，仍选择 balanced-208k；它在 production 历史基线的更激进压缩与 compact 的更高 post usage 之间取得参数和保留量折中。这不是 overall/weighted score；本汇总末尾记录了该选择已接入正式 256K 默认。
 
 本轮最终四个 v5 attempt 均用 manifest-owned dedicated-root clean 清除，workspace/home/artifacts 对应目录不存在且文件数为 0，四份 report.json/report.md 保留。repo-root clean 以仓库根为 eval-root 返回 exit=2 和 clean requires a dedicated Eval root。标准答案、固定 ToolCall 序列、T06+、生产默认和 Git 写操作均未恢复或执行。
 
@@ -115,8 +115,17 @@ prefix 仍来自真实 `ApplicationContextService.compose_generation_request`、
 
 新 CLI compare 精确结果：production→balanced `compatible=true`、六维 delta `0/0/0/+1.172/0/0`，pre/post/headroom delta `+6144/+32026/-32026`；balanced→compact `compatible=true`、六维 delta `0/0/0/+0.4765/0/0`，`+4096/+23508/-23508`；balanced→repeat-balanced `compatible=true`、六维 delta `0/0/0/+0.085/0/0`，`0/+2/-2`，三者 `incompatibilities=[]`。用 `t09-3-w04-final-smoke` 对 v5 balanced 的 incompatible compare 为 `compatible=false`、`delta=null`，不兼容项为 `fingerprints.code/prompt/run_args/runtime/task`、`task_ids`、`sample_count`、`task_sample_counts` 及对应 `fingerprint_variants.code/prompt/run_args/runtime/task`。
 
-根据新证据仍选择 `balanced-208k`：所有候选质量/安全相关维度和 verifier 相同；compact 有最高 efficiency 但更高 post usage、更低 headroom/working headroom，production 有更大总 headroom但 auto gate/working headroom 更紧，balanced 是上下文余量和 compaction 行为的折中。选择仅是 Eval 候选，不改变生产默认。
+根据新证据仍选择 `balanced-208k`：所有候选质量/安全相关维度和 verifier 相同；compact 有最高 efficiency 但更高 post usage、更低 headroom/working headroom，production 历史基线有更大总 headroom但 auto gate/working headroom 更紧，balanced 是上下文余量和 compaction 行为的折中。该选择现已由返工接入正式 256K 默认；候选轴和历史 baseline 仍用于 Eval 比较。
 
 本轮实际创建 11 个外部 attempt：route-debug 1 个、首次 balanced 验证 2 个、最终四候选各 2 个；compact 错误 candidate 名称在 attempt 创建前拒绝。11 个 attempt 均用 manifest-owned dedicated-root clean 清除了 workspace/home/artifacts；最终四个 v5 experiment 的这些组件文件数为 0，每份报告目录只保留 `report.json` 与 `report.md`。repo-root clean 仍 exit=2 并拒绝非 dedicated root。
 
-本轮验证：`tests/eval` `87 passed`；上下文/诊断 `89 passed`；架构 `23 passed`；全量 `1247 passed, 3 skipped`；`compileall` exit=0；`git diff --check` exit=0（仅 CRLF 提示）；runner/profile help 均 exit=0；路线/报告定向测试及三组 compatible、一次 incompatible compare 均通过。live Provider、远端 cache/latency/billing、远端长上下文和费用仍未验证。未修改生产默认、T06+、排除目录或执行 Git 写操作。
+本轮验证：`tests/eval` `87 passed`；上下文/诊断 `89 passed`；架构 `23 passed`；全量 `1247 passed, 3 skipped`；`compileall` exit=0；`git diff --check` exit=0（仅 CRLF 提示）；runner/profile help 均 exit=0；路线/报告定向测试及三组 compatible、一次 incompatible compare 均通过。live Provider、远端 cache/latency/billing、远端长上下文和费用仍未验证。W04 历史运行未修改生产默认；后续返工接入记录见下节，未触碰排除目录或执行 Git 写操作。
+
+## 返工追加：采纳 balanced-208k 为 256K 正式生产默认（2026-08-27）
+
+包级审核发现 W04 历史报告把 `balanced-208k` 仅描述为 Eval 候选，未证明它进入生产链。该返工只补齐冻结 Tasks 要求的生产回写证据，不改变候选比较、公共 API、配置字段或既有失败/缓存语义。
+
+- `ContextBudget` 的正式 resolver 在 effective input 为 `256_000` 时使用选定的 `balanced-208k` 初始工程默认：working headroom `48_000`、High Water `208_000`、retained/Low Water `96_000`、fine timeline `16_000`、compaction input/output `64_000/4_096`、count allowance `8_192`；Application Turn 的有界 L4 epoch 上限仍为既有 `4`。
+- effective input 小于或大于 `256_000` 时继续使用现有有界自适应派生；Provider/configured ceiling 仍只收紧 effective limit，不会把 balanced 的 256K 数值硬写进更小窗口。input、output、combined 三个 Hard Gate 以及 Active Turn freeze 未改变。
+- `eval/profile.py` 中的 `production-default` 保留为 W04 原始历史公式 baseline，用于复核原始 compare；它不再代表当前生产 resolver。`balanced-208k` 仍是候选轴记录，同时也是当前 256K 正式默认的事实来源。
+- 新增 Core exact-profile 与正式 Application Turn 回归，并调整 High→Low fake provider 断言按实际 safety allowance 计算；本轮定向、Eval、架构、全量和工具链精确结果记录在对应返工 Feedback。

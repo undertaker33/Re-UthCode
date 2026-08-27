@@ -68,9 +68,11 @@ W04 的长上下文候选只通过私有、可替换的 Eval seam 复用现有 `
 
 | Candidate | Effective / auto gate | Retained / fine | Compact input / output | Max epochs / count allowance |
 | --- | ---: | ---: | ---: | ---: |
-| `production-default` | `256000 / 243200` | `72000 / 16000` | `64000 / 4000` | `4 / 0` |
+| `production-default`（历史公式 baseline） | `256000 / 243200` | `72000 / 16000` | `64000 / 4000` | `4 / 0` |
 | `balanced-208k` | `256000 / 208000` | `96000 / 16000` | `64000 / 4096` | `4 / 8192` |
 | `compact-224k` | `256000 / 224000` | `128000 / 12000` | `48000 / 3072` | `3 / 12288` |
+
+`production-default` 这一行保留 W04 采纳前的历史公式，供报告 compare 复核；当前正式生产 resolver 在 effective input 为 `256000` 时使用 Eval 选定的 `balanced-208k`：High Water `208000`、retained/Low Water `96000`、working headroom `48000`、compaction input/output `64000/4096`、count allowance `8192`。该默认属于生产内部工程策略，不新增产品配置字段；低于或高于 `256000` 的 effective window 继续使用有界自适应派生并服从 configured/provider 收紧。
 
 运行同一受控长负载：
 
