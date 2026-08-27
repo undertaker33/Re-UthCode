@@ -53,6 +53,7 @@ from uthcode.application import (
 ApplicationFactory: TypeAlias = Callable[..., Any]
 ProviderBuilder: TypeAlias = Callable[..., Any]
 Verifier: TypeAlias = Callable[[Path], VerifierResult | Mapping[str, object] | Awaitable[VerifierResult | Mapping[str, object]]]
+DiagnosticsHook: TypeAlias = Callable[[], Mapping[str, object]]
 
 _REDACTED = "<redacted>"
 _SECRET_KEY = re.compile(
@@ -446,6 +447,8 @@ async def run_attempt(
     live: bool = False,
     live_authorized: bool = False,
     secret_values: Sequence[str] = (),
+    candidate_variant: Mapping[str, object] | None = None,
+    diagnostics_hook: DiagnosticsHook | None = None,
 ) -> AttemptExecution:
     """Run exactly one Application Run/Turn and persist safe attempt artifacts.
 
@@ -469,6 +472,10 @@ async def run_attempt(
         raise TypeError("application_factory must be callable")
     if verifier is not None and not callable(verifier):
         raise TypeError("verifier must be callable or None")
+    if candidate_variant is not None and not isinstance(candidate_variant, Mapping):
+        raise TypeError("candidate_variant must be a mapping or None")
+    if diagnostics_hook is not None and not callable(diagnostics_hook):
+        raise TypeError("diagnostics_hook must be callable or None")
     if timeout_seconds is None:
         timeout_seconds = float(task.timeout_seconds)
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
@@ -652,6 +659,17 @@ async def run_attempt(
             # completed attempt into a different execution result.
             diagnostics["application_diagnostics"] = "not_available"
 
+    if diagnostics_hook is not None:
+        try:
+            value = diagnostics_hook()
+            diagnostics["eval_workload"] = (
+                dict(value) if isinstance(value, Mapping) else "not_available"
+            )
+        except Exception:
+            # Eval-only workload telemetry is observational and must not alter
+            # the Application outcome or failure category.
+            diagnostics["eval_workload"] = "not_available"
+
     # The verifier is deliberately called once after the Turn, including a
     # permission block, so partial side effects remain inspectable.
     if verifier is not None:
@@ -731,6 +749,7 @@ async def run_attempt(
             "task_id": task.task_id,
             "attempt_id": attempt.attempt_id,
             "fingerprints": fingerprints,
+            "candidate_variant": candidate_variant,
             "started_at": started_at,
             "ended_at": ended_at,
             "instruction_sha256": _hash_payload(instruction),
@@ -775,6 +794,7 @@ async def run_attempt(
         diagnostics,
         artifact_files,
         safe_events,
+        candidate_variant,
     )
     _json_write(
         attempt.artifacts / artifact_files["record"],
@@ -877,6 +897,7 @@ def _make_record(
     diagnostics: Mapping[str, object],
     artifact_files: Mapping[str, str],
     events: Sequence[AgentEvent],
+    candidate_variant: Mapping[str, object] | None = None,
 ) -> Any:
     from eval.models import AttemptRecord
 
@@ -902,6 +923,7 @@ def _make_record(
         verifier_result=verifier_result,
         metrics=metric_values,
         artifact_manifest=dict(artifact_files),
+        candidate_variant=(None if candidate_variant is None else dict(candidate_variant)),
     )
 
 

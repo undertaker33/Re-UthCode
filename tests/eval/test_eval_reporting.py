@@ -487,3 +487,99 @@ def test_report_renderers_show_all_dimensions_without_single_ranking() -> None:
         assert dimension in markdown
         assert dimension in terminal
     assert "overall" not in markdown.lower()
+
+
+def test_aggregate_preserves_unavailable_reasons_and_stable_fact_fields() -> None:
+    report = aggregate_experiment(
+        "fact-precision",
+        [
+            {
+                "task_id": "long-context-constraint",
+                "finish_category": "success",
+                "diagnostic_facts": {
+                    "history_read": {
+                        "status": "not_available",
+                        "value": None,
+                        "reason": "offline workload has no HistoryRead ref",
+                        "evidence_refs": ["diagnostics.eval_workload.history_read"],
+                    },
+                    "prefix_stability": {
+                        "status": "available",
+                        "value": {
+                            "stable": True,
+                            "change_reason": "stable",
+                            "instruction_epoch": 1,
+                        },
+                        "evidence_refs": ["diagnostics.context_diagnostics.prefix_changed"],
+                    },
+                },
+            }
+        ],
+    )
+
+    history = report["facts"]["history_read"]
+    assert history["reasons"] == ["offline workload has no HistoryRead ref"]
+    prefix = report["facts"]["prefix_stability"]
+    assert prefix["stable_fields"] == {"change_reason": "stable", "stable": True}
+
+    failure_report = aggregate_experiment(
+        "failure-source-status",
+        [
+            {
+                "task_id": "long-context-constraint",
+                "finish_category": "success",
+                "diagnostic_facts": {
+                    "failure_correctness": {
+                        "status": "not_available",
+                        "value": None,
+                        "source_status": "not_applicable",
+                        "reason": "successful workload",
+                        "evidence_refs": [
+                            "diagnostics.eval_workload.failure_correctness"
+                        ],
+                    }
+                },
+            }
+        ],
+    )
+    failure = failure_report["facts"]["failure_correctness"]
+    assert failure["status"] == "not_available"
+    assert failure["source_status"] == "not_applicable"
+    assert failure["reasons"] == ["successful workload"]
+
+    markdown = render_markdown_report(report)
+    terminal = render_terminal_summary(report)
+    assert "offline workload has no HistoryRead ref" in markdown
+    assert "change_reason" in markdown and "stable" in markdown
+    assert "offline workload has no HistoryRead ref" in terminal
+    assert "source_status: not_applicable" in render_markdown_report(failure_report)
+
+    comparable = {
+        **report,
+        "fingerprints": {
+            key: key
+            for key in (
+                "code",
+                "task",
+                "model",
+                "model_id",
+                "provider",
+                "prompt",
+                "config",
+                "permission",
+                "run_args",
+                "platform",
+                "runtime",
+                "uthcode_revision",
+            )
+        },
+        "fingerprint_variants": {},
+    }
+    compared = compare_experiments(comparable, comparable)
+    assert compared["delta"]["facts"]["history_read"]["baseline_reasons"] == [
+        "offline workload has no HistoryRead ref"
+    ]
+    assert compared["delta"]["facts"]["prefix_stability"]["baseline_stable_fields"] == {
+        "change_reason": "stable",
+        "stable": True,
+    }

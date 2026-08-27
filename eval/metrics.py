@@ -30,11 +30,18 @@ DIAGNOSTIC_FACTS = (
     "tokens",
     "tool_calls",
     "compact_count",
+    "pre_compact_usage",
+    "post_compact_usage",
+    "post_compact_headroom",
+    "work_distance",
+    "workload_route",
     "rediscovery",
     "repeated_exploration",
     "externalization",
+    "history_read",
     "prefix_stability",
     "cache_reuse",
+    "failure_correctness",
 )
 
 _CONTEXT_DIAGNOSTIC_KEYS = frozenset(
@@ -76,9 +83,20 @@ _NON_SECRET_COUNT_KEYS = frozenset(
         "input_tokens",
         "output_tokens",
         "total_tokens",
+        "budget_tokens",
+        "used_tokens",
+        "token_estimate",
+        "tokens",
+        "framing_tokens",
+        "instruction_tokens",
+        "messages_tokens",
+        "tools_tokens",
+        "stable_prefix_estimated_tokens",
+        "tool_schema_estimated_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
         "provider_response_input_tokens",
+        "provider_response_input_tokens_by_iteration",
     }
 )
 
@@ -574,6 +592,21 @@ def _application_diagnostic_mapping(diagnostics: Mapping[str, object]) -> Mappin
     return value if isinstance(value, Mapping) else None
 
 
+def _eval_workload_mapping(diagnostics: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = diagnostics.get("eval_workload")
+    return value if isinstance(value, Mapping) else None
+
+
+def _last_int(value: object) -> int | None:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in reversed(value):
+            candidate = _optional_int(item)
+            if candidate is not None:
+                return candidate
+        return None
+    return _optional_int(value)
+
+
 def compute_diagnostic_facts(
     *,
     verifier_result: object,
@@ -654,6 +687,55 @@ def compute_diagnostic_facts(
         ("diagnostics.application_diagnostics.compaction.count",),
     )
 
+    workload = _eval_workload_mapping(diagnostic_values)
+    pre_compact_usage = _last_int(
+        workload.get("pre_compact_usage") if workload is not None else None
+    )
+    post_compact_usage = _last_int(
+        workload.get("post_compact_usage") if workload is not None else None
+    )
+    post_compact_headroom = _last_int(
+        workload.get("post_compact_headroom") if workload is not None else None
+    )
+    facts["pre_compact_usage"] = _fact(
+        MetricStatus.AVAILABLE if pre_compact_usage is not None else MetricStatus.NOT_AVAILABLE,
+        pre_compact_usage,
+        ("diagnostics.eval_workload.pre_compact_usage",),
+        samples=(workload.get("pre_compact_usage") if workload is not None else None),
+    )
+    facts["post_compact_usage"] = _fact(
+        MetricStatus.AVAILABLE if post_compact_usage is not None else MetricStatus.NOT_AVAILABLE,
+        post_compact_usage,
+        ("diagnostics.eval_workload.post_compact_usage",),
+        samples=(workload.get("post_compact_usage") if workload is not None else None),
+    )
+    facts["post_compact_headroom"] = _fact(
+        MetricStatus.AVAILABLE if post_compact_headroom is not None else MetricStatus.NOT_AVAILABLE,
+        post_compact_headroom,
+        ("diagnostics.eval_workload.post_compact_headroom",),
+        samples=(workload.get("post_compact_headroom") if workload is not None else None),
+    )
+    work_distance = workload.get("work_distance") if workload is not None else None
+    facts["work_distance"] = _fact(
+        MetricStatus.AVAILABLE if isinstance(work_distance, Mapping) else MetricStatus.NOT_AVAILABLE,
+        work_distance if isinstance(work_distance, Mapping) else None,
+        ("diagnostics.eval_workload.work_distance",),
+    )
+    route = workload.get("route") if workload is not None else None
+    route_available = isinstance(route, Mapping) and route.get("status") == "available"
+    facts["workload_route"] = _fact(
+        MetricStatus.AVAILABLE if route_available else MetricStatus.NOT_AVAILABLE,
+        {
+            key: value
+            for key, value in route.items()
+            if key != "status"
+        }
+        if route_available and isinstance(route, Mapping)
+        else None,
+        ("diagnostics.eval_workload.route",),
+        reason=(route.get("reason") if isinstance(route, Mapping) else None),
+    )
+
     context = _context_diagnostic_mapping(diagnostic_values)
     rediscovery = None
     if context is not None:
@@ -697,18 +779,50 @@ def compute_diagnostic_facts(
         ("diagnostics.application_diagnostics.externalization",),
     )
 
+    history_read = workload.get("history_read") if workload is not None else None
+    history_available = isinstance(history_read, Mapping) and history_read.get("status") == "available"
+    facts["history_read"] = _fact(
+        MetricStatus.AVAILABLE if history_available else MetricStatus.NOT_AVAILABLE,
+        history_read if history_available else None,
+        ("diagnostics.eval_workload.history_read",),
+        reason=(history_read.get("reason") if isinstance(history_read, Mapping) else None),
+    )
+
     prefix_value = None
-    if context is not None and isinstance(context.get("prefix_changed"), bool):
+    prefix_refs = ["diagnostics.context_diagnostics.prefix_changed"]
+    workload_prefix = workload.get("prefix") if workload is not None else None
+    prefix_reason = (
+        workload_prefix.get("reason")
+        if isinstance(workload_prefix, Mapping)
+        else None
+    )
+    if (
+        isinstance(workload_prefix, Mapping)
+        and workload_prefix.get("status") == "available"
+    ):
+        prefix_value = {
+            key: value
+            for key, value in workload_prefix.items()
+            if key != "status"
+        }
+        prefix_refs.append("diagnostics.eval_workload.prefix")
+    elif context is not None and isinstance(context.get("prefix_changed"), bool):
         prefix_value = {
             "stable": not context["prefix_changed"],
             "fingerprint": context.get("stable_prefix_fingerprint"),
             "instruction_epoch": _optional_int(context.get("instruction_epoch")),
             "change_reason": context.get("prefix_change_reason"),
         }
+    prefix_extra = (
+        {"reason": prefix_reason}
+        if prefix_value is None and isinstance(prefix_reason, str) and prefix_reason
+        else {}
+    )
     facts["prefix_stability"] = _fact(
         MetricStatus.AVAILABLE if prefix_value is not None else MetricStatus.NOT_AVAILABLE,
         prefix_value,
-        ("diagnostics.context_diagnostics.prefix_changed",),
+        prefix_refs,
+        **prefix_extra,
     )
 
     provider_usage = _provider_usage(diagnostic_values)
@@ -731,7 +845,46 @@ def compute_diagnostic_facts(
         MetricStatus.AVAILABLE if cache_value is not None else MetricStatus.NOT_AVAILABLE,
         cache_value,
         ("diagnostics.provider_usage.cache_read", "diagnostics.provider_usage.cache_write"),
+        reason=(
+            workload.get("cache", {}).get("reason")
+            if workload is not None and isinstance(workload.get("cache"), Mapping)
+            else None
+        ),
     )
+
+    expected_failure = diagnostic_values.get("expected_failure_reason")
+    actual_failure = None
+    if turn is not None:
+        actual_failure = turn.get("failure_reason")
+    if actual_failure is None:
+        actual_failure = diagnostic_values.get("failure_reason")
+    if isinstance(expected_failure, str) and isinstance(actual_failure, str):
+        facts["failure_correctness"] = _fact(
+            MetricStatus.AVAILABLE,
+            expected_failure == actual_failure,
+            ("diagnostics.expected_failure_reason", "turn_result.failure_reason"),
+        )
+    else:
+        failure_value = workload.get("failure_correctness") if workload is not None else None
+        failure_available = (
+            isinstance(failure_value, Mapping)
+            and failure_value.get("status") == "available"
+        )
+        facts["failure_correctness"] = _fact(
+            MetricStatus.AVAILABLE if failure_available else MetricStatus.NOT_AVAILABLE,
+            failure_value if failure_available else None,
+            ("diagnostics.eval_workload.failure_correctness",),
+            source_status=(
+                failure_value.get("status")
+                if isinstance(failure_value, Mapping)
+                else "not_applicable"
+            ),
+            reason=(
+                failure_value.get("reason")
+                if isinstance(failure_value, Mapping)
+                else "failure matrix is outside the successful workload"
+            ),
+        )
     return facts
 
 

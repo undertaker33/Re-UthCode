@@ -698,6 +698,7 @@ class AttemptRecord:
     verifier_result: VerifierResult | None
     metrics: dict[str, MetricValue]
     artifact_manifest: dict[str, object]
+    candidate_variant: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _schema_version(self.schema_version))
@@ -723,6 +724,16 @@ class AttemptRecord:
         if not isinstance(manifest, Mapping):
             raise ContractError("artifact_manifest: expected an object")
         object.__setattr__(self, "artifact_manifest", manifest)
+        if self.candidate_variant is not None:
+            candidate = _freeze_json(self.candidate_variant, "candidate_variant")
+            if not isinstance(candidate, Mapping):
+                raise ContractError("candidate_variant: expected an object")
+            if not isinstance(candidate.get("id"), str) or not candidate["id"]:
+                raise ContractError("candidate_variant.id: expected a non-empty string")
+            parameters = candidate.get("parameters")
+            if not isinstance(parameters, Mapping) or not parameters:
+                raise ContractError("candidate_variant.parameters: expected an object")
+            object.__setattr__(self, "candidate_variant", candidate)
 
     @staticmethod
     def _string_mapping(value: object, field: str) -> dict[str, str]:
@@ -743,6 +754,7 @@ class AttemptRecord:
                 "paths", "timestamps", "duration_seconds", "finish_category", "turn_result",
                 "verifier_result", "metrics", "artifact_manifest",
             },
+            optional={"candidate_variant"},
         )
         verifier_value = payload["verifier_result"]
         verifier = None if verifier_value is None else VerifierResult.from_mapping(verifier_value)
@@ -756,6 +768,9 @@ class AttemptRecord:
             verifier,
             {key: MetricValue.from_mapping(item) for key, item in _mapping(payload["metrics"], "metrics").items()},
             dict(_mapping(payload["artifact_manifest"], "artifact_manifest")),
+            None
+            if payload.get("candidate_variant") is None
+            else dict(_mapping(payload["candidate_variant"], "candidate_variant")),
         )  # type: ignore[arg-type]
 
     from_dict = from_mapping
@@ -765,7 +780,7 @@ class AttemptRecord:
         return cls.from_mapping(_parse_json_object(value, "AttemptRecord"))
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "experiment_id": self.experiment_id,
             "task_id": self.task_id,
@@ -780,6 +795,9 @@ class AttemptRecord:
             "metrics": {key: value.to_dict() for key, value in self.metrics.items()},
             "artifact_manifest": _thaw_json(self.artifact_manifest),
         }
+        if self.candidate_variant is not None:
+            result["candidate_variant"] = _thaw_json(self.candidate_variant)
+        return result
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))

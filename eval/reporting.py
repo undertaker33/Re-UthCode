@@ -124,13 +124,34 @@ def _aggregate_fact(attempts: Sequence[Mapping[str, object]], name: str) -> dict
         for ref in item.get("evidence_refs", ())
         if isinstance(item.get("evidence_refs", ()), Sequence)
     })
+    reasons = sorted({
+        str(item.get("reason"))
+        for item in details
+        if isinstance(item, Mapping)
+        and isinstance(item.get("reason"), str)
+        and item.get("reason")
+    })
     result: dict[str, object] = {
         "status": MetricStatus.AVAILABLE.value if available else MetricStatus.NOT_AVAILABLE.value,
         "values": values,
         "available_count": len(available),
         "sample_count": len(attempts),
         "evidence_refs": refs,
+        "reasons": reasons,
     }
+    source_statuses = sorted({
+        str(item.get("source_status"))
+        for item in details
+        if isinstance(item, Mapping)
+        and isinstance(item.get("source_status"), str)
+        and item.get("source_status")
+    })
+    if source_statuses:
+        result["source_status"] = (
+            source_statuses[0]
+            if len(source_statuses) == 1
+            else source_statuses
+        )
     if not available:
         result.update({"median": None, "mean": None})
         return result
@@ -154,6 +175,7 @@ def _aggregate_fact(attempts: Sequence[Mapping[str, object]], name: str) -> dict
     if all(isinstance(value, Mapping) for value in values):
         medians: dict[str, float] = {}
         means: dict[str, float] = {}
+        stable_fields: dict[str, object] = {}
         keys = sorted({
             str(key)
             for value in values
@@ -161,19 +183,63 @@ def _aggregate_fact(attempts: Sequence[Mapping[str, object]], name: str) -> dict
             for key in value
         })
         for key in keys:
-            field_values = [
-                _numeric(value.get(key))
+            raw_field_values = [
+                value.get(key)
                 for value in values
                 if isinstance(value, Mapping)
             ]
+            field_values = [_numeric(value) for value in raw_field_values]
             numeric_fields = [item for item in field_values if item is not None]
             if numeric_fields:
                 medians[key] = median(numeric_fields)
                 means[key] = sum(numeric_fields) / len(numeric_fields)
-        result.update({"median": medians or None, "mean": means or None})
+            if raw_field_values and all(item == raw_field_values[0] for item in raw_field_values):
+                stable_value = raw_field_values[0]
+                if _numeric(stable_value) is None:
+                    stable_fields[key] = stable_value
+        result.update({
+            "median": medians or None,
+            "mean": means or None,
+            "stable_fields": stable_fields or None,
+        })
         return result
     result.update({"median": None, "mean": None})
     return result
+
+
+def _fact_summary(item: Mapping[str, object]) -> object:
+    summary: object = item.get("true_rate", item.get("median", "—"))
+    stable_fields = item.get("stable_fields")
+    if isinstance(stable_fields, Mapping) and stable_fields:
+        if isinstance(summary, Mapping):
+            merged = dict(summary)
+            merged.update(stable_fields)
+            summary = merged
+        else:
+            summary = dict(stable_fields)
+    source_status = item.get("source_status")
+    if isinstance(source_status, str) and source_status:
+        if summary in (None, "—"):
+            summary = f"source_status: {source_status}"
+        elif isinstance(summary, Mapping):
+            merged = dict(summary)
+            merged["source_status"] = source_status
+            summary = merged
+        else:
+            summary = f"{summary}; source_status: {source_status}"
+    reasons = item.get("reasons")
+    if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)) and reasons:
+        reason_text = "; ".join(str(reason) for reason in reasons)
+        if summary in (None, "—"):
+            return f"reason: {reason_text}"
+        return f"{summary}; reason: {reason_text}"
+    return summary
+
+
+def _display_value(value: object) -> str:
+    if isinstance(value, (Mapping, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
 
 
 def _fact_delta(left: object, right: object) -> dict[str, object]:
@@ -191,6 +257,10 @@ def _fact_delta(left: object, right: object) -> dict[str, object]:
         "baseline": baseline.get("median"),
         "candidate": candidate.get("median"),
         "delta": None,
+        "baseline_reasons": baseline.get("reasons", []),
+        "candidate_reasons": candidate.get("reasons", []),
+        "baseline_stable_fields": baseline.get("stable_fields"),
+        "candidate_stable_fields": candidate.get("stable_fields"),
     }
     if result["status"] != MetricStatus.AVAILABLE.value:
         return result
@@ -237,6 +307,25 @@ def _task_sample_counts(attempts: Sequence[Mapping[str, object]]) -> dict[str, i
     return dict(sorted(counts.items()))
 
 
+def _candidate_variant_summary(attempts: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    values: dict[str, dict[str, object]] = {}
+    for attempt in attempts:
+        candidate = attempt.get("candidate_variant")
+        if not isinstance(candidate, Mapping):
+            continue
+        profile_id = candidate.get("id")
+        parameters = candidate.get("parameters")
+        if not isinstance(profile_id, str) or not profile_id:
+            continue
+        if not isinstance(parameters, Mapping):
+            continue
+        values[profile_id] = {
+            "id": profile_id,
+            "parameters": dict(parameters),
+        }
+    return [values[key] for key in sorted(values)]
+
+
 def _valid_task_sample_counts(report: Mapping[str, object]) -> bool:
     value = report.get("task_sample_counts")
     task_ids = report.get("task_ids")
@@ -272,6 +361,7 @@ def aggregate_experiment(experiment_id: str, attempts: Sequence[object]) -> dict
     fingerprints, variants = _fingerprint_summary(normalized)
     task_sample_counts = _task_sample_counts(normalized)
     task_ids = sorted(task_sample_counts)
+    candidate_variants = _candidate_variant_summary(normalized)
     finish_categories: dict[str, int] = {}
     for item in normalized:
         category = str(item.get("finish_category", "unknown"))
@@ -293,6 +383,7 @@ def aggregate_experiment(experiment_id: str, attempts: Sequence[object]) -> dict
         "task_sample_counts": task_sample_counts,
         "fingerprints": fingerprints,
         "fingerprint_variants": variants,
+        "candidate_variants": candidate_variants,
         "finish_categories": finish_categories,
         "dimensions": dimensions,
         "facts": facts,
@@ -394,6 +485,10 @@ def compare_experiments(baseline: Mapping[str, object], candidate: Mapping[str, 
         )
         for fact in DIAGNOSTIC_FACTS
     }
+    delta["candidate_variants"] = {
+        "baseline": baseline.get("candidate_variants", []),
+        "candidate": candidate.get("candidate_variants", []),
+    }
     return {"schema_version": 1, "compatible": True, "incompatibilities": [], "delta": delta}
 
 
@@ -404,6 +499,7 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
         "",
         f"Samples: `{report.get('sample_count', 0)}`",
         f"Task sample counts: `{json.dumps(report.get('task_sample_counts', {}), ensure_ascii=False, sort_keys=True)}`",
+        f"Candidate variants: `{json.dumps(report.get('candidate_variants', []), ensure_ascii=False, sort_keys=True)}`",
         "",
         "| Dimension | Status | Median score | Available |",
         "| --- | --- | ---: | ---: |",
@@ -422,9 +518,9 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
     facts = report.get("facts", {})
     for fact in DIAGNOSTIC_FACTS:
         item = facts.get(fact, {}) if isinstance(facts, Mapping) else {}
-        summary = item.get("true_rate", item.get("median", "—"))
+        summary = _fact_summary(item) if isinstance(item, Mapping) else "—"
         lines.append(
-            f"| `{fact}` | `{item.get('status', 'not_available')}` | {summary} | "
+            f"| `{fact}` | `{item.get('status', 'not_available')}` | {_display_value(summary)} | "
             f"{item.get('available_count', 0)}/{item.get('sample_count', 0)} |"
         )
     lines.extend(["", "Safety hard failures: `" + str(report.get("safety_hard_failure_count", 0)) + "`", ""])
@@ -450,10 +546,10 @@ def render_terminal_summary(report: Mapping[str, object]) -> str:
     facts = report.get("facts", {})
     for fact in DIAGNOSTIC_FACTS:
         item = facts.get(fact, {}) if isinstance(facts, Mapping) else {}
-        summary = item.get("true_rate", item.get("median", "n/a"))
+        summary = _fact_summary(item) if isinstance(item, Mapping) else "n/a"
         lines.append(
             f"fact.{fact}: {item.get('status', 'not_available')} "
-            f"median_or_rate={summary} "
+            f"median_or_rate={_display_value(summary)} "
             f"available={item.get('available_count', 0)}/{item.get('sample_count', 0)}"
         )
     lines.append(f"safety_hard_failures: {report.get('safety_hard_failure_count', 0)}")

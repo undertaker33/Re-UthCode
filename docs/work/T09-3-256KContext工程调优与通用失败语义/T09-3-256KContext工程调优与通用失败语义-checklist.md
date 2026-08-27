@@ -51,17 +51,17 @@
 
 ## T05：256K profile、cache 与 failure Eval 调优
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/eval -q`，全部通过。
-- [ ] 从现有 `python -m eval.runner` 手动入口运行离线 T09-3 smoke/profile compare；精确命令、外部 attempt 根与结果写入 W04 Feedback，未访问真实 Provider。
-- [ ] 至少三组明显不同的候选进入同一 compatible fingerprint 比较，覆盖 High/Low、fine timeline、L4 budget/epoch、count allowance 等实际参数；报告保留候选配置与 task sample counts。
-- [ ] 报告分别标明 deterministic acceptance 与 tuning evidence，且并列输出 correctness、context、exploration、efficiency、stability、safety，不存在 overall/weighted score。
-- [ ] 每组可观察 task verifier、tokens、compact count、pre/post usage、post-compact headroom、work distance、rediscovery/repeated exploration、externalization/HistoryRead、cache usage/availability、prefix change/reason 与 failure correctness。
-- [ ] compare 对不兼容 code/prompt/model/provider/config/task sample 等共同控制变量拒绝正式 delta；profile id/完整参数作为受控 candidate axis 单独记录，各候选逐任务样本分布一致，未放宽其它 fingerprint；compatible 报告重复生成结果稳定。
-- [ ] profile candidate 通过 Eval 私有 seam 注入，没有新增产品 config 字段或扩大公共 `create_application` API。
-- [ ] 最终初始工程默认有逐维取舍说明：任务成功与约束不明显退化、compact 不 thrash、post-compact 工作空间充分、重复探索与 cache invalidation 无明显恶化；未把该数值声明为 public API。
-- [ ] live Provider cache/latency/billing 未获授权时报告 `NOT VERIFIED (authorization required)` / unavailable；没有读取真实 secret 或发起网络请求。
-- [ ] 仓库内只保留版本化 candidate/fixture/汇总证据，不存在 attempt、cache、临时 home/workspace 或第二 benchmark runner。
-- [ ] D-T09-3-01、05、06、07 在 T05候选、报告、选择理由与 W04 Feedback 中均有证据。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/eval -q`，全部通过。
+- [x] 从现有 `python -m eval.runner` 手动入口运行离线 T09-3 smoke/profile compare；精确命令、外部 attempt 根与结果写入 W04 Feedback，未访问真实 Provider。
+- [x] 至少三组明显不同的候选进入同一 compatible fingerprint 比较，覆盖 High/Low、fine timeline、L4 budget/epoch、count allowance 等实际参数；报告保留候选配置与 task sample counts。
+- [x] 报告分别标明 deterministic acceptance 与 tuning evidence，且并列输出 correctness、context、exploration、efficiency、stability、safety，不存在 overall/weighted score。
+- [x] 每组可观察 task verifier、tokens、compact count、pre/post usage、post-compact headroom、work distance、rediscovery/repeated exploration、externalization/HistoryRead、cache usage/availability、prefix change/reason 与 failure correctness。
+- [x] compare 对不兼容 code/prompt/model/provider/config/task sample 等共同控制变量拒绝正式 delta；profile id/完整参数作为受控 candidate axis 单独记录，各候选逐任务样本分布一致，未放宽其它 fingerprint；compatible 报告重复生成结果稳定。
+- [x] profile candidate 通过 Eval 私有 seam 注入，没有新增产品 config 字段或扩大公共 `create_application` API。
+- [x] 最终初始工程默认有逐维取舍说明：任务成功与约束不明显退化、compact 不 thrash、post-compact 工作空间充分、重复探索与 cache invalidation 无明显恶化；未把该数值声明为 public API。
+- [x] live Provider cache/latency/billing 未获授权时报告 `NOT VERIFIED (authorization required)` / unavailable；没有读取真实 secret 或发起网络请求。
+- [x] 仓库内只保留版本化 candidate/fixture/汇总证据，不存在 attempt、cache、临时 home/workspace 或第二 benchmark runner。
+- [x] D-T09-3-01、05、06、07 在 T05候选、报告、选择理由与 W04 Feedback 中均有证据。
 
 ## T06：[接入主流程] Application 统一投影与正式入口收口
 

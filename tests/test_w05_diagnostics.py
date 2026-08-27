@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from eval.metrics import compute_diagnostic_facts
+from eval.metrics import DIAGNOSTIC_FACTS, compute_diagnostic_facts
 from eval.metrics import compute_metric_details
 from eval.reporting import aggregate_experiment, compare_experiments
 from uthcode.application import ApplicationContextService, UthCodeApplication
@@ -587,17 +587,7 @@ def test_eval_reports_context_facts_and_compares_without_candidate_quality_gate(
     baseline = aggregate_experiment("baseline", [_report_attempt(_facts(10, success=True))])
     candidate = aggregate_experiment("candidate", [_report_attempt(_facts(20, success=False))])
 
-    assert set(baseline["facts"]) == {
-        "success",
-        "tokens",
-        "tool_calls",
-        "compact_count",
-        "rediscovery",
-        "repeated_exploration",
-        "externalization",
-        "prefix_stability",
-        "cache_reuse",
-    }
+    assert set(baseline["facts"]) == set(DIAGNOSTIC_FACTS)
     assert baseline["facts"]["tokens"]["median"]["total_tokens"] == 10  # type: ignore[index]
     assert baseline["facts"]["cache_reuse"]["status"] == "available"  # type: ignore[index]
     comparison = compare_experiments(baseline, candidate)
