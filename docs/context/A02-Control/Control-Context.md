@@ -12,7 +12,7 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 
 - `[FACT]` 已实现三段权限决策：`Guard -> Policy -> Strategy`，并支持 Run-local `SessionGrant`。
 - `[FACT]` 已实现 `default`、`auto`、`full_access` 三种 Run-local 权限模式；用户配置可持久化安全默认值 `default|auto`，`full_access` 仍仅当前 Run 有效。
-- `[FACT]` 已实现五类 typed pause：`USER_REQUESTED`、`USER_INPUT_REQUIRED`、`PROVIDER_UNAVAILABLE`、`PERMISSION_REQUIRED`、`PLAN_REVIEW_REQUIRED`。
+- `[FACT]` 已实现五类 typed pause kind：`USER_REQUESTED`、`USER_INPUT_REQUIRED`、`PROVIDER_UNAVAILABLE`、`PERMISSION_REQUIRED`、`PLAN_REVIEW_REQUIRED`；Provider unavailable 的 `PauseReason` 可区分 `NETWORK_ERROR`、`RATE_LIMITED` 与 `TIMEOUT`。
 - `[FACT]` 暂停/恢复保持同一个 `AgentTurnExecution`、同一个 `TurnHandle` 和同一个事件流，不创建替代 Turn。
 - `[FACT]` 取消优先于待处理的恢复或审批响应；取消幂等。
 - `[FACT]` Agent Loop 在 trusted preflight 与 Permission 之间直接执行 PLAN 只读检查，并在 usage accounting 后、assistant final 提交前直接执行 unfinished-task 阻断；Plan Review 只由合法 `ProposePlan` 控制 ToolCall 触发。
@@ -107,7 +107,7 @@ running segment
 - `_TurnDriver` 独占 asyncio task、事件 queue、响应 waiter；Interface 只使用 `TurnHandle`。
 - `PauseRequest` 与响应必须严格匹配 `pause_id/run_id/turn_id`；工具型暂停还必须匹配 `tool_call_id`，权限暂停还匹配 `permission_id`。
 - `AskUserQuestion` 支持 1—4 个问题，类型为 text/single-select/multi-select；答案在恢复前完整校验。
-- `PLAN_REVIEW_REQUIRED`（Plan Review）、`USER_INPUT_REQUIRED`（AskUser）、`PERMISSION_REQUIRED`（Permission）、`PROVIDER_UNAVAILABLE`（Retry）与 `USER_REQUESTED` 是互斥的 typed interaction；pending typed interaction 存在时拒绝普通 Steering，输入优先交给对应 typed response。
+- `PLAN_REVIEW_REQUIRED`（Plan Review）、`USER_INPUT_REQUIRED`（AskUser）、`PERMISSION_REQUIRED`（Permission）、`PROVIDER_UNAVAILABLE`（Retry，区分 network/rate-limit/timeout）与 `USER_REQUESTED` 是互斥的 typed interaction；pending typed interaction 存在时拒绝普通 Steering，输入优先交给对应 typed response。
 - 用户主动暂停是 cooperative pause，不等于取消；Provider attempt 可被暂停信号打断，正在执行的普通 Tool 不因暂停被强杀。
 - `Bash` 取消会尝试终止进程树，但执行仍使用当前 OS 用户权限；不得描述为沙箱。
 - 未知错误对外转为稳定、无内部异常正文的失败事件/结果。

@@ -24,7 +24,7 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 | `/compact` | 通过 Application 的同一 Compact orchestrator 执行手动压缩；低 pressure 也可执行，无候选时返回成功 no-op，不创建垃圾 Timeline record |
 | `/new` | 创建新的空 Session，并切换当前 Run |
 | `/resume [session-id]` | 从当前项目的 Session Picker 或指定 ID 恢复已提交 Transcript、Timeline、Tool Result ref 和 Instruction State，并从新的 Run/Turn 开始；不恢复 active Runtime continuation |
-| `/status` | 显示当前模型、Provider、配置来源、分维 configured/provider/effective limits、Pressure/Preflight、Auto/Hard Gate、Timeline checkpoint、Compact outcome 和 History persistence outcome |
+| `/status` | 显示当前模型、Provider、配置来源、分维 configured/provider/default/effective limits 与 provenance、Pressure/Preflight、Auto/Hard Gate、Timeline checkpoint、Compact outcome、History persistence outcome 和 cache availability |
 | `/quit` | 退出 UthCode |
 
 常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q`、`/exit`。

@@ -65,38 +65,38 @@
 
 ## T06：[接入主流程] Application 统一投影与正式入口收口
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_w05_diagnostics.py tests/test_t09_1_context_protocol_e2e.py tests/test_cli.py tests/test_tui.py -q`，全部通过。
-- [ ] default resolver、frozen profile、High->Low、Provider cache usage 与 FailureReason 都通过 `create_application -> create_run -> start_turn -> AgentLoop` 唯一正式链工作。
-- [ ] ordinary、post-tool、post-resume、manual、L4/L5、overflow 的每次真实 model call 均使用同一 frozen request safety/Provider chain，且最终 Hard Gate 证据存在。
-- [ ] `/status`、Headless diagnostics 安全表达 limit provenance、effective、High/Low、cache availability/provenance、prefix reason 与 failure fact，不包含 Transcript/summary/Tool Result/secret/native exception。
-- [ ] CLI、TUI、Headless 只消费 Application structured reason/message projection；没有独立 Context、cache、failure 编排或 Provider exception switch。
-- [ ] bootstrap 只组合现有依赖；`rg -n "ContextManager|CacheManager|ErrorManager|Registry|CompactionJob|CompactionScheduler" src/uthcode/application src/uthcode/interfaces` 的命中不包含本包新增通用机制。
-- [ ] 被替代的旧 resolver、High-only stop、重复 presentation/cache helper、过渡 wrapper/export 已删除，且 active Turn 异常/取消后仍释放独占槽位。
-- [ ] D-T09-3-02、07 以及 D-T09-3-01～06 的主链接线在 T06 tests 与 W05 Feedback 中有证据。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_w05_diagnostics.py tests/test_t09_1_context_protocol_e2e.py tests/test_cli.py tests/test_tui.py -q`，全部通过。
+- [x] default resolver、frozen profile、High->Low、Provider cache usage 与 FailureReason 都通过 `create_application -> create_run -> start_turn -> AgentLoop` 唯一正式链工作。
+- [x] ordinary、post-tool、post-resume、manual、L4/L5、overflow 的每次真实 model call 均使用同一 frozen request safety/Provider chain，且最终 Hard Gate 证据存在。
+- [x] `/status`、Headless diagnostics 安全表达 limit provenance、effective、High/Low、cache availability/provenance、prefix reason 与 failure fact，不包含 Transcript/summary/Tool Result/secret/native exception。
+- [x] CLI、TUI、Headless 只消费 Application structured reason/message projection；没有独立 Context、cache、failure 编排或 Provider exception switch。
+- [x] bootstrap 只组合现有依赖；`rg -n "ContextManager|CacheManager|ErrorManager|Registry|CompactionJob|CompactionScheduler" src/uthcode/application src/uthcode/interfaces` 的命中不包含本包新增通用机制。
+- [x] 被替代的旧 resolver、High-only stop、重复 presentation/cache helper、过渡 wrapper/export 已删除，且 active Turn 异常/取消后仍释放独占槽位。
+- [x] D-T09-3-02、07 以及 D-T09-3-01～06 的主链接线在 T06 tests 与 W05 Feedback 中有证据。
 
 ## T07：[端到端验证] 离线验收、调优报告与文档同步
 
-- [ ] 从正式 Headless/Application 入口完成 default-only、小/大 ceiling、Active Turn freeze、High->Low、finite breaker、manual、overflow、cache hint/invalidation、terminal failure 与 recoverable pause 的离线 E2E。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`，全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，精确 passed/failed/skipped 写入 W05 Feedback。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`，退出码为 0。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，结果为 `No broken requirements found.`。
-- [ ] 执行 `git diff --check`，退出码为 0；`git status --short` 中用户开工前已有的 `docs/core-design/T09-context-engineering.md` 删除与 `临时目录/` 未被覆盖、恢复或纳入本包。
-- [ ] 使用 `uth-utf8-guard` 检查 T09-3 工作包、`docs/Context-Index.md`、A03/A04 及本包实际修改的其它 Markdown，UTF-8、replacement character、mojibake 和 fence parity 全部通过。
-- [ ] `docs/Context-Index.md`、A03/A04 及 `docs/README.md` 维护映射命中的当前文档与最终 `src/ + tests/` 一致；没有修改 T09/T09-1/T09-2 冻结正文、Spec、Tasks、Prompt 或 Checklist。
-- [ ] T09-3 Eval 汇总能够回答最终 High/Low 选择、post-compact工作距离、compact/rediscovery/repeated exploration、cache/prefix、质量退化与 unavailable 指标原因。
-- [ ] 无授权 live Provider 项明确为未验证；没有把它写成通过或隐藏验收。
-- [ ] D-T09-3-01～08 在 Spec、Tasks、W01～W05 Prompt、Checklist 与 Feedback 中逐项可追踪。
+- [x] 从正式 Headless/Application 入口完成 default-only、小/大 ceiling、Active Turn freeze、High->Low、finite breaker、manual、overflow、cache hint/invalidation、terminal failure 与 recoverable pause 的离线 E2E。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，精确 passed/failed/skipped 写入 W05 Feedback。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`，退出码为 0。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，结果为 `No broken requirements found.`。
+- [x] 执行 `git diff --check`，退出码为 0；`git status --short` 中用户开工前已有的 `docs/core-design/T09-context-engineering.md` 删除与 `临时目录/` 未被覆盖、恢复或纳入本包。
+- [x] 使用 `uth-utf8-guard` 检查 T09-3 工作包、`docs/Context-Index.md`、A03/A04 及本包实际修改的其它 Markdown，UTF-8、replacement character、mojibake 和 fence parity 全部通过。
+- [x] `docs/Context-Index.md`、A03/A04 及 `docs/README.md` 维护映射命中的当前文档与最终 `src/ + tests/` 一致；没有修改 T09/T09-1/T09-2 冻结正文、Spec、Tasks、Prompt 或 Checklist。
+- [x] T09-3 Eval 汇总能够回答最终 High/Low 选择、post-compact工作距离、compact/rediscovery/repeated exploration、cache/prefix、质量退化与 unavailable 指标原因。
+- [x] 无授权 live Provider 项明确为未验证；没有把它写成通过或隐藏验收。
+- [x] D-T09-3-01～08 在 Spec、Tasks、W01～W05 Prompt、Checklist 与 Feedback 中逐项可追踪。
 
 ## T08：[遗留负担清理] 单一路径与取消路线确认
 
-- [ ] `rg -n "active_evidence_budget|uncompressed_tail_budget|retained_hard_cap" src tests eval docs/context docs/Context-Index.md` 返回 0 条。
-- [ ] `rg -n "bundled.*model|model.*catalog|model.?name.*context|context.*model.?name" src/uthcode tests eval docs/context docs/Context-Index.md` 不存在 bundled model metadata、型号猜测或隐式 tuning table；普通文本命中在 Feedback 说明。
-- [ ] `rg -n "ContextPolicyRegistry|ContextManager|CompactManager|CompactionJob|CompactionScheduler|CacheManager|CacheRegistry|ErrorManager|ErrorRegistry" src tests eval` 返回 0 条或只有明确非生产文本且逐条解释。
-- [ ] `rg -n "prompt_cache_key|cache_control" src/uthcode/core src/uthcode/interfaces` 返回 0 条；Tool Schema仍只有 Tool System authority，Compat 默认不盲发专有参数。
-- [ ] Interface 无 Provider/SDK exception classifier；Network/rate-limit/timeout Pause/Retry、Session quarantine、Hard Gate、Permission、Secret 与 unsandboxed Bash 语义无范围外改变。
-- [ ] 本包产生但未使用的 profile branch、cache experiment、一次性脚本、重复 helper/export/wrapper、不可达代码和仓库内 Eval 运行产物已删除；用户既有 dirty files 保留。
-- [ ] `docs/OutstandingDebtList.md` 已按“能力欠账：无”核对并保持不变；没有把 Out of Scope、未来能力或未授权 live Eval 登记为欠账。
-- [ ] 清理后重新执行 T01～T07 的最小定向、`tests/eval`、架构、全量、compileall、pip check、diff check 与 UTF-8 guard，精确结果写入 W05 Feedback。
-- [ ] 全部 Checklist 已有真实证据、W01～W05 Feedback 齐全后，`docs/Context-Index.md` 将 T09-3 标为 `implemented_unarchived`；工作包仍留在 `docs/work/`，未执行归档、commit、push、merge、rebase、tag 或 release。
-- [ ] D-T09-3-01～08 的最终否定扫描和取消路线验证完整，未弱化任何冻结 MUST。
+- [x] `rg -n "active_evidence_budget|uncompressed_tail_budget|retained_hard_cap" src tests eval docs/context docs/Context-Index.md` 返回 0 条。
+- [x] `rg -n "bundled.*model|model.*catalog|model.?name.*context|context.*model.?name" src/uthcode tests eval docs/context docs/Context-Index.md` 不存在 bundled model metadata、型号猜测或隐式 tuning table；普通文本命中在 Feedback 说明。
+- [x] `rg -n "ContextPolicyRegistry|ContextManager|CompactManager|CompactionJob|CompactionScheduler|CacheManager|CacheRegistry|ErrorManager|ErrorRegistry" src tests eval` 返回 0 条或只有明确非生产文本且逐条解释。
+- [x] `rg -n "prompt_cache_key|cache_control" src/uthcode/core src/uthcode/interfaces` 返回 0 条；Tool Schema仍只有 Tool System authority，Compat 默认不盲发专有参数。
+- [x] Interface 无 Provider/SDK exception classifier；Network/rate-limit/timeout Pause/Retry、Session quarantine、Hard Gate、Permission、Secret 与 unsandboxed Bash 语义无范围外改变。
+- [x] 本包产生但未使用的 profile branch、cache experiment、一次性脚本、重复 helper/export/wrapper、不可达代码和仓库内 Eval 运行产物已删除；用户既有 dirty files 保留。
+- [x] `docs/OutstandingDebtList.md` 已按“能力欠账：无”核对并保持不变；没有把 Out of Scope、未来能力或未授权 live Eval 登记为欠账。
+- [x] 清理后重新执行 T01～T07 的最小定向、`tests/eval`、架构、全量、compileall、pip check、diff check 与 UTF-8 guard，精确结果写入 W05 Feedback。
+- [x] 全部 Checklist 已有真实证据、W01～W05 Feedback 齐全后，`docs/Context-Index.md` 将 T09-3 标为 `implemented_unarchived`；工作包仍留在 `docs/work/`，未执行归档、commit、push、merge、rebase、tag 或 release。
+- [x] D-T09-3-01～08 的最终否定扫描和取消路线验证完整，未弱化任何冻结 MUST。
