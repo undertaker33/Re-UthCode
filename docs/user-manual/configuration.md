@@ -51,7 +51,7 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 
 `models.<model-ref>.context_window` 是用户显式配置的输入运行上限，必须是正整数。项目配置只能在用户配置已经存在该值时保持或收紧，不能补造缺失值或放大用户值。Provider 可以在运行时提供更小的可靠 `max_input_tokens`，最终请求使用两者中更紧的上限；`max_output_tokens` 和可选的 combined-context 限制分别校验，未知维度不会被猜测或伪造。
 
-如果用户没有配置 `context_window`，且 Provider 也没有可靠输入上限，当前模型会在发送前 fail closed；UthCode 不使用固定窗口、型号名称推断或官方随包窗口表作为回退。每次普通请求、工具续环、手动 Compact、L4/L5 和 overflow retry 都会按最终 Provider-visible request 重新执行 Hard Gate。
+如果用户没有配置 `context_window`，UthCode 使用 `256_000` 的默认输入 Operating Window；Provider 若报告更小的可靠 `max_input_tokens`，则进一步收紧，且最终值和来源会显示在 `/status` 与 diagnostics 中。每个 Active Turn 在首次请求准备时冻结这一预算；普通请求、工具续环、手动 Compact、L4/L5 和 overflow retry 都沿用同一 Application Context/Hard Gate 链路。UthCode 不使用型号名称推断或官方随包窗口表作为上限权威。
 
 ## `permissions.toml`
 

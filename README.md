@@ -9,6 +9,7 @@ UthCode 是一个面向本地项目的 AI 编程助手。它既可以在终端�
 - 阅读、搜索、创建和修改工作目录内的文件。
 - 通过 `Bash` 执行命令，并对工具操作进行权限判断和必要的用户确认。
 - 支持 Anthropic、OpenAI Responses 和 OpenAI-compatible 模型服务。
+- Context 输入预算默认使用 `256_000` Operating Window，按 configured/provider 限制收紧，并通过统一 Application diagnostics 暴露来源、Gate、缓存可用性与失败/暂停投影。
 - 在同一 `AgentRun` 内保留多轮对话，支持暂停、恢复、取消和运行中补充指令；terminal Turn 提交到 Session History 后，可由新的 Run/Turn 通过 `/resume` 继续，未提交的 Runtime checkpoint 不跨进程恢复。
 - 提供 Plan Mode、计划审阅和任务状态跟踪。
 - 同时提供交互式 TUI 与适合脚本调用的 `exec` 模式。

@@ -15,7 +15,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`、Model `remote_id`/`display_name`；`/model` 原子写回只修改用户级 `default_model`。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
 - `[FACT]` CLI/TUI 进入正式运行前通过 Application `ensure_session()` 打开一个 fresh Session。Session v3 只持久化 metadata（schema 3）、Transcript、Timeline、Tool Result、writer lock 与 Instruction State；v1/v2 明确 incompatible。terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
-- `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；Integration 不重新编译 Context。
+- `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane、default/configured/provider/effective budget provenance 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；Integration 不重新编译 Context。
 - `[FACT]` `/compact` 已通过 Command/Application/Session 路径调用同一 Context orchestrator；低 pressure 也可手动执行，无完整候选或无 reduction value 时返回成功 no-op。L4/L5 与 overflow recovery 使用 tool-free、bounded、Hard-gated 的 Compact request；ordinary overflow 最多 forced reduction/rebuild/re-gate/retry 一次。
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
@@ -29,7 +29,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` verifier 作为独立离线子进程读取 attempt workspace；`eval/metrics.py` 与 `eval/reporting.py` 只消费公开事件、终态、verifier 和受控 diagnostics，报告并列保留六个维度，不生成总分。
 - `[FACT]` 真实 Eval 运行必须显式提供 `--model` 远端模型标识；该标识进入 attempt 和聚合报告的 `model_id` 指纹。报告同时保存 `task_sample_counts`；Compare 先校验每份报告的映射非空、键集合等于 `task_ids` 且计数总和等于 `sample_count`，再要求两边逐任务样本计数映射完全一致。
 - `[BOUNDARY]` Eval 不注册正式 `uthcode` CLI，不接入 CI，不修改 `src/uthcode/**`；workspace、home、artifact、cache 和 report 都必须位于物理校验过的仓库外专用根。
-- `[FACT]` Eval diagnostics 可以消费 configured/provider/effective limits、selected/omitted block IDs、Pressure/Preflight、Auto/Hard、Timeline/Compaction、epoch/prefix、Tool externalization、Session recovery 和 Provider Usage 的安全投影；Memory/retrieval 仍保持 `not_available`，报告继续保留六个并列维度，不生成总分。
+- `[FACT]` Eval diagnostics 可以消费 configured/provider/default/effective limits、tightened sources、selected/omitted block IDs、Pressure/Preflight、Auto/Hard、Timeline/Compaction、epoch/prefix、Tool externalization、Session recovery、Provider cache usage 与 terminal FailureReason/PauseReason 的安全投影；Memory/retrieval 仍保持 `not_available`，报告继续保留六个并列维度，不生成总分。
 
 ## 物理依赖边界
 
@@ -106,7 +106,7 @@ uthcode exec <prompt>
   -> one AgentRun
   -> one TurnHandle
   -> final answer 写 stdout
-  -> reasoning/tool/failure 写 stderr
+  -> Application 的 PauseReason/FailureReason 文案与 reasoning/tool diagnostics 写 stderr
   -> 若 Turn 需要 AskUser/Permission/Retry/Resume：exec 无响应通道，取消同一 Turn 并返回失败
 ```
 
