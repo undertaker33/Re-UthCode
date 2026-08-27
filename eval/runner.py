@@ -15,11 +15,12 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 
 from eval.execution import AttemptExecution, EvalExecutionError, run_attempt
 from eval.models import TaskDefinition, VerifierResult
+from eval.profile import PROFILE_IDS, applied_profile, profile_by_id
 from eval.reporting import (
     aggregate_experiment,
     compare_experiments,
@@ -43,9 +44,16 @@ from uthcode.application import (
     TextPart,
     ToolCallPart,
     Usage,
+    create_application,
 )
 from uthcode.core import SecretValue
 from uthcode.core.provider import ModelLimits
+from eval.workloads import (
+    PROFILE_WORKLOAD_INSTRUCTION,
+    ProfileWorkloadProvider,
+    prepare_profile_workspace,
+    seed_profile_history,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +67,7 @@ TASK_IDS = (
     "permission-boundary",
     "long-context-constraint",
 )
+PROFILE_TASK_ID = "long-context-constraint"
 REPORT_NAME = "report.json"
 
 
@@ -87,6 +96,26 @@ class _ScriptedProvider:
         for event in self._scripts[index]:
             raise_if_cancelled()
             yield event
+
+
+class _ProfileApplicationProxy:
+    """Seed the Eval Session immediately before the measured Run is created."""
+
+    def __init__(self, application: object, provider: ProfileWorkloadProvider) -> None:
+        self._application = application
+        self._provider = provider
+        self._seeded = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._application, name)
+
+    def create_run(self, **kwargs: object) -> object:
+        if not self._seeded:
+            seeded_turns = seed_profile_history(self._application)
+            self._provider.record_seeded_history(seeded_turns)
+            self._seeded = True
+        create_run = getattr(self._application, "create_run")
+        return create_run(**kwargs)
 
 
 def _completed(*parts: object, finish_reason: str = "stop") -> GenerationCompleted:
@@ -297,6 +326,77 @@ async def _execute_attempt(
     return _write_attempt_record(execution)
 
 
+async def _execute_profile_attempt(
+    task_dir: Path,
+    task: TaskDefinition,
+    eval_root: Path,
+    experiment_id: str,
+    attempt_id: str,
+    *,
+    profile_id: str,
+    prompt_salt: str,
+    model_id: str,
+) -> dict[str, object]:
+    profile = profile_by_id(profile_id)
+    fixture = task_dir / task.fixture_path
+    attempt = create_attempt(
+        REPO_ROOT,
+        eval_root,
+        experiment_id,
+        task.task_id,
+        attempt_id,
+        fixture,
+    )
+    evidence_bytes = prepare_profile_workspace(attempt.workspace)
+    provider_box: dict[str, ProfileWorkloadProvider] = {}
+
+    def provider_builder(_provider_profile: object, _model_profile: object) -> ProfileWorkloadProvider:
+        # Attempt numbers are the controlled route variable.  The same seed is
+        # used for every candidate at a given attempt so route variation stays
+        # separate from the candidate profile and remains comparable.
+        route_seed = int(attempt_id) - 1
+        provider = ProfileWorkloadProvider(model_id=model_id, route_seed=route_seed)
+        provider_box["provider"] = provider
+        return provider
+
+    def application_factory(config: EffectiveConfig, **kwargs: object) -> object:
+        application = create_application(config, **kwargs)
+        provider = provider_box.get("provider")
+        if provider is None:
+            raise EvalExecutionError("profile Provider was not constructed")
+        provider.attach_application(application, attempt.artifacts)
+        application.new_session_for_command()  # type: ignore[attr-defined]
+        return _ProfileApplicationProxy(application, provider)
+
+    instruction = (task_dir / task.instruction_path).read_text(encoding="utf-8")
+    instruction += "\n\n" + PROFILE_WORKLOAD_INSTRUCTION
+    if prompt_salt:
+        instruction += f"\n\n[manual prompt salt: {prompt_salt}]\n"
+
+    def diagnostics_hook() -> Mapping[str, object]:
+        provider = provider_box.get("provider")
+        if provider is None:
+            return {"status": "not_available"}
+        return provider.public_diagnostics(evidence_bytes=evidence_bytes)
+
+    with applied_profile(profile):
+        execution = await run_attempt(
+            task,
+            attempt,
+            instruction=instruction,
+            config=_config(ProviderKind.FAKE, None, model_id),
+            provider_builder=provider_builder,
+            application_factory=application_factory,
+            verifier=_verifier(task_dir, task),
+            run_id=f"{experiment_id}-{task.task_id}-{attempt_id}",
+            live=False,
+            live_authorized=False,
+            candidate_variant=profile.to_variant(),
+            diagnostics_hook=diagnostics_hook,
+        )
+    return _write_attempt_record(execution)
+
+
 def _report_paths(eval_root: Path, experiment_id: str) -> tuple[Path, Path]:
     directory = eval_root / "reports" / experiment_id
     directory.mkdir(parents=True, exist_ok=True)
@@ -345,6 +445,15 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--live-authorized", action="store_true")
 
 
+def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--candidate", choices=PROFILE_IDS, required=True)
+    parser.add_argument("--experiment", required=True)
+    parser.add_argument("--eval-root", required=True)
+    parser.add_argument("--attempts", type=_positive_int, default=1)
+    parser.add_argument("--prompt-salt", default="")
+    parser.add_argument("--model")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manual private UthCode Eval runner (offline by default).")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -362,6 +471,12 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="run one task or the complete seven-task suite")
     _add_run_arguments(run)
+
+    profile = subparsers.add_parser(
+        "profile",
+        help="run one offline long-context workload with a controlled Context profile",
+    )
+    _add_profile_arguments(profile)
 
     compare = subparsers.add_parser("compare", help="compare two compatible experiment reports")
     compare.add_argument("--baseline", required=True)
@@ -437,9 +552,44 @@ async def _run_command(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+async def _run_profile_command(args: argparse.Namespace) -> dict[str, object]:
+    if args.attempts <= 0:
+        raise EvalExecutionError("profile attempts must be positive")
+    eval_root = resolve_eval_root(REPO_ROOT, Path(args.eval_root))
+    task_dir, task = _task(PROFILE_TASK_ID)
+    model_id = args.model.strip() if isinstance(args.model, str) and args.model.strip() else "eval-model"
+    attempts: list[dict[str, object]] = []
+    for number in range(1, args.attempts + 1):
+        attempts.append(
+            await _execute_profile_attempt(
+                task_dir,
+                task,
+                eval_root,
+                args.experiment,
+                str(number),
+                profile_id=args.candidate,
+                prompt_salt=args.prompt_salt,
+                model_id=model_id,
+            )
+        )
+    report_path, report = _write_report(eval_root, args.experiment, attempts)
+    return {
+        "mode": "fake",
+        "experiment_id": args.experiment,
+        "profile_id": args.candidate,
+        "task_ids": [PROFILE_TASK_ID],
+        "attempt_count": len(attempts),
+        "report_path": str(report_path),
+        "report": report,
+        "terminal_summary": render_terminal_summary(report),
+    }
+
+
 def _main(args: argparse.Namespace) -> dict[str, object]:
     if args.command in {"smoke", "run"}:
         return asyncio.run(_run_command(args))
+    if args.command == "profile":
+        return asyncio.run(_run_profile_command(args))
     if args.command == "compare":
         return compare_experiments(_read_json(Path(args.baseline)), _read_json(Path(args.candidate)))
     if args.command == "clean":
