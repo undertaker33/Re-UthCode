@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from uthcode.application.history import _transcript_entries_for_message
@@ -11,7 +13,7 @@ from uthcode.core.history import (
     TranscriptRef,
     TranscriptSequenceError,
 )
-from uthcode.core.provider import Message, TextPart, ToolCallPart, ToolResultPart
+from uthcode.core.provider import Message, NativeItem, ReasoningPart, TextPart, ToolCallPart, ToolResultPart
 
 
 def _entry(sequence: int, *, turn_id: str = "turn-1", kind: TranscriptKind = TranscriptKind.USER_MESSAGE, unit: str | None = None, payload: dict | None = None, commit_boundary: bool = True) -> TranscriptEntry:
@@ -76,4 +78,47 @@ def test_application_message_conversion_preserves_complete_message_identity() ->
     entries = _transcript_entries_for_message("session-1", "turn-1", 1, message)
     assert len(entries) == 2
     assert {entry.semantic_unit_id for entry in entries} == {"turn-1"}
-    assert all(entry.payload["message"] == message.to_dict() for entry in entries)
+    assert [entry.payload["message_id"] for entry in entries] == ["turn-1:1", "turn-1:1"]
+    assert [entry.payload["message_part_index"] for entry in entries] == [0, 1]
+    assert [entry.payload["role"] for entry in entries] == ["assistant", "assistant"]
+    assert [entry.payload["part"] for entry in entries] == [
+        message.parts[0].to_dict(),
+        message.parts[1].to_dict(),
+    ]
+    assert all("message" not in entry.payload for entry in entries)
+
+
+def test_application_message_conversion_keeps_each_reasoning_carrier_local() -> None:
+    reasoning_native = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=0,
+        kind="thinking",
+        payload={"type": "thinking", "thinking": "plan", "signature": "sig"},
+    )
+    text_native = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=1,
+        kind="text",
+        payload={"type": "text", "text": "answer"},
+    )
+    message = Message(
+        "assistant",
+        (ReasoningPart("plan"), TextPart("answer")),
+        native_items=(reasoning_native, text_native),
+    )
+
+    entries = _transcript_entries_for_message("session-1", "turn-2", 4, message)
+
+    assert [entry.payload["part"] for entry in entries] == [
+        {"type": "reasoning", "text": "plan"},
+        {"type": "text", "text": "answer"},
+    ]
+    assert entries[0].payload["native_items"] == [reasoning_native.to_dict()]
+    assert entries[1].payload["native_items"] == [text_native.to_dict()]
+    encoded = "".join(json.dumps(entry.to_dict(), ensure_ascii=False) for entry in entries)
+    assert encoded.count('"message"') == 0
+    assert encoded.count('"part"') == 2

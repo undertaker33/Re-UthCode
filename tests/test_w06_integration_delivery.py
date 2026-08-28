@@ -163,7 +163,7 @@ async def test_t09_2_v3_session_formal_turn_compact_close_reopen_resume_preserve
             if entry.kind is TranscriptKind.TOOL_RESULT
         ]
         assert len(tool_results) == 1
-        metadata = tool_results[0].payload["metadata"]
+        metadata = tool_results[0].payload["part"]["metadata"]
         assert isinstance(metadata, Mapping)
         reference = metadata["ref"]
         assert isinstance(reference, str) and reference

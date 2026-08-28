@@ -767,7 +767,9 @@ def _incomplete_units(transcript: Transcript) -> tuple[SemanticUnit, ...]:
 
 
 def _tool_id(entry: TranscriptEntry) -> str | None:
-    value = entry.payload.get("tool_call_id")
+    part = entry.payload.get("part")
+    payload = part if isinstance(part, Mapping) else entry.payload
+    value = payload.get("tool_call_id")
     return value if isinstance(value, str) and value else None
 
 

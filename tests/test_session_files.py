@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, TranscriptEntry, TranscriptKind, TranscriptRef
+from uthcode.core.provider import Message, ReasoningPart, TextPart
 from uthcode.integrations import session_files
 from uthcode.integrations.session_files import (
     SessionBusyError,
@@ -45,6 +46,45 @@ def test_session_v3_layout_preserves_transcript_and_timeline(tmp_path: Path) -> 
     assert recovered.transcript.entries == entries
     assert recovered.timeline.fine_entries[0].summary == "tool work complete"
     assert recovered.timeline.active_checkpoint is not None
+
+
+def test_session_v3_reads_legacy_full_message_payload_without_rewriting(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("legacy", project_key="project")
+    message = Message("assistant", (ReasoningPart("plan"), TextPart("answer")))
+    legacy_entry = TranscriptEntry(
+        "legacy",
+        1,
+        "turn-legacy",
+        TranscriptKind.ASSISTANT_MESSAGE,
+        {
+            "type": "reasoning",
+            "text": "plan",
+            "message_id": "turn-legacy:1",
+            "message": message.to_dict(),
+        },
+        semantic_unit_id="turn-legacy",
+    )
+    path = store.session_path("legacy") / "transcript.jsonl"
+    session_files._append_jsonl(
+        path,
+        (
+            {
+                "schema_version": 2,
+                "kind": "transcript",
+                "sequence": 1,
+                "entry": legacy_entry.to_dict(),
+            },
+        ),
+    )
+    before_bytes = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+
+    recovered = store.read_session("legacy")
+
+    assert recovered.transcript.entries == (legacy_entry,)
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime
 
 
 def test_timeline_trailing_derived_record_is_not_logically_committed(tmp_path: Path) -> None:

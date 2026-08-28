@@ -6,6 +6,7 @@ import pytest
 
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.core.context import (
     CompactionPolicy,
     ContextCompactor,
@@ -15,10 +16,10 @@ from uthcode.core.context import (
     ContextSnapshot,
     messages_from_context_snapshot,
 )
-from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind
+from uthcode.core.history import ActiveCheckpoint, SemanticEntry, SemanticUnit, Timeline, Transcript, TranscriptEntry, TranscriptKind
 from uthcode.core.prompt import ContextAuthority, ContextBlock, ContextScope, ContextSourceKind, ContextStability, ProjectInstructionSource, RuntimePromptContext, ToolDefinitionSource
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import GenerationRequest, Message, TextPart, ToolDefinition
+from uthcode.core.provider import GenerationRequest, Message, NativeItem, ReasoningPart, TextPart, ToolDefinition
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.integrations.providers.openai_responses import _prompt_cache_key
@@ -234,6 +235,81 @@ def test_timeline_summary_is_conversation_data_and_raw_tail_remains_visible() ->
     assert snapshot.timeline_checkpoint_id == "turn-1"
     messages = messages_from_context_snapshot(snapshot)
     assert any("summary of first" in part.text for message in messages for part in message.parts if isinstance(part, TextPart))
+
+
+def test_context_rebuilds_reasoning_and_formal_parts_with_native_items() -> None:
+    native_reasoning = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=0,
+        kind="thinking",
+        payload={"type": "thinking", "thinking": "plan", "signature": "sig"},
+    )
+    native_text = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=1,
+        kind="text",
+        payload={"type": "text", "text": "answer"},
+    )
+    entries = _transcript_entries_for_message(
+        "session-1",
+        "turn-reasoning",
+        1,
+        Message(
+            "assistant",
+            (ReasoningPart("plan"), TextPart("answer")),
+            native_items=(native_reasoning, native_text),
+        ),
+    )
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            transcript=Transcript("session-1", entries),
+            current_turn=("tail",),
+        )
+    )
+
+    messages = messages_from_context_snapshot(snapshot)
+    assistant = next(message for message in messages if message.role == "assistant")
+    assert assistant.parts == (ReasoningPart("plan"), TextPart("answer"))
+    assert assistant.native_items == (native_reasoning, native_text)
+    assert "plan" not in "".join(
+        part.text for part in assistant.parts if isinstance(part, TextPart)
+    )
+
+
+def test_context_rejects_non_contiguous_history_message_identity() -> None:
+    def entry(sequence: int, message_id: str, part_index: int, text: str) -> TranscriptEntry:
+        return TranscriptEntry(
+            "session-1",
+            sequence,
+            "turn-identity",
+            TranscriptKind.USER_MESSAGE,
+            {
+                "role": "user",
+                "message_id": message_id,
+                "message_part_index": part_index,
+                "part": {"type": "text", "text": text},
+            },
+            semantic_unit_id="turn-identity",
+        )
+
+    entries = (
+        entry(1, "message-a", 0, "same"),
+        entry(2, "message-b", 0, "other"),
+        entry(3, "message-a", 1, "tail"),
+    )
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            transcript=Transcript("session-1", entries),
+            current_turn=("tail",),
+        )
+    )
+
+    with pytest.raises(ContextCompilationError, match="non-contiguous"):
+        messages_from_context_snapshot(snapshot)
 
 
 def test_current_user_is_protected_and_remains_at_conversation_tail_over_budget() -> None:

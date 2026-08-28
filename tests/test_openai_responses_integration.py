@@ -473,7 +473,13 @@ async def test_responses_request_shapes_tools_native_replay_and_cross_identity_f
     assert "instructions" not in other_client.calls[-1]
     input_values = other_client.calls[-1]["input"]
     assert not any(item.get("type") == "reasoning" for item in input_values)
-    assert any(item.get("role") == "assistant" for item in input_values)
+    assistant_items = [item for item in input_values if item.get("role") == "assistant"]
+    assert assistant_items == [
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        }
+    ]
 
 
 @pytest.mark.asyncio

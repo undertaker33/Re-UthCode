@@ -78,6 +78,7 @@ from uthcode.core.provider import (
     ProviderTimeoutError,
     ProviderIdentity,
     ProviderResponse,
+    ReasoningPart as ProviderReasoningPart,
     RateLimitError,
     ReasoningDelta as ProviderReasoningDelta,
     TextDelta,
@@ -857,6 +858,62 @@ async def test_reasoning_tool_and_provider_events_preserve_authoritative_order()
     assert sum(isinstance(event, (TurnCompleted, TurnFailed, TurnCancelled)) for event in events) == 1
     for event in events:
         assert agent_event_from_json(event.to_json()) == event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parts",
+    [
+        (ProviderReasoningPart("only"),),
+        (TextPart(""),),
+        (ProviderReasoningPart("only"), TextPart("")),
+    ],
+)
+async def test_stop_requires_non_empty_formal_text_part(parts: tuple[object, ...]) -> None:
+    provider = ScriptedProvider([[_response(*parts)]])
+    execution = _start(_loop(provider))
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INVALID_PROVIDER_RESPONSE
+    assert execution.state.messages == (execution.state.messages[0],)
+    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_stays_out_of_final_text_and_tool_progress_remains_legal() -> None:
+    tool = RecordingTool("read", output="tool-result")
+    call = ToolCallPart("call-reasoning", "read", {"value": "x"})
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ProviderReasoningPart("plan"),
+                    TextPart("progress"),
+                    call,
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(ProviderReasoningPart("final thought"), TextPart("answer"))],
+        ]
+    )
+
+    events, result, _ = await _drive(_start(_loop(provider, (tool,))))
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "answer"
+    completed = [event for event in events if isinstance(event, AssistantMessageCompleted)]
+    assert completed[0].message.parts == (
+        ProviderReasoningPart("plan"),
+        TextPart("progress"),
+    )
+    assert completed[-1].message.parts == (
+        ProviderReasoningPart("final thought"),
+        TextPart("answer"),
+    )
+    assert [event.final_text for event in events if isinstance(event, TurnCompleted)] == ["answer"]
 
 
 @pytest.mark.asyncio

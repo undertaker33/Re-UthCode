@@ -564,6 +564,11 @@ async def test_anthropic_same_identity_replays_native_history_and_other_identity
         if message["role"] == "assistant"
     )
     assert all(block["type"] == "text" or block["type"] == "tool_use" for block in other_assistant["content"])
+    assert [
+        block["text"]
+        for block in other_assistant["content"]
+        if block["type"] == "text"
+    ] == ["answer"]
     assert not any(block["type"] == "redacted_thinking" for block in other_assistant["content"])
 
 

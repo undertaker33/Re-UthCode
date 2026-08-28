@@ -10,19 +10,19 @@
 
 ## T02：Provider reasoning 与正式终态合同
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_provider_contract.py tests/test_agent_events.py tests/test_agent_loop.py tests/test_openai_compat_integration.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py -q`，全部通过。
-- [ ] reasoning→content、同 chunk reasoning+content、content→reasoning→content、多 reasoning segment 的事件顺序均有精确断言。
-- [ ] 同 identity 的 reasoning+ToolCall continuation 保留所需 carrier；跨 identity 请求中 reasoning 既不作为 native carrier，也不进入 assistant content。
-- [ ] reasoning-only stop、空 TextPart stop 产生受控 invalid response；ReasoningPart+非空 TextPart final 和 ReasoningPart+ToolCall progress 正常。
-- [ ] TurnCompleted/TurnResult 的 final_text 只来自正式 TextPart，reasoning 不进入修正消息或最终正文。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_provider_contract.py tests/test_agent_events.py tests/test_agent_loop.py tests/test_openai_compat_integration.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py -q`，全部通过。
+- [x] reasoning→content、同 chunk reasoning+content、content→reasoning→content、多 reasoning segment 的事件顺序均有精确断言。
+- [x] 同 identity 的 reasoning+ToolCall continuation 保留所需 carrier；跨 identity 请求中 reasoning 既不作为 native carrier，也不进入 assistant content。
+- [x] reasoning-only stop、空 TextPart stop 产生受控 invalid response；ReasoningPart+非空 TextPart final 和 ReasoningPart+ToolCall progress 正常。
+- [x] TurnCompleted/TurnResult 的 final_text 只来自正式 TextPart，reasoning 不进入修正消息或最终正文。
 
 ## T03：Transcript 逻辑消息与 reasoning 持久化
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_contract.py tests/test_context_compiler.py tests/test_session_files.py tests/test_w04_session_commands.py -q`，全部通过。
-- [ ] 多 part assistant/tool message 新写入后，每个 entry 只含自身 part；重建恰好得到一个按原 part 顺序排列的逻辑 Message。
-- [ ] ReasoningPart 与 TextPart 分别 round-trip；reasoning 可用于 replay，但永不并入 final TextPart。
-- [ ] 相同文本不同 message identity 不去重；同 identity 非连续复用被拒绝；ToolCall/ToolResult ID、FIFO 和 semantic unit 完整。
-- [ ] 旧 full-message v3 Session 可读取且文件 hash/mtime 不变；新 writer 不产生 `parts × full message` 存储放大。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_contract.py tests/test_context_compiler.py tests/test_session_files.py tests/test_w04_session_commands.py -q`，全部通过。
+- [x] 多 part assistant/tool message 新写入后，每个 entry 只含自身 part；重建恰好得到一个按原 part 顺序排列的逻辑 Message。
+- [x] ReasoningPart 与 TextPart 分别 round-trip；reasoning 可用于 replay，但永不并入 final TextPart。
+- [x] 相同文本不同 message identity 不去重；同 identity 非连续复用被拒绝；ToolCall/ToolResult ID、FIFO 和 semantic unit 完整。
+- [x] 旧 full-message v3 Session 可读取且文件 hash/mtime 不变；新 writer 不产生 `parts × full message` 存储放大。
 
 ## T04：Session 安全回放与惰性生命周期
 

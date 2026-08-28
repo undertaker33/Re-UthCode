@@ -234,6 +234,43 @@ async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_or
 
 
 @pytest.mark.asyncio
+async def test_chat_public_stream_preserves_interleaved_reasoning_and_text_segments() -> None:
+    chunks = [
+        _chunk(
+            ChoiceDelta.model_construct(
+                role="assistant", content="first", reasoning_content="plan"
+            )
+        ),
+        _chunk(
+            ChoiceDelta.model_construct(
+                role="assistant", content=None, reasoning_content="more"
+            )
+        ),
+        _chunk(ChoiceDelta(role="assistant", content="second")),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="stop"),
+    ]
+    client = _OpenAICompatClient(chunks)
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
+    events = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+
+    assert [
+        type(event)
+        for event in events
+        if isinstance(event, (ReasoningDelta, TextDelta))
+    ] == [ReasoningDelta, TextDelta, ReasoningDelta, TextDelta]
+    response = next(event.response for event in events if isinstance(event, GenerationCompleted))
+    assert response.message.parts == (
+        ReasoningPart("plan"),
+        TextPart("first"),
+        ReasoningPart("more"),
+        TextPart("second"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_request_keeps_context_steering_duplicates_and_current_user_separate() -> None:
     client = _OpenAICompatClient(_chunks())
     provider = build_openai_compat_provider(
@@ -454,7 +491,7 @@ async def test_chat_cross_identity_native_items_are_ignored_and_standard_parts_r
     await _collect(other, _request(response.message))
     assistant = other_client.calls[-1]["messages"][0]
     assert "reasoning_content" not in assistant
-    assert assistant["content"] == "plananswer"
+    assert assistant["content"] == "answer"
     assert assistant["tool_calls"][0]["id"] == "call-1"
 
 

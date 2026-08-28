@@ -88,7 +88,7 @@ def _required_index(value: object, label: str) -> int:
 def _message_text(message: Message) -> str:
     values: list[str] = []
     for part in message.parts:
-        if isinstance(part, (TextPart, ReasoningPart)):
+        if isinstance(part, TextPart):
             values.append(part.text)
         elif isinstance(part, ToolResultPart):
             values.append(part.content)
@@ -137,7 +137,7 @@ def _assistant_message(
                 reasoning_values.append(part.text)
             else:
                 # A carrier owned by another Provider is intentionally ignored.
-                text_values.append(part.text)
+                continue
         elif isinstance(part, ToolCallPart):
             tool_call_id = part.tool_call_id
             name = part.name
@@ -379,11 +379,23 @@ class OpenAICompatProvider:
             tools: dict[int, _ToolState] = {}
             finish_reason: str | None = None
             usage: Usage | None = None
-            text_value = ""
-            reasoning_value = ""
             part_order: list[tuple[str, int]] = []
-            seen_text = False
-            seen_reasoning = False
+            part_values: dict[tuple[str, int], str] = {}
+            next_segment_index = {"text": 0, "reasoning": 0}
+            active_content_kind: str | None = None
+
+            def append_content_segment(kind: str, value: str) -> None:
+                nonlocal active_content_kind
+                if not value:
+                    return
+                if part_order and active_content_kind == kind and part_order[-1][0] == kind:
+                    marker = part_order[-1]
+                else:
+                    marker = (kind, next_segment_index[kind])
+                    next_segment_index[kind] += 1
+                    part_order.append(marker)
+                part_values[marker] = part_values.get(marker, "") + value
+                active_content_kind = kind
 
             while True:
                 try:
@@ -413,16 +425,6 @@ class OpenAICompatProvider:
                             )
                         finish_reason = raw_finish
                     delta = _field(choice, "delta")
-                    content = _field(delta, "content")
-                    if content is not None:
-                        if not isinstance(content, str):
-                            raise InvalidProviderResponseError("Chat text delta is invalid")
-                        if content:
-                            if not seen_text:
-                                part_order.append(("text", 0))
-                                seen_text = True
-                            text_value += content
-                            yield TextDelta(content)
                     reasoning_content = _field(delta, "reasoning_content")
                     if reasoning_content is not None:
                         if not isinstance(reasoning_content, str):
@@ -430,11 +432,15 @@ class OpenAICompatProvider:
                                 "Chat reasoning content is invalid"
                             )
                         if reasoning_content:
-                            if not seen_reasoning:
-                                part_order.append(("reasoning", 0))
-                                seen_reasoning = True
-                            reasoning_value += reasoning_content
+                            append_content_segment("reasoning", reasoning_content)
                             yield ReasoningDelta(reasoning_content)
+                    content = _field(delta, "content")
+                    if content is not None:
+                        if not isinstance(content, str):
+                            raise InvalidProviderResponseError("Chat text delta is invalid")
+                        if content:
+                            append_content_segment("text", content)
+                            yield TextDelta(content)
                     tool_calls = _field(delta, "tool_calls") or ()
                     if not isinstance(tool_calls, Sequence) or isinstance(
                         tool_calls, (str, bytes, bytearray)
@@ -447,6 +453,7 @@ class OpenAICompatProvider:
                         state = tools.setdefault(index, _ToolState(index=index))
                         if ("tool", index) not in part_order:
                             part_order.append(("tool", index))
+                        active_content_kind = "tool"
                         raw_id = _field(raw_tool_call, "id")
                         if raw_id is not None:
                             if not isinstance(raw_id, str) or not raw_id:
@@ -490,6 +497,7 @@ class OpenAICompatProvider:
             native_items: list[NativeItem] = []
             for sequence_index, (kind, key) in enumerate(part_order):
                 if kind == "text":
+                    text_value = part_values[(kind, key)]
                     parts.append(TextPart(text_value))
                     native_items.append(
                         NativeItem(
@@ -505,6 +513,7 @@ class OpenAICompatProvider:
                         )
                     )
                 elif kind == "reasoning":
+                    reasoning_value = part_values[(kind, key)]
                     parts.append(ReasoningPart(reasoning_value))
                     native_items.append(
                         NativeItem(

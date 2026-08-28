@@ -683,6 +683,13 @@ def _validate_response(response: object) -> tuple[ToolCallPart, ...]:
     if len(set(call_ids)) != len(call_ids):
         raise InvalidProviderResponseError("Provider response contains duplicate ToolCall IDs")
     finish_reason = response.response.finish_reason
+    if finish_reason is FinishReason.STOP and not any(
+        isinstance(part, TextPart) and bool(part.text)
+        for part in message.parts
+    ):
+        raise InvalidProviderResponseError(
+            "Provider STOP response must contain a non-empty formal TextPart"
+        )
     if finish_reason is FinishReason.TOOL_CALLS and not calls:
         raise InvalidProviderResponseError("Provider marked tool calls without a ToolCall")
     if calls and finish_reason not in {

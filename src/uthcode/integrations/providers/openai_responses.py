@@ -328,7 +328,7 @@ def _parse_arguments(arguments: object) -> dict[str, object]:
 def _request_text(message: Message) -> str:
     text: list[str] = []
     for part in message.parts:
-        if isinstance(part, (TextPart, ReasoningPart)):
+        if isinstance(part, TextPart):
             text.append(part.text)
         elif isinstance(part, ToolResultPart):
             text.append(part.content)
@@ -400,12 +400,10 @@ def _request_input(
                     }
                 )
             elif isinstance(part, ReasoningPart):
-                values.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": part.text}],
-                    }
-                )
+                # Reasoning without this protocol's native carrier is not
+                # formal assistant content and must not cross the provider
+                # identity boundary as output text.
+                continue
             elif isinstance(part, ToolCallPart):
                 values.append(
                     {

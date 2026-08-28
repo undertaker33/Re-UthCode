@@ -103,7 +103,7 @@ def _text(value: object, label: str, *, allow_empty: bool = True) -> str:
 def _message_text(message: Message) -> str:
     values: list[str] = []
     for part in message.parts:
-        if isinstance(part, (TextPart, ReasoningPart)):
+        if isinstance(part, TextPart):
             values.append(part.text)
         elif isinstance(part, ToolResultPart):
             values.append(part.content)
@@ -135,9 +135,8 @@ def _assistant_content(
         if isinstance(part, ReasoningPart):
             native = _native_at(message, identity, index, {"thinking", "redacted_thinking"})
             if native is None:
-                # Reasoning without this protocol's signed native item is a
-                # standard Core part and is sent as ordinary assistant text.
-                content.append({"type": "text", "text": part.text})
+                # Reasoning without this protocol's signed native item is not
+                # formal assistant content and cannot be replayed here.
                 continue
             if native.kind == "redacted_thinking":
                 data = native.payload.get("data")
