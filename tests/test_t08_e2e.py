@@ -222,6 +222,8 @@ def _without_context(messages: tuple[Message, ...]) -> tuple[Message, ...]:
                 and part.text.startswith("[Context]\n")
             )
         )
+        if not parts:
+            continue
         normalized.append(Message(message.role, parts, message.native_items))
     return tuple(normalized)
 

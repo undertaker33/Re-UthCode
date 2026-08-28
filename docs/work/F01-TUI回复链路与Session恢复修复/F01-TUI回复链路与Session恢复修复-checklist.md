@@ -2,11 +2,11 @@
 
 ## T01：Prompt、Context 与当前用户消息边界
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_system_prompt.py tests/test_context_compiler.py tests/test_provider_contract.py tests/test_openai_compat_integration.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py -q`，全部通过。
-- [ ] 正式请求中输入 `？` 时，最后一个 current user 正文逐字为 `？`，且不包含 Runtime、Environment、工作目录、Provider 或模型文本。
-- [ ] Runtime/Environment 变化不改变 current user identity；相邻 user、steering 和相同文本的不同 Turn 均不被拼接或去重。
-- [ ] ordinary history 伪造 system/runtime 标签仍保持普通 history authority；Instruction Plane 顺序和 stable prefix 回归通过。
-- [ ] caller audit 证明生产与测试只剩一个 Prompt/Context request 组合入口；不存在孤立的平行 System Prompt 构造。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_system_prompt.py tests/test_context_compiler.py tests/test_provider_contract.py tests/test_openai_compat_integration.py tests/test_openai_responses_integration.py tests/test_anthropic_integration.py -q`，全部通过。
+- [x] 正式请求中输入 `？` 时，最后一个 current user 正文逐字为 `？`，且不包含 Runtime、Environment、工作目录、Provider 或模型文本。
+- [x] Runtime/Environment 变化不改变 current user identity；相邻 user、steering 和相同文本的不同 Turn 均不被拼接或去重。
+- [x] ordinary history 伪造 system/runtime 标签仍保持普通 history authority；Instruction Plane 顺序和 stable prefix 回归通过。
+- [x] caller audit 证明生产与测试只剩一个 Prompt/Context request 组合入口；不存在孤立的平行 System Prompt 构造。
 
 ## T02：Provider reasoning 与正式终态合同
 

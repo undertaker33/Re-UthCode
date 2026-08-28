@@ -1779,7 +1779,6 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
     if not isinstance(snapshot, ContextSnapshot):
         raise TypeError("snapshot must be a ContextSnapshot")
     result: list[Message] = []
-    contextual_texts: list[str] = []
     last_history_identity: tuple[str, ...] | None = None
     last_history_was_full_message = False
 
@@ -1854,26 +1853,28 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
             continue
         if block.plane is ContextPlane.CONTEXTUAL:
             break_history_identity()
-            contextual_texts.append(block.content)
+            # Contextual facts are conversation data, but they are not part of
+            # the current user message.  Keep one provider-neutral user
+            # message per source so the final current-user tail remains an
+            # exact, independently addressable message.  The source marker is
+            # a structural boundary for providers which only expose user
+            # messages; it is deliberately not an Instruction Plane label.
+            append(
+                Message(
+                    "user",
+                    (
+                        TextPart(
+                            "[Context]\n"
+                            f"[source={block.source_kind.value} "
+                            f"provenance={block.provenance}]\n"
+                            f"{block.content}"
+                        ),
+                    ),
+                )
+            )
             continue
         break_history_identity()
         append(Message("user", (TextPart(block.content),)))
-    if contextual_texts:
-        user_index = next(
-            (index for index in range(len(result) - 1, -1, -1) if result[index].role == "user"),
-            None,
-        )
-        if user_index is not None:
-            current = result[user_index]
-            context_parts = tuple(TextPart(f"[Context]\n{value}") for value in contextual_texts)
-            result[user_index] = Message("user", context_parts + current.parts, current.native_items)
-        else:
-            result.append(
-                Message(
-                    "user",
-                    tuple(TextPart(f"[Context]\n{value}") for value in contextual_texts),
-                )
-            )
     return tuple(result)
 
 

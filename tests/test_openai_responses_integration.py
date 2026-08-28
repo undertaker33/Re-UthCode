@@ -297,6 +297,36 @@ async def test_responses_public_stream_preserves_items_indices_usage_and_reasoni
 
 
 @pytest.mark.asyncio
+async def test_responses_request_keeps_context_steering_duplicates_and_current_user_separate() -> None:
+    client = _OpenAIClient(_item_events())
+    provider = build_openai_responses_provider("gpt-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("[Context] runtime"),)),
+            Message("user", (TextPart("steering"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("？"),)),
+        ),
+    )
+
+    sent = client.calls[0]["input"]
+    assert [item["content"][0]["text"] for item in sent] == [
+        "[Context] runtime",
+        "steering",
+        "duplicate",
+        "duplicate",
+        "？",
+    ]
+    assert sent[-1] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "？"}],
+    }
+
+
+@pytest.mark.asyncio
 async def test_responses_prompt_cache_key_uses_stable_facts_not_conversation_body() -> None:
     tool = ToolDefinition(
         "search",

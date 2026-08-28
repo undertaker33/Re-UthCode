@@ -38,6 +38,13 @@ def _completed(*parts: object, finish_reason: FinishReason) -> GenerationComplet
     )
 
 
+def _latest_tool_message(request: GenerationRequest) -> Message:
+    for message in reversed(request.messages):
+        if message.role == "tool":
+            return message
+    raise AssertionError("request has no tool message")
+
+
 class _ScriptedProvider:
     identity = ProviderIdentity("fake", "t07-1", "offline")
 
@@ -139,7 +146,7 @@ async def test_full_access_skips_builtin_guard_through_formal_application(
 
     assert not any(isinstance(event, TurnPaused) for event in events)
     assert tool.preflight_count == tool.execute_count == 1
-    assert provider.requests[1].messages[-1].parts[0].tool_call_id == "ordinary"  # type: ignore[union-attr]
+    assert _latest_tool_message(provider.requests[1]).parts[0].tool_call_id == "ordinary"
 
 
 @pytest.mark.asyncio
@@ -178,7 +185,7 @@ async def test_auto_runs_static_cd_d_and_cmd_read_group_without_pause(
     assert tool.preflight_count == tool.execute_count == 2
     result_ids = {
         part.tool_call_id
-        for part in provider.requests[1].messages[-1].parts
+        for part in _latest_tool_message(provider.requests[1]).parts
     }
     assert result_ids == {"navigation", "group"}
 
@@ -226,7 +233,7 @@ async def test_full_access_rejects_nested_circuit_breakers_before_execute(
     assert tool.execute_count == 0
     result_ids = {
         part.tool_call_id
-        for part in provider.requests[1].messages[-1].parts
+        for part in _latest_tool_message(provider.requests[1]).parts
     }
     assert result_ids == {f"nested-{index}" for index in range(len(commands))}
 
@@ -266,7 +273,7 @@ async def test_circuit_breaker_rejects_before_execute_in_every_mode(
     assert tool.execute_count == 0
     finished = next(event for event in events if isinstance(event, ToolFinished))
     assert finished.tool_call_id == "breaker"
-    assert provider.requests[1].messages[-1].parts[0].tool_call_id == "breaker"  # type: ignore[union-attr]
+    assert _latest_tool_message(provider.requests[1]).parts[0].tool_call_id == "breaker"
 
 
 @pytest.mark.asyncio

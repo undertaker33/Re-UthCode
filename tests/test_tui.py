@@ -341,6 +341,13 @@ def _completed(
     )
 
 
+def _latest_tool_message(request: GenerationRequest) -> Message:
+    for message in reversed(request.messages):
+        if message.role == "tool":
+            return message
+    raise AssertionError("request has no tool message")
+
+
 def _application(*events: object, delay: float = 0.0) -> UthCodeApplication:
     provider_events = events or (_completed("fake response"),)
     return UthCodeApplication(
@@ -1509,7 +1516,7 @@ async def test_tui_pause_resume_and_ask_user_pilot(
         assert len(started_handles) == 1
         assert len(provider.requests) == 3
         assert "已完成" in output.getvalue()
-        assert provider.requests[2].messages[-1].parts == (
+        assert _latest_tool_message(provider.requests[2]).parts == (
             ToolResultPart("ask-1", '{"answers": {"q1": ["答案"]}}'),
         )
         assert not tui._background_tasks
@@ -1895,7 +1902,7 @@ async def test_tui_pause_question_panel_submits_through_application_turn() -> No
         assert len(provider.requests) == 2
         assert any(
             "答案" in getattr(part, "content", "")
-            for part in provider.requests[1].messages[-1].parts
+            for part in _latest_tool_message(provider.requests[1]).parts
         )
     finally:
         await _stop_tui(tui, pipe_state, task)
@@ -2002,10 +2009,10 @@ async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
         response = resume_calls[0]
         assert type(response).__name__ == "UserInputResponse"
         assert response.answers["mode"] == ["fast"]  # type: ignore[union-attr]
-        assert provider.requests[1].messages[-1].parts == (
+        assert _latest_tool_message(provider.requests[1]).parts == (
             ToolResultPart("ask-other", '{"answers": {"mode": ["fast"]}}'),
         )
-        assert "custom-owner" not in provider.requests[1].messages[-1].parts[0].content
+        assert "custom-owner" not in _latest_tool_message(provider.requests[1]).parts[0].content
     finally:
         await _stop_tui(tui, pipe_state, task)
 

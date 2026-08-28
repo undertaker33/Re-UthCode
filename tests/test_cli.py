@@ -90,6 +90,21 @@ def _application(
     )
 
 
+def _latest_non_context_user_text(request: GenerationRequest) -> str:
+    for message in reversed(request.messages):
+        if message.role != "user":
+            continue
+        if message.parts and all(
+            isinstance(part, TextPart) and part.text.startswith("[Context]\n")
+            for part in message.parts
+        ):
+            continue
+        return "\n".join(
+            part.text for part in message.parts if isinstance(part, TextPart)
+        )
+    return ""
+
+
 class _ScriptedProvider(FakeProvider):
     def __init__(self, scripts: Iterable[Iterable[ProviderEvent]]) -> None:
         super().__init__(model_limits=TEST_LIMITS)
@@ -219,7 +234,7 @@ def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
     assert stdout == "ignored\n"
     assert stderr == ""
     request = application.provider.recorded_requests[0]
-    assert request.messages[0].parts[-1].text == "hello"
+    assert _latest_non_context_user_text(request) == "hello"
 
 
 def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
@@ -234,7 +249,7 @@ def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
     assert result == 0
     assert stdout == "fake response\n"
     assert stderr == ""
-    assert application.provider.recorded_requests[0].messages[0].parts[-1].text == "/help"
+    assert _latest_non_context_user_text(application.provider.recorded_requests[0]) == "/help"
 
 
 def test_exec_rejects_empty_prompt_without_creating_a_request() -> None:

@@ -281,6 +281,36 @@ async def test_anthropic_public_stream_maps_text_usage_and_closes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_request_keeps_context_steering_duplicates_and_current_user_separate() -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("[Context] runtime"),)),
+            Message("user", (TextPart("steering"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("？"),)),
+        ),
+    )
+
+    sent = client.calls[0]["messages"]
+    assert [message["content"][0]["text"] for message in sent] == [
+        "[Context] runtime",
+        "steering",
+        "duplicate",
+        "duplicate",
+        "？",
+    ]
+    assert sent[-1] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "？"}],
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_max_output", (8_192, 128))
 async def test_anthropic_async_limits_are_awaited_by_provider(
     provider_max_output: int,

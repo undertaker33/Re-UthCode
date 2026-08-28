@@ -80,6 +80,13 @@ def _completed(*parts: object, finish_reason: FinishReason) -> GenerationComplet
     )
 
 
+def _latest_tool_message(request: GenerationRequest) -> Message:
+    for message in reversed(request.messages):
+        if message.role == "tool":
+            return message
+    raise AssertionError("request has no tool message")
+
+
 class _ScriptedProvider:
     identity = ProviderIdentity("fake", "w04-script", "w04-model")
 
@@ -337,7 +344,7 @@ async def test_formal_reject_returns_error_and_continues_safe_batch(tmp_path: Pa
     assert [event.is_error for event in finished] == [True, False]
     assert (workspace / "blocked.txt").exists() is False
     assert write.execute_count == 0
-    tool_message = provider.requests[1].messages[-1]
+    tool_message = _latest_tool_message(provider.requests[1])
     assert [part.content for part in tool_message.parts] == [
         "Error: permission rejected",
         "1\tstable",
@@ -426,7 +433,8 @@ async def test_formal_read_and_grep_sensitive_resources_enter_guard_without_cont
     assert seen_tools == ["ReadFile", "Grep"]
     assert [event.is_error for event in finished] == [True, True]
     assert all(secret not in event.to_json() for event in events)
-    assert all(secret not in part.content for part in provider.requests[1].messages[-1].parts)
+    tool_message = _latest_tool_message(provider.requests[1])
+    assert all(secret not in part.content for part in tool_message.parts)
 
 
 @pytest.mark.asyncio

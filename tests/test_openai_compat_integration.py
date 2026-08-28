@@ -234,6 +234,35 @@ async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_or
 
 
 @pytest.mark.asyncio
+async def test_chat_request_keeps_context_steering_duplicates_and_current_user_separate() -> None:
+    client = _OpenAICompatClient(_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("[Context] runtime"),)),
+            Message("user", (TextPart("steering"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("？"),)),
+        ),
+    )
+
+    sent = client.calls[0]["messages"]
+    assert [message["content"] for message in sent] == [
+        "[Context] runtime",
+        "steering",
+        "duplicate",
+        "duplicate",
+        "？",
+    ]
+    assert sent[-1] == {"role": "user", "content": "？"}
+
+
+@pytest.mark.asyncio
 async def test_chat_compat_does_not_send_responses_or_anthropic_cache_fields() -> None:
     client = _OpenAICompatClient(_chunks())
     provider = build_openai_compat_provider(
