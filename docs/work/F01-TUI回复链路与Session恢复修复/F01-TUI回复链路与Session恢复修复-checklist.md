@@ -52,20 +52,20 @@
 
 ## T07：TUI 时序化流式投影与 reasoning 视觉
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py -q`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py -q`，全部通过。
 - [ ] 长 reasoning 在 terminal 前至少产生两次 preview 更新，安全 Markdown block 可增量进入 scrollback，不等待完整 Turn。
 - [ ] assistant delta 到达期间独立 preview 持续变化；权威 assistant block 只在消息完成后永久提交一次。
-- [ ] `reasoning R -> assistant A`、`assistant A1 -> reasoning R -> assistant A2`、多 segment reasoning 的永久顺序、标题和出现次数均有精确断言。
-- [ ] reasoning bar 与 formal assistant bar 使用不同语义色值；正文色可相同，颜色不是唯一角色标识。
-- [ ] pending preview 不混合 reasoning/final；fenced code、resize、Tool force flush、terminal correction 均不重排或重复 scrollback。
-- [ ] renderer 不再用多份以 `message_id:kind` 为键的字典分组 flush，已永久输出内容不可回写。
+- [x] `reasoning R -> assistant A`、`assistant A1 -> reasoning R -> assistant A2`、多 segment reasoning 的永久顺序、标题和出现次数均有精确断言。
+- [x] reasoning bar 与 formal assistant bar 使用不同语义色值；正文色可相同，颜色不是唯一角色标识。
+- [x] pending preview 不混合 reasoning/final；fenced code、resize、Tool force flush、terminal correction 均不重排或重复 scrollback。
+- [x] renderer 不再用多份以 `message_id:kind` 为键的字典分组 flush，已永久输出内容不可回写。
 
 ## T08：TUI `/resume` hydrate
 
 - [ ] 跨进程创建包含 user、reasoning、final、两个 ToolCall 的 Session，重启后 `/resume`，全部安全记录按原 sequence 各显示一次。
-- [ ] 回放中不存在 raw ToolResult、Tool arguments、native payload、API key、环境值或未提交 interaction；Tool 名无重复。
+- [x] 回放中不存在 raw ToolResult、Tool arguments、native payload、API key、环境值或未提交 interaction；Tool 名无重复。
 - [ ] replay 前后 Provider call count、Turn count 和 Transcript entry count不增加；`/new` 不回放旧 Session。
-- [ ] 长 Session 按有界 batch 回放且 batch 间事件循环可调度；不会一次拼接巨型字符串冻结 TUI。
+- [x] 长 Session 按有界 batch 回放且 batch 间事件循环可调度；不会一次拼接巨型字符串冻结 TUI。
 - [ ] hydrate 完成后第一条新消息的 Provider 请求包含恢复历史和唯一 current user tail；旧内容不重复持久化。
 - [ ] busy/corrupt/unknown resume 原子失败，当前屏幕、Session 和 Run 不被部分替换。
 

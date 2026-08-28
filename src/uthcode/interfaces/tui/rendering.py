@@ -81,6 +81,7 @@ class TextUpdate:
     kind: str
     text: str
     mode: Literal["append", "replace"] = "append"
+    authoritative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,14 @@ class TaskStateUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class RenderOperation:
+    """One ordered, display-safe operation in the Agent event timeline."""
+
+    kind: Literal["user", "plan", "task_state", "text", "tool", "terminal"]
+    value: object
+
+
+@dataclass(frozen=True, slots=True)
 class RenderBatch:
     users: tuple[tuple[str, str], ...] = ()
     plans: tuple[PlanUpdate, ...] = ()
@@ -113,6 +122,7 @@ class RenderBatch:
     terminal_message: str | None = None
     final_text: str | None = None
     activity: str | None = None
+    operations: tuple[RenderOperation, ...] = ()
 
     @property
     def has_updates(self) -> bool:
@@ -125,6 +135,7 @@ class RenderBatch:
             or self.terminal
             or self.terminal_message
             or self.activity
+            or self.operations
         )
 
 
@@ -205,10 +216,14 @@ def _safe_markdown_boundary(text: str) -> int:
 
 @dataclass(slots=True)
 class _TextBuffer:
+    block_id: str
     kind: str
+    message_id: str
+    segment_index: int | None = None
     pending: str = ""
-    rendered: str = ""
     completed: str | None = None
+    authoritative_emitted: bool = False
+    closed: bool = False
 
 
 def _message_text(message: object) -> str:
@@ -243,47 +258,138 @@ class AgentEventRenderer:
         self.interval_seconds = interval_seconds
         self._clock = clock
         self._last_flush_at = clock()
-        self._buffers: dict[str, _TextBuffer] = {}
+        self._blocks: list[_TextBuffer] = []
+        self._active: _TextBuffer | None = None
+        self._next_block_number = 0
+
+    def _new_block(
+        self,
+        *,
+        kind: str,
+        message_id: str,
+        segment_index: int | None = None,
+    ) -> _TextBuffer:
+        self._next_block_number += 1
+        block = _TextBuffer(
+            block_id=f"{message_id}:{kind}:{self._next_block_number}",
+            kind=kind,
+            message_id=message_id,
+            segment_index=segment_index,
+        )
+        self._blocks.append(block)
+        self._active = block
+        return block
+
+    def _active_block(self, *, kind: str, message_id: str) -> _TextBuffer:
+        block = self._active
+        if (
+            block is None
+            or block.closed
+            or block.kind != kind
+            or block.message_id != message_id
+        ):
+            block = self._new_block(kind=kind, message_id=message_id)
+        return block
+
+    def _latest_assistant_block(self, message_id: str) -> _TextBuffer | None:
+        for block in reversed(self._blocks):
+            if block.kind == "assistant" and block.message_id == message_id:
+                return block
+        return None
+
+    @staticmethod
+    def _with_operation(
+        batch: RenderBatch,
+        *,
+        kind: Literal["user", "plan", "task_state", "text", "tool", "terminal"],
+        value: object,
+    ) -> RenderBatch:
+        return replace(
+            batch,
+            operations=batch.operations + (RenderOperation(kind, value),),
+        )
+
+    @staticmethod
+    def _visible(batch: RenderBatch) -> RenderBatch | None:
+        return batch if batch.has_updates else None
 
     def push(self, event: AgentEvent) -> RenderBatch | None:
         if not isinstance(event, AgentEvent):
             raise TypeError("event must be an AgentEvent")
         event_type = event.event_type
         if event_type == "turn_started":
+            value = (
+                _text_value(event, "message_id"),
+                _message_text(getattr(event, "message", None)),
+            )
             return RenderBatch(
                 users=(
-                    (
-                        _text_value(event, "message_id"),
-                        _message_text(getattr(event, "message", None)),
-                    ),
-                )
+                    value,
+                ),
+                operations=(RenderOperation("user", value),),
             )
+        if event_type == "reasoning_started":
+            batch = self.flush()
+            active = self._active
+            if active is not None:
+                active.closed = True
+            self._new_block(
+                kind="reasoning",
+                message_id=_text_value(event, "message_id"),
+                segment_index=getattr(event, "segment_index", None),
+            )
+            return self._visible(batch)
+        if event_type == "reasoning_finished":
+            batch = self.flush()
+            active = self._active
+            if (
+                active is not None
+                and active.kind == "reasoning"
+                and active.message_id == _text_value(event, "message_id")
+            ):
+                active.closed = True
+                self._active = None
+            return self._visible(batch)
         if event_type in {"reasoning_delta", "assistant_message_delta"}:
             kind = "reasoning" if event_type == "reasoning_delta" else "assistant"
-            key = f"{_text_value(event, 'message_id')}:{kind}"
             text = _text_value(event, "text")
             if not text:
                 return None
-            self._buffers.setdefault(key, _TextBuffer(kind)).pending += text
+            block = self._active_block(
+                kind=kind,
+                message_id=_text_value(event, "message_id"),
+            )
+            block.pending += text
             if self._clock() - self._last_flush_at >= self.interval_seconds:
                 return self.flush()
             return None
         if event_type == "assistant_message_completed":
-            key = f"{_text_value(event, 'message_id')}:assistant"
-            buffer = self._buffers.setdefault(key, _TextBuffer("assistant"))
+            message_id = _text_value(event, "message_id")
+            buffer = self._active
+            if (
+                buffer is None
+                or buffer.kind != "assistant"
+                or buffer.message_id != message_id
+                or buffer.authoritative_emitted
+            ):
+                buffer = self._latest_assistant_block(message_id)
+            if buffer is None or buffer.authoritative_emitted:
+                buffer = self._new_block(kind="assistant", message_id=message_id)
             buffer.completed = _message_text(getattr(event, "message", None))
-            return self.flush()
+            buffer.closed = True
+            batch = self.flush()
+            self._active = None
+            return self._visible(batch)
         if event_type == "plan_proposed":
             batch = self.flush()
+            update = PlanUpdate(
+                int(getattr(event, "revision")),
+                _text_value(event, "plan_text"),
+            )
             return replace(
                 batch,
-                plans=batch.plans
-                + (
-                    PlanUpdate(
-                        int(getattr(event, "revision")),
-                        _text_value(event, "plan_text"),
-                    ),
-                ),
+                plans=batch.plans + (update,),
+                operations=batch.operations + (RenderOperation("plan", update),),
             )
         if event_type == "task_state_changed":
             batch = self.flush()
@@ -295,9 +401,11 @@ class AgentEventRenderer:
                 )
                 for item in getattr(task_state, "items", ())
             )
+            update = TaskStateUpdate(items)
             return replace(
                 batch,
-                task_states=batch.task_states + (TaskStateUpdate(items),),
+                task_states=batch.task_states + (update,),
+                operations=batch.operations + (RenderOperation("task_state", update),),
             )
         if event_type == "behavior_mode_changed":
             mode = _enum_value(getattr(event, "behavior_mode", ""))
@@ -325,7 +433,11 @@ class AgentEventRenderer:
                 _text_value(event, "command", "<tool summary unavailable>"),
                 status,
             )
-            return replace(batch, tools=batch.tools + (update,))
+            return replace(
+                batch,
+                tools=batch.tools + (update,),
+                operations=batch.operations + (RenderOperation("tool", update),),
+            )
         if event_type == "turn_pausing":
             return replace(self.flush(), activity="pausing…")
         if event_type == "turn_paused":
@@ -333,46 +445,74 @@ class AgentEventRenderer:
         if event_type == "turn_resumed":
             return replace(self.flush(), activity="generating")
         if event_type == "turn_completed":
+            batch = self.flush()
             return replace(
-                self.flush(),
+                batch,
                 terminal="completed",
                 final_text=_text_value(event, "final_text"),
+                operations=batch.operations
+                + (RenderOperation("terminal", "completed"),),
             )
         if event_type == "turn_failed":
+            batch = self.flush()
             return replace(
-                self.flush(),
+                batch,
                 terminal="failed",
                 terminal_message=failure_message(
                     getattr(event, "failure_reason", None)
                 ),
+                operations=batch.operations
+                + (RenderOperation("terminal", "failed"),),
             )
         if event_type == "turn_cancelled":
-            return replace(self.flush(), terminal="cancelled")
+            batch = self.flush()
+            return replace(
+                batch,
+                terminal="cancelled",
+                operations=batch.operations
+                + (RenderOperation("terminal", "cancelled"),),
+            )
         return None
 
     def flush(self) -> RenderBatch:
         updates: list[TextUpdate] = []
-        for block_id, buffer in self._buffers.items():
+        for buffer in self._blocks:
+            block_id = buffer.block_id
+            if buffer.authoritative_emitted:
+                continue
+            was_completed = buffer.completed is not None
             if buffer.completed is not None:
                 desired = buffer.completed
-                if desired.startswith(buffer.rendered):
-                    text = desired[len(buffer.rendered) :]
-                    mode: Literal["append", "replace"] = "append"
-                else:
-                    text = desired
-                    mode = "replace"
+                # Preserve a final unflushed delta as a preview operation
+                # before the authoritative replacement.  The TUI never makes
+                # the former permanent for assistant blocks.
+                if buffer.pending:
+                    updates.append(
+                        TextUpdate(block_id, buffer.kind, buffer.pending)
+                    )
+                    buffer.pending = ""
+                updates.append(
+                    TextUpdate(
+                        block_id,
+                        buffer.kind,
+                        desired,
+                        mode="replace",
+                        authoritative=True,
+                    )
+                )
                 buffer.completed = None
                 buffer.pending = ""
-                buffer.rendered = desired
             else:
                 text = buffer.pending
                 mode = "append"
                 buffer.pending = ""
-                buffer.rendered += text
-            if text or mode == "replace":
-                updates.append(TextUpdate(block_id, buffer.kind, text, mode))
+                if text:
+                    updates.append(TextUpdate(block_id, buffer.kind, text, mode))
+            if was_completed:
+                buffer.authoritative_emitted = True
+        operations = tuple(RenderOperation("text", update) for update in updates)
         self._last_flush_at = self._clock()
-        return RenderBatch(text=tuple(updates))
+        return RenderBatch(text=tuple(updates), operations=operations)
 
 
 __all__ = [
@@ -380,6 +520,7 @@ __all__ = [
     "MarkdownStream",
     "PlanUpdate",
     "RenderBatch",
+    "RenderOperation",
     "TaskStateUpdate",
     "TextUpdate",
     "ToolUpdate",

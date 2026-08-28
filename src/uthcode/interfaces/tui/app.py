@@ -84,8 +84,10 @@ from .windows_input import create_windows_unicode_input
 class _StreamProjection:
     stream: MarkdownStream
     kind: str
+    block_id: str = ""
     started: bool = False
     open: bool = False
+    authoritative: bool = False
 
 
 def _install_modified_enter_sequences() -> None:
@@ -134,7 +136,10 @@ class UthCodeTUI:
         self._exit_code = 0
         self._esc = EscArmState()
         self._picker_draft: Document | None = None
-        self._streams: dict[str, _StreamProjection] = {}
+        # Keep one append-only list in provider/event order.  A mapping keyed
+        # by message kind would regroup interleaved reasoning and assistant
+        # blocks and make the permanent scrollback chronology unknowable.
+        self._streams: list[_StreamProjection] = []
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._emit_lock = asyncio.Lock()
         self._renderer = RichTerminalRenderer()
@@ -196,7 +201,6 @@ class UthCodeTUI:
 
     async def run_async(self) -> int:
         try:
-            self.application.ensure_session()
             await self.ui.run_async(
                 pre_run=lambda: self._spawn(self._show_startup())
             )
@@ -372,8 +376,22 @@ class UthCodeTUI:
             height=self._preview_height(),
         )
         return [
-            ("class:preview.role", "┃ UthCode:\n"),
-            ("class:preview", pending),
+            (
+                "class:preview.reasoning.role"
+                if self._latest_preview_kind() == "reasoning"
+                else "class:preview.role",
+                (
+                    "┃ UthCode · reasoning:\n"
+                    if self._latest_preview_kind() == "reasoning"
+                    else "┃ UthCode:\n"
+                ),
+            ),
+            (
+                "class:preview.reasoning"
+                if self._latest_preview_kind() == "reasoning"
+                else "class:preview",
+                pending,
+            ),
         ]
 
     def _candidate_fragments(self) -> StyleAndTextTuples:
@@ -757,17 +775,33 @@ class UthCodeTUI:
                 if action.restored
                 else f"new session: {action.session_id}"
             )
+            if action.restored:
+                await self._hydrate_replay(action.replay)
         self._invalidate()
 
-    def _start_turn(self, prompt: str) -> None:
+    def _start_turn(self, prompt: str) -> bool:
+        ensure_session = getattr(self.application, "ensure_session", None)
+        if callable(ensure_session):
+            try:
+                ensure_session()
+            except Exception:
+                self.activity = "error"
+                self._spawn(self._show_error("无法创建 Session；可以继续输入"))
+                return False
         self._reset_stream_projection()
         self.interaction.close()
-        handle = self._run.start_turn(prompt)
+        try:
+            handle = self._run.start_turn(prompt)
+        except Exception:
+            self.activity = "error"
+            self._spawn(self._show_error("无法开始请求；可以继续输入"))
+            return False
         self._active_handle = handle
         self._esc.clear()
         self.activity = "generating"
         self._generation_task = asyncio.create_task(self._consume_turn(handle))
         self._invalidate()
+        return True
 
     async def _consume_turn(self, handle: TurnHandle) -> None:
         renderer = AgentEventRenderer()
@@ -835,12 +869,16 @@ class UthCodeTUI:
             try:
                 if not self._closing:
                     if cancelled:
-                        await self._finish_consumer_output(renderer)
+                        await self._finish_consumer_output(
+                            renderer,
+                            discard_assistant=True,
+                        )
                         self.activity = "cancelled"
                     elif failure_message is not None:
                         await self._finish_consumer_output(
                             renderer,
                             error_message=failure_message,
+                            discard_assistant=True,
                         )
             finally:
                 if failure_message is not None or (cancelled and not self._closing):
@@ -858,6 +896,7 @@ class UthCodeTUI:
         renderer: AgentEventRenderer,
         *,
         error_message: str | None = None,
+        discard_assistant: bool = False,
     ) -> None:
         """Best-effort UI closure that never owns Application Turn cleanup."""
 
@@ -866,7 +905,7 @@ class UthCodeTUI:
         except Exception:
             pass
         try:
-            await self._flush_streams()
+            await self._flush_streams(discard_assistant=discard_assistant)
         except Exception:
             pass
         if error_message is not None:
@@ -880,109 +919,282 @@ class UthCodeTUI:
         if batch.activity is not None:
             self.activity = batch.activity
         writes: list[str] = []
-        for _message_id, text in batch.users:
-            writes.append(self._renderer.user_message(text))
-        for update in batch.plans:
-            writes.append(
-                self._renderer.plan_message(update.text, revision=update.revision)
-            )
-        for update in batch.task_states:
-            writes.append(self._renderer.task_state(update.items))
-        for update in batch.text:
-            projection = self._streams.setdefault(
-                update.block_id,
-                _StreamProjection(MarkdownStream(), update.kind),
-            )
-            projection.kind = update.kind
-            stream = projection.stream
-            if update.mode == "replace":
-                commits, corrected = stream.replace(update.text)
-                if corrected:
-                    if not projection.started:
-                        stream.committed = ""
-                        stream.pending = update.text
-                        corrected = False
-                        commits = ()
-                    else:
-                        writes.append(self._renderer.correction(update.text))
-                        stream.committed = update.text
-                        stream.pending = ""
-            else:
-                commits = stream.append(update.text)
-            for block in commits:
-                writes.append(self._render_stream_block(update.block_id, block))
-        if batch.tools:
-            writes.append(self._render_forced_streams())
-            for update in batch.tools:
-                if update.status == "running":
-                    self.activity = f"running {update.tool_name}: {update.command}"
-                else:
+        if batch.operations:
+            for operation in batch.operations:
+                if operation.kind == "user":
+                    _message_id, text = operation.value  # type: ignore[misc]
+                    writes.append(self._renderer.user_message(text))
+                elif operation.kind == "plan":
+                    update = operation.value
                     writes.append(
-                        self._renderer.tool(
-                            status=update.status,
-                            name=update.tool_name,
-                            command=update.command,
+                        self._renderer.plan_message(
+                            update.text, revision=update.revision  # type: ignore[union-attr]
                         )
                     )
-        if batch.terminal is not None:
-            writes.append(self._render_forced_streams(
-                final_text=batch.final_text if batch.terminal == "completed" else None
-            ))
-            if batch.terminal == "completed":
-                self.activity = "ready"
-            elif batch.terminal == "cancelled":
-                self.activity = "cancelled"
-            else:
+                elif operation.kind == "task_state":
+                    update = operation.value
+                    writes.append(self._renderer.task_state(update.items))  # type: ignore[union-attr]
+                elif operation.kind == "text":
+                    self._apply_text_update(operation.value, writes)  # type: ignore[arg-type]
+                elif operation.kind == "tool":
+                    update = operation.value
+                    self._apply_tool_update(update, writes)  # type: ignore[arg-type]
+                elif operation.kind == "terminal":
+                    self._apply_terminal_update(batch, writes)
+        else:
+            # Keep direct RenderBatch construction useful for local callers
+            # while all AgentEventRenderer output uses the ordered path above.
+            for _message_id, text in batch.users:
+                writes.append(self._renderer.user_message(text))
+            for update in batch.plans:
                 writes.append(
-                    self._renderer.system(
-                        batch.terminal_message or project_failure_message(None),
-                        error=True,
-                    )
+                    self._renderer.plan_message(update.text, revision=update.revision)
                 )
-                self.activity = "error"
+            for update in batch.task_states:
+                writes.append(self._renderer.task_state(update.items))
+            for update in batch.text:
+                self._apply_text_update(update, writes)
+            if batch.tools:
+                for update in batch.tools:
+                    self._apply_tool_update(update, writes)
+            if batch.terminal is not None:
+                self._apply_terminal_update(batch, writes)
         output = "".join(writes)
         if output:
             await self._emit(output)
         self._invalidate()
 
-    def _render_stream_block(self, block_id: str, text: str) -> str:
-        projection = self._streams[block_id]
-        role = "UthCode · reasoning" if projection.kind == "reasoning" else "UthCode:"
-        rendered = self._renderer.agent_message(
-            text,
-            role=role,
-            show_role=not projection.started,
-            trailing_blank=False,
+    def _stream_projection(
+        self,
+        block_id: str,
+        kind: str,
+    ) -> _StreamProjection:
+        for projection in self._streams:
+            if projection.block_id == block_id:
+                return projection
+        projection = _StreamProjection(
+            MarkdownStream(),
+            kind,
+            block_id=block_id,
         )
+        self._streams.append(projection)
+        return projection
+
+    def _apply_text_update(self, update: object, writes: list[str]) -> None:
+        block_id = str(getattr(update, "block_id"))
+        kind = str(getattr(update, "kind"))
+        text = str(getattr(update, "text"))
+        mode = str(getattr(update, "mode", "append"))
+        authoritative = bool(getattr(update, "authoritative", False))
+        projection = self._stream_projection(block_id, kind)
+        stream = projection.stream
+
+        if kind == "assistant" and not authoritative:
+            if mode == "replace":
+                if projection.started and stream.committed:
+                    writes.append(self._renderer.correction(text))
+                    stream.committed = text
+                    stream.pending = ""
+                else:
+                    stream.pending = text
+            else:
+                stream.pending += text
+            return
+
+        if authoritative:
+            if kind == "assistant":
+                forced = self._force_reasoning_before(projection)
+                if forced:
+                    writes.append(forced)
+            if projection.authoritative:
+                if stream.committed != text:
+                    writes.append(self._renderer.correction(text))
+                    stream.committed = text
+                stream.pending = ""
+                return
+            if stream.committed and stream.committed != text:
+                writes.append(self._renderer.correction(text))
+            elif not stream.committed and text:
+                writes.append(self._render_stream_block(block_id, text))
+            stream.committed = text
+            stream.pending = ""
+            projection.authoritative = True
+            return
+
+        if mode == "replace":
+            commits, corrected = stream.replace(text)
+            if corrected:
+                if not projection.started:
+                    stream.committed = ""
+                    stream.pending = text
+                    commits = ()
+                else:
+                    writes.append(self._renderer.correction(text))
+                    stream.committed = text
+                    stream.pending = ""
+        else:
+            commits = stream.append(text)
+        for block in commits:
+            writes.append(self._render_stream_block(block_id, block))
+
+    def _force_reasoning_before(self, projection: _StreamProjection) -> str:
+        """Close earlier reasoning previews before an assistant authority."""
+
+        writes: list[str] = []
+        for candidate in self._streams:
+            if candidate is projection:
+                break
+            if candidate.kind != "reasoning":
+                continue
+            tail = candidate.stream.force()
+            if tail:
+                writes.append(self._render_stream_block(candidate.block_id, tail))
+        return "".join(writes)
+
+    def _render_forced_reasoning(self) -> str:
+        """Commit only reasoning tails at a Tool or failed-turn boundary."""
+
+        writes: list[str] = []
+        for projection in self._streams:
+            if projection.kind != "reasoning":
+                continue
+            tail = projection.stream.force()
+            if tail:
+                writes.append(self._render_stream_block(projection.block_id, tail))
+        if any(
+            projection.kind == "reasoning" and projection.open
+            for projection in self._streams
+        ):
+            writes.append("\n")
+            for projection in self._streams:
+                if projection.kind == "reasoning":
+                    projection.open = False
+        return "".join(writes)
+
+    def _discard_assistant_previews(self) -> None:
+        """Drop non-authoritative assistant tails without writing scrollback."""
+
+        for projection in self._streams:
+            if projection.kind == "assistant":
+                projection.stream.pending = ""
+                projection.open = False
+
+    def _apply_tool_update(self, update: object, writes: list[str]) -> None:
+        status = str(getattr(update, "status"))
+        tool_name = str(getattr(update, "tool_name"))
+        command = str(getattr(update, "command"))
+        forced = self._render_forced_reasoning()
+        if status == "running":
+            if forced:
+                writes.append(forced)
+            self.activity = f"running {tool_name}: {command}"
+            return
+        writes.append(
+            forced
+            + self._renderer.tool(
+                status=status,
+                name=tool_name,
+                command=command,
+            )
+        )
+
+    def _apply_terminal_update(self, batch: RenderBatch, writes: list[str]) -> None:
+        terminal = batch.terminal
+        if terminal == "completed":
+            writes.append(
+                self._render_forced_streams(
+                    final_text=batch.final_text,
+                )
+            )
+            self.activity = "ready"
+        else:
+            writes.append(self._render_forced_reasoning())
+            self._discard_assistant_previews()
+            if terminal == "cancelled":
+                self.activity = "cancelled"
+                return
+            writes.append(
+                self._renderer.system(
+                    batch.terminal_message or project_failure_message(None),
+                    error=True,
+                )
+            )
+            self.activity = "error"
+
+    def _render_stream_block(self, block_id: str, text: str) -> str:
+        projection = self._stream_projection(block_id, "assistant")
+        if projection.kind == "reasoning":
+            rendered = self._renderer.reasoning_message(
+                text,
+                show_role=not projection.started,
+                trailing_blank=False,
+            )
+        else:
+            rendered = self._renderer.agent_message(
+                text,
+                show_role=not projection.started,
+                trailing_blank=False,
+            )
         projection.started = True
         projection.open = True
         return rendered
 
     def _render_forced_streams(self, *, final_text: str | None = None) -> str:
         writes: list[str] = []
-        for block_id, projection in self._streams.items():
+        latest_assistant = next(
+            (
+                projection
+                for projection in reversed(self._streams)
+                if projection.kind == "assistant"
+            ),
+            None,
+        )
+        for projection in self._streams:
+            if projection is latest_assistant and final_text is not None:
+                continue
             tail = projection.stream.force()
             if tail:
-                writes.append(self._render_stream_block(block_id, tail))
-        if any(projection.open for projection in self._streams.values()):
-            writes.append("\n")
-            for projection in self._streams.values():
-                projection.open = False
+                writes.append(self._render_stream_block(projection.block_id, tail))
         if final_text is not None:
-            latest = next(
-                (
-                    projection.stream.committed
-                    for projection in reversed(tuple(self._streams.values()))
-                    if projection.kind == "assistant"
-                ),
-                "",
-            )
-            if latest != final_text:
-                writes.append(self._renderer.correction(final_text))
+            if latest_assistant is None:
+                latest_assistant = self._stream_projection(
+                    "assistant:terminal",
+                    "assistant",
+                )
+            if latest_assistant.authoritative:
+                if latest_assistant.stream.committed != final_text:
+                    writes.append(self._renderer.correction(final_text))
+            else:
+                current = latest_assistant.stream.committed
+                latest_assistant.stream.pending = ""
+                if current and current != final_text:
+                    writes.append(self._renderer.correction(final_text))
+                elif not current and final_text:
+                    writes.append(
+                        self._render_stream_block(
+                            latest_assistant.block_id,
+                            final_text,
+                        )
+                    )
+                latest_assistant.stream.committed = final_text
+                latest_assistant.authoritative = True
+        if any(projection.open for projection in self._streams):
+            writes.append("\n")
+            for projection in self._streams:
+                projection.open = False
         return "".join(writes)
 
-    async def _flush_streams(self, *, final_text: str | None = None) -> None:
-        output = self._render_forced_streams(final_text=final_text)
+    async def _flush_streams(
+        self,
+        *,
+        final_text: str | None = None,
+        discard_assistant: bool = False,
+    ) -> None:
+        if discard_assistant:
+            output = self._render_forced_reasoning()
+            self._discard_assistant_previews()
+        else:
+            output = self._render_forced_streams(final_text=final_text)
         if output:
             await self._emit(output)
 
@@ -1226,10 +1438,54 @@ class UthCodeTUI:
         ) and self._candidate_height() > 0
 
     def _pending_text(self) -> str:
-        return "".join(
-            projection.stream.pending
-            for projection in self._streams.values()
-        )
+        for projection in reversed(self._streams):
+            if projection.stream.pending:
+                return projection.stream.pending
+        return ""
+
+    def _latest_preview_kind(self) -> str | None:
+        for projection in reversed(self._streams):
+            if projection.stream.pending:
+                return projection.kind
+        return None
+
+    async def _hydrate_replay(self, records: object) -> None:
+        """Append safe Application replay records in bounded UI batches."""
+
+        values = tuple(records)  # type: ignore[arg-type]
+        allowed = {"user", "steering", "reasoning", "assistant", "tool"}
+        if any(getattr(record, "kind", None) not in allowed for record in values):
+            raise ValueError("Application returned an invalid Session replay record")
+        batch_size = 32
+        for start in range(0, len(values), batch_size):
+            self._sync_renderer_width()
+            writes: list[str] = []
+            for record in values[start : start + batch_size]:
+                kind = str(getattr(record, "kind"))
+                text = str(getattr(record, "text", ""))
+                if kind == "user":
+                    writes.append(self._renderer.user_message(text))
+                elif kind == "steering":
+                    writes.append(self._renderer.user_message(text, role="you · steering"))
+                elif kind == "reasoning":
+                    writes.append(self._renderer.reasoning_message(text))
+                elif kind == "assistant":
+                    writes.append(self._renderer.agent_message(text))
+                else:
+                    writes.append(
+                        self._renderer.tool(
+                            status=str(getattr(record, "status", None) or "finished"),
+                            name=str(getattr(record, "tool_name", None) or "unknown tool"),
+                            command=text or "<tool summary unavailable>",
+                        )
+                    )
+            if writes:
+                await self._emit("".join(writes))
+            if start + batch_size < len(values):
+                await self._yield_replay()
+
+    async def _yield_replay(self) -> None:
+        await asyncio.sleep(0)
 
     def _terminal_size(self) -> tuple[int, int]:
         try:
@@ -1281,6 +1537,12 @@ class UthCodeTUI:
                 "status.warning": PALETTE.error,
                 "preview": f"{PALETTE.text} bg:{PALETTE.input_background}",
                 "preview.role": f"bold {PALETTE.success} bg:{PALETTE.input_background}",
+                "preview.reasoning": (
+                    f"{PALETTE.text} bg:{PALETTE.input_background}"
+                ),
+                "preview.reasoning.role": (
+                    f"bold {PALETTE.reasoning_accent} bg:{PALETTE.input_background}"
+                ),
                 "candidates": f"{PALETTE.text} bg:{PALETTE.user_background}",
                 "candidate": f"{PALETTE.text} bg:{PALETTE.user_background}",
                 "candidate.selected": (
