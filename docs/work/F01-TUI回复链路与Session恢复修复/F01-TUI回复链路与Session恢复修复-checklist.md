@@ -29,7 +29,7 @@
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_w04_session_commands.py tests/test_application.py tests/test_cli.py tests/test_session_files.py -q`，全部通过。
 - [x] Application replay DTO 按 durable sequence 完整包含 user、steering、reasoning、formal assistant 和 safe Tool terminal，且不包含 raw ToolResult、native payload、secret 或 pending state。
 - [x] replay projection 不调用 Provider、不创建 Turn、不追加 Transcript；busy/corrupt/unknown/storage failure 保持当前 Session、锁和 replay 不变。
-- [ ] TUI 冷启动后立即退出、只执行 help/status、打开并关闭 Session Picker 均不新增 Session ID。
+- [x] TUI 冷启动后立即退出、只执行 help/status、打开并关闭 Session Picker 均不新增 Session ID。
 - [x] 第一条普通输入恰好创建一个 Session；第一条 `/resume <id>` 不创建 throwaway Session；第一条 `/new` 只创建一个 Session；`exec <prompt>` 正常持久化。
 - [x] lazy ensure 失败时无永久 user record、无 Provider call、Run 保持 idle，关闭无 active Session 安全。
 
@@ -53,8 +53,8 @@
 ## T07：TUI 时序化流式投影与 reasoning 视觉
 
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py -q`，全部通过。
-- [ ] 长 reasoning 在 terminal 前至少产生两次 preview 更新，安全 Markdown block 可增量进入 scrollback，不等待完整 Turn。
-- [ ] assistant delta 到达期间独立 preview 持续变化；权威 assistant block 只在消息完成后永久提交一次。
+- [x] 长 reasoning 在 terminal 前至少产生两次 preview 更新，安全 Markdown block 可增量进入 scrollback，不等待完整 Turn。
+- [x] assistant delta 到达期间独立 preview 持续变化；权威 assistant block 只在消息完成后永久提交一次。
 - [x] `reasoning R -> assistant A`、`assistant A1 -> reasoning R -> assistant A2`、多 segment reasoning 的永久顺序、标题和出现次数均有精确断言。
 - [x] reasoning bar 与 formal assistant bar 使用不同语义色值；正文色可相同，颜色不是唯一角色标识。
 - [x] pending preview 不混合 reasoning/final；fenced code、resize、Tool force flush、terminal correction 均不重排或重复 scrollback。
@@ -62,39 +62,39 @@
 
 ## T08：TUI `/resume` hydrate
 
-- [ ] 跨进程创建包含 user、reasoning、final、两个 ToolCall 的 Session，重启后 `/resume`，全部安全记录按原 sequence 各显示一次。
+- [x] 跨进程创建包含 user、reasoning、final、两个 ToolCall 的 Session，重启后 `/resume`，全部安全记录按原 sequence 各显示一次。
 - [x] 回放中不存在 raw ToolResult、Tool arguments、native payload、API key、环境值或未提交 interaction；Tool 名无重复。
-- [ ] replay 前后 Provider call count、Turn count 和 Transcript entry count不增加；`/new` 不回放旧 Session。
+- [x] replay 前后 Provider call count、Turn count 和 Transcript entry count不增加；`/new` 不回放旧 Session。
 - [x] 长 Session 按有界 batch 回放且 batch 间事件循环可调度；不会一次拼接巨型字符串冻结 TUI。
-- [ ] hydrate 完成后第一条新消息的 Provider 请求包含恢复历史和唯一 current user tail；旧内容不重复持久化。
-- [ ] busy/corrupt/unknown resume 原子失败，当前屏幕、Session 和 Run 不被部分替换。
+- [x] hydrate 完成后第一条新消息的 Provider 请求包含恢复历史和唯一 current user tail；旧内容不重复持久化。
+- [x] busy/corrupt/unknown resume 原子失败，当前屏幕、Session 和 Run 不被部分替换。
 
 ## T09：[接入主流程] 唯一请求、历史、Session 与 TUI 链路
 
-- [ ] 执行 F01 全部定向测试，普通、post-tool、post-resume、model switch、`/new`、CLI、Headless 和 TUI 均走唯一正式链。
-- [ ] `tests/test_architecture_boundaries.py` 证明 Interface 不读取 Core History、Provider SDK、Session files、Tool Registry 或 Secret internals。
-- [ ] active Turn reasoning/tool continuity、terminal Transcript、resume replay 与下一 Turn context 使用各自正确 typed view，无正文降级或双写。
-- [ ] caller audit 证明 Prompt 双轨、reasoning→text fallback、full-message duplicate payload、cold-start ensure、kind-grouped renderer 和重复 Tool title 旧入口均不可达或已删除。
+- [x] 执行 F01 全部定向测试，普通、post-tool、post-resume、model switch、`/new`、CLI、Headless 和 TUI 均走唯一正式链。
+- [x] `tests/test_architecture_boundaries.py` 证明 Interface 不读取 Core History、Provider SDK、Session files、Tool Registry 或 Secret internals。
+- [x] active Turn reasoning/tool continuity、terminal Transcript、resume replay 与下一 Turn context 使用各自正确 typed view，无正文降级或双写。
+- [x] caller audit 证明 Prompt 双轨、reasoning→text fallback、full-message duplicate payload、cold-start ensure、kind-grouped renderer 和重复 Tool title 旧入口均不可达或已删除。
 
 ## T10：[端到端验证] 四现象、九类问题与真实入口验收
 
-- [ ] 从正式 TUI 依次输入 `你好`、`你是什么模型`、`当前工作环境是？`、`？`，捕获请求证明消息来源、角色和 current user 尾部正确。
-- [ ] 从正式入口完成 reasoning→Tool batch→final→退出→重启→`/resume`→继续对话，永久输出顺序、颜色、次数和上下文连续性符合 Spec。
-- [ ] 在 Windows Terminal 人工验证 reasoning/final 流式刷新、不同 bar 色、Markdown fence、中文 shell 输出、scrollback、resize 和复制，结果写入 W06 Feedback。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`，全部通过。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，精确 passed/failed/skipped 写入 W06 Feedback。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`，退出码为 0。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，结果为 `No broken requirements found.`。
-- [ ] 执行 `git diff --check`，退出码为 0；用户开工前已有改动未被覆盖。
-- [ ] A01、A03、A04、TUI、用户手册及维护映射命中的当前文档与最终代码一致，全部通过 UTF-8 guard。
+- [x] 从正式 TUI 依次输入 `你好`、`你是什么模型`、`当前工作环境是？`、`？`，捕获请求证明消息来源、角色和 current user 尾部正确。
+- [x] 从正式入口完成 reasoning→Tool batch→final→退出→重启→`/resume`→继续对话，永久输出顺序、颜色、次数和上下文连续性符合 Spec。
+- [x] 在 Windows Terminal 人工验证 reasoning/final 流式刷新、不同 bar 色、Markdown fence、中文 shell 输出、scrollback、resize 和复制，结果写入 W06 Feedback。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`，全部通过。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，精确 passed/failed/skipped 写入 W06 Feedback。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests eval`，退出码为 0。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pip check`，结果为 `No broken requirements found.`。
+- [x] 执行 `git diff --check`，退出码为 0；用户开工前已有改动未被覆盖。
+- [x] A01、A03、A04、TUI、用户手册及维护映射命中的当前文档与最终代码一致，全部通过 UTF-8 guard。
 
 ## T11：[遗留负担清理] 单一路径与历史负担收口
 
-- [ ] `rg -n "ReasoningPart.*TextPart|text_values.*reasoning|reasoning.*text_values" src/uthcode/integrations/providers tests` 不存在跨 identity reasoning 降级正文逻辑；合理类型测试命中在 Feedback 说明。
-- [ ] `rg -n "ensure_session\(" src/uthcode/interfaces` 的命中均有真实 prompt 或显式 Session 命令前置，不存在 TUI cold-start ensure。
-- [ ] renderer、History 和 Prompt caller audit 不存在第二状态仓库、full-message payload duplication、分类型 flush 双轨或孤立 Prompt path。
-- [ ] `rg -n "ReplayManager|HistoryManager|SessionMigration|EncodingManager|SecretManager" src tests` 返回 0 条。
-- [ ] 本包临时 Session、probe、日志、截图和缓存已清理，不删除旧 Session 或用户文件。
-- [ ] `docs/OutstandingDebtList.md` 已按“能力欠账：无”核对并保持不变；Out of Scope 未登记为欠账。
-- [ ] 清理后重新执行 F01 最小定向、架构、全量、compileall、pip check、diff check 与 UTF-8 guard，精确结果写入 W06 Feedback。
-- [ ] W01～W06 Feedback 齐全且全部 Checklist 有证据后，`docs/Context-Index.md` 将 F01 标记为 `implemented_unarchived`；未归档、未 commit、未 push。
+- [x] `rg -n "ReasoningPart.*TextPart|text_values.*reasoning|reasoning.*text_values" src/uthcode/integrations/providers tests` 不存在跨 identity reasoning 降级正文逻辑；合理类型测试命中在 Feedback 说明。
+- [x] `rg -n "ensure_session\(" src/uthcode/interfaces` 的命中均有真实 prompt 或显式 Session 命令前置，不存在 TUI cold-start ensure。
+- [x] renderer、History 和 Prompt caller audit 不存在第二状态仓库、full-message payload duplication、分类型 flush 双轨或孤立 Prompt path。
+- [x] `rg -n "ReplayManager|HistoryManager|SessionMigration|EncodingManager|SecretManager" src tests` 返回 0 条。
+- [x] 本包临时 Session、probe、日志、截图和缓存已清理，不删除旧 Session 或用户文件。
+- [x] `docs/OutstandingDebtList.md` 已按“能力欠账：无”核对并保持不变；Out of Scope 未登记为欠账。
+- [x] 清理后重新执行 F01 最小定向、架构、全量、compileall、pip check、diff check 与 UTF-8 guard，精确结果写入 W06 Feedback。
+- [x] W01～W06 Feedback 齐全且全部 Checklist 有证据后，`docs/Context-Index.md` 将 F01 标记为 `implemented_unarchived`；未归档、未 commit、未 push。

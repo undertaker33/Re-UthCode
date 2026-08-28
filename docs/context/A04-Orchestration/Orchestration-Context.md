@@ -14,12 +14,12 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
 - `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`、Model `remote_id`/`display_name`；`/model` 原子写回只修改用户级 `default_model`。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
-- `[FACT]` CLI/TUI 进入正式运行前通过 Application `ensure_session()` 打开一个 fresh Session。Session v3 只持久化 metadata（schema 3）、Transcript、Timeline、Tool Result、writer lock 与 Instruction State；v1/v2 明确 incompatible。terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
+- `[FACT]` Session 只在真实请求或显式 Session 命令需要时打开：`exec <prompt>` 与 TUI 首条普通输入调用 `ensure_session()`，`/new` 显式创建，`/resume` 直接锁定并恢复目标；TUI 启动、退出、help/status 和打开/关闭 Picker 不创建 Session。Session v3 只持久化 metadata（schema 3）、Transcript、Timeline、Tool Result、writer lock 与 Instruction State；v1/v2 明确 incompatible。terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
 - `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane、default/configured/provider/effective budget provenance 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；effective input 为 `256_000` 时，该正式 resolver 使用 Eval 选定的 `balanced-208k` profile，其它窗口保留有界自适应派生并服从 configured/provider 收紧；Integration 不重新编译 Context。
 - `[FACT]` `/compact` 已通过 Command/Application/Session 路径调用同一 Context orchestrator；低 pressure 也可手动执行，无完整候选或无 reduction value 时返回成功 no-op。L4/L5 与 overflow recovery 使用 tool-free、bounded、Hard-gated 的 Compact request；ordinary overflow 最多 forced reduction/rebuild/re-gate/retry 一次。
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
-- `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息；`uthcode exec` 每次创建一个 Run 和一个 Turn。
+- `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息，但直到真实普通输入或显式 Session 命令才创建持久 Session；`uthcode exec` 每次创建一个 Run 和一个 Turn，并在真实 prompt 前惰性 ensure。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
 
@@ -66,7 +66,8 @@ python -m uthcode / uthcode
      -> permission rule loader
      -> ApplicationToolService
      -> UthCodeApplication
-  -> CLI/TUI: application.ensure_session()
+  -> CLI exec / TUI 普通输入: 有真实 prompt 时 application.ensure_session()
+  -> `/new`: 显式创建 fresh Session；`/resume`: 直接恢复目标 Session
 ```
 
 ## 普通请求编排
