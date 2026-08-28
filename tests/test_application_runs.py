@@ -130,13 +130,41 @@ def _request_text(request: GenerationRequest) -> str:
     )
 
 
+def _is_context_message(message: Message) -> bool:
+    return (
+        message.role == "user"
+        and bool(message.parts)
+        and all(
+            isinstance(part, TextPart) and part.text.startswith("[Context]\n")
+            for part in message.parts
+        )
+    )
+
+
 def _latest_user_text(request: GenerationRequest) -> str:
     for message in reversed(request.messages):
-        if message.role == "user":
+        if message.role == "user" and not _is_context_message(message):
             return "\n".join(
                 part.text for part in message.parts if isinstance(part, TextPart)
             )
     return ""
+
+
+def _context_text(request: GenerationRequest) -> str:
+    return "\n".join(
+        part.text
+        for message in request.messages
+        if _is_context_message(message)
+        for part in message.parts
+        if isinstance(part, TextPart)
+    )
+
+
+def _latest_message(request: GenerationRequest, role: str) -> Message:
+    for message in reversed(request.messages):
+        if message.role == role:
+            return message
+    raise AssertionError(f"request has no {role!r} message")
 
 
 def _without_context(message: Message) -> Message:
@@ -619,7 +647,12 @@ async def test_same_run_history_is_retained_and_different_runs_are_isolated() ->
 
     first_second_request = provider.requests[1]
     isolated_request = provider.requests[2]
-    assert [message.role for message in first_second_request.messages] == [
+    first_second_conversation = tuple(
+        message
+        for message in first_second_request.messages
+        if not _is_context_message(message)
+    )
+    assert [message.role for message in first_second_conversation] == [
         "user",
         "assistant",
         "user",
@@ -627,10 +660,10 @@ async def test_same_run_history_is_retained_and_different_runs_are_isolated() ->
     assert _without_context(first_second_request.messages[0]).parts == (
         TextPart("first question"),
     )
-    assert _without_context(isolated_request.messages[0]).parts == (
-        TextPart("isolated question"),
-    )
-    assert len(isolated_request.messages) == 1
+    assert _latest_user_text(isolated_request) == "isolated question"
+    assert len(
+        tuple(message for message in isolated_request.messages if not _is_context_message(message))
+    ) == 1
     assert first_run.snapshot().run_id == "first-run"
     assert second_run.snapshot().run_id == "second-run"
 
@@ -723,7 +756,7 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
     assert not any(isinstance(event, TurnCancelled) for event in events)
     tool_finished = next(event for event in events if isinstance(event, ToolFinished))
-    assert tool_finished.command == "ReadFile note.txt"
+    assert tool_finished.command == "note.txt"
     assert hidden_content not in tool_finished.to_json()
     assert hidden_content not in result.to_json()
     assert hidden_content not in run.snapshot().to_json()
@@ -733,12 +766,52 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
         ASK_USER_TOOL_DEFINITION,
         TODO_WRITE_TOOL_DEFINITION,
     )
-    assert second_request.messages[-2].role == "assistant"
-    tool_message = second_request.messages[-1]
-    assert tool_message.role == "tool"
+    assert _latest_message(second_request, "assistant").role == "assistant"
+    tool_message = _latest_message(second_request, "tool")
     assert tool_message.parts == (ToolResultPart("read-call", f"1\t{hidden_content}"),)
     assert result.final_text == "The note says exactly what was requested."
     assert "I have the result." not in (result.final_text or "")
+
+
+@pytest.mark.asyncio
+async def test_application_tool_activity_is_fifo_and_names_have_one_owner(
+    tmp_path: Path,
+) -> None:
+    first = _ApplicationGateTool("First")
+    second = _ApplicationGateTool("Second")
+    provider = _ScriptedProvider(
+        (
+            (
+                _response(
+                    ToolCallPart("first-call", "First", {"value": "one"}),
+                    ToolCallPart("second-call", "Second", {"value": "two"}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        tools=(first, second),
+    )
+    run = application.create_run()
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+
+    events = await _collect(run.start_turn("run both tools"))
+    started = [event for event in events if isinstance(event, ToolStarted)]
+    finished = [event for event in events if isinstance(event, ToolFinished)]
+
+    assert [event.tool_call_id for event in started] == ["first-call", "second-call"]
+    assert [event.tool_call_id for event in finished] == ["first-call", "second-call"]
+    assert [event.status for event in finished] == ["finished", "finished"]
+    assert [event.tool_name for event in finished] == ["First", "Second"]
+    assert [event.command for event in finished] == ["<arguments hidden>", "<arguments hidden>"]
+    assert all(event.tool_name not in event.command for event in (*started, *finished))
+    assert first.trace == ["preflight:one", "execute:one"]
+    assert second.trace == ["preflight:two", "execute:two"]
 
 
 @pytest.mark.asyncio
@@ -820,8 +893,8 @@ async def test_t09_2_formal_headless_run_turn_keeps_tool_plan_todo_gate_and_fina
         True,
         False,
     ]
-    assert "一次性运行反馈类型：completion_blocked" in _latest_user_text(provider.requests[4])
-    completed_result = provider.requests[-1].messages[-1].parts[0]
+    assert "一次性运行反馈类型：completion_blocked" in _context_text(provider.requests[4])
+    completed_result = _latest_message(provider.requests[-1], "tool").parts[0]
     assert isinstance(completed_result, ToolResultPart)
     assert completed_result.tool_call_id == "todo-complete"
     assert '"status": "completed"' in completed_result.content
@@ -856,7 +929,7 @@ async def test_tool_summary_failure_does_not_block_tool_execution(
 
     tool_finished = next(event for event in events if isinstance(event, ToolFinished))
     assert tool_finished.command == "<tool summary unavailable>"
-    assert provider.requests[1].messages[-1].parts == (
+    assert _latest_message(provider.requests[1], "tool").parts == (
         ToolResultPart("read-call", f"1\t{hidden_content}"),
     )
 
@@ -916,11 +989,11 @@ def test_tool_descriptions_are_bounded_and_do_not_echo_write_content_or_unknown_
         ToolCallPart("glob", "Glob", {"pattern": "x" * 500, "path": "."})
     )
 
-    assert write_summary == "WriteFile note.txt"
-    assert read_summary == "ReadFile note.txt"
-    assert edit_summary == "EditFile note.txt"
+    assert write_summary == "note.txt"
+    assert read_summary == "note.txt"
+    assert edit_summary == "note.txt"
     assert secret not in bash_summary
-    assert grep_summary == "Grep path=src"
+    assert grep_summary == "path=src"
     assert unknown_summary == "<unknown tool>"
     assert len(long_summary) == 240
     assert long_summary.endswith("…")
@@ -976,7 +1049,7 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ]
 
     assert len(tool_events) == 2
-    assert all(event.command.startswith("Bash echo") for event in tool_events)
+    assert all(event.command.startswith("echo") for event in tool_events)
     serialized = " ".join(event.to_json() for event in tool_events)
     assert environment_value not in serialized
     assert short_environment_value not in serialized
@@ -1004,7 +1077,7 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ).describe_tool_call(
         ToolCallPart("ordinary", "Bash", {"command": "echo 2026-08-06"})
     )
-    assert ordinary_summary == "Bash echo 2026-08-06"
+    assert ordinary_summary == "echo 2026-08-06"
 
     configured_secret = "xy7"
     monkeypatch.setenv("W02_CONFIG_SECRET_SOURCE", configured_secret)
@@ -1015,7 +1088,44 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ).describe_tool_call(
         ToolCallPart("configured", "Bash", {"command": f"echo {configured_secret}"})
     )
-    assert configured_summary == "Bash echo <redacted>"
+    assert configured_summary == "echo <redacted>"
+
+
+def test_tool_summary_has_a_single_display_owner(tmp_path: Path) -> None:
+    service = ApplicationToolService(create_default_tools(tmp_path), workdir=tmp_path)
+
+    cases = (
+        ("Bash", {"command": "echo hello"}, "echo hello"),
+        ("ReadFile", {"path": "note.txt"}, "note.txt"),
+        ("WriteFile", {"path": "note.txt", "content": "hidden"}, "note.txt"),
+        (
+            "EditFile",
+            {"path": "note.txt", "old_string": "hidden", "new_string": "new"},
+            "note.txt",
+        ),
+        ("Glob", {"pattern": "*.py", "path": "src"}, "pattern=*.py path=src"),
+        ("Grep", {"pattern": "secret", "path": "src"}, "path=src"),
+    )
+
+    for name, arguments, expected in cases:
+        summary = service.describe_tool_call(ToolCallPart("call", name, arguments))
+        assert summary == expected
+        assert name not in summary
+
+    session_service = ApplicationToolService(
+        create_default_tools(tmp_path),
+        workdir=tmp_path,
+        session_provider=lambda: None,
+    )
+    for name, arguments in (
+        ("ToolResultRead", {"ref": "opaque-ref"}),
+        ("HistoryRead", {"ref": "opaque-ref"}),
+    ):
+        summary = session_service.describe_tool_call(
+            ToolCallPart("call", name, arguments)
+        )
+        assert summary.startswith("ref=opaque-ref")
+        assert name not in summary
 
 
 @pytest.mark.asyncio
@@ -1309,10 +1419,11 @@ async def test_headless_ask_user_round_trip_resumes_same_turn() -> None:
         ASK_USER_TOOL_DEFINITION,
         TODO_WRITE_TOOL_DEFINITION,
     )
-    assert provider.requests[1].messages[-1].parts[0] == ToolResultPart(
+    tool_message = _latest_message(provider.requests[1], "tool")
+    assert tool_message.parts[0] == ToolResultPart(
         "ask-1", '{"answers": {"answer": ["Ada"]}}'
     )
-    assert provider.requests[1].messages[-1].parts[1] == ToolResultPart(
+    assert tool_message.parts[1] == ToolResultPart(
         "later-1", "Error: unknown tool: missing", is_error=True
     )
     assert [event.tool_call_id for event in events if isinstance(event, ToolFinished)] == [
@@ -1400,7 +1511,7 @@ async def test_headless_two_ask_user_prompts_resume_fifo_in_one_turn() -> None:
     assert result.run_id == first_pause.run_id
     assert result.turn_id == first_pause.turn_id
     assert len(provider.requests) == 2
-    assert provider.requests[1].messages[-1].parts == (
+    assert _latest_message(provider.requests[1], "tool").parts == (
         ToolResultPart("ask-1", '{"answers": {"first": ["Ada"]}}'),
         ToolResultPart("ask-2", '{"answers": {"second": ["Grace"]}}'),
     )
@@ -1544,8 +1655,8 @@ async def test_t08_application_mode_selects_exact_builtin_tool_view_and_prompt(
         "AskUserQuestion",
         "TodoWrite",
     ]
-    assert "当前行为模式：PLAN" in _latest_user_text(provider.requests[0])
-    assert "当前行为模式：DEFAULT" in _latest_user_text(provider.requests[1])
+    assert "当前行为模式：PLAN" in _context_text(provider.requests[0])
+    assert "当前行为模式：DEFAULT" in _context_text(provider.requests[1])
 
 
 @pytest.mark.asyncio
@@ -1758,15 +1869,15 @@ async def test_t08_application_todo_completion_gate_continues_without_exposing_c
         isinstance(event, AssistantMessageDelta) and event.text == "hidden premature"
         for event in events
     )
-    assert "一次性运行反馈类型：completion_blocked" in _latest_user_text(provider.requests[2])
-    assert "[completed] verify" in _latest_user_text(provider.requests[3])
+    assert "一次性运行反馈类型：completion_blocked" in _context_text(provider.requests[2])
+    assert "[completed] verify" in _context_text(provider.requests[3])
     snapshot_payload = run.snapshot().to_dict()
     assert "task_state" not in snapshot_payload and "plan_state" not in snapshot_payload
     next_handle = run.start_turn("next turn")
     next_result = await asyncio.wait_for(next_handle.result(), timeout=1)
     assert next_result.status is RunStatus.COMPLETED
-    assert "当前 TaskState：空" in _latest_user_text(provider.requests[4])
-    assert "一次性运行反馈类型" not in _latest_user_text(provider.requests[4])
+    assert "当前 TaskState：空" in _context_text(provider.requests[4])
+    assert "一次性运行反馈类型" not in _context_text(provider.requests[4])
 
 
 @pytest.mark.asyncio
@@ -1800,15 +1911,20 @@ async def test_t08_application_steering_interrupts_provider_and_cleans_coordinat
     assert result.status is RunStatus.COMPLETED
     assert result.run_id == "steer-run" and result.final_text == "updated answer"
     assert len(provider.requests) == 2
-    assert [message.role for message in provider.requests[1].messages] == ["user", "user"]
-    assert provider.requests[1].messages[-1].parts[-1] == TextPart("also verify tests")
+    conversation = tuple(
+        message
+        for message in provider.requests[1].messages
+        if not _is_context_message(message)
+    )
+    assert [message.role for message in conversation] == ["user", "user"]
+    assert _latest_user_text(provider.requests[1]) == "also verify tests"
     requested = [event for event in events if isinstance(event, UserSteeringRequested)]
     applied = [event for event in events if isinstance(event, UserSteeringApplied)]
     assert len(requested) == len(applied) == 1
     assert requested[0].steering_id == applied[0].steering_id
     assert sum(isinstance(event, TurnStarted) for event in events) == 1
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
-    assert "一次性运行反馈类型：user_steering" in _latest_user_text(provider.requests[1])
+    assert "一次性运行反馈类型：user_steering" in _context_text(provider.requests[1])
     assert handle.steer("after terminal") is False
     assert handle._driver.execution.pending_steering is None
     assert handle._driver._response_waiter is None
@@ -1848,8 +1964,13 @@ async def test_t08_application_plan_generation_accepts_steering_but_review_pause
     assert pending.plan_review_request.plan_text == "Plan after steering"
     assert run.behavior_mode is BehaviorMode.PLAN
     assert handle.steer("must use typed revise now") is False
-    assert [message.role for message in provider.requests[1].messages] == ["user", "user"]
-    assert provider.requests[1].messages[-1].parts[-1] == TextPart("also cover rollback")
+    conversation = tuple(
+        message
+        for message in provider.requests[1].messages
+        if not _is_context_message(message)
+    )
+    assert [message.role for message in conversation] == ["user", "user"]
+    assert _latest_user_text(provider.requests[1]) == "also cover rollback"
     assert [item.name for item in provider.requests[1].tools] == [
         "ReadFile",
         "Glob",
@@ -1860,7 +1981,7 @@ async def test_t08_application_plan_generation_accepts_steering_but_review_pause
         "AskUserQuestion",
         "ProposePlan",
     ]
-    assert "一次性运行反馈类型：user_steering" in _latest_user_text(provider.requests[1])
+    assert "一次性运行反馈类型：user_steering" in _context_text(provider.requests[1])
     assert handle.cancel() is True
 
     events = await asyncio.wait_for(events_task, timeout=1)
@@ -1960,7 +2081,7 @@ async def test_t08_plan_approval_updates_active_run_and_next_turn_keeps_default_
     next_result = await asyncio.wait_for(next_handle.result(), timeout=1)
     assert next_result.status is RunStatus.COMPLETED
     assert run.behavior_mode is BehaviorMode.DEFAULT
-    next_prompt = _latest_user_text(provider.requests[3])
+    next_prompt = _context_text(provider.requests[3])
     assert "当前行为模式：DEFAULT" in next_prompt
     assert "当前 TaskState：空" in next_prompt
     assert "当前 PlanState：空" in next_prompt
@@ -2053,13 +2174,13 @@ async def test_t08_approved_plan_todo_state_survives_typed_pause_then_resets_nex
         True,
         False,
     ]
-    assert "[in_progress] verify" in _latest_user_text(provider.requests[2])
-    assert "revision=1, approved" in _latest_user_text(provider.requests[2])
+    assert "[in_progress] verify" in _context_text(provider.requests[2])
+    assert "revision=1, approved" in _context_text(provider.requests[2])
 
     next_handle = run.start_turn("next")
     assert (await asyncio.wait_for(next_handle.result(), timeout=1)).status is RunStatus.COMPLETED
-    assert "当前 TaskState：空" in _latest_user_text(provider.requests[5])
-    assert "当前 PlanState：空" in _latest_user_text(provider.requests[5])
+    assert "当前 TaskState：空" in _context_text(provider.requests[5])
+    assert "当前 PlanState：空" in _context_text(provider.requests[5])
 
 
 @pytest.mark.asyncio
@@ -2125,7 +2246,7 @@ async def test_t08_steering_preserves_task_state_until_model_explicitly_rewrites
         "old goal",
         "new goal",
     ]
-    steering_prompt = _latest_user_text(provider.requests[2])
+    steering_prompt = _context_text(provider.requests[2])
     assert "[in_progress] old goal" in steering_prompt
     assert "一次性运行反馈类型：user_steering" in steering_prompt
 
@@ -2149,7 +2270,7 @@ async def test_t08_steering_pending_makes_provider_pause_rejection_truthful(
     assert result.status is RunStatus.COMPLETED
     assert result.final_text == "updated answer"
     assert len(provider.requests) == 2
-    assert provider.requests[1].messages[-1].parts[-1] == TextPart("updated goal")
+    assert _latest_user_text(provider.requests[1]) == "updated goal"
     assert sum(isinstance(event, UserSteeringApplied) for event in events) == 1
     assert not any(isinstance(event, TurnPaused) for event in events)
 

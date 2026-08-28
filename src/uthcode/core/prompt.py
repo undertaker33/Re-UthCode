@@ -510,23 +510,6 @@ class PromptSection:
 
 
 @dataclass(frozen=True, slots=True)
-class SystemPromptContext:
-    """Explicit runtime values used by the Core System Prompt."""
-
-    workdir: str
-    platform_name: str
-    platform_release: str
-    current_date: str
-    model_ref: str
-    provider_protocol: str
-    remote_model_id: str
-
-    def __post_init__(self) -> None:
-        for field_name in self.__dataclass_fields__:
-            _require_text(getattr(self, field_name), field_name)
-
-
-@dataclass(frozen=True, slots=True)
 class RuntimePromptContext:
     """Only the current structured facts needed by runtime prompt semantics."""
 
@@ -573,68 +556,6 @@ def _escape_runtime_value(value: str) -> str:
         "|": "\\|",
     }
     return "".join(replacements.get(character, character) for character in value)
-
-
-def _render_sections(sections: Sequence[PromptSection]) -> str:
-    rendered: list[str] = []
-    for section in sorted(sections, key=lambda item: item.priority):
-        content = section.content.strip()
-        if not content:
-            continue
-        rendered.append(f"## {section.name}\n{content}")
-    return "\n\n".join(rendered).rstrip()
-
-
-def _public_prompt_sections() -> tuple[PromptSection, ...]:
-    """Parse the versioned public asset without copying its prose into Core."""
-
-    sections: list[PromptSection] = []
-    current_name: str | None = None
-    current_lines: list[str] = []
-    priority = 0
-    for line in read_public_coding_prompt().splitlines():
-        if line.startswith("## "):
-            if current_name is not None:
-                sections.append(
-                    PromptSection(current_name, priority, "\n".join(current_lines).strip())
-                )
-                priority += 10
-            current_name = line[3:].strip()
-            current_lines = []
-            continue
-        if current_name is None:
-            if line.strip():
-                current_name = "公共编码提示"
-                current_lines = [line]
-            continue
-        current_lines.append(line)
-    if current_name is not None:
-        sections.append(
-            PromptSection(current_name, priority, "\n".join(current_lines).strip())
-        )
-    if not sections:  # pragma: no cover - the asset loader already rejects empty text.
-        raise RuntimeError("public coding prompt asset contains no sections")
-    return tuple(sections)
-
-
-def _instruction_prompt_sections(
-    blocks: Sequence[ContextBlock],
-) -> tuple[PromptSection, ...]:
-    sections: list[PromptSection] = []
-    for index, block in enumerate(blocks):
-        if not isinstance(block, ContextBlock):
-            raise TypeError("instruction_blocks must contain ContextBlock values")
-        if not block.is_instruction:
-            raise ValueError("only Instruction Plane blocks may be rendered as instructions")
-        scope = block.scope.value if isinstance(block.scope, Enum) else block.scope
-        sections.append(
-            PromptSection(
-                f"项目指令（{scope}）",
-                45 + index,
-                block.content,
-            )
-        )
-    return tuple(sections)
 
 
 def build_runtime_prompt_section(context: RuntimePromptContext) -> PromptSection:
@@ -696,55 +617,6 @@ def build_runtime_prompt_section(context: RuntimePromptContext) -> PromptSection
     )
 
 
-def build_system_prompt(
-    context: SystemPromptContext,
-    *,
-    runtime_context: RuntimePromptContext | None = None,
-    instruction_blocks: Sequence[ContextBlock] | None = None,
-) -> str:
-    """Build the asset-backed prompt plus Core and runtime-owned sections.
-
-    ``instruction_blocks`` is intentionally limited to trusted Instruction
-    Plane blocks.
-    """
-
-    if not isinstance(context, SystemPromptContext):
-        raise TypeError("context must be a SystemPromptContext")
-    if runtime_context is None:
-        runtime_context = RuntimePromptContext()
-    if not isinstance(runtime_context, RuntimePromptContext):
-        raise TypeError("runtime_context must be a RuntimePromptContext or None")
-
-    sections = (
-        *_public_prompt_sections(),
-        PromptSection(
-            name="核心运行契约",
-            priority=35,
-            content=_CORE_RUNTIME_CONTRACT,
-        ),
-        *(
-            _instruction_prompt_sections(instruction_blocks)
-            if instruction_blocks is not None
-            else ()
-        ),
-        build_runtime_prompt_section(runtime_context),
-        PromptSection(
-            name="当前运行环境",
-            priority=100,
-            content=(
-                f"- 工作目录：{_escape_runtime_value(context.workdir)}\n"
-                f"- 平台：{_escape_runtime_value(context.platform_name)} / "
-                f"{_escape_runtime_value(context.platform_release)}\n"
-                f"- 当前日期：{_escape_runtime_value(context.current_date)}\n"
-                f"- 模型选择：{_escape_runtime_value(context.model_ref)}\n"
-                f"- Provider 协议：{_escape_runtime_value(context.provider_protocol)}\n"
-                f"- 远端模型：{_escape_runtime_value(context.remote_model_id)}"
-            ),
-        ),
-    )
-    return _render_sections(sections)
-
-
 __all__ = [
     "ContextAuthority",
     "ContextBlock",
@@ -757,11 +629,9 @@ __all__ = [
     "ProjectInstructionSource",
     "RuntimePromptContext",
     "StableInstructionPrefixEpoch",
-    "SystemPromptContext",
     "ToolDefinitionSource",
     "build_instruction_prefix",
     "build_runtime_prompt_section",
-    "build_system_prompt",
     "core_runtime_contract_source",
     "estimate_tool_schema_tokens",
     "instruction_prefix_fingerprint",

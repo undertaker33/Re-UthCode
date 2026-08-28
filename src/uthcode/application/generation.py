@@ -82,6 +82,7 @@ from .sessions import (
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
     SessionCatalogEntry,
+    SessionReplayRecord,
 )
 from .tools import ApplicationToolService
 from .provider_usage import public_usage_diagnostics
@@ -754,7 +755,10 @@ class UthCodeApplication:
     def resume_session(self, session_id: str) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.resume_session(session_id)
+        return self._session_service.resume_session(
+            session_id,
+            replay_builder=self._build_session_replay,
+        )
 
     def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return the Application-owned same-project Session Picker data."""
@@ -777,9 +781,38 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        session = self._session_service.resume_session_for_command(session_id)
+        session = self._session_service.resume_session_for_command(
+            session_id,
+            replay_builder=self._build_session_replay,
+        )
         self._refresh_context_for_session(session)
         return session
+
+    def session_replay(
+        self,
+        session_id: str | None = None,
+    ) -> tuple[SessionReplayRecord, ...]:
+        """Return a safe replay projection without opening a Session."""
+
+        if self._session_service is None:
+            return ()
+        active = self._session_service.active_session
+        if session_id is None:
+            return () if active is None else active.replay
+        if active is not None and active.session_id == session_id:
+            return active.replay
+        snapshot = self._session_service.read_session(session_id)
+        return self._build_session_replay(snapshot)
+
+    def _build_session_replay(self, snapshot) -> tuple[SessionReplayRecord, ...]:
+        """Build the interface-neutral replay through Application redaction."""
+
+        if self._session_service is None:
+            return ()
+        return self._session_service.project_replay_snapshot(
+            snapshot,
+            tool_summary=self._tool_service.describe_tool_call,
+        )
 
     async def compact_session(self) -> CompactionResult:
         """Run one manual L4 epoch through the active Turn's Context path."""

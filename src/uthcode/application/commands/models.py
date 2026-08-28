@@ -14,6 +14,8 @@ from enum import Enum
 from uthcode.core.permission import PermissionMode
 from uthcode.core.planning import BehaviorMode
 
+from ..sessions import SessionReplayRecord
+
 
 class CommandKind(str, Enum):
     """The command semantics understood by the Application layer."""
@@ -192,12 +194,17 @@ class SessionChanged(UiAction):
 
     session_id: str
     restored: bool = False
+    replay: tuple[SessionReplayRecord, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
             raise ValueError("session_id must be a non-empty string")
         if not isinstance(self.restored, bool):
             raise TypeError("restored must be a boolean")
+        replay = tuple(self.replay)
+        if not all(isinstance(record, SessionReplayRecord) for record in replay):
+            raise TypeError("replay must contain SessionReplayRecord values")
+        object.__setattr__(self, "replay", replay)
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,5 +318,6 @@ __all__ = [
     "PermissionModeSelected",
     "QuitInterface",
     "SessionChanged",
+    "SessionReplayRecord",
     "UiAction",
 ]

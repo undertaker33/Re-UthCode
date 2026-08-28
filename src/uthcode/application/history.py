@@ -12,25 +12,6 @@ def _transcript_entries_for_message(
     sequence: int,
     message: Message,
 ) -> tuple[TranscriptEntry, ...]:
-    """Persist one complete Message as an identity-local semantic unit."""
+    """Persist one Message as part-local entries in one semantic unit."""
 
-    entries = transcript_entries_from_message(session_id, turn_id, sequence, message)
-    message_id = f"{turn_id}:{sequence}"
-    converted: list[TranscriptEntry] = []
-    for entry in entries:
-        payload = dict(entry.payload)
-        payload["message"] = message.to_dict()
-        payload["message_id"] = message_id
-        converted.append(
-            TranscriptEntry(
-                session_id=entry.session_id,
-                sequence=entry.sequence,
-                turn_id=entry.turn_id,
-                kind=entry.kind,
-                payload=payload,
-                created_at=entry.created_at,
-                commit_boundary=entry.commit_boundary,
-                semantic_unit_id=entry.semantic_unit_id,
-            )
-        )
-    return tuple(converted)
+    return transcript_entries_from_message(session_id, turn_id, sequence, message)

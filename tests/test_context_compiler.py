@@ -6,6 +6,7 @@ import pytest
 
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.core.context import (
     CompactionPolicy,
     ContextCompactor,
@@ -15,9 +16,10 @@ from uthcode.core.context import (
     ContextSnapshot,
     messages_from_context_snapshot,
 )
-from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind
+from uthcode.core.history import ActiveCheckpoint, SemanticEntry, SemanticUnit, Timeline, Transcript, TranscriptEntry, TranscriptKind
 from uthcode.core.prompt import ContextAuthority, ContextBlock, ContextScope, ContextSourceKind, ContextStability, ProjectInstructionSource, RuntimePromptContext, ToolDefinitionSource
-from uthcode.core.provider import GenerationRequest, Message, TextPart, ToolDefinition
+from uthcode.core.planning import BehaviorMode
+from uthcode.core.provider import GenerationRequest, Message, NativeItem, ReasoningPart, TextPart, ToolDefinition
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.integrations.providers.openai_responses import _prompt_cache_key
@@ -235,6 +237,81 @@ def test_timeline_summary_is_conversation_data_and_raw_tail_remains_visible() ->
     assert any("summary of first" in part.text for message in messages for part in message.parts if isinstance(part, TextPart))
 
 
+def test_context_rebuilds_reasoning_and_formal_parts_with_native_items() -> None:
+    native_reasoning = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=0,
+        kind="thinking",
+        payload={"type": "thinking", "thinking": "plan", "signature": "sig"},
+    )
+    native_text = NativeItem(
+        "anthropic",
+        "messages",
+        "claude-test",
+        sequence_index=1,
+        kind="text",
+        payload={"type": "text", "text": "answer"},
+    )
+    entries = _transcript_entries_for_message(
+        "session-1",
+        "turn-reasoning",
+        1,
+        Message(
+            "assistant",
+            (ReasoningPart("plan"), TextPart("answer")),
+            native_items=(native_reasoning, native_text),
+        ),
+    )
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            transcript=Transcript("session-1", entries),
+            current_turn=("tail",),
+        )
+    )
+
+    messages = messages_from_context_snapshot(snapshot)
+    assistant = next(message for message in messages if message.role == "assistant")
+    assert assistant.parts == (ReasoningPart("plan"), TextPart("answer"))
+    assert assistant.native_items == (native_reasoning, native_text)
+    assert "plan" not in "".join(
+        part.text for part in assistant.parts if isinstance(part, TextPart)
+    )
+
+
+def test_context_rejects_non_contiguous_history_message_identity() -> None:
+    def entry(sequence: int, message_id: str, part_index: int, text: str) -> TranscriptEntry:
+        return TranscriptEntry(
+            "session-1",
+            sequence,
+            "turn-identity",
+            TranscriptKind.USER_MESSAGE,
+            {
+                "role": "user",
+                "message_id": message_id,
+                "message_part_index": part_index,
+                "part": {"type": "text", "text": text},
+            },
+            semantic_unit_id="turn-identity",
+        )
+
+    entries = (
+        entry(1, "message-a", 0, "same"),
+        entry(2, "message-b", 0, "other"),
+        entry(3, "message-a", 1, "tail"),
+    )
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            transcript=Transcript("session-1", entries),
+            current_turn=("tail",),
+        )
+    )
+
+    with pytest.raises(ContextCompilationError, match="non-contiguous"):
+        messages_from_context_snapshot(snapshot)
+
+
 def test_current_user_is_protected_and_remains_at_conversation_tail_over_budget() -> None:
     snapshot = ContextCompiler(
         budget_tokens=2,
@@ -265,6 +342,140 @@ def test_compiler_accepts_only_bundle_and_rejects_invalid_source_boundaries() ->
 def test_application_context_service_keeps_current_user_at_tail() -> None:
     snapshot = ApplicationContextService().compile(current_turn=("a", "b"), current_user="user")
     assert [block.content for block in snapshot.conversation_plane][-3:] == ["a", "b", "user"]
+
+
+def test_context_projection_keeps_contextual_sources_out_of_current_user_tail() -> None:
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            current_turn=("？",),
+            runtime_sources=(_runtime_block("runtime: deepseek/v4-flash"),),
+            environment_sources=(
+                ContextBlock(
+                    ContextSourceKind.ENVIRONMENT_FACT,
+                    ContextAuthority.ENVIRONMENT,
+                    ContextStability.DYNAMIC,
+                    ContextScope.TURN,
+                    "test:environment",
+                    "environment: D:/project/Re-UthCode",
+                ),
+            ),
+        )
+    )
+
+    messages = messages_from_context_snapshot(snapshot)
+
+    assert messages[-1] == Message("user", (TextPart("？"),))
+    assert any(
+        message.role == "user"
+        and any("runtime: deepseek/v4-flash" in part.text for part in message.parts if isinstance(part, TextPart))
+        for message in messages[:-1]
+    )
+    assert any(
+        message.role == "user"
+        and any("environment: D:/project/Re-UthCode" in part.text for part in message.parts if isinstance(part, TextPart))
+        for message in messages[:-1]
+    )
+
+
+def test_application_request_keeps_current_user_exact_after_runtime_composition() -> None:
+    request, _snapshot = ApplicationContextService().compose_generation_request(
+        (Message("user", (TextPart("？"),)),),
+        run_id="run-current-user",
+        runtime_context=RuntimePromptContext(),
+        environment_sources=(
+            ContextBlock(
+                ContextSourceKind.ENVIRONMENT_FACT,
+                ContextAuthority.ENVIRONMENT,
+                ContextStability.DYNAMIC,
+                ContextScope.TURN,
+                "test:environment",
+                "environment: model=deepseek/v4-flash",
+            ),
+        ),
+    )
+
+    assert request.messages[-1] == Message("user", (TextPart("？"),))
+
+
+def test_application_composition_keeps_user_identity_across_context_changes_and_turns() -> None:
+    service = ApplicationContextService()
+    current_user = Message("user", (TextPart("？"),))
+
+    def environment(content: str) -> ContextBlock:
+        return ContextBlock(
+            ContextSourceKind.ENVIRONMENT_FACT,
+            ContextAuthority.ENVIRONMENT,
+            ContextStability.DYNAMIC,
+            ContextScope.TURN,
+            "test:environment",
+            content,
+        )
+
+    first, _ = service.compose_generation_request(
+        (current_user,),
+        run_id="context-change-1",
+        runtime_context=RuntimePromptContext(behavior_mode=BehaviorMode.DEFAULT),
+        environment_sources=(environment("environment: one"),),
+    )
+    second, _ = service.compose_generation_request(
+        (current_user,),
+        run_id="context-change-2",
+        runtime_context=RuntimePromptContext(behavior_mode=BehaviorMode.PLAN),
+        environment_sources=(environment("environment: two"),),
+    )
+
+    assert first.messages[-1] == current_user
+    assert second.messages[-1] == current_user
+    assert first.messages[-1].parts == second.messages[-1].parts == (TextPart("？"),)
+    assert any(
+        isinstance(part, TextPart) and "environment: one" in part.text
+        for message in first.messages[:-1]
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and "environment: two" in part.text
+        for message in second.messages[:-1]
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and "当前行为模式：DEFAULT" in part.text
+        for message in first.messages[:-1]
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and "当前行为模式：PLAN" in part.text
+        for message in second.messages[:-1]
+        for part in message.parts
+    )
+
+    turns, _ = service.compose_generation_request(
+        (
+            Message("user", (TextPart("same"),)),
+            Message("user", (TextPart("steering"),)),
+            Message("user", (TextPart("same"),)),
+        ),
+        run_id="adjacent-turns",
+    )
+    non_context_user_texts = tuple(
+        part.text
+        for message in turns.messages
+        if message.role == "user"
+        and not (
+            len(message.parts) == 1
+            and isinstance(message.parts[0], TextPart)
+            and message.parts[0].text.startswith("[Context]\n")
+        )
+        for part in message.parts
+        if isinstance(part, TextPart)
+    )
+    assert non_context_user_texts == ("same", "steering", "same")
+    assert turns.messages[-1] == Message("user", (TextPart("same"),))
+
+
+def test_prompt_has_no_parallel_standalone_system_builder() -> None:
+    import uthcode.core.prompt as prompt_module
+
+    assert not hasattr(prompt_module, "build_system_prompt")
 
 
 def test_application_composes_context_and_resumes_instruction_state(tmp_path: Path) -> None:

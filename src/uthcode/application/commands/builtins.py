@@ -312,7 +312,12 @@ def _resume_session(context: CommandContext) -> OpenSessionPicker | SessionChang
         raise _session_error(exc, session_id=session_id) from None
     except Exception:
         raise CommandExecutionError("无法恢复 Session") from None
-    return SessionChanged(str(session.session_id), restored=True)
+    replay = getattr(session, "replay", ())
+    return SessionChanged(
+        str(session.session_id),
+        restored=True,
+        replay=tuple(replay),
+    )
 
 
 def create_builtin_registry() -> CommandRegistry:

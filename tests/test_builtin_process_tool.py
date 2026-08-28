@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,7 +29,14 @@ from uthcode.core.permission import (
     RuleSet,
 )
 from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
-from uthcode.integrations.tools.process_tools import BashTool, classify_bash_command
+from uthcode.integrations.tools.process_tools import (
+    BashTool,
+    _completed_result,
+    _decode_process_output,
+    _windows_output_encodings,
+    classify_bash_command,
+)
+from uthcode.integrations.tools import process_tools
 from uthcode.integrations.permissions import default_guard_rules
 
 
@@ -522,6 +530,80 @@ async def test_bash_distinguishes_stdout_stderr_and_nonzero_exit(tmp_path: Path)
     assert "STDOUT:\nout" in result.content
     assert "STDERR:\nerr" in result.content
     assert "Exit code: 3" in result.content
+
+
+@pytest.mark.asyncio
+async def test_bash_decodes_windows_cp936_stdout_and_stderr(tmp_path: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("reported Windows shell encoding is a Windows contract")
+
+    encoding = next(
+        (
+            candidate
+            for candidate in _windows_output_encodings()
+            if candidate.casefold().replace("-", "") not in {"utf8", "utf_8"}
+            and _can_encode_chinese(candidate)
+        ),
+        None,
+    )
+    if encoding is None:
+        pytest.skip("no current reported non-UTF-8 encoding can represent Chinese")
+    encoded = "中文".encode(encoding)
+
+    command = _python_command(
+        f"import sys; value={encoded!r}; "
+        "sys.stdout.buffer.write(value); sys.stderr.buffer.write(value)"
+    )
+    result = await BashTool(tmp_path).execute(
+        {"command": command},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    assert result.is_error is False
+    assert "STDOUT:\n中文" in result.content
+    assert "STDERR:\n中文" in result.content
+    assert "\ufffd" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_bash_preserves_utf8_chinese_stdout_and_stderr(tmp_path: Path) -> None:
+    command = _python_command(
+        "import sys; value='\\u4e2d\\u6587'.encode('utf-8'); "
+        "sys.stdout.buffer.write(value); sys.stderr.buffer.write(value)"
+    )
+    result = await BashTool(tmp_path).execute(
+        {"command": command},  # type: ignore[arg-type]
+        cancellation=CancellationToken(),
+    )
+
+    assert result.is_error is False
+    assert "STDOUT:\n中文" in result.content
+    assert "STDERR:\n中文" in result.content
+    assert "\ufffd" not in result.content
+
+
+def _can_encode_chinese(encoding: str) -> bool:
+    try:
+        "中文".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def test_bash_output_uses_replacement_only_when_reported_encodings_reject_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_tools, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        process_tools,
+        "_windows_output_encodings",
+        lambda: ("ascii",),
+    )
+    assert _decode_process_output(b"\xff") == "\ufffd"
+
+    result = _completed_result(0, b"\xff", b"")
+
+    assert "\ufffd" in result.content
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from uthcode.integrations.tools.history_read import (
 _MAX_SUMMARY_CHARS = 240
 _SUMMARY_UNAVAILABLE = "<tool summary unavailable>"
 _UNKNOWN_TOOL = "<unknown tool>"
+_CUSTOM_ARGUMENTS_HIDDEN = "<arguments hidden>"
 _REDACTED = "<redacted>"
 _NON_SECRET_AMBIENT_VALUES = frozenset({"0", "1"})
 _SENSITIVE_NAME = (
@@ -278,9 +279,11 @@ class ApplicationToolService:
         """Return a bounded, display-safe summary for one registered call.
 
         This method deliberately understands only the stable semantics of the
-        current Tool definitions.  It never serializes the full arguments and
-        never includes a ToolResult.  Unknown or malformed calls receive a
-        safe placeholder instead of exposing arbitrary input.
+        current Tool definitions.  It owns the safe argument summary, while
+        the AgentEvent ``tool_name`` field owns the displayed Tool name.  It
+        never serializes the full arguments and never includes a ToolResult.
+        Unknown or malformed calls receive a safe placeholder instead of
+        exposing arbitrary input.
         """
 
         try:
@@ -294,12 +297,12 @@ class ApplicationToolService:
             if call.name == "Bash":
                 command = safe_bash_command_summary(_safe_command(arguments.get("command")))
                 command = self._redactor.redact(command)
-                summary = f"Bash {command}"
+                summary = command
             elif call.name in {"ReadFile", "WriteFile", "EditFile"}:
                 path = self._redactor.redact(
                     _safe_text(arguments.get("path"), "<path unavailable>")
                 )
-                summary = f"{call.name} {_safe_path(path, self._workdir)}"
+                summary = _safe_path(path, self._workdir)
             elif call.name == "Glob":
                 pattern = self._redactor.redact(
                     _safe_text(arguments.get("pattern"), "<pattern unavailable>")
@@ -308,7 +311,7 @@ class ApplicationToolService:
                     _safe_text(arguments.get("path", "."), ".")
                 )
                 scope = _safe_path(scope_value, self._workdir)
-                summary = f"Glob pattern={pattern} path={scope}"
+                summary = f"pattern={pattern} path={scope}"
             elif call.name == "Grep":
                 scope_value = self._redactor.redact(
                     _safe_text(arguments.get("path", "."), ".")
@@ -317,7 +320,7 @@ class ApplicationToolService:
                 # A search pattern is caller-supplied content and may itself
                 # be a secret read from a sensitive file.  Keep it out of
                 # ToolStarted/Pause summaries altogether.
-                summary = f"Grep path={scope}"
+                summary = f"path={scope}"
                 if arguments.get("include") not in (None, ""):
                     include = self._redactor.redact(
                         _safe_text(arguments.get("include"), "<include unavailable>")
@@ -327,16 +330,17 @@ class ApplicationToolService:
                 ref = _safe_text(arguments.get("ref"), "<ref unavailable>")
                 offset = arguments.get("offset", 0)
                 limit = arguments.get("limit", self._tool_result_policy.read_page_limit_bytes)
-                summary = f"ToolResultRead ref={ref} offset={offset} limit={limit}"
+                summary = f"ref={ref} offset={offset} limit={limit}"
             elif call.name == "HistoryRead":
                 ref = _safe_text(arguments.get("ref"), "<ref unavailable>")
                 offset = arguments.get("offset", 0)
                 limit = arguments.get("limit", self._history_read_policy.page_entry_limit)
-                summary = f"HistoryRead ref={ref} offset={offset} limit={limit}"
+                summary = f"ref={ref} offset={offset} limit={limit}"
             else:
                 # A custom Tool may have arbitrary argument names.  Its name
-                # is useful, while its argument payload is not safe to echo.
-                summary = call.name
+                # is carried separately by AgentEvent, while its argument
+                # payload is not safe to echo.
+                summary = _CUSTOM_ARGUMENTS_HIDDEN
             summary = self._redactor.redact(summary)
             return _truncate_summary(_single_line(summary))
         except Exception:

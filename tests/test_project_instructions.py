@@ -22,8 +22,6 @@ from uthcode.core.prompt import (
     ContextSourceKind,
     ContextStability,
     ToolDefinitionSource,
-    SystemPromptContext,
-    build_system_prompt,
     build_instruction_prefix,
     core_runtime_contract_source,
     public_prompt_source,
@@ -125,20 +123,17 @@ def test_public_instruction_prefix_has_typed_authority_and_stable_order() -> Non
     assert prefix.instruction_epoch == 2
     assert prefix.fingerprint
 
-    prompt = build_system_prompt(
-        SystemPromptContext(
-            workdir="C:/workspace",
-            platform_name="Windows",
-            platform_release="11",
-            current_date="2026-08-15",
-            model_ref="test/model",
-            provider_protocol="responses",
-            remote_model_id="test-model",
-        ),
-        instruction_blocks=(user,),
+    instruction_sources = build_instruction_prefix(
+        (public_prompt_source(), core_runtime_contract_source(), user),
+        instruction_epoch=3,
     )
-    assert "## 核心运行契约" in prompt
-    assert core_runtime_contract_source().content in prompt
+    assert instruction_sources.blocks == (
+        public_prompt_source(),
+        core_runtime_contract_source(),
+        user,
+    )
+    assert public_prompt_source().content in instruction_sources.content
+    assert core_runtime_contract_source().content in instruction_sources.content
 
     tool_source = ToolDefinitionSource(
         (ToolDefinition("Search", "search files", {"type": "object"}),)
@@ -147,7 +142,6 @@ def test_public_instruction_prefix_has_typed_authority_and_stable_order() -> Non
     assert tool_source.tool_schema_fingerprint == tool_source.schema_fingerprint
     assert "Search" not in read_public_coding_prompt()
     assert public_prompt_source().content == read_public_coding_prompt()
-    assert "Search" not in prompt
 
 
 def test_loader_is_broad_to_narrow_and_directory_scopes_are_lazy(tmp_path: Path) -> None:

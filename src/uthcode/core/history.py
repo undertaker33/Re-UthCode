@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from .provider import JsonPayload, Message, ToolCallPart, ToolResultPart
+from .provider import JsonPayload, Message, TextPart, ToolCallPart, ToolResultPart
 
 
 TRANSCRIPT_SCHEMA_VERSION = 2
@@ -56,6 +56,15 @@ class TimelineError(ValueError):
 
 class TimelineSequenceError(TimelineError):
     """Timeline records cannot be appended out of order."""
+
+
+def _entry_part_payload(entry: "TranscriptEntry") -> Mapping[str, Any]:
+    """Return the typed part payload for both current and legacy entries."""
+
+    nested = entry.payload.get("part")
+    if isinstance(nested, MappingABC):
+        return nested
+    return entry.payload
 
 
 @dataclass(frozen=True)
@@ -133,17 +142,18 @@ class SemanticUnit:
     @property
     def complete(self) -> bool:
         calls = tuple(
-            entry.payload.get("tool_call_id")
+            _entry_part_payload(entry).get("tool_call_id")
             for entry in self.entries
             if entry.kind is TranscriptKind.TOOL_CALL
         )
         results = tuple(
-            entry.payload.get("tool_call_id")
+            _entry_part_payload(entry).get("tool_call_id")
             for entry in self.entries
             if entry.kind is TranscriptKind.TOOL_RESULT
         )
         if any(
-            not isinstance(entry.payload.get("tool_call_id"), str) or not entry.payload.get("tool_call_id")
+            not isinstance(_entry_part_payload(entry).get("tool_call_id"), str)
+            or not _entry_part_payload(entry).get("tool_call_id")
             for entry in self.entries
             if entry.kind in (TranscriptKind.TOOL_CALL, TranscriptKind.TOOL_RESULT)
         ):
@@ -566,16 +576,28 @@ def transcript_entries_from_message(session_id: str, turn_id: str, sequence_star
     entries: list[TranscriptEntry] = []
     sequence = sequence_start
     unit_id = turn_id
-    for part in message.parts:
+    message_id = f"{turn_id}:{sequence_start}"
+    parts = message.parts or (TextPart(""),)
+    for part_index, part in enumerate(parts):
         if isinstance(part, ToolCallPart):
             kind = TranscriptKind.TOOL_CALL
         elif isinstance(part, ToolResultPart):
             kind = TranscriptKind.TOOL_RESULT
         else:
             kind = TranscriptKind.USER_MESSAGE if message.role == "user" else TranscriptKind.ASSISTANT_MESSAGE
-        payload = part.to_dict() if hasattr(part, "to_dict") else {"text": str(part)}
+        payload: dict[str, Any] = {
+            "role": message.role,
+            "message_id": message_id,
+            "message_part_index": part_index,
+            "part": part.to_dict() if hasattr(part, "to_dict") else {"text": str(part)},
+        }
+        native_items = tuple(
+            item.to_dict()
+            for item in message.native_items
+            if item.sequence_index == part_index
+        )
+        if native_items:
+            payload["native_items"] = native_items
         entries.append(TranscriptEntry(session_id, sequence, turn_id, kind, payload, semantic_unit_id=unit_id))
         sequence += 1
-    if not entries:
-        entries.append(TranscriptEntry(session_id, sequence, turn_id, TranscriptKind.USER_MESSAGE if message.role == "user" else TranscriptKind.ASSISTANT_MESSAGE, {"text": ""}, semantic_unit_id=unit_id))
     return tuple(entries)

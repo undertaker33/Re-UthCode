@@ -56,6 +56,7 @@ from .provider import (
     GenerationRequest,
     Message,
     ModelLimits,
+    NativeItem,
     TextPart,
     ToolCallPart,
     ToolDefinition,
@@ -1779,32 +1780,39 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
     if not isinstance(snapshot, ContextSnapshot):
         raise TypeError("snapshot must be a ContextSnapshot")
     result: list[Message] = []
-    contextual_texts: list[str] = []
     last_history_identity: tuple[str, ...] | None = None
     last_history_was_full_message = False
+    seen_history_identities: set[tuple[str, ...]] = set()
 
     def append(message: Message) -> None:
         result.append(message)
 
     def append_transcript_entry(entry: TranscriptEntry) -> None:
         nonlocal last_history_identity, last_history_was_full_message
-        identity, message, is_full_message = _transcript_entry_message(entry)
+        identity, message, is_full_message, part_index = _transcript_entry_message(entry)
         if identity == last_history_identity:
             if last_history_was_full_message or is_full_message:
-                # _history_for_messages may persist the complete Message on
-                # every part entry.  This is an identity-local reconstruction
-                # rule, not content-based de-duplication.
+                if not last_history_was_full_message or not is_full_message or result[-1] != message:
+                    raise ContextCompilationError("history message identity has conflicting full payloads")
                 last_history_was_full_message = True
                 return
             previous = result[-1]
-            if previous.role == message.role:
-                result[-1] = Message(
-                    previous.role,
-                    previous.parts + message.parts,
-                    previous.native_items,
-                )
-                return
+            if previous.role != message.role or part_index is None:
+                raise ContextCompilationError("history message part order is invalid")
+            if part_index != len(previous.parts):
+                raise ContextCompilationError("history message part order is invalid")
+            result[-1] = Message(
+                previous.role,
+                previous.parts + message.parts,
+                previous.native_items + message.native_items,
+            )
+            return
+        if identity in seen_history_identities:
+            raise ContextCompilationError("history message identity is non-contiguous")
+        if not is_full_message and part_index is not None and part_index != 0:
+            raise ContextCompilationError("history message must start at part index zero")
         append(message)
+        seen_history_identities.add(identity)
         last_history_identity = identity
         last_history_was_full_message = is_full_message
 
@@ -1812,6 +1820,7 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
         nonlocal last_history_identity, last_history_was_full_message
         last_history_identity = None
         last_history_was_full_message = False
+        seen_history_identities.clear()
 
     for block in snapshot.selected_blocks:
         if block.plane is ContextPlane.INSTRUCTION:
@@ -1854,32 +1863,34 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
             continue
         if block.plane is ContextPlane.CONTEXTUAL:
             break_history_identity()
-            contextual_texts.append(block.content)
+            # Contextual facts are conversation data, but they are not part of
+            # the current user message.  Keep one provider-neutral user
+            # message per source so the final current-user tail remains an
+            # exact, independently addressable message.  The source marker is
+            # a structural boundary for providers which only expose user
+            # messages; it is deliberately not an Instruction Plane label.
+            append(
+                Message(
+                    "user",
+                    (
+                        TextPart(
+                            "[Context]\n"
+                            f"[source={block.source_kind.value} "
+                            f"provenance={block.provenance}]\n"
+                            f"{block.content}"
+                        ),
+                    ),
+                )
+            )
             continue
         break_history_identity()
         append(Message("user", (TextPart(block.content),)))
-    if contextual_texts:
-        user_index = next(
-            (index for index in range(len(result) - 1, -1, -1) if result[index].role == "user"),
-            None,
-        )
-        if user_index is not None:
-            current = result[user_index]
-            context_parts = tuple(TextPart(f"[Context]\n{value}") for value in contextual_texts)
-            result[user_index] = Message("user", context_parts + current.parts, current.native_items)
-        else:
-            result.append(
-                Message(
-                    "user",
-                    tuple(TextPart(f"[Context]\n{value}") for value in contextual_texts),
-                )
-            )
     return tuple(result)
 
 
 def _transcript_entry_message(
     entry: TranscriptEntry,
-) -> tuple[tuple[str, ...], Message, bool]:
+) -> tuple[tuple[str, ...], Message, bool, int | None]:
     if not hasattr(entry, "payload") or not hasattr(entry, "kind"):
         raise ContextCompilationError("Transcript entry is malformed")
     payload = entry.payload
@@ -1892,13 +1903,34 @@ def _transcript_entry_message(
             # deterministic ``message_id`` created from each message's first
             # sequence; use it when present and never fall back to text.
             message_id = payload.get("message_id")
-            if isinstance(message_id, str) and message_id.strip():
+            if "message_id" in payload:
+                if not isinstance(message_id, str) or not message_id.strip():
+                    raise ContextCompilationError("history message identity is invalid")
                 return (entry.session_id, entry.turn_id, message.role, message_id)
             # Core also accepts standalone atomic History entries that do not
             # claim to represent a reconstructable full Message.  Keep those
             # entry-local; only the full-message persistence envelope below
             # requires an explicit Message identity.
             return (entry.session_id, entry.turn_id, message.role, f"entry:{entry.sequence}")
+
+        def part_index_for() -> int | None:
+            value = payload.get("message_part_index")
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ContextCompilationError("history message part index is invalid")
+            return value
+
+        def native_items_for() -> tuple[NativeItem, ...]:
+            values = payload.get("native_items", ())
+            if values is None:
+                return ()
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
+                raise ContextCompilationError("history native items are malformed")
+            try:
+                return tuple(NativeItem.from_dict(value) for value in values)
+            except (TypeError, ValueError, KeyError):
+                raise ContextCompilationError("history native items are malformed") from None
 
         message_value = payload.get("message")
         if isinstance(message_value, Mapping):
@@ -1907,29 +1939,44 @@ def _transcript_entry_message(
                 raise ContextCompilationError("history message identity is missing")
             try:
                 message = Message.from_dict(message_value)
-                return identity_for(message), message, True
+                return identity_for(message), message, True, None
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history message payload is malformed") from None
         part_value = payload.get("part")
         if isinstance(part_value, Mapping):
             role = payload.get("role", "user")
             try:
-                message = Message.from_dict({"role": role, "parts": [part_value]})
-                return identity_for(message), message, False
+                message = Message.from_dict(
+                    {
+                        "role": role,
+                        "parts": [dict(part_value)],
+                        "native_items": [item.to_dict() for item in native_items_for()],
+                    }
+                )
+                part_type = part_value.get("type")
+                if entry.kind is TranscriptKind.TOOL_CALL and part_type != "tool_call":
+                    raise ValueError("ToolCall entry part type is invalid")
+                if entry.kind is TranscriptKind.TOOL_RESULT and part_type != "tool_result":
+                    raise ValueError("ToolResult entry part type is invalid")
+                return identity_for(message), message, False, part_index_for()
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history part payload is malformed") from None
         if payload.get("type") == "tool_call":
             try:
                 message = Message.from_dict({"role": "assistant", "parts": [dict(payload)]})
-                return identity_for(message), message, False
+                return identity_for(message), message, False, None
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history ToolCall payload is malformed") from None
         if payload.get("type") == "tool_result":
             try:
                 message = Message.from_dict({"role": "tool", "parts": [dict(payload)]})
-                return identity_for(message), message, False
+                return identity_for(message), message, False, None
             except (TypeError, ValueError, KeyError):
                 raise ContextCompilationError("history ToolResult payload is malformed") from None
+        raw_text = payload.get("text")
+        if isinstance(raw_text, str):
+            role = "assistant" if entry.kind is TranscriptKind.ASSISTANT_MESSAGE else "user"
+            return identity_for(Message(role, (TextPart(raw_text),))), Message(role, (TextPart(raw_text),)), False, None
     raise ContextCompilationError("history entry does not carry a Message payload")
 
 

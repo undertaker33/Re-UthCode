@@ -343,7 +343,6 @@ def main(
             config_loader=loader,
             application_factory=factory,
         )
-        application.ensure_session()
         if tui_runner is None:
             result = _default_tui_runner(application)
         else:

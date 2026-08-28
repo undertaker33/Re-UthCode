@@ -53,6 +53,8 @@ from uthcode.core.context import ContextCompilationError
 from uthcode.core.interaction import (
     ASK_USER_TOOL_DEFINITION,
     PauseKind,
+    PermissionApprovalChoice,
+    PermissionApprovalResponse,
     PlanReviewChoice,
     PlanReviewResponse,
     RetryProviderResponse,
@@ -78,6 +80,7 @@ from uthcode.core.provider import (
     ProviderTimeoutError,
     ProviderIdentity,
     ProviderResponse,
+    ReasoningPart as ProviderReasoningPart,
     RateLimitError,
     ReasoningDelta as ProviderReasoningDelta,
     TextDelta,
@@ -90,8 +93,11 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.core.permission import (
+    Decision,
+    DecisionReason,
     Effect,
     PermissionAction,
+    PermissionDecision,
     PermissionEvaluator,
     PermissionMode,
     ResourceScope,
@@ -860,6 +866,62 @@ async def test_reasoning_tool_and_provider_events_preserve_authoritative_order()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parts",
+    [
+        (ProviderReasoningPart("only"),),
+        (TextPart(""),),
+        (ProviderReasoningPart("only"), TextPart("")),
+    ],
+)
+async def test_stop_requires_non_empty_formal_text_part(parts: tuple[object, ...]) -> None:
+    provider = ScriptedProvider([[_response(*parts)]])
+    execution = _start(_loop(provider))
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal
+    assert segment.result is not None
+    assert segment.result.termination_reason is TerminationReason.INVALID_PROVIDER_RESPONSE
+    assert execution.state.messages == (execution.state.messages[0],)
+    assert not any(isinstance(event, TurnCompleted) for event in segment.events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_stays_out_of_final_text_and_tool_progress_remains_legal() -> None:
+    tool = RecordingTool("read", output="tool-result")
+    call = ToolCallPart("call-reasoning", "read", {"value": "x"})
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ProviderReasoningPart("plan"),
+                    TextPart("progress"),
+                    call,
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(ProviderReasoningPart("final thought"), TextPart("answer"))],
+        ]
+    )
+
+    events, result, _ = await _drive(_start(_loop(provider, (tool,))))
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "answer"
+    completed = [event for event in events if isinstance(event, AssistantMessageCompleted)]
+    assert completed[0].message.parts == (
+        ProviderReasoningPart("plan"),
+        TextPart("progress"),
+    )
+    assert completed[-1].message.parts == (
+        ProviderReasoningPart("final thought"),
+        TextPart("answer"),
+    )
+    assert [event.final_text for event in events if isinstance(event, TurnCompleted)] == ["answer"]
+
+
+@pytest.mark.asyncio
 async def test_multiple_tools_are_fifo_and_never_parallel() -> None:
     first = RecordingTool("first", output="one", delay=0.01)
     second = RecordingTool("second", output="two", delay=0.01)
@@ -893,6 +955,102 @@ async def test_tool_errors_close_every_original_call_id_and_continue() -> None:
     assert all(part.is_error for part in provider.requests[1].messages[-1].parts)
     assert failing.started == ["three"]
     assert any(isinstance(event, ToolFinished) and event.status == "failed" for event in events)
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["AskUserQuestion", "TodoWrite", "ProposePlan", "Reveal"],
+)
+def test_tool_activity_summary_never_falls_back_to_tool_name(
+    tool_name: str,
+) -> None:
+    provider = ScriptedProvider([[_response(TextPart("unused"))]])
+    loop = _loop(provider)
+    loop._tool_call_describer = None
+    execution = _start(loop, ask=True)
+
+    command = execution._safe_command(  # type: ignore[attr-defined]
+        ToolCallPart("call-summary", tool_name, {}),
+        known=True,
+    )
+
+    assert tool_name not in command
+    assert command
+
+
+@pytest.mark.asyncio
+async def test_permission_denial_and_user_rejection_publish_denied_tool_status() -> None:
+    tool = PolicyTool("Write", Effect.WRITE, ToolPlanningAccess.READ_ONLY)
+
+    def permission(action: PermissionAction) -> PermissionDecision:
+        return PermissionDecision(
+            Decision.DENY,
+            DecisionReason.POLICY_MATCH,
+            action,
+            PermissionMode.DEFAULT,
+        )
+
+    provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart("deny-call", "Write", {"value": "x"}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(TextPart("done"))],
+        ]
+    )
+    loop = _loop(provider, (tool,))
+    loop._permission_resolver = permission
+    events, result, _ = await _drive(_start(loop))
+
+    denied = [event for event in events if isinstance(event, ToolFinished)]
+    assert result.final_text == "done"
+    assert [(event.status, event.is_error) for event in denied] == [("denied", True)]
+
+    def ask_permission(action: PermissionAction) -> PermissionDecision:
+        return PermissionDecision(
+            Decision.ASK,
+            DecisionReason.MODE_FALLBACK,
+            action,
+            PermissionMode.DEFAULT,
+        )
+
+    reject_provider = ScriptedProvider(
+        [
+            [
+                _response(
+                    ToolCallPart("reject-call", "Write", {"value": "x"}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                )
+            ],
+            [_response(TextPart("done"))],
+        ]
+    )
+    reject_loop = _loop(reject_provider, (tool,))
+    reject_loop._permission_resolver = ask_permission
+    execution = _start(reject_loop)
+    paused = await execution.run_segment(pause_signal=CancellationToken())
+    assert paused.paused and paused.continuation is not None
+    pause = paused.continuation.pending_pause
+    assert pause is not None and pause.permission_request is not None
+    resumed = await execution.run_segment(
+        pause_signal=CancellationToken(),
+        response=PermissionApprovalResponse(
+            pause.pause_id,
+            pause.run_id,
+            pause.turn_id,
+            pause.permission_request.permission_id,
+            PermissionApprovalChoice.REJECT,
+        ),
+    )
+
+    assert resumed.terminal and resumed.result is not None
+    all_events = paused.events + resumed.events
+    rejected = [event for event in all_events if isinstance(event, ToolFinished)]
+    assert resumed.result.final_text == "done"
+    assert [(event.status, event.is_error) for event in rejected] == [("denied", True)]
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from .sessions import (
     SessionActiveError,
     SessionCatalogEntry,
     SessionOperationError,
+    SessionReplayRecord,
 )
 from uthcode.core.context import ContextUsage
 from uthcode.core.interaction import (
@@ -157,6 +158,7 @@ __all__ = [
     "TranscriptAppendOutcome",
     "SessionCatalogEntry",
     "SessionOperationError",
+    "SessionReplayRecord",
     "AgentEvent",
     "AgentRun",
     "ArgumentSpec",

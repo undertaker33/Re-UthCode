@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +14,13 @@ from uthcode.core.history import (
     TranscriptEntry,
     TranscriptKind,
     TranscriptRef,
+)
+from uthcode.core.provider import (
+    Message,
+    ReasoningPart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
 )
 from uthcode.integrations.session_files import (
     TimelineAppendOutcome,
@@ -43,6 +50,95 @@ class SessionOperationError(RuntimeError):
         super().__init__(kind)
 
 
+_REPLAY_KINDS = frozenset({"user", "steering", "reasoning", "assistant", "tool"})
+_REPLAY_TOOL_STATUSES = frozenset(
+    {
+        "succeeded",
+        "success",
+        "failed",
+        "error",
+        "cancelled",
+        "unknown",
+        "denied",
+        "skipped",
+        "finished",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionReplayRecord:
+    """One durable, interface-neutral record safe for Session hydrate."""
+
+    session_id: str
+    sequence: int
+    turn_id: str
+    kind: str
+    text: str = ""
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    status: str | None = None
+    is_error: bool = False
+    created_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("replay session_id must be a non-empty string")
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int):
+            raise TypeError("replay sequence must be an integer")
+        if self.sequence < 1:
+            raise ValueError("replay sequence must be positive")
+        if not isinstance(self.turn_id, str) or not self.turn_id.strip():
+            raise ValueError("replay turn_id must be a non-empty string")
+        if not isinstance(self.kind, str) or self.kind not in _REPLAY_KINDS:
+            raise ValueError("unsupported replay record kind")
+        if not isinstance(self.text, str):
+            raise TypeError("replay text must be a string")
+        for value, field_name in (
+            (self.tool_name, "tool_name"),
+            (self.tool_call_id, "tool_call_id"),
+            (self.status, "status"),
+            (self.created_at, "created_at"),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"replay {field_name} must be a string or None")
+        if self.tool_name is not None and not self.tool_name.strip():
+            raise ValueError("replay tool_name must be non-empty when provided")
+        if self.tool_call_id is not None and not self.tool_call_id.strip():
+            raise ValueError("replay tool_call_id must be non-empty when provided")
+        if self.status is not None and self.status not in _REPLAY_TOOL_STATUSES:
+            raise ValueError("unsupported replay tool status")
+        if not isinstance(self.is_error, bool):
+            raise TypeError("replay is_error must be a boolean")
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize only the bounded replay contract, never raw parts."""
+
+        value: dict[str, object] = {
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "turn_id": self.turn_id,
+            "kind": self.kind,
+            "text": self.text,
+            "is_error": self.is_error,
+        }
+        for field_name in (
+            "tool_name",
+            "tool_call_id",
+            "status",
+            "created_at",
+        ):
+            field_value = getattr(self, field_name)
+            if field_value is not None:
+                value[field_name] = field_value
+        return value
+
+
+SessionReplayBuilder = Callable[
+    [SessionSnapshot], Iterable[SessionReplayRecord]
+]
+
+
 @dataclass(frozen=True, slots=True)
 class SessionCatalogEntry:
     """Application-owned, display-safe data for the independent TUI Picker."""
@@ -67,12 +163,18 @@ class _StagedSession:
 class ApplicationSession:
     """One lock-held Application Session at a durable semantic boundary."""
 
-    __slots__ = ("_service", "_writer", "_closed")
+    __slots__ = ("_service", "_writer", "_closed", "_replay")
 
-    def __init__(self, service: "ApplicationSessionService", writer: SessionWriter) -> None:
+    def __init__(
+        self,
+        service: "ApplicationSessionService",
+        writer: SessionWriter,
+        replay: Sequence[SessionReplayRecord] = (),
+    ) -> None:
         self._service = service
         self._writer = writer
         self._closed = False
+        self._replay = _normalize_replay(replay, writer.snapshot.session_id)
 
     def __enter__(self) -> "ApplicationSession":
         self._require_open()
@@ -110,6 +212,17 @@ class ApplicationSession:
     @property
     def instruction_state(self) -> InstructionStateMetadata:
         return InstructionStateMetadata.from_dict(self.metadata.instruction_state)
+
+    @property
+    def replay(self) -> tuple[SessionReplayRecord, ...]:
+        """Return the safe replay prepared at the last Session boundary."""
+
+        self._require_open()
+        return self._replay
+
+    def _set_replay(self, replay: Sequence[SessionReplayRecord]) -> None:
+        self._require_open()
+        self._replay = _normalize_replay(replay, self.session_id)
 
     @property
     def recovery_diagnostics(self) -> tuple[str, ...]:
@@ -323,12 +436,20 @@ class ApplicationSessionService:
             self._record_operation("create", "failed", session_id, kind="storage")
             raise SessionOperationError("storage", session_id=session_id) from exc
 
-    def resume_session(self, session_id: str) -> ApplicationSession:
+    def resume_session(
+        self,
+        session_id: str,
+        *,
+        replay_builder: SessionReplayBuilder | None = None,
+    ) -> ApplicationSession:
         self._require_no_active_session()
         # Use the same staged loader boundary as the command path.  A strict
         # include failure must not leave a previously active instruction
         # prefix installed on the Application while this target is rejected.
-        staged = self._stage_resume_session(session_id)
+        staged = self._stage_resume_session(
+            session_id,
+            replay_builder=replay_builder,
+        )
         session = self._commit_staged(staged)
         self._record_operation(
             "resume",
@@ -338,7 +459,12 @@ class ApplicationSessionService:
         )
         return session
 
-    def resume_session_for_command(self, session_id: str) -> ApplicationSession:
+    def resume_session_for_command(
+        self,
+        session_id: str,
+        *,
+        replay_builder: SessionReplayBuilder | None = None,
+    ) -> ApplicationSession:
         """Resume with a stable error category safe for Slash command output."""
 
         try:
@@ -348,9 +474,17 @@ class ApplicationSessionService:
                 # would require releasing the very lock that proves it is
                 # active, so rebuild a candidate loader under that existing
                 # lock and commit only after the filesystem read succeeds.
-                session = self._refresh_active_session_for_resume(active)
+                session = self._refresh_active_session_for_resume(
+                    active,
+                    replay_builder=replay_builder,
+                )
             else:
-                session = self._commit_staged(self._stage_resume_session(session_id))
+                session = self._commit_staged(
+                    self._stage_resume_session(
+                        session_id,
+                        replay_builder=replay_builder,
+                    )
+                )
             self._record_operation(
                 "resume",
                 "success",
@@ -410,6 +544,33 @@ class ApplicationSessionService:
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)
 
+    def project_replay(
+        self,
+        session_id: str,
+        *,
+        tool_summary: Callable[[ToolCallPart], str] | None = None,
+    ) -> tuple[SessionReplayRecord, ...]:
+        """Project one durable Session into safe records without opening it."""
+
+        return _project_replay(
+            self.read_session(session_id),
+            tool_summary=tool_summary,
+        )
+
+    def project_replay_snapshot(
+        self,
+        snapshot: SessionSnapshot,
+        *,
+        tool_summary: Callable[[ToolCallPart], str] | None = None,
+    ) -> tuple[SessionReplayRecord, ...]:
+        """Project an already loaded snapshot without storage or lifecycle I/O."""
+
+        if not isinstance(snapshot, SessionSnapshot):
+            raise TypeError("snapshot must be a SessionSnapshot")
+        if snapshot.project_key != self.project_key:
+            raise ValueError("snapshot belongs to another project")
+        return _project_replay(snapshot, tool_summary=tool_summary)
+
     def close(self) -> None:
         session = self._active
         if session is not None:
@@ -448,7 +609,12 @@ class ApplicationSessionService:
             raise
         return _StagedSession(ApplicationSession(self, writer), candidate_loader)
 
-    def _stage_resume_session(self, session_id: str) -> _StagedSession:
+    def _stage_resume_session(
+        self,
+        session_id: str,
+        *,
+        replay_builder: SessionReplayBuilder | None = None,
+    ) -> _StagedSession:
         """Lock and validate a target before touching the active Session."""
 
         writer = self.store.open_writer(
@@ -458,6 +624,17 @@ class ApplicationSessionService:
         candidate_loader: InstructionLoader | None = None
         try:
             writer.__enter__()
+            # Replay is a read-only projection of the loaded snapshot.  Build
+            # it before any target metadata touch so a projection failure can
+            # release the staged writer without mutating the active Session.
+            replay = (
+                _normalize_replay(
+                    replay_builder(writer.snapshot),
+                    writer.snapshot.session_id,
+                )
+                if replay_builder is not None
+                else ()
+            )
             if self.instruction_loader is not None:
                 candidate_loader = self.instruction_loader.fork_for_session()
                 state = InstructionStateMetadata.from_dict(
@@ -474,16 +651,30 @@ class ApplicationSessionService:
         except Exception:
             writer.close()
             raise
-        return _StagedSession(ApplicationSession(self, writer), candidate_loader)
+        return _StagedSession(
+            ApplicationSession(self, writer, replay),
+            candidate_loader,
+        )
 
     def _refresh_active_session_for_resume(
         self,
         active: ApplicationSession,
+        *,
+        replay_builder: SessionReplayBuilder | None = None,
     ) -> ApplicationSession:
         """Refresh an already-held target without releasing its writer lock."""
 
+        replay = (
+            _normalize_replay(
+                replay_builder(active._writer.snapshot),
+                active.session_id,
+            )
+            if replay_builder is not None
+            else active.replay
+        )
         if self.instruction_loader is None:
             active._writer.touch()
+            active._set_replay(replay)
             return active
         candidate_loader = self.instruction_loader.fork_for_session()
         state = InstructionStateMetadata.from_dict(
@@ -494,6 +685,7 @@ class ApplicationSessionService:
             candidate_loader.instruction_state.to_dict()
         )
         self.instruction_loader.adopt_session_state(candidate_loader)
+        active._set_replay(replay)
         return active
 
     def _commit_staged(self, staged: _StagedSession) -> ApplicationSession:
@@ -557,9 +749,170 @@ __all__ = [
     "TimelineAppendOutcome",
     "TranscriptAppendOutcome",
     "SessionCatalogEntry",
+    "SessionReplayRecord",
     "SessionActiveError",
     "SessionOperationError",
 ]
+
+
+def _normalize_replay(
+    replay: Iterable[SessionReplayRecord],
+    session_id: str,
+) -> tuple[SessionReplayRecord, ...]:
+    try:
+        records = tuple(replay)
+    except TypeError as exc:
+        raise TypeError("replay must be an iterable of SessionReplayRecord") from exc
+    previous_sequence = 0
+    for record in records:
+        if not isinstance(record, SessionReplayRecord):
+            raise TypeError("replay must contain SessionReplayRecord values")
+        if record.session_id != session_id:
+            raise ValueError("replay record belongs to another Session")
+        if record.sequence < previous_sequence:
+            raise ValueError("replay records must be ordered by durable sequence")
+        previous_sequence = record.sequence
+    return records
+
+
+def _entry_parts(entry: TranscriptEntry) -> tuple[object, ...]:
+    """Decode current part-local entries and the old full-message shape."""
+
+    payload = entry.payload
+    nested = payload.get("part")
+    if isinstance(nested, Mapping):
+        message = Message.from_dict(
+            {
+                "role": payload.get("role"),
+                "parts": (nested,),
+            }
+        )
+        return message.parts
+    # Session v3 kept one full Message under ``message`` while the current
+    # writer stores one typed part under ``part``.  The v3 reader deliberately
+    # remains read-only; replay must understand that shape without rewriting
+    # the durable transcript.
+    legacy_message = payload.get("message")
+    if isinstance(legacy_message, Mapping):
+        return Message.from_dict(legacy_message).parts
+    if isinstance(payload.get("parts"), Sequence):
+        return Message.from_dict(payload).parts
+    raise ValueError("Transcript entry has no typed Message part")
+
+
+def _bounded_replay_text(value: str, *, limit: int = 240) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _replay_tool_status(result: ToolResultPart) -> tuple[str, bool]:
+    value = result.metadata.get("execution_status")
+    status = value if isinstance(value, str) else None
+    if status not in _REPLAY_TOOL_STATUSES:
+        status = "failed" if result.is_error else "succeeded"
+    return status, result.is_error
+
+
+def _project_replay(
+    snapshot: SessionSnapshot,
+    *,
+    tool_summary: Callable[[ToolCallPart], str] | None = None,
+) -> tuple[SessionReplayRecord, ...]:
+    """Build a chronological, safe projection from complete semantic units."""
+
+    records: list[SessionReplayRecord] = []
+    calls: dict[str, tuple[str, str]] = {}
+    user_seen: set[str] = set()
+    legacy_message_ids: set[tuple[str, str, str]] = set()
+    for unit in snapshot.transcript.semantic_units(complete_only=True):
+        for entry in unit.entries:
+            # The pre-W02 writer emitted one full ``message`` envelope for
+            # each part.  Those entries share the logical message identity;
+            # project that envelope once while leaving current part-local
+            # entries untouched (they have no ``message`` key).
+            legacy_message = entry.payload.get("message")
+            legacy_message_id = entry.payload.get("message_id")
+            if isinstance(legacy_message, Mapping) and isinstance(
+                legacy_message_id, str
+            ) and legacy_message_id.strip():
+                identity = (
+                    entry.session_id,
+                    entry.turn_id,
+                    legacy_message_id,
+                )
+                if identity in legacy_message_ids:
+                    continue
+                legacy_message_ids.add(identity)
+            for part in _entry_parts(entry):
+                sequence = entry.sequence
+                if isinstance(part, ToolCallPart):
+                    summary = (
+                        tool_summary(part)
+                        if tool_summary is not None
+                        else f"{part.name} completed"
+                    )
+                    if not isinstance(summary, str):
+                        raise TypeError("tool replay summary must be a string")
+                    calls[part.tool_call_id] = (
+                        part.name,
+                        _bounded_replay_text(summary),
+                    )
+                    continue
+                if isinstance(part, ToolResultPart):
+                    name, summary = calls.pop(
+                        part.tool_call_id,
+                        ("Tool", "Tool completed"),
+                    )
+                    status, is_error = _replay_tool_status(part)
+                    records.append(
+                        SessionReplayRecord(
+                            session_id=snapshot.session_id,
+                            sequence=sequence,
+                            turn_id=entry.turn_id,
+                            kind="tool",
+                            text=summary,
+                            tool_name=name,
+                            tool_call_id=part.tool_call_id,
+                            status=status,
+                            is_error=is_error,
+                            created_at=entry.created_at,
+                        )
+                    )
+                    continue
+                if not isinstance(part, (TextPart, ReasoningPart)):
+                    continue
+                if entry.kind in (
+                    TranscriptKind.USER_MESSAGE,
+                    TranscriptKind.USER_STEERING,
+                ):
+                    if not isinstance(part, TextPart):
+                        continue
+                    kind = (
+                        "steering"
+                        if entry.kind is TranscriptKind.USER_STEERING
+                        or entry.turn_id in user_seen
+                        else "user"
+                    )
+                    user_seen.add(entry.turn_id)
+                elif isinstance(part, ReasoningPart):
+                    kind = "reasoning"
+                elif entry.kind is TranscriptKind.ASSISTANT_MESSAGE:
+                    kind = "assistant"
+                else:
+                    continue
+                records.append(
+                    SessionReplayRecord(
+                        session_id=snapshot.session_id,
+                        sequence=sequence,
+                        turn_id=entry.turn_id,
+                        kind=kind,
+                        text=part.text,
+                        created_at=entry.created_at,
+                    )
+                )
+    return _normalize_replay(records, snapshot.session_id)
 
 
 def _first_user_preview(snapshot: SessionSnapshot, *, limit: int = 160) -> str:

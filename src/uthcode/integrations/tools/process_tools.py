@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import locale
 import os
 import re
 import shlex
@@ -1962,8 +1963,8 @@ def _completed_result(
     stdout_bytes: bytes,
     stderr_bytes: bytes,
 ) -> ToolExecutionResult:
-    stdout = stdout_bytes.decode("utf-8", errors="replace").rstrip()
-    stderr = stderr_bytes.decode("utf-8", errors="replace").rstrip()
+    stdout = _decode_process_output(stdout_bytes).rstrip()
+    stderr = _decode_process_output(stderr_bytes).rstrip()
     sections: list[str] = []
     if stdout:
         sections.append(f"STDOUT:\n{stdout}")
@@ -1979,6 +1980,53 @@ def _completed_result(
         "\n\n".join(sections),
         is_error=returncode not in (None, 0),
     )
+
+
+def _decode_process_output(data: bytes) -> str:
+    """Decode captured process bytes using the current shell's known encodings."""
+
+    encodings = ["utf-8"]
+    if os.name == "nt":
+        encodings.extend(_windows_output_encodings())
+
+    seen: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return data.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    return data.decode("utf-8", errors="replace")
+
+
+def _windows_output_encodings() -> tuple[str, ...]:
+    """Return finite ANSI/OEM encodings reported by this Windows shell."""
+
+    encodings: list[str] = []
+    try:
+        kernel32 = ctypes.windll.kernel32
+        for function_name in ("GetConsoleOutputCP", "GetOEMCP", "GetACP"):
+            function = getattr(kernel32, function_name, None)
+            if function is None:
+                continue
+            function.restype = wintypes.UINT
+            code_page = int(function())
+            if code_page > 0:
+                encodings.append(f"cp{code_page}")
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    try:
+        system_encoding = locale.getencoding()
+    except (AttributeError, LookupError):
+        system_encoding = ""
+    if system_encoding:
+        encodings.append(system_encoding)
+    return tuple(encodings)
 
 
 def _text(arguments: Mapping[str, object], name: str) -> str:

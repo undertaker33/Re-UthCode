@@ -281,6 +281,36 @@ async def test_anthropic_public_stream_maps_text_usage_and_closes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_request_keeps_context_steering_duplicates_and_current_user_separate() -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    await _collect(
+        provider,
+        _request(
+            Message("user", (TextPart("[Context] runtime"),)),
+            Message("user", (TextPart("steering"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("duplicate"),)),
+            Message("user", (TextPart("？"),)),
+        ),
+    )
+
+    sent = client.calls[0]["messages"]
+    assert [message["content"][0]["text"] for message in sent] == [
+        "[Context] runtime",
+        "steering",
+        "duplicate",
+        "duplicate",
+        "？",
+    ]
+    assert sent[-1] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "？"}],
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_max_output", (8_192, 128))
 async def test_anthropic_async_limits_are_awaited_by_provider(
     provider_max_output: int,
@@ -534,6 +564,11 @@ async def test_anthropic_same_identity_replays_native_history_and_other_identity
         if message["role"] == "assistant"
     )
     assert all(block["type"] == "text" or block["type"] == "tool_use" for block in other_assistant["content"])
+    assert [
+        block["text"]
+        for block in other_assistant["content"]
+        if block["type"] == "text"
+    ] == ["answer"]
     assert not any(block["type"] == "redacted_thinking" for block in other_assistant["content"])
 
 

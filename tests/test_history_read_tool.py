@@ -95,7 +95,7 @@ async def test_history_read_reads_only_the_active_session_ref_in_bounded_pages()
         payload = json.loads(result.content)
         assert payload["schema_version"] == 1
         assert payload["ref"] == ref.to_token()
-        recovered.extend(entry["payload"]["message"]["parts"][0]["text"] for entry in payload["entries"])
+        recovered.extend(entry["payload"]["part"]["text"] for entry in payload["entries"])
         if payload["eof"]:
             assert payload["next_offset"] == payload["total_entries"]
             break

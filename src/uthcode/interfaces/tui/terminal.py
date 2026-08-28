@@ -28,6 +28,7 @@ class Palette:
     accent: str = "#FEA62B"
     user_background: str = "#242F38"
     input_background: str = "#1E1E1E"
+    reasoning_accent: str = "#78A9FF"
     plan_accent: str = "#78A9FF"
     plan_background: str = "#17233A"
     code_background: str = "#121212"
@@ -97,12 +98,34 @@ class RichTerminalRenderer:
         )
         return self._capture(panel) + "\n"
 
-    def user_message(self, text: str) -> str:
+    def user_message(self, text: str, *, role: str = "you") -> str:
         return self._role_block(
-            role="you",
+            role=role,
             content=Text(text, style=self.palette.text),
             background=self.palette.user_background,
             bar=self.palette.muted,
+        )
+
+    def reasoning_message(
+        self,
+        markdown: str,
+        *,
+        role: str = "UthCode · reasoning",
+        show_role: bool = True,
+        trailing_blank: bool = True,
+    ) -> str:
+        """Render typed reasoning with its own semantic bar colour."""
+
+        content = Markdown(
+            _protect_nested_markdown_fences(markdown),
+            code_theme=UthCodeCodeStyle,
+        )
+        return self._role_block(
+            role=role if show_role else "",
+            content=content,
+            background=None,
+            bar=self.palette.reasoning_accent,
+            trailing_blank=trailing_blank,
         )
 
     def agent_message(

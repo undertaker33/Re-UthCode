@@ -21,6 +21,7 @@ from uthcode.application import (
     BehaviorModeChanged,
     BehaviorModeSelected,
     CompletionBlocked,
+    EffectiveConfig,
     FailureReason,
     GenerationCompleted,
     GenerationRequest,
@@ -41,6 +42,8 @@ from uthcode.application import (
     QuestionKind,
     RetryProviderResponse,
     RunStatus,
+    SessionChanged,
+    SessionReplayRecord,
     TextDelta,
     TextPart,
     TaskItem,
@@ -52,10 +55,13 @@ from uthcode.application import (
     ToolResultPart,
     Usage,
     UthCodeApplication,
+    create_application,
     UserSteeringApplied,
     UserSteeringRequested,
     UserInputRequest,
     UserQuestion,
+    CommandOutcome,
+    OutcomeStatus,
     failure_message,
     pause_message,
 )
@@ -64,13 +70,25 @@ from uthcode.core.provider import (
     FinishReason,
     ModelLimits,
     NetworkError,
+    ReasoningDelta as ProviderReasoningDelta,
     ProviderEvent,
     RateLimitError,
 )
 from uthcode.core.agent import TerminationReason
-from uthcode.core.agent_events import TurnFailed
+from uthcode.core.agent_events import (
+    AssistantMessageCompleted,
+    AssistantMessageDelta,
+    AssistantMessageKind,
+    ReasoningDelta as AgentReasoningDelta,
+    ReasoningFinished,
+    ReasoningStarted,
+    ToolFinished,
+    ToolStarted,
+    TurnFailed,
+)
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.providers.fake import FakeProvider
+from uthcode.integrations.session_files import SessionFileStore
 from uthcode.interfaces.tui.app import (
     UthCodeTUI,
     _StreamProjection,
@@ -87,6 +105,7 @@ from uthcode.interfaces.tui.rendering import (
     MarkdownStream,
     PlanUpdate,
     RenderBatch,
+    RenderOperation,
     TextUpdate,
     TaskStateUpdate,
     ToolUpdate,
@@ -339,6 +358,13 @@ def _completed(
             finish_reason=finish_reason,
         )
     )
+
+
+def _latest_tool_message(request: GenerationRequest) -> Message:
+    for message in reversed(request.messages):
+        if message.role == "tool":
+            return message
+    raise AssertionError("request has no tool message")
 
 
 def _application(*events: object, delay: float = 0.0) -> UthCodeApplication:
@@ -673,6 +699,497 @@ def test_markdown_stream_commits_paragraphs_and_force_flushes_tail() -> None:
     assert stream.force() == "- one\n- two"
 
 
+def test_renderer_keeps_interleaved_reasoning_and_assistant_blocks_in_event_order() -> None:
+    now = [10.0]
+    renderer = AgentEventRenderer(interval_seconds=0.5, clock=lambda: now[0])
+    events = (
+        ReasoningStarted("run", "turn", "m1", 1, 1),
+        AgentReasoningDelta("run", "turn", "m1", 1, "R1"),
+        ReasoningFinished("run", "turn", "m1", 1, 1),
+        # A completed assistant message must be committed as one authority
+        # update, while a later reasoning segment remains a new block.
+        AssistantMessageDelta("run", "turn", "m1", 1, "A1"),
+        AssistantMessageCompleted(
+            "run", "turn", "m1", 1,
+            AssistantMessageKind.PROGRESS,
+            Message("assistant", (TextPart("A1"),)),
+        ),
+        ReasoningStarted("run", "turn", "m1", 1, 2),
+        AgentReasoningDelta("run", "turn", "m1", 1, "R2"),
+        ReasoningFinished("run", "turn", "m1", 1, 2),
+        AssistantMessageDelta("run", "turn", "m1", 1, "A2"),
+        AssistantMessageCompleted(
+            "run", "turn", "m1", 1,
+            AssistantMessageKind.FINAL,
+            Message("assistant", (TextPart("A2"),)),
+        ),
+    )
+
+    batches = []
+    for index, event in enumerate(events):
+        if index in {1, 3, 6, 8}:
+            now[0] += 1.0
+        batches.append(renderer.push(event))
+    batches.append(renderer.flush())
+    operations = [
+        operation
+        for batch in batches
+        if batch is not None
+        for operation in batch.operations
+    ]
+
+    assert [operation.kind for operation in operations] == [
+        "text", "text", "text", "text", "text", "text"
+    ]
+    updates = [
+        operation.value
+        for operation in operations
+        if operation.kind == "text"
+    ]
+    assert [(update.kind, update.text) for update in updates] == [
+        ("reasoning", "R1"),
+        ("assistant", "A1"),
+        ("assistant", "A1"),
+        ("reasoning", "R2"),
+        ("assistant", "A2"),
+        ("assistant", "A2"),
+    ]
+    assert [update.authoritative for update in updates] == [
+        False, False, True, False, False, True
+    ]
+
+
+def test_renderer_exposes_reasoning_and_formal_semantic_bar_colours() -> None:
+    renderer = RichTerminalRenderer(width=80)
+    reasoning = renderer.reasoning_message("思考")
+    formal = renderer.agent_message("回答")
+
+    assert PALETTE.reasoning_accent != PALETTE.success
+    assert f"38;2;{int(PALETTE.reasoning_accent[1:3], 16)};" in reasoning
+    assert f"38;2;{int(PALETTE.success[1:3], 16)};" in formal
+
+
+def test_reasoning_preview_uses_declared_prompt_toolkit_style() -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    tui._streams.append(
+        _StreamProjection(
+            MarkdownStream(pending="思考中"),
+            "reasoning",
+            block_id="reasoning-preview",
+        )
+    )
+
+    fragments = tui._preview_fragments()
+    style = tui._style()
+    reasoning_role = style.get_attrs_for_style_str("class:preview.reasoning.role")
+    formal_role = style.get_attrs_for_style_str("class:preview.role")
+    reasoning_body = style.get_attrs_for_style_str("class:preview.reasoning")
+
+    assert fragments[0] == (
+        "class:preview.reasoning.role",
+        "┃ UthCode · reasoning:\n",
+    )
+    assert fragments[1] == ("class:preview.reasoning", "思考中")
+    assert reasoning_role.color == PALETTE.reasoning_accent.lstrip("#")
+    assert formal_role.color == PALETTE.success.lstrip("#")
+    assert reasoning_role != formal_role
+    assert reasoning_body.color == PALETTE.text.lstrip("#")
+
+
+@pytest.mark.asyncio
+async def test_assistant_delta_is_preview_only_until_authoritative_completion() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(TextUpdate("m:assistant", "assistant", "preview"),),
+        )
+    )
+    assert tui._pending_text() == "preview"
+    assert "preview" not in output.getvalue()
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(
+                TextUpdate(
+                    "m:assistant",
+                    "assistant",
+                    "authoritative",
+                    mode="replace",
+                    authoritative=True,
+                ),
+            ),
+        )
+    )
+    rendered = output.getvalue()
+    assert tui._pending_text() == ""
+    assert rendered.count("UthCode:") == 1
+    assert "preview" not in rendered
+    assert "authoritative" in rendered
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tail_is_forced_before_formal_authority() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(TextUpdate("m:reasoning:1", "reasoning", "reasoning tail"),)
+        )
+    )
+    await tui._apply_batch(
+        RenderBatch(
+            text=(
+                TextUpdate(
+                    "m:assistant:1",
+                    "assistant",
+                    "formal answer",
+                    mode="replace",
+                    authoritative=True,
+                ),
+            )
+        )
+    )
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert plain.index("reasoning tail") < plain.index("formal answer")
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_forces_reasoning_but_keeps_assistant_preview() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(
+                TextUpdate("m:reasoning", "reasoning", "reasoning tail"),
+                TextUpdate("m:assistant", "assistant", "assistant preview"),
+            )
+        )
+    )
+    await tui._apply_batch(
+        RenderBatch(
+            tools=(ToolUpdate("call-1", "Bash", "dir", "finished"),),
+        )
+    )
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "reasoning tail" in plain
+    assert "finished" in plain and "Bash" in plain
+    assert "assistant preview" not in plain
+    assert tui._pending_text() == "assistant preview"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failed", "cancelled"])
+async def test_failed_or_cancelled_terminal_discards_assistant_preview(
+    terminal: str,
+) -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(
+                TextUpdate("m:reasoning", "reasoning", "reasoning tail"),
+                TextUpdate("m:assistant", "assistant", "assistant preview"),
+            )
+        )
+    )
+    await tui._apply_batch(
+        RenderBatch(
+            terminal=terminal,
+            terminal_message="provider failed" if terminal == "failed" else None,
+        )
+    )
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "reasoning tail" in plain
+    assert "assistant preview" not in plain
+    assert tui._pending_text() == ""
+    assert "UthCode:" not in plain
+
+
+@pytest.mark.asyncio
+async def test_completed_terminal_commits_final_once_after_tool_boundary() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+
+    await tui._apply_batch(
+        RenderBatch(
+            text=(TextUpdate("m:assistant", "assistant", "preview"),),
+            tools=(ToolUpdate("call-1", "Bash", "dir", "finished"),),
+        )
+    )
+    await tui._apply_batch(
+        RenderBatch(
+            terminal="completed",
+            final_text="authoritative final",
+        )
+    )
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "preview" not in plain
+    assert plain.count("UthCode:") == 1
+    assert plain.count("authoritative final") == 1
+
+
+@pytest.mark.asyncio
+async def test_real_stream_keeps_reasoning_before_one_formal_permanent_block() -> None:
+    provider = _ScriptedProvider(
+        ((
+            ProviderReasoningDelta("先思考"),
+            TextDelta("正式回复"),
+            _completed("正式回复"),
+        ),),
+        delay=0.21,
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    output = RecordingOutput()
+    tui = UthCodeTUI(application, terminal_output=output)
+    tui._start_turn("hello")
+    task = tui._generation_task
+    assert task is not None
+    await task
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert plain.index("先思考") < plain.index("正式回复")
+    assert plain.count("UthCode · reasoning") == 1
+    assert plain.count("UthCode:") == 1
+
+
+@pytest.mark.asyncio
+async def test_real_consumer_keeps_delayed_assistant_delta_in_preview_until_final() -> None:
+    provider = _ScriptedProvider(
+        ((TextDelta("draft"), _completed("final")),),
+        delay=0.21,
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    output = RecordingOutput()
+    tui = UthCodeTUI(application, terminal_output=output)
+    tui._start_turn("hello")
+    task = tui._generation_task
+    assert task is not None
+
+    await _wait_until(lambda: tui._pending_text() == "draft", attempts=200)
+    assert "draft" not in output.getvalue()
+    await task
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "draft" not in plain
+    assert plain.count("UthCode:") == 1
+    assert plain.count("final") == 1
+
+
+@pytest.mark.asyncio
+async def test_real_consumer_cancellation_discards_assistant_draft() -> None:
+    provider = _ScriptedProvider(
+        ((TextDelta("cancel draft"), _completed("never shown")),),
+        delay=0.21,
+    )
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    output = RecordingOutput()
+    tui = UthCodeTUI(application, terminal_output=output)
+    tui._start_turn("hello")
+    task = tui._generation_task
+    assert task is not None
+
+    await _wait_until(lambda: tui._pending_text() == "cancel draft", attempts=200)
+    task.cancel()
+    await task
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "cancel draft" not in plain
+    assert "never shown" not in plain
+    assert tui._pending_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_real_consumer_failure_discards_assistant_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ScriptedProvider(
+        ((TextDelta("failed draft"), _completed("never shown")),),
+        delay=0.21,
+    )
+    original_push = AgentEventRenderer.push
+
+    def fail_on_authority(
+        renderer: AgentEventRenderer,
+        event: AgentEvent,
+    ) -> RenderBatch | None:
+        if event.event_type == "assistant_message_completed":
+            raise RuntimeError("consumer projection failed")
+        return original_push(renderer, event)
+
+    monkeypatch.setattr(AgentEventRenderer, "push", fail_on_authority)
+    application = UthCodeApplication(
+        provider,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=Path("C:/workspace"),
+            platform_name="TestOS",
+            platform_release="1.0",
+            current_date="2026-08-06",
+        ),
+    )
+    output = RecordingOutput()
+    tui = UthCodeTUI(application, terminal_output=output)
+    tui._start_turn("hello")
+    task = tui._generation_task
+    assert task is not None
+    await task
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "failed draft" not in plain
+    assert tui._pending_text() == ""
+    assert tui.activity == "error"
+
+
+@pytest.mark.asyncio
+async def test_resume_hydrate_is_ordered_bounded_and_does_not_enter_live_stream() -> None:
+    output = RecordingOutput()
+    tui = UthCodeTUI(_application(), terminal_output=output)
+    records = tuple(
+        SessionReplayRecord(
+            "resume-1", index, "turn-1", kind, text=text,
+            tool_name="Bash" if kind == "tool" else None,
+            tool_call_id=f"call-{index}" if kind == "tool" else None,
+            status="finished" if kind == "tool" else None,
+        )
+        for index, (kind, text) in enumerate(
+            (("user", "你好"), ("reasoning", "先想"),
+             ("assistant", "回答"), ("tool", "dir")),
+            start=1,
+        )
+    )
+    emits: list[str] = []
+    yields = 0
+
+    async def capture(value: str) -> None:
+        emits.append(value)
+
+    async def record_yield() -> None:
+        nonlocal yields
+        yields += 1
+
+    tui._emit = capture  # type: ignore[method-assign]
+    tui._yield_replay = record_yield  # type: ignore[method-assign]
+    await tui._apply_command_outcome(
+        "/resume resume-1",
+        CommandOutcome(
+            OutcomeStatus.SUCCESS,
+            ui_action=SessionChanged("resume-1", restored=True, replay=records),
+        ),
+    )
+
+    plain = Text.from_ansi("".join(emits)).plain
+    assert plain.index("你好") < plain.index("先想") < plain.index("回答") < plain.index("Bash")
+    assert plain.count("你好") == 1
+    assert plain.count("先想") == 1
+    assert plain.count("回答") == 1
+    assert plain.count("dir") == 1
+    assert not tui._streams
+    assert yields == 0  # one batch is not required to yield
+
+
+@pytest.mark.asyncio
+async def test_resume_hydrate_yields_between_bounded_batches() -> None:
+    tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
+    records = tuple(
+        SessionReplayRecord("resume-2", index, "turn-1", "user", f"line-{index}")
+        for index in range(1, 66)
+    )
+    emits: list[str] = []
+    yields = 0
+
+    async def capture(value: str) -> None:
+        emits.append(value)
+
+    async def record_yield() -> None:
+        nonlocal yields
+        yields += 1
+
+    tui._emit = capture  # type: ignore[method-assign]
+    tui._yield_replay = record_yield  # type: ignore[method-assign]
+    await tui._hydrate_replay(records)
+
+    assert len(emits) == 3
+    assert yields == 2
+    assert "line-1" in emits[0]
+    assert "line-33" in emits[1]
+    assert "line-65" in emits[2]
+
+
+@pytest.mark.asyncio
+async def test_tui_startup_is_lazy_and_first_input_ensures_session() -> None:
+    application = _application()
+    calls: list[str] = []
+    original_ensure = application.ensure_session
+
+    def record_ensure():  # type: ignore[no-untyped-def]
+        calls.append("ensure")
+        return original_ensure()
+
+    application.ensure_session = record_ensure  # type: ignore[method-assign]
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    assert calls == []
+    await tui._show_startup()
+    assert calls == []
+    tui._start_turn("first input")
+    assert calls == ["ensure"]
+    await tui.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tui_cold_start_help_status_picker_and_exit_do_not_create_session(
+    tmp_path: Path,
+) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    provider = FakeProvider(events=(_completed("unused"),), model_limits=TEST_LIMITS)
+    application = create_application(
+        EffectiveConfig.single_model("fake/model", context_window=1_000_000),
+        provider_builder=lambda _profile, _model: provider,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=tmp_path),
+        session_store=store,
+    )
+    tui, pipe_state, task, _output = await _start_tui(application)
+    try:
+        assert application.list_sessions() == ()
+        await tui._handle_submission("/help")
+        await tui._handle_submission("/status")
+        await tui._handle_submission("/resume")
+        assert application.list_sessions() == ()
+    finally:
+        await _stop_tui(tui, pipe_state, task)
+    assert application.list_sessions() == ()
+
+
 def test_t08_events_project_plan_task_mode_steering_and_completion_control() -> None:
     renderer = AgentEventRenderer(clock=lambda: 10.0)
     plan = renderer.push(
@@ -832,6 +1349,41 @@ def test_tool_rows_keep_status_text_and_semantic_colour() -> None:
     assert "\x1b[38;2;154;154;154m┃" in success
     assert "\x1b[38;2;154;154;154m┃" in failure
     assert success.endswith("\n\n") and failure.endswith("\n\n")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command", "status"),
+    [
+        ("AskUserQuestion", "<user input required>", "finished"),
+        ("TodoWrite", "<task state update>", "finished"),
+        ("ProposePlan", "<plan review required>", "finished"),
+        ("Reveal", "<tool summary unavailable>", "denied"),
+    ],
+)
+def test_tui_consumes_real_tool_events_without_repeating_tool_name(
+    tool_name: str,
+    command: str,
+    status: str,
+) -> None:
+    renderer = AgentEventRenderer(clock=lambda: 10.0)
+    events = (
+        ToolStarted("run", "turn", 1, "batch", "call", tool_name, command),
+        ToolFinished("run", "turn", 1, "batch", "call", tool_name, command, status, status == "denied"),
+    )
+
+    batches = [renderer.push(event) for event in events]
+    updates = [batch.tools[0] for batch in batches if batch is not None]
+
+    assert [(update.tool_name, update.command, update.status) for update in updates] == [
+        (tool_name, command, "running"),
+        (tool_name, command, status),
+    ]
+    rendered = RichTerminalRenderer(width=80).tool(
+        status=updates[-1].status,
+        name=updates[-1].tool_name,
+        command=updates[-1].command,
+    )
+    assert Text.from_ansi(rendered).plain.count(tool_name) == 1
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows console event")
@@ -1267,6 +1819,8 @@ async def test_one_event_batch_uses_one_permanent_terminal_commit() -> None:
                     "assistant",
                     "assistant",
                     "第一段。\n\n第二段。",
+                    mode="replace",
+                    authoritative=True,
                 ),
             ),
             tools=(ToolUpdate("tool", "Bash", "dir", "finished"),),
@@ -1509,7 +2063,7 @@ async def test_tui_pause_resume_and_ask_user_pilot(
         assert len(started_handles) == 1
         assert len(provider.requests) == 3
         assert "已完成" in output.getvalue()
-        assert provider.requests[2].messages[-1].parts == (
+        assert _latest_tool_message(provider.requests[2]).parts == (
             ToolResultPart("ask-1", '{"answers": {"q1": ["答案"]}}'),
         )
         assert not tui._background_tasks
@@ -1895,7 +2449,7 @@ async def test_tui_pause_question_panel_submits_through_application_turn() -> No
         assert len(provider.requests) == 2
         assert any(
             "答案" in getattr(part, "content", "")
-            for part in provider.requests[1].messages[-1].parts
+            for part in _latest_tool_message(provider.requests[1]).parts
         )
     finally:
         await _stop_tui(tui, pipe_state, task)
@@ -2002,10 +2556,10 @@ async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
         response = resume_calls[0]
         assert type(response).__name__ == "UserInputResponse"
         assert response.answers["mode"] == ["fast"]  # type: ignore[union-attr]
-        assert provider.requests[1].messages[-1].parts == (
+        assert _latest_tool_message(provider.requests[1]).parts == (
             ToolResultPart("ask-other", '{"answers": {"mode": ["fast"]}}'),
         )
-        assert "custom-owner" not in provider.requests[1].messages[-1].parts[0].content
+        assert "custom-owner" not in _latest_tool_message(provider.requests[1]).parts[0].content
     finally:
         await _stop_tui(tui, pipe_state, task)
 
@@ -2371,10 +2925,11 @@ def test_transient_height_budget_fits_small_terminal() -> None:
         + 1
         <= 5
     )
-    tui._streams["pending"] = _StreamProjection(
+    tui._streams.append(_StreamProjection(
         MarkdownStream(pending="still generating"),
         "assistant",
-    )
+        block_id="pending",
+    ))
     tui._terminal_size = lambda: (40, 3)  # type: ignore[method-assign]
     assert tui._preview_height() == 0
     assert not tui._has_preview()
@@ -2439,10 +2994,11 @@ async def test_clear_keeps_scrollback_and_run_but_resets_projection() -> None:
     output = RecordingOutput()
     tui = UthCodeTUI(_application(), terminal_output=output)
     run = tui._run
-    tui._streams["x"] = _StreamProjection(
+    tui._streams.append(_StreamProjection(
         MarkdownStream(pending="preview"),
         "assistant",
-    )
+        block_id="x",
+    ))
     await tui._clear_viewport()
     assert tui._run is run
     assert not tui._streams
@@ -2454,15 +3010,16 @@ async def test_clear_keeps_scrollback_and_run_but_resets_projection() -> None:
 @pytest.mark.asyncio
 async def test_each_turn_discards_previous_transient_stream_projection() -> None:
     tui = UthCodeTUI(_application(), terminal_output=RecordingOutput())
-    tui._streams["old-turn"] = _StreamProjection(
+    tui._streams.append(_StreamProjection(
         MarkdownStream(pending="stale preview"),
         "assistant",
+        block_id="old-turn",
         started=True,
         open=True,
-    )
+    ))
 
     tui._start_turn("new turn")
-    assert "old-turn" not in tui._streams
+    assert all(projection.block_id != "old-turn" for projection in tui._streams)
     assert tui._generation_task is not None
     await tui._generation_task
 
@@ -2511,9 +3068,8 @@ async def test_final_answer_renders_once_instead_of_one_role_block_per_paragraph
         )
     )
     partial = output.getvalue()
-    assert partial.count("UthCode:") == 1
-    assert "第一段" in partial and "第二段" in partial
-    assert "项目二" not in partial
+    assert partial.count("UthCode:") == 0
+    assert "第一段" not in partial
     await tui._apply_batch(
         RenderBatch(
             terminal="completed",

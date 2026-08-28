@@ -44,8 +44,9 @@ from uthcode.core.provider import (
     ToolCallPart,
     ToolDefinition,
 )
+from uthcode.core.agent_events import ToolFinished, ToolStarted
 from uthcode.core.tool import ToolExecutionResult
-from uthcode.interfaces.cli import main
+from uthcode.interfaces.cli import _tool_diagnostic, main
 from uthcode.integrations.providers.fake import FakeProvider
 
 
@@ -88,6 +89,21 @@ def _application(
             model_limits=TEST_LIMITS,
         )
     )
+
+
+def _latest_non_context_user_text(request: GenerationRequest) -> str:
+    for message in reversed(request.messages):
+        if message.role != "user":
+            continue
+        if message.parts and all(
+            isinstance(part, TextPart) and part.text.startswith("[Context]\n")
+            for part in message.parts
+        ):
+            continue
+        return "\n".join(
+            part.text for part in message.parts if isinstance(part, TextPart)
+        )
+    return ""
 
 
 class _ScriptedProvider(FakeProvider):
@@ -196,6 +212,14 @@ def _injected_main(
 def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> None:
     application = _application()
     seen: list[UthCodeApplication] = []
+    ensure_calls: list[str] = []
+    original_ensure = application.ensure_session
+
+    def record_ensure():
+        ensure_calls.append("ensure")
+        return original_ensure()
+
+    application.ensure_session = record_ensure  # type: ignore[method-assign]
 
     result = main(
         [],
@@ -208,6 +232,7 @@ def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> N
 
     assert result == 17
     assert seen == [application]
+    assert ensure_calls == []
 
 
 def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
@@ -219,7 +244,7 @@ def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
     assert stdout == "ignored\n"
     assert stderr == ""
     request = application.provider.recorded_requests[0]
-    assert request.messages[0].parts[-1].text == "hello"
+    assert _latest_non_context_user_text(request) == "hello"
 
 
 def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
@@ -234,7 +259,7 @@ def test_exec_reads_stdin_and_keeps_slash_prompt_as_plain_text() -> None:
     assert result == 0
     assert stdout == "fake response\n"
     assert stderr == ""
-    assert application.provider.recorded_requests[0].messages[0].parts[-1].text == "/help"
+    assert _latest_non_context_user_text(application.provider.recorded_requests[0]) == "/help"
 
 
 def test_exec_rejects_empty_prompt_without_creating_a_request() -> None:
@@ -338,12 +363,39 @@ def test_exec_cancels_permission_pause_without_auto_approval_or_secret_leak(
     assert result == 1
     assert stdout == ""
     assert "working" in stderr
-    assert "tool running: Reveal (Reveal)" in stderr
-    assert "tool cancelled: Reveal (Reveal)" in stderr
+    assert "tool running: Reveal (<arguments hidden>)" in stderr
+    assert "tool cancelled: Reveal (<arguments hidden>)" in stderr
     assert "permission approval required" in stderr
     assert secret not in stdout + stderr
     assert "ToolResult" not in stdout + stderr
     assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command"),
+    [
+        ("AskUserQuestion", "<user input required>"),
+        ("TodoWrite", "<task state update>"),
+        ("ProposePlan", "<plan review required>"),
+        ("Reveal", "<tool summary unavailable>"),
+    ],
+)
+def test_cli_composes_real_tool_events_without_repeating_tool_name(
+    tool_name: str,
+    command: str,
+) -> None:
+    events = (
+        ToolStarted("run", "turn", 1, "batch", "call", tool_name, command),
+        ToolFinished("run", "turn", 1, "batch", "call", tool_name, command, "finished", False),
+    )
+
+    diagnostics = [_tool_diagnostic(event) for event in events]
+
+    assert diagnostics == [
+        f"tool running: {tool_name} ({command})",
+        f"tool finished: {tool_name} ({command})",
+    ]
+    assert all(diagnostic.count(tool_name) == 1 for diagnostic in diagnostics)
 
 
 def test_exec_cancels_turn_when_agent_pauses(
