@@ -26,12 +26,12 @@
 
 ## T04：Session 安全回放与惰性生命周期
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_w04_session_commands.py tests/test_application.py tests/test_cli.py tests/test_session_files.py -q`，全部通过。
-- [ ] Application replay DTO 按 durable sequence 完整包含 user、steering、reasoning、formal assistant 和 safe Tool terminal，且不包含 raw ToolResult、native payload、secret 或 pending state。
-- [ ] replay projection 不调用 Provider、不创建 Turn、不追加 Transcript；busy/corrupt/unknown/storage failure 保持当前 Session、锁和 replay 不变。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_w04_session_commands.py tests/test_application.py tests/test_cli.py tests/test_session_files.py -q`，全部通过。
+- [x] Application replay DTO 按 durable sequence 完整包含 user、steering、reasoning、formal assistant 和 safe Tool terminal，且不包含 raw ToolResult、native payload、secret 或 pending state。
+- [x] replay projection 不调用 Provider、不创建 Turn、不追加 Transcript；busy/corrupt/unknown/storage failure 保持当前 Session、锁和 replay 不变。
 - [ ] TUI 冷启动后立即退出、只执行 help/status、打开并关闭 Session Picker 均不新增 Session ID。
-- [ ] 第一条普通输入恰好创建一个 Session；第一条 `/resume <id>` 不创建 throwaway Session；第一条 `/new` 只创建一个 Session；`exec <prompt>` 正常持久化。
-- [ ] lazy ensure 失败时无永久 user record、无 Provider call、Run 保持 idle，关闭无 active Session 安全。
+- [x] 第一条普通输入恰好创建一个 Session；第一条 `/resume <id>` 不创建 throwaway Session；第一条 `/new` 只创建一个 Session；`exec <prompt>` 正常持久化。
+- [x] lazy ensure 失败时无永久 user record、无 Provider call、Run 保持 idle，关闭无 active Session 安全。
 
 ## T05：Windows 进程输出解码
 

@@ -23,6 +23,7 @@ from .models import (
     PermissionModeSelected,
     QuitInterface,
     SessionChanged,
+    SessionReplayRecord,
     UiAction,
 )
 from .parser import CommandParser, parse_command
@@ -54,6 +55,7 @@ __all__ = [
     "PermissionModeSelected",
     "QuitInterface",
     "SessionChanged",
+    "SessionReplayRecord",
     "UiAction",
     "complete_commands",
     "create_builtin_registry",

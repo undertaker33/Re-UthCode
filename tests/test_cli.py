@@ -211,6 +211,14 @@ def _injected_main(
 def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> None:
     application = _application()
     seen: list[UthCodeApplication] = []
+    ensure_calls: list[str] = []
+    original_ensure = application.ensure_session
+
+    def record_ensure():
+        ensure_calls.append("ensure")
+        return original_ensure()
+
+    application.ensure_session = record_ensure  # type: ignore[method-assign]
 
     result = main(
         [],
@@ -223,6 +231,7 @@ def test_default_cli_passes_one_formal_application_to_injected_tui_runner() -> N
 
     assert result == 17
     assert seen == [application]
+    assert ensure_calls == []
 
 
 def test_exec_position_prompt_streams_text_and_finishes_with_newline() -> None:
