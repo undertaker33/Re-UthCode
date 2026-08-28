@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-27
+snapshot_date: 2026-08-28
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + tests/
@@ -51,8 +51,8 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-27
-status_scope: docs/work/TXX-* + docs/work/archive/
+status_snapshot: 2026-08-28
+status_scope: docs/work/*XX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
   implemented_unarchived: 当前源码已有实现，Checklist 全部完成且 Feedback 已记录，但目录仍在 docs/work/
@@ -89,6 +89,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
+| F01 | TUI 回复链路与 Session 恢复修复 | `docs/work/F01-TUI回复链路与Session恢复修复/` | 已完成问题探索与 D-F01-01～04 用户决策，正式 Spec、Tasks、Checklist、W01～W06 Prompt 已生成；尚未派发任何 Worker，生产代码未实施 |
 
 ## 跨层最短链路
 
