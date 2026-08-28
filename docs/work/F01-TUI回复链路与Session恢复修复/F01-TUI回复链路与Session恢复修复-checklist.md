@@ -35,20 +35,20 @@
 
 ## T05：Windows 进程输出解码
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_builtin_process_tool.py -q`，全部通过。
-- [ ] UTF-8 中文 stdout/stderr、Windows OEM/ANSI 中文 stdout/stderr、非法混合 bytes、空输出和非零退出均有测试。
-- [ ] Windows 正式 Bash 入口执行包含中文文件名的目录命令，结果不含 Unicode replacement character（`U+FFFD`）或 mojibake，exit code 正确。
-- [ ] timeout、cancel、output limit、unsandboxed process execution 与现有 shell 选择语义不变。
-- [ ] `rg -n "chardet|charset_normalizer|EncodingManager|EncodingRegistry" src tests` 不存在新编码猜测依赖或框架。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_builtin_process_tool.py -q`，全部通过。
+- [x] UTF-8 中文 stdout/stderr、Windows OEM/ANSI 中文 stdout/stderr、非法混合 bytes、空输出和非零退出均有测试。
+- [x] Windows 正式 Bash 入口执行包含中文文件名的目录命令，结果不含 Unicode replacement character（`U+FFFD`）或 mojibake，exit code 正确。
+- [x] timeout、cancel、output limit、unsandboxed process execution 与现有 shell 选择语义不变。
+- [x] `rg -n "chardet|charset_normalizer|EncodingManager|EncodingRegistry" src tests` 不存在新编码猜测依赖或框架。
 
 ## T06：Tool 活动摘要与 FIFO 展示合同
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_tools.py tests/test_application_runs.py tests/test_agent_loop.py -q`，全部通过。
-- [ ] Bash、ReadFile、WriteFile、EditFile、Glob、Grep、ToolResultRead、HistoryRead 的 name+summary 组合中 Tool 名均只出现一次。
-- [ ] 至少两个 ToolCall 的同 batch 中，每个 ToolFinished 恰好一次且顺序与 call FIFO 相同；success/error/denied/cancelled/skipped 有文字状态。
-- [ ] ToolStarted 只更新 transient activity，ToolFinished 才产生 permanent record；快速 Tool 不重复输出。
-- [ ] 配置 secret、敏感 assignment/option、裸 key、Authorization/Bearer、`q7z`、`qz`、`q` ambient 值均脱敏，`0/1` 普通数字命令保持可读。
-- [ ] Write/Edit content、Grep pattern、unknown/custom arguments 和 ToolResult 正文不进入事件、摘要或 replay。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_tools.py tests/test_application_runs.py tests/test_agent_loop.py -q`，全部通过。
+- [x] Bash、ReadFile、WriteFile、EditFile、Glob、Grep、ToolResultRead、HistoryRead 的 name+summary 组合中 Tool 名均只出现一次。
+- [x] 至少两个 ToolCall 的同 batch 中，每个 ToolFinished 恰好一次且顺序与 call FIFO 相同；success/error/denied/cancelled/skipped 有文字状态。
+- [x] ToolStarted 只更新 transient activity，ToolFinished 才产生 permanent record；快速 Tool 不重复输出。
+- [x] 配置 secret、敏感 assignment/option、裸 key、Authorization/Bearer、`q7z`、`qz`、`q` ambient 值均脱敏，`0/1` 普通数字命令保持可读。
+- [x] Write/Edit content、Grep pattern、unknown/custom arguments 和 ToolResult 正文不进入事件、摘要或 replay。
 
 ## T07：TUI 时序化流式投影与 reasoning 视觉
 

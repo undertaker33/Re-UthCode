@@ -44,8 +44,9 @@ from uthcode.core.provider import (
     ToolCallPart,
     ToolDefinition,
 )
+from uthcode.core.agent_events import ToolFinished, ToolStarted
 from uthcode.core.tool import ToolExecutionResult
-from uthcode.interfaces.cli import main
+from uthcode.interfaces.cli import _tool_diagnostic, main
 from uthcode.integrations.providers.fake import FakeProvider
 
 
@@ -362,12 +363,39 @@ def test_exec_cancels_permission_pause_without_auto_approval_or_secret_leak(
     assert result == 1
     assert stdout == ""
     assert "working" in stderr
-    assert "tool running: Reveal (Reveal)" in stderr
-    assert "tool cancelled: Reveal (Reveal)" in stderr
+    assert "tool running: Reveal (<arguments hidden>)" in stderr
+    assert "tool cancelled: Reveal (<arguments hidden>)" in stderr
     assert "permission approval required" in stderr
     assert secret not in stdout + stderr
     assert "ToolResult" not in stdout + stderr
     assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command"),
+    [
+        ("AskUserQuestion", "<user input required>"),
+        ("TodoWrite", "<task state update>"),
+        ("ProposePlan", "<plan review required>"),
+        ("Reveal", "<tool summary unavailable>"),
+    ],
+)
+def test_cli_composes_real_tool_events_without_repeating_tool_name(
+    tool_name: str,
+    command: str,
+) -> None:
+    events = (
+        ToolStarted("run", "turn", 1, "batch", "call", tool_name, command),
+        ToolFinished("run", "turn", 1, "batch", "call", tool_name, command, "finished", False),
+    )
+
+    diagnostics = [_tool_diagnostic(event) for event in events]
+
+    assert diagnostics == [
+        f"tool running: {tool_name} ({command})",
+        f"tool finished: {tool_name} ({command})",
+    ]
+    assert all(diagnostic.count(tool_name) == 1 for diagnostic in diagnostics)
 
 
 def test_exec_cancels_turn_when_agent_pauses(

@@ -68,7 +68,7 @@ from uthcode.core.provider import (
     RateLimitError,
 )
 from uthcode.core.agent import TerminationReason
-from uthcode.core.agent_events import TurnFailed
+from uthcode.core.agent_events import ToolFinished, ToolStarted, TurnFailed
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.interfaces.tui.app import (
@@ -839,6 +839,41 @@ def test_tool_rows_keep_status_text_and_semantic_colour() -> None:
     assert "\x1b[38;2;154;154;154m┃" in success
     assert "\x1b[38;2;154;154;154m┃" in failure
     assert success.endswith("\n\n") and failure.endswith("\n\n")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command", "status"),
+    [
+        ("AskUserQuestion", "<user input required>", "finished"),
+        ("TodoWrite", "<task state update>", "finished"),
+        ("ProposePlan", "<plan review required>", "finished"),
+        ("Reveal", "<tool summary unavailable>", "denied"),
+    ],
+)
+def test_tui_consumes_real_tool_events_without_repeating_tool_name(
+    tool_name: str,
+    command: str,
+    status: str,
+) -> None:
+    renderer = AgentEventRenderer(clock=lambda: 10.0)
+    events = (
+        ToolStarted("run", "turn", 1, "batch", "call", tool_name, command),
+        ToolFinished("run", "turn", 1, "batch", "call", tool_name, command, status, status == "denied"),
+    )
+
+    batches = [renderer.push(event) for event in events]
+    updates = [batch.tools[0] for batch in batches if batch is not None]
+
+    assert [(update.tool_name, update.command, update.status) for update in updates] == [
+        (tool_name, command, "running"),
+        (tool_name, command, status),
+    ]
+    rendered = RichTerminalRenderer(width=80).tool(
+        status=updates[-1].status,
+        name=updates[-1].tool_name,
+        command=updates[-1].command,
+    )
+    assert Text.from_ansi(rendered).plain.count(tool_name) == 1
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows console event")

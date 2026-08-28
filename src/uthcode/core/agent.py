@@ -2009,14 +2009,14 @@ class AgentTurnExecution:
     def _safe_command(self, call: ToolCallPart, *, known: bool) -> str:
         if not known:
             return "<unknown tool>"
-        if call.name in {
-            ASK_USER_TOOL_DEFINITION.name,
-            TODO_WRITE_TOOL_DEFINITION.name,
-            PROPOSE_PLAN_TOOL_DEFINITION.name,
-        }:
-            command = call.name
+        if call.name == ASK_USER_TOOL_DEFINITION.name:
+            command = "<user input required>"
+        elif call.name == TODO_WRITE_TOOL_DEFINITION.name:
+            command = "<task state update>"
+        elif call.name == PROPOSE_PLAN_TOOL_DEFINITION.name:
+            command = "<plan review required>"
         elif self._loop._tool_call_describer is None:
-            command = call.name
+            command = "<tool summary unavailable>"
         else:
             try:
                 command = self._loop._tool_call_describer(call)
@@ -2423,7 +2423,7 @@ class AgentTurnExecution:
                     elif choice is PermissionApprovalChoice.REJECT:
                         result = _controlled_tool_result(call, "Error: permission rejected")
                         controlled = True
-                        status = "failed"
+                        status = "denied"
                     else:
                         result, controlled, status = await self._execute_prepared(resumed_prepared)
                         if (
@@ -2496,7 +2496,7 @@ class AgentTurnExecution:
                                         "Error: permission denied",
                                     )
                                     controlled = True
-                                    status = "failed"
+                                    status = "denied"
                                 else:
                                     self._pending_prepared_call = prepared_or_result
                                     self._continuation = replace(

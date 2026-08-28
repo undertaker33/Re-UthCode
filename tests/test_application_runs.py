@@ -756,7 +756,7 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     assert sum(isinstance(event, TurnCompleted) for event in events) == 1
     assert not any(isinstance(event, TurnCancelled) for event in events)
     tool_finished = next(event for event in events if isinstance(event, ToolFinished))
-    assert tool_finished.command == "ReadFile note.txt"
+    assert tool_finished.command == "note.txt"
     assert hidden_content not in tool_finished.to_json()
     assert hidden_content not in result.to_json()
     assert hidden_content not in run.snapshot().to_json()
@@ -771,6 +771,47 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     assert tool_message.parts == (ToolResultPart("read-call", f"1\t{hidden_content}"),)
     assert result.final_text == "The note says exactly what was requested."
     assert "I have the result." not in (result.final_text or "")
+
+
+@pytest.mark.asyncio
+async def test_application_tool_activity_is_fifo_and_names_have_one_owner(
+    tmp_path: Path,
+) -> None:
+    first = _ApplicationGateTool("First")
+    second = _ApplicationGateTool("Second")
+    provider = _ScriptedProvider(
+        (
+            (
+                _response(
+                    ToolCallPart("first-call", "First", {"value": "one"}),
+                    ToolCallPart("second-call", "Second", {"value": "two"}),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        tools=(first, second),
+    )
+    run = application.create_run()
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+
+    events = await _collect(run.start_turn("run both tools"))
+    started = [event for event in events if isinstance(event, ToolStarted)]
+    finished = [event for event in events if isinstance(event, ToolFinished)]
+
+    assert [event.tool_call_id for event in started] == ["first-call", "second-call"]
+    assert [event.tool_call_id for event in finished] == ["first-call", "second-call"]
+    assert [event.status for event in finished] == ["finished", "finished"]
+    assert [event.tool_name for event in finished] == ["First", "Second"]
+    assert [event.command for event in finished] == ["<arguments hidden>", "<arguments hidden>"]
+    assert all(event.tool_name not in event.command for event in (*started, *finished))
+    assert first.trace == ["preflight:one", "execute:one"]
+    assert second.trace == ["preflight:two", "execute:two"]
 
 
 @pytest.mark.asyncio
@@ -948,11 +989,11 @@ def test_tool_descriptions_are_bounded_and_do_not_echo_write_content_or_unknown_
         ToolCallPart("glob", "Glob", {"pattern": "x" * 500, "path": "."})
     )
 
-    assert write_summary == "WriteFile note.txt"
-    assert read_summary == "ReadFile note.txt"
-    assert edit_summary == "EditFile note.txt"
+    assert write_summary == "note.txt"
+    assert read_summary == "note.txt"
+    assert edit_summary == "note.txt"
     assert secret not in bash_summary
-    assert grep_summary == "Grep path=src"
+    assert grep_summary == "path=src"
     assert unknown_summary == "<unknown tool>"
     assert len(long_summary) == 240
     assert long_summary.endswith("…")
@@ -1008,7 +1049,7 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ]
 
     assert len(tool_events) == 2
-    assert all(event.command.startswith("Bash echo") for event in tool_events)
+    assert all(event.command.startswith("echo") for event in tool_events)
     serialized = " ".join(event.to_json() for event in tool_events)
     assert environment_value not in serialized
     assert short_environment_value not in serialized
@@ -1036,7 +1077,7 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ).describe_tool_call(
         ToolCallPart("ordinary", "Bash", {"command": "echo 2026-08-06"})
     )
-    assert ordinary_summary == "Bash echo 2026-08-06"
+    assert ordinary_summary == "echo 2026-08-06"
 
     configured_secret = "xy7"
     monkeypatch.setenv("W02_CONFIG_SECRET_SOURCE", configured_secret)
@@ -1047,7 +1088,44 @@ async def test_tool_summaries_redact_known_values_and_common_credentials_in_both
     ).describe_tool_call(
         ToolCallPart("configured", "Bash", {"command": f"echo {configured_secret}"})
     )
-    assert configured_summary == "Bash echo <redacted>"
+    assert configured_summary == "echo <redacted>"
+
+
+def test_tool_summary_has_a_single_display_owner(tmp_path: Path) -> None:
+    service = ApplicationToolService(create_default_tools(tmp_path), workdir=tmp_path)
+
+    cases = (
+        ("Bash", {"command": "echo hello"}, "echo hello"),
+        ("ReadFile", {"path": "note.txt"}, "note.txt"),
+        ("WriteFile", {"path": "note.txt", "content": "hidden"}, "note.txt"),
+        (
+            "EditFile",
+            {"path": "note.txt", "old_string": "hidden", "new_string": "new"},
+            "note.txt",
+        ),
+        ("Glob", {"pattern": "*.py", "path": "src"}, "pattern=*.py path=src"),
+        ("Grep", {"pattern": "secret", "path": "src"}, "path=src"),
+    )
+
+    for name, arguments, expected in cases:
+        summary = service.describe_tool_call(ToolCallPart("call", name, arguments))
+        assert summary == expected
+        assert name not in summary
+
+    session_service = ApplicationToolService(
+        create_default_tools(tmp_path),
+        workdir=tmp_path,
+        session_provider=lambda: None,
+    )
+    for name, arguments in (
+        ("ToolResultRead", {"ref": "opaque-ref"}),
+        ("HistoryRead", {"ref": "opaque-ref"}),
+    ):
+        summary = session_service.describe_tool_call(
+            ToolCallPart("call", name, arguments)
+        )
+        assert summary.startswith("ref=opaque-ref")
+        assert name not in summary
 
 
 @pytest.mark.asyncio
