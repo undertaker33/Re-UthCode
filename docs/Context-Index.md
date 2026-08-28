@@ -46,7 +46,7 @@ path_migration:
 | 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、固定 PLAN 非 READ 与 unfinished-task 控制检查 | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定控制检查；无 OS Sandbox、动态控制 registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
 | 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、Transcript/Timeline、动态 Context Budget/Gate（default 256K、effective 256K 使用 Eval 选定的 balanced-208k profile、configured/provider 收紧与 provenance）、Session v3 metadata、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；L4/L5、manual Compact、HistoryRead 与 overflow retry 已进入正式链路；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Session ensure/close、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Session、Plan/Task、Steering |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、真实 prompt/显式命令触发的惰性 Session、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Session、Plan/Task、Steering |
 
 ## current-status
 
@@ -84,19 +84,20 @@ status_values:
 | T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | T01～T08 Checklist 全部完成；W01～W06 Feedback 齐全；定向、架构和全量回归结果记录于 W06 Feedback；工作包未归档 |
 | T09-2 | 工程收敛与提前抽象清理 | `docs/work/T09-2-工程收敛与提前抽象清理/` | W01 Task 1～9 Checklist 已完成；全量 `1189 passed, 3 skipped`、compileall/pip check/diff check/UTF-8 guard 均通过。用户已确认 `AGENTS.md` 的 57 行规则为本次交付基线，后续 T09-2 提交/推送一并纳入；工作包未归档 |
 | T09-3 | 256K Context 工程调优与通用失败语义 | `docs/work/T09-3-256KContext工程调优与通用失败语义/` | W01～W05 Feedback 齐全，T01～T08 Checklist 已完成；Application 唯一主链已收口 default 256K/balanced-208k profile/provenance、High→Low/L4/L5/overflow、Provider cache usage、FailureReason/PauseReason 与安全 diagnostics；返工已补充 selected profile 进入正式 resolver/Turn 的证据；定向、Eval、架构、全量、compileall、pip check、diff check 与 UTF-8 guard 结果记录于 W05 Feedback；工作包未归档 |
+| F01 | TUI 回复链路与 Session 恢复修复 | `docs/work/F01-TUI回复链路与Session恢复修复/` | W01～W06 Feedback 齐全；W01～W05 已接入 typed Prompt/History、safe replay、TUI 流式时序与 `/resume` hydrate；W06 R3 记录用户真实界面验收原话“界面基本没问题”及 Session JSONL / 正式 replay 只读证据；JSONL 不记录 `/resume` 动作本身，恢复结论由用户验收与 W06 E2E 支撑；Checklist 全部完成；工作包未归档 |
 
 ### `not_implemented`
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| F01 | TUI 回复链路与 Session 恢复修复 | `docs/work/F01-TUI回复链路与Session恢复修复/` | 已完成问题探索与 D-F01-01～04 用户决策，正式 Spec、Tasks、Checklist、W01～W06 Prompt 已生成；尚未派发任何 Worker，生产代码未实施 |
 
 ## 跨层最短链路
 
 ```text
 interfaces/cli.py 或 interfaces/tui/app.py
   -> application/bootstrap.py:create_application
-  -> application/generation.py:UthCodeApplication.ensure_session / create_run
+  -> application/generation.py:UthCodeApplication.create_run
+  -> (真实 prompt/显式命令时) UthCodeApplication.ensure_session / resume_session_for_command
   -> application/runs.py:AgentRun.start_turn
   -> core/agent.py:AgentLoop / AgentTurnExecution
   -> core/provider.py:ProviderPort

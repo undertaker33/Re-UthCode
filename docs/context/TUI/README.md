@@ -46,7 +46,7 @@ Windows Console Unicode / VT 按键 / bracketed paste
                  ↓              ↓
         Slash / Model 候选     普通消息
                  ↓              ↓
-              UthCodeApplication / active Session / AgentRun
+              UthCodeApplication / AgentRun
                           ↓
                     公开 AgentEvent
                           ↓
@@ -65,7 +65,7 @@ Application(
 )
 ```
 
-普通文本的入口由当前 `AgentRun` 生命周期决定：CLI/TUI 启动时由 Application 确保 active Session，idle 时调用 `start_turn`；active 且没有 typed interaction 时调用同一 `TurnHandle.steer(text)`。terminal Turn 的新增 History、Tool Result ref 与 Instruction State 由 Application 持久化。AskUser、Permission、Provider Retry 与 Plan Review 任一交互 pending 时，输入始终先归当前交互层，不能旁路成 Steering 或第二个 Turn。
+普通文本的入口由当前 `AgentRun` 生命周期决定：CLI `exec` 或 TUI 首条普通输入在真实 prompt 前由 Application 惰性确保 active Session，随后 idle 时调用 `start_turn`；active 且没有 typed interaction 时调用同一 `TurnHandle.steer(text)`。TUI 启动、退出、help/status 和 Picker 不创建持久 Session；`/new` 与 `/resume` 由 Application 完成显式切换。terminal Turn 的新增 History、Tool Result ref 与 Instruction State 由 Application 持久化。AskUser、Permission、Provider Retry 与 Plan Review 任一交互 pending 时，输入始终先归当前交互层，不能旁路成 Steering 或第二个 Turn。
 
 Windows 使用 prompt_toolkit 的原生 `KEY_EVENT_RECORD` Unicode 输入路径，并对 `Shift+Enter` 做一处修饰键映射。这样既不把 IME 提交拆成单字节，也不要求 Windows Terminal 支持 Kitty 键盘协议；模型或工具进程修改控制台代码页后，输入仍以 Unicode 进入 `Buffer`。粘贴由 prompt_toolkit 处理并原样保留多行文本。
 
@@ -168,7 +168,7 @@ Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resum
 
 启动先发送 `CSI 2J` 和 Home，只清当前视口，然后显示包含 UthCode Logo、当前模型、cwd 和主要快捷键的欢迎区。
 
-欢迎区之前由 Application 确保一个 active Session；退出时 TUI 调用 Application close，释放 Session writer。`/new` 会创建 fresh Session，`/resume` 会在锁定并重建目标 Instruction State 后切换。
+欢迎区不创建 active Session；退出时 TUI 调用 Application close，释放已打开的 Session writer。`/new` 会创建 fresh Session，`/resume` 会在锁定并重建目标 Instruction State 后切换并回放安全 durable records。
 
 `/clear` 使用相同的清视口语义并打印新视图分隔线：
 

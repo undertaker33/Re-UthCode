@@ -11,6 +11,8 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 ## 当前结论
 
 - `[FACT]` `RunState` 是单个 Run 当前 Turn 的权威、不可变 Core 状态。
+- `[FACT]` Transcript 新写入按单个 typed Message part 保存角色、连续 identity 和 part 顺序；`ReasoningPart` 与正式 `TextPart` 可独立重建，reasoning 永不成为 final 文本。旧 v3 full-message envelope 只读兼容，不原地迁移。
+- `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放只包含 user、steering、reasoning、formal assistant 和脱敏 Tool 终态，不包含 raw ToolResult、native payload、秘密或 pending interaction。
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
