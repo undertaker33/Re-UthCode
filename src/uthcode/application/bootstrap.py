@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from os import PathLike
 from pathlib import Path
@@ -13,6 +13,8 @@ from uthcode.integrations.config.loader import (
     ConfigurationError as IntegrationConfigurationError,
     ConfigurationInitializationRequired as IntegrationConfigurationInitializationRequired,
     load_config_data,
+    read_user_config_view_data,
+    resolve_user_home,
 )
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.permissions import load_permission_rules
@@ -22,6 +24,8 @@ from uthcode.integrations.instruction_files import (
 )
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.core.tool import Tool
+from uthcode.core.permission import PermissionMode
+from uthcode.core.secrets import SecretValue
 
 from .configuration import (
     ConfigurationModelError,
@@ -29,7 +33,12 @@ from .configuration import (
     EffectiveConfig,
     LaunchOptions,
     ModelProfile,
+    ProviderKind,
     ProviderProfile,
+    UserConfigurationView,
+    UserConfigurationWriteRequest,
+    UserModelView,
+    UserProviderView,
 )
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
 from .sessions import ApplicationSessionService
@@ -71,6 +80,131 @@ class ConfigurationInitializationRequired(ConfigurationError):
             f"{self.template_path}",
         )
         self.path = self.template_path
+
+
+def _user_config_path(home: str | PathLike[str] | None = None) -> Path:
+    explicit_home = Path(home) if home is not None else None
+    return (resolve_user_home(explicit_home) / ".uthcode" / "config.toml").resolve(
+        strict=False
+    )
+
+
+def _map_integration_configuration_error(
+    exc: IntegrationConfigurationError,
+) -> ConfigurationError:
+    if isinstance(exc, IntegrationConfigurationInitializationRequired):
+        return ConfigurationInitializationRequired(exc.template_path)
+    return ConfigurationError(exc.message, path=exc.path, field=exc.field)
+
+
+def read_user_configuration(
+    *,
+    home: str | PathLike[str] | None = None,
+) -> UserConfigurationView:
+    """Read the current user config as a display-safe Application DTO."""
+
+    path = _user_config_path(home)
+    try:
+        raw = read_user_config_view_data(path, create_if_missing=True)
+    except IntegrationConfigurationError as exc:
+        raise _map_integration_configuration_error(exc) from None
+    providers_raw = raw.get("providers", {})
+    models_raw = raw.get("models", {})
+    return UserConfigurationView(
+        default_model=raw.get("default_model", ""),
+        default_permission_mode=raw.get("default_permission_mode", "default"),
+        providers=(
+            providers_raw
+            if isinstance(providers_raw, Mapping)
+            else {}
+        ),
+        models=models_raw if isinstance(models_raw, Mapping) else {},
+        path=path,
+    )
+
+
+def _user_write_payload(
+    request: UserConfigurationWriteRequest,
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if request.default_model is not None:
+        payload["default_model"] = request.default_model
+    if request.default_permission_mode is not None:
+        mode = request.default_permission_mode
+        payload["default_permission_mode"] = (
+            mode.value if isinstance(mode, PermissionMode) else mode
+        )
+    if request.providers is not None:
+        providers: dict[str, dict[str, object]] = {}
+        for profile_id, raw_profile in request.providers.items():
+            if not isinstance(raw_profile, Mapping):
+                raise TypeError(f"providers.{profile_id} must be a mapping")
+            providers[profile_id] = {}
+            for key, value in raw_profile.items():
+                # A null key from a form means "unchanged".  An empty string
+                # remains the explicit request to clear the configured key.
+                if key == "api_key" and value is None:
+                    continue
+                if key == "kind" and isinstance(value, ProviderKind):
+                    value = value.value
+                providers[profile_id][key] = (
+                    value.reveal()
+                    if key == "api_key" and isinstance(value, SecretValue)
+                    else value
+                )
+        payload["providers"] = providers
+    if request.models is not None:
+        models: dict[str, dict[str, object]] = {}
+        for model_ref, raw_profile in request.models.items():
+            if not isinstance(raw_profile, Mapping):
+                raise TypeError(f"models.{model_ref} must be a mapping")
+            profile = dict(raw_profile)
+            profile.pop("model_ref", None)
+            models[model_ref] = profile
+        payload["models"] = models
+    return payload
+
+
+def write_user_configuration(
+    request: UserConfigurationWriteRequest | Mapping[str, object],
+    *,
+    home: str | PathLike[str] | None = None,
+) -> UserConfigurationView:
+    """Validate and atomically write a current-schema user config update."""
+
+    if not isinstance(request, UserConfigurationWriteRequest):
+        if not isinstance(request, Mapping):
+            raise TypeError("request must be UserConfigurationWriteRequest or mapping")
+        unsupported = [
+            key
+            for key in request
+            if key not in {
+                "default_model",
+                "default_permission_mode",
+                "providers",
+                "models",
+            }
+        ]
+        if unsupported:
+            raise ConfigurationError(
+                "unsupported configuration field",
+                path=_user_config_path(home),
+                field=str(unsupported[0]),
+            )
+        request = UserConfigurationWriteRequest(
+            default_model=request.get("default_model"),
+            default_permission_mode=request.get("default_permission_mode"),
+            providers=request.get("providers"),
+            models=request.get("models"),
+        )
+    path = _user_config_path(home)
+    try:
+        writer_module = import_module("uthcode.integrations.config.writer")
+        writer = writer_module.write_user_config
+        writer(path, _user_write_payload(request))
+    except IntegrationConfigurationError as exc:
+        raise _map_integration_configuration_error(exc) from None
+    return read_user_configuration(home=home)
 
 
 def _provider_config(
@@ -285,4 +419,6 @@ __all__ = [
     "ConfigurationInitializationRequired",
     "create_application",
     "load_effective_config",
+    "read_user_configuration",
+    "write_user_configuration",
 ]

@@ -15,6 +15,11 @@ from uthcode.application import (
     ModelProfile,
     ProviderKind,
     ProviderProfile,
+    UserConfigurationView,
+    UserConfigurationWriteRequest,
+    create_application,
+    read_user_configuration,
+    write_user_configuration,
     load_effective_config,
 )
 
@@ -622,3 +627,562 @@ def test_loader_does_not_read_environment_secrets_or_make_provider_requests(
 
     assert config.providers["local"].api_key is None
     assert "sk-configuration-test-secret" not in repr(config)
+
+
+def test_user_configuration_view_is_available_before_application_bootstrap(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    view = read_user_configuration(home=home)
+
+    assert isinstance(view, UserConfigurationView)
+    assert view.default_model == ""
+    assert view.default_permission_mode == "default"
+    assert set(view.providers) == {"slot-1", "slot-2", "slot-3"}
+    assert set(view.models) == {"slot-1", "slot-2", "slot-3"}
+    assert all(not provider.api_key_configured for provider in view.providers.values())
+    assert "slot-1-secret" not in repr(view)
+
+
+def test_semantically_invalid_toml_still_returns_editable_safe_view(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "missing/ref"
+default_permission_mode = "full_access"
+
+[providers.local]
+kind = "not-a-provider"
+api_key = "safe-view-secret"
+
+[models."broken/ref"]
+provider = "missing"
+remote_id = ""
+context_window = -1
+''',
+        encoding="utf-8",
+    )
+
+    view = read_user_configuration(home=home)
+
+    assert view.default_model == "missing/ref"
+    assert view.default_permission_mode == "full_access"
+    assert view.providers["local"].kind == "not-a-provider"
+    assert view.providers["local"].api_key_configured is True
+    assert view.models["broken/ref"].provider_profile_id == "missing"
+    assert view.models["broken/ref"].context_window == -1
+    assert "safe-view-secret" not in repr(view)
+
+
+def test_invalid_toml_read_is_stable_and_preserves_original_file(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    original = 'default_model = "unterminated\n'
+    user.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="configuration cannot be parsed") as raised:
+        read_user_configuration(home=home)
+
+    assert raised.value.path == user.resolve()
+    assert user.read_text(encoding="utf-8") == original
+
+
+def test_user_configuration_write_preserves_or_replaces_keys_without_exposing_them(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    old_key = "literal-old-user-config-secret"
+    new_key = "literal-new-user-config-secret"
+    user.write_text(
+        f'''# retain this comment
+default_model = "local/ref"
+default_permission_mode = "auto"
+
+[providers.local]
+kind = "openai_responses"
+api_key = "{old_key}"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    original_view = read_user_configuration(home=home)
+    request = UserConfigurationWriteRequest(
+        default_model="local/ref",
+        default_permission_mode="default",
+        providers={
+            "local": {
+                "kind": "openai_responses",
+                # An explicit None means retain the existing literal/env
+                # expression, as a form submission may send null for an
+                # unchanged field.
+                "api_key": None,
+            }
+        },
+        models={
+            "local/ref": {
+                "provider_profile_id": "local",
+                "remote_id": "remote-updated",
+            }
+        },
+    )
+    retained = write_user_configuration(request, home=home)
+
+    assert retained.providers["local"].api_key_configured is True
+    assert old_key in user.read_text(encoding="utf-8")
+    assert new_key not in repr(retained)
+    assert "# retain this comment" in user.read_text(encoding="utf-8")
+
+    replaced = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="local/ref",
+            providers={
+                "local": {
+                    "kind": "openai_responses",
+                    "api_key": new_key,
+                }
+            },
+            models={
+                "local/ref": {
+                    "provider_profile_id": "local",
+                    "remote_id": "remote-updated",
+                }
+            },
+        ),
+        home=home,
+    )
+
+    rendered = user.read_text(encoding="utf-8")
+    assert new_key in rendered
+    assert old_key not in rendered
+    assert new_key not in repr(replaced)
+    assert original_view.models["local/ref"].remote_id == "remote"
+
+
+@pytest.mark.parametrize("environment_value", [None, "env-retained-secret"])
+def test_user_configuration_write_retains_env_key_without_resolving_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_value: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    environment_name = "W01_RETAINED_CONFIG_KEY"
+    if environment_value is None:
+        monkeypatch.delenv(environment_name, raising=False)
+    else:
+        monkeypatch.setenv(environment_name, environment_value)
+    expression = f"env:{environment_name}"
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{expression}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    retained = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="remote/ref",
+            providers={
+                "remote": {
+                    "kind": "openai_responses",
+                    "api_key": None,
+                }
+            },
+            models={
+                "remote/ref": {
+                    "provider_profile_id": "remote",
+                    "remote_id": "remote-updated",
+                }
+            },
+        ),
+        home=home,
+    )
+
+    assert retained.providers["remote"].api_key_configured is True
+    assert f'api_key = "{expression}"' in user.read_text(encoding="utf-8")
+    if environment_value is None:
+        with pytest.raises(ConfigurationError, match="missing or empty"):
+            load_effective_config(cwd=tmp_path, home=home)
+    else:
+        config = load_effective_config(cwd=tmp_path, home=home)
+        assert config.providers["remote"].api_key is not None
+        assert config.providers["remote"].api_key.reveal() == environment_value
+
+
+def test_user_configuration_write_adds_modifies_and_deletes_unreferenced_profiles(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "keep/ref"
+default_permission_mode = "default"
+
+[providers.keep]
+kind = "fake"
+
+[providers.remove]
+kind = "fake"
+
+[models."keep/ref"]
+provider = "keep"
+remote_id = "keep-old"
+display_name = "Keep old"
+
+[models."remove/ref"]
+provider = "remove"
+remote_id = "remove"
+''',
+        encoding="utf-8",
+    )
+
+    result = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="new/ref",
+            providers={
+                "keep": {"kind": ProviderKind.FAKE},
+                "new": {"kind": "fake"},
+            },
+            models={
+                "keep/ref": {
+                    "provider_profile_id": "keep",
+                    "remote_id": "keep-new",
+                    "display_name": "Keep new",
+                },
+                "new/ref": {
+                    "provider_profile_id": "new",
+                    "remote_id": "new-remote",
+                },
+            },
+        ),
+        home=home,
+    )
+
+    assert set(result.providers) == {"keep", "new"}
+    assert set(result.models) == {"keep/ref", "new/ref"}
+    assert result.default_model == "new/ref"
+    assert result.models["keep/ref"].remote_id == "keep-new"
+    assert result.models["new/ref"].provider_profile_id == "new"
+    rendered = user.read_text(encoding="utf-8")
+    assert "remove" not in rendered
+    assert 'provider = "new"' in rendered
+    assert 'remote_id = "keep-new"' in rendered
+
+
+def test_user_configuration_write_rejects_deleting_default_model_atomically(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "keep/ref"
+[providers.keep]
+kind = "fake"
+[models."keep/ref"]
+provider = "keep"
+remote_id = "keep"
+[models."other/ref"]
+provider = "keep"
+remote_id = "other"
+''',
+        encoding="utf-8",
+    )
+    original = user.read_bytes()
+
+    with pytest.raises(ConfigurationError, match="default_model must reference"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="keep/ref",
+                providers={"keep": {"kind": "fake"}},
+                models={
+                    "other/ref": {
+                        "provider_profile_id": "keep",
+                        "remote_id": "other",
+                    }
+                },
+            ),
+            home=home,
+        )
+
+    assert user.read_bytes() == original
+
+
+def test_user_configuration_write_rejects_invalid_provider_and_model_updates(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "keep/ref"
+[providers.keep]
+kind = "fake"
+[models."keep/ref"]
+provider = "keep"
+remote_id = "keep"
+''',
+        encoding="utf-8",
+    )
+    original = user.read_bytes()
+
+    with pytest.raises(ConfigurationError, match="invalid Provider profile"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="keep/ref",
+                providers={"keep": {"kind": "not-a-provider"}},
+                models={
+                    "keep/ref": {
+                        "provider_profile_id": "keep",
+                        "remote_id": "keep",
+                    }
+                },
+            ),
+            home=home,
+        )
+    assert user.read_bytes() == original
+
+    with pytest.raises(ConfigurationError, match="unknown provider reference"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="broken/ref",
+                providers={"keep": {"kind": "fake"}},
+                models={
+                    "keep/ref": {
+                        "provider_profile_id": "keep",
+                        "remote_id": "keep",
+                    },
+                    "broken/ref": {
+                        "provider_profile_id": "missing",
+                        "remote_id": "broken",
+                    },
+                },
+            ),
+            home=home,
+        )
+    assert user.read_bytes() == original
+
+
+def test_user_configuration_write_validates_references_and_full_access(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+[providers.local]
+kind = "fake"
+[models."local/ref"]
+provider = "local"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+    original = user.read_bytes()
+
+    with pytest.raises(ConfigurationError, match="provider reference"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="local/ref",
+                providers={"local": {"kind": "fake"}},
+                models={
+                    "local/ref": {
+                        "provider_profile_id": "missing",
+                        "remote_id": "remote",
+                    }
+                },
+            ),
+            home=home,
+        )
+    assert user.read_bytes() == original
+
+    with pytest.raises(ConfigurationError, match="default or auto"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="local/ref",
+                default_permission_mode="full_access",
+                providers={"local": {"kind": "fake"}},
+                models={
+                    "local/ref": {
+                        "provider_profile_id": "local",
+                        "remote_id": "remote",
+                    }
+                },
+            ),
+            home=home,
+        )
+    assert user.read_bytes() == original
+
+
+def test_user_configuration_write_rejects_deleting_referenced_provider(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+[providers.local]
+kind = "fake"
+[models."local/ref"]
+provider = "local"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="provider reference"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="local/ref",
+                providers={},
+                models={
+                    "local/ref": {
+                        "provider_profile_id": "local",
+                        "remote_id": "remote",
+                    }
+                },
+            ),
+            home=home,
+        )
+
+
+def test_user_configuration_write_failure_is_atomic_and_secret_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    original = '''default_model = "local/ref"
+[providers.local]
+kind = "fake"
+[models."local/ref"]
+provider = "local"
+remote_id = "remote"
+'''
+    user.write_text(original, encoding="utf-8")
+    secret = "atomic-secret-that-must-not-appear"
+
+    import uthcode.integrations.config.writer as writer
+
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr(writer.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated atomic replace failure") as raised:
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="local/ref",
+                providers={
+                    "local": {"kind": "fake", "api_key": secret},
+                },
+                models={
+                    "local/ref": {
+                        "provider_profile_id": "local",
+                        "remote_id": "remote",
+                    }
+                },
+            ),
+            home=home,
+        )
+
+    assert secret not in str(raised.value)
+    assert user.read_text(encoding="utf-8") == original
+    assert not list(user.parent.glob(".*.tmp"))
+
+
+def test_user_configuration_write_rejects_unknown_request_fields(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    with pytest.raises(ConfigurationError, match="unsupported configuration field"):
+        write_user_configuration(
+            {
+                "default_model": "local/ref",
+                "future_setting": "must-not-be-ignored",
+            },
+            home=home,
+        )
+
+    assert not (home / ".uthcode" / "config.toml").exists()
+
+
+def test_invalid_first_write_does_not_create_a_partial_config(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    with pytest.raises(ConfigurationError, match="default_model"):
+        write_user_configuration(
+            UserConfigurationWriteRequest(
+                default_model="missing/ref",
+                providers={"local": {"kind": "fake"}},
+                models={
+                    "local/ref": {
+                        "provider_profile_id": "local",
+                        "remote_id": "remote",
+                    }
+                },
+            ),
+            home=home,
+        )
+
+    assert not (home / ".uthcode" / "config.toml").exists()
+
+
+def test_valid_first_write_reloads_and_constructs_application(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    written = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="local/ref",
+            default_permission_mode="auto",
+            providers={"local": {"kind": ProviderKind.FAKE}},
+            models={
+                "local/ref": {
+                    "provider_profile_id": "local",
+                    "remote_id": "remote",
+                    "display_name": "Local",
+                }
+            },
+        ),
+        home=home,
+    )
+
+    assert written.default_model == "local/ref"
+    config = load_effective_config(cwd=tmp_path, home=home)
+    assert isinstance(config, EffectiveConfig)
+    assert config.default_model == "local/ref"
+    assert config.default_permission_mode.value == "auto"
+
+    application = create_application(
+        config,
+        storage_root=tmp_path / "sessions",
+    )
+    try:
+        assert application.configuration is config
+    finally:
+        application.close()

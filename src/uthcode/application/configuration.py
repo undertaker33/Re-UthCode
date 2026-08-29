@@ -205,6 +205,282 @@ class ModelProfile:
             object.__setattr__(self, "display_name", self.remote_id)
 
 
+@dataclass(frozen=True, slots=True)
+class UserProviderView:
+    """Display-safe projection of one user Provider profile."""
+
+    provider_profile_id: str
+    kind: ProviderKind | str | None = None
+    base_url: object | None = None
+    api_key_configured: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_profile_id, str):
+            raise TypeError("provider_profile_id must be a string")
+        if isinstance(self.kind, ProviderKind):
+            object.__setattr__(self, "kind", self.kind.value)
+        if not isinstance(self.api_key_configured, bool):
+            raise TypeError("api_key_configured must be a boolean")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "provider_profile_id": self.provider_profile_id,
+            "kind": self.kind,
+            "base_url": self.base_url,
+            "api_key_configured": self.api_key_configured,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UserModelView:
+    """Display-safe projection of one user Model profile."""
+
+    model_ref: str
+    provider_profile_id: object | None = None
+    remote_id: object | None = None
+    display_name: object | None = None
+    context_window: object | None = None
+    max_output_tokens: object | None = None
+    reasoning_effort: object | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_ref, str):
+            raise TypeError("model_ref must be a string")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "model_ref": self.model_ref,
+            "provider_profile_id": self.provider_profile_id,
+            "remote_id": self.remote_id,
+            "display_name": self.display_name,
+            "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
+            "reasoning_effort": self.reasoning_effort,
+        }
+
+
+def _safe_user_provider(value: object, profile_id: str) -> UserProviderView:
+    if isinstance(value, UserProviderView):
+        return value
+    if not isinstance(value, Mapping):
+        value = {}
+    return UserProviderView(
+        provider_profile_id=str(value.get("provider_profile_id", profile_id)),
+        kind=value.get("kind"),
+        base_url=value.get("base_url"),
+        api_key_configured=value.get("api_key_configured", False) is True,
+    )
+
+
+def _safe_user_model(value: object, model_ref: str) -> UserModelView:
+    if isinstance(value, UserModelView):
+        return value
+    if not isinstance(value, Mapping):
+        value = {}
+    return UserModelView(
+        model_ref=str(value.get("model_ref", model_ref)),
+        provider_profile_id=value.get("provider_profile_id"),
+        remote_id=value.get("remote_id"),
+        display_name=value.get("display_name"),
+        context_window=value.get("context_window"),
+        max_output_tokens=value.get("max_output_tokens"),
+        reasoning_effort=value.get("reasoning_effort"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class UserConfigurationView:
+    """Safe user configuration view usable before Application construction."""
+
+    default_model: object = ""
+    default_permission_mode: object = "default"
+    providers: Mapping[str, UserProviderView] = MappingProxyType({})
+    models: Mapping[str, UserModelView] = MappingProxyType({})
+    path: Path | None = None
+
+    def __post_init__(self) -> None:
+        providers: dict[str, UserProviderView] = {}
+        if not isinstance(self.providers, Mapping):
+            raise TypeError("providers must be a mapping")
+        for profile_id, value in self.providers.items():
+            if not isinstance(profile_id, str):
+                raise TypeError("provider profile IDs must be strings")
+            providers[profile_id] = _safe_user_provider(value, profile_id)
+        models: dict[str, UserModelView] = {}
+        if not isinstance(self.models, Mapping):
+            raise TypeError("models must be a mapping")
+        for model_ref, value in self.models.items():
+            if not isinstance(model_ref, str):
+                raise TypeError("model refs must be strings")
+            models[model_ref] = _safe_user_model(value, model_ref)
+        object.__setattr__(self, "providers", MappingProxyType(providers))
+        object.__setattr__(self, "models", MappingProxyType(models))
+        if self.path is not None:
+            object.__setattr__(self, "path", Path(self.path))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "default_model": self.default_model,
+            "default_permission_mode": self.default_permission_mode,
+            "providers": {
+                profile_id: profile.to_dict()
+                for profile_id, profile in self.providers.items()
+            },
+            "models": {
+                model_ref: profile.to_dict()
+                for model_ref, profile in self.models.items()
+            },
+        }
+
+
+def _freeze_user_write_mapping(
+    value: Mapping[str, object],
+    *,
+    field: str,
+) -> Mapping[str, object]:
+    frozen: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{field} keys must be strings")
+        if isinstance(item, SecretValue):
+            frozen[key] = item
+        elif item is None or isinstance(item, (str, bool, int)):
+            frozen[key] = item
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise ConfigurationModelError(f"{field}.{key} must be finite")
+            frozen[key] = item
+        elif isinstance(item, Mapping):
+            frozen[key] = _freeze_user_write_mapping(
+                item,
+                field=f"{field}.{key}",
+            )
+        elif isinstance(item, (list, tuple)):
+            frozen[key] = tuple(item)
+        else:
+            raise TypeError(f"{field}.{key} contains an unsupported value")
+    return MappingProxyType(frozen)
+
+
+def _freeze_user_write_section(
+    value: Mapping[str, object] | None,
+    *,
+    field_name: str,
+) -> Mapping[str, Mapping[str, object]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+    result: dict[str, Mapping[str, object]] = {}
+    for profile_id, raw_profile in value.items():
+        if not isinstance(profile_id, str):
+            raise TypeError(f"{field_name} keys must be strings")
+        if isinstance(raw_profile, UserProviderView):
+            profile: Mapping[str, object] = {
+                "kind": raw_profile.kind,
+                "base_url": raw_profile.base_url,
+            }
+        elif isinstance(raw_profile, UserModelView):
+            profile = {
+                key: value
+                for key, value in raw_profile.to_dict().items()
+                if key != "model_ref"
+            }
+        elif isinstance(raw_profile, Mapping):
+            profile = raw_profile
+        else:
+            raise TypeError(f"{field_name}.{profile_id} must be a mapping")
+        values: dict[str, object] = {}
+        for key, value in profile.items():
+            if field_name == "providers" and key == "api_key":
+                if isinstance(value, SecretValue):
+                    values[key] = value
+                elif value is None or value == "":
+                    values[key] = value
+                elif isinstance(value, str):
+                    values[key] = SecretValue(value)
+                else:
+                    raise TypeError("providers.api_key must be a string")
+            else:
+                values[key] = value
+        result[profile_id] = _freeze_user_write_mapping(
+            values,
+            field=f"{field_name}.{profile_id}",
+        )
+    return MappingProxyType(result)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class UserConfigurationWriteRequest:
+    """Current-schema user configuration update.
+
+    None on a root section means leave that section unchanged.  An empty
+    mapping explicitly removes all profiles in that section.  Provider API
+    keys are transient write input; repr and to_dict never expose values.
+    """
+
+    default_model: str | None = None
+    default_permission_mode: PermissionMode | str | None = None
+    providers: Mapping[str, object] | None = None
+    models: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "providers",
+            _freeze_user_write_section(self.providers, field_name="providers"),
+        )
+        object.__setattr__(
+            self,
+            "models",
+            _freeze_user_write_section(self.models, field_name="models"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        providers: dict[str, dict[str, object]] | None = None
+        if self.providers is not None:
+            providers = {}
+            for profile_id, profile in self.providers.items():
+                safe: dict[str, object] = {}
+                for key, value in profile.items():
+                    if key == "api_key":
+                        safe["api_key_configured"] = (
+                            isinstance(value, SecretValue)
+                            or (
+                                isinstance(value, str)
+                                and bool(value.strip())
+                            )
+                        )
+                    elif isinstance(value, ProviderKind):
+                        safe[key] = value.value
+                    else:
+                        safe[key] = value
+                providers[profile_id] = safe
+        models = (
+            None
+            if self.models is None
+            else {model_ref: dict(profile) for model_ref, profile in self.models.items()}
+        )
+        mode = self.default_permission_mode
+        if isinstance(mode, PermissionMode):
+            mode = mode.value
+        return {
+            "default_model": self.default_model,
+            "default_permission_mode": mode,
+            "providers": providers,
+            "models": models,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            "UserConfigurationWriteRequest("
+            f"default_model={self.default_model!r}, "
+            f"default_permission_mode={self.default_permission_mode!r}, "
+            f"providers={None if self.providers is None else '<redacted>'!r}, "
+            f"models={None if self.models is None else tuple(self.models)!r})"
+        )
+
+
 def _coerce_source(value: ConfigSource | str | Path) -> ConfigSource:
     if isinstance(value, ConfigSource):
         return value
@@ -418,4 +694,8 @@ __all__ = [
     "ModelProfile",
     "ProviderKind",
     "ProviderProfile",
+    "UserConfigurationView",
+    "UserConfigurationWriteRequest",
+    "UserModelView",
+    "UserProviderView",
 ]
