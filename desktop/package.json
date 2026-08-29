@@ -9,7 +9,7 @@
     "package": "electron-forge package",
     "make": "electron-forge make",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts"
+    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts tests/renderer.test.tsx"
   },
   "dependencies": {
     "react": "19.1.1",

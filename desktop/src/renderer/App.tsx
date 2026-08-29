@@ -1,0 +1,472 @@
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import type { DesktopApi, DesktopPreferences, JsonObject, JsonValue, PanelModePreference, ThemePreference } from "../desktop-api";
+import { ChatTimeline } from "./ChatTimeline";
+import { Composer } from "./Composer";
+import { RuntimePanel } from "./RuntimePanel";
+import { Sidebar } from "./Sidebar";
+import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
+import { SettingsView, type ConfigurationWrite } from "./SettingsView";
+import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type ConfigurationView } from "./state";
+
+export interface AppProps {
+  api?: DesktopApi;
+  initialState?: RendererState;
+}
+
+function runtimeApi(explicit?: DesktopApi): DesktopApi | undefined {
+  if (explicit) return explicit;
+  if (typeof window !== "undefined" && window.uthcode) return window.uthcode;
+  return undefined;
+}
+
+function asObject(value: unknown): JsonObject {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as JsonObject;
+  return {};
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (error && typeof error === "object") {
+    const source = error as { message?: unknown; error?: { message?: unknown } };
+    if (typeof source.error?.message === "string") return source.error.message;
+    if (typeof source.message === "string") return source.message;
+  }
+  return fallback;
+}
+
+async function waitForIdle(api: DesktopApi): Promise<void> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      const value = asObject(await api.requestRuntime("status.get", {}));
+      if (value.active_turn !== true) return;
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function projectPreferences(projects: ProjectState[]): DesktopPreferences["recentProjects"] {
+  return projects.map((project) => ({
+    path: project.path,
+    alias: project.alias,
+    pinned: project.pinned,
+    lastOpenedAt: project.lastOpenedAt,
+  }));
+}
+
+type RuntimeRequest = (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject) => Promise<JsonValue>;
+
+export function projectRemovalPlan(projects: readonly ProjectState[], selectedProjectKey: string | null, removedProjectKey: string): {
+  remaining: ProjectState[];
+  current: boolean;
+  replacement: ProjectState | null;
+} {
+  const remaining = projects.filter((project) => project.projectKey !== removedProjectKey);
+  return {
+    remaining,
+    current: selectedProjectKey === removedProjectKey,
+    replacement: remaining[0] ?? null,
+  };
+}
+
+/** Recreate the Application/Run owner after configuration changes. */
+export async function rebootstrapProject(
+  request: RuntimeRequest,
+  projectPath: string,
+  sessionId: string | null,
+  onProjectOpened: (result: JsonValue) => void,
+  onSessionResumed: (result: JsonValue) => void,
+): Promise<void> {
+  await request("runtime.shutdown", {});
+  await request("runtime.initialize", { workdir: projectPath });
+  const opened = await request("project.open", { path: projectPath });
+  onProjectOpened(opened);
+  if (sessionId) {
+    const resumed = await request("session.resume", { session_id: sessionId });
+    onSessionResumed(resumed);
+  }
+}
+
+export function App({ api: explicitApi, initialState }: AppProps) {
+  const [state, dispatch] = useReducer(reduceRendererState, initialState ?? createInitialState());
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const api = runtimeApi(explicitApi);
+
+  const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
+    if (!api) throw new Error("Desktop API is unavailable");
+    return api.requestRuntime(method, params);
+  }, [api]);
+
+  const persist = useCallback(async (key: "theme" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
+    if (!api) return;
+    try {
+      await api.writePreference(key as never, value as never);
+    } catch {
+      // Desktop metadata is advisory; a temporary preference failure must not
+      // replace the Application's authoritative state.
+    }
+  }, [api]);
+
+  const refreshCatalog = useCallback(async (projectKey: string) => {
+    try {
+      const result = asObject(await send("project.sessions", {}));
+      const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+      dispatch({ type: "catalog_refreshed", projectKey, sessions });
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Session catalog unavailable") });
+    }
+  }, [send]);
+
+  const openProjectPath = useCallback(async (path: string) => {
+    try {
+      const result = await send("project.open", { path });
+      dispatch({ type: "project_opened", result });
+      const next = stateRef.current.projects.some((project) => project.projectKey === path)
+        ? stateRef.current.projects
+        : [...stateRef.current.projects, { path, projectKey: path, alias: path.split(/[\\/]/u).filter(Boolean).pop() || path, pinned: false, sessions: [], catalogFresh: true }];
+      await persist("recentProjects", projectPreferences(next));
+      await persist("selectedProjectKey", path);
+      await refreshCatalog(path);
+    } catch (error) {
+      const existing = stateRef.current.projects.find((project) => project.projectKey === path);
+      const project = existing ?? { path, projectKey: path, alias: path.split(/[\\/]/u).filter(Boolean).pop() || path, pinned: false, sessions: [], catalogFresh: false };
+      const projects = existing ? stateRef.current.projects : [...stateRef.current.projects, project];
+      dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), selectedProjectKey: path, selectedSessionId: null } });
+      await persist("recentProjects", projectPreferences(projects));
+      await persist("selectedProjectKey", path);
+      dispatch({ type: "runtime_error", message: errorMessage(error, "Project could not be opened"), state: "configuration_required" });
+      dispatch({ type: "set_view", view: "settings" });
+    }
+  }, [persist, refreshCatalog, send]);
+
+  useEffect(() => {
+    if (!api) {
+      dispatch({ type: "runtime_state", state: "ready" });
+      return undefined;
+    }
+    let cancelled = false;
+    const unsubscribe = api.subscribeAgentEvents((event) => {
+      if (!cancelled) dispatch({ type: "agent_event", event });
+    });
+    void Promise.all([
+      api.readPreference("theme"),
+      api.readPreference("panelMode"),
+      api.readPreference("recentProjects"),
+      api.readPreference("projectAliases"),
+      api.readPreference("pinnedProjectKeys"),
+      api.readPreference("selectedProjectKey"),
+      api.readPreference("selectedSessionId"),
+    ]).then(([theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, selectedProjectKey, selectedSessionId]) => {
+      if (cancelled) return;
+      dispatch({ type: "hydrate_preferences", preferences: { theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, selectedProjectKey, selectedSessionId } });
+      const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
+      if (selected) {
+        void send("runtime.initialize", { workdir: selected.path }).then((result) => {
+          if (cancelled) return;
+          dispatch({ type: "runtime_initialized", result });
+          void refreshCatalog(selected.path);
+          if (selectedSessionId) {
+            void send("session.resume", { session_id: selectedSessionId }).then((resumed) => {
+              if (!cancelled) dispatch({ type: "session_resumed", result: resumed });
+            }).catch((error) => {
+              if (!cancelled) dispatch({ type: "notice", text: errorMessage(error, "Selected Session could not be resumed") });
+            });
+          }
+        }).catch((error) => {
+          if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, "Runtime could not start"), state: "configuration_required" });
+        });
+      } else {
+        dispatch({ type: "runtime_state", state: "ready" });
+      }
+    }).catch((error) => {
+      if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, "Desktop preferences unavailable"), state: "ready" });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [api, send]);
+
+  const openProject = useCallback(async () => {
+    if (!api) return;
+    try {
+      const path = await api.openProject();
+      if (path) await openProjectPath(path);
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Project picker unavailable") });
+    }
+  }, [api, openProjectPath]);
+
+  const closeActiveTurn = useCallback(async () => {
+    if (!api || !stateRef.current.activeTurn) return;
+    try {
+      await send("turn.cancel", {});
+    } catch {
+      // The Bridge owns the terminal error. We still wait for its state before
+      // asking it to replace a Session/Application.
+    }
+    await waitForIdle(api);
+  }, [api, send]);
+
+  const resumeSession = useCallback(async (project: ProjectState, sessionId: string) => {
+    if (!api) return;
+    await closeActiveTurn();
+    try {
+      if (stateRef.current.selectedProjectKey !== project.projectKey) {
+        const opened = await send("project.open", { path: project.path });
+        dispatch({ type: "project_opened", result: opened });
+        await persist("selectedProjectKey", project.projectKey);
+      }
+      if (sessionId) {
+        const result = await send("session.resume", { session_id: sessionId });
+        dispatch({ type: "session_resumed", result });
+        await persist("selectedSessionId", sessionId);
+      } else {
+        const result = await send("session.new", {});
+        const source = asObject(result);
+        const nextId = typeof source.session_id === "string" ? source.session_id : "";
+        if (nextId) {
+          dispatch({ type: "session_new", sessionId: nextId, run: source.run });
+          await persist("selectedSessionId", nextId);
+        }
+      }
+      await refreshCatalog(project.projectKey);
+    } catch (error) {
+      dispatch({ type: "runtime_error", message: errorMessage(error, "Session could not be opened"), state: "ready" });
+    }
+  }, [api, closeActiveTurn, persist, refreshCatalog, send]);
+
+  const newSession = useCallback(async () => {
+    const project = stateRef.current.projects.find((item) => item.projectKey === stateRef.current.selectedProjectKey);
+    if (project) await resumeSession(project, "");
+  }, [resumeSession]);
+
+  const executeCommand = useCallback(async (text: string) => {
+    if (!text.trim() || !api) return;
+    try {
+      const result = await send("command.execute", { text });
+      dispatch({ type: "command_result", result });
+      const source = asObject(result);
+      const action = asObject(source.ui_action);
+      if (action.type === "open_model_picker") {
+        try {
+          const completion = asObject(await send("command.complete", { prefix: "/model " }));
+          const values = Array.isArray(completion.argument_candidates) ? completion.argument_candidates.filter((value): value is string => typeof value === "string") : [];
+          dispatch({ type: "model_candidates", values });
+        } catch {
+          dispatch({ type: "model_candidates", values: [] });
+        }
+      }
+      if (action.type === "session_changed" && typeof action.session_id === "string") {
+        await persist("selectedSessionId", action.session_id);
+        await refreshCatalog(stateRef.current.selectedProjectKey ?? "");
+      }
+      if (action.type === "quit_interface") {
+        await api.closeShell();
+      }
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Command could not be executed") });
+    }
+  }, [api, persist, refreshCatalog, send]);
+
+  const submitComposer = useCallback(async (text: string) => {
+    if (!api || !text.trim() || stateRef.current.pendingInteraction) return;
+    if (text.trimStart().startsWith("/")) {
+      await executeCommand(text.trim());
+      return;
+    }
+    const steering = stateRef.current.activeTurn;
+    try {
+      const result = steering
+        ? await send("turn.steer", { text })
+        : await send("turn.start", { prompt: text });
+      dispatch({ type: "turn_accepted", run: asObject(result).run, steering, text });
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be started") });
+    }
+  }, [api, executeCommand, send]);
+
+  const completeCommand = useCallback(async (prefix: string) => {
+    if (!api || !prefix.trimStart().startsWith("/")) return;
+    try {
+      const result = await send("command.complete", { prefix });
+      dispatch({ type: "command_candidates", result });
+    } catch {
+      dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } });
+    }
+  }, [api, send]);
+
+  const sendInteraction = useCallback(async (response: JsonObject) => {
+    if (!api || !stateRef.current.pendingInteraction) return;
+    dispatch({ type: "interaction_submitting", value: true });
+    try {
+      await send("turn.resume", { response });
+    } catch (error) {
+      dispatch({ type: "interaction_submitting", value: false });
+      dispatch({ type: "notice", text: errorMessage(error, "Interaction could not be submitted") });
+    }
+  }, [api, send]);
+
+  const cancelTurn = useCallback(async () => {
+    if (!api) return;
+    try {
+      await send("turn.cancel", {});
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be cancelled") });
+    }
+  }, [api, send]);
+
+  const pauseTurn = useCallback(async () => {
+    if (!api) return;
+    try {
+      await send("turn.pause", {});
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be paused") });
+    }
+  }, [api, send]);
+
+  const setTheme = useCallback((theme: ThemePreference) => {
+    dispatch({ type: "set_theme", theme });
+    void persist("theme", theme);
+  }, [persist]);
+
+  const setPanelMode = useCallback((panelMode: PanelModePreference) => {
+    dispatch({ type: "set_panel_mode", panelMode });
+    void persist("panelMode", panelMode);
+  }, [persist]);
+
+  const toggleRuntime = useCallback(() => {
+    setPanelMode(stateRef.current.panelMode === "floating" ? "hidden" : "floating");
+  }, [setPanelMode]);
+
+  const aliasChange = useCallback((projectKey: string, alias: string) => {
+    const projects = stateRef.current.projects.map((project) => project.projectKey === projectKey ? { ...project, alias } : project);
+    dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), projectAliases: Object.fromEntries(projects.map((project) => [project.projectKey, project.alias])) } });
+    void persist("recentProjects", projectPreferences(projects));
+    void persist("projectAliases", Object.fromEntries(projects.map((project) => [project.projectKey, project.alias])));
+  }, [persist]);
+
+  const togglePin = useCallback((project: ProjectState) => {
+    const projects = stateRef.current.projects.map((item) => item.projectKey === project.projectKey ? { ...item, pinned: !item.pinned } : item);
+    dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), pinnedProjectKeys: projects.filter((item) => item.pinned).map((item) => item.projectKey) } });
+    void persist("recentProjects", projectPreferences(projects));
+    void persist("pinnedProjectKeys", projects.filter((item) => item.pinned).map((item) => item.projectKey));
+  }, [persist]);
+
+  const removeProject = useCallback(async (project: ProjectState) => {
+    const current = stateRef.current;
+    const removal = projectRemovalPlan(current.projects, current.selectedProjectKey, project.projectKey);
+    if (!removal.current) {
+      const remaining = removal.remaining;
+      dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(remaining) } });
+      await persist("recentProjects", projectPreferences(remaining));
+      return;
+    }
+
+    await closeActiveTurn();
+    try {
+      const replacement = removal.replacement;
+      if (replacement) {
+        const opened = await send("project.open", { path: replacement.path });
+        dispatch({ type: "project_opened", result: opened });
+        dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(removal.remaining), selectedProjectKey: replacement.projectKey, selectedSessionId: null } });
+        await persist("recentProjects", projectPreferences(removal.remaining));
+        await persist("selectedProjectKey", replacement.projectKey);
+        await persist("selectedSessionId", null);
+        await refreshCatalog(replacement.projectKey);
+      } else {
+        await send("runtime.shutdown", {});
+        dispatch({ type: "workspace_cleared" });
+        dispatch({ type: "hydrate_preferences", preferences: { recentProjects: [], selectedProjectKey: null, selectedSessionId: null } });
+        await persist("recentProjects", []);
+        await persist("selectedProjectKey", null);
+        await persist("selectedSessionId", null);
+      }
+    } catch (error) {
+      dispatch({ type: "runtime_error", message: errorMessage(error, "Project could not be removed"), state: "ready" });
+    }
+  }, [closeActiveTurn, persist, refreshCatalog, send]);
+
+  const openExplorer = useCallback((project: ProjectState) => {
+    if (!api) return;
+    void api.openProjectInExplorer(project.path).catch((error) => dispatch({ type: "notice", text: errorMessage(error, "Explorer could not be opened") }));
+  }, [api]);
+
+  const loadSettings = useCallback(async () => {
+    if (!api) {
+      dispatch({ type: "settings_loaded", configuration: {} });
+      return;
+    }
+    dispatch({ type: "set_view", view: "settings" });
+    try {
+      const result = asObject(await send("settings.get", {}));
+      dispatch({ type: "settings_loaded", configuration: (asObject(result.configuration) as ConfigurationView) });
+    } catch (error) {
+      dispatch({ type: "settings_error", message: errorMessage(error, "Configuration is not initialized") });
+    }
+  }, [api, send]);
+
+  const saveSettings = useCallback(async (request: ConfigurationWrite) => {
+    if (!api || stateRef.current.activeTurn) {
+      dispatch({ type: "settings_error", message: "Finish the active Turn before saving settings" });
+      throw new Error("Finish the active Turn before saving settings");
+    }
+    const projectKey = stateRef.current.selectedProjectKey;
+    const sessionId = stateRef.current.selectedSessionId;
+    dispatch({ type: "settings_saving", value: true });
+    try {
+      const result = await send("settings.save", { request: request as unknown as JsonObject });
+      dispatch({ type: "settings_loaded", configuration: asObject(result).configuration as ConfigurationView });
+      if (projectKey) {
+        await rebootstrapProject(
+          send,
+          projectKey,
+          sessionId,
+          (opened) => dispatch({ type: "project_opened", result: opened }),
+          (resumed) => dispatch({ type: "session_resumed", result: resumed }),
+        );
+        dispatch({ type: "runtime_state", state: "ready" });
+        await refreshCatalog(projectKey);
+      }
+      dispatch({ type: "notice", text: "Settings saved" });
+    } catch (error) {
+      dispatch({ type: "settings_error", message: errorMessage(error, "Configuration could not be saved") });
+      throw error;
+    } finally {
+      dispatch({ type: "settings_saving", value: false });
+    }
+  }, [api, refreshCatalog, send]);
+
+  const content = state.view === "settings" ? (
+    <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} />
+  ) : (
+    <>
+      <header className="chat-header">
+        <div>
+          <p className="eyebrow">Conversation</p>
+          <h1>{state.selectedSessionId ? `Session ${state.selectedSessionId.slice(0, 8)}` : "New conversation"}</h1>
+        </div>
+        <div className="chat-header__actions">
+          <button type="button" className="runtime-toggle" aria-label="Toggle Runtime panel" onClick={toggleRuntime}>{state.panelMode === "floating" ? "Hide Runtime" : "Open Runtime"}</button>
+          {state.panelMode === "hidden" && <button type="button" onClick={() => setPanelMode("docked")}>Show Runtime</button>}
+          <button type="button" onClick={() => void executeCommand("/compact")} disabled={state.activeTurn || !state.selectedSessionId}>Compact</button>
+          <button type="button" onClick={() => void executeCommand("/status")}>Status</button>
+        </div>
+      </header>
+      <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} />
+      {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
+      <Composer state={state} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
+    </>
+  );
+
+  const themeClass = `theme-${state.theme}`;
+  return (
+    <div className={`app-shell ${themeClass} panel-${state.panelMode}`}>
+      <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} runtimeHidden={state.panelMode === "hidden"} runtimeOpen={state.panelMode === "floating"} onToggleRuntime={toggleRuntime} onRestoreRuntime={() => setPanelMode("docked")} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />
+      <main className="main-column" aria-label="UthCode conversation workspace">{content}</main>
+      <RuntimePanel state={state} onPanelModeChange={setPanelMode} />
+      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
+    </div>
+  );
+}

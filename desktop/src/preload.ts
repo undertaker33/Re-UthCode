@@ -57,6 +57,9 @@ export function installPreload(
       requirePath(projectPath);
       await ipcRenderer.invoke("desktop.project.explorer", projectPath);
     },
+    async closeShell(): Promise<void> {
+      await ipcRenderer.invoke("desktop.shell.close");
+    },
     async requestRuntime(method: RuntimeMethod, params: JsonObject): Promise<JsonValue> {
       requireMethod(method);
       requireJsonObject(params, "runtime params");

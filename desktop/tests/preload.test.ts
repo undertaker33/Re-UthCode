@@ -47,6 +47,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(exposed.name, "uthcode");
   assert.equal(exposed.api, api);
   assert.deepEqual(Object.keys(api).sort(), [
+    "closeShell",
     "openProject",
     "openProjectInExplorer",
     "readPreference",
@@ -60,6 +61,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
 
   assert.equal(await api.openProject(), "C:\\Projects\\UthCode");
   await api.openProjectInExplorer("C:\\Projects\\UthCode");
+  await api.closeShell();
   await api.requestRuntime("status.get", {});
   await api.readPreference("theme");
   await api.writePreference("theme", "dark");
@@ -67,6 +69,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
     { channel: "desktop.project.explorer", args: ["C:\\Projects\\UthCode"] },
+    { channel: "desktop.shell.close", args: [] },
     { channel: "desktop.runtime.request", args: [{ method: "status.get", params: {} }] },
     { channel: "desktop.preference.read", args: ["theme"] },
     { channel: "desktop.preference.write", args: ["theme", "dark"] },
@@ -165,6 +168,7 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
     write: async () => ({ theme: "dark" }),
   };
   const opened: string[] = [];
+  let shellCloseCount = 0;
   const removeHandlers = registerIpcHandlers({
     window: window as never,
     runtime: runtime as never,
@@ -180,12 +184,15 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
       opened.push(path);
       return "";
     }) as never,
+    closeShell: () => { shellCloseCount += 1; },
   });
 
   const pick = handlers.get(IPC_CHANNELS.pickProject);
   const explorer = handlers.get(IPC_CHANNELS.openProjectInExplorer);
+  const closeShell = handlers.get(IPC_CHANNELS.closeShell);
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
-  assert.ok(pick && explorer && runtimeRequest);
+  assert.ok(pick && explorer && closeShell && runtimeRequest);
+  await assert.rejects(closeShell?.({ sender: {}, senderFrame: mainFrame }), /not trusted/);
   await assert.rejects(
     runtimeRequest?.({ sender: {}, senderFrame: mainFrame }, { method: "status.get", params: {} }),
     /not trusted/,
@@ -193,9 +200,48 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
   await assert.rejects(explorer?.(trustedEvent, "C:\\Projects\\Other"), /selected before/);
   assert.equal(await pick?.(trustedEvent), "C:\\Projects\\UthCode");
   await explorer?.(trustedEvent, "C:\\Projects\\UthCode");
+  await closeShell?.(trustedEvent);
   assert.deepEqual(opened, ["C:\\Projects\\UthCode"]);
+  assert.equal(shellCloseCount, 1);
   removeHandlers();
   assert.equal(handlers.size, 0);
+});
+
+test("main runtime shutdown handler waits for the Runtime child reap boundary", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const calls: string[] = [];
+  const runtime = {
+    start: async () => { calls.push("start"); },
+    request: async (method: string) => { calls.push(`request:${method}`); return { state: "stopped" }; },
+    shutdownAfterRequest: async () => { calls.push("reap"); },
+  };
+  const preferences = { read: async () => ({}), write: async () => ({}) };
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: preferences as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
+    openPath: (async () => "") as never,
+  });
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(runtimeRequest);
+  const result = await runtimeRequest?.({ sender: webContents, senderFrame: mainFrame }, { method: "runtime.shutdown", params: {} });
+  assert.deepEqual(result, { state: "stopped" });
+  assert.deepEqual(calls, ["start", "request:runtime.shutdown", "reap"]);
+  removeHandlers();
 });
 
 test("production Runtime wiring projects diagnostics and idle failures without native details", () => {
