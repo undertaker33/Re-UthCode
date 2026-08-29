@@ -12,16 +12,16 @@
 
 ## T02：Python Desktop Bridge
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_desktop_protocol.py tests/test_desktop_bridge.py tests/test_architecture_boundaries.py -q`，全部通过。
-- [ ] valid request 每次只调用对应 Application use case 一次；invalid JSON、unknown method/field、duplicate/unknown id 产生 protocol error 且不进入 Agent Runtime。
-- [ ] Bridge 只持有一个 Application、一个 Run 和最多一个 active Turn；second start 被拒绝，steer/pause/resume/cancel 都作用于同一 handle，terminal 释放 active slot。
-- [ ] pending typed interaction 截获普通输入和 Slash；stale/wrong-kind/duplicate response 被拒绝且不改变 pending；ResumeTurn、AskUser、Permission、Plan、Retry 具体 response 映射正确。
-- [ ] Plan/Retry/Pause Cancel 调用 `TurnHandle.cancel()`；Plan Revise 空 feedback 被拒绝；Permission 使用每次 request.choices，没有 SESSION choice 时不伪造该操作。
-- [ ] command completion 同时覆盖 command 与 argument candidates；active/pending 门禁与 TUI 当前行为一致，不允许 `/model`/`/new`/`/resume`/`/compact`/mode 命令绕过 active Turn。
-- [ ] session new/resume 与 project switch 都创建 fresh Run，旧 history/session grant/mode/active handle 不渗入；corrupt/busy/unknown/projection failure 不破坏原 active Session。
-- [ ] AgentEvent 保留原名、identity 与顺序；Runtime lifecycle/protocol error 与 TurnFailed/Provider failure 分域，子进程异常不伪装为 FailureReason。
-- [ ] 以子进程运行 `python -m uthcode.interfaces.desktop` 完成 ready/status/shutdown，stdout 每一行均为合法协议 JSON，stderr 不污染 parser，shutdown 调用 Application close。
-- [ ] 注入假 secret/native exception/raw ToolResult 后，response/event/error/stdout/stderr 的公开投影不包含该内容。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_desktop_protocol.py tests/test_desktop_bridge.py tests/test_architecture_boundaries.py -q`，全部通过。
+- [x] valid request 每次只调用对应 Application use case 一次；invalid JSON、unknown method/field、duplicate/unknown id 产生 protocol error 且不进入 Agent Runtime。
+- [x] Bridge 只持有一个 Application、一个 Run 和最多一个 active Turn；second start 被拒绝，steer/pause/resume/cancel 都作用于同一 handle，terminal 释放 active slot。
+- [x] pending typed interaction 截获普通输入和 Slash；stale/wrong-kind/duplicate response 被拒绝且不改变 pending；ResumeTurn、AskUser、Permission、Plan、Retry 具体 response 映射正确。
+- [x] Plan/Retry/Pause Cancel 调用 `TurnHandle.cancel()`；Plan Revise 空 feedback 被拒绝；Permission 使用每次 request.choices，没有 SESSION choice 时不伪造该操作。
+- [x] command completion 同时覆盖 command 与 argument candidates；active/pending 门禁与 TUI 当前行为一致，不允许 `/model`/`/new`/`/resume`/`/compact`/mode 命令绕过 active Turn。
+- [x] session new/resume 与 project switch 都创建 fresh Run，旧 history/session grant/mode/active handle 不渗入；corrupt/busy/unknown/projection failure 不破坏原 active Session。
+- [x] AgentEvent 保留原名、identity 与顺序；Runtime lifecycle/protocol error 与 TurnFailed/Provider failure 分域，子进程异常不伪装为 FailureReason。
+- [x] 以子进程运行 `python -m uthcode.interfaces.desktop` 完成 ready/status/shutdown，stdout 每一行均为合法协议 JSON，stderr 不污染 parser，shutdown 调用 Application close。
+- [x] 注入假 secret/native exception/raw ToolResult 后，response/event/error/stdout/stderr 的公开投影不包含该内容。
 
 ## T03：Electron Shell 与 Python Process
 
