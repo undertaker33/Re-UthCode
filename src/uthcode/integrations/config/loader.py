@@ -357,8 +357,163 @@ def _validate_project_mapping(mapping: Mapping[str, Any], *, path: Path) -> None
     _validate_model_tables(mapping, path=path, project=True)
 
 
+def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a parsed user config to current fields without credentials."""
+
+    result: dict[str, Any] = {}
+    for key in ("default_model", "default_permission_mode"):
+        if key in mapping:
+            result[key] = mapping[key]
+
+    raw_providers = mapping.get("providers", {})
+    safe_providers: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_providers, Mapping):
+        for profile_id, raw_profile in raw_providers.items():
+            if not isinstance(profile_id, str):
+                continue
+            profile = raw_profile if isinstance(raw_profile, Mapping) else {}
+            safe: dict[str, Any] = {
+                "provider_profile_id": profile_id,
+                "kind": profile.get("kind"),
+                "base_url": profile.get("base_url"),
+                "api_key_configured": (
+                    isinstance(profile.get("api_key"), str)
+                    and bool(profile.get("api_key", "").strip())
+                ),
+            }
+            safe_providers[profile_id] = safe
+    result["providers"] = safe_providers
+
+    raw_models = mapping.get("models", {})
+    safe_models: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_models, Mapping):
+        for model_ref, raw_profile in raw_models.items():
+            if not isinstance(model_ref, str):
+                continue
+            profile = raw_profile if isinstance(raw_profile, Mapping) else {}
+            safe_models[model_ref] = {
+                "model_ref": model_ref,
+                # provider is the TOML spelling.  The Application DTO
+                # performs the explicit translation to provider_profile_id.
+                "provider_profile_id": profile.get("provider"),
+                "remote_id": profile.get("remote_id"),
+                "display_name": profile.get("display_name"),
+                "context_window": profile.get("context_window"),
+                "max_output_tokens": profile.get("max_output_tokens"),
+                "reasoning_effort": profile.get("reasoning_effort"),
+            }
+    result["models"] = safe_models
+    return result
+
+
+def read_user_config_view_data(
+    path: str | os.PathLike[str] | Path,
+    *,
+    create_if_missing: bool = False,
+) -> Mapping[str, Any]:
+    """Read only display-safe current-schema user configuration fields.
+
+    This function intentionally never resolves or returns an API key.  A
+    missing file is created only when explicitly requested by the Application
+    bootstrap use case.
+    """
+
+    target = _physical_path(path)
+    if not target.is_file():
+        if not create_if_missing:
+            raise ConfigurationError("user configuration was not found", path=target)
+        try:
+            create_user_template(target)
+        except Exception:
+            raise ConfigurationError(
+                "user configuration is missing and its template could not be created",
+                path=target,
+            ) from None
+    return _safe_user_mapping(_read_mapping(target))
+
+
 def _blank(value: object) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def validate_user_config_mapping(
+    mapping: Mapping[str, Any],
+    *,
+    path: str | os.PathLike[str] | Path,
+    resolve_secrets: bool = True,
+) -> LoadedConfigData:
+    """Validate one complete user mapping without reading project config.
+
+    Normal loading resolves configured credentials.  The atomic writer can
+    pass ``resolve_secrets=False`` to validate a candidate's credential
+    expression without requiring an ``env:`` variable to exist during an
+    edit.
+    """
+
+    target = _physical_path(path)
+    if not isinstance(mapping, Mapping):
+        raise ConfigurationError("configuration root must be a table", path=target)
+    if not mapping:
+        raise ConfigurationInitializationRequired(target)
+    _validate_user_mapping(mapping, path=target)
+    default_permission_mode = mapping.get("default_permission_mode", "default")
+    if default_permission_mode not in {"default", "auto"}:
+        raise ConfigurationError(
+            "default_permission_mode must be default or auto",
+            path=target,
+            field="default_permission_mode",
+        )
+    providers = _provider_profiles(
+        mapping,
+        path=target,
+        resolve_secrets=resolve_secrets,
+    )
+    models = _model_tables(mapping, path=target)
+    selected_ref = mapping.get("default_model")
+    if not providers and not models and _blank(selected_ref):
+        raise ConfigurationInitializationRequired(target)
+    if not isinstance(selected_ref, str) or not selected_ref.strip():
+        raise ConfigurationError(
+            "configuration requires a default_model",
+            path=target,
+            field="default_model",
+        )
+    canonical_models = _model_profiles(models, path=target)
+    if selected_ref not in canonical_models:
+        raise ConfigurationError(
+            "default_model must reference an enabled Model profile",
+            path=target,
+            field="default_model",
+        )
+    for model_ref, profile in canonical_models.items():
+        provider_profile_id = profile["provider_profile_id"]
+        if provider_profile_id not in providers:
+            raise ConfigurationError(
+                "unknown provider reference",
+                path=target,
+                field=f"models.{model_ref}.provider",
+            )
+        reasoning_effort = profile.get("reasoning_effort")
+        provider = providers[provider_profile_id]
+        provider_kind = provider.get("kind")
+        if (
+            reasoning_effort is not None
+            and reasoning_effort != "none"
+            and provider_kind
+            not in {"fake", "openai_responses", "openai_compat"}
+        ):
+            raise ConfigurationError(
+                f"Provider {provider_profile_id!r} does not support reasoning_effort",
+                path=target,
+                field=f"models.{model_ref}.reasoning_effort",
+            )
+    return LoadedConfigData(
+        default_model=selected_ref,
+        providers=providers,
+        models=canonical_models,
+        sources=(LoadedConfigSource("user", target),),
+        default_permission_mode=default_permission_mode,
+    )
 
 
 def _resolve_api_key(value: object, *, path: Path, field: str) -> SecretValue | None:
@@ -387,10 +542,32 @@ def _resolve_api_key(value: object, *, path: Path, field: str) -> SecretValue | 
     return SecretValue(value)
 
 
+def _validate_api_key_expression(
+    value: object,
+    *,
+    path: Path,
+    field: str,
+) -> bool:
+    """Validate key syntax without reading a literal or environment value."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    if not isinstance(value, str):
+        raise ConfigurationError("api_key must be a string", path=path, field=field)
+    if value.startswith("env:") and _ENVIRONMENT_NAME.fullmatch(value[4:]) is None:
+        raise ConfigurationError(
+            "api_key environment variable name is invalid",
+            path=path,
+            field=field,
+        )
+    return True
+
+
 def _provider_profiles(
     mapping: Mapping[str, Any],
     *,
     path: Path,
+    resolve_secrets: bool = True,
 ) -> dict[str, dict[str, object]]:
     raw_providers = _require_table(mapping.get("providers", {}), path=path, field="providers")
     result: dict[str, dict[str, object]] = {}
@@ -418,12 +595,21 @@ def _provider_profiles(
                 path=path,
                 field=f"providers.{profile_id}",
             )
-        api_key = _resolve_api_key(
-            api_key_value,
-            path=path,
-            field=f"providers.{profile_id}.api_key",
-        )
-        if kind.strip().lower() != "fake" and api_key is None:
+        if resolve_secrets:
+            api_key = _resolve_api_key(
+                api_key_value,
+                path=path,
+                field=f"providers.{profile_id}.api_key",
+            )
+            api_key_configured = api_key is not None
+        else:
+            api_key = None
+            api_key_configured = _validate_api_key_expression(
+                api_key_value,
+                path=path,
+                field=f"providers.{profile_id}.api_key",
+            )
+        if kind.strip().lower() != "fake" and not api_key_configured:
             raise ConfigurationError(
                 "real Provider requires a non-empty api_key",
                 path=path,
@@ -677,5 +863,7 @@ __all__ = [
     "discover_scoped_paths",
     "load_config_data",
     "physical_path",
+    "read_user_config_view_data",
     "resolve_user_home",
+    "validate_user_config_mapping",
 ]

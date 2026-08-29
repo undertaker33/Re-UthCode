@@ -8,12 +8,18 @@ from .configuration import (
     ModelProfile,
     ProviderKind,
     ProviderProfile,
+    UserConfigurationView,
+    UserConfigurationWriteRequest,
+    UserModelView,
+    UserProviderView,
 )
 from .bootstrap import (
     ConfigurationError,
     ConfigurationInitializationRequired,
     create_application,
     load_effective_config,
+    read_user_configuration,
+    write_user_configuration,
 )
 from .generation import (
     ApplicationStatus,
@@ -221,6 +227,10 @@ __all__ = [
     "ProviderIdentity",
     "ProviderResponse",
     "ProviderProfile",
+    "UserConfigurationView",
+    "UserConfigurationWriteRequest",
+    "UserModelView",
+    "UserProviderView",
     "PauseKind",
     "PauseReason",
     "PauseRequest",
@@ -268,6 +278,8 @@ __all__ = [
     "failure_message",
     "create_builtin_registry",
     "load_effective_config",
+    "read_user_configuration",
+    "write_user_configuration",
     "parse_command",
     "pause_message",
     "parse_instruction_references",

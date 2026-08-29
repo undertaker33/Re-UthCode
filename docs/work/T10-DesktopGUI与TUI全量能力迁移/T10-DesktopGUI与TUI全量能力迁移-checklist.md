@@ -2,13 +2,13 @@
 
 ## T01：用户配置 GUI 闭环
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_configuration.py tests/test_config_contract.py tests/test_config_loader_integration.py -q`，全部通过。
-- [ ] 无配置、空模板、语义无效但 TOML 可解析时能返回可编辑安全视图；TOML 语法不可解析时返回稳定错误而不破坏原文件。
-- [ ] 安全读取只返回 Provider/Model 当前字段和 `api_key_configured`，不返回 literal/env key、`SecretValue`、未知字段或 project credentials。
-- [ ] 新增/修改/删除 Provider/Model、default model 和 default permission 的有效/无效路径均有测试；`full_access` 不可写为默认值。
-- [ ] 修改已配置 Provider 但未提供新 key 时保留原 literal/env 表达；提供新 key 时一次性替换且 response 不回显；删除被 Model 引用的 Provider 被拒绝。
-- [ ] 原子写入成功后 `load_effective_config` 和 `create_application` 可成功；写入失败不留部分文件，现有 `/model` 与 `/permission` 写回测试不退化。
-- [ ] 注入假 API Key 后，配置 DTO、`repr`、error、log 和 test snapshot 均不包含明文。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_configuration.py tests/test_config_contract.py tests/test_config_loader_integration.py -q`，全部通过。
+- [x] 无配置、空模板、语义无效但 TOML 可解析时能返回可编辑安全视图；TOML 语法不可解析时返回稳定错误而不破坏原文件。
+- [x] 安全读取只返回 Provider/Model 当前字段和 `api_key_configured`，不返回 literal/env key、`SecretValue`、未知字段或 project credentials。
+- [x] 新增/修改/删除 Provider/Model、default model 和 default permission 的有效/无效路径均有测试；`full_access` 不可写为默认值。
+- [x] 修改已配置 Provider 但未提供新 key 时保留原 literal/env 表达；提供新 key 时一次性替换且 response 不回显；删除被 Model 引用的 Provider 被拒绝。
+- [x] 原子写入成功后 `load_effective_config` 和 `create_application` 可成功；写入失败不留部分文件，现有 `/model` 与 `/permission` 写回测试不退化。
+- [x] 注入假 API Key 后，配置 DTO、`repr`、error、log 和 test snapshot 均不包含明文。
 
 ## T02：Python Desktop Bridge
 
