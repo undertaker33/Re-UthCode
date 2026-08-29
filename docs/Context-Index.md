@@ -51,7 +51,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-28
+status_snapshot: 2026-08-29
 status_scope: docs/work/*XX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -74,22 +74,23 @@ status_values:
 | T07-1 | 权限分类与完全访问收口 | `docs/work/archive/T07-1-权限分类与完全访问收口/` |
 | T08 | 任务规划与执行控制 | `docs/work/archive/T08-任务规划与执行控制/` |
 | T08-1 | 阶段一扫尾 | `docs/work/archive/T08-1-阶段一扫尾/` |
+| B01 | 私有测试集 v0 | `docs/work/archive/B01-私有测试集v0/` |
+| T09 | Prompt 与 Context Engineering | `docs/work/archive/T09-Prompt与ContextEngineering/` |
+| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/archive/T09-1-Context预算与Compact协议补齐/` |
+| T09-2 | 工程收敛与提前抽象清理 | `docs/work/archive/T09-2-工程收敛与提前抽象清理/` |
+| T09-3 | 256K Context 工程调优与通用失败语义 | `docs/work/archive/T09-3-256KContext工程调优与通用失败语义/` |
+| F01 | TUI 回复链路与 Session 恢复修复 | `docs/work/archive/F01-TUI回复链路与Session恢复修复/` |
 
 ### `implemented_unarchived`
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| B01 | 私有测试集 v0 | `docs/work/B01-私有测试集v0/` | W03 第二轮已关闭报告级 `task_sample_counts` 内部一致性阻断；Task 1～9 Checklist 已完成；Eval 77、定向 297、架构 23、全量 1084 passed/3 skipped；真实 baseline 仍需单独授权，工作包未归档 |
-| T09 | Prompt 与 Context Engineering | `docs/work/T09-Prompt与ContextEngineering/` | W06 及定点返工接入 Session closed-fact persistence、Tool Result ref、Instruction State resume、分阶段 persistence outcome 与 Eval diagnostics；T09-1 在独立工作包中补齐 dynamic limits、Transcript/Timeline、生产 L4/L5、manual Compact、HistoryRead 与 overflow retry；T09 工作包未归档 |
-| T09-1 | Context 预算与 Compact 协议补齐 | `docs/work/T09-1-Context预算与Compact协议补齐/` | T01～T08 Checklist 全部完成；W01～W06 Feedback 齐全；定向、架构和全量回归结果记录于 W06 Feedback；工作包未归档 |
-| T09-2 | 工程收敛与提前抽象清理 | `docs/work/T09-2-工程收敛与提前抽象清理/` | W01 Task 1～9 Checklist 已完成；全量 `1189 passed, 3 skipped`、compileall/pip check/diff check/UTF-8 guard 均通过。用户已确认 `AGENTS.md` 的 57 行规则为本次交付基线，后续 T09-2 提交/推送一并纳入；工作包未归档 |
-| T09-3 | 256K Context 工程调优与通用失败语义 | `docs/work/T09-3-256KContext工程调优与通用失败语义/` | W01～W05 Feedback 齐全，T01～T08 Checklist 已完成；Application 唯一主链已收口 default 256K/balanced-208k profile/provenance、High→Low/L4/L5/overflow、Provider cache usage、FailureReason/PauseReason 与安全 diagnostics；返工已补充 selected profile 进入正式 resolver/Turn 的证据；定向、Eval、架构、全量、compileall、pip check、diff check 与 UTF-8 guard 结果记录于 W05 Feedback；工作包未归档 |
-| F01 | TUI 回复链路与 Session 恢复修复 | `docs/work/F01-TUI回复链路与Session恢复修复/` | W01～W06 Feedback 齐全；W01～W05 已接入 typed Prompt/History、safe replay、TUI 流式时序与 `/resume` hydrate；W06 R3 记录用户真实界面验收原话“界面基本没问题”及 Session JSONL / 正式 replay 只读证据；JSONL 不记录 `/resume` 动作本身，恢复结论由用户验收与 W06 E2E 支撑；Checklist 全部完成；工作包未归档 |
 
 ### `not_implemented`
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
+| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | 原始需求、Spec、Tasks、Checklist 与 W01～W06 Prompt 已生成；未派发 Worker，未开始实施 |
 
 ## 跨层最短链路
 
