@@ -25,15 +25,15 @@
 
 ## T03：Electron Shell 与 Python Process
 
-- [ ] 在 `desktop` 执行 `npm ci`、`npm run typecheck`、`npm test`，全部通过。
-- [ ] 执行 `npm ls electron @electron-forge/cli @electron-forge/plugin-webpack @electron-forge/maker-squirrel`，记录实际解析版本，Electron 为冻结 44.x stable 线、Forge 为 7.11.2 stable 线。
-- [ ] BrowserWindow 断言 `nodeIntegration=false`、`contextIsolation=true`、`sandbox=true`；Renderer 中 `require`/`process`/`fs`/`child_process` 不可用，Preload 不暴露 raw `ipcRenderer` 或 event 对象。
-- [ ] production CSP、navigation/new-window deny/allowlist、no-webview、IPC sender/frame/origin 校验和本地内容限制有自动或打包后证据。
-- [ ] Python child 使用 `spawn` + `shell:false` + 三路 pipe + `windowsHide:true`；dev 只用当前项目 Python，production 只从 `process.resourcesPath` 解析 Runtime，无 PATH/system Python fallback。
-- [ ] request timeout、Bridge exit、malformed response 会拒绝对应 pending request 并显示 Runtime 边界错误，不伪装为 Agent/Provider failure。
-- [ ] folder picker 只返回选定绝对路径；Explorer 动作只处理已登记项目路径；Renderer 不能发起任意 shell/fs 操作。
-- [ ] Desktop preference 只持久化 theme/window/nav/panel/recent/alias/pin/selection 类 UI 元数据，无 API Key、Session 内容或 Agent 权威事实。
-- [ ] graceful shutdown 与有界 terminate/reap 测试通过，记录 child PID 并断言 Electron 退出后进程不存在。
+- [x] 在 `desktop` 执行 `npm ci`、`npm run typecheck`、`npm test`，全部通过。
+- [x] 执行 `npm ls electron @electron-forge/cli @electron-forge/plugin-webpack @electron-forge/maker-squirrel`，记录实际解析版本，Electron 为冻结 44.x stable 线、Forge 为 7.11.2 stable 线。
+- [x] BrowserWindow 断言 `nodeIntegration=false`、`contextIsolation=true`、`sandbox=true`；Renderer 中 `require`/`process`/`fs`/`child_process` 不可用，Preload 不暴露 raw `ipcRenderer` 或 event 对象。
+- [x] production CSP、navigation/new-window deny/allowlist、no-webview、IPC sender/frame/origin 校验和本地内容限制有自动或打包后证据。
+- [x] Python child 使用 `spawn` + `shell:false` + 三路 pipe + `windowsHide:true`；dev 只用当前项目 Python，production 只从 `process.resourcesPath` 解析 Runtime，无 PATH/system Python fallback。
+- [x] request timeout、Bridge exit、malformed response 会拒绝对应 pending request 并显示 Runtime 边界错误，不伪装为 Agent/Provider failure。
+- [x] folder picker 只返回选定绝对路径；Explorer 动作只处理已登记项目路径；Renderer 不能发起任意 shell/fs 操作。
+- [x] Desktop preference 只持久化 theme/window/nav/panel/recent/alias/pin/selection 类 UI 元数据，无 API Key、Session 内容或 Agent 权威事实。
+- [x] graceful shutdown 与有界 terminate/reap 测试通过，记录 child PID 并断言 Electron 退出后进程不存在。
 
 ## T04：Desktop 主界面、Project 与 Session
 
