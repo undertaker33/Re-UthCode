@@ -74,6 +74,7 @@ export interface AgentEvent {
 export interface DesktopApi {
   openProject(): Promise<string | null>;
   openProjectInExplorer(projectPath: string): Promise<void>;
+  closeShell(): Promise<void>;
   requestRuntime(method: RuntimeMethod, params: JsonObject): Promise<JsonValue>;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;
   readPreference<K extends PreferenceKey>(key: K): Promise<DesktopPreferences[K]>;

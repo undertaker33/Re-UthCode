@@ -37,22 +37,22 @@
 
 ## T04：Desktop 主界面、Project 与 Session
 
-- [ ] 执行 Renderer 定向测试，New chat/Open project、pinned/projects/recent、Settings 和 Runtime Panel floating/docked/hidden 均通过。
+- [x] 执行 Renderer 定向测试，New chat/Open project、pinned/projects/recent、Settings 和 Runtime Panel floating/docked/hidden 均通过。
 - [ ] 打开项目调用 native folder picker；编辑显示别名不改变 filesystem/workdir/project key；移除项目不删磁盘或 Session。
 - [ ] 项目激活时 catalog 从 Application 刷新；非当前项目 last-known catalog 只用于导航，resume 内容不来自该缓存或 Renderer 文件扫描。
 - [ ] 点击三个不同 Session 时各自的 safe replay 原子替换 Timeline，标签使用 preview/short ID，后续输入进入被选 Session。
-- [ ] 新建 Session 后 Timeline 立即为空、绑定 fresh Run，不显示上一 Session 消息、mode 或 grant。
+- [x] 新建 Session 后 Timeline 立即为空、绑定 fresh Run，不显示上一 Session 消息、mode 或 grant。
 - [ ] active Turn 时切 Session/Project 严格经过 cancel -> terminal -> close/recreate -> fresh Run -> resume，不同时启动多项目 Runtime。
-- [ ] 生产 UI 不存在恢复会话页、account/logout/usage、hover preview cards、第二全局左栏、fake projectStore 或浏览器 prompt/confirm。
+- [x] 生产 UI 不存在恢复会话页、account/logout/usage、hover preview cards、第二全局左栏、fake projectStore 或浏览器 prompt/confirm。
 
 ## T05：Conversation Timeline、Streaming 与 Composer
 
-- [ ] Renderer 测试覆盖 replay `user/steering/reasoning/assistant/tool` 按 sequence 排序，与 live stream 连续且不伪造 replay 不包含的 Plan/Todo/pause/failure 持久事实。
-- [ ] assistant delta 仅更新 preview，completed 以权威正文替换且只显示一次，failed/cancelled 丢弃未完成 preview。
-- [ ] reasoning tail 在 assistant/tool/terminal 前收口，tool started -> finished/failed 同一 activity 只固化一次，事件不按类型重排，ToolResult 正文不显示。
-- [ ] Markdown headings/paragraphs/lists/quote/table/link/inline/fenced code 可读，raw HTML/script 不执行，link 走明确安全路径。
+- [x] Renderer 测试覆盖 replay `user/steering/reasoning/assistant/tool` 按 sequence 排序，与 live stream 连续且不伪造 replay 不包含的 Plan/Todo/pause/failure 持久事实。
+- [x] assistant delta 仅更新 preview，completed 以权威正文替换且只显示一次，failed/cancelled 丢弃未完成 preview。
+- [x] reasoning tail 在 assistant/tool/terminal 前收口，tool started -> finished/failed 同一 activity 只固化一次，事件不按类型重排，ToolResult 正文不显示。
+- [x] Markdown headings/paragraphs/lists/quote/table/link/inline/fenced code 可读，raw HTML/script 不执行，link 走明确安全路径。
 - [ ] idle composer 调用 start_turn，active ordinary input 调用 steer 且不创建第二 Turn，pause 与 cancel 状态/结果明确区分。
-- [ ] TaskState 为 replace-all 投影，CompletionBlocked 显示原因且不显示被丢弃 final，Runtime Panel 不暴露 prompt/transcript/ToolResult/secret/native exception。
+- [x] TaskState 为 replace-all 投影，CompletionBlocked 显示原因且不显示被丢弃 final，Runtime Panel 不暴露 prompt/transcript/ToolResult/secret/native exception。
 - [ ] Slash completion 的 command/alias/arguments 均来自 Python；Model/Permission/Behavior/New/Compact GUI 操作与 Slash 复用同一 Application authority。
 - [ ] `/clear` 只清当前 visible Timeline，不换 Run/删 durable Session；`/quit` 走正常 Runtime shutdown。
 
@@ -60,20 +60,20 @@
 
 - [ ] AskUser 组件测试覆盖 1～4 题、text/single-select/multi-select、2～6 选项、Other、前后移动、返回修改和提交前 review。
 - [ ] AskUser request/waiting/answered 都在 Timeline 有可观察状态，answer 后同一 Turn 继续 Markdown/Tool/Reasoning 并可再次产生 interaction。
-- [ ] Permission 测试动态渲染 request.choices，覆盖包含/不包含 Session 授权的 request，Session grant 不写 Desktop preference。
+- [x] Permission 测试动态渲染 request.choices，覆盖包含/不包含 Session 授权的 request，Session grant 不写 Desktop preference。
 - [ ] Plan 每个 revision 显示完整内容，Approve/Revise 走 typed resume，Revise 需非空 feedback，Cancel 走 handle.cancel。
-- [ ] Provider Retry 只展示 Runtime 投影并提交 `RetryProviderResponse`，Cancel 走 handle.cancel，Renderer 无 HTTP/backoff/reconnect state machine。
-- [ ] 用户 Pause Continue 提交 `ResumeTurnResponse`，Cancel 走 handle.cancel；pending 时 Composer 和 Slash 不旁路为 Steering/command/new Turn。
+- [x] Provider Retry 只展示 Runtime 投影并提交 `RetryProviderResponse`，Cancel 走 handle.cancel，Renderer 无 HTTP/backoff/reconnect state machine。
+- [x] 用户 Pause Continue 提交 `ResumeTurnResponse`，Cancel 走 handle.cancel；pending 时 Composer 和 Slash 不旁路为 Steering/command/new Turn。
 
 ## T07：Settings 与 Theme
 
 - [ ] 无有效配置时 Desktop 可直接进入 Settings，完成 Provider/Model/default 配置并启动 Application。
-- [ ] Settings 只显示有真实内容的模型与提供商、权限与安全、界面、关于；无空分类、虚构字段或通用 Settings schema。
+- [x] Settings 只显示有真实内容的模型与提供商、权限与安全、界面、关于；无空分类、虚构字段或通用 Settings schema。
 - [ ] Provider/Model 增删改、引用校验、default model/permission 通过 GUI 与 T01 use case 完成，不在 TypeScript 复制校验 authority。
 - [ ] API Key 仅显示 configured/masked，replace 成功后输入清空，Renderer persisted state/Main log/Bridge event/error 不含 key。
 - [ ] idle runtime-affecting save 执行 validate -> close -> reload -> recreate -> resume durable Session；active Turn 时保持原 Runtime 并明确阻止应用。
 - [ ] system/dark/light 选择与持久化通过，两主题下 message/Markdown/reasoning/tool/interaction/plan/todo/error/code/focus/runtime/settings 可读，颜色不是唯一线索。
-- [ ] Settings 是连续行/分隔线布局，不存在 SettingCard/CardGrid/dashboard tile 或设计说明文案。
+- [x] Settings 是连续行/分隔线布局，不存在 SettingCard/CardGrid/dashboard tile 或设计说明文案。
 
 ## T08：Windows Runtime Bundle 与 Installer
 

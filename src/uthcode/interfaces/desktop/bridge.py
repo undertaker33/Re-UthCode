@@ -197,6 +197,17 @@ def _safe_value(value: object) -> object:
     return None
 
 
+def _permission_mode_value(run: object) -> str | None:
+    """Read only the Run's allowlisted permission-mode projection."""
+
+    try:
+        mode = getattr(run, "permission_mode", None)
+        value = getattr(mode, "value", mode)
+    except Exception:
+        return None
+    return value if value in {"default", "auto", "full_access"} else None
+
+
 def _action_value(action: object | None) -> dict[str, object] | None:
     if action is None:
         return None
@@ -433,6 +444,13 @@ class DesktopBridge:
             if strict:
                 raise BridgeError("projection_error", "Run projection unavailable")
             return None
+        # RunSnapshot intentionally remains a Core-safe state DTO.  The
+        # current permission strategy belongs to the Application-owned Run,
+        # so add only its allowlisted scalar to this existing safe projection.
+        projected.pop("permission_mode", None)
+        permission_mode = _permission_mode_value(run)
+        if permission_mode is not None:
+            projected["permission_mode"] = permission_mode
         return projected
 
     def _snapshot(self) -> dict[str, object] | None:
@@ -1109,6 +1127,7 @@ class DesktopBridge:
                     setter(action.mode)
                 except Exception:
                     raise BridgeError("command_error", "permission mode could not be selected") from None
+            result["run"] = self._snapshot()
         elif isinstance(action, QuitInterface):
             await self.shutdown(publish_state=True)
         return result

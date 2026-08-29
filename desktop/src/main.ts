@@ -36,6 +36,7 @@ const PRELOAD_ENTRY = () =>
 export const IPC_CHANNELS = Object.freeze({
   pickProject: "desktop.project.pick",
   openProjectInExplorer: "desktop.project.explorer",
+  closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
   runtimeEvent: "desktop.runtime.event",
   preferenceRead: "desktop.preference.read",
@@ -120,6 +121,7 @@ interface MainIpcOptions {
   showOpenDialog?: typeof dialog.showOpenDialog;
   openPath?: typeof shell.openPath;
   registeredProjects?: Set<string>;
+  closeShell?: () => void;
   ipc?: Pick<typeof ipcMain, "handle" | "removeHandler">;
 }
 
@@ -130,6 +132,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   const showOpenDialog = options.showOpenDialog ?? dialog.showOpenDialog;
   const openPath = options.openPath ?? shell.openPath;
   const ipc = options.ipc ?? ipcMain;
+  const closeShell = options.closeShell ?? beginApplicationShutdown;
 
   const onPickProject = async (event: IpcMainInvokeEvent): Promise<string | null> => {
     assertSender(event);
@@ -153,6 +156,11 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     if (failure) throw new MainBoundaryError("explorer_open_failed", "Project Explorer action failed");
   };
 
+  const onCloseShell = async (event: IpcMainInvokeEvent): Promise<void> => {
+    assertSender(event);
+    closeShell();
+  };
+
   const onRuntimeRequest = async (
     event: IpcMainInvokeEvent,
     payload: unknown,
@@ -166,7 +174,20 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     }
     try {
       await options.runtime.start();
-      return await options.runtime.request(payload.method, payload.params);
+      const request = options.runtime.request(payload.method, payload.params);
+      if (payload.method === "runtime.shutdown") {
+        let result;
+        try {
+          result = await request;
+        } finally {
+          // The Bridge response only acknowledges its close request. Keep
+          // the child owned until its close/reap event is observed so a
+          // following initialize cannot race a still-live process.
+          await options.runtime.shutdownAfterRequest();
+        }
+        return result;
+      }
+      return await request;
     } catch (error) {
       if (error instanceof RuntimeBoundaryError || error instanceof RuntimeRequestError) throw error;
       throw new MainBoundaryError("runtime_error", "Desktop Runtime request failed");
@@ -193,6 +214,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
 
   ipc.handle(IPC_CHANNELS.pickProject, onPickProject);
   ipc.handle(IPC_CHANNELS.openProjectInExplorer, onOpenProjectInExplorer);
+  ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);
   ipc.handle(IPC_CHANNELS.preferenceWrite, onWritePreference);

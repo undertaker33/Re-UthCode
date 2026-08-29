@@ -240,12 +240,25 @@ export class PythonRuntime {
   }
 
   async shutdown(): Promise<void> {
+    return this.closeChild(true);
+  }
+
+  /**
+   * Complete the close/reap phase after a caller already received the
+   * runtime.shutdown response.  The response is not the process boundary:
+   * the child remains owned until its close event has been observed.
+   */
+  async shutdownAfterRequest(): Promise<void> {
+    return this.closeChild(false);
+  }
+
+  private async closeChild(requestBridge: boolean): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     if (!this.child || this._state === "idle") {
       this._state = "stopped";
       return;
     }
-    this.shutdownPromise = this.shutdownInternal();
+    this.shutdownPromise = this.shutdownInternal(requestBridge);
     try {
       await this.shutdownPromise;
     } finally {
@@ -253,7 +266,7 @@ export class PythonRuntime {
     }
   }
 
-  private async shutdownInternal(): Promise<void> {
+  private async shutdownInternal(requestBridge: boolean): Promise<void> {
     const child = this.child;
     if (!child) {
       this._state = "stopped";
@@ -262,17 +275,19 @@ export class PythonRuntime {
     this._state = "stopping";
     const closeWindow = Math.max(1, this.shutdownTimeoutMs);
     try {
-      // Do not let the normal request timeout (30s by default) extend the
-      // bounded close contract. An unresponsive bridge is terminated within
-      // its own bounded graceful-request window instead of holding Electron's
-      // close event. Termination and close confirmation retain separate
-      // bounded windows below.
-      await this.requestInternal(
-        "runtime.shutdown",
-        {},
-        true,
-        Math.min(this.requestTimeoutMs, closeWindow),
-      );
+      if (requestBridge) {
+        // Do not let the normal request timeout (30s by default) extend the
+        // bounded close contract. An unresponsive bridge is terminated within
+        // its own bounded graceful-request window instead of holding Electron's
+        // close event. Termination and close confirmation retain separate
+        // bounded windows below.
+        await this.requestInternal(
+          "runtime.shutdown",
+          {},
+          true,
+          Math.min(this.requestTimeoutMs, closeWindow),
+        );
+      }
     } catch {
       // A dead or unresponsive bridge is still reaped below. Its failure is
       // a Runtime boundary condition, never an Agent/Provider failure.

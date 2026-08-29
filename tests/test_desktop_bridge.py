@@ -1298,6 +1298,40 @@ async def test_status_projection_drops_native_exception_and_secret_values() -> N
 
 
 @pytest.mark.asyncio
+async def test_run_permission_mode_is_added_to_safe_runtime_and_command_projections() -> None:
+    class ProjectedRun(_FakeRun):
+        def snapshot(self) -> dict[str, object]:
+            return {"run_id": "run-safe", "status": "running"}
+
+    class PermissionApplication(_FakeApplication):
+        def create_run(self) -> ProjectedRun:
+            run = ProjectedRun()
+            self.runs.append(run)
+            return run
+
+        def set_default_permission_mode(self, mode: PermissionMode) -> PermissionMode:
+            return mode
+
+    application = PermissionApplication()
+    bridge = DesktopBridge(application=application)
+
+    application.runs[0].set_permission_mode(PermissionMode.AUTO)
+    status = await bridge.handle_request(RequestEnvelope("permission-status", "status.get", {}))
+    assert status.ok is True
+    assert status.result is not None
+    assert status.result["runtime"]["run"]["permission_mode"] == "auto"  # type: ignore[index]
+
+    selected = await bridge.handle_request(
+        RequestEnvelope("permission-command", "command.execute", {"text": "/permission full_access"})
+    )
+    assert selected.ok is True
+    assert selected.result is not None
+    assert selected.result["run"]["permission_mode"] == "full_access"  # type: ignore[index]
+    assert application.runs[0].permission_mode is PermissionMode.FULL_ACCESS
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_status_projection_drops_real_tool_result_part_content() -> None:
     application = _FakeApplication()
     content = "RAW-TOOL-RESULT-MUST-NOT-CROSS-DESKTOP"

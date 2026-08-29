@@ -17,6 +17,10 @@ const configuration: Configuration = {
           options: { configFile: typeScriptConfig },
         },
       },
+      {
+        test: /\.css$/u,
+        type: "asset/source",
+      },
     ],
   },
   resolve: { extensions: [".js", ".ts", ".tsx"] },

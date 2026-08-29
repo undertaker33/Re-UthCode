@@ -320,6 +320,56 @@ test("forced shutdown removes the PID of an actual child process", async () => {
   assert.equal(runtime.state, "stopped");
 });
 
+test("runtime shutdown request waits for close/reap before replacing the child PID", async () => {
+  const bridgeScript = [
+    "const readline = require('node:readline');",
+    "const input = readline.createInterface({ input: process.stdin });",
+    "input.on('line', (line) => {",
+    "  const request = JSON.parse(line);",
+    "  const result = { state: request.method === 'runtime.shutdown' ? 'stopped' : 'ready', method: request.method };",
+    "  process.stdout.write(JSON.stringify({ type: 'response', id: request.id, ok: true, result }) + '\\n');",
+    "  if (request.method === 'runtime.shutdown') setTimeout(() => process.exit(0), 15);",
+    "});",
+  ].join("\n");
+  const runtime = new PythonRuntime({
+    launch: { command: process.execPath, args: ["-e", bridgeScript] },
+    spawn: spawnChild as never,
+    requestTimeoutMs: 500,
+    shutdownTimeoutMs: 500,
+  });
+
+  await runtime.start();
+  const firstPid = runtime.pid;
+  assert.ok(firstPid);
+  assert.deepEqual(await runtime.request("runtime.initialize", { workdir: process.cwd() }), {
+    state: "ready",
+    method: "runtime.initialize",
+  });
+  assert.deepEqual(await runtime.request("project.open", { path: process.cwd() }), {
+    state: "ready",
+    method: "project.open",
+  });
+  assert.deepEqual(await runtime.request("session.resume", { session_id: "durable-session" }), {
+    state: "ready",
+    method: "session.resume",
+  });
+  assert.deepEqual(await runtime.request("runtime.shutdown", {}), {
+    state: "stopped",
+    method: "runtime.shutdown",
+  });
+  assert.equal(runtime.pid, firstPid, "response completion alone must retain child ownership");
+
+  await runtime.shutdownAfterRequest();
+  assert.equal(runtime.pid, undefined);
+  assert.equal(runtime.state, "stopped");
+
+  await runtime.start();
+  const replacementPid = runtime.pid;
+  assert.ok(replacementPid);
+  assert.notEqual(replacementPid, firstPid);
+  await runtime.shutdown();
+});
+
 test("desktop preferences persist only allowlisted UI metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "uthcode-preferences-"));
   const file = join(root, "preferences.json");
