@@ -1,6 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
+import squirrelStartup from "electron-squirrel-startup";
 import { isAbsolute, resolve, join } from "node:path";
+
+// Squirrel.Windows starts the app with a short-lived lifecycle argument while
+// installing, updating, or uninstalling.  Handle it before registering the
+// normal window/runtime lifecycle so those helper launches never spawn Python.
+const isSquirrelLifecycleLaunch = squirrelStartup;
+if (isSquirrelLifecycleLaunch) app.quit();
 
 import {
   isJsonObject,
@@ -383,7 +390,8 @@ export function bootstrapMain(): void {
 // bundle; importing helpers in unit tests remains inert.
 if (
   typeof UTHCODE_DESKTOP_MAIN_BUNDLE !== "undefined" &&
-  UTHCODE_DESKTOP_MAIN_BUNDLE
+  UTHCODE_DESKTOP_MAIN_BUNDLE &&
+  !isSquirrelLifecycleLaunch
 ) {
   bootstrapMain();
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from .bridge import DesktopBridge
+from uthcode.interfaces.desktop.bridge import DesktopBridge
 
 
 def main() -> None:

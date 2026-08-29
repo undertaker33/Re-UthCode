@@ -77,15 +77,15 @@
 
 ## T08：Windows Runtime Bundle 与 Installer
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m PyInstaller --clean --noconfirm desktop/packaging/uthcode-runtime.spec`，生成 onedir `uthcode-desktop-runtime.exe` 与 `_internal`。
-- [ ] Runtime 保留 console subsystem stdio，未使用 `--noconsole/--windowed`；通过 Electron `windowsHide:true` 隐藏窗口且三路 pipe 可用。
-- [ ] 直接 spawn packaged Runtime 完成 ready/status/shutdown，stdout 每行合法 JSON、退出码 0，`prompt_assets/coding_agent.md` 可由 `importlib.resources` 读取。
-- [ ] 构建 spec 只收集真实依赖/资源，不存在 `--collect-all everything`、构建输入复制、路径敏感 Hash 或构建专用完整性链。
-- [ ] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。
-- [ ] packaged app `resources` 中完整存在 Runtime exe + `_internal`，production 启动无 system Python fallback，关闭后无 orphan child。
-- [ ] Squirrel install/update/uninstall 特殊启动参数在 Main 早期收口，没有因 lifecycle 启动多个 Python child；Electron Fuses 实际打包状态已检查并记录。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m PyInstaller --clean --noconfirm desktop/packaging/uthcode-runtime.spec`，生成 onedir `uthcode-desktop-runtime.exe` 与 `_internal`。
+- [x] Runtime 保留 console subsystem stdio，未使用 `--noconsole/--windowed`；通过 Electron `windowsHide:true` 隐藏窗口且三路 pipe 可用。
+- [x] 直接 spawn packaged Runtime 完成 ready/status/shutdown，stdout 每行合法 JSON、退出码 0，`prompt_assets/coding_agent.md` 可由 `importlib.resources` 读取。
+- [x] 构建 spec 只收集真实依赖/资源，不存在 `--collect-all everything`、构建输入复制、路径敏感 Hash 或构建专用完整性链。
+- [x] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。
+- [x] packaged app `resources` 中完整存在 Runtime exe + `_internal`，production 启动无 system Python fallback，关闭后无 orphan child。
+- [x] Squirrel install/update/uninstall 特殊启动参数在 Main 早期收口，没有因 lifecycle 启动多个 Python child；Electron Fuses 实际打包状态已检查并记录。
 - [ ] 在无系统 Python 的 Windows 11 x64 环境执行安装 -> 启动 -> 首配 -> 对话 -> 关闭 -> 卸载，精确环境/结果记入 W05 Feedback。
-- [ ] 未签名 Installer 明确标记为 development/release-candidate 验收，不宣称已满足公开发行签名/SmartScreen 要求。
+- [x] 未签名 Installer 明确标记为 development/release-candidate 验收，不宣称已满足公开发行签名/SmartScreen 要求。
 
 ## T09：[接入主流程] Desktop 全链路接入
 
