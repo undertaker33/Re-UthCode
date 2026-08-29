@@ -1,24 +1,31 @@
 {
   "name": "uthcode-desktop",
+  "productName": "UthCode",
   "version": "0.1.0",
   "private": true,
+  "author": "Re:UthCode contributors",
   "description": "UthCode Desktop shell",
   "main": "./.webpack/main",
   "scripts": {
     "start": "electron-forge start",
-    "package": "electron-forge package",
-    "make": "electron-forge make",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts tests/renderer.test.tsx"
+    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts tests/renderer.test.tsx tests/windows-packaging.test.ts",
+    "build:runtime": "node scripts/build-python-runtime.mjs",
+    "package": "npm run build:runtime && electron-forge package",
+    "make": "npm run build:runtime && electron-forge make"
   },
   "dependencies": {
+    "electron-squirrel-startup": "1.0.1",
     "react": "19.1.1",
     "react-dom": "19.1.1"
   },
   "devDependencies": {
     "@electron-forge/cli": "7.11.2",
     "@electron-forge/maker-squirrel": "7.11.2",
+    "@electron-forge/plugin-fuses": "7.11.2",
     "@electron-forge/plugin-webpack": "7.11.2",
+    "@electron/fuses": "1.8.0",
+    "@types/electron-squirrel-startup": "1.0.2",
     "@types/node": "24.3.0",
     "@types/react": "19.1.12",
     "@types/react-dom": "19.1.9",
