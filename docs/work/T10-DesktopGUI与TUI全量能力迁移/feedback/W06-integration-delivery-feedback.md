@@ -649,3 +649,29 @@ git diff --check
 真实隔离 Electron 空态覆盖 dark docked/floating/hidden、light 与 760px narrow；密集主工作区使用 test-only visual fixture，由正式 `AgentEvent` DTO、生产 reducer、`App` 与生产组件生成，覆盖 Project/Session pin、user/assistant/reasoning/tool/plan/status、Todo、active Pause/Cancel/Steer 和完整 Runtime。Fixture 不进入 production bundle，不提供生产 fake state；稳定 ignored 证据位于 `desktop/dist/ui-acceptance/main-workspace/`。由于 Electron 隔离模式必须保留 Windows profile identity，而 Python bootstrap 不读取测试 guard 的临时 `UTHCODE_CONFIG_PATH`，本轮没有伪造 populated Runtime E2E，也未读取或改写真实用户配置。
 
 Sol/medium Reviewer 经多轮复审后输出 `APPROVED_TO_COMMIT_T10_MAIN_WORKSPACE_UI`。Settings 与复杂 Interaction 的完整视觉重建、真实 Provider populated Desktop E2E、两主题全功能人工验收、干净 Windows Installer 首配/对话/卸载仍未完成；因此不新增 Checklist 勾选，`docs/Context-Index.md` 继续保持 T10 `not_implemented`。
+
+### 返工第 9 轮追加：Settings 与 Typed Interaction 视觉重建（2026-08-30）
+
+本轮在已合并的主工作区视觉体系上重建 Settings 与 Typed Interaction。Settings 保留真实 Provider、Model、default model、default permission、theme 与 about 字段，采用连续双栏导航/内容布局；900px 以下收敛为可横向滚动的顶部分区导航和单列设置行。五个分类均为可聚焦的真实 section anchor，不存在永久高亮的假入口。Provider kind、default model、Remove Provider/Model 与 Clear key 均有对象上下文的 accessible name；API key 继续只显示 configured 状态，删除 Provider 会同步清理该 ID 的 transient `apiKeys`/`touchedKeys`，防止同 ID 重建时误带旧 key。
+
+Typed Interaction 沿用主工作区 token 与层级，覆盖 AskUser、Permission、Plan、Provider Retry 和 User Pause。实现继续使用正式 `PendingInteraction`、动态 Permission choices、Plan revision/approve/revise 非空 feedback、Retry/Pause typed response 与 cancel；pending 时 Composer/Slash 门禁不变。生产 `App` 每次只挂载一个 pending surface；tests 下的密集并排 fixture 仅用于 QA，不进入 production bundle，也不构成生产 card matrix。
+
+本轮精确验证：
+
+```text
+conda run --no-capture-output -n re-uthcode npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer 定向测试
+-> 41 passed，0 failed
+
+conda run --no-capture-output -n re-uthcode npm test  (cwd=desktop)
+-> 72 passed，0 failed，0 skipped
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+test-only production-component fixture 生成 Settings dark/light/narrow 与 Typed Interaction dense 证据，稳定 ignored 路径为 `desktop/dist/ui-acceptance/settings-interactions/`；中文 replacement character 与常见 mojibake 扫描均为 0。Sol/medium Reviewer 修复假导航、accessible name 与 transient API key 残留后输出 `APPROVED_TO_COMMIT_T10_SETTINGS_INTERACTIONS_UI`。
+
+本轮截图不是 Provider 触发的真实 Electron typed interaction E2E。真实 Settings save/rebootstrap 窗口闭环、AskUser/Permission/Plan/Retry/Pause 的逐项窗口操作、读屏/全键盘/focus/长内容滚动、两主题完整人工流程和干净 Windows Installer 首配/对话/卸载仍未完成；因此不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

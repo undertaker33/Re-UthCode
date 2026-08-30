@@ -16,7 +16,7 @@ import { App, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../
 import { ChatTimeline, renderMarkdown } from "../src/renderer/ChatTimeline";
 import { Composer, applyCompletion } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
-import { SettingsView, configurationRequest, parseOptionalPositiveInteger, renameModelRef, renameProviderId } from "../src/renderer/SettingsView";
+import { SettingsView, configurationRequest, parseOptionalPositiveInteger, renameModelRef, renameProviderId, settingsSaveRequest, withoutRecordKey } from "../src/renderer/SettingsView";
 import { RuntimePanel } from "../src/renderer/RuntimePanel";
 
 function replayRecord(sequence: number, kind: string, text: string) {
@@ -304,6 +304,45 @@ test("T07 Settings uses the current configuration view and does not render secre
   assert.match(markup, /Models|Providers|Permissions|Interface|About/);
   assert.match(markup, /fake\/model/);
   assert.doesNotMatch(markup, /sk-live-secret|api_key=|secret value/u);
+});
+
+test("T07 rebuilt Settings and typed interactions keep accessible continuous and narrow layouts", async () => {
+  const state = createInitialState({ runtimeState: "ready", theme: "light", configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", api_key_configured: true } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model" } } }, settingsLoaded: true });
+  const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
+  assert.match(settingsMarkup, /aria-label="Settings sections"/u);
+  assert.match(settingsMarkup, /aria-label="Visible settings groups"/u);
+  for (const id of ["providers", "models", "defaults", "interface", "about"]) {
+    assert.match(settingsMarkup, new RegExp(`href="#settings-${id}"`));
+    assert.match(settingsMarkup, new RegExp(`id="settings-${id}"`));
+  }
+  assert.doesNotMatch(settingsMarkup, /aria-current=/u);
+  assert.match(settingsMarkup, /aria-label="fake provider kind"/u);
+  assert.match(settingsMarkup, /aria-label="Remove provider fake"/u);
+  assert.match(settingsMarkup, /aria-label="Clear API key for provider fake"/u);
+  assert.match(settingsMarkup, /aria-label="Remove model fake\/model"/u);
+  assert.match(settingsMarkup, /<label[^>]*for="default-model"[^>]*>Default model<\/label><select id="default-model"/u);
+  assert.match(settingsMarkup, /configured/u);
+  assert.match(settingsMarkup, /Replace API key/u);
+  const permission = { kind: "permission_required", pauseId: "pause-a11y", runId: "run-a11y", turnId: "turn-a11y", request: { permission_id: "permission-a11y", choices: ["once", "reject"] } } as const;
+  const interactionMarkup = renderToStaticMarkup(<InteractionSurface interaction={permission} onSubmit={() => undefined} onCancel={() => undefined} />);
+  assert.match(interactionMarkup, /aria-label="Permission approval"/u);
+  assert.match(interactionMarkup, /type="button"/u);
+  const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
+  assert.match(css, /\.settings-view\s*\{[^}]*grid-template-columns:\s*220px minmax\(0, 1fr\)/s);
+  assert.match(css, /\.settings-section\s*\{[^}]*border-top:\s*1px solid var\(--line\)/s);
+  assert.match(css, /@media \(max-width:\s*900px\)[\s\S]*?\.settings-view\s*\{[^}]*grid-template-columns:\s*1fr/s);
+  assert.match(css, /\.interaction-surface\s*\{[^}]*border-top:\s*2px solid var\(--accent\)/s);
+});
+
+test("T07 removing a provider discards its transient key before the same ID can be recreated", () => {
+  const apiKeys = withoutRecordKey({ fake: "sk-transient", keep: "sk-keep" }, "fake");
+  const touchedKeys = withoutRecordKey({ fake: true, keep: true }, "fake");
+  const recreatedDraft = { providers: { fake: { kind: "fake", base_url: null }, keep: { kind: "fake", base_url: null } } };
+  const request = settingsSaveRequest(recreatedDraft, apiKeys, touchedKeys);
+  const providers = request.providers as Record<string, Record<string, unknown>>;
+  assert.equal(providers.fake.api_key, undefined);
+  assert.equal(providers.keep.api_key, "sk-keep");
+  assert.doesNotMatch(JSON.stringify(request), /sk-transient/u);
 });
 
 test("T07 configuration request keeps API key transient and maps current schema fields", () => {

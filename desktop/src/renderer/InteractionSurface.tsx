@@ -91,7 +91,7 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
     const otherValue = (otherText[question.question_id] ?? "").trim();
     const otherSelected = otherValue.length > 0 && selected.includes(otherValue);
     const setSelected = (values: string[]) => setAnswers((current) => ({ ...current, [question.question_id]: values }));
-            const completeAnswer = selected.length > 0 && selected.every((value) => value.trim().length > 0);
+    const completeAnswer = selected.length > 0 && selected.every((value) => value.trim().length > 0);
     const submit = () => {
       const normalized = Object.fromEntries(questions.map((item) => [item.question_id, answers[item.question_id] ?? []]));
       void onSubmit(buildUserInputResponse(interaction, normalized));
