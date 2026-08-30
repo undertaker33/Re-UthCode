@@ -675,3 +675,32 @@ git diff --check
 test-only production-component fixture 生成 Settings dark/light/narrow 与 Typed Interaction dense 证据，稳定 ignored 路径为 `desktop/dist/ui-acceptance/settings-interactions/`；中文 replacement character 与常见 mojibake 扫描均为 0。Sol/medium Reviewer 修复假导航、accessible name 与 transient API key 残留后输出 `APPROVED_TO_COMMIT_T10_SETTINGS_INTERACTIONS_UI`。
 
 本轮截图不是 Provider 触发的真实 Electron typed interaction E2E。真实 Settings save/rebootstrap 窗口闭环、AskUser/Permission/Plan/Retry/Pause 的逐项窗口操作、读屏/全键盘/focus/长内容滚动、两主题完整人工流程和干净 Windows Installer 首配/对话/卸载仍未完成；因此不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 10 轮追加：Provider 四字段首配（2026-08-30）
+
+用户人工验收指出 Settings 将内部配置 schema 直接暴露为首配必填项。核对 Application/config authority 后确认 `display_name`、`context_window`、`max_output_tokens` 与 `reasoning_effort` 均为 optional；现有 limits resolver 已按 configured/provider/default 来源解析，Renderer 不需要也不得猜测模型限制。
+
+Settings 基础区现只展开 Provider、Base URL、Model 与 API Key。空配置在 Renderer draft 内使用稳定内部 Provider/Model profile key，新 Provider 默认走 `openai_compat`，首个 Model 自动成为 default；内部 profile ID、model reference/provider linkage、display name、limits 与 reasoning 进入默认关闭的 Advanced。编辑已有复杂配置时这些 optional 字段原样保留并可编辑，不静默丢失。缺失或清空的 `display_name` 保持 `null`，不会被折叠字段转换为 Application 拒绝的空字符串。API key 继续使用 configured/masked/replace/clear transient 语义，不回显已配置值。
+
+本轮精确验证：
+
+```text
+conda run --no-capture-output -n re-uthcode npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer 定向测试
+-> 43 passed，0 failed
+
+Desktop 完整 npm test（Reviewer 复跑）
+-> 74 passed，0 failed
+
+Python configuration 定向测试
+-> 56 passed，0 failed
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+四字段 fixture 证明 save candidate 包含 `openai_compat`、Base URL、remote model 与 transient key，optional limits/reasoning/display name 保持 `null`，且已有省略 optional 字段的合法配置可直接保存。dark/light/narrow 证据已更新于 `desktop/dist/ui-acceptance/settings-interactions/`，中文 replacement character 与常见 mojibake 扫描为 0。Sol/medium Reviewer 输出 `APPROVED_TO_COMMIT_T10_SIMPLE_PROVIDER_SETUP`。
+
+真实 API Key/Provider 的 Electron Settings 保存与 rebootstrap 仍需用户配置后执行；本轮不读取或写入真实用户配置，不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
