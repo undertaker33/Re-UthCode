@@ -65,6 +65,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   await api.requestRuntime("status.get", {});
   await api.readPreference("theme");
   await api.writePreference("theme", "dark");
+  await api.writePreference("pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]);
 
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
@@ -73,6 +74,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     { channel: "desktop.runtime.request", args: [{ method: "status.get", params: {} }] },
     { channel: "desktop.preference.read", args: ["theme"] },
     { channel: "desktop.preference.write", args: ["theme", "dark"] },
+    { channel: "desktop.preference.write", args: ["pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]] },
   ]);
 
   const events: unknown[] = [];

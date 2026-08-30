@@ -20,6 +20,7 @@ export interface RecentProjectPreference {
   pinned?: boolean;
   lastOpenedAt?: string;
 }
+export interface PinnedSessionPreference { projectKey: string; sessionId: string; }
 
 export interface DesktopPreferences {
   theme: ThemePreference;
@@ -28,6 +29,7 @@ export interface DesktopPreferences {
   recentProjects: RecentProjectPreference[];
   projectAliases: Record<string, string>;
   pinnedProjectKeys: string[];
+  pinnedSessions: PinnedSessionPreference[];
   selectedProjectKey: string | null;
   selectedSessionId: string | null;
 }
@@ -39,6 +41,7 @@ export const PREFERENCE_KEYS = [
   "recentProjects",
   "projectAliases",
   "pinnedProjectKeys",
+  "pinnedSessions",
   "selectedProjectKey",
   "selectedSessionId",
 ] as const;

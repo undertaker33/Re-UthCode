@@ -44,28 +44,28 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   };
 
   return (
-    <section aria-label="Composer" aria-disabled={pending || undefined}>
-      {candidates.length > 0 && <div role="listbox" aria-label="Command completion">
+    <section className="composer" aria-label="Composer" aria-disabled={pending || undefined}>
+      {candidates.length > 0 && <div className="command-menu" role="listbox" aria-label="Command completion">
         {candidates.map((candidate, index) => <button type="button" key={`${candidate.value}-${index}`} role="option" onClick={() => onChange(applyCompletion(state.composerText, candidate.value))}><span>{candidate.display || candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
-      <div>
-        <div>
-          <button type="button" onClick={() => void onCommand(state.run?.behavior_mode === "plan" ? "/do" : "/plan")} disabled={pending || state.activeTurn}>{state.run?.behavior_mode === "plan" ? "PLAN" : "DEFAULT"}</button>
-          <label>Permission <select value={permissionSelectValue(state.permissionMode)} disabled={pending || state.activeTurn} onChange={(event) => void onCommand(`/permission ${event.target.value}`)}><option value="" disabled>Unavailable</option><option value="default">default</option><option value="auto">auto</option><option value="full_access">full_access</option></select></label>
-          {state.modelPickerOpen ? <label>Model <select autoFocus value="" onChange={(event) => void onCommand(`/model ${event.target.value}`)} disabled={pending || state.activeTurn}><option value="">Choose model</option>{state.modelCandidates.map((model) => <option value={model} key={model}>{model}</option>)}</select></label> : <button type="button" onClick={() => void onCommand("/model")} disabled={pending || state.activeTurn}>Model</button>}
+      <div className="composer-toolbar">
+        <div className="composer-selectors">
+          <button type="button" className={state.run?.behavior_mode === "plan" ? "is-plan" : ""} onClick={() => void onCommand(state.run?.behavior_mode === "plan" ? "/do" : "/plan")} disabled={pending || state.activeTurn}>{state.run?.behavior_mode === "plan" ? "PLAN" : "DEFAULT"}</button>
+          <label><span className="sr-only">Permission</span><select aria-label="Permission" value={permissionSelectValue(state.permissionMode)} disabled={pending || state.activeTurn} onChange={(event) => void onCommand(`/permission ${event.target.value}`)}><option value="" disabled>Unavailable</option><option value="default">default</option><option value="auto">auto</option><option value="full_access">full_access</option></select></label>
+          {state.modelPickerOpen ? <label><span className="sr-only">Model</span><select aria-label="Model" autoFocus value="" onChange={(event) => void onCommand(`/model ${event.target.value}`)} disabled={pending || state.activeTurn}><option value="">Choose model</option>{state.modelCandidates.map((model) => <option value={model} key={model}>{model}</option>)}</select></label> : <button type="button" onClick={() => void onCommand("/model")} disabled={pending || state.activeTurn}>Model</button>}
         </div>
-        <output>{pending ? "Interaction required" : state.activeTurn ? state.turnStatus : "Ready"}</output>
+        <output className="composer-state">{pending ? "Interaction required" : state.activeTurn ? state.turnStatus : "Ready"}</output>
       </div>
-      <div>
+      <div className="composer-input">
         <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} placeholder={pending ? "Complete the interaction above" : state.activeTurn ? "Send steering to the active Turn" : "Message UthCode"} disabled={pending} rows={3} aria-label="Message UthCode" />
-        <div>
+        <div className="composer-actions">
           {state.activeTurn && !pending && <button type="button" onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}>Pause</button>}
           {state.activeTurn && <button type="button" onClick={() => void onCancel()}>Cancel</button>}
           <button type="button" onClick={submit} disabled={pending || !hasText}>{pending ? "Waiting" : state.activeTurn ? "Steer" : "Send"}</button>
         </div>
       </div>
-      <p>Enter to send · Shift+Enter for a new line</p>
+      <p className="composer-hint">Enter to send · Shift+Enter for a new line</p>
     </section>
   );
 }

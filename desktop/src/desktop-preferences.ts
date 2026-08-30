@@ -7,6 +7,7 @@ import type {
   PanelModePreference,
   PreferenceKey,
   RecentProjectPreference,
+  PinnedSessionPreference,
   ThemePreference,
   WindowBoundsPreference,
 } from "./desktop-api";
@@ -21,6 +22,7 @@ export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = {
   recentProjects: [],
   projectAliases: {},
   pinnedProjectKeys: [],
+  pinnedSessions: [],
   selectedProjectKey: null,
   selectedSessionId: null,
 };
@@ -28,6 +30,7 @@ export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = {
 const MAX_STRING_LENGTH = 4096;
 const MAX_RECENT_PROJECTS = 50;
 const MAX_PINNED_PROJECTS = 200;
+const MAX_PINNED_SESSIONS = 500;
 
 export class PreferenceValidationError extends Error {
   readonly kind = "invalid_preference";
@@ -46,6 +49,7 @@ function clonePreferences(value: DesktopPreferences): DesktopPreferences {
     recentProjects: value.recentProjects.map((item) => ({ ...item })),
     projectAliases: { ...value.projectAliases },
     pinnedProjectKeys: [...value.pinnedProjectKeys],
+    pinnedSessions: value.pinnedSessions.map((item) => ({ ...item })),
     selectedProjectKey: value.selectedProjectKey,
     selectedSessionId: value.selectedSessionId,
   };
@@ -167,6 +171,19 @@ function validateStringList(value: unknown, field: string): string[] {
   return value.map((item, index) => requireString(item, `${field}[${index}]`));
 }
 
+function validatePinnedSessions(value: unknown): PinnedSessionPreference[] {
+  if (!Array.isArray(value) || value.length > MAX_PINNED_SESSIONS) throw new PreferenceValidationError("pinnedSessions must be a bounded array");
+  const unique = new Map<string, PinnedSessionPreference>();
+  value.forEach((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new PreferenceValidationError(`pinnedSessions[${index}] must be an object`);
+    const source = entry as Record<string, unknown>;
+    if (Object.keys(source).some((key) => key !== "projectKey" && key !== "sessionId")) throw new PreferenceValidationError(`pinnedSessions[${index}] has unknown fields`);
+    const item = { projectKey: requireString(source.projectKey, `pinnedSessions[${index}].projectKey`), sessionId: requireString(source.sessionId, `pinnedSessions[${index}].sessionId`) };
+    unique.set(`${item.projectKey}\0${item.sessionId}`, item);
+  });
+  return [...unique.values()];
+}
+
 function validateNullableString(value: unknown, field: string): string | null {
   if (value === null) return null;
   return requireString(value, field);
@@ -187,6 +204,7 @@ function validateDocument(value: unknown): DesktopPreferences {
   if (source.recentProjects !== undefined) result.recentProjects = validateRecentProjects(source.recentProjects);
   if (source.projectAliases !== undefined) result.projectAliases = validateStringMap(source.projectAliases, "projectAliases");
   if (source.pinnedProjectKeys !== undefined) result.pinnedProjectKeys = validateStringList(source.pinnedProjectKeys, "pinnedProjectKeys");
+  if (source.pinnedSessions !== undefined) result.pinnedSessions = validatePinnedSessions(source.pinnedSessions);
   if (source.selectedProjectKey !== undefined) result.selectedProjectKey = validateNullableString(source.selectedProjectKey, "selectedProjectKey");
   if (source.selectedSessionId !== undefined) result.selectedSessionId = validateNullableString(source.selectedSessionId, "selectedSessionId");
   return result;
@@ -229,6 +247,7 @@ export class DesktopPreferencesStore {
       case "recentProjects": normalized = validateRecentProjects(value); break;
       case "projectAliases": normalized = validateStringMap(value, key); break;
       case "pinnedProjectKeys": normalized = validateStringList(value, key); break;
+      case "pinnedSessions": normalized = validatePinnedSessions(value); break;
       case "selectedProjectKey": normalized = validateNullableString(value, key); break;
       case "selectedSessionId": normalized = validateNullableString(value, key); break;
     }

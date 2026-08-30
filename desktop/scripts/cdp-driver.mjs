@@ -15,7 +15,7 @@
  *   node scripts/cdp-launcher.mjs -- node scripts/cdp-driver.mjs --port 9229 --expect-text "fixture response"
  */
 
-import { appendFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { assertCdpEnvironmentIsolated } from "./cdp-test-guard.mjs";
 
 function option(name, fallback = undefined) {
@@ -33,10 +33,12 @@ const flow = option("flow", "basic");
 const planChoice = option("plan-choice", "approve");
 const delayAction = option("delay-action", "pause");
 const skipQuit = process.argv.includes("--no-quit");
+const screenshotDir = option("screenshot-dir");
+const fixtureHtml = option("fixture-html");
 let flowDeadline = 0;
 let isolationError;
 try {
-  assertCdpEnvironmentIsolated({ label: "cdp-driver", outputPaths: logPath ? [logPath] : [] });
+  assertCdpEnvironmentIsolated({ label: "cdp-driver", outputPaths: [logPath, screenshotDir].filter(Boolean) });
 } catch (error) {
   isolationError = error instanceof Error ? error : new Error(String(error));
 }
@@ -49,6 +51,14 @@ function writeLog(event, details = {}) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function capture(session, name) {
+  if (!screenshotDir) return;
+  await mkdir(screenshotDir, { recursive: true });
+  const result = await session.send("Page.captureScreenshot", { format: "png", fromSurface: true });
+  await writeFile(`${screenshotDir}/${name}.png`, Buffer.from(result.data, "base64"));
+  writeLog("screenshot_saved", { name, screenshotDir });
 }
 
 function remainingBudget(label) {
@@ -410,6 +420,44 @@ async function run() {
     await session.send("Page.enable");
     await waitFor(session, "UthCode shell", "Boolean(document.querySelector('[aria-label=\\\"Project navigation\\\"]'))");
     await waitFor(session, "Composer", "Boolean(document.querySelector('textarea[aria-label=\\\"Message UthCode\\\"]'))");
+
+    if (flow === "visual-fixture") {
+      if (!fixtureHtml) throw new Error("visual-fixture requires --fixture-html");
+      const html = await readFile(fixtureHtml, "utf8");
+      await evaluateAction(session, "install test-only populated markup", `document.open(); document.write(${JSON.stringify(html)}); document.close(); true`);
+      await waitFor(session, "populated fixture", "document.body?.innerText?.includes('Acceptance project') && document.body?.innerText?.includes('Inspecting the authoritative') && document.body?.innerText?.includes('Tasks')");
+      await session.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
+      await capture(session, "main-populated-fixture");
+      if (skipQuit) {
+        await session.send("Emulation.clearDeviceMetricsOverride");
+        await session.send("Page.reload", { ignoreCache: true });
+        await waitFor(session, "production shell restored", "Boolean(document.querySelector('[aria-label=\"Project navigation\"]'))");
+      } else await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+      writeLog("driver_complete", { exitCode: 0, evidence: "test-only visual fixture; not runtime E2E" });
+      return;
+    }
+
+    if (flow === "visual") {
+      await clickText(session, "Settings");
+      await waitFor(session, "Settings view", "Boolean(document.querySelector('[aria-label=\\\"Settings\\\"]'))");
+      await setSelect(session, "theme", "dark");
+      await clickText(session, "Back to chat");
+      await capture(session, "main-dark-docked");
+      await setSelect(session, "Runtime panel layout", "floating");
+      await capture(session, "main-dark-floating");
+      await setSelect(session, "Runtime panel layout", "hidden");
+      await capture(session, "main-dark-hidden");
+      await clickText(session, "Settings");
+      await setSelect(session, "theme", "light");
+      await clickText(session, "Back to chat");
+      await capture(session, "main-light");
+      await session.send("Emulation.setDeviceMetricsOverride", { width: 760, height: 640, deviceScaleFactor: 1, mobile: false });
+      await capture(session, "main-narrow");
+      await session.send("Emulation.clearDeviceMetricsOverride");
+      if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+      writeLog("driver_complete", { exitCode: 0 });
+      return;
+    }
 
     if (flow === "shell") {
       const rendererReady = await evaluateAction(session, "Renderer ready", "JSON.stringify({ readyState: document.readyState, title: document.title, bodyReady: Boolean(document.body) })");
