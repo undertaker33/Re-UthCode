@@ -9,6 +9,8 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 
 `uthcode` 启动交互界面。`uthcode exec` 执行一次任务；未提供 `PROMPT` 时从标准输入读取。`exec` 的最终回答写入 stdout，进度和错误写入 stderr。
 
+Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Configuration 公共出口；Slash 命令的名称、参数、权限和 Session 语义与本页 TUI 参考一致。
+
 ## TUI 命令
 
 | 命令 | 作用 |

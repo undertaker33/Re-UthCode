@@ -454,8 +454,30 @@ test("T07 Settings exposes editable schema IDs and model context/token limits", 
   assert.match(markup, /value="4096"/);
   assert.equal(parseOptionalPositiveInteger("128000"), 128000);
   assert.equal(parseOptionalPositiveInteger(""), null);
-  const renamedProvider = renameProviderId({ providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } } }, "fake", "local");
+  const renamedProvider = renameProviderId({ providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } }, providerOriginalIds: { fake: "fake" } }, "fake", "local");
   assert.equal(renamedProvider.models?.["fake/model"]?.provider_profile_id, "local");
+  assert.deepEqual(renamedProvider.provider_renames, { fake: "local" });
+  const renamedAgain = renameProviderId(renamedProvider, "local", "cloud");
+  assert.deepEqual(renamedAgain.provider_renames, { fake: "cloud" });
+  assert.deepEqual(configurationRequest(renamedProvider).provider_renames, { fake: "local" });
+  assert.equal(configurationRequest(renamedProvider).providerOriginalIds, undefined);
+  const returnedToOriginal = renameProviderId(renamedAgain, "cloud", "fake");
+  assert.equal(returnedToOriginal.provider_renames, undefined);
+  assert.deepEqual(returnedToOriginal.providerOriginalIds, { fake: "fake" });
+
+  const draftProvider = renameProviderId({ providers: { provider: { kind: "fake" } } }, "provider", "local");
+  assert.equal(draftProvider.provider_renames, undefined);
+
+  const movedA = renameProviderId({
+    providers: { A: { kind: "fake" }, B: { kind: "fake" } },
+    models: { "a/model": { provider_profile_id: "A" }, "b/model": { provider_profile_id: "B" } },
+    providerOriginalIds: { A: "A", B: "B" },
+  }, "A", "X");
+  const movedBatch = renameProviderId(movedA, "B", "A");
+  assert.deepEqual(movedBatch.provider_renames, { A: "X", B: "A" });
+  assert.deepEqual(Object.keys(movedBatch.providers ?? {}).sort(), ["A", "X"]);
+  assert.equal(movedBatch.models?.["a/model"]?.provider_profile_id, "X");
+  assert.equal(movedBatch.models?.["b/model"]?.provider_profile_id, "A");
   const renamedModel = renameModelRef({ default_model: "fake/model", models: { "fake/model": { provider_profile_id: "local" } } }, "fake/model", "local/model");
   assert.equal(renamedModel.default_model, "local/model");
   assert.ok(renamedModel.models?.["local/model"]);

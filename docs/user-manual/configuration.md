@@ -2,6 +2,10 @@
 
 UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`permissions.toml` 管理工具权限规则。Provider 只允许在用户级配置中定义；项目配置只能选择用户级 Provider 和模型参数。API Key 可直接写入用户级 `api_key`（literal），或使用 `env:VARIABLE_NAME` 读取当前进程环境变量；项目配置禁止凭据和端点。
 
+TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Desktop Settings 页只编辑下文列出的模型、Provider、默认权限和主题等界面设置；API key 输入只用于本次配置写入，不会显示或持久化到 Desktop preference 文件。
+
+Desktop Settings 修改已配置 Provider ID 时会提交显式 rename 映射，并同步更新引用该 Provider 的 Model Profile。未输入新 key 时，用户配置中原有的 literal 或 `env:VARIABLE_NAME` 表达会原样保留；只有输入 replacement key 时才替换该值。Provider ID 冲突或不存在的源 ID 会拒绝整次写入，失败不会改动配置文件。
+
 ## `config.toml`
 
 用户配置位于 `~/.uthcode/config.toml`，项目配置位于 `<项目目录>/.uthcode/config.toml`。

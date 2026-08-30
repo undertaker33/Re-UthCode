@@ -13,6 +13,7 @@ UthCode 是一个面向本地项目的 AI 编程助手。它既可以在终端�
 - 在同一 `AgentRun` 内保留多轮对话，支持暂停、恢复、取消和运行中补充指令；terminal Turn 提交到 Session History 后，可由新的 Run/Turn 通过 `/resume` 继续，未提交的 Runtime checkpoint 不跨进程恢复。
 - 提供 Plan Mode、计划审阅和任务状态跟踪。
 - 同时提供交互式 TUI 与适合脚本调用的 `exec` 模式。
+- `desktop/` 提供 Windows Desktop shell；它通过 Python Runtime JSONL Bridge 复用同一 Application、Session、Run、Turn、Interaction 和 AgentEvent，不另建一套产品状态。
 
 ## 快速开始
 
@@ -28,6 +29,25 @@ uthcode
 首次运行会创建包含三个空 Provider/Model 槽位的 `~/.uthcode/config.toml` 并停止。填写一组完整配置后，将 `default_model` 指向模型逻辑 ID，再次运行 `uthcode` 即可；也可以填写 Fake Provider 离线体验。
 
 > `Bash` 使用当前操作系统用户权限执行，不是 OS Sandbox。请先在受版本控制的项目中使用，并留意权限确认内容。
+
+### Windows Desktop（开发/候选版本）
+
+在已激活 `re-uthcode` 环境的 Windows 11 x64 机器上，可从源码启动 Desktop shell：
+
+```powershell
+conda activate re-uthcode
+cd desktop
+npm ci
+npm run start
+```
+
+Desktop 使用与 TUI 相同的用户级 `~/.uthcode/config.toml`；首次配置和 API key 仍由当前配置 schema 管理。构建 Windows 安装包可执行：
+
+```powershell
+npm run make -- --platform=win32 --arch=x64
+```
+
+产物位于 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`。当前仓库产物未签名，仅作为 development/release-candidate 使用，不代表公开发行或 SmartScreen 验收已完成。
 
 ## 文档导航
 

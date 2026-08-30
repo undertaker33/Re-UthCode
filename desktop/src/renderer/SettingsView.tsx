@@ -15,6 +15,9 @@ export interface ConfigurationWrite {
   default_permission_mode?: "default" | "auto";
   providers?: Record<string, Record<string, unknown>>;
   models?: Record<string, Record<string, unknown>>;
+  provider_renames?: Record<string, string>;
+  /** Renderer-only source identity; stripped before the Bridge request. */
+  providerOriginalIds?: Record<string, string>;
 }
 
 export function configurationRequest(value: ConfigurationWrite): ConfigurationWrite {
@@ -23,6 +26,7 @@ export function configurationRequest(value: ConfigurationWrite): ConfigurationWr
   if (value.default_permission_mode !== undefined) request.default_permission_mode = value.default_permission_mode;
   if (value.providers) request.providers = Object.fromEntries(Object.entries(value.providers).map(([key, profile]) => [key, { ...profile }]));
   if (value.models) request.models = Object.fromEntries(Object.entries(value.models).map(([key, profile]) => [key, { ...profile }]));
+  if (value.provider_renames) request.provider_renames = { ...value.provider_renames };
   return request;
 }
 
@@ -33,7 +37,29 @@ export function renameProviderId(value: ConfigurationWrite, oldId: string, nextI
   const models = value.models
     ? Object.fromEntries(Object.entries(value.models).map(([ref, profile]) => [ref, profile.provider_profile_id === oldId ? { ...profile, provider_profile_id: normalized } : { ...profile }]))
     : undefined;
-  return { ...value, providers, ...(models ? { models } : {}) };
+  const providerRenames = { ...(value.provider_renames ?? {}) };
+  const originalIds = { ...(value.providerOriginalIds ?? {}) };
+  const sourceId = originalIds[oldId];
+  delete originalIds[oldId];
+
+  // A provider created in this draft has no persisted source identity, so a
+  // local key edit is just a key edit. Only an existing profile can produce a
+  // writer rename, and the source identity is stable while the draft moves.
+  if (sourceId !== undefined) {
+    originalIds[normalized] = sourceId;
+    delete providerRenames[sourceId];
+    if (normalized !== sourceId) providerRenames[sourceId] = normalized;
+  }
+
+  const next: ConfigurationWrite = {
+    ...value,
+    providers,
+    ...(models ? { models } : {}),
+    providerOriginalIds: originalIds,
+  };
+  if (Object.keys(providerRenames).length > 0) next.provider_renames = providerRenames;
+  else delete next.provider_renames;
+  return next;
 }
 
 export function renameModelRef(value: ConfigurationWrite, oldRef: string, nextRef: string): ConfigurationWrite {
@@ -51,9 +77,11 @@ export function parseOptionalPositiveInteger(value: string): number | null {
 
 function sourceConfig(value: ConfigurationView | null): ConfigurationWrite {
   const providers: Record<string, Record<string, unknown>> = {};
+  const providerOriginalIds: Record<string, string> = {};
   for (const [id, raw] of Object.entries(value?.providers ?? {})) {
     const profile = raw as Record<string, unknown>;
     providers[id] = { kind: profile.kind ?? "fake", base_url: profile.base_url ?? null, api_key_configured: profile.api_key_configured === true };
+    providerOriginalIds[id] = id;
   }
   const models: Record<string, Record<string, unknown>> = {};
   for (const [ref, raw] of Object.entries(value?.models ?? {})) {
@@ -72,6 +100,7 @@ function sourceConfig(value: ConfigurationView | null): ConfigurationWrite {
     default_permission_mode: value?.default_permission_mode === "auto" ? "auto" : "default",
     providers,
     models,
+    providerOriginalIds,
   };
 }
 
@@ -116,7 +145,21 @@ export function SettingsView({ state, onBack, onSave, onThemeChange }: SettingsV
     while (draft.providers?.[id]) id = `provider-${index++}`;
     setDraft((current) => ({ ...current, providers: { ...(current.providers ?? {}), [id]: { kind: "fake", base_url: null } } }));
   };
-  const removeProvider = (id: string) => setDraft((current) => ({ ...current, providers: Object.fromEntries(Object.entries(current.providers ?? {}).filter(([key]) => key !== id)) }));
+  const removeProvider = (id: string) => setDraft((current) => {
+    const providerOriginalIds = { ...(current.providerOriginalIds ?? {}) };
+    const providerRenames = { ...(current.provider_renames ?? {}) };
+    const sourceId = providerOriginalIds[id];
+    if (sourceId !== undefined) delete providerRenames[sourceId];
+    delete providerOriginalIds[id];
+    const next: ConfigurationWrite = {
+      ...current,
+      providers: Object.fromEntries(Object.entries(current.providers ?? {}).filter(([key]) => key !== id)),
+      providerOriginalIds,
+    };
+    if (Object.keys(providerRenames).length > 0) next.provider_renames = providerRenames;
+    else delete next.provider_renames;
+    return next;
+  });
   const addModel = () => {
     let ref = "model";
     let index = 1;

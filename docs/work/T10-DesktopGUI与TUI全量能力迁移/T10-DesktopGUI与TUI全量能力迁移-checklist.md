@@ -40,7 +40,7 @@
 - [x] 执行 Renderer 定向测试，New chat/Open project、pinned/projects/recent、Settings 和 Runtime Panel floating/docked/hidden 均通过。
 - [ ] 打开项目调用 native folder picker；编辑显示别名不改变 filesystem/workdir/project key；移除项目不删磁盘或 Session。
 - [ ] 项目激活时 catalog 从 Application 刷新；非当前项目 last-known catalog 只用于导航，resume 内容不来自该缓存或 Renderer 文件扫描。
-- [ ] 点击三个不同 Session 时各自的 safe replay 原子替换 Timeline，标签使用 preview/short ID，后续输入进入被选 Session。
+- [x] 点击三个不同 Session 时各自的 safe replay 原子替换 Timeline，标签使用 preview/short ID，后续输入进入被选 Session。
 - [x] 新建 Session 后 Timeline 立即为空、绑定 fresh Run，不显示上一 Session 消息、mode 或 grant。
 - [ ] active Turn 时切 Session/Project 严格经过 cancel -> terminal -> close/recreate -> fresh Run -> resume，不同时启动多项目 Runtime。
 - [x] 生产 UI 不存在恢复会话页、account/logout/usage、hover preview cards、第二全局左栏、fake projectStore 或浏览器 prompt/confirm。
@@ -71,7 +71,7 @@
 - [x] Settings 只显示有真实内容的模型与提供商、权限与安全、界面、关于；无空分类、虚构字段或通用 Settings schema。
 - [ ] Provider/Model 增删改、引用校验、default model/permission 通过 GUI 与 T01 use case 完成，不在 TypeScript 复制校验 authority。
 - [ ] API Key 仅显示 configured/masked，replace 成功后输入清空，Renderer persisted state/Main log/Bridge event/error 不含 key。
-- [ ] idle runtime-affecting save 执行 validate -> close -> reload -> recreate -> resume durable Session；active Turn 时保持原 Runtime 并明确阻止应用。
+- [x] idle runtime-affecting save 执行 validate -> close -> reload -> recreate -> resume durable Session；active Turn 时保持原 Runtime 并明确阻止应用。
 - [ ] system/dark/light 选择与持久化通过，两主题下 message/Markdown/reasoning/tool/interaction/plan/todo/error/code/focus/runtime/settings 可读，颜色不是唯一线索。
 - [x] Settings 是连续行/分隔线布局，不存在 SettingCard/CardGrid/dashboard tile 或设计说明文案。
 
@@ -81,7 +81,7 @@
 - [x] Runtime 保留 console subsystem stdio，未使用 `--noconsole/--windowed`；通过 Electron `windowsHide:true` 隐藏窗口且三路 pipe 可用。
 - [x] 直接 spawn packaged Runtime 完成 ready/status/shutdown，stdout 每行合法 JSON、退出码 0，`prompt_assets/coding_agent.md` 可由 `importlib.resources` 读取。
 - [x] 构建 spec 只收集真实依赖/资源，不存在 `--collect-all everything`、构建输入复制、路径敏感 Hash 或构建专用完整性链。
-- [x] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。
+- [ ] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。（package 已通过；本轮 make 因外部 `20.205.243.166:443` ETIMEDOUT 未完成，未生成可核验的 Setup.exe。）
 - [x] packaged app `resources` 中完整存在 Runtime exe + `_internal`，production 启动无 system Python fallback，关闭后无 orphan child。
 - [x] Squirrel install/update/uninstall 特殊启动参数在 Main 早期收口，没有因 lifecycle 启动多个 Python child；Electron Fuses 实际打包状态已检查并记录。
 - [ ] 在无系统 Python 的 Windows 11 x64 环境执行安装 -> 启动 -> 首配 -> 对话 -> 关闭 -> 卸载，精确环境/结果记入 W05 Feedback。
@@ -91,30 +91,30 @@
 
 - [ ] 从真实 Desktop 启动完成 Renderer -> Preload -> Main -> Bridge -> Application -> Core -> AgentEvent -> Renderer，request/session/run/turn/pause identity 和事件顺序一致。
 - [ ] 配置未初始化、正常对话、Session replay、typed interaction、命令与关闭均不依赖 fake state/prototype stub。
-- [ ] `rg -n "alert\\(|prompt\\(|confirm\\(|fake|mock session|demo" desktop/src`的生产命中为 0 或逐条证明不是原型/假产品行为。
-- [ ] TypeScript 不定义第二 AgentEvent/Session/Permission/Plan/Todo/Failure taxonomy 或完整 Slash/Model authority，Bridge 不直接访问 Core/Provider/Tool/Session Store。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py tests/test_cli.py tests/test_application_runs.py tests/test_agent_events.py tests/test_agent_interaction.py tests/test_architecture_boundaries.py -q`，全部通过。
-- [ ] 从正式入口证明 `uthcode` 仍启动 TUI，`uthcode exec` 仍运行 Headless，Desktop 没有改写两者产品语义。
+- [x] `rg -n "alert\\(|prompt\\(|confirm\\(|fake|mock session|demo" desktop/src`的生产命中为 0 或逐条证明不是原型/假产品行为。
+- [x] TypeScript 不定义第二 AgentEvent/Session/Permission/Plan/Todo/Failure taxonomy 或完整 Slash/Model authority，Bridge 不直接访问 Core/Provider/Tool/Session Store。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py tests/test_cli.py tests/test_application_runs.py tests/test_agent_events.py tests/test_agent_interaction.py tests/test_architecture_boundaries.py -q`，全部通过。
+- [x] 从正式入口证明 `uthcode` 仍启动 TUI，`uthcode exec` 仍运行 Headless，Desktop 没有改写两者产品语义。
 
 ## T10：[端到端验证] Windows Feature Parity
 
 - [ ] 在 Windows 11 x64 安装产物上完成：安装 -> 首配 -> 打开 Re-UthCode -> 新 Session -> 对话 -> Tool -> AskUser -> Permission -> Plan -> Todo -> Steering -> Pause/Resume -> Model/Permission/Mode -> Compact/status -> 退出/重启 -> 旧 Session -> 继续对话。
 - [ ] AskUser E2E 包含多题、单选、多选、Other、回退修改/review；Permission 包含不提供 Session choice 的 request；Plan/Retry/Pause Cancel 均产生 cancel terminal 而非 resume。
-- [ ] active Turn 期间 `/model`/`/new`/`/resume`/`/compact`/`/plan`/`/do`/`/build` 不绕过门禁；pending Interaction 期间输入 Slash 不 dispatch，而是继续当前 interaction。
-- [ ] Session/Project 切换后旧 Run history/grant/mode 不带入 fresh Run，new Session 空视图、resume safe replay 与 live continuity 通过。
-- [ ] invalid config、bad key/provider failure、invalid IPC、Python Runtime crash、Session corrupt/busy、active Turn close/project switch 都有可理解结果，Runtime crash/protocol error 不伪装为 Provider/TurnFailed。
+- [x] active Turn 期间 `/model`/`/new`/`/resume`/`/compact`/`/plan`/`/do`/`/build` 不绕过门禁；pending Interaction 期间输入 Slash 不 dispatch，而是继续当前 interaction。
+- [x] Session/Project 切换后旧 Run history/grant/mode 不带入 fresh Run，new Session 空视图、resume safe replay 与 live continuity 通过。
+- [x] invalid config、bad key/provider failure、invalid IPC、Python Runtime crash、Session corrupt/busy、active Turn close/project switch 都有可理解结果，Runtime crash/protocol error 不伪装为 Provider/TurnFailed。
 - [ ] system/dark/light、Runtime Panel floating/docked/hidden、窄窗口 Chat 可用性与焦点/键盘路径通过真实人工验收。
-- [ ] 安装、Project、Session、Chat、Interaction、Settings、Layout、Exit 的任务书第 33 节每一项均在 W06 Feedback 记录通过或精确未验证原因。
+- [x] 安装、Project、Session、Chat、Interaction、Settings、Layout、Exit 的任务书第 33 节每一项均在 W06 Feedback 记录通过或精确未验证原因。
 
 ## T11：[遗留负担清理] 迁移收口
 
-- [ ] `rg -n "DesktopAgentEvent|DesktopSession|DesktopPermission|DesktopPlan|DesktopTask|DesktopFailure|EventBus|RpcManager|RuntimeManager|TransportFactory|PluginHost|DeviceProtocol" src desktop tests`返回 0 条生产重复 authority/未来占位，其他命中在 Feedback 逐条说明。
-- [ ] `rg -n "Card(Grid)?|DashboardCard|SettingCard|ToolCard|工程参考|设计说明|GUI 化|演示|三栏|这里用于|该区域" desktop/src/renderer`返回 0 条生产卡片布局/设计说明文案，用户数据命中例外在 Feedback 说明。
-- [ ] `rg -n "Subagent|Multi-Agent|Worktree|Git Diff|MCP|Skill|Auto Update|Tray|Windows Service|FastAPI|WebSocket|Named Pipe|gRPC" src/uthcode desktop/src`不存在 T10 未来能力入口/协议占位，必要否定语义命中在 Feedback 说明。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，将精确 passed/failed/skipped 写入 W06 Feedback。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`、`conda run --no-capture-output -n re-uthcode python -m pip check`、`git diff --check`，全部退出码 0。
+- [x] `rg -n "DesktopAgentEvent|DesktopSession|DesktopPermission|DesktopPlan|DesktopTask|DesktopFailure|EventBus|RpcManager|RuntimeManager|TransportFactory|PluginHost|DeviceProtocol" src desktop tests`返回 0 条生产重复 authority/未来占位，其他命中在 Feedback 逐条说明。
+- [x] `rg -n "Card(Grid)?|DashboardCard|SettingCard|ToolCard|工程参考|设计说明|GUI 化|演示|三栏|这里用于|该区域" desktop/src/renderer`返回 0 条生产卡片布局/设计说明文案，用户数据命中例外在 Feedback 说明。
+- [x] `rg -n "Subagent|Multi-Agent|Worktree|Git Diff|MCP|Skill|Auto Update|Tray|Windows Service|FastAPI|WebSocket|Named Pipe|gRPC" src/uthcode desktop/src`不存在 T10 未来能力入口/协议占位，必要否定语义命中在 Feedback 说明。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，将精确 passed/failed/skipped 写入 W06 Feedback。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`、`conda run --no-capture-output -n re-uthcode python -m pip check`、`git diff --check`，全部退出码 0。
 - [ ] 在 `desktop` 重新执行 `npm ci`、typecheck、unit/integration/E2E、build、package、make，并重跑 PyInstaller smoke 与 Installer 关键 E2E，精确结果写入 W06 Feedback。
-- [ ] `README.md`、用户手册、A04/命中的 A02/A03/TUI 当前事实、`docs/Context-Index.md` 与最终 `src/ + tests/` 一致；不把 Desktop 规划写成未实现事实。
-- [ ] UTF-8 检查覆盖本包、Context Index、Outstanding Debt 和实际修改的 Markdown，均可解码，无 replacement character/常见乱码，fenced code block 成对。
+- [x] `README.md`、用户手册、A04/命中的 A02/A03/TUI 当前事实、`docs/Context-Index.md` 与最终 `src/ + tests/` 一致；不把 Desktop 规划写成未实现事实。
+- [x] UTF-8 检查覆盖本包、Context Index、Outstanding Debt 和实际修改的 Markdown，均可解码，无 replacement character/常见乱码，fenced code block 成对。
 - [ ] `docs/OutstandingDebtList.md` 已核对且因“能力欠账：无”保持不变；W01～W06 Feedback 齐全、全部 Checklist 有证据后，Context Index 将 T10 标为 `implemented_unarchived`。
-- [ ] 本包未自动归档，未执行 commit、push、merge、rebase、tag 或 release，并保留用户开工前的手动归档改动。
+- [x] 本包未自动归档，未执行 commit、push、merge、rebase、tag 或 release，并保留用户开工前的手动归档改动。

@@ -37,6 +37,10 @@ src/uthcode/interfaces/tui/
 
 依赖方向保持为 `interfaces → application → core`。TUI 通过 `UthCodeApplication`、`AgentRun`、`TurnHandle` 和公开 `AgentEvent` 工作，不维护第二份会话事实。
 
+## Desktop 共存边界
+
+当前仓库同时提供 Windows Desktop shell。Desktop 位于独立的 `desktop/src/` 与 `src/uthcode/interfaces/desktop/bridge.py`，通过 Python Runtime JSONL Bridge 复用 Application、Session、Run、Turn、typed Interaction 和 AgentEvent；它不改变 TUI 的输入、渲染或 Session 语义。TUI 仍是 `uthcode` 的终端入口，Desktop 不能直接读取 Core、Provider、Tool 或 Session Store 内部状态。
+
 ## 输入数据流
 
 ```text

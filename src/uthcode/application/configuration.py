@@ -410,6 +410,31 @@ def _freeze_user_write_section(
     return MappingProxyType(result)
 
 
+def _freeze_provider_renames(
+    value: Mapping[str, str] | None,
+) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("provider_renames must be a mapping")
+    frozen: dict[str, str] = {}
+    for old_id, new_id in value.items():
+        if not isinstance(old_id, str) or not old_id.strip():
+            raise ConfigurationModelError(
+                "provider_renames source IDs must be non-empty strings"
+            )
+        if not isinstance(new_id, str) or not new_id.strip():
+            raise ConfigurationModelError(
+                "provider_renames destination IDs must be non-empty strings"
+            )
+        if old_id == new_id:
+            raise ConfigurationModelError(
+                "provider_renames source and destination IDs must differ"
+            )
+        frozen[old_id] = new_id
+    return MappingProxyType(frozen)
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class UserConfigurationWriteRequest:
     """Current-schema user configuration update.
@@ -423,6 +448,7 @@ class UserConfigurationWriteRequest:
     default_permission_mode: PermissionMode | str | None = None
     providers: Mapping[str, object] | None = None
     models: Mapping[str, object] | None = None
+    provider_renames: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -434,6 +460,11 @@ class UserConfigurationWriteRequest:
             self,
             "models",
             _freeze_user_write_section(self.models, field_name="models"),
+        )
+        object.__setattr__(
+            self,
+            "provider_renames",
+            _freeze_provider_renames(self.provider_renames),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -469,6 +500,11 @@ class UserConfigurationWriteRequest:
             "default_permission_mode": mode,
             "providers": providers,
             "models": models,
+            "provider_renames": (
+                None
+                if self.provider_renames is None
+                else dict(self.provider_renames)
+            ),
         }
 
     def __repr__(self) -> str:
@@ -477,7 +513,8 @@ class UserConfigurationWriteRequest:
             f"default_model={self.default_model!r}, "
             f"default_permission_mode={self.default_permission_mode!r}, "
             f"providers={None if self.providers is None else '<redacted>'!r}, "
-            f"models={None if self.models is None else tuple(self.models)!r})"
+            f"models={None if self.models is None else tuple(self.models)!r}, "
+            f"provider_renames={None if self.provider_renames is None else dict(self.provider_renames)!r})"
         )
 
 
