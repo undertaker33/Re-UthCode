@@ -86,10 +86,11 @@ test("T04 catalog and preference updates keep the active project/session navigat
   assert.equal(state.projects.find((project) => project.projectKey === "C:/Projects/one")?.alias, "Renamed");
 });
 
-test("T04 production shell has real navigation surfaces and no prototype account controls", () => {
+test("semantic shell mounts without prototype state", () => {
   const state: RendererState = createInitialState();
   const markup = renderToStaticMarkup(<App initialState={state} api={undefined} />);
-  assert.match(markup, /New chat/);
+  assert.match(markup, /aria-label="UthCode conversation workspace"/);
+  assert.match(markup, /New session/);
   assert.match(markup, /Open project/);
   assert.match(markup, /Settings/);
   assert.match(markup, /Runtime/);
@@ -97,7 +98,7 @@ test("T04 production shell has real navigation surfaces and no prototype account
   assert.doesNotMatch(markup, /prompt\(|confirm\(/u);
 });
 
-test("T04 navigation and Runtime Panel render the supported continuous surfaces", () => {
+test("project groups, session state, and Runtime projections remain connected", () => {
   const base = createInitialState({
     projects: [
       { path: "C:/one", projectKey: "C:/one", alias: "One", pinned: true, sessions: [{ session_id: "s1", preview: "first" }], catalogFresh: true },
@@ -106,12 +107,21 @@ test("T04 navigation and Runtime Panel render the supported continuous surfaces"
     selectedProjectKey: "C:/one",
   });
   const appMarkup = renderToStaticMarkup(<App initialState={base} api={undefined} />);
-  assert.match(appMarkup, /Pinned/);
-  assert.match(appMarkup, /Projects/);
+  assert.match(appMarkup, /aria-label="Project navigation"/);
+  assert.match(appMarkup, /One/);
+  assert.match(appMarkup, /Two/);
   assert.match(appMarkup, /first/);
+  assert.match(appMarkup, />Pinned</);
+  assert.match(appMarkup, />Projects</);
+  assert.match(appMarkup, /Remove from Desktop/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
-    const panelMarkup = renderToStaticMarkup(<RuntimePanel state={createInitialState({ ...base, panelMode })} onPanelModeChange={() => undefined} />);
+    const panelMarkup = renderToStaticMarkup(<RuntimePanel state={createInitialState({ ...base, panelMode, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
+    assert.match(panelMarkup, /aria-label="Runtime information"/);
     assert.match(panelMarkup, new RegExp(`runtime-panel--${panelMode}`));
+    assert.match(panelMarkup, /1,200 \/ 4,000/);
+    assert.match(panelMarkup, />plan</);
+    if (panelMode === "hidden") assert.match(panelMarkup, /aria-hidden="true"/);
+    else assert.doesNotMatch(panelMarkup, /aria-hidden="true"/);
   }
 });
 
@@ -489,16 +499,17 @@ test("T07 hidden Runtime Panel keeps restore controls in the shell", () => {
   assert.match(markup, /Open Runtime/);
 });
 
-test("T07 Runtime switch remains visible and floating mode is a narrow drawer", async () => {
+test("T07 Runtime switch and three layout modes remain operational", async () => {
   const dockedMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "docked" })} api={undefined} />);
   assert.match(dockedMarkup, /aria-label="Toggle Runtime panel"/);
   assert.match(dockedMarkup, /Open Runtime/);
   const floatingMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "floating" })} api={undefined} />);
   assert.match(floatingMarkup, /Hide Runtime/);
+  assert.match(floatingMarkup, /runtime-panel--floating/);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
-  const narrowCss = css.slice(css.indexOf("@media (max-width: 1080px)"));
-  assert.match(narrowCss, /\.runtime-panel--floating[\s\S]*position: fixed/);
-  assert.match(narrowCss, /\.app-shell\.panel-floating \.runtime-panel--floating \{ display: block; \}/);
+  assert.match(css, /\.runtime-panel--docked\s*\{[^}]*position:\s*relative[^}]*width:/s);
+  assert.match(css, /\.runtime-panel--floating\s*\{[^}]*position:\s*fixed[^}]*inset:[^}]*max-height:/s);
+  assert.match(css, /\.runtime-panel--hidden\s*\{\s*display:\s*none;/s);
 });
 
 test("T07 completion preserves canonical slash prefixes and replaces only the current argument", () => {

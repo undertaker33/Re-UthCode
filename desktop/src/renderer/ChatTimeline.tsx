@@ -29,7 +29,7 @@ export function renderInline(source: string): ReactNode[] {
     if (token.startsWith("[") && match[2]) {
       const label = token.slice(1, token.indexOf("]("));
       const href = safeHref(match[2]);
-      nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{label}</a> : <span key={`link-${index}`} className="link-blocked">{label}</span>);
+      nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{label}</a> : <span key={`link-${index}`}>{label}</span>);
     } else if (token.startsWith("`") && token.endsWith("`")) {
       nodes.push(<code key={`code-${index}`}>{token.slice(1, -1)}</code>);
     } else if (token.startsWith("**")) {
@@ -153,19 +153,16 @@ function entryLabel(entry: TimelineEntry): string {
 
 export function ChatTimeline({ entries, todo, notice }: ChatTimelineProps) {
   return (
-    <section className="timeline" aria-label="Chat timeline">
-      {notice && <p className="timeline-notice">{notice}</p>}
-      {entries.length === 0 && <div className="timeline--empty"><p>Select a Session or start a new chat.</p></div>}
+    <section aria-label="Chat timeline">
+      {notice && <p role="status">{notice}</p>}
+      {entries.length === 0 && <p>No conversation selected.</p>}
       {entries.map((entry) => (
-        <article key={entry.id} className={`timeline-entry timeline-entry--${entry.kind}${entry.streaming ? " is-streaming" : ""}${entry.status ? ` is-${entry.status}` : ""}`}>
-          <div className="timeline-entry__rail" aria-hidden="true" />
-          <div className="timeline-entry__body">
-            <div className="timeline-entry__meta"><span>{entryLabel(entry)}</span>{entry.kind === "tool" && <span className={`tool-state${entry.isError ? " tool-state--error" : ""}`}>{entry.status || "running"}</span>}{entry.streaming && <span>writing…</span>}</div>
-            <div className="timeline-entry__content">{entry.kind === "tool" ? <p className="tool-summary">{entry.text}{entry.status === "failed" ? " · failed" : entry.status === "completed" ? " · completed" : " · running"}</p> : renderMarkdown(entry.text)}</div>
-          </div>
+        <article key={entry.id} aria-label={entryLabel(entry)} aria-busy={entry.streaming || undefined}>
+          <header>{entryLabel(entry)}{entry.kind === "tool" && ` · ${entry.status || "running"}`}{entry.streaming && " · streaming"}</header>
+          <div>{entry.kind === "tool" ? <p>{entry.text}{entry.status === "failed" ? " · failed" : entry.status === "completed" ? " · completed" : " · running"}</p> : renderMarkdown(entry.text)}</div>
         </article>
       ))}
-      {todo.length > 0 && <section className="todo-strip" aria-label="Current tasks"><div className="timeline-entry__meta"><span>Tasks</span><span>{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></div><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} className={`todo-item todo-item--${item.status}`}><span aria-hidden="true">{item.status === "completed" ? "✓" : item.status === "in_progress" ? "›" : "○"}</span>{item.content}</li>)}</ul></section>}
+      {todo.length > 0 && <section aria-label="Current tasks"><h2>Tasks ({todo.filter((item) => item.status === "completed").length}/{todo.length})</h2><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>{item.content}</li>)}</ul></section>}
     </section>
   );
 }
