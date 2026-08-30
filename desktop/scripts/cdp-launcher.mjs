@@ -10,7 +10,12 @@
  *
  * CLI:
  *   node scripts/cdp-launcher.mjs -- node scripts/cdp-openai-fixture.mjs --port 0
- *   node scripts/cdp-launcher.mjs --env UTHCODE_CONFIG_PATH=C:\\Users\\93445\\.uthcode\\config.toml -- node scripts/cdp-driver.mjs
+ *   node scripts/cdp-launcher.mjs --electron -- UthCode.exe --remote-debugging-port=9229
+ *
+ * The default mode gives fixtures, drivers, and Python helpers a fully isolated
+ * Windows profile. Electron mode deliberately preserves the host Windows
+ * profile identity (Chromium uses it while bootstrapping), but redirects the
+ * UthCode config and forces a unique temporary user-data directory.
  */
 
 import { spawn } from "node:child_process";
@@ -22,7 +27,10 @@ import { join, win32 } from "node:path";
 const DESKTOP_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const WORKSPACE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const REQUIRED_PATH_ENV = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"];
+const WINDOWS_PROFILE_ENV = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"];
 const OUTPUT_FLAGS = new Set(["--log", "--ready-file", "--log-file", "--user-data-dir"]);
+const LAUNCH_MODES = new Set(["isolated", "electron"]);
+const MANAGED_ENV_KEYS = new Set([...WINDOWS_PROFILE_ENV, "UTHCODE_CONFIG_PATH"].map((name) => name.toUpperCase()));
 
 function lexicalPath(value) {
   return win32.normalize(win32.resolve(String(value))).toLowerCase();
@@ -44,20 +52,26 @@ function assertRootedPath(label, value, root) {
   if (isWithin(value, WORKSPACE_ROOT) && label === "HOME") throw new Error("HOME cannot be the workspace");
 }
 
-export function assertCdpLaunchEnvironment({ root, env, outputPaths = [] }) {
+export function assertCdpLaunchEnvironment({ root, env, outputPaths = [], mode = "isolated", userDataDir }) {
+  if (!LAUNCH_MODES.has(mode)) throw new Error(`unsupported launch mode: ${mode}`);
   assertRootedPath("launch root", root, tmpdir());
-  const home = env.HOME;
-  const userProfile = env.USERPROFILE;
-  for (const name of REQUIRED_PATH_ENV) assertRootedPath(name, env[name], root);
-  if (!samePath(home, userProfile)) throw new Error("HOME and USERPROFILE must identify the same isolated root");
-
-  const homeFromDrivePair = `${env.HOMEDRIVE ?? ""}${env.HOMEPATH ?? ""}`;
-  if (!env.HOMEDRIVE || !env.HOMEPATH || !samePath(homeFromDrivePair, userProfile)) {
-    throw new Error("HOMEDRIVE/HOMEPATH must identify USERPROFILE");
-  }
-  if (!isWithin(homeFromDrivePair, root)) throw new Error("HOMEDRIVE/HOMEPATH escapes isolated root");
-
   assertRootedPath("UTHCODE_CONFIG_PATH", env.UTHCODE_CONFIG_PATH, root);
+  if (mode === "isolated") {
+    const home = env.HOME;
+    const userProfile = env.USERPROFILE;
+    for (const name of REQUIRED_PATH_ENV) assertRootedPath(name, env[name], root);
+    if (!samePath(home, userProfile)) throw new Error("HOME and USERPROFILE must identify the same isolated root");
+
+    const homeFromDrivePair = `${env.HOMEDRIVE ?? ""}${env.HOMEPATH ?? ""}`;
+    if (!env.HOMEDRIVE || !env.HOMEPATH || !samePath(homeFromDrivePair, userProfile)) {
+      throw new Error("HOMEDRIVE/HOMEPATH must identify USERPROFILE");
+    }
+    if (!isWithin(homeFromDrivePair, root)) throw new Error("HOMEDRIVE/HOMEPATH escapes isolated root");
+  } else {
+    if (!userDataDir) throw new Error("Electron user-data-dir is required");
+    assertRootedPath("Electron user-data-dir", userDataDir, root);
+    if (samePath(userDataDir, env.UTHCODE_CONFIG_PATH)) throw new Error("Electron user-data-dir must be separate from config");
+  }
   for (const outputPath of outputPaths) assertRootedPath("launcher output", outputPath, root);
 }
 
@@ -67,26 +81,58 @@ function windowsDrivePair(path) {
   return { drive: parsed.root.slice(0, 2), path: normalized.slice(2) || "\\" };
 }
 
-export async function createIsolatedCdpContext({ prefix = "uthcode-cdp-launch-", envOverrides = {}, outputPaths = [] } = {}) {
+function validateEnvOverrides(envOverrides) {
+  const seen = new Set();
+  for (const name of Object.keys(envOverrides)) {
+    const normalizedName = name.toUpperCase();
+    if (seen.has(normalizedName)) throw new Error(`duplicate environment key: ${name}`);
+    seen.add(normalizedName);
+    if (MANAGED_ENV_KEYS.has(normalizedName)) {
+      throw new Error(`managed environment key cannot be overridden: ${name}`);
+    }
+  }
+}
+
+function rejectCallerUserDataDir(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const equalsIndex = argument.indexOf("=");
+    const flag = equalsIndex >= 0 ? argument.slice(0, equalsIndex) : argument;
+    if (flag !== "--user-data-dir") continue;
+    throw new Error("Electron --user-data-dir is launcher-managed");
+  }
+}
+
+function electronArgs(args, userDataDir) {
+  rejectCallerUserDataDir(args);
+  return [...args, `--user-data-dir=${userDataDir}`];
+}
+
+export async function createIsolatedCdpContext({ prefix = "uthcode-cdp-launch-", envOverrides = {}, outputPaths = [], mode = "isolated" } = {}) {
+  if (!LAUNCH_MODES.has(mode)) throw new Error(`unsupported launch mode: ${mode}`);
+  validateEnvOverrides(envOverrides);
   const root = await mkdtemp(join(tmpdir(), prefix));
   const home = join(root, "home");
   const appData = join(root, "appdata");
   const localAppData = join(root, "localappdata");
   const configPath = join(home, ".uthcode", "config.toml");
+  const userDataDir = join(root, "electron-user-data");
   const homePair = windowsDrivePair(home);
-  const env = {
-    ...process.env,
-    HOME: home,
-    USERPROFILE: home,
-    APPDATA: appData,
-    LOCALAPPDATA: localAppData,
-    HOMEDRIVE: homePair.drive,
-    HOMEPATH: homePair.path,
-    UTHCODE_CONFIG_PATH: configPath,
-  };
+  const env = mode === "electron"
+    ? { ...process.env, UTHCODE_CONFIG_PATH: configPath }
+    : {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: appData,
+      LOCALAPPDATA: localAppData,
+      HOMEDRIVE: homePair.drive,
+      HOMEPATH: homePair.path,
+      UTHCODE_CONFIG_PATH: configPath,
+    };
   Object.assign(env, envOverrides);
   try {
-    assertCdpLaunchEnvironment({ root, env, outputPaths });
+    assertCdpLaunchEnvironment({ root, env, outputPaths, mode, userDataDir: mode === "electron" ? userDataDir : undefined });
     await mkdir(join(home, ".uthcode"), { recursive: true });
     await mkdir(appData, { recursive: true });
     await mkdir(localAppData, { recursive: true });
@@ -96,6 +142,8 @@ export async function createIsolatedCdpContext({ prefix = "uthcode-cdp-launch-",
       appData,
       localAppData,
       configPath,
+      userDataDir,
+      mode,
       env,
       cleanup: () => rm(root, { recursive: true, force: true }),
     };
@@ -119,12 +167,27 @@ function outputPathsFromArgs(args) {
   return paths;
 }
 
-export async function spawnIsolatedCommand({ command, args = [], cwd = DESKTOP_ROOT, envOverrides = {}, stdio = "inherit", prefix } = {}) {
+export async function spawnIsolatedCommand({ command, args = [], cwd = DESKTOP_ROOT, envOverrides = {}, stdio = "inherit", prefix, mode = "isolated" } = {}) {
   if (!command) throw new Error("launcher command is required");
-  const context = await createIsolatedCdpContext({ prefix, envOverrides, outputPaths: outputPathsFromArgs(args) });
+  validateEnvOverrides(envOverrides);
+  if (mode === "electron") rejectCallerUserDataDir(args);
+  const context = await createIsolatedCdpContext({ prefix, envOverrides, mode });
+  const launchArgs = mode === "electron" ? electronArgs(args, context.userDataDir) : args;
+  try {
+    assertCdpLaunchEnvironment({
+      root: context.root,
+      env: context.env,
+      mode,
+      userDataDir: mode === "electron" ? context.userDataDir : undefined,
+      outputPaths: outputPathsFromArgs(launchArgs),
+    });
+  } catch (error) {
+    await context.cleanup();
+    throw error;
+  }
   let child;
   try {
-    child = spawn(command, args, { cwd, env: context.env, stdio, windowsHide: true });
+    child = spawn(command, launchArgs, { cwd, env: context.env, stdio, windowsHide: true });
     return { child, context };
   } catch (error) {
     await context.cleanup();
@@ -142,13 +205,18 @@ function parseCli(argv) {
   const separator = argv.indexOf("--");
   if (separator < 0 || separator === argv.length - 1) throw new Error("launcher requires a command after --");
   const envOverrides = {};
+  let mode = "isolated";
   for (let index = 0; index < separator; index += 1) {
+    if (argv[index] === "--electron") {
+      mode = "electron";
+      continue;
+    }
     if (argv[index] !== "--env") throw new Error(`unknown launcher option: ${argv[index]}`);
     const [name, value] = parseEnvOverride(argv[index + 1] ?? "");
     envOverrides[name] = value;
     index += 1;
   }
-  return { envOverrides, command: argv[separator + 1], args: argv.slice(separator + 2) };
+  return { envOverrides, mode, command: argv[separator + 1], args: argv.slice(separator + 2) };
 }
 
 function waitForChild(child) {

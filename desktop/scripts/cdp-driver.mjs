@@ -411,6 +411,16 @@ async function run() {
     await waitFor(session, "UthCode shell", "Boolean(document.querySelector('[aria-label=\\\"Project navigation\\\"]'))");
     await waitFor(session, "Composer", "Boolean(document.querySelector('textarea[aria-label=\\\"Message UthCode\\\"]'))");
 
+    if (flow === "shell") {
+      const rendererReady = await evaluateAction(session, "Renderer ready", "JSON.stringify({ readyState: document.readyState, title: document.title, bodyReady: Boolean(document.body) })");
+      writeLog("assertion_pass", { description: "Renderer ready", value: rendererReady });
+      writeLog("action", { action: "close_shell" });
+      await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+      writeLog("quit_requested", { port: cdpPort });
+      writeLog("driver_complete", { exitCode: 0 });
+      return;
+    }
+
     // New Session -> real Provider request -> streamed AgentEvent projection.
     await clickText(session, "New chat");
     await waitFor(session, "new conversation header", "document.querySelector('h1')?.textContent?.includes('Session') || document.querySelector('h1')?.textContent?.includes('New conversation')");

@@ -522,3 +522,99 @@ Reviewer 指出旧轮历史证据被后来新增的 launcher 回写。本轮仅�
 旧轮还确实发生过 PowerShell `$home` 误用导致真实用户配置被 fixture 覆盖；覆盖前没有备份。用户授权、由调度者把 `C:\Users\93445\.uthcode\config.toml` 重建为空白安全配置（仅 `default_permission_mode = "default"`）不等于恢复原内容，本 Feedback 不声称原配置已恢复，也不把重建文件作为旧证据。
 
 从返工第3轮起，未来所有 CDP、fixture 和 Electron 复现必须先经 `desktop/scripts/cdp-launcher.mjs`：由 launcher 创建并校验唯一系统临时 root，统一隔离用户环境、状态、日志和输出，再在有界 deadline 内启动目标；不得再提供或执行绕过 launcher 的新复现命令。该未来规则不回写旧轮，旧轮 raw 记录保持上述实际事实。
+
+### 返工第 5 轮追加：Forge 离线校验与打包复验（2026-08-30）
+
+本轮根据 Reviewer 的缓存校验 finding 做最小修复：`desktop/forge.config.ts` 通过 `createRequire(import.meta.url)` 加载本地 `electron/checksums.json`，并将其设置为 `packagerConfig.download.checksums`。未设置 `unsafelyDisableChecksums`，未复制 ZIP，也未引入绝对路径。当前本地缓存 `C:\Users\93445\AppData\Local\electron\Cache\16cfa46effad3eaba32b3370f8ae31cae8ea2624490eaa5f736d489be8e9c6c4\electron-v44.0.0-win32-x64.zip` 大小为 157455369 bytes，SHA256 为 `e61aa3bcea8152bc0730abd015e47c032d778a0ef10e2a1c78ba3c4ea47942f9`，与已安装包的对应 checksum 一致。`desktop/tests/windows-packaging.test.ts` 新增真实配置回归，比较上述 artifact checksum。
+
+本轮所有外部启动均经 `desktop/scripts/cdp-launcher.mjs`，用户配置仍由临时 HOME/USERPROFILE/APPDATA/LOCALAPPDATA 隔离；Forge cache 通过 `ELECTRON_FORGE_PACKAGER_CONFIG_DOWNLOAD_CACHE_ROOT` 显式指向已存在的 Electron cache，只读使用，不访问 `C:\Users\93445\.uthcode\config.toml`。package/make 不是 CDP/fixture/Electron 应用复现，均使用本地 ZIP 和内置 checksums 完成，没有重试 GitHub。
+
+本轮命令与精确结果：
+
+```text
+node scripts/cdp-launcher.mjs -- conda run --no-capture-output -n re-uthcode npm run typecheck  (cwd=desktop)
+-> exit 0
+
+node scripts/cdp-launcher.mjs -- conda run --no-capture-output -n re-uthcode npx tsx --test --test-name-pattern='Forge packaging uses' tests/windows-packaging.test.ts  (cwd=desktop)
+-> 1 passed, 0 failed
+
+node scripts/cdp-launcher.mjs -- conda run --no-capture-output -n re-uthcode npx tsx --test tests/windows-packaging.test.ts  (cwd=desktop)
+-> 4 passed, 0 failed, 56277.4541ms
+
+node scripts/cdp-launcher.mjs --env ELECTRON_FORGE_PACKAGER_CONFIG_DOWNLOAD_CACHE_ROOT=C:\Users\93445\AppData\Local\electron\Cache -- conda run --no-capture-output -n re-uthcode npm run package  (cwd=desktop)
+-> exit 0；PyInstaller onedir + Runtime smoke、Forge packaged app 均成功
+
+node scripts/cdp-launcher.mjs --env ELECTRON_FORGE_PACKAGER_CONFIG_DOWNLOAD_CACHE_ROOT=C:\Users\93445\AppData\Local\electron\Cache -- conda run --no-capture-output -n re-uthcode npm run make  (cwd=desktop)
+-> exit 0；Squirrel distributable 成功，`desktop/out/make/squirrel.windows/x64/UthCode Setup.exe` 已生成
+
+node scripts/cdp-launcher.mjs -- conda run --no-capture-output -n re-uthcode npm test  (cwd=desktop)
+-> 63 passed, 0 failed, 0 skipped, 56322.5626ms
+```
+
+Checklist 仅将第 84 项复选框由未完成改为完成；其原有括号中的旧轮外部网络失败说明保留为历史记录。第 87、116、119 项以及 Windows 干净机、Installer 首配/对话/卸载、完整真实 Feature Parity 和人工 UI 清单仍未完成，未将其写成通过。`docs/Context-Index.md` 当前事实同步为 package/make 与完整 Desktop 自动化测试已有证据，但 T10 仍保持 `not_implemented`。
+
+### 返工第 6 轮追加：Electron 隔离模式、shell driver 与 packaged 启动复核（2026-08-30）
+
+本轮处理 Reviewer 的 packaged `UthCode.exe` `0x80000003` finding。最小对照先在唯一系统临时目录复制同一 packaged 目录，均通过当时的全 profile 隔离 launcher 启动：原 Fuse 产物、仅关闭 `EnableEmbeddedAsarIntegrityValidation` 的副本、仅关闭 `OnlyLoadAppFromAsar` 的副本、替换为 pristine Electron 44 的副本，以及有/无 `--disable-gpu` 的最终产物均立即 exit 1；stderr 只有 Chromium allocator verbose 行。该对照排除了 Fuse 单项、`@electron/fuses` 的 Electron 44 wire 第 9 项、rcedit/Forge 最终 EXE 和 GPU 作为根因。此前 Windows Application Error 1000 的同一故障记录为 `UthCode.exe` exception `0x80000003`、offset `0x31f2805`（Report ID `d377047e-f5b9-4e89-ba90-b4cbe9858e39`；后续对照同 offset），但对照均使用错误隔离模式，不能归因于产品 EXE。
+
+根因是旧 launcher 将 Windows Electron 启动所需的 `HOME`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`HOMEDRIVE`、`HOMEPATH` 全部重写为临时目录。`desktop/scripts/cdp-launcher.mjs` 现增加明确 `--electron` 模式：保留上述六个 Windows profile identity 值，只将 `UTHCODE_CONFIG_PATH` 指向 launcher 创建的唯一临时 root 内路径，并强制追加同一 root 内唯一 `--user-data-dir`；调用者覆盖 profile、真实配置或自带 user-data-dir 均在 spawn 前静默拒绝。默认模式仍对 fixture、driver、Python helper 全量隔离六个 profile 变量；日志、ready-file、log-file 和 user-data-dir 输出继续必须在临时 root 内。该模式不读取或写入 `C:\Users\93445\.uthcode\config.toml`。
+
+本轮用新模式对新 packaged 产物完成真实 Renderer/CDP smoke：
+
+```text
+node scripts/cdp-launcher.mjs --electron -- out/UthCode-win32-x64/UthCode.exe --remote-debugging-port=9250 --disable-gpu --enable-logging=stderr
+-> Electron 在固定端口启动并保持运行；target 为
+   file:///D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/resources/app.asar/.webpack/renderer/main_window/index.html
+
+node scripts/cdp-launcher.mjs -- node scripts/cdp-driver.mjs --port 9250 --flow shell --timeout-ms 30000 --request-timeout-ms 5000
+-> exit 0；Project navigation、Composer、Renderer ready
+   (readyState=complete,title=UthCode,bodyReady=true)、window.uthcode.closeShell 通过；
+   Electron launcher 随后 exit 0，无残留 UthCode/runtime 进程。
+```
+
+为防止 shell smoke 回退到 Provider 流程，`desktop/scripts/cdp-driver.mjs` 增加最小 `flow=shell` 分支：完成 shell/Composer 断言后记录 Renderer ready、请求 close、记录 `driver_complete` 并直接返回。`desktop/tests/cdp-isolation.test.ts` 增加固定 target 缺失时的 shell-mode bounded regression；shell mode 与两种 launcher 模式/逃逸拒绝共 6 项通过。
+
+本轮验证结果：
+
+```text
+npx tsx --test tests/cdp-isolation.test.ts
+-> 6 passed，0 failed，0 skipped
+
+npm run typecheck
+-> exit 0
+
+npm test
+-> 66 passed，0 failed，0 skipped
+
+package/make
+-> 本轮 checksum 修复后的 package、make 已均 exit 0；新 packaged app 与
+   desktop/out/make/squirrel.windows/x64/UthCode Setup.exe 已生成（本轮不重复执行）。
+```
+
+P2：Checklist 第 84 项括号已改为当前 package/make exit 0 与 Setup.exe 已生成；旧轮 `20.205.243.166:443` ETIMEDOUT 只保留在本 Feedback 历史记录。P3：`windows-packaging.test.ts` 从已安装 `electron/package.json` 的版本动态组装 win32-x64 artifact，断言 checksums mapping 一致且值为 64 位十六进制，不再硬编码 v44 或固定摘要。Checklist 第 87、116、119 项以及 Windows 干净机 Installer、首配/对话/卸载、完整真实 Feature Parity 和人工 UI 清单仍未完成；Context Index 继续保持 T10 `not_implemented`，不得更新为 `implemented_unarchived`。
+
+本轮 governed Markdown 写回前后均执行 `uth-utf8-guard`，只修改当前 Checklist 第 84 项并在 Feedback 末尾追加本节；未覆盖旧轮历史记录。无 Git commit/push/merge/rebase/tag/release/归档。
+
+### 返工第 7 轮追加：Windows 环境变量大小写保护（2026-08-30）
+
+Reviewer 发现 Windows 环境变量名大小写不敏感，而 launcher 的 protected-env 判断曾大小写敏感；`--electron --env home=...` 与 `--env uthcode_config_path=...` 因此可能绕过 preflight。现已在 `desktop/scripts/cdp-launcher.mjs` 对 env key 使用大写规范化：Electron 模式和默认 isolated 模式均拒绝六个 Windows profile key 及 `UTHCODE_CONFIG_PATH` 的任意大小写形式；同一请求内的 case-variant duplicate key 也在创建临时 root、spawn、日志或 server 之前拒绝。默认 isolated 模式的完整 profile 隔离行为保持不变，Electron 模式仍保留 Windows profile identity 并只使用临时 config/user-data-dir。
+
+`desktop/tests/cdp-isolation.test.ts` 新增 lower/mixed-case profile/config 逃逸及默认模式重复 key 用例；每个拒绝断言均确认 child 未 spawn 且 stdout/stderr 为空。未读取或写入真实用户配置，未执行 Git 写操作。
+
+本轮精确验证：
+
+```text
+node --check scripts/cdp-launcher.mjs
+-> exit 0
+
+npx tsx --test tests/cdp-isolation.test.ts
+-> 7 passed，0 failed，0 skipped
+
+npm run typecheck
+-> exit 0
+
+npm test（此前同一修复后的完整回归）
+-> 67 passed，0 failed，0 skipped
+```
+
+`uth-utf8-guard` 与 `git diff --check` 在本轮 Feedback 追加后复跑并通过；Context Index 仍保持 T10 `not_implemented`。Checklist 第 87、116、119 项、干净 Windows/Installer、首配/对话/卸载、完整真实 Feature Parity 与人工 UI 仍未验证。

@@ -6,10 +6,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import forgeConfig from "../forge.config";
 
 const desktopRoot = new URL("../", import.meta.url);
 const repoRoot = new URL("../../", import.meta.url);
 const execFileAsync = promisify(execFile);
+const requirePackage = createRequire(import.meta.url);
 
 type ExecFailure = {
   code?: number | string;
@@ -20,6 +23,17 @@ type ExecFailure = {
 async function read(relative: string, root = desktopRoot): Promise<string> {
   return readFile(new URL(relative, root), "utf8");
 }
+
+test("Forge packaging uses the installed Electron checksums without remote checksum lookup", () => {
+  const packageChecksums = requirePackage("electron/checksums.json") as Record<string, string>;
+  const electronPackage = requirePackage("electron/package.json") as { version: string };
+  const configuredChecksums = forgeConfig.packagerConfig?.download?.checksums;
+  const artifact = `electron-v${electronPackage.version}-win32-x64.zip`;
+
+  assert.ok(configuredChecksums);
+  assert.match(packageChecksums[artifact] ?? "", /^[0-9a-f]{64}$/u);
+  assert.equal(configuredChecksums[artifact], packageChecksums[artifact]);
+});
 
 test("T08 checked-in build contract defines the bundled Runtime and Installer", async () => {
   const spec = await read("packaging/uthcode-runtime.spec");
