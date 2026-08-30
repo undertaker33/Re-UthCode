@@ -1,14 +1,20 @@
 import type { ForgeConfig } from "@electron-forge/shared-types";
 import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 
+const require = createRequire(import.meta.url);
+const electronChecksums = require("electron/checksums.json") as Record<string, string>;
 const runtimeResourcePath = resolve(__dirname, ".runtime", "uthcode-runtime");
 
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
     extraResource: runtimeResourcePath,
+    download: {
+      checksums: electronChecksums,
+    },
   },
   makers: [
     {

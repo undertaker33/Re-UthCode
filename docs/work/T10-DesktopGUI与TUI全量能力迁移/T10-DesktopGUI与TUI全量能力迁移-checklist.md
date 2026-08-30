@@ -81,7 +81,7 @@
 - [x] Runtime 保留 console subsystem stdio，未使用 `--noconsole/--windowed`；通过 Electron `windowsHide:true` 隐藏窗口且三路 pipe 可用。
 - [x] 直接 spawn packaged Runtime 完成 ready/status/shutdown，stdout 每行合法 JSON、退出码 0，`prompt_assets/coding_agent.md` 可由 `importlib.resources` 读取。
 - [x] 构建 spec 只收集真实依赖/资源，不存在 `--collect-all everything`、构建输入复制、路径敏感 Hash 或构建专用完整性链。
-- [ ] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。（package 已通过；本轮 make 因外部 `20.205.243.166:443` ETIMEDOUT 未完成，未生成可核验的 Setup.exe。）
+- [x] 在 `desktop` 执行 `npm run package -- --platform=win32 --arch=x64` 和 `npm run make -- --platform=win32 --arch=x64`，成功生成 packaged app 与 `UthCode Setup.exe`。（本轮 package 与 make 均 exit 0，已生成 packaged app 与 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`；旧轮 `20.205.243.166:443` ETIMEDOUT 仅保留在 Feedback 历史记录。）
 - [x] packaged app `resources` 中完整存在 Runtime exe + `_internal`，production 启动无 system Python fallback，关闭后无 orphan child。
 - [x] Squirrel install/update/uninstall 特殊启动参数在 Main 早期收口，没有因 lifecycle 启动多个 Python child；Electron Fuses 实际打包状态已检查并记录。
 - [ ] 在无系统 Python 的 Windows 11 x64 环境执行安装 -> 启动 -> 首配 -> 对话 -> 关闭 -> 卸载，精确环境/结果记入 W05 Feedback。
