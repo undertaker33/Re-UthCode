@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
 import squirrelStartup from "electron-squirrel-startup";
 import { isAbsolute, resolve, join } from "node:path";
@@ -130,6 +130,7 @@ interface MainIpcOptions {
   registeredProjects?: Set<string>;
   closeShell?: () => void;
   ipc?: Pick<typeof ipcMain, "handle" | "removeHandler">;
+  setNativeTheme?: (theme: DesktopPreferences["theme"]) => void;
 }
 
 export function registerIpcHandlers(options: MainIpcOptions): () => void {
@@ -140,6 +141,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   const openPath = options.openPath ?? shell.openPath;
   const ipc = options.ipc ?? ipcMain;
   const closeShell = options.closeShell ?? beginApplicationShutdown;
+  const setNativeTheme = options.setNativeTheme ?? ((theme: DesktopPreferences["theme"]) => { nativeTheme.themeSource = theme; });
 
   const onPickProject = async (event: IpcMainInvokeEvent): Promise<string | null> => {
     assertSender(event);
@@ -216,7 +218,9 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     assertSender(event);
     assertPreferenceKey(key);
     if (!isJsonValue(value)) throw new MainBoundaryError("invalid_preference", "Desktop preference value is invalid");
-    return options.preferences.write(key, value as never);
+    const written = await options.preferences.write(key, value as never);
+    if (key === "theme") setNativeTheme(written.theme);
+    return written;
   };
 
   ipc.handle(IPC_CHANNELS.pickProject, onPickProject);
@@ -332,6 +336,8 @@ function createMainWindow(): BrowserWindow {
     height: 800,
     minWidth: 800,
     minHeight: 600,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#1d1d1f" : "#f5f5f7",
+    autoHideMenuBar: true,
     webPreferences: getSecureWebPreferences(PRELOAD_ENTRY()),
   });
   const rendererEntry = RENDERER_ENTRY();
@@ -358,9 +364,12 @@ function createMainWindow(): BrowserWindow {
 }
 
 export function bootstrapMain(): void {
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     preferences = new DesktopPreferencesStore(join(app.getPath("userData"), "desktop-preferences.json"));
     runtime = createRuntime();
+    const initialPreferences = await preferences.read();
+    nativeTheme.themeSource = initialPreferences.theme;
+    Menu.setApplicationMenu(null);
     mainWindow = createMainWindow();
     removeIpcHandlers = registerIpcHandlers({
       window: mainWindow,

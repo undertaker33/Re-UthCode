@@ -104,6 +104,8 @@ test("compiled Webpack Main entry bootstraps and creates the secure window", asy
     BrowserWindow: FakeBrowserWindow,
     dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
     ipcMain,
+    Menu: { setApplicationMenu: (_menu: unknown) => undefined },
+    nativeTheme: { themeSource: "system", shouldUseDarkColors: true },
     shell: { openPath: async () => "" },
   };
   const previousPython = process.env.UTHCODE_PYTHON;
@@ -121,7 +123,10 @@ test("compiled Webpack Main entry bootstraps and creates the secure window", asy
       return originalLoad(request, parent, isMain);
     };
     createRequire(bundlePath)(bundlePath);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    const deadline = Date.now() + 2_000;
+    while (FakeBrowserWindow.instances.length === 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
 
     assert.equal(app.readyCalls, 1);
     assert.equal(FakeBrowserWindow.instances.length, 1);
@@ -130,6 +135,9 @@ test("compiled Webpack Main entry bootstraps and creates the secure window", asy
     assert.equal(webPreferences.nodeIntegration, false);
     assert.equal(webPreferences.contextIsolation, true);
     assert.equal(webPreferences.sandbox, true);
+    assert.equal(window.options.autoHideMenuBar, true);
+    assert.equal(window.options.backgroundColor, "#1d1d1f");
+    assert.equal(electron.nativeTheme.themeSource, "system");
     assert.equal(window.loadedURL, "");
   } finally {
     moduleLoader._load = originalLoad;
