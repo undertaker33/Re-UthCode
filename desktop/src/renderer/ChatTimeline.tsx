@@ -153,16 +153,16 @@ function entryLabel(entry: TimelineEntry): string {
 
 export function ChatTimeline({ entries, todo, notice }: ChatTimelineProps) {
   return (
-    <section aria-label="Chat timeline">
-      {notice && <p role="status">{notice}</p>}
-      {entries.length === 0 && <p>No conversation selected.</p>}
+    <section className="timeline" aria-label="Chat timeline">
+      {notice && <p className="timeline-notice" role="status">{notice}</p>}
+      {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>Start a conversation in this project.</p></div>}
       {entries.map((entry) => (
-        <article key={entry.id} aria-label={entryLabel(entry)} aria-busy={entry.streaming || undefined}>
-          <header>{entryLabel(entry)}{entry.kind === "tool" && ` · ${entry.status || "running"}`}{entry.streaming && " · streaming"}</header>
-          <div>{entry.kind === "tool" ? <p>{entry.text}{entry.status === "failed" ? " · failed" : entry.status === "completed" ? " · completed" : " · running"}</p> : renderMarkdown(entry.text)}</div>
+        <article key={entry.id} className={`timeline-entry timeline-entry--${entry.kind}`} aria-label={entryLabel(entry)} aria-busy={entry.streaming || undefined}>
+          <header><span>{entryLabel(entry)}</span>{entry.kind === "tool" && <small data-error={entry.isError || undefined}>{entry.status || "running"}</small>}{entry.streaming && <small>writing…</small>}</header>
+          <div className="timeline-content">{entry.kind === "tool" ? <p>{entry.text}{entry.status === "failed" ? " · failed" : entry.status === "completed" ? " · completed" : " · running"}</p> : renderMarkdown(entry.text)}</div>
         </article>
       ))}
-      {todo.length > 0 && <section aria-label="Current tasks"><h2>Tasks ({todo.filter((item) => item.status === "completed").length}/{todo.length})</h2><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>{item.content}</li>)}</ul></section>}
+      {todo.length > 0 && <section className="todo-strip" aria-label="Current tasks"><header><h2>Tasks</h2><span>{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>{item.content}</li>)}</ul></section>}
     </section>
   );
 }

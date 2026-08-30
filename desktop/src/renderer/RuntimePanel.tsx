@@ -2,7 +2,7 @@ import type { PanelModePreference } from "../desktop-api";
 import type { RendererState } from "./state";
 
 export interface RuntimePanelProps {
-  state: Pick<RendererState, "runtimeState" | "runtimeError" | "run" | "activeTurn" | "turnStatus" | "completionBlocked" | "diagnostics" | "selectedProjectKey" | "selectedSessionId" | "panelMode">;
+  state: Pick<RendererState, "runtimeState" | "runtimeError" | "run" | "permissionMode" | "currentModelRef" | "activeTurn" | "turnStatus" | "completionBlocked" | "diagnostics" | "selectedProjectKey" | "selectedSessionId" | "panelMode">;
   onPanelModeChange: (mode: PanelModePreference) => void;
 }
 function usageLabel(usage: Record<string, unknown> | undefined): string {
@@ -16,9 +16,9 @@ function usageLabel(usage: Record<string, unknown> | undefined): string {
 export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
   return (
     <aside className={`runtime-panel runtime-panel--${state.panelMode}`} aria-label="Runtime information" aria-hidden={state.panelMode === "hidden" || undefined}>
-      <header>
+      <header className="runtime-heading">
         <div>
-          <p>Runtime</p>
+          <p>Runtime inspector</p>
           <h2>{state.runtimeState === "ready" ? "Ready" : state.runtimeState.replace(/_/gu, " ")}</h2>
         </div>
         <label>
@@ -30,9 +30,11 @@ export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
           </select>
         </label>
       </header>
-      <dl>
+      <dl className="runtime-facts">
         <div><dt>Turn</dt><dd>{state.activeTurn ? state.turnStatus : "idle"}</dd></div>
-        <div><dt>Model run</dt><dd>{state.run?.run_id ? state.run.run_id.slice(0, 8) : "—"}</dd></div>
+        <div><dt>Run ID</dt><dd title={state.run?.run_id}>{state.run?.run_id ? state.run.run_id.slice(0, 8) : "—"}</dd></div>
+        <div><dt>Model</dt><dd title={state.currentModelRef ?? undefined}>{state.currentModelRef ?? "—"}</dd></div>
+        <div><dt>Permission</dt><dd>{state.permissionMode}</dd></div>
         <div><dt>Context</dt><dd>{usageLabel(state.run?.usage)}</dd></div>
         <div><dt>Mode</dt><dd>{state.run?.behavior_mode ?? "default"}</dd></div>
         <div><dt>Project</dt><dd title={state.selectedProjectKey ?? undefined}>{state.selectedProjectKey ? state.selectedProjectKey.split(/[\\/]/u).filter(Boolean).pop() : "—"}</dd></div>

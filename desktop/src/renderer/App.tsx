@@ -6,7 +6,8 @@ import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type ConfigurationView } from "./state";
+import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
+import { UiIcon } from "./UiIcon";
 
 export interface AppProps {
   api?: DesktopApi;
@@ -69,6 +70,12 @@ export function projectRemovalPlan(projects: readonly ProjectState[], selectedPr
   };
 }
 
+export function projectPinPlan(projects: readonly ProjectState[], pinnedSessions: DesktopPreferences["pinnedSessions"], projectKey: string) {
+  const projectsNext = projects.map((item) => item.projectKey === projectKey ? { ...item, pinned: !item.pinned } : item);
+  const pinned = projectsNext.find((item) => item.projectKey === projectKey)?.pinned === true;
+  return { projects: projectsNext, pinnedSessions: pinned ? pinnedSessions.filter((item) => item.projectKey !== projectKey) : [...pinnedSessions] };
+}
+
 /** Recreate the Application/Run owner after configuration changes. */
 export async function rebootstrapProject(
   request: RuntimeRequest,
@@ -98,7 +105,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     return api.requestRuntime(method, params);
   }, [api]);
 
-  const persist = useCallback(async (key: "theme" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
+  const persist = useCallback(async (key: "theme" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
     if (!api) return;
     try {
       await api.writePreference(key as never, value as never);
@@ -115,6 +122,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "catalog_refreshed", projectKey, sessions });
     } catch (error) {
       dispatch({ type: "notice", text: errorMessage(error, "Session catalog unavailable") });
+    }
+  }, [send]);
+
+  const refreshRuntimeStatus = useCallback(async () => {
+    try {
+      dispatch({ type: "status_loaded", result: await send("status.get", {}) });
+    } catch {
+      // Runtime status is supplementary safe projection; command and Run
+      // authority remain usable when it is temporarily unavailable.
     }
   }, [send]);
 
@@ -155,16 +171,18 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("recentProjects"),
       api.readPreference("projectAliases"),
       api.readPreference("pinnedProjectKeys"),
+      api.readPreference("pinnedSessions"),
       api.readPreference("selectedProjectKey"),
       api.readPreference("selectedSessionId"),
-    ]).then(([theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, selectedProjectKey, selectedSessionId]) => {
+    ]).then(([theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId]) => {
       if (cancelled) return;
-      dispatch({ type: "hydrate_preferences", preferences: { theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, selectedProjectKey, selectedSessionId } });
+      dispatch({ type: "hydrate_preferences", preferences: { theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId } });
       const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
       if (selected) {
         void send("runtime.initialize", { workdir: selected.path }).then((result) => {
           if (cancelled) return;
           dispatch({ type: "runtime_initialized", result });
+          void refreshRuntimeStatus();
           void refreshCatalog(selected.path);
           if (selectedSessionId) {
             void send("session.resume", { session_id: selectedSessionId }).then((resumed) => {
@@ -186,7 +204,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       cancelled = true;
       unsubscribe();
     };
-  }, [api, send]);
+  }, [api, refreshRuntimeStatus, send]);
 
   const openProject = useCallback(async () => {
     if (!api) return;
@@ -249,6 +267,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "command_result", result });
       const source = asObject(result);
       const action = asObject(source.ui_action);
+      if (action.type === "model_selected") void refreshRuntimeStatus();
       if (action.type === "open_model_picker") {
         try {
           const completion = asObject(await send("command.complete", { prefix: "/model " }));
@@ -268,7 +287,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     } catch (error) {
       dispatch({ type: "notice", text: errorMessage(error, "Command could not be executed") });
     }
-  }, [api, persist, refreshCatalog, send]);
+  }, [api, persist, refreshCatalog, refreshRuntimeStatus, send]);
 
   const submitComposer = useCallback(async (text: string) => {
     if (!api || !text.trim() || stateRef.current.pendingInteraction) return;
@@ -348,10 +367,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const togglePin = useCallback((project: ProjectState) => {
-    const projects = stateRef.current.projects.map((item) => item.projectKey === project.projectKey ? { ...item, pinned: !item.pinned } : item);
-    dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), pinnedProjectKeys: projects.filter((item) => item.pinned).map((item) => item.projectKey) } });
+    const { projects, pinnedSessions } = projectPinPlan(stateRef.current.projects, stateRef.current.pinnedSessions, project.projectKey);
+    dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), pinnedProjectKeys: projects.filter((item) => item.pinned).map((item) => item.projectKey), pinnedSessions } });
     void persist("recentProjects", projectPreferences(projects));
     void persist("pinnedProjectKeys", projects.filter((item) => item.pinned).map((item) => item.projectKey));
+    void persist("pinnedSessions", pinnedSessions);
+  }, [persist]);
+
+  const toggleSessionPin = useCallback((project: ProjectState, session: SessionSummary) => {
+    if (project.pinned) return;
+    const current = stateRef.current.pinnedSessions;
+    const exists = current.some((item) => item.projectKey === project.projectKey && item.sessionId === session.session_id);
+    const pinnedSessions = exists
+      ? current.filter((item) => item.projectKey !== project.projectKey || item.sessionId !== session.session_id)
+      : [...current, { projectKey: project.projectKey, sessionId: session.session_id }];
+    dispatch({ type: "hydrate_preferences", preferences: { pinnedSessions } });
+    void persist("pinnedSessions", pinnedSessions);
   }, [persist]);
 
   const removeProject = useCallback(async (project: ProjectState) => {
@@ -427,6 +458,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           (resumed) => dispatch({ type: "session_resumed", result: resumed }),
         );
         dispatch({ type: "runtime_state", state: "ready" });
+        await refreshRuntimeStatus();
         await refreshCatalog(projectKey);
       }
       dispatch({ type: "notice", text: "Settings saved" });
@@ -436,21 +468,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     } finally {
       dispatch({ type: "settings_saving", value: false });
     }
-  }, [api, refreshCatalog, send]);
+  }, [api, refreshCatalog, refreshRuntimeStatus, send]);
 
   const content = state.view === "settings" ? (
     <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} />
   ) : (
     <>
-      <header>
-        <div>
+      <header className="conversation-bar">
+        <div className="conversation-title">
+          <span className="conversation-presence" aria-hidden="true" />
           <h1>{state.selectedSessionId ? `Session ${state.selectedSessionId.slice(0, 8)}` : "New conversation"}</h1>
         </div>
-        <div>
-          <button type="button" aria-label="Toggle Runtime panel" onClick={toggleRuntime}>{state.panelMode === "floating" ? "Hide Runtime" : "Open Runtime"}</button>
-          {state.panelMode === "hidden" && <button type="button" onClick={() => setPanelMode("docked")}>Show Runtime</button>}
-          <button type="button" onClick={() => void executeCommand("/compact")} disabled={state.activeTurn || !state.selectedSessionId}>Compact</button>
-          <button type="button" onClick={() => void executeCommand("/status")}>Status</button>
+        <div className="conversation-actions">
+          <button type="button" className="icon-button" title="Runtime" aria-label="Toggle Runtime panel" onClick={toggleRuntime}><UiIcon name="panel" /></button>
+          {state.panelMode === "hidden" && <button type="button" className="text-button" onClick={() => setPanelMode("docked")}>Show Runtime</button>}
+          <button type="button" className="icon-button" title="Compact" aria-label="Compact Session" onClick={() => void executeCommand("/compact")} disabled={state.activeTurn || !state.selectedSessionId}><UiIcon name="compact" /></button>
+          <button type="button" className="icon-button" title="Status" aria-label="Show status" onClick={() => void executeCommand("/status")}><UiIcon name="status" /></button>
         </div>
       </header>
       <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} />
@@ -461,11 +494,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const themeClass = `theme-${state.theme}`;
   return (
-    <div className={themeClass}>
-      <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} runtimeHidden={state.panelMode === "hidden"} runtimeOpen={state.panelMode === "floating"} onToggleRuntime={toggleRuntime} onRestoreRuntime={() => setPanelMode("docked")} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />
+    <div className={`app-shell ${themeClass} panel-${state.panelMode}`}>
+      <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} runtimeHidden={state.panelMode === "hidden"} runtimeOpen={state.panelMode === "floating"} onToggleRuntime={toggleRuntime} onRestoreRuntime={() => setPanelMode("docked")} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />
       <main aria-label="UthCode conversation workspace">{content}</main>
       <RuntimePanel state={state} onPanelModeChange={setPanelMode} />
-      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
+      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
     </div>
   );
 }

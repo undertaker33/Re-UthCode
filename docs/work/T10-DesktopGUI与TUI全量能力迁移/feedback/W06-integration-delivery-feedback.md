@@ -618,3 +618,34 @@ npm test（此前同一修复后的完整回归）
 ```
 
 `uth-utf8-guard` 与 `git diff --check` 在本轮 Feedback 追加后复跑并通过；Context Index 仍保持 T10 `not_implemented`。Checklist 第 87、116、119 项、干净 Windows/Installer、首配/对话/卸载、完整真实 Feature Parity 与人工 UI 仍未验证。
+
+### 返工第 8 轮追加：主工作区旧 UI 清理与按 v5 原型重建（2026-08-30）
+
+用户人工验收否决原 Renderer 的设计与功能呈现后，本轮停止补丁式修复，先建立可运行的无设计基线，再以 `uthcode-desktop-ui-prototype-v5.html` 为视觉与交互结构参考重建主工作区。清理基线已由 PR #63 合并：删除旧设计系统、装饰 DOM 与旧外观断言，同时保留 Application/Bridge 编排、AgentEvent/Session replay 投影、typed interaction response、Settings/secret、安全 Markdown、Composer command authority、Project/Session 与 Runtime safe projection；清理阶段 Renderer 36 项、完整 Desktop 67 项通过。
+
+主工作区重建覆盖 286px Project/Session 导航、50px 顶栏、约 820px 连续 Timeline、右对齐 user bubble、非卡片化 assistant/reasoning/tool/plan/status、底部悬浮 Composer，以及 318px Runtime Inspector 的 docked/floating/hidden 三态。新增统一 `UiIcon`，所有 SVG 固定 16×16、`stroke: currentColor`、`fill: none`，防止 Chromium 默认 300×150 SVG 破版。dark/light/system 的小字 token 以 sRGB 实算覆盖 bg/sidebar/surface/raised，最低对比度为 5.615:1。Runtime 只展示安全投影，Run ID、权威 `current_model`、Permission、Context、Mode、Project、Session 均不读取 secret/raw payload。
+
+经用户批准，Desktop 本地偏好最小增加结构化 `pinnedSessions: [{ projectKey, sessionId }]`。该字段不进入 Application/Core；store 对对象字段、非空字符串、数组上限和组合键去重做严格验证，并兼容旧 preference 文档缺字段。导航采用单一归属：独立 pinned Session 不再进入 Project child/Recent；pinned Project 的 child 只在 Project tree；pin Project 会清除其 child 的独立 pins；hydrate 会归一化旧重复组合。
+
+本轮精确验证：
+
+```text
+conda run --no-capture-output -n re-uthcode npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer 定向测试
+-> 最终 39 passed，0 failed
+
+Desktop 完整 npm test
+-> 变更收敛阶段 70 passed，0 failed，0 skipped
+
+CDP isolation
+-> 7 passed，0 failed
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+真实隔离 Electron 空态覆盖 dark docked/floating/hidden、light 与 760px narrow；密集主工作区使用 test-only visual fixture，由正式 `AgentEvent` DTO、生产 reducer、`App` 与生产组件生成，覆盖 Project/Session pin、user/assistant/reasoning/tool/plan/status、Todo、active Pause/Cancel/Steer 和完整 Runtime。Fixture 不进入 production bundle，不提供生产 fake state；稳定 ignored 证据位于 `desktop/dist/ui-acceptance/main-workspace/`。由于 Electron 隔离模式必须保留 Windows profile identity，而 Python bootstrap 不读取测试 guard 的临时 `UTHCODE_CONFIG_PATH`，本轮没有伪造 populated Runtime E2E，也未读取或改写真实用户配置。
+
+Sol/medium Reviewer 经多轮复审后输出 `APPROVED_TO_COMMIT_T10_MAIN_WORKSPACE_UI`。Settings 与复杂 Interaction 的完整视觉重建、真实 Provider populated Desktop E2E、两主题全功能人工验收、干净 Windows Installer 首配/对话/卸载仍未完成；因此不新增 Checklist 勾选，`docs/Context-Index.md` 继续保持 T10 `not_implemented`。

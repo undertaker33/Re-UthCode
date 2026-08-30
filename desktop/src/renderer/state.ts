@@ -13,6 +13,7 @@ export interface SessionSummary {
   timeline_checkpoint_id?: string | null;
   transcript_entries?: number;
   corrupt?: boolean;
+  pinned?: boolean;
 }
 
 export interface ProjectState {
@@ -104,6 +105,8 @@ export interface RendererState {
   todo: TodoItem[];
   run: RunProjection | null;
   permissionMode: PermissionModeProjection;
+  pinnedSessions: DesktopPreferences["pinnedSessions"];
+  currentModelRef: string | null;
   modelCandidates: string[];
   modelPickerOpen: boolean;
   activeTurn: boolean;
@@ -139,6 +142,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   todo: [],
   run: null,
   permissionMode: "unknown",
+  pinnedSessions: [],
+  currentModelRef: null,
   modelCandidates: [],
   modelPickerOpen: false,
   activeTurn: false,
@@ -216,6 +221,11 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
     transcript_entries: typeof source?.transcript_entries === "number" ? source.transcript_entries : 0,
     corrupt: source?.corrupt === true,
   };
+}
+
+function applySessionPins(sessions: SessionSummary[], projectKey: string, pinnedSessions: DesktopPreferences["pinnedSessions"]): SessionSummary[] {
+  const pinned = new Set(pinnedSessions.filter((item) => item.projectKey === projectKey).map((item) => item.sessionId));
+  return sessions.map((session) => ({ ...session, pinned: pinned.has(session.session_id) }));
 }
 
 function normalizeProjectPath(value: unknown): string | null {
@@ -327,7 +337,7 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
     : [];
   const nextRun = normalizeRun(source.run);
   return {
-    ...permissionUnknownAtRunBoundary(replaceProject(state, { ...projectFromPath(path, existing), sessions, catalogFresh: true }), nextRun),
+    ...permissionUnknownAtRunBoundary(replaceProject(state, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, state.pinnedSessions), catalogFresh: true }), nextRun),
     selectedProjectKey: path,
     selectedSessionId: null,
     timeline: [],
@@ -342,7 +352,7 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
 }
 
 export function applyCatalogRefreshed(state: RendererState, projectKey: string, values: readonly unknown[]): RendererState {
-  const sessions = values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null);
+  const sessions = applySessionPins(values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null), projectKey, state.pinnedSessions);
   const replaced = replaceProject(state, projectFromPath(projectKey, state.projects.find((item) => item.projectKey === projectKey)));
   return {
     ...replaced,
@@ -586,6 +596,7 @@ export type RendererAction =
   | { type: "hydrate_preferences"; preferences: Partial<DesktopPreferences> }
   | { type: "runtime_state"; state: RuntimeStateName; error?: string | null }
   | { type: "runtime_initialized"; result: unknown }
+  | { type: "status_loaded"; result: unknown }
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
   | { type: "project_opened"; result: unknown }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[] }
@@ -618,6 +629,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const hasAliases = preferences.projectAliases !== undefined;
       const hasPinned = preferences.pinnedProjectKeys !== undefined;
       const pinned = new Set(preferences.pinnedProjectKeys ?? []);
+      const requestedPinnedSessions = preferences.pinnedSessions ?? state.pinnedSessions;
       const sourceProjects = hasRecent ? recent : state.projects;
       const projects = sourceProjects
         .filter((item): item is { path: string; alias?: string; pinned?: boolean; lastOpenedAt?: string } => !!item && typeof item.path === "string")
@@ -629,13 +641,17 @@ export function reduceRendererState(state: RendererState, action: RendererAction
             alias: hasAliases ? aliases[item.path] || item.alias || item.path.split(/[\\/]/u).filter(Boolean).pop() || item.path : existing?.alias || item.alias || item.path.split(/[\\/]/u).filter(Boolean).pop() || item.path,
             pinned: hasPinned ? pinned.has(item.path) || item.pinned === true : existing?.pinned ?? item.pinned === true,
             lastOpenedAt: item.lastOpenedAt ?? existing?.lastOpenedAt,
-            sessions: existing?.sessions ?? [],
+            sessions: applySessionPins(existing?.sessions ?? [], item.path, requestedPinnedSessions),
             catalogFresh: existing?.catalogFresh ?? false,
           };
         });
+      const pinnedProjectKeys = new Set(projects.filter((project) => project.pinned).map((project) => project.projectKey));
+      const pinnedSessions = requestedPinnedSessions.filter((item) => !pinnedProjectKeys.has(item.projectKey));
+      const normalizedProjects = projects.map((project) => ({ ...project, sessions: applySessionPins(project.sessions, project.projectKey, pinnedSessions) }));
       return {
         ...state,
-        projects,
+        projects: normalizedProjects,
+        pinnedSessions,
         selectedProjectKey: preferences.selectedProjectKey !== undefined ? preferences.selectedProjectKey ?? null : state.selectedProjectKey,
         selectedSessionId: preferences.selectedSessionId !== undefined ? preferences.selectedSessionId ?? null : state.selectedSessionId,
         theme: preferences.theme !== undefined ? (preferences.theme === "dark" || preferences.theme === "light" ? preferences.theme : "system") : state.theme,
@@ -653,6 +669,12 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         runtimeError: null,
         ...(run ? { run, permissionMode: permissionModeOf(run) } : { permissionMode: "unknown" as const }),
       };
+    }
+    case "status_loaded": {
+      const source = resultRecord(action.result);
+      const application = asRecord(source.application);
+      const currentModelRef = nonEmptyText(application?.current_model);
+      return currentModelRef ? { ...state, currentModelRef } : state;
     }
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
@@ -703,7 +725,8 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         const run = actionValue.type === "behavior_mode_selected" && typeof actionValue.mode === "string"
           ? { ...(state.run ?? {}), behavior_mode: actionValue.mode }
           : projectedRun ?? state.run;
-        return { ...state, run, permissionMode, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
+        const currentModelRef = actionValue.type === "model_selected" ? nonEmptyText(actionValue.model_ref) ?? state.currentModelRef : state.currentModelRef;
+        return { ...state, run, permissionMode, currentModelRef, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: output || null, notice: output || null, composerText: "" };
       return { ...state, commandOutput: output || null, notice: output || null, composerText: "" };
@@ -721,6 +744,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         todo: [],
         run: null,
         permissionMode: "unknown",
+        currentModelRef: null,
         activeTurn: false,
         turnStatus: "idle",
         pendingInteraction: null,

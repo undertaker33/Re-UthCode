@@ -12,7 +12,7 @@ import {
   sessionLabel,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
+import { App, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
 import { ChatTimeline, renderMarkdown } from "../src/renderer/ChatTimeline";
 import { Composer, applyCompletion } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
@@ -28,6 +28,17 @@ function replayRecord(sequence: number, kind: string, text: string) {
     text,
     is_error: false,
   } as never;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (hex: string) => {
+    const channels = hex.slice(1).match(/.{2}/gu)?.map((value) => Number.parseInt(value, 16) / 255) ?? [];
+    const linear = channels.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  };
+  const a = luminance(foreground);
+  const b = luminance(background);
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
 test("T04 replay is ordered and session labels use preview then short id", () => {
@@ -79,18 +90,20 @@ test("T04 catalog and preference updates keep the active project/session navigat
   state = reduceRendererState(state, { type: "catalog_refreshed", projectKey: "C:/Projects/two", sessions: [{ session_id: "session-2", preview: "second" }] });
   state = reduceRendererState(state, { type: "hydrate_preferences", preferences: { recentProjects: [{ path: "C:/Projects/one" }, { path: "C:/Projects/two" }], selectedProjectKey: "C:/Projects/one", selectedSessionId: "session-1" } });
   state = reduceRendererState(state, { type: "hydrate_preferences", preferences: { projectAliases: { "C:/Projects/one": "Renamed" } } });
+  state = reduceRendererState(state, { type: "hydrate_preferences", preferences: { pinnedSessions: [{ projectKey: "C:/Projects/one", sessionId: "session-1" }] } });
   assert.equal(state.selectedProjectKey, "C:/Projects/one");
   assert.equal(state.selectedSessionId, "session-1");
   assert.equal(state.projects.find((project) => project.projectKey === "C:/Projects/one")?.sessions[0]?.session_id, "session-1");
   assert.equal(state.projects.find((project) => project.projectKey === "C:/Projects/two")?.sessions[0]?.session_id, "session-2");
   assert.equal(state.projects.find((project) => project.projectKey === "C:/Projects/one")?.alias, "Renamed");
+  assert.equal(state.projects.find((project) => project.projectKey === "C:/Projects/one")?.sessions[0]?.pinned, true);
 });
 
 test("semantic shell mounts without prototype state", () => {
   const state: RendererState = createInitialState();
   const markup = renderToStaticMarkup(<App initialState={state} api={undefined} />);
   assert.match(markup, /aria-label="UthCode conversation workspace"/);
-  assert.match(markup, /New session/);
+  assert.match(markup, /New chat/);
   assert.match(markup, /Open project/);
   assert.match(markup, /Settings/);
   assert.match(markup, /Runtime/);
@@ -102,9 +115,10 @@ test("project groups, session state, and Runtime projections remain connected", 
   const base = createInitialState({
     projects: [
       { path: "C:/one", projectKey: "C:/one", alias: "One", pinned: true, sessions: [{ session_id: "s1", preview: "first" }], catalogFresh: true },
-      { path: "C:/two", projectKey: "C:/two", alias: "Two", pinned: false, sessions: [], catalogFresh: false },
+      { path: "C:/two", projectKey: "C:/two", alias: "Two", pinned: false, sessions: [{ session_id: "s2", preview: "second", pinned: true }], catalogFresh: true },
     ],
     selectedProjectKey: "C:/one",
+    pinnedSessions: [{ projectKey: "C:/two", sessionId: "s2" }],
   });
   const appMarkup = renderToStaticMarkup(<App initialState={base} api={undefined} />);
   assert.match(appMarkup, /aria-label="Project navigation"/);
@@ -113,16 +127,34 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.match(appMarkup, /first/);
   assert.match(appMarkup, />Pinned</);
   assert.match(appMarkup, />Projects</);
-  assert.match(appMarkup, /Remove from Desktop/);
+  assert.match(appMarkup, /aria-label="Remove One"/);
+  assert.match(appMarkup, /Pinned sessions/);
+  assert.match(appMarkup, /aria-label="Unpin session second"/);
+  assert.equal((appMarkup.match(/>second</gu) ?? []).length, 1);
+  assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
+  assert.doesNotMatch(appMarkup, /aria-label="Pin session first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
-    const panelMarkup = renderToStaticMarkup(<RuntimePanel state={createInitialState({ ...base, panelMode, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
+    const panelMarkup = renderToStaticMarkup(<RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
     assert.match(panelMarkup, /aria-label="Runtime information"/);
     assert.match(panelMarkup, new RegExp(`runtime-panel--${panelMode}`));
     assert.match(panelMarkup, /1,200 \/ 4,000/);
     assert.match(panelMarkup, />plan</);
+    assert.match(panelMarkup, />Run ID</);
+    assert.match(panelMarkup, /provider\/model/);
+    assert.match(panelMarkup, />auto</);
     if (panelMode === "hidden") assert.match(panelMarkup, /aria-hidden="true"/);
     else assert.doesNotMatch(panelMarkup, /aria-hidden="true"/);
   }
+});
+
+test("project pinning absorbs independent Session pins into the project tree", () => {
+  const projects = [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions: [{ session_id: "s1", pinned: true }], catalogFresh: true }];
+  const plan = projectPinPlan(projects, [{ projectKey: "C:/one", sessionId: "s1" }, { projectKey: "C:/two", sessionId: "s2" }], "C:/one");
+  assert.equal(plan.projects[0].pinned, true);
+  assert.deepEqual(plan.pinnedSessions, [{ projectKey: "C:/two", sessionId: "s2" }]);
+  const normalized = reduceRendererState(createInitialState({ projects }), { type: "hydrate_preferences", preferences: { recentProjects: [{ path: "C:/one", pinned: true }], pinnedProjectKeys: ["C:/one"], pinnedSessions: [{ projectKey: "C:/one", sessionId: "s1" }] } });
+  assert.deepEqual(normalized.pinnedSessions, []);
+  assert.equal(normalized.projects[0].sessions[0].pinned, false);
 });
 
 test("T05 reducer keeps event order, replaces assistant preview, and settles tools once", () => {
@@ -292,6 +324,29 @@ test("T07 theme classes expose system, dark, and light without changing content 
     const markup = renderToStaticMarkup(<App initialState={state} api={undefined} />);
     assert.match(markup, new RegExp(`theme-${theme}`));
   }
+});
+
+test("main workspace visual contract keeps 16px SVGs and readable theme tokens", async () => {
+  const markup = renderToStaticMarkup(<App initialState={createInitialState({ theme: "dark", timeline: [{ id: "user-1", kind: "user", text: "hello" }] })} api={undefined} />);
+  assert.match(markup, /class="ui-icon" viewBox="0 0 16 16"/);
+  assert.match(markup, /class="timeline-entry timeline-entry--user"/);
+  const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
+  assert.match(css, /\.ui-icon\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;[^}]*stroke-width:\s*1\.35/s);
+  assert.match(css, /\.timeline-entry--user \.timeline-content\s*\{[^}]*color:\s*#fff;[^}]*background:\s*#4a50b8/s);
+  assert.match(css, /@media \(prefers-color-scheme: light\)[\s\S]*\.theme-system[\s\S]*--text:\s*#202027/s);
+  assert.match(css, /\.theme-light\s*\{[^}]*--bg:\s*#f5f5f7;[^}]*--accent:\s*#565fd7/s);
+  for (const background of ["#1d1d1f", "#18181a", "#242427", "#2b2b2f"]) assert.ok(contrastRatio("#9696a1", background) >= 4.5);
+  for (const background of ["#f5f5f7", "#ececef", "#ffffff", "#e3e3e9"]) assert.ok(contrastRatio("#5b5c67", background) >= 4.5);
+});
+
+test("Runtime model uses only the Application status and model-selection projections", () => {
+  let state = createInitialState();
+  state = reduceRendererState(state, { type: "status_loaded", result: { application: { current_model: "provider/authoritative" } } });
+  assert.equal(state.currentModelRef, "provider/authoritative");
+  state = reduceRendererState(state, { type: "command_result", result: { ui_action: { type: "model_selected", model_ref: "provider/selected" }, output: "selected" } });
+  assert.equal(state.currentModelRef, "provider/selected");
+  state = reduceRendererState(state, { type: "status_loaded", result: { application: { current_model: "" }, raw_provider_payload: "secret" } });
+  assert.equal(state.currentModelRef, "provider/selected");
 });
 
 test("T04 settings rebootstrap uses the real Runtime and project/session boundaries", async () => {
