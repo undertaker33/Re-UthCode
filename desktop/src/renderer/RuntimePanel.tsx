@@ -15,13 +15,13 @@ function usageLabel(usage: Record<string, unknown> | undefined): string {
 
 export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
   return (
-    <aside className={`runtime-panel runtime-panel--${state.panelMode}`} aria-label="Runtime information">
-      <div className="panel-heading">
+    <aside className={`runtime-panel runtime-panel--${state.panelMode}`} aria-label="Runtime information" aria-hidden={state.panelMode === "hidden" || undefined}>
+      <header>
         <div>
-          <p className="eyebrow">Runtime</p>
+          <p>Runtime</p>
           <h2>{state.runtimeState === "ready" ? "Ready" : state.runtimeState.replace(/_/gu, " ")}</h2>
         </div>
-        <label className="panel-mode-control">
+        <label>
           <span className="sr-only">Runtime panel layout</span>
           <select value={state.panelMode} onChange={(event) => onPanelModeChange(event.target.value as PanelModePreference)} aria-label="Runtime panel layout">
             <option value="docked">Docked</option>
@@ -29,8 +29,8 @@ export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
             <option value="hidden">Hidden</option>
           </select>
         </label>
-      </div>
-      <dl className="runtime-facts">
+      </header>
+      <dl>
         <div><dt>Turn</dt><dd>{state.activeTurn ? state.turnStatus : "idle"}</dd></div>
         <div><dt>Model run</dt><dd>{state.run?.run_id ? state.run.run_id.slice(0, 8) : "—"}</dd></div>
         <div><dt>Context</dt><dd>{usageLabel(state.run?.usage)}</dd></div>
@@ -38,9 +38,9 @@ export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
         <div><dt>Project</dt><dd title={state.selectedProjectKey ?? undefined}>{state.selectedProjectKey ? state.selectedProjectKey.split(/[\\/]/u).filter(Boolean).pop() : "—"}</dd></div>
         <div><dt>Session</dt><dd>{state.selectedSessionId ? state.selectedSessionId.slice(0, 8) : "—"}</dd></div>
       </dl>
-      {state.completionBlocked && <p className="runtime-alert runtime-alert--warning">{state.completionBlocked}</p>}
-      {state.runtimeError && <p className="runtime-alert runtime-alert--error" role="alert">{state.runtimeError}</p>}
-      {state.diagnostics.length > 0 && <p className="runtime-note">Runtime diagnostics available ({state.diagnostics.length})</p>}
+      {state.completionBlocked && <p>{state.completionBlocked}</p>}
+      {state.runtimeError && <p role="alert">{state.runtimeError}</p>}
+      {state.diagnostics.length > 0 && <p>Runtime diagnostics available ({state.diagnostics.length})</p>}
     </aside>
   );
 }

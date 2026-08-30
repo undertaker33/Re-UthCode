@@ -442,13 +442,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} />
   ) : (
     <>
-      <header className="chat-header">
+      <header>
         <div>
-          <p className="eyebrow">Conversation</p>
           <h1>{state.selectedSessionId ? `Session ${state.selectedSessionId.slice(0, 8)}` : "New conversation"}</h1>
         </div>
-        <div className="chat-header__actions">
-          <button type="button" className="runtime-toggle" aria-label="Toggle Runtime panel" onClick={toggleRuntime}>{state.panelMode === "floating" ? "Hide Runtime" : "Open Runtime"}</button>
+        <div>
+          <button type="button" aria-label="Toggle Runtime panel" onClick={toggleRuntime}>{state.panelMode === "floating" ? "Hide Runtime" : "Open Runtime"}</button>
           {state.panelMode === "hidden" && <button type="button" onClick={() => setPanelMode("docked")}>Show Runtime</button>}
           <button type="button" onClick={() => void executeCommand("/compact")} disabled={state.activeTurn || !state.selectedSessionId}>Compact</button>
           <button type="button" onClick={() => void executeCommand("/status")}>Status</button>
@@ -462,11 +461,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const themeClass = `theme-${state.theme}`;
   return (
-    <div className={`app-shell ${themeClass} panel-${state.panelMode}`}>
+    <div className={themeClass}>
       <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} runtimeHidden={state.panelMode === "hidden"} runtimeOpen={state.panelMode === "floating"} onToggleRuntime={toggleRuntime} onRestoreRuntime={() => setPanelMode("docked")} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />
-      <main className="main-column" aria-label="UthCode conversation workspace">{content}</main>
+      <main aria-label="UthCode conversation workspace">{content}</main>
       <RuntimePanel state={state} onPanelModeChange={setPanelMode} />
-      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
+      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
     </div>
   );
 }
