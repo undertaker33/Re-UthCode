@@ -733,3 +733,35 @@ git diff --check
 测试在 `PYTHONIOENCODING=cp936`、`PYTHONUTF8=0` 下向真实子进程写入 raw UTF-8，覆盖中文 success response、structured error、AgentEvent 和 strict invalid-byte transport error；Node 侧逐 byte 切分验证中文 reasoning、assistant、error 与 stderr diagnostic。Session 通过正式 typed parts 持久化，再经 `ApplicationSessionService.project_replay` 逐项核对 user/reasoning/assistant/tool 中文一致。Sol/medium Reviewer 输出 `APPROVED_TO_COMMIT_T10_DESKTOP_UTF8_BOUNDARY_FIX`。
 
 修复只保证重启后新传输和新持久化数据。已经以错误编码落盘的旧 Session 不自动猜测编码、不重写；用户需重启现有 Desktop/Python Runtime 并新建 Session 验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 12 轮追加：Desktop 壳层、会话 Runtime 与 Settings 导航收敛（2026-08-30）
+
+本轮按用户人工验收清理 Desktop 壳层中的无效入口与重复布局。Electron 主进程在创建窗口前读取已持久化主题并设置 `nativeTheme.themeSource`，主题偏好写入成功后同步更新原生主题；移除亮色原生菜单栏，并为窗口设置与实际主题一致的背景色。聊天顶栏只保留真实 Runtime 开关，删除 `/compact`、`/status` 图标入口与左下角 Open Runtime。Runtime 只在聊天视图挂载：docked 保持完整 inspector，floating 固定为 304×304 圆角可滚动浮窗，Settings 不再显示 Runtime panel、状态 badge 或任何 Runtime 投影。
+
+进入 Settings 后不再同时渲染全局 Project/Session Sidebar；Settings 自身导航直接占据左侧并提供返回聊天入口。Providers、Models、Permissions、Interface 下把使用说明当模块副标题的 hint 已删除。此次触及的 icon-only 会话置顶按钮补齐与 accessible name 一致的 hover tooltip。800px 最小窗口的 docked Runtime 场景对 Composer 做响应式分行：selectors、状态、textarea 与操作按钮保持可读可操作，Timeline 增加 286px 底部滚动安全区，最终内容可滚到固定 Composer 上方；未隐藏 Sidebar/Runtime，也未提高窗口最小宽度。
+
+本轮精确验证：
+
+```text
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer、Main 与 Preload 定向测试
+-> 52 passed，0 failed
+
+Renderer 最终复审定向测试
+-> 43 passed，0 failed
+
+conda run --no-capture-output -n re-uthcode npx tsx --test tests/runtime-process.test.ts  (cwd=desktop)
+-> 14 passed，0 failed
+
+Python Desktop/协议/架构定向测试（Reviewer）
+-> 88 passed，0 failed
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+生产组件视觉证据位于 `desktop/dist/ui-acceptance/prompt-1/`，覆盖 dark/light、floating/docked、Settings、窄窗口，以及最终 800×720 `runtime-docked-800.png`。Sol/medium Reviewer 经三轮复审，先拦截 Settings Runtime 泄漏、说明性副标题、tooltip 与三态/窄屏覆盖缺口，再拦截最小窗口 Composer 不可用回归；修复后输出 `APPROVED`。
+
+普通环境执行完整 `npm test` 得到 76 passed、1 failed；唯一失败是命令未进入 `re-uthcode` Conda 环境而找不到项目 Python，失败的 Runtime suite 随后在指定 Conda 环境 14/14 通过。完整测试会管理未跟踪的 `.runtime`、`.webpack` 与 packaging build 目录；本轮没有执行显式清理或停止用户进程，但开工前未记录的 `.runtime` 内容无法原样证明或恢复，生成目录随后由测试重新建立且未进入 tracked diff。真实 Electron 窗口截图与 `Menu.setApplicationMenu(null)` 后菜单角色/快捷键交互仍未验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

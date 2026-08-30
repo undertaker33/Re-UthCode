@@ -18,7 +18,6 @@ export function RuntimePanel({ state, onPanelModeChange }: RuntimePanelProps) {
     <aside className={`runtime-panel runtime-panel--${state.panelMode}`} aria-label="Runtime information" aria-hidden={state.panelMode === "hidden" || undefined}>
       <header className="runtime-heading">
         <div>
-          <p>Runtime inspector</p>
           <h2>{state.runtimeState === "ready" ? "Ready" : state.runtimeState.replace(/_/gu, " ")}</h2>
         </div>
         <label>

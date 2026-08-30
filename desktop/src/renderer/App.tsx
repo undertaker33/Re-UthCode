@@ -356,7 +356,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const toggleRuntime = useCallback(() => {
-    setPanelMode(stateRef.current.panelMode === "floating" ? "hidden" : "floating");
+    setPanelMode(stateRef.current.panelMode === "hidden" ? "floating" : "hidden");
   }, [setPanelMode]);
 
   const aliasChange = useCallback((projectKey: string, alias: string) => {
@@ -480,10 +480,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <h1>{state.selectedSessionId ? `Session ${state.selectedSessionId.slice(0, 8)}` : "New conversation"}</h1>
         </div>
         <div className="conversation-actions">
-          <button type="button" className="icon-button" title="Runtime" aria-label="Toggle Runtime panel" onClick={toggleRuntime}><UiIcon name="panel" /></button>
-          {state.panelMode === "hidden" && <button type="button" className="text-button" onClick={() => setPanelMode("docked")}>Show Runtime</button>}
-          <button type="button" className="icon-button" title="Compact" aria-label="Compact Session" onClick={() => void executeCommand("/compact")} disabled={state.activeTurn || !state.selectedSessionId}><UiIcon name="compact" /></button>
-          <button type="button" className="icon-button" title="Status" aria-label="Show status" onClick={() => void executeCommand("/status")}><UiIcon name="status" /></button>
+          <button type="button" className="icon-button" title="Toggle Runtime" aria-label="Toggle Runtime panel" onClick={toggleRuntime}><UiIcon name="panel" /></button>
         </div>
       </header>
       <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} />
@@ -494,10 +491,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const themeClass = `theme-${state.theme}`;
   return (
-    <div className={`app-shell ${themeClass} panel-${state.panelMode}`}>
-      <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} runtimeHidden={state.panelMode === "hidden"} runtimeOpen={state.panelMode === "floating"} onToggleRuntime={toggleRuntime} onRestoreRuntime={() => setPanelMode("docked")} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />
+    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
+      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main aria-label="UthCode conversation workspace">{content}</main>
-      <RuntimePanel state={state} onPanelModeChange={setPanelMode} />
+      {state.view === "chat" && <RuntimePanel state={state} onPanelModeChange={setPanelMode} />}
       {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
     </div>
   );

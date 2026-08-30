@@ -246,6 +246,28 @@ test("main runtime shutdown handler waits for the Runtime child reap boundary", 
   removeHandlers();
 });
 
+test("theme preference writes update the native Electron chrome for dark light and system", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const ipc = { handle: (channel: string, handler: (...args: any[]) => Promise<unknown>) => handlers.set(channel, handler), removeHandler: (channel: string) => { handlers.delete(channel); } };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const applied: string[] = [];
+  let theme: "system" | "dark" | "light" = "system";
+  const remove = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: { start: async () => undefined, request: async () => ({}), shutdownAfterRequest: async () => undefined } as never,
+    preferences: { read: async () => ({ theme }), write: async (_key: string, value: typeof theme) => ({ theme: (theme = value) }) } as never,
+    rendererEntry: mainFrame.url, isPackaged: true, ipc: ipc as never,
+    showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
+    openPath: (async () => "") as never,
+    setNativeTheme: (value) => applied.push(value),
+  });
+  const write = handlers.get(IPC_CHANNELS.preferenceWrite);
+  for (const value of ["dark", "light", "system"] as const) await write?.({ sender: webContents, senderFrame: mainFrame }, "theme", value);
+  assert.deepEqual(applied, ["dark", "light", "system"]);
+  remove();
+});
+
 test("production Runtime wiring projects diagnostics and idle failures without native details", () => {
   const sent: unknown[] = [];
   const targetWindow = {

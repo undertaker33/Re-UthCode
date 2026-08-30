@@ -129,7 +129,7 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.match(appMarkup, />Projects</);
   assert.match(appMarkup, /aria-label="Remove One"/);
   assert.match(appMarkup, /Pinned sessions/);
-  assert.match(appMarkup, /aria-label="Unpin session second"/);
+  assert.match(appMarkup, /title="Unpin session second" aria-label="Unpin session second"/);
   assert.equal((appMarkup.match(/>second</gu) ?? []).length, 1);
   assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
   assert.doesNotMatch(appMarkup, /aria-label="Pin session first"/);
@@ -608,23 +608,47 @@ test("T07 Settings exposes editable schema IDs and model context/token limits", 
   assert.ok(renamedModel.models?.["local/model"]);
 });
 
-test("T07 hidden Runtime Panel keeps restore controls in the shell", () => {
+test("Prompt 1 hidden Runtime is restored only from the chat header", () => {
   const markup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "hidden" })} api={undefined} />);
-  assert.match(markup, /Show Runtime/);
-  assert.match(markup, /Open Runtime/);
+  assert.match(markup, /title="Toggle Runtime" aria-label="Toggle Runtime panel"/);
+  assert.doesNotMatch(markup, />Open Runtime</);
+  assert.doesNotMatch(markup, /Compact Session|Show status/);
 });
 
 test("T07 Runtime switch and three layout modes remain operational", async () => {
   const dockedMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "docked" })} api={undefined} />);
   assert.match(dockedMarkup, /aria-label="Toggle Runtime panel"/);
-  assert.match(dockedMarkup, /Open Runtime/);
   const floatingMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "floating" })} api={undefined} />);
-  assert.match(floatingMarkup, /Hide Runtime/);
   assert.match(floatingMarkup, /runtime-panel--floating/);
+  const settingsMarkup = renderToStaticMarkup(<App initialState={createInitialState({ view: "settings", panelMode: "docked", settingsLoaded: true })} api={undefined} />);
+  assert.match(settingsMarkup, /class="app-shell theme-system panel-docked settings-shell"/);
+  assert.match(settingsMarkup, /aria-label="Settings sections"/);
+  assert.doesNotMatch(settingsMarkup, /aria-label="Project navigation"|aria-label="Runtime information"|settings-runtime|>READY<|>Ready</);
+  assert.doesNotMatch(settingsMarkup, /Connect the service that runs your models|Use the model name expected by your provider|Default permission mode for new Runs|Appearance preferences are stored on this Desktop installation/);
+  const selectedModes: string[] = [];
+  const panel = RuntimePanel({ state: createInitialState({ panelMode: "docked" }), onPanelModeChange: (mode) => selectedModes.push(mode) });
+  const findSelect = (node: React.ReactNode): React.ReactElement<{ onChange: (event: { target: { value: string } }) => void }> | null => {
+    if (!React.isValidElement(node)) return null;
+    if (node.type === "select") return node as React.ReactElement<{ onChange: (event: { target: { value: string } }) => void }>;
+    const children = (node.props as { children?: React.ReactNode }).children;
+    for (const child of React.Children.toArray(children)) { const found = findSelect(child); if (found) return found; }
+    return null;
+  };
+  const modeSelect = findSelect(panel);
+  assert.ok(modeSelect);
+  for (const value of ["floating", "docked", "hidden"]) modeSelect.props.onChange({ target: { value } });
+  assert.deepEqual(selectedModes, ["floating", "docked", "hidden"]);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.runtime-panel--docked\s*\{[^}]*position:\s*relative[^}]*width:/s);
-  assert.match(css, /\.runtime-panel--floating\s*\{[^}]*position:\s*fixed[^}]*inset:[^}]*max-height:/s);
+  assert.match(css, /\.runtime-panel--floating\s*\{[^}]*position:\s*fixed[^}]*width:\s*304px;[^}]*height:\s*304px;[^}]*border-radius:\s*18px/s);
   assert.match(css, /\.runtime-panel--hidden\s*\{\s*display:\s*none;/s);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\s*\{\s*--sidebar-width:\s*196px;/);
+  assert.match(css, /\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s);
+  assert.match(css, /\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column/s);
+  assert.match(css, /\.app-shell\.panel-docked \.composer textarea\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*min-height:\s*72px;[^}]*word-break:\s*normal/s);
+  assert.match(css, /\.app-shell\.panel-docked \.composer-actions\s*\{[^}]*flex-wrap:\s*wrap;[^}]*justify-content:\s*flex-end/s);
+  assert.match(css, /\.app-shell\.panel-docked \.timeline\s*\{\s*padding-bottom:\s*286px;/);
+  assert.doesNotMatch(css, /settings-runtime|settings-section__hint/);
 });
 
 test("T07 completion preserves canonical slash prefixes and replaces only the current argument", () => {

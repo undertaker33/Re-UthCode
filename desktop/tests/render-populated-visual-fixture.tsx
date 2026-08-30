@@ -9,10 +9,12 @@ import type { AgentEvent } from "../src/desktop-api";
 async function main() {
 const output = process.argv[2];
 if (!output) throw new Error("output path is required");
+const theme = process.argv[3] === "light" ? "light" : "dark";
+const panelMode = process.argv[4] === "floating" ? "floating" : process.argv[4] === "hidden" ? "hidden" : "docked";
 let state = createInitialState({
   runtimeState: "ready",
-  theme: "dark",
-  panelMode: "docked",
+  theme,
+  panelMode,
   currentModelRef: "offline/model",
   permissionMode: "auto",
   run: {
