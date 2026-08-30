@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from uthcode.application.sessions import ApplicationSessionService
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, TranscriptEntry, TranscriptKind, TranscriptRef
-from uthcode.core.provider import Message, ReasoningPart, TextPart
+from uthcode.core.provider import Message, ReasoningPart, TextPart, ToolCallPart, ToolResultPart
 from uthcode.integrations import session_files
 from uthcode.integrations.session_files import (
     SessionBusyError,
@@ -46,6 +47,37 @@ def test_session_v3_layout_preserves_transcript_and_timeline(tmp_path: Path) -> 
     assert recovered.transcript.entries == entries
     assert recovered.timeline.fine_entries[0].summary == "tool work complete"
     assert recovered.timeline.active_checkpoint is not None
+
+
+def test_session_jsonl_preserves_chinese_user_assistant_reasoning_and_tool_text(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("unicode", project_key="中文项目")
+    entries = (
+        TranscriptEntry("unicode", 1, "turn-中文", TranscriptKind.USER_MESSAGE, {"role": "user", "part": TextPart("你好").to_dict()}, semantic_unit_id="turn-中文"),
+        TranscriptEntry("unicode", 2, "turn-中文", TranscriptKind.ASSISTANT_MESSAGE, {"role": "assistant", "part": ReasoningPart("正在分析中文输入").to_dict()}, semantic_unit_id="turn-中文"),
+        TranscriptEntry("unicode", 3, "turn-中文", TranscriptKind.ASSISTANT_MESSAGE, {"role": "assistant", "part": TextPart("你好，这是中文回答。").to_dict()}, semantic_unit_id="turn-中文"),
+        TranscriptEntry("unicode", 4, "turn-中文", TranscriptKind.TOOL_CALL, {"role": "assistant", "part": ToolCallPart("call-中文", "读取", {}).to_dict()}, semantic_unit_id="turn-中文"),
+        TranscriptEntry("unicode", 5, "turn-中文", TranscriptKind.TOOL_RESULT, {"role": "tool", "part": ToolResultPart("call-中文", "工具执行完成").to_dict()}, semantic_unit_id="turn-中文"),
+    )
+    with store.open_writer("unicode", expected_project_key="中文项目") as writer:
+        writer.append_transcript(entries)
+        summary = SemanticEntry("turn-中文", "工具摘要：执行成功", (writer.snapshot.transcript.reference(1, 5),), session_id="unicode")
+        writer.append_timeline_transaction((summary,), ActiveCheckpoint("turn-中文", ("turn-中文",), session_id="unicode"))
+    recovered = store.read_session("unicode", expected_project_key="中文项目")
+    assert recovered.transcript.entries == entries
+    assert recovered.timeline.fine_entries[0].summary == "工具摘要：执行成功"
+    replay = ApplicationSessionService(storage_root=tmp_path / "sessions", project_key="中文项目", instruction_loader=None, store=store).project_replay("unicode", tool_summary=lambda part: f"工具摘要：{part.name}")
+    assert [(record.kind, record.text) for record in replay] == [
+        ("user", "你好"),
+        ("reasoning", "正在分析中文输入"),
+        ("assistant", "你好，这是中文回答。"),
+        ("tool", "工具摘要：读取"),
+    ]
+    raw = (store.session_path("unicode") / "transcript.jsonl").read_bytes()
+    decoded = raw.decode("utf-8", errors="strict")
+    assert "你好" in decoded
+    assert "正在分析中文输入" in decoded
+    assert "工具执行完成" in decoded
 
 
 def test_session_v3_reads_legacy_full_message_payload_without_rewriting(tmp_path: Path) -> None:
