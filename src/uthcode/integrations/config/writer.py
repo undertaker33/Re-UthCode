@@ -22,6 +22,7 @@ from .template import USER_CONFIG_TEMPLATE
 _ROOT_FIELDS = frozenset(
     {"default_model", "default_permission_mode", "providers", "models"}
 )
+_PAYLOAD_FIELDS = _ROOT_FIELDS | {"provider_renames"}
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key"})
 _MODEL_FIELDS = frozenset(
     {
@@ -127,12 +128,46 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
 
 def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
     for key in payload:
-        if key not in _ROOT_FIELDS:
+        if key not in _PAYLOAD_FIELDS:
             raise ConfigurationError(
                 "unsupported configuration field",
                 path=path,
                 field=str(key),
             )
+    renames = payload.get("provider_renames")
+    if renames is not None:
+        if not isinstance(renames, Mapping):
+            raise ConfigurationError(
+                "value must be a mapping",
+                path=path,
+                field="provider_renames",
+            )
+        destinations: set[str] = set()
+        for old_id, new_id in renames.items():
+            if (
+                not isinstance(old_id, str)
+                or not old_id.strip()
+                or not isinstance(new_id, str)
+                or not new_id.strip()
+            ):
+                raise ConfigurationError(
+                    "provider rename IDs must be non-empty strings",
+                    path=path,
+                    field="provider_renames",
+                )
+            if old_id == new_id:
+                raise ConfigurationError(
+                    "provider rename source and destination must differ",
+                    path=path,
+                    field=f"provider_renames.{old_id}",
+                )
+            if new_id in destinations:
+                raise ConfigurationError(
+                    "provider rename destinations must be unique",
+                    path=path,
+                    field=f"provider_renames.{old_id}",
+                )
+            destinations.add(new_id)
     for section_name, allowed in (
         ("providers", _PROVIDER_FIELDS),
         ("models", _MODEL_FIELDS),
@@ -188,6 +223,51 @@ def _set_or_delete(table: Any, key: str, value: object) -> None:
             del table[key]
         return
     table[key] = value
+
+
+def _apply_provider_renames(
+    document: Any,
+    renames: Mapping[str, str],
+) -> None:
+    if not renames:
+        return
+    section = _replace_or_get_table(document, "providers")
+    existing_ids = set(section.keys())
+    destinations = set(renames.values())
+    for old_id, new_id in renames.items():
+        if old_id not in existing_ids:
+            raise ConfigurationError(
+                "provider rename source does not exist",
+                field=f"provider_renames.{old_id}",
+            )
+        # A destination may be another source in the same atomic rename
+        # request (for example A->X, B->A): that source is released by the
+        # same move.  Other existing destinations remain conflicts.
+        if new_id in existing_ids and new_id not in renames:
+            raise ConfigurationError(
+                "provider rename destination already exists",
+                field=f"provider_renames.{old_id}",
+            )
+    if len(destinations) != len(renames):
+        # This is also validated by _validate_payload_shape, but keep the
+        # mutation boundary defensive for direct internal callers.
+        raise ConfigurationError("provider rename destinations must be unique")
+
+    moved = {new_id: section[old_id] for old_id, new_id in renames.items()}
+    for old_id in renames:
+        del section[old_id]
+    for new_id, profile in moved.items():
+        section[new_id] = profile
+
+    models = document.get("models")
+    if not isinstance(models, Mapping):
+        return
+    for profile in models.values():
+        if not isinstance(profile, Mapping):
+            continue
+        provider_id = profile.get("provider")
+        if provider_id in renames:
+            profile["provider"] = renames[provider_id]
 
 
 def _apply_providers(document: Any, requested: Mapping[str, Any]) -> None:
@@ -269,6 +349,9 @@ def write_user_config(
     for key in ("default_model", "default_permission_mode"):
         if key in payload:
             _set_or_delete(document, key, payload[key])
+    renames = payload.get("provider_renames")
+    if renames is not None:
+        _apply_provider_renames(document, renames)
     if "providers" in payload and payload["providers"] is not None:
         _apply_providers(document, payload["providers"])
     if "models" in payload and payload["models"] is not None:

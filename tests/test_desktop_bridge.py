@@ -1464,6 +1464,183 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key_expression", "environment_name", "environment_value", "replacement"),
+    [
+        ("literal-gui-provider-key", None, None, None),
+        ("env:W06_GUI_PROVIDER_KEY", "W06_GUI_PROVIDER_KEY", "env-gui-secret", None),
+        ("literal-gui-provider-key", None, None, "replacement-gui-provider-key"),
+    ],
+)
+async def test_settings_save_gui_request_renames_provider_through_application_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key_expression: str,
+    environment_name: str | None,
+    environment_value: str | None,
+    replacement: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    if environment_name is None:
+        monkeypatch.delenv("W06_GUI_PROVIDER_KEY", raising=False)
+    elif environment_value is None:
+        monkeypatch.delenv(environment_name, raising=False)
+    else:
+        monkeypatch.setenv(environment_name, environment_value)
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{key_expression}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+    profile: dict[str, object] = {"kind": "openai_responses"}
+    if replacement is not None:
+        profile["api_key"] = replacement
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+    result = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-gui-rename",
+            "settings.save",
+            {
+                "request": {
+                    "default_model": "remote/ref",
+                    "provider_renames": {"remote": "renamed"},
+                    "providers": {"renamed": profile},
+                    "models": {
+                        "remote/ref": {
+                            "provider_profile_id": "renamed",
+                            "remote_id": "remote",
+                        }
+                    },
+                }
+            },
+        )
+    )
+
+    assert result.ok is True
+    rendered = user.read_text(encoding="utf-8")
+    assert "[providers.remote]" not in rendered
+    assert "[providers.renamed]" in rendered
+    assert 'provider = "renamed"' in rendered
+    if replacement is None:
+        assert f'api_key = "{key_expression}"' in rendered
+    else:
+        assert f'api_key = "{replacement}"' in rendered
+        assert key_expression not in rendered
+    assert key_expression not in json.dumps(result.to_dict())
+    assert replacement is None or replacement not in json.dumps(result.to_dict())
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_save_gui_request_rejects_provider_rename_conflict_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "remote/ref"
+
+[providers.remote]
+kind = "fake"
+
+[providers.existing]
+kind = "fake"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+    original = user.read_bytes()
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+    conflict = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-gui-conflict",
+            "settings.save",
+            {"request": {"provider_renames": {"remote": "existing"}}},
+        )
+    )
+    invalid = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-gui-invalid",
+            "settings.save",
+            {"request": {"provider_renames": {"missing": "renamed"}}},
+        )
+    )
+
+    assert conflict.ok is False
+    assert invalid.ok is False
+    assert user.read_bytes() == original
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_save_gui_request_allows_batch_rename_into_released_source(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "a/ref"
+
+[providers.a]
+kind = "fake"
+
+[providers.b]
+kind = "fake"
+
+[models."a/ref"]
+provider = "a"
+remote_id = "a"
+
+[models."b/ref"]
+provider = "b"
+remote_id = "b"
+''',
+        encoding="utf-8",
+    )
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+    result = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-gui-batch-rename",
+            "settings.save",
+            {
+                "request": {
+                    "default_model": "a/ref",
+                    "provider_renames": {"a": "x", "b": "a"},
+                    "providers": {"x": {"kind": "fake"}, "a": {"kind": "fake"}},
+                    "models": {
+                        "a/ref": {"provider_profile_id": "x", "remote_id": "a"},
+                        "b/ref": {"provider_profile_id": "a", "remote_id": "b"},
+                    },
+                }
+            },
+        )
+    )
+
+    assert result.ok is True
+    rendered = user.read_text(encoding="utf-8")
+    assert "[providers.b]" not in rendered
+    assert "[providers.x]" in rendered
+    assert 'provider = "x"' in rendered
+    assert 'provider = "a"' in rendered
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_serve_forever_flushes_lifecycle_jsonl_and_closes_application() -> None:
     application = _FakeApplication()
     bridge = DesktopBridge(application=application)

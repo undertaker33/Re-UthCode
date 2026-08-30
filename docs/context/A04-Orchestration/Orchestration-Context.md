@@ -20,6 +20,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息，但直到真实普通输入或显式 Session 命令才创建持久 Session；`uthcode exec` 每次创建一个 Run 和一个 Turn，并在真实 prompt 前惰性 ensure。
+- `[FACT]` Windows Desktop 通过 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 `src/uthcode/interfaces/desktop/bridge.py` 接入同一个 Application/Run/Turn/AgentEvent 链；Renderer 只投影 Bridge 的安全结果，配置、Session、Command 和 typed Interaction 不在 TypeScript 中复制。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
 
@@ -111,6 +112,20 @@ uthcode exec <prompt>
   -> 若 Turn 需要 AskUser/Permission/Retry/Resume：exec 无响应通道，取消同一 Turn 并返回失败
 ```
 
+### Windows Desktop
+
+```text
+desktop/src/renderer/App.tsx
+  -> desktop/src/preload.ts（窄 contextBridge API）
+  -> desktop/src/main.ts（IPC sender/frame/origin 校验与窗口生命周期）
+  -> desktop/src/python-runtime.ts（console JSONL child，windowsHide）
+  -> src/uthcode/interfaces/desktop/bridge.py
+  -> UthCodeApplication -> AgentRun -> TurnHandle -> Core AgentEvent
+  -> Python Runtime JSONL -> Main -> Preload -> Renderer state projection
+```
+
+Desktop 的 `PythonRuntime` 只负责一个受控 child 的 stdio、请求相关和 close/reap；Bridge 负责 Application/Run 生命周期和安全 DTO 投影。未提交的 Runtime checkpoint 不跨进程恢复，Runtime crash/protocol error 仍与 Provider/Turn failure 分离。
+
 ## Application 职责索引
 
 | 主题 | 文件 | 关键符号/检索词 |
@@ -124,6 +139,7 @@ uthcode exec <prompt>
 | Slash Command | `src/uthcode/application/commands/` | `CommandRegistry`, `CommandParser`, `CommandDispatcher`, `CommandOutcome` |
 | CLI/exec | `src/uthcode/interfaces/cli.py` | `main`, `_stream_exec`, `_ExecProjection` |
 | TUI | `src/uthcode/interfaces/tui/` | `UthCodeTUI`, `AgentEventRenderer`, `TuiInteractionState` |
+| Desktop | `desktop/src/` + `src/uthcode/interfaces/desktop/bridge.py` | `App`, `PythonRuntime`, `DesktopBridge`, `DesktopApi` |
 
 ## 当前命令编排
 
@@ -161,7 +177,7 @@ implemented:
 - `[ABSENT]` 自动任务拆分、依赖图、并行 Worker、合并结果策略。
 - `[ABSENT]` Multi-Agent 共享 Context、共享 Memory、资源锁和调度策略。
 - `[BOUNDARY]` 不恢复跨进程 Runtime checkpoint；resume 只重建已提交 Transcript/Timeline/Instruction State，并从新 Run/Turn 开始。
-- `[DEFER]` Web/Desktop/IDE 等新 Interface；新增时仍必须只接 Application。
+- `[FACT]` 当前 Windows Desktop 已接入上述 Application 主链；未来 Web/IDE 等新 Interface 仍必须单独设计并只接 Application。
 
 ## 修改路由
 
@@ -172,6 +188,7 @@ Run/Turn 驱动与竞态      -> application/runs.py
 Slash 命令定义/解析/派发 -> application/commands/
 CLI/exec 投影            -> interfaces/cli.py
 TUI 编排                 -> interfaces/tui/app.py
+Desktop 编排/进程边界    -> desktop/src/ + interfaces/desktop/bridge.py
 Subagent/Multi-Agent     -> 当前不存在；需先定义新需求与 Application/Core 边界
 ```
 

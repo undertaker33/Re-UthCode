@@ -6,7 +6,7 @@ context_file: docs/Context-Index.md
 snapshot_date: 2026-08-28
 document_language: zh-CN
 target_reader: coding-agent
-source_of_truth: src/ + tests/
+source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
 ```
 
 ## Agent 读取协议
@@ -14,7 +14,7 @@ source_of_truth: src/ + tests/
 1. 先根据任务命中层级，只读下表对应的 `*-Context.md`。
 2. 需要跨层修改时，再读取依赖层；不要默认遍历全部活跃工作包与 `docs/work/archive/`。
 3. 本目录记录“当前代码事实”，不是需求、设计提案或兼容承诺。
-4. 事实冲突时按以下优先级处理：`src/ + tests/` > 本目录 > 根 `README.md` > `docs/work/TXX-*` 活跃工作包 > `docs/work/archive/`。
+4. 事实冲突时按以下优先级处理：`src/ + desktop/src/ + tests/ + desktop/tests/` > 本目录 > 根 `README.md` > `docs/work/TXX-*` 活跃工作包 > `docs/work/archive/`。
 5. `docs/work/` 表达活跃需求或实施记录；存在工作包不等于对应能力已经进入源码。
 6. 四层是理解与检索视图，不是新的 Python 顶层包；源码仍遵守 `interfaces -> application -> core`，并由 `application` 组合 `integrations`。
 
@@ -46,12 +46,12 @@ path_migration:
 | 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、固定 PLAN 非 READ 与 unfinished-task 控制检查 | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定控制检查；无 OS Sandbox、动态控制 registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
 | 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、Transcript/Timeline、动态 Context Budget/Gate（default 256K、effective 256K 使用 Eval 选定的 balanced-208k profile、configured/provider 收紧与 provenance）、Session v3 metadata、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；L4/L5、manual Compact、HistoryRead 与 overflow retry 已进入正式链路；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、真实 prompt/显式命令触发的惰性 Session、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、CLI、Session、Plan/Task、Steering |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Windows Desktop Python Runtime/Bridge 适配、真实 prompt/显式命令触发的惰性 Session、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Plan/Task、Steering |
 
 ## current-status
 
 ```text
-status_snapshot: 2026-08-29
+status_snapshot: 2026-08-30
 status_scope: docs/work/*XX-* + docs/work/archive/
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -90,7 +90,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | 原始需求、Spec、Tasks、Checklist 与 W01～W06 Prompt 已生成；未派发 Worker，未开始实施 |
+| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W05 已实现配置、Bridge、Electron shell、Renderer、打包链；W06 的 package 与固定端口 CDP/离线链路已有通过证据；最终 make/Installer 因外部 `20.205.243.166:443` ETIMEDOUT 未完成，Checklist 第 84、116 项未勾，Windows 干净机 Installer、完整 Feature Parity 与人工 UI 清单仍未验证，保持 `not_implemented` |
 
 ## 跨层最短链路
 
@@ -106,6 +106,11 @@ interfaces/cli.py 或 interfaces/tui/app.py
   -> core/permission.py:PermissionEvaluator
   -> application/runs.py:_TurnDriver
   -> AgentEvent 流 / TurnResult
+
+desktop/src/renderer/App.tsx
+  -> desktop/src/preload.ts -> desktop/src/main.ts -> desktop/src/python-runtime.ts
+  -> src/uthcode/interfaces/desktop/bridge.py
+  -> 同一 Application/Run/Turn/Core/AgentEvent 链
 ```
 
 配置 contract 当前事实：用户级 `config.toml` 使用 `default_model`、Provider `api_key`（literal 或 `env:VARIABLE_NAME`）、Model `remote_id`/`display_name`/可选 `reasoning_effort`；项目配置不得定义 Provider、端点或凭据等价字段。逻辑 Model Profile ID 仅用于界面和状态，AgentRun 与 direct generation 都把快照的 `remote_id` 写入 `GenerationRequest.model`；`/model` 原子写回只修改用户级 `default_model`。输入运行上限由 configured/provider/default 三类来源按收紧规则解析，未配置时 default 为 `256_000`；effective 为 `256_000` 时，正式 resolver/Turn 使用 Eval 选定的 `balanced-208k` profile，其它窗口按有界自适应派生，并在 Active Turn 内冻结。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.interfaces.tui.app import UthCodeTUI
 from uthcode.interfaces.tui.rendering import RenderBatch, RenderOperation, TextUpdate
+from conftest import _assert_isolated_test_path
 
 
 def _completed(text: str = "answer") -> GenerationCompleted:
@@ -211,9 +213,20 @@ class _StreamingPreviewProvider:
 
 def _build_application(project: Path, sessions: SessionFileStore, provider: _Provider):
     user_root = project.parent / "home" / ".uthcode"
+    _assert_isolated_test_path("W06 project", project)
+    _assert_isolated_test_path("W06 session store", sessions.root)
+    _assert_isolated_test_path("W06 user root", user_root)
+    _assert_isolated_test_path("W06 config", user_root / "config.toml")
     user_root.mkdir(parents=True, exist_ok=True)
     loader = InstructionLoader(user_root=user_root, project_root=project, reader=InstructionFileReader())
     return create_application(EffectiveConfig.single_model("fake/ref", provider_profile_id="fake", remote_id="fake-model", context_window=1_000_000), provider_builder=lambda _profile, _model: provider, runtime_context=ApplicationRuntimeContext.from_system(workdir=project), instruction_loader=loader, session_store=sessions)
+
+
+def test_w06_test_state_guard_rejects_real_user_profile_and_config() -> None:
+    with pytest.raises(AssertionError, match="real user profile/config"):
+        _assert_isolated_test_path("test HOME", Path(r"C:\Users\93445"))
+    with pytest.raises(AssertionError, match="real user profile/config"):
+        _assert_isolated_test_path("test config", Path(r"C:\Users\93445\.uthcode\config.toml"))
 
 
 def test_w06_create_fails_closed_on_missing_instruction_include(tmp_path: Path) -> None:
@@ -480,6 +493,9 @@ async def test_unique_application_chain_preserves_history_across_model_switch(
     project = tmp_path / "project"
     project.mkdir()
     user_root = tmp_path / "home" / ".uthcode"
+    _assert_isolated_test_path("W06 model-switch project", project)
+    _assert_isolated_test_path("W06 model-switch user root", user_root)
+    _assert_isolated_test_path("W06 model-switch config", user_root / "config.toml")
     user_root.mkdir(parents=True)
     loader = InstructionLoader(
         user_root=user_root,
@@ -607,6 +623,16 @@ async def test_tui_session_picker_open_close_does_not_create_session(
 
     pipe_context = create_pipe_input()
     pipe = pipe_context.__enter__()
+    input_attached = asyncio.Event()
+    original_attach = pipe.attach
+
+    @contextmanager
+    def attach_with_lifecycle_signal(callback):  # type: ignore[no-untyped-def]
+        with original_attach(callback):
+            input_attached.set()
+            yield
+
+    pipe.attach = attach_with_lifecycle_signal  # type: ignore[method-assign]
     tui = UthCodeTUI(
         application,
         input_device=pipe,
@@ -622,11 +648,15 @@ async def test_tui_session_picker_open_close_does_not_create_session(
         raise AssertionError("condition did not become true")
 
     try:
-        await wait_until(lambda: tui.ui.is_running)
+        # is_running is set before prompt_toolkit attaches the pipe reader;
+        # synchronize on the actual attachment before injecting keys.
+        await wait_until(lambda: tui.ui.is_running and input_attached.is_set())
         await tui._handle_submission("/resume")
         assert tui.session_picker.open
         assert tuple(item.session_id for item in application.list_sessions()) == initial_ids
-        pipe.send_text("\x1b")
+        # Send the terminal's explicit Kitty Escape sequence so the fixture
+        # does not depend on prompt_toolkit's bare-Escape timeout matcher.
+        pipe.send_text("\x1b[27u")
         await wait_until(lambda: not tui.session_picker.open)
         assert tuple(item.session_id for item in application.list_sessions()) == initial_ids
     finally:

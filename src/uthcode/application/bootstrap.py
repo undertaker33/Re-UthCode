@@ -162,6 +162,8 @@ def _user_write_payload(
             profile.pop("model_ref", None)
             models[model_ref] = profile
         payload["models"] = models
+    if request.provider_renames is not None:
+        payload["provider_renames"] = dict(request.provider_renames)
     return payload
 
 
@@ -183,6 +185,7 @@ def write_user_configuration(
                 "default_permission_mode",
                 "providers",
                 "models",
+                "provider_renames",
             }
         ]
         if unsupported:
@@ -196,6 +199,7 @@ def write_user_configuration(
             default_permission_mode=request.get("default_permission_mode"),
             providers=request.get("providers"),
             models=request.get("models"),
+            provider_renames=request.get("provider_renames"),
         )
     path = _user_config_path(home)
     try:

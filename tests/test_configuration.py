@@ -828,6 +828,167 @@ remote_id = "remote"
         assert config.providers["remote"].api_key.reveal() == environment_value
 
 
+@pytest.mark.parametrize(
+    ("key_expression", "environment_name", "environment_value", "replacement"),
+    [
+        ("literal-old-provider-key", None, None, None),
+        ("env:W06_PROVIDER_RENAME_KEY", "W06_PROVIDER_RENAME_KEY", "env-retained-secret", None),
+        ("literal-old-provider-key", None, None, "literal-new-provider-key"),
+    ],
+)
+def test_user_configuration_write_renames_provider_without_exposing_or_losing_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key_expression: str,
+    environment_name: str | None,
+    environment_value: str | None,
+    replacement: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    if environment_name is None:
+        monkeypatch.delenv("W06_PROVIDER_RENAME_KEY", raising=False)
+    elif environment_value is None:
+        monkeypatch.delenv(environment_name, raising=False)
+    else:
+        monkeypatch.setenv(environment_name, environment_value)
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{key_expression}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+    request_profile: dict[str, object] = {"kind": "openai_responses"}
+    if replacement is not None:
+        request_profile["api_key"] = replacement
+    request = UserConfigurationWriteRequest(
+        default_model="remote/ref",
+        provider_renames={"remote": "renamed"},
+        providers={"renamed": request_profile},
+        models={
+            "remote/ref": {
+                "provider_profile_id": "renamed",
+                "remote_id": "remote",
+            }
+        },
+    )
+
+    written = write_user_configuration(request, home=home)
+    rendered = user.read_text(encoding="utf-8")
+    assert set(written.providers) == {"renamed"}
+    assert written.models["remote/ref"].provider_profile_id == "renamed"
+    assert written.default_model == "remote/ref"
+    assert written.providers["renamed"].api_key_configured is True
+    assert "remote]" not in rendered
+    assert 'provider = "renamed"' in rendered
+    if replacement is None:
+        assert f'api_key = "{key_expression}"' in rendered
+    else:
+        assert f'api_key = "{replacement}"' in rendered
+        assert key_expression not in rendered
+    assert key_expression not in repr(request)
+    assert key_expression not in repr(written)
+    assert replacement is None or replacement not in repr(written)
+    safe_request = request.to_dict()
+    assert safe_request["provider_renames"] == {"remote": "renamed"}
+    expected_provider = {"kind": "openai_responses"}
+    if replacement is not None:
+        expected_provider["api_key_configured"] = True
+    assert safe_request["providers"] == {"renamed": expected_provider}
+
+
+def test_user_configuration_write_rejects_provider_rename_conflict_or_invalid_source_atomically(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    original = '''default_model = "remote/ref"
+
+[providers.remote]
+kind = "fake"
+
+[providers.existing]
+kind = "fake"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+'''
+    user.write_text(original, encoding="utf-8")
+    original_bytes = user.read_bytes()
+
+    for renames in ({"remote": "existing"}, {"missing": "renamed"}):
+        with pytest.raises(ConfigurationError, match="provider rename"):
+            write_user_configuration(
+                UserConfigurationWriteRequest(provider_renames=renames),
+                home=home,
+            )
+        assert user.read_bytes() == original_bytes
+
+    with pytest.raises(ConfigurationModelError, match="destination IDs"):
+        UserConfigurationWriteRequest(provider_renames={"remote": ""})
+    assert user.read_bytes() == original_bytes
+
+
+def test_user_configuration_write_allows_batch_provider_rename_into_released_source(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "a/ref"
+
+[providers.a]
+kind = "fake"
+
+[providers.b]
+kind = "fake"
+
+[models."a/ref"]
+provider = "a"
+remote_id = "a"
+
+[models."b/ref"]
+provider = "b"
+remote_id = "b"
+''',
+        encoding="utf-8",
+    )
+
+    result = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="a/ref",
+            provider_renames={"a": "x", "b": "a"},
+            providers={"x": {"kind": "fake"}, "a": {"kind": "fake"}},
+            models={
+                "a/ref": {"provider_profile_id": "x", "remote_id": "a"},
+                "b/ref": {"provider_profile_id": "a", "remote_id": "b"},
+            },
+        ),
+        home=home,
+    )
+
+    rendered = user.read_text(encoding="utf-8")
+    assert set(result.providers) == {"a", "x"}
+    assert result.models["a/ref"].provider_profile_id == "x"
+    assert result.models["b/ref"].provider_profile_id == "a"
+    assert result.default_model == "a/ref"
+    assert "[providers.b]" not in rendered
+    assert "[providers.x]" in rendered
+    assert 'provider = "x"' in rendered
+    assert 'provider = "a"' in rendered
+
+
 def test_user_configuration_write_adds_modifies_and_deletes_unreferenced_profiles(
     tmp_path: Path,
 ) -> None:

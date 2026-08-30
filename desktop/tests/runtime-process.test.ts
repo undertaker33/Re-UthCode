@@ -1,20 +1,51 @@
 import { EventEmitter } from "node:events";
 import { spawn as spawnChild } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 
 import {
   PythonRuntime,
   RuntimeBoundaryError,
+  type SpawnLike,
   resolvePythonLaunch,
 } from "../src/python-runtime";
 import {
   DesktopPreferences,
   DEFAULT_DESKTOP_PREFERENCES,
 } from "../src/desktop-preferences";
+
+const REAL_USER_PROFILE = resolve("C:\\Users\\93445");
+const REAL_USER_CONFIG = resolve(REAL_USER_PROFILE, ".uthcode", "config.toml");
+
+function isWithin(candidate: string, root: string): boolean {
+  const child = relative(resolve(root), resolve(candidate));
+  const parentPrefix = process.platform === "win32" ? "\\" : "/";
+  return child === "" || (!child.startsWith(`..${parentPrefix}`) && child !== "..");
+}
+
+function assertIsolatedTestPath(label: string, candidate: string): string {
+  const resolved = resolve(candidate);
+  const systemTemp = resolve(tmpdir());
+  const workspace = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+  assert.notEqual(resolved.toLowerCase(), REAL_USER_PROFILE.toLowerCase(), `${label} must not be the real user profile`);
+  assert.notEqual(resolved.toLowerCase(), REAL_USER_CONFIG.toLowerCase(), `${label} must not be the real user config`);
+  assert.ok(
+    !isWithin(resolved, REAL_USER_PROFILE) || isWithin(resolved, systemTemp),
+    `${label} must not use real-user state outside system temp`,
+  );
+  assert.ok(isWithin(resolved, systemTemp) || isWithin(resolved, workspace), `${label} must be under workspace or temp`);
+  return resolved;
+}
+
+test("desktop test isolation guard rejects the real user profile and config", () => {
+  assert.throws(() => assertIsolatedTestPath("test HOME", REAL_USER_PROFILE), /real user profile/);
+  assert.throws(() => assertIsolatedTestPath("test config", REAL_USER_CONFIG), /real user config/);
+});
 
 class FakeChild extends EventEmitter {
   readonly pid = 4242;
@@ -368,6 +399,143 @@ test("runtime shutdown request waits for close/reap before replacing the child P
   assert.ok(replacementPid);
   assert.notEqual(replacementPid, firstPid);
   await runtime.shutdown();
+});
+
+function reUthcodePythonExecutable(): string {
+  const configured = process.env.UTHCODE_PYTHON?.trim();
+  if (configured && existsSync(configured)) return configured;
+
+  const condaExecutable = process.env.CONDA_EXE?.trim();
+  if (condaExecutable) {
+    const condaRoot = dirname(dirname(condaExecutable));
+    const executable = process.platform === "win32"
+      ? join(condaRoot, "envs", "re-uthcode", "python.exe")
+      : join(condaRoot, "envs", "re-uthcode", "bin", "python");
+    if (existsSync(executable)) return executable;
+  }
+
+  const activePrefix = process.env.CONDA_PREFIX?.trim();
+  if (activePrefix && basename(activePrefix) === "re-uthcode") {
+    const executable = process.platform === "win32"
+      ? join(activePrefix, "python.exe")
+      : join(activePrefix, "bin", "python");
+    if (existsSync(executable)) return executable;
+  }
+  throw new Error("re-uthcode Python executable is required for the offline Desktop integration test");
+}
+
+async function waitForAgentEvent(
+  events: Array<Record<string, unknown>>,
+  type: string,
+  timeoutMs = 10_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const event = events.find((candidate) => candidate.type === type);
+    if (event) return event;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for Desktop AgentEvent ${type}`);
+}
+
+test("offline Desktop Runtime traverses Bridge, Application, Core, events, and replay", async () => {
+  const home = await mkdtemp(join(tmpdir(), "uthcode-desktop-e2e-home-"));
+  const project = await mkdtemp(join(tmpdir(), "uthcode-desktop-e2e-project-"));
+  const configDirectory = join(home, ".uthcode");
+  assertIsolatedTestPath("Desktop test HOME", home);
+  assertIsolatedTestPath("Desktop test project", project);
+  assertIsolatedTestPath("Desktop test config", join(configDirectory, "config.toml"));
+  await mkdir(configDirectory, { recursive: true });
+  await writeFile(
+    join(configDirectory, "config.toml"),
+    [
+      'default_model = "offline/model"',
+      "",
+      "[providers.offline]",
+      'kind = "fake"',
+      "",
+      '[models."offline/model"]',
+      'provider = "offline"',
+      'remote_id = "offline-model"',
+      'display_name = "Offline integration model"',
+      "context_window = 4096",
+      "max_output_tokens = 256",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const events: Array<Record<string, unknown>> = [];
+  const diagnostics: string[] = [];
+  const runtime = new PythonRuntime({
+    launch: resolvePythonLaunch({
+      mode: "development",
+      pythonExecutable: reUthcodePythonExecutable(),
+    }),
+    spawn: ((
+      command: string,
+      args: string[],
+      options: Parameters<SpawnLike>[2],
+    ) => spawnChild(command, args, {
+      ...options,
+      cwd: join(process.cwd(), ".."),
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        APPDATA: join(home, "AppData", "Roaming"),
+        LOCALAPPDATA: join(home, "AppData", "Local"),
+        HOMEDRIVE: "",
+        HOMEPATH: "",
+      },
+    })) as SpawnLike,
+    requestTimeoutMs: 15_000,
+    shutdownTimeoutMs: 5_000,
+    onAgentEvent: (event) => events.push(event as Record<string, unknown>),
+    onDiagnostic: (line) => diagnostics.push(line),
+  });
+
+  try {
+    await runtime.start();
+    const initialized = await runtime.request("runtime.initialize", { workdir: project });
+    assert.equal((initialized as Record<string, unknown>).application, true);
+
+    const opened = await runtime.request("project.open", { path: project });
+    assert.equal((opened as Record<string, unknown>).project !== undefined, true);
+
+    const created = await runtime.request("session.new", {});
+    const sessionId = (created as Record<string, unknown>).session_id;
+    assert.equal(typeof sessionId, "string");
+    assert.deepEqual((created as Record<string, unknown>).replay, []);
+
+    const started = await runtime.request("turn.start", { prompt: "offline Desktop chain" });
+    const runId = (started as Record<string, unknown>).run_id;
+    const turnId = (started as Record<string, unknown>).turn_id;
+    assert.equal(typeof runId, "string");
+    assert.equal(typeof turnId, "string");
+
+    const completed = await waitForAgentEvent(events, "turn_completed");
+    assert.equal(completed.run_id, runId);
+    assert.equal(completed.turn_id, turnId);
+    assert.ok(
+      events.find((event) => event.type === "assistant_message_completed" && event.run_id === runId),
+      JSON.stringify(events),
+    );
+
+    const resumed = await runtime.request("session.resume", { session_id: sessionId as string });
+    const replay = (resumed as Record<string, unknown>).replay;
+    assert.equal((resumed as Record<string, unknown>).restored, true);
+    assert.ok(Array.isArray(replay));
+    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "user"));
+    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "assistant"));
+    assert.deepEqual(diagnostics, []);
+  } finally {
+    await runtime.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(project, { recursive: true, force: true });
+  }
+  assert.equal(runtime.state, "stopped");
+  assert.equal(runtime.pid, undefined);
 });
 
 test("desktop preferences persist only allowlisted UI metadata", async () => {

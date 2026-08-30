@@ -3,23 +3,72 @@
 from __future__ import annotations
 
 import asyncio
+import ntpath
 import os
 import socket
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+
+def _lexical_windows_path(path: Path | str) -> str:
+    """Normalize Windows paths without touching the filesystem."""
+
+    return ntpath.normcase(ntpath.normpath(ntpath.abspath(os.fspath(path))))
+
+
+_WORKSPACE_ROOT = _lexical_windows_path(Path(__file__).parent.parent)
+_SYSTEM_TEMP_ROOT = _lexical_windows_path(tempfile.gettempdir())
+_REAL_USER_PROFILE = r"C:\Users\93445"
+_REAL_USER_CONFIG = r"C:\Users\93445\.uthcode\config.toml"
+_REAL_USER_PROFILE_KEY = _lexical_windows_path(_REAL_USER_PROFILE)
+_REAL_USER_CONFIG_KEY = _lexical_windows_path(_REAL_USER_CONFIG)
+
+
+def _within(path: str, root: str) -> bool:
+    normalized_path = _lexical_windows_path(path)
+    normalized_root = _lexical_windows_path(root).rstrip("\\")
+    return normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}\\")
+
+
+def _assert_isolated_test_path(label: str, path: Path) -> Path:
+    """Reject real-user state using lexical Windows path semantics only."""
+
+    normalized = _lexical_windows_path(path)
+    if normalized in {_REAL_USER_PROFILE_KEY, _REAL_USER_CONFIG_KEY}:
+        raise AssertionError(f"{label} resolves to the real user profile/config")
+    if _within(normalized, _REAL_USER_PROFILE_KEY) and not _within(normalized, _SYSTEM_TEMP_ROOT):
+        raise AssertionError(f"{label} resolves inside the real user profile")
+    if not (_within(normalized, _WORKSPACE_ROOT) or _within(normalized, _SYSTEM_TEMP_ROOT)):
+        raise AssertionError(f"{label} must be under the workspace or system temp")
+    return path
 
 
 @pytest.fixture(autouse=True)
 def isolate_user_home(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep permission/config lifecycle files inside the test sandbox."""
 
-    home = tmp_path / "home"
+    temporary_root = _assert_isolated_test_path("pytest temporary root", Path(tmp_path))
+    home = temporary_root / "home"
+    appdata = home / "AppData" / "Roaming"
+    local_appdata = home / "AppData" / "Local"
+    config_path = home / ".uthcode" / "config.toml"
+    _assert_isolated_test_path("test HOME", home)
+    _assert_isolated_test_path("test APPDATA", appdata)
+    _assert_isolated_test_path("test LOCALAPPDATA", local_appdata)
+    _assert_isolated_test_path("test config", config_path)
     home.mkdir()
+    appdata.mkdir(parents=True)
+    local_appdata.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
     monkeypatch.setenv("HOMEDRIVE", home.drive)
     monkeypatch.setenv("HOMEPATH", str(home)[len(home.drive):])
+    monkeypatch.setenv("UTHCODE_CONFIG_PATH", str(config_path))
 
 
 @pytest.fixture(autouse=True)

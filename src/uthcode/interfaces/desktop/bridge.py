@@ -1153,6 +1153,7 @@ class DesktopBridge:
             "default_permission_mode",
             "providers",
             "models",
+            "provider_renames",
         }
         if "request" in params:
             _require_params(params, {"request"}, method="settings.save")

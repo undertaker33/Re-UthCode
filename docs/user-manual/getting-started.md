@@ -48,4 +48,25 @@ uthcode exec --cwd C:\work\my-project "解释这个项目的目录结构"
 
 真实普通请求或显式 `/new`、`/resume` 时才会打开持久 Session；TUI 启动、帮助、状态和 Session Picker 不创建空 Session。terminal Turn 的已提交 Transcript、Timeline、AGENTS 激活元数据和大结果 ref 可在进程结束后通过 `/resume` 由新的 Run/Turn 继续使用。若 Transcript 已落盘而 Instruction State metadata 同步失败，状态 diagnostics 会显示 partial，不会把已提交消息重复送入下一轮；暂停中的 Turn、Permission/AskUser waiter 和 Runtime checkpoint 不会跨进程恢复。未显式配置 `context_window` 时，输入预算从 `256_000` default 开始，并可被 Provider 的可靠上限收紧；`/status` 显示实际来源。
 
+## Windows Desktop
+
+仓库内的 `desktop/` 提供 Windows 11 x64 Desktop shell，通过 Python Runtime JSONL Bridge 复用当前 Application、Session、Run、Turn、Interaction 和 AgentEvent。它与 TUI 共用用户级 `~/.uthcode/config.toml`，不会创建另一套模型、权限或会话事实。
+
+在已激活 `re-uthcode` 环境的 Windows 机器上从源码启动：
+
+```powershell
+conda activate re-uthcode
+cd desktop
+npm ci
+npm run start
+```
+
+构建 Windows 安装包：
+
+```powershell
+npm run make -- --platform=win32 --arch=x64
+```
+
+安装包输出在 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`。当前构建未签名，仅用于 development/release-candidate 验收；首次配置仍按上面的用户级配置说明完成。
+
 > UthCode 的 `Bash` 工具不是 OS Sandbox，命令以当前操作系统用户权限执行。
