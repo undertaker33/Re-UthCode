@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
   PythonRuntime,
   RuntimeBoundaryError,
+  RuntimeRequestError,
   type SpawnLike,
   resolvePythonLaunch,
 } from "../src/python-runtime";
@@ -153,6 +154,53 @@ test("Python child uses piped stdio and correlates responses and events", async 
   assert.deepEqual(await resultPromise, { state: "ready" });
   assert.deepEqual(events, [{ type: "agent_delta", text: "hi" }]);
   assert.deepEqual(diagnostics, ["bridge diagnostic"]);
+});
+
+test("stderr UTF-8 diagnostics wait for complete characters and lines and reset between children", async () => {
+  const first = new FakeChild();
+  const second = new FakeChild();
+  const children = [first, second];
+  const diagnostics: string[] = [];
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => children.shift() as FakeChild) as never,
+    onDiagnostic: (line) => diagnostics.push(line),
+  });
+  await runtime.start();
+  const encoded = Buffer.from("中文诊断\n", "utf8");
+  for (const byte of encoded) first.stderr.emit("data", Buffer.from([byte]));
+  assert.deepEqual(diagnostics, ["中文诊断"]);
+  const incomplete = Buffer.from("旧", "utf8");
+  first.stderr.emit("data", incomplete.subarray(0, 2));
+  first.emit("close", 1, null);
+  assert.equal(diagnostics.length, 2);
+  await runtime.start();
+  second.stderr.emit("data", Buffer.from("新进程诊断\n", "utf8"));
+  assert.equal(diagnostics.at(-1), "新进程诊断");
+  assert.doesNotMatch(diagnostics.at(-1) ?? "", /旧|�/u);
+  second.emit("close", 0, null);
+});
+
+test("stdout UTF-8 decoder preserves Chinese reasoning assistant events and structured errors across chunks", async () => {
+  const child = new FakeChild();
+  const events: Array<Record<string, unknown>> = [];
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    onAgentEvent: (event) => events.push(event as Record<string, unknown>),
+  });
+  await runtime.start();
+  const pending = runtime.request("turn.start", { prompt: "你好" });
+  const id = requestId(child);
+  const lines = [
+    { type: "agent_event", event: { type: "reasoning_delta", text: "正在分析中文" } },
+    { type: "agent_event", event: { type: "assistant_message_completed", message: { role: "assistant", parts: [{ type: "text", text: "你好，这是回答" }] } } },
+    { type: "response", id, ok: false, error: { kind: "provider_error", message: "中文错误信息" } },
+  ].map((value) => `${JSON.stringify(value)}\n`).join("");
+  for (const byte of Buffer.from(lines, "utf8")) child.stdout.emit("data", Buffer.from([byte]));
+  await assert.rejects(pending, (error: unknown) => error instanceof RuntimeRequestError && error.message === "中文错误信息");
+  assert.equal(events[0]?.text, "正在分析中文");
+  assert.equal((((events[1]?.message as Record<string, unknown>).parts as Array<Record<string, unknown>>)[0]?.text), "你好，这是回答");
 });
 
 test("timeout, malformed output, and unexpected exit reject pending requests as runtime errors", async () => {
@@ -508,7 +556,8 @@ test("offline Desktop Runtime traverses Bridge, Application, Core, events, and r
     assert.equal(typeof sessionId, "string");
     assert.deepEqual((created as Record<string, unknown>).replay, []);
 
-    const started = await runtime.request("turn.start", { prompt: "offline Desktop chain" });
+    const chinesePrompt = "你好，请保留推理、回答与会话预览中的中文。";
+    const started = await runtime.request("turn.start", { prompt: chinesePrompt });
     const runId = (started as Record<string, unknown>).run_id;
     const turnId = (started as Record<string, unknown>).turn_id;
     assert.equal(typeof runId, "string");
@@ -528,6 +577,8 @@ test("offline Desktop Runtime traverses Bridge, Application, Core, events, and r
     assert.ok(Array.isArray(replay));
     assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "user"));
     assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "assistant"));
+    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "user" && entry.text === chinesePrompt));
+    assert.doesNotMatch(JSON.stringify({ events, replay }), /�|浣犲ソ|璇蜂繚鐣/u);
     assert.deepEqual(diagnostics, []);
   } finally {
     await runtime.shutdown();

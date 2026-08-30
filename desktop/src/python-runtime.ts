@@ -135,9 +135,11 @@ export class PythonRuntime {
   private readonly onAgentEvent?: (event: AgentEvent) => void;
   private readonly onRuntimeState?: (state: string) => void;
   private readonly onDiagnostic?: (line: string) => void;
-  private readonly decoder = new StringDecoder("utf8");
+  private decoder = new StringDecoder("utf8");
+  private diagnosticDecoder = new StringDecoder("utf8");
   private child: ChildProcessLike | undefined;
   private outputBuffer = "";
+  private diagnosticBuffer = "";
   private exitPromise: Promise<void> | undefined;
   private resolveExit: (() => void) | undefined;
   private closeConfirmedChild: ChildProcessLike | undefined;
@@ -173,6 +175,7 @@ export class PythonRuntime {
       );
     }
     this._state = "starting";
+    this.resetTransportBuffers();
     try {
       const child = this.spawnProcess(this.launch.command, this.launch.args, {
         shell: false,
@@ -444,10 +447,30 @@ export class PythonRuntime {
   }
 
   private consumeStderr(chunk: unknown): void {
-    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-    for (const line of text.split(/\r?\n/)) {
+    if (typeof chunk === "string") this.diagnosticBuffer += chunk;
+    else if (Buffer.isBuffer(chunk)) this.diagnosticBuffer += this.diagnosticDecoder.write(chunk);
+    else this.diagnosticBuffer += String(chunk);
+    let newline: number;
+    while ((newline = this.diagnosticBuffer.indexOf("\n")) >= 0) {
+      const line = this.diagnosticBuffer.slice(0, newline).replace(/\r$/, "");
+      this.diagnosticBuffer = this.diagnosticBuffer.slice(newline + 1);
       if (line) this.onDiagnostic?.(line);
     }
+  }
+
+  private flushAndResetTransportBuffers(): void {
+    this.outputBuffer += this.decoder.end();
+    if (this.outputBuffer) this.consumeLine(this.outputBuffer.replace(/\r$/, ""));
+    this.diagnosticBuffer += this.diagnosticDecoder.end();
+    if (this.diagnosticBuffer) this.onDiagnostic?.(this.diagnosticBuffer.replace(/\r$/, ""));
+    this.resetTransportBuffers();
+  }
+
+  private resetTransportBuffers(): void {
+    this.decoder = new StringDecoder("utf8");
+    this.diagnosticDecoder = new StringDecoder("utf8");
+    this.outputBuffer = "";
+    this.diagnosticBuffer = "";
   }
 
   private failMalformedOutput(): void {
@@ -471,6 +494,7 @@ export class PythonRuntime {
 
   private handleProcessClose(child: ChildProcessLike, _code: unknown, _signal: unknown): void {
     if (this.child !== child) return;
+    this.flushAndResetTransportBuffers();
     this.closeConfirmedChild = child;
     if (this._state !== "stopping" && this._state !== "stopped") {
       this.markFailed();

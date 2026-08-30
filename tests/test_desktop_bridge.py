@@ -1693,3 +1693,70 @@ def test_desktop_module_stdout_is_jsonl_protocol_only() -> None:
     assert any(payload.get("type") == "response" and payload.get("id") == "shutdown" for payload in payloads)
     assert all("Traceback" not in line for line in lines)
     assert "Traceback" not in stderr
+
+
+def test_desktop_module_jsonl_transport_is_utf8_in_both_directions() -> None:
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONIOENCODING"] = "cp936"
+    environment["PYTHONUTF8"] = "0"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "uthcode.interfaces.desktop"],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    success = '{"type":"request","id":"status-中文","method":"status.get","params":{}}\n'
+    request = '{"type":"request","id":"bad-中文","method":"不存在的方法","params":{"文本":"你好"}}\n'
+    shutdown = '{"type":"request","id":"shutdown-中文","method":"runtime.shutdown","params":{}}\n'
+    stdout, stderr = process.communicate((success + request + shutdown).encode("utf-8"), timeout=10)
+    assert process.returncode == 0
+    decoded = stdout.decode("utf-8", errors="strict")
+    payloads = [json.loads(line) for line in decoded.splitlines() if line]
+    assert any(payload.get("id") == "status-中文" and payload.get("ok") is True for payload in payloads)
+    error = next(payload for payload in payloads if payload.get("id") == "bad-中文")
+    assert error["ok"] is False
+    assert error["error"]["message"] == "unknown Desktop method"
+    assert stderr.decode("utf-8", errors="strict") == ""
+
+
+def test_desktop_stdio_override_emits_utf8_agent_event_under_cp936_environment() -> None:
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONIOENCODING"] = "cp936"
+    environment["PYTHONUTF8"] = "0"
+    script = (
+        "import json,sys;"
+        "from uthcode.interfaces.desktop.__main__ import _configure_utf8_stdio;"
+        "_configure_utf8_stdio();"
+        "sys.stdout.write(json.dumps({'type':'agent_event','event':{'type':'reasoning_delta','text':'中文推理'}},ensure_ascii=False)+'\\n');"
+        "sys.stdout.flush()"
+    )
+    result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).parents[1], env=environment, capture_output=True, timeout=10)
+    assert result.returncode == 0
+    payload = json.loads(result.stdout.decode("utf-8", errors="strict"))
+    assert payload["event"]["text"] == "中文推理"
+    assert result.stderr == b""
+
+
+def test_desktop_module_rejects_invalid_utf8_without_business_dispatch() -> None:
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONIOENCODING"] = "cp936"
+    environment["PYTHONUTF8"] = "0"
+    result = subprocess.run(
+        [sys.executable, "-m", "uthcode.interfaces.desktop"],
+        cwd=Path(__file__).parents[1], env=environment,
+        input=b'{"type":"request","id":"bad","method":"status.get","params":{"text":"\x81"}}\n',
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0
+    assert b'"id":"bad"' not in result.stdout
+    decoded = result.stdout.decode("utf-8", errors="strict")
+    assert '"kind":"transport_error"' in decoded
+    assert result.stderr.decode("utf-8", errors="strict") == ""

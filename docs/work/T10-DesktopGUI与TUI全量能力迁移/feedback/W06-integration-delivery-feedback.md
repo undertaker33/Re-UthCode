@@ -704,3 +704,32 @@ git diff --check
 四字段 fixture 证明 save candidate 包含 `openai_compat`、Base URL、remote model 与 transient key，optional limits/reasoning/display name 保持 `null`，且已有省略 optional 字段的合法配置可直接保存。dark/light/narrow 证据已更新于 `desktop/dist/ui-acceptance/settings-interactions/`，中文 replacement character 与常见 mojibake 扫描为 0。Sol/medium Reviewer 输出 `APPROVED_TO_COMMIT_T10_SIMPLE_PROVIDER_SETUP`。
 
 真实 API Key/Provider 的 Electron Settings 保存与 rebootstrap 仍需用户配置后执行；本轮不读取或写入真实用户配置，不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 11 轮追加：Windows Desktop JSONL UTF-8 边界（2026-08-30）
+
+用户真实 Desktop 对话截图显示 Renderer 输入“你好”正常，但 Reasoning、Assistant 与 Session preview 出现大面积 replacement character 和 UTF-8/GBK mojibake。根因不是字体或 CSS，而是 Desktop Python JSONL 子进程入口继承 Windows legacy code page；Node 与 Python 的协议编码没有在两端形成完整的显式 UTF-8 流边界。
+
+`src/uthcode/interfaces/desktop/__main__.py` 现只在 Desktop JSONL entrypoint 启动 Bridge 前，将 stdin/stdout/stderr 明确配置为 `encoding="utf-8", errors="strict"`。开发 Python 与 PyInstaller console bundle 使用同一入口；TUI/CLI 不受影响，Renderer 不做 GBK 猜测或 replacement 修补。`desktop/src/python-runtime.ts` 的 stdout/stderr 分别使用独立 UTF-8 `StringDecoder` 与行缓冲，多字节字符和完整诊断行允许跨任意 chunk；child close 时 flush，下一次 start 创建全新 decoder/buffer，避免跨进程串线。
+
+本轮精确验证：
+
+```text
+Python Desktop Bridge/Protocol/Session 定向测试
+-> 90 passed，0 failed
+
+Desktop runtime-process
+-> 14 passed，0 failed
+
+conda run --no-capture-output -n re-uthcode npm test  (cwd=desktop)
+-> 76 passed，0 failed，0 skipped
+
+conda run --no-capture-output -n re-uthcode npm run typecheck  (cwd=desktop)
+-> exit 0
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+测试在 `PYTHONIOENCODING=cp936`、`PYTHONUTF8=0` 下向真实子进程写入 raw UTF-8，覆盖中文 success response、structured error、AgentEvent 和 strict invalid-byte transport error；Node 侧逐 byte 切分验证中文 reasoning、assistant、error 与 stderr diagnostic。Session 通过正式 typed parts 持久化，再经 `ApplicationSessionService.project_replay` 逐项核对 user/reasoning/assistant/tool 中文一致。Sol/medium Reviewer 输出 `APPROVED_TO_COMMIT_T10_DESKTOP_UTF8_BOUNDARY_FIX`。
+
+修复只保证重启后新传输和新持久化数据。已经以错误编码落盘的旧 Session 不自动猜测编码、不重写；用户需重启现有 Desktop/Python Runtime 并新建 Session 验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
