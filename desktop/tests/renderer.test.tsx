@@ -316,7 +316,7 @@ test("T07 rebuilt Settings and typed interactions keep accessible continuous and
     assert.match(settingsMarkup, new RegExp(`id="settings-${id}"`));
   }
   assert.doesNotMatch(settingsMarkup, /aria-current=/u);
-  assert.match(settingsMarkup, /aria-label="fake provider kind"/u);
+  assert.match(settingsMarkup, /aria-label="fake provider"/u);
   assert.match(settingsMarkup, /aria-label="Remove provider fake"/u);
   assert.match(settingsMarkup, /aria-label="Clear API key for provider fake"/u);
   assert.match(settingsMarkup, /aria-label="Remove model fake\/model"/u);
@@ -343,6 +343,27 @@ test("T07 removing a provider discards its transient key before the same ID can 
   assert.equal(providers.fake.api_key, undefined);
   assert.equal(providers.keep.api_key, "sk-keep");
   assert.doesNotMatch(JSON.stringify(request), /sk-transient/u);
+});
+
+test("T07 four-field setup writes a valid OpenAI-compatible candidate without guessed model limits", () => {
+  const request = settingsSaveRequest({
+    default_model: "model",
+    default_permission_mode: "default",
+    providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
+    models: { model: { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } },
+  }, { provider: "sk-test-only" }, { provider: true });
+  assert.equal(request.default_model, "model");
+  assert.deepEqual(request.providers?.provider, { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key: "sk-test-only" });
+  assert.deepEqual(request.models?.model, { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
+});
+
+test("T07 missing optional model fields stay null instead of becoming invalid empty strings", () => {
+  const state = createInitialState({ configuration: { default_model: "provider/model", default_permission_mode: "default", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model" } } }, settingsLoaded: true });
+  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
+  assert.match(markup, /aria-label="provider\/model display name"[^>]*value=""/u);
+  const request = settingsSaveRequest({ default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1" } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } } }, {}, {});
+  assert.deepEqual(request.models?.["provider/model"], { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
+  assert.doesNotMatch(JSON.stringify(request), /"display_name":""/u);
 });
 
 test("T07 configuration request keeps API key transient and maps current schema fields", () => {
