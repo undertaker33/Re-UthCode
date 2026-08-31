@@ -59,7 +59,7 @@ class TuiInteractionState:
     selected_options: set[int] = field(default_factory=set)
     answers: dict[str, list[str]] = field(default_factory=dict)
     draft: str = ""
-    other_mode: bool = False
+    free_text_mode: bool = False
 
     @property
     def open(self) -> bool:
@@ -131,7 +131,7 @@ class TuiInteractionState:
         if question is None:
             return None
         if self.option_index >= len(question.options):
-            return "Other" if question.allow_other else None
+            return "自行输入"
         return question.options[self.option_index].label
 
     @property
@@ -186,7 +186,7 @@ class TuiInteractionState:
             return
         question = self.current_question
         if question is not None:
-            count = len(question.options) + (1 if question.allow_other else 0)
+            count = len(question.options) + 1
             if count:
                 self.option_index = (self.option_index + delta) % count
 
@@ -194,10 +194,10 @@ class TuiInteractionState:
         if self.mode is not InteractionMode.QUESTIONS or not self.is_select:
             return False
         question = self.current_question
-        if question is None or self.other_mode:
+        if question is None or self.free_text_mode:
             return False
         if self.option_index >= len(question.options):
-            return self.choose_other()
+            return self.choose_free_text()
         if question.kind.value == "single_select":
             self.selected_options = {self.option_index}
         elif self.option_index in self.selected_options:
@@ -206,21 +206,21 @@ class TuiInteractionState:
             self.selected_options.add(self.option_index)
         return True
 
-    def choose_other(self) -> bool:
+    def choose_free_text(self) -> bool:
         question = self.current_question
-        if question is None or not question.allow_other:
+        if question is None or not self.is_select:
             return False
-        self.other_mode = True
+        self.free_text_mode = True
         self.draft = ""
         return True
 
-    def exit_other(self) -> bool:
-        """Leave Other input and restore a legal ordinary option focus."""
+    def exit_free_text(self) -> bool:
+        """Leave free-text input and restore an option focus."""
 
-        if not self.other_mode:
+        if not self.free_text_mode:
             return False
         question = self.current_question
-        self.other_mode = False
+        self.free_text_mode = False
         self.draft = ""
         if question is None:
             self.selected_options.clear()
@@ -474,9 +474,10 @@ class TuiInteractionState:
                 selected = index in self.selected_options
                 marker = "✓" if selected else ("›" if index == self.option_index else " ")
                 lines.append(("class:interaction.option", f"{marker} {option.label} — {option.description}\n"))
-            if question.allow_other:
-                marker = "›" if self.other_mode or self.option_index >= len(question.options) else " "
-                lines.append(("class:interaction.option", f"{marker} Other\n"))
+            marker = "›" if self.free_text_mode or self.option_index >= len(question.options) else " "
+            lines.append(("class:interaction.option", f"{marker} 自行输入\n"))
+            if self.free_text_mode:
+                lines.append(("class:interaction.hint", "输入答案后按 Enter · Esc 返回选项\n"))
         return tuple(lines)
 
     def _reset(self, pause: PauseRequest | None) -> None:
@@ -488,13 +489,13 @@ class TuiInteractionState:
         self.selected_options.clear()
         self.answers.clear()
         self.draft = ""
-        self.other_mode = False
+        self.free_text_mode = False
 
     def _reset_question_draft(self) -> None:
         self.option_index = 0
         self.selected_options.clear()
         self.draft = ""
-        self.other_mode = False
+        self.free_text_mode = False
 
     def _load_answer_draft(self) -> None:
         question = self.current_question
@@ -505,15 +506,11 @@ class TuiInteractionState:
         self.selected_options = {
             index for index, option in enumerate(question.options) if option.label in values
         }
-        self.other_mode = bool(
-            question.allow_other and values and not self.selected_options
-        )
-        self.draft = (
-            values[0]
-            if values and (question.kind.value == "text" or self.other_mode)
-            else ""
-        )
-        if self.other_mode:
+        option_labels = {option.label for option in question.options}
+        free_values = [value for value in values if value not in option_labels]
+        self.free_text_mode = bool(free_values)
+        self.draft = values[0] if question.kind.value == "text" else (free_values[0] if free_values else "")
+        if self.free_text_mode:
             self.option_index = len(question.options)
         elif self.selected_options:
             self.option_index = min(self.selected_options)
@@ -527,18 +524,23 @@ class TuiInteractionState:
         if question.kind.value == "text":
             value = self.draft.strip()
             return [value] if value else []
-        if self.other_mode:
-            value = self.draft.strip()
-            return [value] if value and question.allow_other else []
         values = [
             option.label
             for index, option in enumerate(question.options)
             if index in self.selected_options
         ]
         if question.kind.value == "single_select":
+            if self.free_text_mode:
+                value = self.draft.strip()
+                return [value] if value else []
             if values:
                 return values[:1]
-            return [question.options[self.option_index].label]
+            if self.option_index < len(question.options):
+                return [question.options[self.option_index].label]
+            return []
+        value = self.draft.strip() if self.free_text_mode else ""
+        if value and value not in values:
+            values.append(value)
         return values
 
 

@@ -1237,7 +1237,7 @@ class UthCodeTUI:
         if self.interaction.mode is InteractionMode.PLAN_REVISION:
             value = self.interaction.draft
         elif question is not None and (
-            question.kind.value == "text" or self.interaction.other_mode
+            question.kind.value == "text" or self.interaction.free_text_mode
         ):
             value = self.interaction.draft
         self.buffer.set_document(
@@ -1252,9 +1252,9 @@ class UthCodeTUI:
             self.buffer.set_document(Document("", 0), bypass_readonly=True)
         elif (
             self.interaction.mode is InteractionMode.QUESTIONS
-            and self.interaction.other_mode
+            and self.interaction.free_text_mode
         ):
-            self.interaction.exit_other()
+            self.interaction.exit_free_text()
             self._sync_interaction_buffer()
         elif self.interaction.previous_question():
             self._sync_interaction_buffer()
@@ -1339,8 +1339,10 @@ class UthCodeTUI:
                 self.interaction.selected_options = {
                     self.interaction.current_options.index(typed)
                 }
-            elif question.allow_other:
-                self.interaction.choose_other()
+                self.interaction.free_text_mode = False
+                self.interaction.set_draft("")
+            else:
+                self.interaction.choose_free_text()
                 self.interaction.set_draft(typed)
         else:
             self.interaction.set_draft(self.buffer.text)

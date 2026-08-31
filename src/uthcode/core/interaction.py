@@ -182,7 +182,6 @@ class UserQuestion(_JsonModel):
     question: str
     kind: QuestionKind
     options: tuple[QuestionOption, ...] = ()
-    allow_other: bool = False
 
     def __post_init__(self) -> None:
         _require_text(self.question_id, "question_id")
@@ -194,18 +193,14 @@ class UserQuestion(_JsonModel):
         if not all(isinstance(option, QuestionOption) for option in options):
             raise TypeError("options must contain QuestionOption values")
         object.__setattr__(self, "options", options)
-        if not isinstance(self.allow_other, bool):
-            raise TypeError("allow_other must be a boolean")
 
         if kind is QuestionKind.TEXT:
             if options:
                 raise ValueError("text questions must not contain options")
-            if self.allow_other:
-                raise ValueError("text questions must not allow Other")
             return
 
-        if not 2 <= len(options) <= 6:
-            raise ValueError("select questions require between 2 and 6 options")
+        if not 2 <= len(options) <= 3:
+            raise ValueError("select questions require between 2 and 3 options")
         labels = [option.label for option in options]
         if len(set(labels)) != len(labels):
             raise ValueError("select option labels must be unique")
@@ -219,7 +214,6 @@ class UserQuestion(_JsonModel):
         }
         if self.kind is not QuestionKind.TEXT:
             payload["options"] = [option.to_dict() for option in self.options]
-            payload["allow_other"] = self.allow_other
         return payload
 
     @classmethod
@@ -230,28 +224,18 @@ class UserQuestion(_JsonModel):
         if kind is QuestionKind.TEXT:
             _expect_keys(payload, base)
             options: tuple[QuestionOption, ...] = ()
-            allow_other = False
         else:
-            if not base.issubset(payload):
-                _expect_keys(payload, base | {"options"})
-            allowed = base | {"options", "allow_other"}
-            extra = set(payload) - allowed
-            if extra:
-                raise ValueError(f"payload has unknown fields: {sorted(extra)!r}")
-            if "options" not in payload:
-                raise ValueError("payload is missing fields: ['options']")
+            _expect_keys(payload, base | {"options"})
             options = tuple(
                 QuestionOption.from_dict(item)  # type: ignore[arg-type]
                 for item in _as_tuple(_required(payload, "options"), "options")
             )
-            allow_other = payload.get("allow_other", False)  # type: ignore[assignment]
         return cls(
             question_id=_required(payload, "question_id"),  # type: ignore[arg-type]
             header=_required(payload, "header"),  # type: ignore[arg-type]
             question=_required(payload, "question"),  # type: ignore[arg-type]
             kind=kind,
             options=options,
-            allow_other=allow_other,  # type: ignore[arg-type]
         )
 
     @classmethod
@@ -311,10 +295,6 @@ class UserInputRequest(_JsonModel):
                 raise ValueError("single-select questions require exactly one answer")
             if question.kind is QuestionKind.MULTI_SELECT and not values:
                 raise ValueError("multi-select questions require at least one answer")
-            if question.kind is not QuestionKind.TEXT:
-                allowed = {option.label for option in question.options}
-                if not question.allow_other and any(value not in allowed for value in values):
-                    raise ValueError(f"answers contain an invalid option for {question_id}")
         return normalized
 
     def answers_to_json(self, answers: Mapping[str, Sequence[str]] | JsonPayload) -> str:
@@ -1057,7 +1037,7 @@ _OPTION_SCHEMA: dict[str, object] = {
 _SELECT_QUESTION_SCHEMA: dict[str, object] = {
     "type": "array",
     "minItems": 2,
-    "maxItems": 6,
+    "maxItems": 3,
     "items": _OPTION_SCHEMA,
     "uniqueItems": True,
 }
@@ -1070,7 +1050,6 @@ _QUESTION_SCHEMA: dict[str, object] = {
         "question": {"type": "string", "minLength": 1},
         "kind": {"enum": [item.value for item in QuestionKind]},
         "options": _SELECT_QUESTION_SCHEMA,
-        "allow_other": {"type": "boolean"},
     },
     "required": ["question_id", "header", "question", "kind"],
     "additionalProperties": False,
@@ -1079,10 +1058,7 @@ _QUESTION_SCHEMA: dict[str, object] = {
             "if": {"properties": {"kind": {"const": QuestionKind.TEXT.value}}},
             "then": {
                 "not": {
-                    "anyOf": [
-                        {"required": ["options"]},
-                        {"required": ["allow_other"]},
-                    ]
+                    "required": ["options"],
                 }
             },
         },

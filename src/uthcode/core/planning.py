@@ -287,6 +287,236 @@ PROPOSE_PLAN_TOOL_DEFINITION = ToolDefinition(
 )
 
 
+class _PlanContentDecoder:
+    """Decode only the ``plan`` string from one ProposePlan argument stream.
+
+    Provider argument chunks are JSON fragments, so a chunk boundary can fall
+    between any two characters (including an escape sequence).  This tiny
+    state machine intentionally understands only the current ProposePlan
+    object shape; the complete ``ToolCallPart.arguments`` payload remains the
+    authority for final validation.
+    """
+
+    __slots__ = (
+        "_phase",
+        "_key_chars",
+        "_key_escape",
+        "_plan_escape",
+        "_unicode_digits",
+        "_unicode_remaining",
+        "_pending_high_surrogate",
+        "_expect_low_surrogate_u",
+    )
+
+    _HEX = frozenset("0123456789abcdefABCDEF")
+    _ESCAPED = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+
+    def __init__(self) -> None:
+        self._phase = "start"
+        self._key_chars: list[str] = []
+        self._key_escape = False
+        self._plan_escape = False
+        self._unicode_digits: list[str] = []
+        self._unicode_remaining = 0
+        self._pending_high_surrogate: int | None = None
+        self._expect_low_surrogate_u = False
+
+    @property
+    def invalid(self) -> bool:
+        return self._phase == "invalid"
+
+    def feed(self, chunk: str) -> str:
+        """Return newly decoded natural-language text from one raw chunk."""
+
+        if not isinstance(chunk, str):
+            raise TypeError("plan argument chunk must be a string")
+        if self.invalid or self._phase == "done":
+            return ""
+
+        output: list[str] = []
+        for char in chunk:
+            self._consume(char, output)
+            if self.invalid:
+                break
+        return "".join(output)
+
+    def finish(self) -> bool:
+        """Return whether the streamed object reached its closing brace."""
+
+        if self._phase == "done":
+            return True
+        if self._phase == "invalid":
+            return False
+        self._phase = "invalid"
+        return False
+
+    def _consume(self, char: str, output: list[str]) -> None:
+        if self._phase == "start":
+            if char.isspace():
+                return
+            if char == "{":
+                self._phase = "key_start"
+                return
+            self._phase = "invalid"
+            return
+
+        if self._phase == "key_start":
+            if char.isspace():
+                return
+            if char != '"':
+                self._phase = "invalid"
+                return
+            self._key_chars.clear()
+            self._key_escape = False
+            self._phase = "key"
+            return
+
+        if self._phase == "key":
+            if self._key_escape:
+                self._key_chars.append(char)
+                self._key_escape = False
+                return
+            if char == "\\":
+                self._key_chars.append(char)
+                self._key_escape = True
+                return
+            if char == '"':
+                try:
+                    key = json.loads('"' + "".join(self._key_chars) + '"')
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._phase = "invalid"
+                    return
+                if key != "plan":
+                    self._phase = "invalid"
+                    return
+                self._phase = "colon"
+                return
+            if ord(char) < 0x20:
+                self._phase = "invalid"
+                return
+            self._key_chars.append(char)
+            return
+
+        if self._phase == "colon":
+            if char.isspace():
+                return
+            if char != ":":
+                self._phase = "invalid"
+                return
+            self._phase = "plan_start"
+            return
+
+        if self._phase == "plan_start":
+            if char.isspace():
+                return
+            if char != '"':
+                self._phase = "invalid"
+                return
+            self._phase = "plan"
+            self._plan_escape = False
+            self._unicode_digits.clear()
+            self._unicode_remaining = 0
+            self._pending_high_surrogate = None
+            self._expect_low_surrogate_u = False
+            return
+
+        if self._phase == "plan":
+            self._consume_plan_char(char, output)
+            return
+
+        if self._phase == "end":
+            if char.isspace():
+                return
+            if char == "}":
+                self._phase = "done"
+                return
+            self._phase = "invalid"
+            return
+
+        if self._phase == "done" and not char.isspace():
+            self._phase = "invalid"
+
+    def _consume_plan_char(self, char: str, output: list[str]) -> None:
+        if self._expect_low_surrogate_u:
+            if char == "u":
+                self._expect_low_surrogate_u = False
+                self._unicode_digits.clear()
+                self._unicode_remaining = 4
+                return
+            self._phase = "invalid"
+            return
+
+        if self._unicode_remaining:
+            if char not in self._HEX:
+                self._phase = "invalid"
+                return
+            self._unicode_digits.append(char)
+            self._unicode_remaining -= 1
+            if self._unicode_remaining:
+                return
+            codepoint = int("".join(self._unicode_digits), 16)
+            self._unicode_digits.clear()
+            if self._pending_high_surrogate is not None:
+                if not 0xDC00 <= codepoint <= 0xDFFF:
+                    self._phase = "invalid"
+                    return
+                high = self._pending_high_surrogate
+                self._pending_high_surrogate = None
+                output.append(chr(0x10000 + ((high - 0xD800) << 10) + (codepoint - 0xDC00)))
+                return
+            if 0xD800 <= codepoint <= 0xDBFF:
+                self._pending_high_surrogate = codepoint
+                return
+            if 0xDC00 <= codepoint <= 0xDFFF:
+                self._phase = "invalid"
+                return
+            output.append(chr(codepoint))
+            return
+
+        if self._pending_high_surrogate is not None:
+            if char == "\\":
+                self._expect_low_surrogate_u = True
+                return
+            self._phase = "invalid"
+            return
+
+        if self._plan_escape:
+            self._plan_escape = False
+            if char == "u":
+                self._unicode_digits.clear()
+                self._unicode_remaining = 4
+                return
+            decoded = self._ESCAPED.get(char)
+            if decoded is None:
+                self._phase = "invalid"
+                return
+            output.append(decoded)
+            return
+
+        if char == "\\":
+            self._plan_escape = True
+            return
+        if char == '"':
+            if self._pending_high_surrogate is not None:
+                self._phase = "invalid"
+                return
+            self._phase = "end"
+            return
+        if ord(char) < 0x20:
+            self._phase = "invalid"
+            return
+        output.append(char)
+
+
 def parse_propose_plan_arguments(arguments: Mapping[str, object]) -> str:
     """Validate a ProposePlan payload and return its complete natural-language plan."""
 

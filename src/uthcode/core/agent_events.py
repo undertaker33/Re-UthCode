@@ -331,6 +331,22 @@ class PlanProposed(AgentEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class PlanContentDelta(AgentEvent):
+    """A display-safe natural-language increment for one Plan tool call."""
+
+    event_type: ClassVar[str] = "plan_content_delta"
+    iteration: int
+    tool_call_id: str
+    text: str
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_positive_int(self.iteration, "iteration")
+        _require_text(self.tool_call_id, "tool_call_id")
+        _require_text(self.text, "text")
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionBlocked(AgentEvent):
     event_type: ClassVar[str] = "completion_blocked"
     iteration: int
@@ -639,6 +655,7 @@ AgentEventValue: TypeAlias = (
     | UsageUpdated
     | BehaviorModeChanged
     | TaskStateChanged
+    | PlanContentDelta
     | PlanProposed
     | CompletionBlocked
     | UserSteeringRequested
@@ -670,6 +687,7 @@ _EVENT_TYPES: dict[str, type[AgentEvent]] = {
         UsageUpdated,
         BehaviorModeChanged,
         TaskStateChanged,
+        PlanContentDelta,
         PlanProposed,
         CompletionBlocked,
         UserSteeringRequested,
@@ -815,6 +833,25 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             _required(payload, "iteration"),  # type: ignore[arg-type]
             _required(payload, "revision"),  # type: ignore[arg-type]
             _required(payload, "plan_text"),  # type: ignore[arg-type]
+        )
+    if event_type == PlanContentDelta.event_type:
+        _expect_keys(
+            payload,
+            {
+                "type",
+                "run_id",
+                "turn_id",
+                "iteration",
+                "tool_call_id",
+                "text",
+            },
+        )
+        return PlanContentDelta(
+            run_id,
+            turn_id,
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+            _required(payload, "tool_call_id"),  # type: ignore[arg-type]
+            _required(payload, "text"),  # type: ignore[arg-type]
         )
     if event_type == CompletionBlocked.event_type:
         _expect_keys(
@@ -984,6 +1021,7 @@ __all__ = [
     "CompletionBlocked",
     "FailureReason",
     "IterationStarted",
+    "PlanContentDelta",
     "PlanProposed",
     "ReasoningDelta",
     "ReasoningFinished",

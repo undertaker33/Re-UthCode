@@ -624,20 +624,155 @@ test("T06 Interaction Surface uses dynamic Permission choices and never assumes 
   assert.match(sessionMarkup, /Allow for session/);
 });
 
-test("T06 Interaction Surface exposes AskUser review and Plan revision controls", () => {
-  const inputInteraction = { kind: "user_input_required", pauseId: "pause-1", runId: "run-1", turnId: "turn-1", toolCallId: "call-1", request: { questions: [{ question_id: "q1", header: "Name", question: "Your name?", kind: "text" }, { question_id: "q2", header: "Color", question: "Pick", kind: "single_select", options: [{ label: "Red", description: "warm" }, { label: "Blue", description: "cool" }], allow_other: true }] } } as const;
+test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flow", async () => {
+  const inputInteraction = { kind: "user_input_required", pauseId: "pause-1", runId: "run-1", turnId: "turn-1", toolCallId: "call-1", request: { questions: [{ question_id: "q1", header: "Name", question: "Your name?", kind: "text" }, { question_id: "q2", header: "Color", question: "Pick", kind: "single_select", options: [{ label: "Red", description: "warm" }, { label: "Blue", description: "cool" }] }] } } as const;
   const inputMarkup = renderToStaticMarkup(<InteractionSurface interaction={inputInteraction} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(inputMarkup, /Your name\?/);
   assert.match(inputMarkup, /下一步/);
   assert.match(inputMarkup, /取消轮次/);
+  const singleMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [inputInteraction.request.questions[1]] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
+  assert.match(singleMarkup, /Color Provide another answer/);
   const planInteraction = { kind: "plan_review_required", pauseId: "pause-2", runId: "run-1", turnId: "turn-1", request: { revision: 3, plan_text: "Step one\nStep two" } } as const;
   const planMarkup = renderLanguage("en", <InteractionSurface interaction={planInteraction} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(planMarkup, /Revision 3/);
   assert.match(planMarkup, /Approve and execute/);
   assert.match(planMarkup, /Revision feedback/);
-  const multiMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [{ question_id: "q1", header: "Tags", question: "Pick tags", kind: "multi_select", options: [{ label: "One", description: "first" }, { label: "Two", description: "second" }], allow_other: true }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const multiMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [{ question_id: "q1", header: "Tags", question: "Pick tags", kind: "multi_select", options: [{ label: "One", description: "first" }, { label: "Two", description: "second" }] }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(multiMarkup, /Pick tags/);
-  assert.match(multiMarkup, /Other/);
+  assert.match(multiMarkup, /Tags Provide another answer/);
+  await withRendererDom(async (dom, container, root) => {
+    const submitted: unknown[] = [];
+    const cancelled: string[] = [];
+    const inputInteraction = {
+      kind: "user_input_required",
+      pauseId: "pause-dom",
+      runId: "run-dom",
+      turnId: "turn-dom",
+      toolCallId: "call-dom",
+      request: {
+        questions: [
+          {
+            question_id: "mode",
+            header: "Mode",
+            question: "Choose a mode",
+            kind: "single_select",
+            options: [
+              { label: "Fast", description: "Fast mode" },
+              { label: "Safe", description: "Safe mode" },
+            ],
+          },
+          {
+            question_id: "tags",
+            header: "Tags",
+            question: "Choose tags",
+            kind: "multi_select",
+            options: [
+              { label: "One", description: "First tag" },
+              { label: "Two", description: "Second tag" },
+            ],
+          },
+          {
+            question_id: "details",
+            header: "Details",
+            question: "Add details",
+            kind: "text",
+          },
+        ],
+      },
+    } as const;
+    const renderInteraction = async (interaction: typeof inputInteraction) => {
+      act(() => {
+        root.render(
+          <LanguageProvider value="en">
+            <InteractionSurface
+              interaction={interaction}
+              onSubmit={(response) => submitted.push(response)}
+              onCancel={() => cancelled.push(interaction.pauseId)}
+            />
+          </LanguageProvider>,
+        );
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const clickButton = async (title: string) => {
+      const button = container.querySelector<HTMLButtonElement>(`button[title="${title}"]`);
+      assert.ok(button, `button ${title} should be present`);
+      act(() => { button!.click(); });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const setInputValue = async (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      assert.ok(setter, "JSDOM input value setter should be available");
+      act(() => {
+        setter!.call(input, value);
+        input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+        input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        // React is imported before the JSDOM window in this suite, so its legacy input fallback observes keyup for controlled fields.
+        input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const freeInput = (header: string) => {
+      const input = container.querySelector<HTMLInputElement>(`input[aria-label="${header} Provide another answer"]`);
+      assert.ok(input, `${header} free input should be present`);
+      return input!;
+    };
+
+    await renderInteraction(inputInteraction);
+    const modeOptions = Array.from(container.querySelectorAll<HTMLInputElement>('input[name="mode"]'));
+    assert.equal(modeOptions.length, 2);
+    act(() => { modeOptions[0]!.click(); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(modeOptions[0]!.checked, true);
+    await clickButton("Next");
+
+    const tagOptions = Array.from(container.querySelectorAll<HTMLInputElement>('input[name="tags"]'));
+    assert.equal(tagOptions.length, 2);
+    act(() => { tagOptions[0]!.click(); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(tagOptions[0]!.checked, true);
+    await setInputValue(freeInput("Tags"), "custom-tag");
+    await clickButton("Back to chat");
+    assert.equal(container.querySelector<HTMLInputElement>('input[name="mode"]')?.checked, true, "previous single option should survive navigation");
+    await setInputValue(freeInput("Mode"), "custom-mode");
+    assert.equal(freeInput("Mode").value, "custom-mode");
+    await clickButton("Next");
+    assert.equal(tagOptions[0]!.checked, true, "previous multi option should survive navigation");
+    assert.equal(freeInput("Tags").value, "custom-tag", "previous multi free text should survive navigation");
+    await clickButton("Next");
+
+    const details = container.querySelector<HTMLInputElement>('input[aria-label="Details"]');
+    assert.ok(details);
+    await setInputValue(details!, "details");
+    await clickButton("Back to chat");
+    assert.equal(freeInput("Tags").value, "custom-tag");
+    await clickButton("Next");
+    assert.equal(container.querySelector<HTMLInputElement>('input[aria-label="Details"]')?.value, "details");
+    await clickButton("Review");
+    assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /custom-mode/);
+    assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /One, custom-tag/);
+    assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /details/);
+    await clickButton("Submit answers");
+    assert.equal(submitted.length, 1, "AskUser should submit exactly once");
+    assert.deepEqual(submitted[0], {
+      type: "user_input",
+      pause_id: "pause-dom",
+      run_id: "run-dom",
+      turn_id: "turn-dom",
+      tool_call_id: "call-dom",
+      answers: {
+        mode: ["custom-mode"],
+        tags: ["One", "custom-tag"],
+        details: ["details"],
+      },
+    });
+
+    const cancelInteraction = { ...inputInteraction, pauseId: "pause-cancel" };
+    await renderInteraction(cancelInteraction);
+    await clickButton("Cancel turn");
+    assert.deepEqual(cancelled, ["pause-cancel"], "cancel should retain the pending pause identity");
+  });
 });
 
 test("T06 Provider Retry and user Pause render only typed continuation/cancel controls", () => {
