@@ -25,3 +25,10 @@ env/
 .ruff_cache/
 .tox/
 .uthcode/
+
+# Desktop dependencies and generated build artifacts
+desktop/node_modules/
+desktop/.webpack/
+desktop/.runtime/
+desktop/out/
+desktop/packaging/.build/

@@ -51,8 +51,8 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-08-30
-status_scope: docs/work/*XX-* + docs/work/archive/
+status_snapshot: 2026-09-01
+status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
   implemented_unarchived: 当前源码已有实现，Checklist 全部完成且 Feedback 已记录，但目录仍在 docs/work/
@@ -90,7 +90,8 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W05 已实现配置、Bridge、Electron shell、Renderer、打包链；W06 已完成 `npm ci`、Python/Desktop 全量回归、Runtime/PyInstaller smoke、package、make、Installer 自动测试和真实 packaged Electron 中英文 CDP 视觉验收；Windows 无系统 Python 干净机 Installer、真实 Provider 首配/对话/卸载、完整 Feature Parity 与人工 UI 清单仍未验证，Checklist 第 87、119 项未完成，保持 `not_implemented` |
+| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W06 Feedback 齐全，自动回归、Runtime/PyInstaller smoke、package/make、Installer 自动测试和 packaged Electron 中英文 CDP 视觉验收已有证据；冻结 Checklist 共 86 项，仍有 20 项未完成，覆盖 Project/Session、Composer/Slash、AskUser/Plan、Settings/主题、真实 Desktop/Installer/Feature Parity 与最终状态收口，其中部分旧验收语义已被 F02 新需求取代但不得回写冻结文件，保持 `not_implemented` |
+| F02 | Desktop GUI 交互与上下文缺陷修复 | `docs/work/F02-DesktopGUI交互与上下文缺陷修复/` | 已按固定基线拆分 Spec、Tasks、Checklist 与 W01～W06 Prompt；尚未由用户派发任何 Worker Prompt，源码未开始实施，保持 `not_implemented` |
 
 ## 跨层最短链路
 
