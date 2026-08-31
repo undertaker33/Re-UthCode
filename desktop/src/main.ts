@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
 import squirrelStartup from "electron-squirrel-startup";
 import { stat } from "node:fs/promises";
@@ -44,6 +44,7 @@ const PRELOAD_ENTRY = () =>
 export const IPC_CHANNELS = Object.freeze({
   pickProject: "desktop.project.pick",
   openProjectInExplorer: "desktop.project.explorer",
+  copySessionId: "desktop.session.copy-id",
   closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
   runtimeEvent: "desktop.runtime.event",
@@ -174,6 +175,7 @@ interface MainIpcOptions {
   closeShell?: () => void;
   ipc?: Pick<typeof ipcMain, "handle" | "removeHandler">;
   setNativeTheme?: (theme: DesktopPreferences["theme"]) => void;
+  writeClipboard?: (value: string) => void;
 }
 
 export function registerIpcHandlers(options: MainIpcOptions): () => void {
@@ -185,6 +187,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   const ipc = options.ipc ?? ipcMain;
   const closeShell = options.closeShell ?? beginApplicationShutdown;
   const setNativeTheme = options.setNativeTheme ?? ((theme: DesktopPreferences["theme"]) => { nativeTheme.themeSource = theme; });
+  const writeClipboard = options.writeClipboard ?? ((value: string) => clipboard.writeText(value));
 
   const onPickProject = async (event: IpcMainInvokeEvent): Promise<string | null> => {
     assertSender(event);
@@ -206,6 +209,18 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     }
     const failure = await openPath(selected);
     if (failure) throw new MainBoundaryError("explorer_open_failed", "Project Explorer action failed");
+  };
+
+  const onCopySessionId = async (event: IpcMainInvokeEvent, value: unknown): Promise<void> => {
+    assertSender(event);
+    if (typeof value !== "string" || !value.trim() || value.length > 4096) {
+      throw new MainBoundaryError("invalid_session_id", "Session ID is invalid");
+    }
+    try {
+      writeClipboard(value);
+    } catch {
+      throw new MainBoundaryError("clipboard_write_failed", "Session ID could not be copied");
+    }
   };
 
   const onCloseShell = async (event: IpcMainInvokeEvent): Promise<void> => {
@@ -298,6 +313,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
 
   ipc.handle(IPC_CHANNELS.pickProject, onPickProject);
   ipc.handle(IPC_CHANNELS.openProjectInExplorer, onOpenProjectInExplorer);
+  ipc.handle(IPC_CHANNELS.copySessionId, onCopySessionId);
   ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);

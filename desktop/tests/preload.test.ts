@@ -52,6 +52,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(exposed.api, api);
   assert.deepEqual(Object.keys(api).sort(), [
     "closeShell",
+    "copySessionId",
     "openProject",
     "openProjectInExplorer",
     "readPreference",
@@ -65,6 +66,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
 
   assert.equal(await api.openProject(), "C:\\Projects\\UthCode");
   await api.openProjectInExplorer("C:\\Projects\\UthCode");
+  await api.copySessionId("session-1");
   await api.closeShell();
   await api.requestRuntime("status.get", {});
   await api.readPreference("theme");
@@ -74,6 +76,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
     { channel: "desktop.project.explorer", args: ["C:\\Projects\\UthCode"] },
+    { channel: "desktop.session.copy-id", args: ["session-1"] },
     { channel: "desktop.shell.close", args: [] },
     { channel: "desktop.runtime.request", args: [{ method: "status.get", params: {} }] },
     { channel: "desktop.preference.read", args: ["theme"] },
@@ -174,6 +177,7 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
     write: async () => ({ theme: "dark" }),
   };
   const opened: string[] = [];
+  const copied: string[] = [];
   let shellCloseCount = 0;
   const removeHandlers = registerIpcHandlers({
     window: window as never,
@@ -190,24 +194,30 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
       opened.push(path);
       return "";
     }) as never,
+    writeClipboard: (value) => { copied.push(value); },
     closeShell: () => { shellCloseCount += 1; },
   });
 
   const pick = handlers.get(IPC_CHANNELS.pickProject);
   const explorer = handlers.get(IPC_CHANNELS.openProjectInExplorer);
+  const copySessionId = handlers.get(IPC_CHANNELS.copySessionId);
   const closeShell = handlers.get(IPC_CHANNELS.closeShell);
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
-  assert.ok(pick && explorer && closeShell && runtimeRequest);
+  assert.ok(pick && explorer && copySessionId && closeShell && runtimeRequest);
   await assert.rejects(closeShell?.({ sender: {}, senderFrame: mainFrame }), /not trusted/);
   await assert.rejects(
     runtimeRequest?.({ sender: {}, senderFrame: mainFrame }, { method: "status.get", params: {} }),
     /not trusted/,
   );
+  await assert.rejects(copySessionId?.({ sender: {}, senderFrame: mainFrame }, "session-1"), /not trusted/);
+  await copySessionId?.(trustedEvent, "session-1");
+  await assert.rejects(copySessionId?.(trustedEvent, "  "), /Session ID is invalid/);
   await assert.rejects(explorer?.(trustedEvent, "C:\\Projects\\Other"), /selected before/);
   assert.equal(await pick?.(trustedEvent), "C:\\Projects\\UthCode");
   await explorer?.(trustedEvent, "C:\\Projects\\UthCode");
   await closeShell?.(trustedEvent);
   assert.deepEqual(opened, ["C:\\Projects\\UthCode"]);
+  assert.deepEqual(copied, ["session-1"]);
   assert.equal(shellCloseCount, 1);
   removeHandlers();
   assert.equal(handlers.size, 0);
@@ -322,6 +332,11 @@ test("Main gates project use to picker or persisted recent registrations", async
       restartedProjects,
     );
     assert.deepEqual([...restartedProjects], [persisted]);
+    const expansionOnlyStore = new DesktopPreferencesStore(join(persisted, "desktop-expansion-only.json"));
+    await expansionOnlyStore.write("expandedProjects", { [persisted]: true });
+    const expansionOnlyProjects = new Set<string>();
+    await hydrateRegisteredProjectsFromPreferences(await expansionOnlyStore.read(), expansionOnlyProjects);
+    assert.deepEqual([...expansionOnlyProjects], [], "session tree UI expansion must not register a trusted project");
     registeredProjects.clear();
     for (const project of restartedProjects) registeredProjects.add(project);
     await runtimeRequest?.(

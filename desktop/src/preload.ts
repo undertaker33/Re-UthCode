@@ -33,8 +33,8 @@ function requirePreferenceKey(value: unknown): asserts value is PreferenceKey {
   if (!isPreferenceKey(value)) throw new TypeError("preference key is not supported");
 }
 
-function requirePath(value: unknown): asserts value is string {
-  if (typeof value !== "string" || value.length === 0) throw new TypeError("project path is invalid");
+function requireNonEmptyString(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) throw new TypeError(`${field} is invalid`);
 }
 
 function requireJson(value: unknown, field: string): asserts value is JsonValue {
@@ -54,8 +54,12 @@ export function installPreload(
       return selected;
     },
     async openProjectInExplorer(projectPath: string): Promise<void> {
-      requirePath(projectPath);
+      requireNonEmptyString(projectPath, "project path");
       await ipcRenderer.invoke("desktop.project.explorer", projectPath);
+    },
+    async copySessionId(sessionId: string): Promise<void> {
+      requireNonEmptyString(sessionId, "session ID");
+      await ipcRenderer.invoke("desktop.session.copy-id", sessionId);
     },
     async closeShell(): Promise<void> {
       await ipcRenderer.invoke("desktop.shell.close");

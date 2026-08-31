@@ -25,6 +25,7 @@ export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = {
   projectAliases: {},
   pinnedProjectKeys: [],
   pinnedSessions: [],
+  expandedProjects: {},
   selectedProjectKey: null,
   selectedSessionId: null,
 };
@@ -53,6 +54,7 @@ function clonePreferences(value: DesktopPreferences): DesktopPreferences {
     projectAliases: { ...value.projectAliases },
     pinnedProjectKeys: [...value.pinnedProjectKeys],
     pinnedSessions: value.pinnedSessions.map((item) => ({ ...item })),
+    expandedProjects: { ...value.expandedProjects },
     selectedProjectKey: value.selectedProjectKey,
     selectedSessionId: value.selectedSessionId,
   };
@@ -172,6 +174,23 @@ function validateStringMap(value: unknown, field: string): Record<string, string
   return result;
 }
 
+function validateBooleanMap(value: unknown, field: string): Record<string, boolean> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new PreferenceValidationError(`${field} must be an object`);
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_PINNED_PROJECTS) {
+    throw new PreferenceValidationError(`${field} must be a bounded object`);
+  }
+  const result: Record<string, boolean> = {};
+  for (const [key, item] of entries) {
+    requireString(key, `${field} key`, MAX_STRING_LENGTH);
+    if (typeof item !== "boolean") throw new PreferenceValidationError(`${field}.${key} must be boolean`);
+    result[key] = item;
+  }
+  return result;
+}
+
 function validateStringList(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.length > MAX_PINNED_PROJECTS) {
     throw new PreferenceValidationError(`${field} must be a bounded array`);
@@ -214,6 +233,7 @@ function validateDocument(value: unknown): DesktopPreferences {
   if (source.projectAliases !== undefined) result.projectAliases = validateStringMap(source.projectAliases, "projectAliases");
   if (source.pinnedProjectKeys !== undefined) result.pinnedProjectKeys = validateStringList(source.pinnedProjectKeys, "pinnedProjectKeys");
   if (source.pinnedSessions !== undefined) result.pinnedSessions = validatePinnedSessions(source.pinnedSessions);
+  if (source.expandedProjects !== undefined) result.expandedProjects = validateBooleanMap(source.expandedProjects, "expandedProjects");
   if (source.selectedProjectKey !== undefined) result.selectedProjectKey = validateNullableString(source.selectedProjectKey, "selectedProjectKey");
   if (source.selectedSessionId !== undefined) result.selectedSessionId = validateNullableString(source.selectedSessionId, "selectedSessionId");
   return result;
@@ -258,6 +278,7 @@ export class DesktopPreferencesStore {
       case "projectAliases": normalized = validateStringMap(value, key); break;
       case "pinnedProjectKeys": normalized = validateStringList(value, key); break;
       case "pinnedSessions": normalized = validatePinnedSessions(value); break;
+      case "expandedProjects": normalized = validateBooleanMap(value, key); break;
       case "selectedProjectKey": normalized = validateNullableString(value, key); break;
       case "selectedSessionId": normalized = validateNullableString(value, key); break;
     }

@@ -832,3 +832,40 @@ git diff --check
 真实测试覆盖 title/catalog/replay/status/TUI title 优先与 preview 保留、非空 Tool Result 保持、move 写失败原状态、真实 DesktopBridge busy/storage/invalid 错误映射、owner/重启边界、并发收敛和 240/241 标题边界。Luna/max Worker 经两轮返工，Sol/medium Reviewer 第三轮输出 `APPROVED`，零阻塞 finding。
 
 残余风险：未启动真实 Electron 验证 startup preference hydration 交互；Windows 路径大小写或物理别名可能导致拒绝型误判，但未发现授权绕过。会话/项目悬浮菜单、折叠、置顶与 UI 调用属于后续 Prompt；本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 15 轮追加：Project / Session 侧栏菜单与稳定顺序（2026-08-31）
+
+侧栏现以稳定的 Project / Session 数组顺序为权威：选中、恢复、刷新和重命名不再把当前 Session 移到第二位；只有用户显式置顶才改变分组展示。每个 Project 的普通 Session 超过 5 条时默认折叠，置顶 Session 独立显示且不占用 5 条配额。当已选 Session 位于折叠区时，仅派生展开可见状态，不移动、复制或改写原数组顺序。Project 展开/收起与 Project/Session 置顶、Project 显示别名作为最小 Desktop UI preference 持久化；旧偏好缺字段时回退空 map，Main 不将这些 UI preference 视为 trusted-project 来源。
+
+Project 和 Session 行均收敛为单一 `···` anchored floating menu，并共用同一套鼠标右键模型。Project 菜单提供置顶/取消置顶、编辑 UI 别名、在资源管理器中打开、从 UthCode 导航移除；“移除”只删除本地导航/偏好引用，不删除磁盘目录。Explorer Main IPC 只接受已注册 Project。Session 菜单提供置顶/取消置顶、调用第 14 轮 Application authority 重命名、移动到另一个已信任 Project，以及通过 typed Main/Preload IPC 复制 Session ID。active/busy/corrupt 状态使不可用动作显式禁用；rename/move 失败不乐观改写 Renderer，移动成功后按原 ID/title/preview 从源 Project 删除并加入目标 Project。
+
+菜单支持 click、contextmenu、ArrowUp/ArrowDown、Home/End、Enter/Space、Escape、outside pointer、Tab/Shift+Tab 与视口边界翻转。Escape/outside 关闭并恢复 trigger 焦点；Tab/Shift+Tab 关闭非模态菜单并按文档顺序离开，不形成焦点陷阱。所有新增固定文案位于现有 `zh-CN` / `en` locale；Project canonical path、Session 完整标题/ID/所属 Project 以 hover/accessible 信息提供，用户数据保持原文。为渲染生产 `Sidebar` 并执行真实 DOM 交互，Desktop 新增仅位于 `devDependencies` 的 `jsdom@26.1.0`；生产依赖树与 bundle 不包含 `jsdom`。
+
+本轮精确验证：
+
+```text
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Desktop 完整 npm test（Reviewer 首轮）
+-> 84 passed，0 failed
+
+Renderer + Preload 最终定向
+-> 59 passed，0 failed
+
+Main bundle + CDP isolation 最终定向
+-> 8 passed，0 failed
+
+Python Session/Desktop Protocol/Bridge 定向（Worker 初轮）
+-> 79 passed，0 failed
+
+Python Desktop/架构定向（Reviewer 首轮）
+-> 90 passed，0 failed
+
+git diff --check
+-> exit 0，仅 LF -> CRLF line-ending 提示
+```
+
+生产 `Sidebar` 的 JSDOM 测试真实覆盖选中的第 6 条 Session 可见且原顺序不变、展开偏好恢复、click/right-click/outside/Escape/Tab/Shift+Tab/focus/viewport，以及 Project trigger Enter + menuitem Space 和 Session trigger Space + menuitem Enter 的动作、关闭、焦点恢复。Luna/max Worker 经两轮返工，Sol/medium Reviewer 第三轮输出 `APPROVED`，零阻塞 finding。
+
+未在本轮返工后重跑完整 `npm test` 或 Python 套件；返工只增加真实 DOM 验收和展开偏好链路，最终定向测试与 bundle isolation 已通过。真实 Electron 中的鼠标/键盘菜单人工交互、Windows Explorer 打开与系统剪贴板仍未人工验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

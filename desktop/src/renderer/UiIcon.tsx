@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "settings" | "runtime" | "panel" | "compact" | "status";
+export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status";
 
 export function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -11,6 +11,8 @@ export function UiIcon({ name }: { name: UiIconName }) {
     edit: <path d="m3.25 11.75.55-2.7 6.9-6.9 2.15 2.15-6.9 6.9zM9.7 3.15l2.15 2.15" />,
     external: <path d="M6.25 3.25h-3v9.5h9.5v-3M8.25 2.75h5v5M13 3 7 9" />,
     trash: <path d="M3.5 4.75h9M6 2.75h4l.75 2M4.5 4.75l.5 8h6l.5-8M7 7v3.5M9.5 7v3.5" />,
+    copy: <><rect x="5" y="4.5" width="7.5" height="8" rx="1" /><path d="M3.5 10.5V3.75c0-.55.45-1 1-1h5.75" /></>,
+    more: <path d="M3.25 8h.5M7.75 8h.5M12.25 8h.5" strokeWidth="2.2" />,
     settings: <><circle cx="8" cy="8" r="2.1" /><path d="M8 2.5v1.2M8 12.3v1.2M2.5 8h1.2M12.3 8h1.2M4.1 4.1l.85.85M11.05 11.05l.85.85M11.9 4.1l-.85.85M4.95 11.05l-.85.85" /></>,
     runtime: <><rect x="2.75" y="3.25" width="10.5" height="9.5" rx="1.2" /><path d="M5 8h2l1-2 1.5 4 1-2H13" /></>,
     panel: <><rect x="2.75" y="3.25" width="10.5" height="9.5" rx="1.2" /><path d="M8.5 3.25v9.5" /></>,
