@@ -11,6 +11,7 @@ import {
   applySessionMutation,
   applySessionResumed,
   createInitialState,
+  configuredContextWindow,
   replayToTimeline,
   reduceRendererState,
   sessionLabel,
@@ -20,8 +21,8 @@ import {
 } from "../src/renderer/state";
 import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
-import { ChatTimeline, renderMarkdown } from "../src/renderer/ChatTimeline";
-import { Composer, applyCompletion } from "../src/renderer/Composer";
+import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
+import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
 import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, renameModelRef, renameProviderId, settingsSaveRequest, withoutRecordKey } from "../src/renderer/SettingsView";
 import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/RuntimePanel";
@@ -30,6 +31,12 @@ import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><button id=before>Before</button><div id=root></div><button id=after>After</button></body></html>", { url: "http://localhost/" });
+  // React's input polyfill probes the legacy IE hook when focusing a
+  // textarea in JSDOM. Keep the fixture focused on renderer behavior.
+  if (!("attachEvent" in dom.window.HTMLElement.prototype)) {
+    Object.defineProperty(dom.window.HTMLElement.prototype, "attachEvent", { configurable: true, value: () => undefined });
+    Object.defineProperty(dom.window.HTMLElement.prototype, "detachEvent", { configurable: true, value: () => undefined });
+  }
   const container = dom.window.document.getElementById("root");
   assert.ok(container);
   let root!: Root;
@@ -186,10 +193,10 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
   assert.doesNotMatch(appMarkup, /aria-label="置顶 first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
-    const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
+    const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", contextUsage: { used_tokens: 1200, budget_tokens: 128000, available: true }, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
     assert.match(panelMarkup, /aria-label="Runtime information"/);
     assert.match(panelMarkup, new RegExp(`runtime-panel--${panelMode}`));
-    assert.match(panelMarkup, /1,200 \/ 4,000/);
+    assert.match(panelMarkup, /1,200 \/ 128,000/);
     assert.match(panelMarkup, />PLAN</);
     assert.match(panelMarkup, />Run ID</);
     assert.match(panelMarkup, /provider\/model/);
@@ -1036,4 +1043,447 @@ test("T07 completion preserves canonical slash prefixes and replaces only the cu
   assert.equal(applyCompletion("/model f", "fake/model"), "/model fake/model ");
   assert.equal(applyCompletion("/m f", "fake/model"), "/m fake/model ");
   assert.equal(applyCompletion("  /model old arg", "new"), "  /model old new ");
+});
+
+test("Prompt 4 timeline follows the tail only while near the bottom and re-arms after a session boundary", async () => {
+  assert.equal(isNearBottom({ scrollTop: 428, scrollHeight: 1000, clientHeight: 500 }), true);
+  assert.equal(isNearBottom({ scrollTop: 427, scrollHeight: 1000, clientHeight: 500 }), false);
+  assert.equal(isNearBottom({ scrollTop: 0, scrollHeight: 500, clientHeight: 500 }), true);
+  const element = { scrollTop: 0, scrollHeight: 1200, clientHeight: 500 };
+  scrollTimelineToBottom(element);
+  assert.equal(element.scrollTop, 700);
+
+  class TestResizeObserver {
+    static instances: TestResizeObserver[] = [];
+    private readonly callback: ResizeObserverCallback;
+    target: Element | null = null;
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      TestResizeObserver.instances.push(this);
+    }
+
+    observe(target: Element): void {
+      this.target = target;
+    }
+
+    disconnect(): void {
+      this.target = null;
+    }
+
+    trigger(): void {
+      this.callback([], this as unknown as ResizeObserver);
+    }
+  }
+  const globalObject = globalThis as unknown as Record<string, unknown>;
+  const previousResizeObserver = globalObject.ResizeObserver;
+  Object.defineProperty(globalObject, "ResizeObserver", { configurable: true, writable: true, value: TestResizeObserver });
+  try {
+    await withRendererDom(async (dom, container, root) => {
+      const entry = (id: string, text: string) => ({ id, kind: "assistant" as const, text, status: "completed" as const });
+      let entries = [entry("one", "one")];
+      let scrollTop = 0;
+      let scrollHeight = 1000;
+      const renderTimeline = async (sessionKey: string) => {
+        act(() => {
+          root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} sessionKey={sessionKey} /></LanguageProvider>);
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      };
+
+      await renderTimeline("project:session-a:1");
+      const timeline = container.querySelector<HTMLElement>(".timeline");
+      assert.ok(timeline);
+      Object.defineProperties(timeline, {
+        scrollTop: { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = value; } },
+        scrollHeight: { configurable: true, get: () => scrollHeight },
+        clientHeight: { configurable: true, get: () => 400 },
+      });
+      const timelineObserver = () => TestResizeObserver.instances.find((observer) => observer.target === timeline);
+      assert.ok(timelineObserver(), "production timeline must install ResizeObserver");
+
+      // A real timeline size change while at the tail follows new content.
+      scrollTop = 600;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      scrollHeight = 1200;
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 800);
+
+      // Scrolling well above the threshold opts out; a real ResizeObserver
+      // callback from a subsequent content change does not steal the position.
+      scrollTop = 450;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      entries = [...entries, entry("three", "three")];
+      scrollHeight = 1400;
+      await renderTimeline("project:session-a:1");
+      assert.equal(scrollTop, 450);
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 450);
+
+      // Returning to the tail re-enables following for a later real geometry
+      // change. No global scroll handler is involved in this assertion.
+      scrollTop = 1000;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      scrollHeight = 1600;
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 1200);
+
+      // Session replacement scrolls to the new session's end and resets the
+      // follow state. A normal rerender in that session still respects scrolling
+      // away from the tail.
+      entries = [entry("new-one", "new session")];
+      scrollHeight = 1800;
+      await renderTimeline("project:session-b:2");
+      assert.equal(scrollTop, 1400);
+      scrollTop = 600;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      entries = [...entries, entry("new-two", "new tail")];
+      scrollHeight = 2000;
+      await renderTimeline("project:session-b:2");
+      assert.equal(scrollTop, 600);
+    });
+
+    await withRendererDom(async (dom, container, root) => {
+      const geometryState = createInitialState({
+        permissionMode: "default",
+        currentModelRef: "local/chat",
+        configuration: { models: { "local/chat": { context_window: 128000 } } },
+      });
+      const geometryEntries = [
+        { id: "geometry-1", kind: "assistant" as const, text: "one", status: "completed" as const },
+        { id: "geometry-2", kind: "assistant" as const, text: "two", status: "completed" as const },
+      ];
+      const renderGeometry = async (panelMode: "docked" | "floating") => {
+        act(() => {
+          root.render(<LanguageProvider value="en"><div className={`app-shell panel-${panelMode}`}>
+            <main className="main-content">
+              <ChatTimeline entries={geometryEntries} todo={[]} sessionKey="geometry:session" />
+              <Composer state={geometryState} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />
+            </main>
+            <RuntimePanel state={{ ...geometryState, panelMode }} onPanelModeChange={() => undefined} />
+          </div></LanguageProvider>);
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      };
+
+      await renderGeometry("docked");
+      const timeline = container.querySelector<HTMLElement>(".timeline");
+      const composer = container.querySelector<HTMLElement>(".composer");
+      const main = container.querySelector<HTMLElement>(".main-content");
+      assert.ok(timeline);
+      assert.ok(composer);
+      assert.ok(main);
+      let scrollTop = 600;
+      let scrollHeight = 1000;
+      let clientHeight = 400;
+      let composerHeight = 120;
+      Object.defineProperties(timeline, {
+        scrollTop: { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = value; } },
+        scrollHeight: { configurable: true, get: () => scrollHeight },
+        clientHeight: { configurable: true, get: () => clientHeight },
+      });
+      composer.getBoundingClientRect = () => ({ x: 0, y: 0, width: 720, height: composerHeight, top: 0, right: 720, bottom: composerHeight, left: 0, toJSON: () => ({}) }) as DOMRect;
+      const timelineObserver = () => TestResizeObserver.instances.find((observer) => observer.target === timeline);
+      const composerObserver = () => TestResizeObserver.instances.find((observer) => observer.target === composer);
+      assert.ok(timelineObserver(), "timeline geometry uses the production ResizeObserver");
+      assert.ok(composerObserver(), "composer geometry uses the production ResizeObserver");
+
+      // The Composer's actual measured height is written to its parent and a
+      // content-box change then drives the timeline observer.
+      act(() => { composerObserver()?.trigger(); });
+      assert.equal(main?.style.getPropertyValue("--composer-height"), "120px");
+      scrollHeight = 1240;
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 840);
+
+      // Switching the real RuntimePanel DOM from docked to floating changes
+      // the available geometry, but an away-from-tail reader stays put.
+      scrollTop = 500;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      await renderGeometry("floating");
+      assert.ok(container.querySelector(".runtime-panel--floating"));
+      clientHeight = 460;
+      scrollHeight = 1500;
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 500);
+
+      // Returning to the tail re-enables follow, including a Composer height
+      // change observed through its real ResizeObserver.
+      scrollTop = scrollHeight - clientHeight;
+      act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+      composerHeight = 168;
+      act(() => { composerObserver()?.trigger(); });
+      assert.equal(main?.style.getPropertyValue("--composer-height"), "168px");
+      scrollHeight = 1710;
+      act(() => { timelineObserver()?.trigger(); });
+      assert.equal(scrollTop, 1250);
+    });
+  } finally {
+    if (previousResizeObserver === undefined) delete globalObject.ResizeObserver;
+    else Object.defineProperty(globalObject, "ResizeObserver", { configurable: true, writable: true, value: previousResizeObserver });
+  }
+});
+
+test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selection, dismissal, and IME safety", async () => {
+  // These are the candidate records returned by Application's built-in
+  // command.complete registry for "/".  Keep the DOM fixture on the real
+  // protocol shape: slash candidates do not carry a disabled state.
+  const registryCandidates = [
+    { value: "/clear", canonical: "clear", display: "/clear — 清空当前界面 Transcript", description: "清空当前界面 Transcript", aliases: [], usage: "/clear", argument_prompt: "", matched_alias: null },
+    { value: "/model", canonical: "model", display: "/model — 查看或切换当前模型", description: "查看或切换当前模型", aliases: ["models", "m"], usage: "/model [model-ref]", argument_prompt: "model-ref: Model Ref", matched_alias: null },
+    { value: "/permission", canonical: "permission", display: "/permission — 查看或切换当前 Run 权限模式", description: "查看或切换当前 Run 权限模式", aliases: [], usage: "/permission [mode]", argument_prompt: "mode: Permission mode", matched_alias: null },
+    { value: "/status", canonical: "status", display: "/status — 显示当前 Application 状态", description: "显示当前 Application 状态", aliases: ["s"], usage: "/status", argument_prompt: "", matched_alias: null },
+    { value: "/quit", canonical: "quit", display: "/quit — 退出当前 Interface", description: "退出当前 Interface", aliases: ["q", "exit"], usage: "/quit", argument_prompt: "", matched_alias: null },
+    { value: "/compact", canonical: "compact", display: "/compact — 压缩上下文", description: "压缩上下文", aliases: ["c"], usage: "/compact", argument_prompt: "", matched_alias: null },
+    { value: "/plan", canonical: "plan", display: "/plan — 进入规划模式", description: "进入规划模式", aliases: [], usage: "/plan", argument_prompt: "", matched_alias: null },
+    { value: "/new", canonical: "new", display: "/new — 创建新会话", description: "创建新会话", aliases: [], usage: "/new", argument_prompt: "", matched_alias: null },
+    { value: "/resume", canonical: "resume", display: "/resume — 恢复会话", description: "恢复会话", aliases: [], usage: "/resume [session-id]", argument_prompt: "session-id", matched_alias: null },
+    { value: "/do", canonical: "do", display: "/do — 进入默认执行模式", description: "进入默认执行模式", aliases: ["build"], usage: "/do", argument_prompt: "", matched_alias: null },
+    { value: "/help", canonical: "help", display: "/help — 显示命令帮助", description: "显示命令帮助", aliases: ["h", "?"], usage: "/help [command]", argument_prompt: "command", matched_alias: null },
+  ];
+  const baseState = createInitialState({
+    composerText: "/",
+    commandCandidates: registryCandidates,
+  });
+  assert.deepEqual(baseState.commandCandidates.map((candidate) => candidate.value), ["/clear", "/model", "/permission", "/status", "/quit", "/compact", "/plan", "/new", "/resume", "/do", "/help"]);
+  assert.equal(nextCompletionIndex(baseState.commandCandidates, 0, 1), 1);
+  assert.equal(nextCompletionIndex(baseState.commandCandidates, 0, -1), 10);
+  assert.equal(edgeCompletionIndex(baseState.commandCandidates, false), 0);
+  assert.equal(edgeCompletionIndex(baseState.commandCandidates, true), 10);
+
+  await withRendererDom(async (dom, container, root) => {
+    const changes: string[] = [];
+    const submitted: string[] = [];
+    const dismissed: number[] = [];
+    const renderComposer = async (key: string, state = baseState) => {
+      act(() => {
+        root.render(<LanguageProvider value="en"><Composer key={key} state={state} onChange={(value) => changes.push(value)} onSubmit={(value) => submitted.push(value)} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} onDismissCompletion={() => dismissed.push(1)} /></LanguageProvider>);
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const press = async (textarea: HTMLTextAreaElement, key: string, init: KeyboardEventInit = {}) => {
+      let event!: KeyboardEvent;
+      act(() => {
+        textarea.focus();
+        event = new dom.window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init });
+        textarea.dispatchEvent(event);
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return event;
+    };
+    const activeIndex = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button")).findIndex((button) => button.classList.contains("is-active"));
+
+    await renderComposer("arrow");
+    const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(textarea);
+    const options = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button"));
+    assert.equal(activeIndex(), 0);
+    await press(textarea!, "ArrowDown");
+    assert.equal(activeIndex(), 1);
+    await press(textarea!, "ArrowDown");
+    assert.equal(activeIndex(), 2);
+    await press(textarea!, "ArrowUp");
+    assert.equal(activeIndex(), 1);
+    await press(textarea!, "ArrowUp");
+    assert.equal(activeIndex(), 0);
+    await press(textarea!, "ArrowUp");
+    assert.equal(activeIndex(), 10, "ArrowUp wraps to the last registry candidate");
+    await press(textarea!, "ArrowDown");
+    assert.equal(activeIndex(), 0, "ArrowDown wraps to the first registry candidate");
+    await press(textarea!, "Home");
+    assert.equal(activeIndex(), 0);
+    await press(textarea!, "End");
+    assert.equal(activeIndex(), 10);
+
+    act(() => { options()[1]?.dispatchEvent(new dom.window.MouseEvent("mouseover", { bubbles: true })); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(activeIndex(), 1, "mouse hover and keyboard active state share one index");
+    act(() => { options()[1]?.click(); });
+    assert.deepEqual(changes.at(-1), "/model ");
+    assert.equal(container.querySelector(".command-menu"), null);
+
+    // Application complete("  /m") returns /model then /help. Selecting the
+    // first real candidate replaces only the current token in the DOM path.
+    const replacementState = createInitialState({
+      composerText: "  /m",
+      commandCandidates: registryCandidates.filter((candidate) => candidate.value === "/model" || candidate.value === "/help"),
+    });
+    await renderComposer("replacement", replacementState);
+    const replacementArea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(replacementArea);
+    const replacementOptions = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button"));
+    assert.deepEqual(replacementOptions().map((button) => button.textContent?.split(" — ")[0]), ["/model", "/help"]);
+    const replacementEvent = await press(replacementArea!, "Enter");
+    assert.equal(replacementEvent.defaultPrevented, true);
+    assert.deepEqual(changes.at(-1), "  /model ");
+    assert.equal(submitted.length, 0);
+    assert.equal(container.querySelector(".command-menu"), null);
+
+    await renderComposer("enter");
+    const enterArea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(enterArea);
+    const enterEvent = await press(enterArea!, "Enter");
+    assert.equal(enterEvent.defaultPrevented, true);
+    assert.deepEqual(changes.at(-1), "/clear ");
+    assert.equal(submitted.length, 0, "completion Enter must not submit the prompt");
+    assert.equal(container.querySelector(".command-menu"), null);
+
+    await renderComposer("tab");
+    const tabArea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(tabArea);
+    const tabEvent = await press(tabArea!, "Tab");
+    assert.equal(tabEvent.defaultPrevented, true);
+    assert.deepEqual(changes.at(-1), "/clear ");
+    assert.equal(container.querySelector(".command-menu"), null);
+
+    await renderComposer("escape");
+    const escapeArea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(escapeArea);
+    const escapeEvent = await press(escapeArea!, "Escape");
+    assert.equal(escapeEvent.defaultPrevented, true);
+    assert.equal(container.querySelector(".command-menu"), null);
+    assert.equal(dismissed.length, 1);
+
+    await renderComposer("ime");
+    const imeArea = container.querySelector<HTMLTextAreaElement>("textarea");
+    assert.ok(imeArea);
+    const composingEvent = await press(imeArea!, "Enter", { isComposing: true });
+    assert.equal(composingEvent.defaultPrevented, false);
+    assert.equal(submitted.length, 0);
+    assert.notEqual(container.querySelector(".command-menu"), null);
+    const keyCodeEvent = await press(imeArea!, "Enter", { keyCode: 229 });
+    assert.equal(keyCodeEvent.defaultPrevented, false);
+    assert.equal(submitted.length, 0);
+  });
+});
+
+test("Prompt 4 Composer keeps mode authority in slash commands while placing permission/model controls in the bottom row", async () => {
+  const state = createInitialState({
+    composerText: "/p",
+    run: { run_id: "run-1", behavior_mode: "plan" },
+    permissionMode: "auto",
+    currentModelRef: "local/chat",
+    modelCandidates: ["local/chat", "remote/fallback"],
+    configuration: {
+      models: {
+        "local/chat": { display_name: "Local Chat", remote_id: "chat-v1", context_window: 128000 },
+        "remote/fallback": { remote_id: "remote-chat" },
+      },
+    },
+    commandCandidates: [{ value: "/plan", display: "/plan", description: "Plan" }],
+  });
+  const commands: string[] = [];
+  assert.equal(modelDisplayName(state.configuration, state.currentModelRef), "Local Chat");
+  assert.equal(modelDisplayName(state.configuration, "remote/fallback"), "remote-chat");
+  const markup = renderLanguage("en", <Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={(value) => commands.push(value)} onPause={() => undefined} onCancel={() => undefined} />);
+  assert.match(markup, /Model: Local Chat/);
+  assert.match(markup, /Default permission/);
+  assert.match(markup, /\/plan/);
+  assert.doesNotMatch(markup, /class="composer-selectors"[^>]*>\s*<button/);
+
+  await withRendererDom(async (dom, container, root) => {
+    act(() => { root.render(<LanguageProvider value="en"><Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={(value) => commands.push(value)} onPause={() => undefined} onCancel={() => undefined} /></LanguageProvider>); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const permissionTrigger = container.querySelector<HTMLButtonElement>(".composer-selectors .custom-select__trigger");
+    const modelTrigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
+    assert.ok(permissionTrigger);
+    assert.ok(modelTrigger);
+    assert.match(modelTrigger?.getAttribute("aria-label") ?? "", /Model: Local Chat/);
+    act(() => { permissionTrigger?.click(); });
+    const permissionOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".composer-selectors .custom-select__list button")).find((button) => button.textContent === "Full access");
+    assert.ok(permissionOption);
+    act(() => { permissionOption?.click(); });
+    act(() => { modelTrigger?.click(); });
+    const modelOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".composer-model .custom-select__list button")).find((button) => button.textContent === "remote-chat");
+    assert.ok(modelOption);
+    act(() => { modelOption?.click(); });
+    assert.deepEqual(commands, ["/permission full_access", "/model", "/model remote/fallback"]);
+  });
+});
+
+test("Prompt 4 context ring uses the safe projection, configured limits, 256K fallback, and accessible tooltip text", () => {
+  const translateEn = (key: "contextUsage" | "contextTokens" | "contextNotStarted") => translate("en", key);
+  const unavailable = renderLanguage("en", <ContextRing usage={{ used_tokens: 0, budget_tokens: 0, available: false }} language="en" fallbackBudget={256000} translate={translateEn} />);
+  assert.match(unavailable, /class="context-ring /);
+  assert.match(unavailable, /data-used="0"/);
+  assert.match(unavailable, /data-budget="256000"/);
+  assert.match(unavailable, /data-available="false"/);
+  assert.match(unavailable, /aria-label="Context usage: 0% · 0 \/ 256,000 tokens · not started"/);
+  assert.equal(contextUsagePercent({ used_tokens: 0, budget_tokens: 128000, available: true }, 128000), 0);
+  assert.equal(contextUsagePercent({ used_tokens: 115200, budget_tokens: 128000, available: true }, 128000), 90);
+  const high = renderLanguage("en", <ContextRing usage={{ used_tokens: 115200, budget_tokens: 128000, available: true }} language="en" fallbackBudget={128000} translate={translateEn} />);
+  assert.match(high, /class="context-ring is-warning"/);
+  assert.match(high, /115,200 \/ 128,000 tokens/);
+  const critical = renderLanguage("zh-CN", <ContextRing usage={{ used_tokens: 128000, budget_tokens: 128000, available: true }} language="zh-CN" fallbackBudget={128000} translate={(key) => translate("zh-CN", key)} />);
+  assert.match(critical, /class="context-ring is-critical"/);
+  assert.match(critical, /上下文使用量: 100%/);
+  assert.match(critical, /128,000 \/ 128,000 Token/);
+  const overBudget = renderLanguage("en", <ContextRing usage={{ used_tokens: 200000, budget_tokens: 4096, available: true }} language="en" fallbackBudget={128000} translate={translateEn} />);
+  assert.match(overBudget, /class="context-ring is-critical"/);
+  assert.match(overBudget, /data-used="200000"/);
+  assert.match(overBudget, /data-budget="128000"/);
+  assert.match(overBudget, /data-percent="100"/);
+});
+
+test("Prompt 4 context usage reducer consumes Application status and respects model configuration", () => {
+  assert.equal(configuredContextWindow({ default_model: "local/chat", models: { "local/chat": { context_window: 96000 } } }, null), 96000);
+  assert.equal(configuredContextWindow({
+    default_model: "fallback/model",
+    models: {
+      "current/model": { context_window: null },
+      "fallback/model": { context_window: 128000 },
+    },
+  }, "current/model"), 128000, "a missing current window falls through to the configured default model");
+  assert.equal(configuredContextWindow({
+    default_model: "fallback/model",
+    models: {
+      "current/model": { context_window: -1 },
+      "fallback/model": { context_window: 128000 },
+    },
+  }, "current/model"), 128000, "an invalid current window falls through to the configured default model");
+  assert.equal(configuredContextWindow({
+    default_model: "fallback/model",
+    models: {
+      "current/model": { context_window: 96000 },
+      "fallback/model": { context_window: 128000 },
+    },
+  }, "current/model"), 96000, "the current model window has priority over the configured default");
+  assert.equal(configuredContextWindow({
+    default_model: "fallback/model",
+    models: {
+      "current/model": { context_window: "128000" },
+      "fallback/model": { context_window: 0 },
+    },
+  }, "current/model"), 256000, "the safe fallback applies when both model windows are invalid");
+  let configured = createInitialState({
+    currentModelRef: "local/chat",
+    configuration: { models: { "local/chat": { context_window: 128000 } } },
+  });
+  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { current_model: "local/chat", context_usage: { used_tokens: 64000, budget_tokens: 4096, available: true } } } });
+  assert.deepEqual(configured.contextUsage, { used_tokens: 64000, budget_tokens: 128000, available: true });
+  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 200000, budget_tokens: 4096, available: true } } } });
+  assert.deepEqual(configured.contextUsage, { used_tokens: 200000, budget_tokens: 128000, available: true });
+  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 0, budget_tokens: 0, available: false } } } });
+  assert.deepEqual(configured.contextUsage, { used_tokens: 0, budget_tokens: 128000, available: false });
+  let unconfigured = createInitialState();
+  unconfigured = reduceRendererState(unconfigured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 100000, budget_tokens: 4096, available: true } } } });
+  assert.deepEqual(unconfigured.contextUsage, { used_tokens: 100000, budget_tokens: 256000, available: true });
+  unconfigured = reduceRendererState(unconfigured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 0, budget_tokens: 0, available: false } } } });
+  assert.deepEqual(unconfigured.contextUsage, { used_tokens: 0, budget_tokens: 256000, available: false });
+  configured = reduceRendererState(configured, { type: "settings_loaded", configuration: { models: { "local/chat": { context_window: 96000 } } } });
+  assert.equal(configured.contextUsage.budget_tokens, 96000);
+});
+
+test("Prompt 4 context ring and composer layout remain legible in both themes and narrow layouts", async () => {
+  const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
+  assert.match(css, /\.context-ring__track\s*\{\s*stroke:\s*var\(--line-strong\)/);
+  assert.match(css, /\.context-ring__progress\s*\{\s*stroke:\s*var\(--accent-strong\)/);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*grid/);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-actions\s*\{[^}]*flex-wrap:\s*wrap/);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-model \.custom-select\s*\{\s*width:\s*min\(230px, calc\(100% - 40px\)\)/);
+  assert.match(css, /--composer-height/);
+  assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "dark" })} api={undefined} />), /theme-dark/);
+  assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "light" })} api={undefined} />), /theme-light/);
 });

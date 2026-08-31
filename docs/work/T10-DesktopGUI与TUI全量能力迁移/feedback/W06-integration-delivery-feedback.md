@@ -869,3 +869,40 @@ git diff --check
 生产 `Sidebar` 的 JSDOM 测试真实覆盖选中的第 6 条 Session 可见且原顺序不变、展开偏好恢复、click/right-click/outside/Escape/Tab/Shift+Tab/focus/viewport，以及 Project trigger Enter + menuitem Space 和 Session trigger Space + menuitem Enter 的动作、关闭、焦点恢复。Luna/max Worker 经两轮返工，Sol/medium Reviewer 第三轮输出 `APPROVED`，零阻塞 finding。
 
 未在本轮返工后重跑完整 `npm test` 或 Python 套件；返工只增加真实 DOM 验收和展开偏好链路，最终定向测试与 bundle isolation 已通过。真实 Electron 中的鼠标/键盘菜单人工交互、Windows Explorer 打开与系统剪贴板仍未人工验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 16 轮追加：Timeline 跟随、Slash 键盘与 Composer 上下文环（2026-08-31）
+
+Timeline 现在以 near-bottom 阈值维护用户滚动意图：用户位于底部时，reasoning、assistant、tool 和 status 的增量内容持续跟随；用户向上离开底部后，新内容不抢占滚动位置；用户重新滚到底部后恢复跟随。新建、切换和恢复 Session 只在 session boundary 定位末尾，同一 Session 普通 rerender 不强制到底。生产 `ChatTimeline`、`Composer` 和 `RuntimePanel` 的 JSDOM 验收通过可控 `ResizeObserver` 真实触发 Timeline 尺寸、Composer 高度 CSS 变量以及 Runtime docked/floating 几何变化；实现没有 interval 或全局 scroll 劫持。
+
+Slash completion 继续消费 Application `command.complete` 返回的权威候选，不复制第二套 Registry。键盘支持 ArrowUp/ArrowDown、Home/End、Enter/Tab 选择、Escape 关闭，并使鼠标 hover/click 与 active item 保持一致；IME composition 期间 Enter 不误选或提交。Enter 的生产 textarea DOM 测试确认只替换当前 slash token，关闭候选且不发送 Prompt。测试最终使用真实 Registry 命令集合 `help/clear/model/permission/status/quit/compact/plan/new/resume/do`，删除了不存在的 `/project` 与 Bridge 未定义的 completion-disabled 字段。
+
+Composer 移除额外的 default/plan 点击切换控件，但保留 `/plan` 权威命令与底层 `BehaviorMode` 能力。权限与模型选择收敛到 Composer 底部工具行，沿用 `CustomSelect`；模型显示 display name，然后回退 remote model/reference。模型右侧的上下文环只从 `Application.status().context_usage` 取 authoritative `used_tokens/available`，不从 DOM 或消息文本估算。预算严格按“当前模型有效 `context_window` -> `default_model` 有效 `context_window` -> 256K”解析，不被 status 的 budget 覆盖；实际 used 超预算时数值保留，环形视觉比例只封顶 100%。Composer 与 RuntimePanel 共用同一 `contextUsage` 投影，tooltip/ARIA 展示百分比、已用/总 token 与未开始状态。
+
+依赖目录尚在时的精确验证：
+
+```text
+runtime-process.test.ts
+-> 14 passed，0 failed
+
+npm run build:runtime
+-> PyInstaller onedir 与 bundled Runtime smoke 通过
+
+npm test  (cwd=desktop)
+-> 91 passed，0 failed，0 skipped；T08 bundled smoke 约 101.3s
+
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer/Main/Preload/CDP isolation 定向
+-> 73 passed，0 failed；其中 Renderer 56 passed
+
+Python Desktop protocol/bridge/architecture 定向
+-> 88 passed
+
+git diff --check
+-> exit 0，仅 LF -> CRLF line-ending 提示
+```
+
+最后两项源码/测试返工补齐了“当前模型缺窗口时继续回退 default model”与“Slash 只使用真实 Registry candidate shape”。由于此前收口 Worker 违反调度指令，删除了未跟踪且可再生成的 `desktop/.runtime`、`desktop/.webpack`、`desktop/node_modules`、`desktop/packaging/.build`，返工后未擅自重建依赖或伪造原内容，因此未在最终两项返工后重跑 npm、bundle、Runtime smoke 或 CDP。本轮追加的最终证据为 Python 88 passed、Registry/slash 静态核对、`git diff --check` 与 Sol/medium Reviewer 源码/测试结构复审；Reviewer 最终输出 `APPROVED`，零阻塞 finding，但明确保留当前环境无法独立复跑 npm 的风险。
+
+该删除不涉及 tracked 文件，可通过项目既有依赖/构建命令重建，但删除前的机器本地内容无法精确恢复。`src/uthcode/application/bootstrap.py` 仍只有工作树换行状态，内容 diff 为空，不属于本轮提交。真实 Electron 中的滚动、Slash 键盘、选择器和上下文环仍未人工验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

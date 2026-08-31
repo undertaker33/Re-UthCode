@@ -5,6 +5,15 @@ export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "to
 export type TimelineStatus = "streaming" | "running" | "completed" | "failed" | "cancelled" | "info";
 export type PermissionModeProjection = "unknown" | "default" | "auto" | "full_access";
 
+/** Safe context usage projection returned by Application.status(). */
+export interface ContextUsageProjection {
+  used_tokens: number;
+  budget_tokens: number;
+  available: boolean;
+}
+
+export const DEFAULT_CONTEXT_WINDOW = 256_000;
+
 export interface SessionSummary {
   session_id: string;
   project_key?: string;
@@ -105,6 +114,7 @@ export interface RendererState {
   timeline: TimelineEntry[];
   todo: TodoItem[];
   run: RunProjection | null;
+  contextUsage: ContextUsageProjection;
   permissionMode: PermissionModeProjection;
   pinnedSessions: DesktopPreferences["pinnedSessions"];
   expandedProjects: DesktopPreferences["expandedProjects"];
@@ -132,6 +142,8 @@ export interface RendererState {
   settingsSaving: boolean;
   settingsLoaded: boolean;
   ignoredRunIds: string[];
+  /** Increments only when the visible Session/Project timeline is replaced. */
+  sessionViewRevision: number;
   nextStatusId: number;
 }
 
@@ -144,6 +156,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   timeline: [],
   todo: [],
   run: null,
+  contextUsage: { used_tokens: 0, budget_tokens: DEFAULT_CONTEXT_WINDOW, available: false },
   permissionMode: "unknown",
   pinnedSessions: [],
   expandedProjects: {},
@@ -171,6 +184,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   settingsSaving: false,
   settingsLoaded: false,
   ignoredRunIds: [],
+  sessionViewRevision: 0,
   nextStatusId: 1,
 };
 
@@ -203,6 +217,54 @@ function numberText(value: unknown): string {
 function nonEmptyText(value: unknown): string | null {
   const text = textValue(value).trim();
   return text ? text : null;
+}
+
+function positiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Return the configured model window for the renderer's safe usage display.
+ * Application owns the used/available projection; the model configuration
+ * owns the context-window limit whenever it is present.
+ */
+export function configuredContextWindow(configuration: ConfigurationView | null | undefined, modelRef: string | null | undefined): number {
+  const references = [
+    modelRef?.trim() ?? "",
+    typeof configuration?.default_model === "string" ? configuration.default_model.trim() : "",
+  ];
+  for (const reference of references) {
+    if (!reference) continue;
+    const value = positiveInteger(configuration?.models?.[reference]?.context_window);
+    if (value !== null) return value;
+  }
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+/** Normalize the Application safe projection without accepting provider usage. */
+export function normalizeContextUsage(value: unknown, fallbackBudget = DEFAULT_CONTEXT_WINDOW): ContextUsageProjection {
+  const source = asRecord(value);
+  // `budget_tokens` is intentionally ignored here. It may be a stale runtime
+  // status field; the configured model window (or the 256k fallback) is the
+  // only renderer limit.
+  const budget = positiveInteger(fallbackBudget) ?? DEFAULT_CONTEXT_WINDOW;
+  const used = typeof source?.used_tokens === "number" && Number.isSafeInteger(source.used_tokens) && source.used_tokens >= 0
+    ? source.used_tokens
+    : null;
+  const available = source?.available === true && used !== null;
+  return {
+    // Keep the Application's measured usage intact even when a stale or
+    // inconsistent source reports more than the configured window.  The
+    // display may cap its visual ratio, but the safe usage fact itself is not
+    // rewritten by the Renderer.
+    used_tokens: available && used !== null ? used : 0,
+    budget_tokens: budget,
+    available,
+  };
+}
+
+function contextUsageAtBoundary(state: RendererState): ContextUsageProjection {
+  return { used_tokens: 0, budget_tokens: configuredContextWindow(state.configuration, state.currentModelRef), available: false };
 }
 
 function shortId(value: string): string {
@@ -378,6 +440,8 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
     activeTurn: false,
     turnStatus: "idle",
     pendingInteraction: null,
+    contextUsage: contextUsageAtBoundary(state),
+    sessionViewRevision: state.sessionViewRevision + 1,
     runtimeState: "ready",
     runtimeError: null,
     view: "chat",
@@ -409,6 +473,8 @@ export function applySessionResumed(state: RendererState, result: unknown): Rend
     activeTurn: false,
     turnStatus: "idle",
     pendingInteraction: null,
+    contextUsage: contextUsageAtBoundary(state),
+    sessionViewRevision: state.sessionViewRevision + 1,
     runtimeError: null,
     notice: "Session resumed",
     ...(projectKey ? { projects: state.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
@@ -773,7 +839,17 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const source = resultRecord(action.result);
       const application = asRecord(source.application);
       const currentModelRef = nonEmptyText(application?.current_model);
-      return currentModelRef ? { ...state, currentModelRef } : state;
+      const selectedModelRef = currentModelRef ?? state.currentModelRef;
+      const contextValue = application && Object.prototype.hasOwnProperty.call(application, "context_usage")
+        ? application.context_usage
+        : undefined;
+      return {
+        ...state,
+        ...(currentModelRef ? { currentModelRef } : {}),
+        ...(contextValue !== undefined
+          ? { contextUsage: normalizeContextUsage(contextValue, configuredContextWindow(state.configuration, selectedModelRef)) }
+          : {}),
+      };
     }
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
@@ -786,7 +862,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new":
-      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, turnStatus: "idle", pendingInteraction: null, notice: "New Session", runtimeError: null };
+      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(state), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
     case "agent_event":
       return reduceAgentEvent(state, action.event);
     case "interaction_submitting":
@@ -811,7 +887,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const actionValue = asRecord(source.ui_action);
       const sessionChanged = actionValue?.type === "session_changed";
       if (sessionChanged && typeof actionValue.session_id === "string") {
-        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], activeTurn: false, turnStatus: "idle" as const, pendingInteraction: null };
+        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], activeTurn: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(state), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: output || null, notice: output || null, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: output || null, composerText: "" };
@@ -827,7 +903,10 @@ export function reduceRendererState(state: RendererState, action: RendererAction
           ? { ...(state.run ?? {}), behavior_mode: actionValue.mode }
           : projectedRun ?? state.run;
         const currentModelRef = actionValue.type === "model_selected" ? nonEmptyText(actionValue.model_ref) ?? state.currentModelRef : state.currentModelRef;
-        return { ...state, run, permissionMode, currentModelRef, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
+        const contextUsage = actionValue.type === "model_selected"
+          ? { used_tokens: 0, budget_tokens: configuredContextWindow(state.configuration, currentModelRef), available: false }
+          : state.contextUsage;
+        return { ...state, run, permissionMode, currentModelRef, contextUsage, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: output || null, notice: output || null, composerText: "" };
       return { ...state, commandOutput: output || null, notice: output || null, composerText: "" };
@@ -844,6 +923,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         timeline: [],
         todo: [],
         run: null,
+        contextUsage: contextUsageAtBoundary(state),
         permissionMode: "unknown",
         currentModelRef: null,
         activeTurn: false,
@@ -864,6 +944,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         ignoredRunIds: state.run?.run_id
           ? [...state.ignoredRunIds, state.run.run_id].slice(-20)
           : state.ignoredRunIds,
+        sessionViewRevision: state.sessionViewRevision + 1,
       };
     case "notice":
       return { ...state, notice: action.text };
@@ -873,8 +954,17 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return { ...state, panelMode: action.panelMode };
     case "set_view":
       return { ...state, view: action.view };
-    case "settings_loaded":
-      return { ...state, configuration: action.configuration, permissionMode: state.run ? state.permissionMode : "unknown", settingsLoaded: true, settingsError: null };
+    case "settings_loaded": {
+      const budget = configuredContextWindow(action.configuration, state.currentModelRef);
+      return {
+        ...state,
+        configuration: action.configuration,
+        contextUsage: { ...state.contextUsage, budget_tokens: budget },
+        permissionMode: state.run ? state.permissionMode : "unknown",
+        settingsLoaded: true,
+        settingsError: null,
+      };
+    }
     case "settings_error":
       return { ...state, settingsError: action.message };
     case "settings_saving":
