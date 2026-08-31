@@ -434,9 +434,16 @@ class UthCodeTUI:
             for index, entry in enumerate(items[:visible]):
                 session_id = str(getattr(entry, "session_id", "unknown"))
                 last_used = str(getattr(entry, "last_used_at", "unknown"))
+                title = str(getattr(entry, "title", "") or "").strip()
+                display_width = max(12, columns - len(session_id) - 24)
                 preview = _bounded_display_text(
                     str(getattr(entry, "preview", "")),
-                    width=max(12, columns - len(session_id) - 24),
+                    width=display_width,
+                )
+                label = (
+                    _bounded_display_text(title, width=display_width)
+                    if title
+                    else preview
                 )
                 marker = "›" if index == self.session_picker.selected_index else " "
                 style = (
@@ -447,7 +454,7 @@ class UthCodeTUI:
                 rows.append(
                     (
                         style,
-                        f"{marker} {session_id} · {last_used} · {preview}\n",
+                        f"{marker} {session_id} · {last_used} · {label}\n",
                     )
                 )
             return rows

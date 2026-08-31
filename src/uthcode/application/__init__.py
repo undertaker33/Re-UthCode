@@ -53,6 +53,7 @@ from .sessions import (
     TranscriptAppendOutcome,
     SessionActiveError,
     SessionCatalogEntry,
+    SessionMutation,
     SessionOperationError,
     SessionReplayRecord,
 )
@@ -163,6 +164,7 @@ __all__ = [
     "TimelineAppendOutcome",
     "TranscriptAppendOutcome",
     "SessionCatalogEntry",
+    "SessionMutation",
     "SessionOperationError",
     "SessionReplayRecord",
     "AgentEvent",

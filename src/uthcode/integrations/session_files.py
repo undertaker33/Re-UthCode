@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,7 @@ from uthcode.core.history import (
 
 SESSION_SCHEMA_VERSION = 3
 SESSION_RECORD_SCHEMA_VERSION = 2
+SESSION_TITLE_MAX_LENGTH = 240
 
 
 class SessionFileError(RuntimeError):
@@ -65,6 +67,27 @@ def _require_text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def normalize_session_title(value: object) -> str:
+    """Normalize one user-facing Session title within the existing text bound.
+
+    Titles are metadata, not previews.  Keep the normalization deliberately
+    small: Unicode NFC and leading/trailing whitespace trimming make an
+    equivalent title stable while preserving meaningful internal whitespace.
+    Callers get a validation error instead of a silently truncated title.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("title must be a string")
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized:
+        raise ValueError("title must be a non-empty string")
+    if len(normalized) > SESSION_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"title must be at most {SESSION_TITLE_MAX_LENGTH} characters"
+        )
+    return normalized
 
 
 def _validate_session_id(value: str) -> str:
@@ -114,6 +137,7 @@ class SessionMetadata:
     last_used_at: str
     instruction_state: Mapping[str, object] = field(default_factory=dict)
     schema_version: int = SESSION_SCHEMA_VERSION
+    title: str | None = None
 
     def __post_init__(self) -> None:
         _validate_session_id(self.session_id)
@@ -123,6 +147,8 @@ class SessionMetadata:
         if self.schema_version != SESSION_SCHEMA_VERSION:
             raise ValueError(f"unsupported Session metadata schema_version: {self.schema_version!r}")
         object.__setattr__(self, "instruction_state", _safe_instruction_state(self.instruction_state))
+        if self.title is not None:
+            object.__setattr__(self, "title", normalize_session_title(self.title))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -132,6 +158,7 @@ class SessionMetadata:
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "instruction_state": dict(self.instruction_state),
+            "title": self.title,
         }
 
     @classmethod
@@ -145,7 +172,7 @@ class SessionMetadata:
         missing = required.difference(value)
         if missing:
             raise SessionCorruptError(f"Session metadata missing fields: {sorted(missing)}")
-        unknown = set(value).difference(required)
+        unknown = set(value).difference(required | {"title"})
         if unknown:
             raise SessionCorruptError(f"Session metadata has unknown fields: {sorted(unknown)}")
         try:
@@ -156,6 +183,7 @@ class SessionMetadata:
                 created_at=str(value["created_at"]),
                 last_used_at=str(value["last_used_at"]),
                 instruction_state=value["instruction_state"],  # type: ignore[arg-type]
+                title=value.get("title"),  # type: ignore[arg-type]
             )
         except (TypeError, ValueError) as exc:
             raise SessionCorruptError(f"invalid Session metadata: {exc}") from exc
@@ -177,6 +205,10 @@ class SessionSnapshot:
     @property
     def project_key(self) -> str:
         return self.metadata.project_key
+
+    @property
+    def title(self) -> str | None:
+        return self.metadata.title
 
     @property
     def last_record_sequence(self) -> int:
@@ -315,8 +347,12 @@ class SessionFileStore:
         *,
         project_key: str,
         instruction_state: Mapping[str, object] | None = None,
+        title: str | None = None,
     ) -> SessionMetadata:
         identifier = _validate_session_id(session_id or uuid.uuid4().hex)
+        normalized_title = (
+            None if title is None else normalize_session_title(title)
+        )
         path = self.session_path(identifier)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -328,7 +364,14 @@ class SessionFileStore:
         for filename in ("transcript.jsonl", "timeline.jsonl"):
             (path / filename).touch()
         now = _now()
-        metadata = SessionMetadata(identifier, _require_text(project_key, "project_key"), now, now, instruction_state or {})
+        metadata = SessionMetadata(
+            identifier,
+            _require_text(project_key, "project_key"),
+            now,
+            now,
+            instruction_state or {},
+            title=normalized_title,
+        )
         _atomic_write_json(path / "metadata.json", metadata.to_dict())
         return metadata
 
@@ -470,6 +513,22 @@ class SessionWriter:
     def update_instruction_state(self, instruction_state: Mapping[str, object]) -> SessionMetadata:
         self._require_writable()
         metadata = replace(self.metadata, instruction_state=_safe_instruction_state(instruction_state), last_used_at=_now())
+        self._write_metadata(metadata)
+        return metadata
+
+    def update_title(self, title: str) -> SessionMetadata:
+        """Persist a normalized Session title through the held writer."""
+
+        self._require_writable()
+        metadata = replace(self.metadata, title=normalize_session_title(title))
+        self._write_metadata(metadata)
+        return metadata
+
+    def update_project_key(self, project_key: str) -> SessionMetadata:
+        """Persist one authoritative project membership change."""
+
+        self._require_writable()
+        metadata = replace(self.metadata, project_key=_require_text(project_key, "project_key"))
         self._write_metadata(metadata)
         return metadata
 
@@ -925,6 +984,7 @@ def _read_timeline(path: Path, session_id: str, transcript: Transcript) -> tuple
 __all__ = [
     "SESSION_RECORD_SCHEMA_VERSION",
     "SESSION_SCHEMA_VERSION",
+    "SESSION_TITLE_MAX_LENGTH",
     "SessionBusyError",
     "SessionCorruptError",
     "SessionDurabilityUnknownError",
@@ -936,6 +996,7 @@ __all__ = [
     "SessionSnapshot",
     "SessionWriter",
     "SessionWriterRequiredError",
+    "normalize_session_title",
     "TimelineAppendOutcome",
     "TranscriptAppendOutcome",
 ]

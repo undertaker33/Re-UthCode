@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
 import squirrelStartup from "electron-squirrel-startup";
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve, join } from "node:path";
 
 // Squirrel.Windows starts the app with a short-lived lifecycle argument while
@@ -113,6 +114,48 @@ function canonicalProjectPath(value: unknown): string {
   return resolve(value);
 }
 
+function registeredProjectPath(value: unknown, registeredProjects: Set<string>): string {
+  const path = canonicalProjectPath(value);
+  if (!registeredProjects.has(path)) {
+    throw new MainBoundaryError(
+      "project_not_registered",
+      "Project must be selected or restored from trusted Desktop history before use",
+    );
+  }
+  return path;
+}
+
+function canonicalizeRecentProjects(
+  value: unknown,
+  registeredProjects: Set<string>,
+): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return entry;
+    const source = entry as Record<string, unknown>;
+    if (typeof source.path !== "string") return entry;
+    const path = registeredProjectPath(source.path, registeredProjects);
+    return { ...source, path };
+  });
+}
+
+/** Restore only persisted, existing project directories into Main authority. */
+export async function hydrateRegisteredProjectsFromPreferences(
+  preferences: Pick<DesktopPreferences, "recentProjects">,
+  registeredProjects: Set<string>,
+): Promise<void> {
+  registeredProjects.clear();
+  for (const recent of preferences.recentProjects) {
+    try {
+      const path = canonicalProjectPath(recent.path);
+      if ((await stat(path)).isDirectory()) registeredProjects.add(path);
+    } catch {
+      // Stale, malformed, or deleted recent entries are advisory metadata;
+      // they never become trusted project identities.
+    }
+  }
+}
+
 function assertPreferenceKey(value: unknown): asserts value is PreferenceKey {
   if (!isPreferenceKey(value)) {
     throw new MainBoundaryError("invalid_preference", "Desktop preference key is not supported");
@@ -181,9 +224,36 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     if (!isRuntimeMethod(payload.method) || !isJsonObject(payload.params)) {
       throw new MainBoundaryError("invalid_runtime_request", "Runtime request is invalid");
     }
+    let requestParams = payload.params;
+    if (payload.method === "session.move") {
+      const targetProject = registeredProjectPath(payload.params.target_project_key, registeredProjects);
+      // Pass the same canonical identity that was checked against Main's
+      // registration set.  The Python Bridge still repeats its own path
+      // validation as a defense-in-depth boundary.
+      requestParams = { ...payload.params, target_project_key: targetProject };
+    } else if (payload.method === "runtime.initialize") {
+      const field = "workdir" in payload.params
+        ? "workdir"
+        : "cwd" in payload.params
+          ? "cwd"
+          : undefined;
+      if (field === undefined) {
+        throw new MainBoundaryError(
+          "invalid_project_path",
+          "Runtime initialization requires a registered Project",
+        );
+      }
+      const projectPath = registeredProjectPath(payload.params[field], registeredProjects);
+      requestParams = { ...payload.params, [field]: projectPath };
+    } else if (payload.method === "project.open") {
+      const projectPath = registeredProjectPath(payload.params.path, registeredProjects);
+      // Opening is a consumer of Main authority.  It never creates trust;
+      // new projects must first pass through the Main folder picker.
+      requestParams = { ...payload.params, path: projectPath };
+    }
     try {
       await options.runtime.start();
-      const request = options.runtime.request(payload.method, payload.params);
+      const request = options.runtime.request(payload.method, requestParams);
       if (payload.method === "runtime.shutdown") {
         let result;
         try {
@@ -218,7 +288,10 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     assertSender(event);
     assertPreferenceKey(key);
     if (!isJsonValue(value)) throw new MainBoundaryError("invalid_preference", "Desktop preference value is invalid");
-    const written = await options.preferences.write(key, value as never);
+    const safeValue = key === "recentProjects"
+      ? canonicalizeRecentProjects(value, registeredProjects)
+      : value;
+    const written = await options.preferences.write(key, safeValue as never);
     if (key === "theme") setNativeTheme(written.theme);
     return written;
   };
@@ -368,6 +441,7 @@ export function bootstrapMain(): void {
     preferences = new DesktopPreferencesStore(join(app.getPath("userData"), "desktop-preferences.json"));
     runtime = createRuntime();
     const initialPreferences = await preferences.read();
+    await hydrateRegisteredProjectsFromPreferences(initialPreferences, registeredProjects);
     nativeTheme.themeSource = initialPreferences.theme;
     Menu.setApplicationMenu(null);
     mainWindow = createMainWindow();

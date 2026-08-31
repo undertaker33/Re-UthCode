@@ -804,3 +804,31 @@ git diff --check
 测试专用 hydrated fixture 仅位于 `desktop/tests` 与 `desktop/scripts`，production entry/import graph 与 bundle isolation 测试证明其不进入生产应用。CDP 使用动态端口、独立 Edge profile、请求 timeout 与 `try/finally`；注入失败测试验证只终止自身浏览器树、socket/pending request 清零且精确 profile 删除。浏览器验证覆盖 CustomSelect 全键盘/焦点行为、Modal focus trap/inert/Cancel/Apply、零模型与多模型 CRUD、Provider rename/delete、API Key transient，以及生产 `App` 配合 test-only fake `DesktopApi` 的 language read/write/即时切换/reload 恢复。六张 canonical 截图位于 `desktop/dist/ui-acceptance/prompt-2/`，覆盖 dark/light、zh/en、narrow 与 Provider modal；控制台错误为 0，未见独立 Models section、双侧栏、Runtime、说明性副标题、乱码或横向裁切。
 
 Sol/medium Reviewer 多轮拦截并复核了多模型 CRUD、零模型 Provider、reasoning effort 非法自由文本、Modal 取消/焦点语义、CustomSelect ARIA/键盘模型、固定文案遗漏、CDP 清理边界、嵌套 Escape 与动态 ID 碰撞，最终输出 `APPROVED`。残余风险：完整 `npm test` 并行执行时 offline Desktop Runtime 曾出现一次时序失败且未自行收尾，该用例独立复跑通过；真实 Electron 菜单角色/快捷键交互仍未验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 14 轮追加：Session 标题与跨 Project 权威迁移（2026-08-31）
+
+本轮先收敛 Session 权威语义，为后续会话菜单 UI 提供单一真实入口。Session metadata 新增可选标题，旧数据可直接读取；标题按 NFC 归一化并只去除首尾空白，保留内部空白，最长 240 字符。Application 新增 `rename_session` 和 `move_session`，对外只返回 `session_id`、`project_key`、`title` 组成的最小 `SessionMutation`，不暴露存储 metadata 或 instruction state。Desktop JSONL 仅通过 `session.rename` / `session.move` 调用这两个 Application 用例；TUI 会话列表优先显示持久化标题。
+
+跨 Project 移动只原子更改 Session metadata 的 `project_key`，Session ID、transcript/timeline、replay/status 与非空 Tool Result 保持不变；源 Project 不再可见/恢复，目标 Project 可见/恢复。活动 writer/turn 存在时返回受控 busy，写入失败保留原状态。同一 `ApplicationSessionService` 实例使用私有内存 receipt 和实例锁收敛重试：同目标并发收敛为成功，不同目标只有一个成功，另一个返回受控 unknown；新实例或其他 Project owner 不能借“同目标重试”探测 Session。本轮不引入持久化 journal、全局 registry 或兼容双轨。
+
+Main 进程中可用于移动的 Project authority 只来自两处：Main folder picker 选中的 canonical 现存目录，以及启动时从 `DesktopPreferencesStore.recentProjects` 读取后仍存在的 canonical 目录。`project.open`、`runtime.initialize` 和 `session.move` 只消费这个集合，不自注册；`preference.write("recentProjects", ...)` 拒绝未注册路径，Renderer 无法通过任意存在目录或偏好写入扩大 authority。
+
+本轮精确验证：
+
+```text
+Python Session/Application/Desktop/TUI 与架构定向复审
+-> 229 passed
+
+Desktop Main/Preload 复审
+-> 10 passed
+
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+git diff --check
+-> exit 0，仅 LF -> CRLF line-ending 提示
+```
+
+真实测试覆盖 title/catalog/replay/status/TUI title 优先与 preview 保留、非空 Tool Result 保持、move 写失败原状态、真实 DesktopBridge busy/storage/invalid 错误映射、owner/重启边界、并发收敛和 240/241 标题边界。Luna/max Worker 经两轮返工，Sol/medium Reviewer 第三轮输出 `APPROVED`，零阻塞 finding。
+
+残余风险：未启动真实 Electron 验证 startup preference hydration 交互；Windows 路径大小写或物理别名可能导致拒绝型误判，但未发现授权绕过。会话/项目悬浮菜单、折叠、置顶与 UI 调用属于后续 Prompt；本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

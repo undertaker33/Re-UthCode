@@ -1,12 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { installPreload } from "../src/preload";
 import type { DesktopApi } from "../src/desktop-api";
+import { DesktopPreferencesStore } from "../src/desktop-preferences";
 import {
   createRuntime,
   getSecureWebPreferences,
+  hydrateRegisteredProjectsFromPreferences,
   IPC_CHANNELS,
   isAllowedRendererUrl,
   registerIpcHandlers,
@@ -207,6 +211,137 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
   assert.equal(shellCloseCount, 1);
   removeHandlers();
   assert.equal(handlers.size, 0);
+});
+
+test("Main gates project use to picker or persisted recent registrations", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const runtime = {
+    start: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params });
+      return { ok: true };
+    },
+  };
+  const preferenceWrites: Array<{ key: string; value: unknown }> = [];
+  const preferences = {
+    read: async () => ({}),
+    write: async (key: string, value: unknown) => {
+      preferenceWrites.push({ key, value });
+      return {};
+    },
+  };
+  const registeredProjects = new Set<string>();
+  const target = await mkdtemp(join(tmpdir(), "uthcode-registered-project-"));
+  const persisted = await mkdtemp(join(tmpdir(), "uthcode-persisted-project-"));
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: preferences as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    registeredProjects,
+    showOpenDialog: (async () => ({ canceled: false, filePaths: [target] })) as never,
+    openPath: (async () => "") as never,
+  });
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(runtimeRequest);
+  try {
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "project.open", params: { path: target } },
+      ),
+      /trusted Desktop history/,
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "runtime.initialize", params: { workdir: target } },
+      ),
+      /trusted Desktop history/,
+    );
+    assert.deepEqual(calls, []);
+    assert.equal(registeredProjects.has(target), false);
+
+    const writePreference = handlers.get(IPC_CHANNELS.preferenceWrite);
+    assert.ok(writePreference);
+    await assert.rejects(
+      writePreference(
+        trustedEvent,
+        "recentProjects",
+        [{ path: persisted }],
+      ),
+      /trusted Desktop history/,
+    );
+    assert.deepEqual(preferenceWrites, []);
+
+    const pick = handlers.get(IPC_CHANNELS.pickProject);
+    assert.equal(await pick?.(trustedEvent), target);
+    assert.equal(registeredProjects.has(target), true);
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "project.open", params: { path: `${target}/.` } },
+    );
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "session.move", params: { session_id: "s", target_project_key: `${target}/.` } },
+    );
+    assert.deepEqual(calls.slice(0, 2), [
+      { method: "project.open", params: { path: target } },
+      { method: "session.move", params: { session_id: "s", target_project_key: target } },
+    ]);
+
+    const injectedRegistered = await writePreference(
+      trustedEvent,
+      "recentProjects",
+      [{ path: `${target}/.` }],
+    );
+    assert.deepEqual(injectedRegistered, {});
+    assert.deepEqual(preferenceWrites, [
+      { key: "recentProjects", value: [{ path: target }] },
+    ]);
+
+    const restartedProjects = new Set<string>();
+    const persistedStore = new DesktopPreferencesStore(join(persisted, "desktop-preferences.json"));
+    await persistedStore.write("recentProjects", [{ path: `${persisted}/.` }]);
+    await hydrateRegisteredProjectsFromPreferences(
+      await persistedStore.read(),
+      restartedProjects,
+    );
+    assert.deepEqual([...restartedProjects], [persisted]);
+    registeredProjects.clear();
+    for (const project of restartedProjects) registeredProjects.add(project);
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "runtime.initialize", params: { workdir: `${persisted}/.` } },
+    );
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "project.open", params: { path: persisted } },
+    );
+    assert.deepEqual(calls.slice(-2), [
+      { method: "runtime.initialize", params: { workdir: persisted } },
+      { method: "project.open", params: { path: persisted } },
+    ]);
+    assert.equal(registeredProjects.has(persisted), true);
+  } finally {
+    removeHandlers();
+    await rm(target, { recursive: true, force: true });
+    await rm(persisted, { recursive: true, force: true });
+  }
 });
 
 test("main runtime shutdown handler waits for the Runtime child reap boundary", async () => {
