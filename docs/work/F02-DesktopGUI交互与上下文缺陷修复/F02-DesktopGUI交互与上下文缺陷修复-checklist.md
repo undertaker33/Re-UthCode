@@ -19,22 +19,22 @@
 
 ## T03：Application Context / Compact 安全投影
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_w05_diagnostics.py -q` 及受影响的现有 Context 定向 tests，全部通过。
-- [ ] 在无更具体限制、显式大窗口配置和可靠 Provider ceiling 三类场景读取 Application status，确认 `budget_tokens` 与实际 ContextBudget/effective limit 同源且 Provider ceiling 可收紧。
-- [ ] resume 已提交 durable Session 后，status 可重建 current estimate；没有对应 Provider 请求 usage 时 measurement 不标 exact。
-- [ ] Provider terminal exact usage 可标 exact；随后追加 Transcript、Tool、Timeline 或 Compact mutation 后再次读取，measurement 回到 estimate。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_w05_diagnostics.py -q` 及受影响的现有 Context 定向 tests，全部通过。
+- [x] 在无更具体限制、显式大窗口配置和可靠 Provider ceiling 三类场景读取 Application status，确认 `budget_tokens` 与实际 ContextBudget/effective limit 同源且 Provider ceiling 可收紧。
+- [x] resume 已提交 durable Session 后，status 可重建 current estimate；没有对应 Provider 请求 usage 时 measurement 不标 exact。
+- [x] Provider terminal exact usage 可标 exact；随后追加 Transcript、Tool、Timeline 或 Compact mutation 后再次读取，measurement 回到 estimate。
 - [ ] manual、auto、overflow compact 都经过同一 Application single-flight，并可观察 `running` 到 `completed|no_change|failed|cancelled` 的 terminal 状态。
 - [ ] 在 Core terminal event 已入队但 Application 尚未完成 result/persistence/active-turn 释放的时序测试中，Desktop 不提前把旧 status 当成最终状态。
-- [ ] 现有 Low Water、Auto Gate、Hard Gate 与 overflow retry 回归通过，证明本任务没有改写 T09-3 safety semantics。
+- [x] 现有 Low Water、Auto Gate、Hard Gate 与 overflow retry 回归通过，证明本任务没有改写 T09-3 safety semantics。
 
 ## T04：Session move 与 Plan replay
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_session_authority.py tests/test_desktop_bridge.py -q`，全部用例通过。
-- [ ] 移动未打开 Session 与当前 open idle Session 均成功；后者同步 close-time state、更新项目归属、释放 writer，并清除 source Application ownership。
-- [ ] active Turn 移动返回稳定 busy/turn-active 结果且不隐式 cancel；invalid target、corrupt、storage 结果不包含路径或异常正文。
-- [ ] 在 project membership 更新前和更新时注入失败，确认源 project membership、writer 与可继续使用状态保持完整，没有 optimistic Renderer mutation。
-- [ ] durable 完整 `ProposePlan` replay 投影为 `kind=plan` 且正文仅为合法 plan 文本；普通 tool replay 保持原语义。
-- [ ] unfinished/malformed Plan、raw arguments、ToolResult private body、Session path 与 secret 不进入 replay 或 Desktop response。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_session_authority.py tests/test_desktop_bridge.py -q`，全部用例通过。
+- [x] 移动未打开 Session 与当前 open idle Session 均成功；后者同步 close-time state、更新项目归属、释放 writer，并清除 source Application ownership。
+- [x] active Turn 移动返回稳定 busy/turn-active 结果且不隐式 cancel；invalid target、corrupt、storage 结果不包含路径或异常正文。
+- [x] 在 project membership 更新前和更新时注入失败，确认源 project membership、writer 与可继续使用状态保持完整，没有 optimistic Renderer mutation。
+- [x] durable 完整 `ProposePlan` replay 投影为 `kind=plan` 且正文仅为合法 plan 文本；普通 tool replay 保持原语义。
+- [x] unfinished/malformed Plan、raw arguments、ToolResult private body、Session path 与 secret 不进入 replay 或 Desktop response。
 - [ ] 当前单 Runtime move 后只用 mutation 更新可见 target，目标项目下一次激活再读 authoritative catalog；测试确认没有第二 Application 或跨项目文件扫描。
 
 ## T05：Desktop 命令、Context 与 Session 投影收口

@@ -9,8 +9,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from uthcode.core.context import (
+    DEFAULT_CONTEXT_INPUT_LIMIT,
     ContextBudget,
     CompactionEpoch,
+    CompactionInProgress,
     CompactionResult,
     ContextCompactor,
     ContextCompiler,
@@ -61,6 +63,109 @@ from .instructions import InstructionLoader
 from .history import _transcript_entries_for_message
 
 
+_CONTEXT_MEASUREMENTS = frozenset({"estimate", "exact", "unavailable"})
+_COMPACTION_STATES = frozenset(
+    {"idle", "running", "completed", "no_change", "failed", "cancelled"}
+)
+_COMPACTION_TRIGGERS = frozenset({"manual", "auto", "overflow"})
+
+
+@dataclass(frozen=True, slots=True)
+class ContextStatus:
+    """Small, display-safe projection of the current Context boundary.
+
+    The Application owns this projection.  ``source`` is deliberately a
+    short, fixed value rather than a Provider name, path, or diagnostics
+    payload so interfaces do not need to inspect internal Context facts.
+    """
+
+    used_tokens: int = 0
+    budget_tokens: int = DEFAULT_CONTEXT_INPUT_LIMIT
+    available: bool = False
+    measurement: str = "unavailable"
+    source: str = "unavailable"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.used_tokens, bool)
+            or not isinstance(self.used_tokens, int)
+            or self.used_tokens < 0
+        ):
+            raise ValueError("used_tokens must be a non-negative integer")
+        if (
+            isinstance(self.budget_tokens, bool)
+            or not isinstance(self.budget_tokens, int)
+            or self.budget_tokens <= 0
+        ):
+            raise ValueError("budget_tokens must be a positive integer")
+        if not isinstance(self.available, bool):
+            raise TypeError("available must be a boolean")
+        if self.measurement not in _CONTEXT_MEASUREMENTS:
+            raise ValueError("unsupported Context measurement")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("source must be a non-empty string")
+        if self.measurement == "unavailable" and self.available:
+            raise ValueError("unavailable Context measurement cannot be available")
+        if self.measurement != "unavailable" and not self.available:
+            raise ValueError("measured Context status must be available")
+
+    @classmethod
+    def unavailable(
+        cls,
+        budget_tokens: int = DEFAULT_CONTEXT_INPUT_LIMIT,
+    ) -> "ContextStatus":
+        return cls(
+            used_tokens=0,
+            budget_tokens=budget_tokens,
+            available=False,
+            measurement="unavailable",
+            source="unavailable",
+        )
+
+    @property
+    def ratio(self) -> float | None:
+        if not self.available:
+            return None
+        return self.used_tokens / self.budget_tokens
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "used_tokens": self.used_tokens,
+            "budget_tokens": self.budget_tokens,
+            "available": self.available,
+            "measurement": self.measurement,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionStatus:
+    """Display-safe lifecycle state for one Application compaction pass."""
+
+    state: str = "idle"
+    trigger: str | None = None
+    changed: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in _COMPACTION_STATES:
+            raise ValueError("unsupported Compaction state")
+        if self.trigger is not None and self.trigger not in _COMPACTION_TRIGGERS:
+            raise ValueError("unsupported Compaction trigger")
+        if self.state == "idle" and self.trigger is not None:
+            raise ValueError("idle Compaction status cannot have a trigger")
+        if self.state == "running" and self.changed is not None:
+            raise ValueError("running Compaction status cannot have changed")
+        if not isinstance(self.changed, (bool, type(None))):
+            raise TypeError("changed must be a boolean or None")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "trigger": self.trigger,
+            "changed": self.changed,
+        }
+
+
 class ApplicationContextService:
     """Assemble current Application sources without owning Context policy."""
 
@@ -82,6 +187,8 @@ class ApplicationContextService:
         self._last_pressure: ContextCountEstimate | None = None
         self._last_accounting: RequestAccounting | None = None
         self._last_count_fallback: str | None = None
+        self._context_status = ContextStatus.unavailable()
+        self._compaction_status = CompactionStatus()
 
     @property
     def compiler(self) -> ContextCompiler:
@@ -90,6 +197,157 @@ class ApplicationContextService:
     @property
     def last_snapshot(self) -> ContextSnapshot | None:
         return self._last_snapshot
+
+    @property
+    def last_budget(self) -> ContextBudget | None:
+        """Return the last Application-resolved ContextBudget, if any."""
+
+        return self._last_budget
+
+    @property
+    def context_status(self) -> ContextStatus:
+        """Return the current safe Context measurement projection."""
+
+        return self._context_status
+
+    @property
+    def compaction_status(self) -> CompactionStatus:
+        """Return the current safe Compaction lifecycle projection."""
+
+        return self._compaction_status
+
+    def _refresh_context_estimate(self) -> None:
+        """Downgrade the projection after a Context-owned mutation."""
+
+        snapshot = self._last_snapshot
+        budget = self._last_budget
+        if snapshot is None or budget is None:
+            self._context_status = ContextStatus.unavailable(
+                budget.effective_input_limit
+                if budget is not None and budget.effective_input_limit is not None
+                else DEFAULT_CONTEXT_INPUT_LIMIT
+            )
+            return
+        effective = budget.effective_input_limit
+        if effective is None:  # pragma: no cover - ContextBudget always resolves one
+            self._context_status = ContextStatus.unavailable()
+            return
+        self._context_status = ContextStatus(
+            used_tokens=snapshot.token_estimate,
+            budget_tokens=effective,
+            available=True,
+            measurement="estimate",
+            source="context_compiler",
+        )
+
+    def refresh_context_estimate(self) -> None:
+        """Public Application hook for a completed Transcript/Timeline mutation."""
+
+        self._refresh_context_estimate()
+
+    def set_context_budget(self, budget: ContextBudget) -> None:
+        """Seed the status denominator before a Session has been compiled."""
+
+        if not isinstance(budget, ContextBudget):
+            raise TypeError("budget must be a ContextBudget")
+        self._last_budget = budget
+        self._refresh_context_estimate()
+
+    def clear_context(self) -> None:
+        """Drop a released Session's Context projection without touching budget."""
+
+        self._last_snapshot = None
+        self._last_gate = None
+        self._last_pressure = None
+        self._last_accounting = None
+        self._last_count_fallback = None
+        self._refresh_context_estimate()
+
+    def record_exact_usage(
+        self,
+        used_tokens: int,
+        *,
+        budget: ContextBudget | None = None,
+    ) -> None:
+        """Record Provider usage for the current request boundary only."""
+
+        if isinstance(used_tokens, bool) or not isinstance(used_tokens, int) or used_tokens < 0:
+            raise ValueError("used_tokens must be a non-negative integer")
+        effective_budget = budget or self._last_budget
+        if effective_budget is not None and not isinstance(effective_budget, ContextBudget):
+            raise TypeError("budget must be a ContextBudget or None")
+        if effective_budget is not None:
+            self._last_budget = effective_budget
+        if self._last_snapshot is None or effective_budget is None:
+            self._refresh_context_estimate()
+            return
+        effective = effective_budget.effective_input_limit
+        if effective is None:  # pragma: no cover - ContextBudget always resolves one
+            self._refresh_context_estimate()
+            return
+        self._context_status = ContextStatus(
+            used_tokens=used_tokens,
+            budget_tokens=effective,
+            available=True,
+            measurement="exact",
+            source="provider_usage",
+        )
+
+    def begin_compaction(self, trigger: str) -> None:
+        """Enter the single Application compaction lifecycle."""
+
+        if trigger not in _COMPACTION_TRIGGERS:
+            raise ValueError("unsupported Compaction trigger")
+        self._compaction_status = CompactionStatus(
+            state="running",
+            trigger=trigger,
+            changed=None,
+        )
+        # Compaction derives a new Context candidate; an earlier exact usage
+        # value cannot describe that in-flight mutation.
+        self._refresh_context_estimate()
+
+    def finish_compaction(
+        self,
+        result: CompactionResult | None,
+        *,
+        trigger: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        """Close the lifecycle with a bounded terminal result."""
+
+        if result is not None and not isinstance(result, CompactionResult):
+            raise TypeError("result must be a CompactionResult or None")
+        if trigger is None:
+            trigger = self._compaction_status.trigger
+        if trigger is not None and trigger not in _COMPACTION_TRIGGERS:
+            raise ValueError("unsupported Compaction trigger")
+        if cancelled or result is None and self._compaction_status.state == "running":
+            state = "cancelled" if cancelled else "failed"
+            changed = False
+        elif result is None:
+            state = "failed"
+            changed = False
+        elif result.failure == "compaction_cancelled":
+            state = "cancelled"
+            changed = result.changed
+        elif result.failure is not None:
+            # A partial bounded pass may retain a durable successful Timeline;
+            # represent that as completed while keeping the detailed reason
+            # in the existing diagnostics projection.
+            state = "completed" if result.changed else "failed"
+            changed = result.changed
+        elif result.changed:
+            state = "completed"
+            changed = True
+        else:
+            state = "no_change"
+            changed = False
+        self._compaction_status = CompactionStatus(
+            state=state,
+            trigger=trigger,
+            changed=changed,
+        )
 
     def compile(
         self,
@@ -178,8 +436,11 @@ class ApplicationContextService:
             previous_snapshot=(self._last_snapshot if previous_snapshot is None else previous_snapshot),
         )
         self._last_snapshot = snapshot
-        if not preserve_request_diagnostics:
+        if context_budget is not None:
             self._last_budget = context_budget
+        elif not preserve_request_diagnostics:
+            self._last_budget = context_budget
+        self._refresh_context_estimate()
         return snapshot
 
     def usage(self, snapshot: ContextSnapshot | None = None) -> ContextUsage:
@@ -267,6 +528,7 @@ class ApplicationContextService:
         if not isinstance(budget, ContextBudget):
             raise TypeError("budget must be a ContextBudget")
         self._last_budget = budget
+        self._refresh_context_estimate()
         self._last_accounting = account_generation_request(request)
         gate = request.metadata.get("context_gate")
         self._last_gate = dict(gate) if isinstance(gate, Mapping) else None
@@ -288,6 +550,66 @@ class ApplicationContextService:
         return self._compactor
 
     async def compact_async(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline | None = None,
+        session_id: str | None = None,
+        summarize: Callable[[CompactionEpoch], object | Awaitable[object]],
+        commit: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ] | None = None,
+        should_continue: Callable[
+            [Timeline],
+            bool | Mapping[str, object] | Awaitable[bool | Mapping[str, object]],
+        ] | None = None,
+        cancellation: CancellationToken | None = None,
+        max_epochs: int = 4,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+        summary_hard_cap: int | None = None,
+        active_turn_id: str | None = None,
+        trigger: str = "manual",
+    ) -> CompactionResult:
+        """Run one bounded compaction pass and expose its lifecycle safely."""
+
+        previous_status = self._compaction_status
+        self.begin_compaction(trigger)
+        try:
+            result = await self._compact_async_impl(
+                transcript,
+                timeline=timeline,
+                session_id=session_id,
+                summarize=summarize,
+                commit=commit,
+                should_continue=should_continue,
+                cancellation=cancellation,
+                max_epochs=max_epochs,
+                input_budget=input_budget,
+                output_reserve=output_reserve,
+                summary_hard_cap=summary_hard_cap,
+                active_turn_id=active_turn_id,
+            )
+        except (GenerationCancelled, CancelledError):
+            self.finish_compaction(None, trigger=trigger, cancelled=True)
+            raise
+        except CompactionInProgress:
+            # A concurrent trigger is rejected by the existing Core
+            # single-flight guard; it must not overwrite the owner
+            # Application's running status with a false terminal failure.
+            if previous_status.state == "running":
+                self._compaction_status = previous_status
+            else:
+                self.finish_compaction(None, trigger=trigger)
+            raise
+        except Exception:
+            self.finish_compaction(None, trigger=trigger)
+            raise
+        self.finish_compaction(result, trigger=trigger)
+        return result
+
+    async def _compact_async_impl(
         self,
         transcript: Transcript,
         *,
@@ -596,6 +918,58 @@ class ApplicationContextService:
         output_reserve: int | None = None,
         summary_hard_cap: int | None = None,
         active_turn_id: str | None = None,
+        trigger: str = "auto",
+    ) -> CompactionResult:
+        """Run one Fine-to-Macro pass and expose its lifecycle safely."""
+
+        previous_status = self._compaction_status
+        self.begin_compaction(trigger)
+        try:
+            result = await self._age_timeline_async_impl(
+                transcript,
+                timeline=timeline,
+                session_id=session_id,
+                summarize=summarize,
+                commit=commit,
+                cancellation=cancellation,
+                fine_budget=fine_budget,
+                input_budget=input_budget,
+                output_reserve=output_reserve,
+                summary_hard_cap=summary_hard_cap,
+                active_turn_id=active_turn_id,
+            )
+        except (GenerationCancelled, CancelledError):
+            self.finish_compaction(None, trigger=trigger, cancelled=True)
+            raise
+        except CompactionInProgress:
+            if previous_status.state == "running":
+                self._compaction_status = previous_status
+            else:
+                self.finish_compaction(None, trigger=trigger)
+            raise
+        except Exception:
+            self.finish_compaction(None, trigger=trigger)
+            raise
+        self.finish_compaction(result, trigger=trigger)
+        return result
+
+    async def _age_timeline_async_impl(
+        self,
+        transcript: Transcript,
+        *,
+        timeline: Timeline,
+        session_id: str | None = None,
+        summarize: Callable[[TimelineAgingEpoch], object | Awaitable[object]],
+        commit: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ] | None = None,
+        cancellation: CancellationToken | None = None,
+        fine_budget: int,
+        input_budget: int | None = None,
+        output_reserve: int | None = None,
+        summary_hard_cap: int | None = None,
+        active_turn_id: str | None = None,
     ) -> CompactionResult:
         """Run at most one tool-free L5 Fine-to-Macro aging epoch.
 
@@ -840,6 +1214,7 @@ class ApplicationContextService:
         return {
             "schema_version": 1,
             "context": context,
+            "context_status": self._context_status.to_dict(),
             "budget": (
                 None if self._last_budget is None else self._last_budget.to_dict()
             ),
@@ -871,6 +1246,7 @@ class ApplicationContextService:
                 "last": None if self._last_compaction is None else dict(self._last_compaction),
                 "events": [dict(item) for item in self._compaction_events],
             },
+            "compaction_status": self._compaction_status.to_dict(),
         }
 
     def _record_compaction(self, event: dict[str, object]) -> None:
@@ -1319,4 +1695,4 @@ def _merge_transcript(
     return merged
 
 
-__all__ = ["ApplicationContextService"]
+__all__ = ["ApplicationContextService", "ContextStatus", "CompactionStatus"]

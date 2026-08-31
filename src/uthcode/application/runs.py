@@ -444,11 +444,27 @@ class AgentRun:
             and not self._last_flush_committed_terminal
         ):
             self._application._record_committed_turn()
+        self._active_turn = None
         # Application owns the public diagnostics projection.  The value is
         # the cumulative Usage of this terminal Turn (including all Provider
-        # iterations/tool continuations), not a second Provider request.
-        self._application._record_formal_run_usage(result.usage)
-        self._active_turn = None
+        # iterations/tool continuations), not a second Provider request.  Core
+        # does not expose a request-attempt counter, so the Application's
+        # successful request-preparation count is consumed as the only proof
+        # that this terminal result came from one request boundary.  The
+        # active-turn ownership is released first so a status read cannot see
+        # an exact terminal projection while the Run still claims the Turn.
+        request_boundary_count = self._application._consume_request_boundary_count(
+            result.run_id,
+            result.turn_id,
+        )
+        self._application._record_formal_run_usage(
+            result.usage,
+            exact_request_boundary=(
+                result.status is RunStatus.COMPLETED
+                and result.tool_call_count == 0
+                and request_boundary_count == 1
+            ),
+        )
 
 
 class _TurnDriver:

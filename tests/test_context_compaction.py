@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from uthcode.application.context import ApplicationContextService
-from uthcode.core.context import CompactionPolicy, ContextCompactor
+from uthcode.core.context import CompactionInProgress, CompactionPolicy, ContextCompactor
 from uthcode.core.history import ActiveCheckpoint, EpochMacroSummary, SemanticEntry, Timeline, Transcript, TranscriptEntry, TranscriptKind, TranscriptRef
 
 
@@ -59,6 +61,64 @@ async def test_application_context_compact_records_bounded_diagnostics() -> None
     diagnostics = service.public_diagnostics()
     assert diagnostics["compaction"]["count"] == 1
     assert diagnostics["compaction"]["last"]["coverage_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_application_compaction_status_covers_running_and_terminal_boundaries() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService()
+    observed: list[tuple[str, str | None, bool | None]] = []
+
+    async def summarize(epoch):
+        status = service.compaction_status
+        observed.append((status.state, status.trigger, status.changed))
+        return {"summary": "summary", "coverage": list(epoch.turn_ids)}
+
+    result = await service.compact_async(
+        transcript,
+        summarize=summarize,
+        trigger="auto",
+    )
+    assert observed == [("running", "auto", None)]
+    assert result.changed is True
+    assert service.compaction_status.to_dict() == {
+        "state": "completed",
+        "trigger": "auto",
+        "changed": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_compaction_triggers_share_single_flight_without_clobbering_owner_status() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def summarize(epoch):
+        entered.set()
+        await release.wait()
+        return {"summary": "summary", "coverage": list(epoch.turn_ids)}
+
+    owner = asyncio.create_task(
+        service.compact_async(transcript, summarize=summarize, trigger="auto")
+    )
+    await entered.wait()
+    with pytest.raises(CompactionInProgress):
+        await service.compact_async(
+            transcript,
+            summarize=summarize,
+            trigger="overflow",
+        )
+    assert service.compaction_status.to_dict() == {
+        "state": "running",
+        "trigger": "auto",
+        "changed": None,
+    }
+    release.set()
+    result = await owner
+    assert result.changed is True
+    assert service.compaction_status.state == "completed"
 
 
 @pytest.mark.asyncio

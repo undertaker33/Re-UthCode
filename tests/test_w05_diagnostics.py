@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
@@ -11,7 +12,18 @@ import pytest
 from eval.metrics import DIAGNOSTIC_FACTS, compute_diagnostic_facts
 from eval.metrics import compute_metric_details
 from eval.reporting import aggregate_experiment, compare_experiments
-from uthcode.application import ApplicationContextService, UthCodeApplication
+from uthcode.application import (
+    ApplicationContextService,
+    CommandDispatcher,
+    EffectiveConfig,
+    ModelProfile,
+    OutcomeStatus,
+    ProviderKind,
+    ProviderProfile,
+    UthCodeApplication,
+    create_builtin_registry,
+)
+from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.instructions import InstructionLoader
 from uthcode.application.provider_usage import public_usage_diagnostics
 from uthcode.core.history import Timeline, Transcript
@@ -46,8 +58,9 @@ from uthcode.application.sessions import (
     SessionOperationError,
 )
 from uthcode.application.tools import ApplicationToolService
+from uthcode.interfaces.desktop.bridge import DesktopBridge
 from uthcode.integrations.providers.fake import FakeProvider
-from uthcode.integrations.session_files import SessionFileStore
+from uthcode.integrations.session_files import SessionBusyError, SessionFileStore
 from uthcode.integrations.tools.tool_result_read import ToolResultPolicy
 from uthcode.integrations.instruction_files import InstructionFileReader
 
@@ -87,6 +100,124 @@ class _ScriptedProvider:
         for event in self.scripts[index]:
             cancellation.raise_if_cancelled()
             yield event
+
+
+class _AsyncLimitsProvider(FakeProvider):
+    """Provider fixture whose model ceiling is available only asynchronously."""
+
+    def __init__(
+        self,
+        limits: ModelLimits,
+        *,
+        identity: ProviderIdentity | None = None,
+        started: asyncio.Event | None = None,
+        gate: asyncio.Event | None = None,
+        failure: BaseException | None = None,
+    ) -> None:
+        super().__init__(
+            identity=identity,
+            events=(_completed(Usage(input_tokens=1, output_tokens=1)),),
+            model_limits=None,
+        )
+        self._async_limits = limits
+        self._started = started
+        self._gate = gate
+        self._failure = failure
+        self.resolved_models: list[str] = []
+        self.expected_loop: asyncio.AbstractEventLoop | None = None
+        self.observed_loops: list[asyncio.AbstractEventLoop] = []
+        self.same_loop = True
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        loop = asyncio.get_running_loop()
+        self.observed_loops.append(loop)
+        if self.expected_loop is not None and loop is not self.expected_loop:
+            self.same_loop = False
+        self.resolved_models.append(model)
+        if self._started is not None:
+            self._started.set()
+        if self._gate is not None:
+            await self._gate.wait()
+        if self._failure is not None:
+            raise self._failure
+        await asyncio.sleep(0)
+        return self._async_limits
+
+
+def _active_two_model_application(
+    tmp_path: Path,
+    candidate_provider: FakeProvider,
+) -> tuple[UthCodeApplication, ApplicationSessionService, FakeProvider, list[str]]:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionFileStore(tmp_path / "sessions")
+    project_key = str(project.resolve())
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    old_limits = ModelLimits(max_input_tokens=18_000, source="test.old-ceiling")
+    old_provider = FakeProvider(
+        identity=ProviderIdentity("old", "fake", "old-model"),
+        events=(_completed(Usage(input_tokens=1, output_tokens=1)),),
+        model_limits=old_limits,
+    )
+    configuration = EffectiveConfig(
+        default_model="old/ref",
+        providers={
+            "old": ProviderProfile("old", ProviderKind.FAKE),
+            "new": ProviderProfile("new", ProviderKind.FAKE),
+        },
+        models={
+            "old/ref": ModelProfile(
+                "old/ref",
+                "old",
+                "old-model",
+                context_window=64_000,
+            ),
+            "new/ref": ModelProfile(
+                "new/ref",
+                "new",
+                "new-model",
+                context_window=64_000,
+            ),
+        },
+    )
+    providers = {"old/ref": old_provider, "new/ref": candidate_provider}
+    writes: list[str] = []
+
+    def builder(_profile: ProviderProfile, model: ModelProfile) -> FakeProvider:
+        return providers[model.model_ref]
+
+    application = UthCodeApplication(
+        old_provider,
+        configuration=configuration,
+        provider_builder=builder,
+        model_writer=writes.append,
+        session_service=service,
+    )
+    application.new_session_for_command()
+    return application, service, old_provider, writes
+
+
+def _session_application(
+    tmp_path: Path,
+    provider: FakeProvider,
+) -> tuple[UthCodeApplication, ApplicationSessionService, SessionFileStore, str]:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionFileStore(tmp_path / "sessions")
+    project_key = str(project.resolve())
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    application = UthCodeApplication(provider, session_service=service)
+    return application, service, store, project_key
 
 
 @pytest.mark.asyncio
@@ -226,6 +357,555 @@ async def test_formal_agent_run_projects_terminal_usage_to_application_diagnosti
 
 
 @pytest.mark.asyncio
+async def test_application_context_status_uses_budget_and_downgrades_after_mutation() -> None:
+    application = UthCodeApplication(
+        FakeProvider(
+            events=(_completed(Usage(input_tokens=10, output_tokens=2)),),
+            model_limits=ModelLimits(max_input_tokens=32_000, source="test.ceiling"),
+        )
+    )
+
+    before = application.status().context_status
+    assert before.budget_tokens == 256_000
+    assert before.available is False
+    assert before.measurement == "unavailable"
+
+    result = await application.create_run(run_id="context-status").start_turn("hello").result()
+    assert result.status.value == "completed"
+    exact = application.status().context_status
+    assert exact.used_tokens == 10
+    assert exact.budget_tokens == 32_000
+    assert exact.available is True
+    assert exact.measurement == "exact"
+    assert exact.source == "provider_usage"
+
+    budget = application.context_service.last_budget
+    assert budget is not None
+    application.context_service.compile(
+        current_turn=(Message("user", (TextPart("follow-up"),)),),
+        context_budget=budget,
+        preserve_request_diagnostics=True,
+    )
+    estimate = application.status().context_status
+    assert estimate.available is True
+    assert estimate.measurement == "estimate"
+    assert estimate.source == "context_compiler"
+
+    no_usage = UthCodeApplication(
+        FakeProvider(
+            events=(_completed(Usage()),),
+            model_limits=ModelLimits(max_input_tokens=32_000, source="test.ceiling"),
+        )
+    )
+    await no_usage.create_run(run_id="context-no-usage").start_turn("hello").result()
+    assert no_usage.status().context_status.measurement == "estimate"
+
+
+def test_cold_session_resume_rebuilds_estimate_with_provider_ceiling(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionFileStore(tmp_path / "sessions")
+    project_key = str(project.resolve())
+    store.create_session("cold-status", project_key=project_key)
+    with store.open_writer("cold-status", expected_project_key=project_key) as writer:
+        writer.append_transcript(
+            _transcript_entries_for_message(
+                "cold-status",
+                "turn-cold",
+                1,
+                Message("user", (TextPart("durable fact"),)),
+            )
+        )
+    provider = FakeProvider(model_limits=ModelLimits(max_input_tokens=12_000, source="test.ceiling"))
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    application = UthCodeApplication(provider, session_service=service)
+    try:
+        application.resume_session_for_command("cold-status")
+        status = application.status().context_status
+        assert status.available is True
+        assert status.measurement == "estimate"
+        assert status.budget_tokens == 12_000
+        assert status.used_tokens > 0
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_session_resume_resolves_async_provider_ceiling_inside_event_loop(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionFileStore(tmp_path / "sessions")
+    project_key = str(project.resolve())
+    store.create_session("cold-async-status", project_key=project_key)
+    with store.open_writer(
+        "cold-async-status",
+        expected_project_key=project_key,
+    ) as writer:
+        writer.append_transcript(
+            _transcript_entries_for_message(
+                "cold-async-status",
+                "turn-cold-async",
+                1,
+                Message("user", (TextPart("durable async fact"),)),
+            )
+        )
+    provider = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.async-ceiling")
+    )
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    application = UthCodeApplication(provider, session_service=service)
+    try:
+        # This is deliberately called while the test event loop is running:
+        # the async Session boundary must resolve on the current loop.
+        provider.expected_loop = asyncio.get_running_loop()
+        await application.resume_session_for_command_async("cold-async-status")
+        status = application.status().context_status
+        assert status.available is True
+        assert status.measurement == "estimate"
+        assert status.budget_tokens == 12_000
+        assert status.used_tokens > 0
+        assert provider.resolved_models == ["fake-model"]
+        assert provider.same_loop is True
+        assert provider.observed_loops == [provider.expected_loop]
+
+        result = await application.create_run(run_id="cold-async-run").start_turn(
+            "use the refreshed ceiling"
+        ).result()
+        assert result.status.value == "completed"
+        request_budget = provider.requests[-1].metadata["context_budget"]
+        assert isinstance(request_budget, Mapping)
+        assert request_budget["effective_input_limit"] == 12_000
+        assert application.status().context_status.budget_tokens == 12_000
+    finally:
+        application.close()
+
+
+def test_sync_session_resume_resolves_async_provider_ceiling_without_running_loop(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionFileStore(tmp_path / "sessions")
+    project_key = str(project.resolve())
+    store.create_session("cold-sync-async-status", project_key=project_key)
+    with store.open_writer(
+        "cold-sync-async-status",
+        expected_project_key=project_key,
+    ) as writer:
+        writer.append_transcript(
+            _transcript_entries_for_message(
+                "cold-sync-async-status",
+                "turn-cold-sync-async",
+                1,
+                Message("user", (TextPart("durable sync async fact"),)),
+            )
+        )
+    provider = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.async-ceiling")
+    )
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    application = UthCodeApplication(provider, session_service=service)
+    try:
+        # This test is intentionally a normal synchronous caller: the adapter
+        # owns the temporary loop because no caller loop is running.
+        application.resume_session_for_command("cold-sync-async-status")
+        status = application.status().context_status
+        assert status.available is True
+        assert status.measurement == "estimate"
+        assert status.budget_tokens == 12_000
+        assert provider.same_loop is True
+        assert len(provider.observed_loops) == 1
+    finally:
+        application.close()
+
+
+def test_sync_model_selection_async_resolver_failure_keeps_state(
+    tmp_path: Path,
+) -> None:
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+        failure=RuntimeError("new provider unavailable"),
+    )
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    old_budget = application.status().context_status.budget_tokens
+    try:
+        with pytest.raises(RuntimeError, match="new provider unavailable"):
+            application.select_model("new/ref")
+
+        assert application.current_model_ref == "old/ref"
+        assert application.provider is old_provider
+        assert application.configuration is not None
+        assert application.configuration.default_model == "old/ref"
+        assert application.status().context_status.budget_tokens == old_budget
+        assert service.active_session is old_session
+        assert writes == []
+        assert len(candidate.observed_loops) == 1
+    finally:
+        application.close()
+
+
+def test_sync_model_selection_async_resolver_invalid_limits_keeps_state(
+    tmp_path: Path,
+) -> None:
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+    )
+
+    async def invalid_limits(_model: str) -> object:
+        return {"max_input_tokens": 12_000}
+
+    candidate.resolve_model_limits = invalid_limits  # type: ignore[method-assign]
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    old_budget = application.status().context_status.budget_tokens
+    try:
+        with pytest.raises(TypeError, match="ModelLimits"):
+            application.select_model("new/ref")
+
+        assert application.current_model_ref == "old/ref"
+        assert application.provider is old_provider
+        assert application.configuration is not None
+        assert application.configuration.default_model == "old/ref"
+        assert application.status().context_status.budget_tokens == old_budget
+        assert service.active_session is old_session
+        assert writes == []
+    finally:
+        application.close()
+
+
+def test_sync_model_selection_async_resolver_none_is_valid_and_commits(
+    tmp_path: Path,
+) -> None:
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+    )
+    resolved_models: list[str] = []
+
+    async def no_ceiling(model: str) -> None:
+        resolved_models.append(model)
+        return None
+
+    candidate.resolve_model_limits = no_ceiling  # type: ignore[method-assign]
+    application, service, _old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    try:
+        selected = application.select_model("new/ref")
+
+        assert selected.model_ref == "new/ref"
+        assert application.current_model_ref == "new/ref"
+        assert application.provider is candidate
+        assert application.status().context_status.budget_tokens == 64_000
+        assert service.active_session is old_session
+        assert writes == ["new/ref"]
+        assert resolved_models == ["new-model"]
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_async_model_selection_preflights_provider_limit_before_active_commit(
+    tmp_path: Path,
+) -> None:
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+    )
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    candidate.expected_loop = asyncio.get_running_loop()
+    try:
+        outcome = await CommandDispatcher(
+            create_builtin_registry(),
+            application,
+        ).dispatch_text_async("/model new/ref")
+
+        assert outcome is not None
+        assert outcome.status is OutcomeStatus.SUCCESS
+        assert application.current_model_ref == "new/ref"
+        assert application.provider is candidate
+        assert application.status().provider_identity.model == "new-model"
+        assert application.status().context_status.budget_tokens == 12_000
+        assert service.active_session is old_session
+        assert writes == ["new/ref"]
+        assert candidate.same_loop is True
+        assert candidate.observed_loops == [candidate.expected_loop]
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_async_model_selection_failure_keeps_active_model_config_and_budget(
+    tmp_path: Path,
+) -> None:
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+        failure=RuntimeError("new provider unavailable"),
+    )
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    old_budget = application.status().context_status.budget_tokens
+    candidate.expected_loop = asyncio.get_running_loop()
+    try:
+        outcome = await CommandDispatcher(
+            create_builtin_registry(),
+            application,
+        ).dispatch_text_async("/model new/ref")
+
+        assert outcome is not None
+        assert outcome.status is OutcomeStatus.EXECUTION_ERROR
+        assert outcome.error == "模型切换失败"
+        assert application.current_model_ref == "old/ref"
+        assert application.provider is old_provider
+        assert application.configuration is not None
+        assert application.configuration.default_model == "old/ref"
+        assert application.status().context_status.budget_tokens == old_budget
+        assert service.active_session is old_session
+        assert writes == []
+        assert candidate.same_loop is True
+        assert candidate.observed_loops == [candidate.expected_loop]
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_async_model_selection_cancel_keeps_active_model_config_and_budget(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+        started=started,
+        gate=gate,
+    )
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    old_budget = application.status().context_status.budget_tokens
+    candidate.expected_loop = asyncio.get_running_loop()
+    task = asyncio.create_task(
+        CommandDispatcher(
+            create_builtin_registry(),
+            application,
+        ).dispatch_text_async("/model new/ref")
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert application.current_model_ref == "old/ref"
+        assert application.provider is old_provider
+        assert application.status().context_status.budget_tokens == old_budget
+        assert service.active_session is old_session
+        assert writes == []
+        assert candidate.same_loop is True
+        assert candidate.observed_loops == [candidate.expected_loop]
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_context_preflight_discards_old_provider_result_after_model_switch(
+    tmp_path: Path,
+) -> None:
+    old_started = asyncio.Event()
+    old_gate = asyncio.Event()
+    old_loops: list[asyncio.AbstractEventLoop] = []
+    candidate = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.new-ceiling"),
+        identity=ProviderIdentity("new", "fake", "new-model"),
+    )
+    application, service, old_provider, writes = _active_two_model_application(
+        tmp_path,
+        candidate,
+    )
+    old_session = service.active_session
+    assert old_session is not None
+    candidate.expected_loop = asyncio.get_running_loop()
+    application._last_provider_limits = None
+    application._last_provider_limits_model = None
+    application._last_provider_limits_provider = None
+
+    async def preflight_old() -> ModelLimits:
+        loop = asyncio.get_running_loop()
+        old_loops.append(loop)
+        old_started.set()
+        await old_gate.wait()
+        return ModelLimits(max_input_tokens=32_000, source="test.old-ceiling")
+
+    async def _blocked_old_limits(_model: str) -> ModelLimits:
+        return await preflight_old()
+
+    old_provider.resolve_model_limits = _blocked_old_limits  # type: ignore[method-assign]
+    preflight_task: asyncio.Task[object] | None = None
+    try:
+        preflight_task = asyncio.create_task(
+            application.preflight_session_context_async()
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=2)
+
+        await application.select_model_async("new/ref")
+        assert application.current_model_ref == "new/ref"
+        assert application.provider is candidate
+        assert application.status().context_status.budget_tokens == 12_000
+        assert writes == ["new/ref"]
+
+        old_gate.set()
+        preflight_budget = await preflight_task
+        assert preflight_budget.effective_input_limit == 12_000
+        assert old_loops == [candidate.expected_loop]
+        assert candidate.same_loop is True
+
+        switched = await application.new_session_for_command_async(
+            context_budget=preflight_budget,
+        )
+        assert switched is service.active_session
+        assert switched is not old_session
+        assert application.current_model_ref == "new/ref"
+        assert application.status().context_status.budget_tokens == 12_000
+    finally:
+        if preflight_task is not None and not preflight_task.done():
+            old_gate.set()
+            await asyncio.gather(preflight_task, return_exceptions=True)
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_async_resume_cancel_preflight_keeps_source_writer_and_bridge_run(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    provider = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.async-ceiling"),
+        started=started,
+        gate=gate,
+    )
+    application, service, store, project_key = _session_application(tmp_path, provider)
+    source = service.create_session_for_command("source")
+    store.create_session("target", project_key=project_key)
+    provider.expected_loop = asyncio.get_running_loop()
+    bridge = DesktopBridge(application=application, workdir=tmp_path / "project")
+    old_run = bridge.run
+
+    class ActiveHandle:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+    active_handle = ActiveHandle()
+    bridge._active_handle = active_handle
+    task = asyncio.create_task(
+        bridge._session_resume({"session_id": "target"})
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert service.active_session is source
+        assert source.snapshot.session_id == "source"
+        assert bridge.run is old_run
+        assert bridge.active_handle is active_handle
+        assert active_handle.cancel_calls == 0
+        with pytest.raises(SessionBusyError):
+            with store.open_writer("source", expected_project_key=project_key):
+                pass
+        with store.open_writer("target", expected_project_key=project_key):
+            pass
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_async_new_cancel_preflight_does_not_create_or_switch_session(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    provider = _AsyncLimitsProvider(
+        ModelLimits(max_input_tokens=12_000, source="test.async-ceiling"),
+        started=started,
+        gate=gate,
+    )
+    application, service, store, project_key = _session_application(tmp_path, provider)
+    provider.expected_loop = asyncio.get_running_loop()
+    task = asyncio.create_task(application.new_session_for_command_async())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert service.active_session is None
+        assert store.list_metadata(project_key=project_key) == ()
+        assert provider.same_loop is True
+        assert provider.observed_loops == [provider.expected_loop]
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        application.close()
+
+
+@pytest.mark.asyncio
 async def test_formal_agent_run_uses_cumulative_usage_for_tool_continuation_cache() -> None:
     first = GenerationCompleted(
         ProviderResponse(
@@ -281,6 +961,12 @@ async def test_formal_agent_run_uses_cumulative_usage_for_tool_continuation_cach
         "tokens": 5,
         "provenance": "usage.details.input_tokens_details.cache_write_tokens",
     }
+    context_status = application.status().context_status
+    assert context_status.measurement == "estimate"
+    assert not (
+        context_status.measurement == "exact"
+        and context_status.used_tokens == 12
+    )
 
 
 def test_efficiency_falls_back_per_token_field_but_keeps_cache_provider_only() -> None:
