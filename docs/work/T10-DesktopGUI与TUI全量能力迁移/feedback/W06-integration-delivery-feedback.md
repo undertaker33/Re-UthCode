@@ -906,3 +906,70 @@ git diff --check
 最后两项源码/测试返工补齐了“当前模型缺窗口时继续回退 default model”与“Slash 只使用真实 Registry candidate shape”。由于此前收口 Worker 违反调度指令，删除了未跟踪且可再生成的 `desktop/.runtime`、`desktop/.webpack`、`desktop/node_modules`、`desktop/packaging/.build`，返工后未擅自重建依赖或伪造原内容，因此未在最终两项返工后重跑 npm、bundle、Runtime smoke 或 CDP。本轮追加的最终证据为 Python 88 passed、Registry/slash 静态核对、`git diff --check` 与 Sol/medium Reviewer 源码/测试结构复审；Reviewer 最终输出 `APPROVED`，零阻塞 finding，但明确保留当前环境无法独立复跑 npm 的风险。
 
 该删除不涉及 tracked 文件，可通过项目既有依赖/构建命令重建，但删除前的机器本地内容无法精确恢复。`src/uthcode/application/bootstrap.py` 仍只有工作树换行状态，内容 diff 为空，不属于本轮提交。真实 Electron 中的滚动、Slash 键盘、选择器和上下文环仍未人工验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 17 轮追加：最终自动化、打包 Electron 视觉验收与 CDP 证据收口（2026-08-31）
+
+本轮通过项目既有命令正规重建了此前被误删的可再生成目录：`desktop/node_modules`、`.runtime`、`.webpack`、`out`与 `packaging/.build`。这些内容是当前 lockfile/构建的新产物，不写为对误删前机器本地内容的精确恢复；重建后产物保留，未再清理。`npm ci` 严格使用 lockfile 并未改写 `package-lock.json`，`npm ls --all --omit=optional` 返回 `problems=[]`。
+
+本轮精确验证：
+
+```text
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+conda run --no-capture-output -n re-uthcode npm test  (cwd=desktop)
+-> 92 passed，0 failed，0 skipped
+
+conda run --no-capture-output -n re-uthcode python -m pytest -q
+-> 1409 passed，3 skipped
+
+Python compileall / pip check / architecture
+-> compileall exit 0；pip check clean；architecture 23 passed
+
+Runtime / PyInstaller smoke
+-> passed；仅保留既有 tzdata hidden-import warning
+
+Webpack main / renderer
+-> passed
+
+npm run package -- --platform=win32 --arch=x64
+-> exit 0
+
+npm run make -- --platform=win32 --arch=x64
+-> exit 0
+
+Windows packaging 独立测试
+-> 4 passed
+
+CDP isolation / runtime
+-> 最终 CDP isolation 8 passed；完整 Desktop 套件总数已包含新增清理回归为 92 passed
+
+Settings acceptance
+-> 2 passed
+
+git diff --check
+-> exit 0，仅 LF -> CRLF line-ending 提示
+```
+
+未激活 Conda 的裸 `npm test` 曾因找不到项目 Python 出现 1 个环境性失败；按项目规则使用 `re-uthcode` Conda 环境后完整通过，不将裸命令失败记为生产回归。
+
+`desktop/scripts/cdp-driver.mjs` 现适配当前双语 DOM 与 `CustomSelect`：使用 `.sidebar`、`.settings-view`、`.composer textarea` 等当前结构，并以 `.custom-select__trigger` / `[role=option]` 执行真实主题和 Runtime layout 操作。修复未放宽 timeout、未 skip 或降低断言，未注入 Renderer fake state。新增 `cdp-packaged-visual-acceptance.mjs` 直接管理 packaged Electron/driver contexts，由实际 CDP run 自动生成报告、日志、截图和 hash。
+
+最终两份真实 packaged Electron 报告：
+
+- 英文：`desktop/dist/ui-acceptance/t10-electron-visual-en-1788177451294-2c22008a/acceptance-report.json`，5267 bytes，SHA256 `11452FFDFE2D4DB388B845A18731511FA919B920A0BAE863161CDAE83C7CEBE9`。
+- 中文：`desktop/dist/ui-acceptance/t10-electron-visual-zh-1788177462239-af308c7d/acceptance-report.json`，5288 bytes，SHA256 `37D3F254C52E848A9C43E43555E39D76075D7EC9BD9F78A9011276C5739A614A`。
+
+两份报告均由 `flow=visual` 真实 packaged Electron 运行产生，status 为 `passed`，分别记录 `en` / `zh-CN`，覆盖 dark/light、docked/floating/hidden、`1264x761` 与 `760x640`；每轮 5 张截图均保留 bytes/SHA256。`consoleErrors=0`、`rendererExceptions=0`、`driverExit=0`、`electronExit=0`；Electron sandbox 内部启动诊断单独保留为 `consoleDiagnostics` 和原始 stderr，没有被吞掉或伪装为零。使用的 `desktop/out/UthCode-win32-x64/UthCode.exe` 为 244,440,576 bytes，SHA256 `65A991399CB0FA49F1E4E105287668E55F6C13B494B871B529E780F2D7239CAA`。
+
+CDP launcher 使用 `--root-receipt` 发布本轮精确临时 root；正常、失败和 forced-timeout 的 runner `finally` 都只按 receipt 删除本轮 `uthcode-cdp-launch-*` root，并用旁系 sentinel 证明不扫删其他进程目录。修复后本轮 launcher roots/receipts/host/profile 残留均为 0，未删除 71 个旧历史 root；无 UthCode/Electron/Runtime/Edge/Python 残留，CDP 9333～9346 无监听。`127.0.0.1:7897` 仍由既有 `verge-mihomo.exe` 代理监听，未触碰。
+
+产物保留：
+
+- `desktop/.runtime/uthcode-runtime/uthcode-desktop-runtime.exe`：12,739,212 bytes，SHA256 `B81BCD408892449368A63696E5BF45DF05F1A0C5C0FA8427E8582BF1A7258CA8`。
+- `desktop/out/UthCode-win32-x64/resources/uthcode-runtime/uthcode-desktop-runtime.exe`：12,739,212 bytes，SHA256 `FD243D283E10FB0C7149CE3FCCB2D4E0A391D266604EB27D983ABF4358E861EE`。
+- `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`：175,595,008 bytes，SHA256 `8C2DC789421837BF58C4DBBD28A909272383DD6321D1D9168984226CEB323AA5`。
+- `desktop/out/make/squirrel.windows/x64/UthCode-0.1.0-full.nupkg`：174,913,243 bytes，SHA256 `63ED844410C4D31CED5CA82EEED99D0A971FEDAFF5A9E0B3CB2BC5FCCA6BE7DF`。
+- `desktop/out/make/squirrel.windows/x64/RELEASES`：78 bytes，SHA256 `44D380DC0CB5BB0D0835194C90ADAF78CA2843ECFEE68A456F5B34AD75DE4769`。
+
+本轮证据足以将 Checklist 第 116 项勾选为完成，但不支持第 87 项或人工清单：当前仍未在“无系统 Python 的干净 Windows 11 x64”执行 Installer 安装/启动/首配/对话/卸载，未使用真实 Provider/API key/网络调用，也未由人工完成全量 Feature Parity/UI 清单。因此 Checklist 第 87、119 项仍保持未完成，`docs/Context-Index.md` 只更新自动化当前事实，T10 仍为 `not_implemented`，不归档。
