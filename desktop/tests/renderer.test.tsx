@@ -16,8 +16,14 @@ import { App, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../
 import { ChatTimeline, renderMarkdown } from "../src/renderer/ChatTimeline";
 import { Composer, applyCompletion } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
-import { SettingsView, configurationRequest, parseOptionalPositiveInteger, renameModelRef, renameProviderId, settingsSaveRequest, withoutRecordKey } from "../src/renderer/SettingsView";
-import { RuntimePanel } from "../src/renderer/RuntimePanel";
+import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, renameModelRef, renameProviderId, settingsSaveRequest, withoutRecordKey } from "../src/renderer/SettingsView";
+import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/RuntimePanel";
+import { CustomSelect, customSelectConsumesEscape, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
+import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
+
+function renderLanguage(language: "zh-CN" | "en", element: React.ReactNode): string {
+  return renderToStaticMarkup(<LanguageProvider value={language}>{element}</LanguageProvider>);
+}
 
 function replayRecord(sequence: number, kind: string, text: string) {
   return {
@@ -102,10 +108,10 @@ test("T04 catalog and preference updates keep the active project/session navigat
 test("semantic shell mounts without prototype state", () => {
   const state: RendererState = createInitialState();
   const markup = renderToStaticMarkup(<App initialState={state} api={undefined} />);
-  assert.match(markup, /aria-label="UthCode conversation workspace"/);
-  assert.match(markup, /New chat/);
-  assert.match(markup, /Open project/);
-  assert.match(markup, /Settings/);
+  assert.match(markup, /aria-label="UthCode 对话工作区"/);
+  assert.match(markup, /新聊天/);
+  assert.match(markup, /打开项目/);
+  assert.match(markup, /设置/);
   assert.match(markup, /Runtime/);
   assert.doesNotMatch(markup, /Log out|Usage|account|Hover preview|demo/u);
   assert.doesNotMatch(markup, /prompt\(|confirm\(/u);
@@ -121,29 +127,29 @@ test("project groups, session state, and Runtime projections remain connected", 
     pinnedSessions: [{ projectKey: "C:/two", sessionId: "s2" }],
   });
   const appMarkup = renderToStaticMarkup(<App initialState={base} api={undefined} />);
-  assert.match(appMarkup, /aria-label="Project navigation"/);
+  assert.match(appMarkup, /aria-label="项目"/);
   assert.match(appMarkup, /One/);
   assert.match(appMarkup, /Two/);
   assert.match(appMarkup, /first/);
-  assert.match(appMarkup, />Pinned</);
-  assert.match(appMarkup, />Projects</);
-  assert.match(appMarkup, /aria-label="Remove One"/);
-  assert.match(appMarkup, /Pinned sessions/);
-  assert.match(appMarkup, /title="Unpin session second" aria-label="Unpin session second"/);
+  assert.match(appMarkup, />已置顶</);
+  assert.match(appMarkup, />项目</);
+  assert.match(appMarkup, /aria-label="移除 One"/);
+  assert.match(appMarkup, /已置顶会话/);
+  assert.match(appMarkup, /title="取消置顶 second" aria-label="取消置顶 second"/);
   assert.equal((appMarkup.match(/>second</gu) ?? []).length, 1);
   assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
-  assert.doesNotMatch(appMarkup, /aria-label="Pin session first"/);
+  assert.doesNotMatch(appMarkup, /aria-label="置顶 会话 first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
-    const panelMarkup = renderToStaticMarkup(<RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
+    const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
     assert.match(panelMarkup, /aria-label="Runtime information"/);
     assert.match(panelMarkup, new RegExp(`runtime-panel--${panelMode}`));
     assert.match(panelMarkup, /1,200 \/ 4,000/);
-    assert.match(panelMarkup, />plan</);
+    assert.match(panelMarkup, />PLAN</);
     assert.match(panelMarkup, />Run ID</);
     assert.match(panelMarkup, /provider\/model/);
-    assert.match(panelMarkup, />auto</);
-    if (panelMode === "hidden") assert.match(panelMarkup, /aria-hidden="true"/);
-    else assert.doesNotMatch(panelMarkup, /aria-hidden="true"/);
+    assert.match(panelMarkup, />Auto</);
+    if (panelMode === "hidden") assert.match(panelMarkup, /<aside[^>]*aria-hidden="true"/);
+    else assert.doesNotMatch(panelMarkup, /<aside[^>]*aria-hidden="true"/);
   }
 });
 
@@ -224,9 +230,9 @@ test("T05 Composer exposes separate steering, pause, cancel, and Python-backed c
     commandCandidates: [{ value: "/model", display: "/model", description: "Select a model" }],
   });
   const markup = renderToStaticMarkup(<Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
-  assert.match(markup, /Steer/);
-  assert.match(markup, /Pause/);
-  assert.match(markup, /Cancel/);
+  assert.match(markup, /引导/);
+  assert.match(markup, /暂停/);
+  assert.match(markup, /取消/);
   assert.match(markup, /Select a model/);
   assert.doesNotMatch(markup, /full command list|hard-coded/);
 });
@@ -246,9 +252,9 @@ test("T05 TaskState replaces the visible todo projection and terminal completion
 test("T06 pending interaction blocks Composer commands and keeps typed control identity", () => {
   const pending = createInitialState({ composerText: "/model", activeTurn: true, turnStatus: "paused", pendingInteraction: { kind: "user_requested", pauseId: "p", runId: "r", turnId: "t" }, commandCandidates: [{ value: "/model", description: "model" }] });
   const markup = renderToStaticMarkup(<Composer state={pending} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
-  assert.match(markup, /Waiting/);
+  assert.match(markup, /等待中/);
   assert.doesNotMatch(markup, /role="listbox"/u);
-  assert.doesNotMatch(markup, />Steer</u);
+  assert.doesNotMatch(markup, />引导</u);
 });
 
 test("T06 typed interaction response builders preserve the same pause identity", () => {
@@ -262,11 +268,11 @@ test("T06 typed interaction response builders preserve the same pause identity",
 
 test("T06 Interaction Surface uses dynamic Permission choices and never assumes session grant", () => {
   const interaction = { kind: "permission_required", pauseId: "pause-1", runId: "run-1", turnId: "turn-1", request: { permission_id: "perm-1", tool: "Bash", action: "execute", choices: ["once", "reject"] } } as const;
-  const markup = renderToStaticMarkup(<InteractionSurface interaction={interaction} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const markup = renderLanguage("en", <InteractionSurface interaction={interaction} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(markup, /Allow once/);
   assert.match(markup, /Reject/);
   assert.doesNotMatch(markup, /Allow for session/);
-  const sessionMarkup = renderToStaticMarkup(<InteractionSurface interaction={{ ...interaction, request: { ...interaction.request, choices: ["once", "session", "reject"] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const sessionMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...interaction, request: { ...interaction.request, choices: ["once", "session", "reject"] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(sessionMarkup, /Allow for session/);
 });
 
@@ -274,57 +280,53 @@ test("T06 Interaction Surface exposes AskUser review and Plan revision controls"
   const inputInteraction = { kind: "user_input_required", pauseId: "pause-1", runId: "run-1", turnId: "turn-1", toolCallId: "call-1", request: { questions: [{ question_id: "q1", header: "Name", question: "Your name?", kind: "text" }, { question_id: "q2", header: "Color", question: "Pick", kind: "single_select", options: [{ label: "Red", description: "warm" }, { label: "Blue", description: "cool" }], allow_other: true }] } } as const;
   const inputMarkup = renderToStaticMarkup(<InteractionSurface interaction={inputInteraction} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(inputMarkup, /Your name\?/);
-  assert.match(inputMarkup, /Next/);
-  assert.match(inputMarkup, /Cancel turn/);
+  assert.match(inputMarkup, /下一步/);
+  assert.match(inputMarkup, /取消轮次/);
   const planInteraction = { kind: "plan_review_required", pauseId: "pause-2", runId: "run-1", turnId: "turn-1", request: { revision: 3, plan_text: "Step one\nStep two" } } as const;
-  const planMarkup = renderToStaticMarkup(<InteractionSurface interaction={planInteraction} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const planMarkup = renderLanguage("en", <InteractionSurface interaction={planInteraction} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(planMarkup, /Revision 3/);
   assert.match(planMarkup, /Approve and execute/);
   assert.match(planMarkup, /Revision feedback/);
-  const multiMarkup = renderToStaticMarkup(<InteractionSurface interaction={{ ...inputInteraction, request: { questions: [{ question_id: "q1", header: "Tags", question: "Pick tags", kind: "multi_select", options: [{ label: "One", description: "first" }, { label: "Two", description: "second" }], allow_other: true }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const multiMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [{ question_id: "q1", header: "Tags", question: "Pick tags", kind: "multi_select", options: [{ label: "One", description: "first" }, { label: "Two", description: "second" }], allow_other: true }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(multiMarkup, /Pick tags/);
   assert.match(multiMarkup, /Other/);
 });
 
 test("T06 Provider Retry and user Pause render only typed continuation/cancel controls", () => {
   const retry = { kind: "provider_unavailable", pauseId: "pause-3", runId: "run-1", turnId: "turn-1", reason: "rate_limited" } as const;
-  const retryMarkup = renderToStaticMarkup(<InteractionSurface interaction={retry} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const retryMarkup = renderLanguage("en", <InteractionSurface interaction={retry} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(retryMarkup, /Retry/);
   assert.match(retryMarkup, /Cancel turn/);
   assert.doesNotMatch(retryMarkup, /backoff|reconnect|HTTP/u);
   const pause = { kind: "user_requested", pauseId: "pause-4", runId: "run-1", turnId: "turn-1", reason: "user_requested" } as const;
-  const pauseMarkup = renderToStaticMarkup(<InteractionSurface interaction={pause} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const pauseMarkup = renderLanguage("en", <InteractionSurface interaction={pause} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(pauseMarkup, /Continue/);
   assert.match(pauseMarkup, /Cancel turn/);
 });
 
 test("T07 Settings uses the current configuration view and does not render secret values", () => {
   const state = createInitialState({ configuration: { default_model: "fake/model", default_permission_mode: "auto", providers: { fake: { provider_profile_id: "fake", kind: "fake", base_url: null, api_key_configured: false } }, models: { "fake/model": { model_ref: "fake/model", provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
-  assert.match(markup, /Models|Providers|Permissions|Interface|About/);
+  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, /Provider 与模型|默认项|界面|关于/);
   assert.match(markup, /fake\/model/);
   assert.doesNotMatch(markup, /sk-live-secret|api_key=|secret value/u);
 });
 
 test("T07 rebuilt Settings and typed interactions keep accessible continuous and narrow layouts", async () => {
   const state = createInitialState({ runtimeState: "ready", theme: "light", configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", api_key_configured: true } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model" } } }, settingsLoaded: true });
-  const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
-  assert.match(settingsMarkup, /aria-label="Settings sections"/u);
-  assert.match(settingsMarkup, /aria-label="Visible settings groups"/u);
-  for (const id of ["providers", "models", "defaults", "interface", "about"]) {
+  const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(settingsMarkup, /aria-label="设置"/u);
+  for (const id of ["providers", "defaults", "interface", "about"]) {
     assert.match(settingsMarkup, new RegExp(`href="#settings-${id}"`));
     assert.match(settingsMarkup, new RegExp(`id="settings-${id}"`));
   }
   assert.doesNotMatch(settingsMarkup, /aria-current=/u);
-  assert.match(settingsMarkup, /aria-label="fake provider"/u);
-  assert.match(settingsMarkup, /aria-label="Remove provider fake"/u);
-  assert.match(settingsMarkup, /aria-label="Clear API key for provider fake"/u);
-  assert.match(settingsMarkup, /aria-label="Remove model fake\/model"/u);
-  assert.match(settingsMarkup, /<label[^>]*for="default-model"[^>]*>Default model<\/label><select id="default-model"/u);
-  assert.match(settingsMarkup, /configured/u);
-  assert.match(settingsMarkup, /Replace API key/u);
+  assert.match(settingsMarkup, /class="provider-row"[^>]*fake/u);
+  assert.match(settingsMarkup, /fake\/model/u);
+  assert.match(settingsMarkup, /已配置/u);
+  assert.doesNotMatch(settingsMarkup, /<select|legacy-settings-editor/u);
   const permission = { kind: "permission_required", pauseId: "pause-a11y", runId: "run-a11y", turnId: "turn-a11y", request: { permission_id: "permission-a11y", choices: ["once", "reject"] } } as const;
-  const interactionMarkup = renderToStaticMarkup(<InteractionSurface interaction={permission} onSubmit={() => undefined} onCancel={() => undefined} />);
+  const interactionMarkup = renderLanguage("en", <InteractionSurface interaction={permission} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(interactionMarkup, /aria-label="Permission approval"/u);
   assert.match(interactionMarkup, /type="button"/u);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
@@ -357,10 +359,26 @@ test("T07 four-field setup writes a valid OpenAI-compatible candidate without gu
   assert.deepEqual(request.models?.model, { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
 });
 
+test("Prompt 2 provider editor groups and preserves every existing model field", () => {
+  assert.equal(modelFieldId("dialog", "a/b", "remote"), "dialog-0061-002f-0062-remote");
+  assert.equal(modelFieldId("dialog", "a/b", "remote"), modelFieldId("dialog", "a/b", "remote"));
+  assert.notEqual(modelFieldId("dialog", "a/b", "remote"), modelFieldId("dialog", "a-b", "remote"));
+  assert.notEqual(modelFieldId("dialog", "中文", "remote"), modelFieldId("dialog", "--", "remote"));
+  assert.notEqual(modelFieldId("dialog", "", "remote"), modelFieldId("dialog", "empty", "remote"));
+  assert.notEqual(modelFieldId("dialog", "one/model", "remote"), modelFieldId("dialog", "two/model", "remote"));
+  assert.deepEqual(reasoningEffortOptions, ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  assert.equal(reasoningEffortOptions.includes("invalid" as never), false);
+  const draft = { providers: { provider: { kind: "openai_compat" } }, models: { primary: { provider_profile_id: "provider", remote_id: "one", display_name: "One", context_window: 128000, max_output_tokens: 8192, reasoning_effort: "high" }, secondary: { provider_profile_id: "provider", remote_id: "two", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null }, other: { provider_profile_id: "other", remote_id: "three" } } };
+  assert.deepEqual(providerModels(draft, "provider"), [["primary", draft.models.primary], ["secondary", draft.models.secondary]]);
+  const request = settingsSaveRequest(draft, {}, {});
+  assert.deepEqual(request.models?.primary, draft.models.primary);
+  assert.deepEqual(request.models?.secondary, draft.models.secondary);
+});
+
 test("T07 missing optional model fields stay null instead of becoming invalid empty strings", () => {
   const state = createInitialState({ configuration: { default_model: "provider/model", default_permission_mode: "default", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
-  assert.match(markup, /aria-label="provider\/model display name"[^>]*value=""/u);
+  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, /provider\/model/u);
   const request = settingsSaveRequest({ default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1" } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } } }, {}, {});
   assert.deepEqual(request.models?.["provider/model"], { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
   assert.doesNotMatch(JSON.stringify(request), /"display_name":""/u);
@@ -537,7 +555,7 @@ test("T06 permission projection is cleared at fresh Run boundaries and only set 
   state = reduceRendererState(state, { type: "session_new", sessionId: "session-one", run: { run_id: "run-two" } });
   assert.equal(state.permissionMode, "unknown");
   const markup = renderToStaticMarkup(<Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
-  assert.match(markup, /Unavailable/);
+  assert.match(markup, /不可用|Unavailable/);
   state = reduceRendererState(state, { type: "command_result", result: { ui_action: { type: "permission_mode_selected", mode: "auto" }, output: "Permission mode: auto" } });
   assert.equal(state.permissionMode, "auto");
 });
@@ -570,13 +588,9 @@ test("T06 runtime initialization updates permission from its safe Run projection
 
 test("T07 Settings exposes editable schema IDs and model context/token limits", () => {
   const state = createInitialState({ configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", base_url: null, api_key_configured: false } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} />);
-  assert.match(markup, /aria-label="fake provider id"/);
-  assert.match(markup, /aria-label="fake\/model model ref"/);
-  assert.match(markup, /aria-label="fake\/model context window"/);
-  assert.match(markup, /aria-label="fake\/model max output tokens"/);
-  assert.match(markup, /value="128000"/);
-  assert.match(markup, /value="4096"/);
+  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, /fake\/model/);
+  assert.doesNotMatch(markup, /context window|max output tokens|legacy-settings-editor/i);
   assert.equal(parseOptionalPositiveInteger("128000"), 128000);
   assert.equal(parseOptionalPositiveInteger(""), null);
   const renamedProvider = renameProviderId({ providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } }, providerOriginalIds: { fake: "fake" } }, "fake", "local");
@@ -610,33 +624,58 @@ test("T07 Settings exposes editable schema IDs and model context/token limits", 
 
 test("Prompt 1 hidden Runtime is restored only from the chat header", () => {
   const markup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "hidden" })} api={undefined} />);
-  assert.match(markup, /title="Toggle Runtime" aria-label="Toggle Runtime panel"/);
+  assert.match(markup, /title="切换 Runtime" aria-label="切换 Runtime"/);
   assert.doesNotMatch(markup, />Open Runtime</);
   assert.doesNotMatch(markup, /Compact Session|Show status/);
 });
 
+test("Prompt 2 locale resources have exact parity and custom select skips disabled options", () => {
+  assert.equal(customSelectConsumesEscape(false), false);
+  assert.equal(customSelectConsumesEscape(true), true);
+  assert.equal(stateLabel("pausing", (key) => translate("zh-CN", key)), "正在暂停…");
+  assert.equal(stateLabel("provider-payload", (key) => translate("zh-CN", key)), "provider-payload");
+  assert.equal(initialEnabledOption([{ value: "", label: "Choose", disabled: true }, { value: "a", label: "A" }], ""), 1);
+  assert.equal(initialEnabledOption([{ value: "a", label: "A" }, { value: "b", label: "B" }], "b"), 1);
+  assert.equal(initialEnabledOption([{ value: "a", label: "A", disabled: true }], "a"), -1);
+  assert.deepEqual(Object.keys(resources.en).sort(), Object.keys(resources["zh-CN"]).sort());
+  assert.equal(translate("en", "settings"), "Settings");
+  assert.equal(translate("zh-CN", "settings"), "设置");
+  const options = [{ value: "none", label: "None", disabled: true }, { value: "a", label: "A" }, { value: "b", label: "B" }];
+  assert.equal(nextEnabledOption(options, 2, 1), 1);
+  assert.equal(nextEnabledOption(options, 1, -1), 2);
+  const source = require("node:fs").readFileSync(new URL("../src/renderer/CustomSelect.tsx", import.meta.url), "utf8");
+  for (const key of ["Enter", " ", "ArrowDown", "ArrowUp", "Home", "End", "Escape", "Tab"]) assert.match(source, new RegExp(JSON.stringify(key).slice(1, -1).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.doesNotMatch(source, /aria-activedescendant/u);
+  assert.match(source, /event\.stopPropagation\(\)/u);
+  const settingsSource = require("node:fs").readFileSync(new URL("../src/renderer/SettingsView.tsx", import.meta.url), "utf8");
+  assert.match(settingsSource, /event\.defaultPrevented/u);
+  const selectMarkup = renderToStaticMarkup(<><CustomSelect value="a" label="First" options={[{ value: "a", label: "A" }]} onChange={() => undefined} /><CustomSelect value="b" label="Second" options={[{ value: "b", label: "B" }]} onChange={() => undefined} /></>);
+  assert.match(selectMarkup, /aria-haspopup="listbox"/u);
+  assert.match(selectMarkup, /aria-expanded="false"/u);
+  const controls = [...selectMarkup.matchAll(/aria-controls="([^"]+)"/gu)].map((match) => match[1]);
+  assert.equal(new Set(controls).size, 2);
+  const selectSources = ["Composer.tsx", "RuntimePanel.tsx", "SettingsView.tsx"].map((name) => require("node:fs").readFileSync(new URL(`../src/renderer/${name}`, import.meta.url), "utf8")).join("\n");
+  assert.doesNotMatch(selectSources, /<select/u);
+  const english = renderToStaticMarkup(<App initialState={createInitialState({ language: "en", view: "settings", settingsLoaded: true })} api={undefined} />);
+  const chinese = renderToStaticMarkup(<App initialState={createInitialState({ language: "zh-CN", view: "settings", settingsLoaded: true })} api={undefined} />);
+  assert.match(english, />Settings</);
+  assert.match(chinese, />设置</);
+});
+
 test("T07 Runtime switch and three layout modes remain operational", async () => {
   const dockedMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "docked" })} api={undefined} />);
-  assert.match(dockedMarkup, /aria-label="Toggle Runtime panel"/);
+  assert.match(dockedMarkup, /aria-label="切换 Runtime"/);
   const floatingMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "floating" })} api={undefined} />);
   assert.match(floatingMarkup, /runtime-panel--floating/);
   const settingsMarkup = renderToStaticMarkup(<App initialState={createInitialState({ view: "settings", panelMode: "docked", settingsLoaded: true })} api={undefined} />);
   assert.match(settingsMarkup, /class="app-shell theme-system panel-docked settings-shell"/);
-  assert.match(settingsMarkup, /aria-label="Settings sections"/);
+  assert.match(settingsMarkup, /aria-label="设置"/);
   assert.doesNotMatch(settingsMarkup, /aria-label="Project navigation"|aria-label="Runtime information"|settings-runtime|>READY<|>Ready</);
   assert.doesNotMatch(settingsMarkup, /Connect the service that runs your models|Use the model name expected by your provider|Default permission mode for new Runs|Appearance preferences are stored on this Desktop installation/);
   const selectedModes: string[] = [];
-  const panel = RuntimePanel({ state: createInitialState({ panelMode: "docked" }), onPanelModeChange: (mode) => selectedModes.push(mode) });
-  const findSelect = (node: React.ReactNode): React.ReactElement<{ onChange: (event: { target: { value: string } }) => void }> | null => {
-    if (!React.isValidElement(node)) return null;
-    if (node.type === "select") return node as React.ReactElement<{ onChange: (event: { target: { value: string } }) => void }>;
-    const children = (node.props as { children?: React.ReactNode }).children;
-    for (const child of React.Children.toArray(children)) { const found = findSelect(child); if (found) return found; }
-    return null;
-  };
-  const modeSelect = findSelect(panel);
-  assert.ok(modeSelect);
-  for (const value of ["floating", "docked", "hidden"]) modeSelect.props.onChange({ target: { value } });
+  const modeSelect = RuntimeLayoutSelect({ value: "docked", onChange: (mode) => selectedModes.push(mode), labels: { control: "Layout", docked: "Docked", floating: "Floating", hidden: "Hidden" } }) as React.ReactElement<{ onChange: (value: string) => void }>;
+  assert.equal(modeSelect.type, CustomSelect);
+  for (const value of ["floating", "docked", "hidden"]) modeSelect.props.onChange(value);
   assert.deepEqual(selectedModes, ["floating", "docked", "hidden"]);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.runtime-panel--docked\s*\{[^}]*position:\s*relative[^}]*width:/s);

@@ -595,7 +595,10 @@ test("desktop preferences persist only allowlisted UI metadata", async () => {
   try {
     const preferences = new DesktopPreferences(file);
     assert.deepEqual(await preferences.read(), DEFAULT_DESKTOP_PREFERENCES);
+    await writeFile(file, JSON.stringify({ theme: "dark" }), "utf8");
+    assert.equal((await preferences.read()).language, "zh-CN");
     await preferences.write("theme", "dark");
+    await preferences.write("language", "en");
     await preferences.write("selectedProjectKey", "C:\\Projects\\UthCode");
     await preferences.write("recentProjects", [
       { path: "C:\\Projects\\UthCode", alias: "Work", pinned: true },
@@ -607,6 +610,8 @@ test("desktop preferences persist only allowlisted UI metadata", async () => {
     const raw = await readFile(file, "utf8");
     assert.equal(raw.includes("api-key"), false);
     assert.deepEqual((await preferences.read()).theme, "dark");
+    assert.deepEqual((await preferences.read()).language, "en");
+    await assert.rejects(preferences.write("language", "fr" as never), /language must be/);
     assert.deepEqual((await preferences.read()).pinnedSessions, [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]);
     await assert.rejects(preferences.write("pinnedSessions", [{ projectKey: "", sessionId: "session-1" }]), /non-empty string/);
     await assert.rejects(preferences.write("pinnedSessions", [{ projectKey: "project", sessionId: "session", extra: true } as never]), /unknown fields/);

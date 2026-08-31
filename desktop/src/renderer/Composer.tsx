@@ -1,5 +1,8 @@
 import type { KeyboardEvent } from "react";
 import type { PermissionModeProjection, RendererState } from "./state";
+import { CustomSelect } from "./CustomSelect";
+import { useTranslation } from "./i18n";
+import { stateLabel } from "./RuntimePanel";
 
 /** Replace only the token currently being completed, preserving slash aliases. */
 export function applyCompletion(prefix: string, completion: string): string {
@@ -22,6 +25,7 @@ export interface ComposerProps {
 }
 
 export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCancel }: ComposerProps) {
+  const { t } = useTranslation();
   const hasText = state.composerText.trim().length > 0;
   const slashMode = state.composerText.trimStart().startsWith("/");
   const pending = state.pendingInteraction !== null;
@@ -44,28 +48,28 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   };
 
   return (
-    <section className="composer" aria-label="Composer" aria-disabled={pending || undefined}>
-      {candidates.length > 0 && <div className="command-menu" role="listbox" aria-label="Command completion">
+    <section className="composer" aria-label={t("composer")} aria-disabled={pending || undefined}>
+      {candidates.length > 0 && <div className="command-menu" role="listbox" aria-label={t("commandCompletion")}>
         {candidates.map((candidate, index) => <button type="button" key={`${candidate.value}-${index}`} role="option" onClick={() => onChange(applyCompletion(state.composerText, candidate.value))}><span>{candidate.display || candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
       <div className="composer-toolbar">
         <div className="composer-selectors">
-          <button type="button" className={state.run?.behavior_mode === "plan" ? "is-plan" : ""} onClick={() => void onCommand(state.run?.behavior_mode === "plan" ? "/do" : "/plan")} disabled={pending || state.activeTurn}>{state.run?.behavior_mode === "plan" ? "PLAN" : "DEFAULT"}</button>
-          <label><span className="sr-only">Permission</span><select aria-label="Permission" value={permissionSelectValue(state.permissionMode)} disabled={pending || state.activeTurn} onChange={(event) => void onCommand(`/permission ${event.target.value}`)}><option value="" disabled>Unavailable</option><option value="default">default</option><option value="auto">auto</option><option value="full_access">full_access</option></select></label>
-          {state.modelPickerOpen ? <label><span className="sr-only">Model</span><select aria-label="Model" autoFocus value="" onChange={(event) => void onCommand(`/model ${event.target.value}`)} disabled={pending || state.activeTurn}><option value="">Choose model</option>{state.modelCandidates.map((model) => <option value={model} key={model}>{model}</option>)}</select></label> : <button type="button" onClick={() => void onCommand("/model")} disabled={pending || state.activeTurn}>Model</button>}
+          <button type="button" title={state.run?.behavior_mode === "plan" ? t("plan") : t("default")} className={state.run?.behavior_mode === "plan" ? "is-plan" : ""} onClick={() => void onCommand(state.run?.behavior_mode === "plan" ? "/do" : "/plan")} disabled={pending || state.activeTurn}>{state.run?.behavior_mode === "plan" ? t("plan") : t("default")}</button>
+          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={pending || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
+          {state.modelPickerOpen ? <CustomSelect label={t("model")} value="" onChange={(value) => void onCommand(`/model ${value}`)} disabled={pending || state.activeTurn} options={[{ value: "", label: t("chooseModel"), disabled: true }, ...state.modelCandidates.map((model) => ({ value: model, label: model }))]} /> : <button type="button" title={t("model")} onClick={() => void onCommand("/model")} disabled={pending || state.activeTurn}>{t("model")}</button>}
         </div>
-        <output className="composer-state">{pending ? "Interaction required" : state.activeTurn ? state.turnStatus : "Ready"}</output>
+        <output className="composer-state">{pending ? t("interactionRequired") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
       </div>
       <div className="composer-input">
-        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} placeholder={pending ? "Complete the interaction above" : state.activeTurn ? "Send steering to the active Turn" : "Message UthCode"} disabled={pending} rows={3} aria-label="Message UthCode" />
+        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} placeholder={pending ? t("completeInteraction") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={pending} rows={3} aria-label={t("message")} />
         <div className="composer-actions">
-          {state.activeTurn && !pending && <button type="button" onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}>Pause</button>}
-          {state.activeTurn && <button type="button" onClick={() => void onCancel()}>Cancel</button>}
-          <button type="button" onClick={submit} disabled={pending || !hasText}>{pending ? "Waiting" : state.activeTurn ? "Steer" : "Send"}</button>
+          {state.activeTurn && !pending && <button type="button" title={t("pause")} onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}>{t("pause")}</button>}
+          {state.activeTurn && <button type="button" title={t("cancel")} onClick={() => void onCancel()}>{t("cancel")}</button>}
+          <button type="button" title={pending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={pending || !hasText}>{pending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
         </div>
       </div>
-      <p className="composer-hint">Enter to send · Shift+Enter for a new line</p>
+      <p className="composer-hint">{t("composerHint")}</p>
     </section>
   );
 }

@@ -765,3 +765,42 @@ git diff --check
 生产组件视觉证据位于 `desktop/dist/ui-acceptance/prompt-1/`，覆盖 dark/light、floating/docked、Settings、窄窗口，以及最终 800×720 `runtime-docked-800.png`。Sol/medium Reviewer 经三轮复审，先拦截 Settings Runtime 泄漏、说明性副标题、tooltip 与三态/窄屏覆盖缺口，再拦截最小窗口 Composer 不可用回归；修复后输出 `APPROVED`。
 
 普通环境执行完整 `npm test` 得到 76 passed、1 failed；唯一失败是命令未进入 `re-uthcode` Conda 环境而找不到项目 Python，失败的 Runtime suite 随后在指定 Conda 环境 14/14 通过。完整测试会管理未跟踪的 `.runtime`、`.webpack` 与 packaging build 目录；本轮没有执行显式清理或停止用户进程，但开工前未记录的 `.runtime` 内容无法原样证明或恢复，生成目录随后由测试重新建立且未进入 tracked diff。真实 Electron 窗口截图与 `Menu.setApplicationMenu(null)` 后菜单角色/快捷键交互仍未验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。
+
+### 返工第 13 轮追加：Provider 行式编辑、双语资源与稳定下拉控件（2026-08-31）
+
+Settings 将原 Providers 与 Models 两个连续编辑区收敛为一个 Provider 列表：每个 Provider 仅占一行，展示类型、Base URL、主要模型、附加模型数量与 API Key 配置状态；点击行或编辑按钮打开统一 modal。Modal 默认只显示 Provider、Base URL、Model 与 API Key，内部 profile ID、Provider kind、全部模型 reference/remote ID/display name/context/max output/reasoning effort 进入默认折叠的 Advanced。合法的零模型 Provider 也可编辑并创建首个模型；Advanced 支持对当前 Provider 新增、删除和编辑多个模型。删除默认模型时按“当前 Provider 剩余首个 -> 全局剩余首个 -> 无默认值”收敛，Provider 重命名、删除、API Key replace/clear 与 transient 标记保持同一完整 draft 语义。
+
+Modal 打开时保存完整 Renderer draft 快照；`×`、Escape、backdrop 与 Cancel 恢复 Provider/Model/default model/API Key transient 等全部修改，Apply 只将编辑结果保留到 Settings 页面 draft，不触发全页保存。Modal 使用首个可编辑字段初始焦点、Tab/Shift+Tab 焦点陷阱、关闭后触发器焦点恢复；背景 Settings nav/content 在打开期间设置 `inert` 与 `aria-hidden` 并在关闭或卸载时恢复。Advanced label/control 使用带组件 `useId` 前缀的可逆 UTF-16 十六进制模型引用编码，避免 `a/b`、`a-b` 与中文引用碰撞。
+
+Desktop Renderer 新增 `zh-CN` 与 `en` 两个独立 typed locale 资源，Settings 提供语言选择；语言作为 Desktop 本地 preference 持久化，旧偏好文档缺字段时回退 `zh-CN`。Settings、Sidebar、Timeline、Interaction、Composer、Runtime 与本地 fallback/notice 的固定文案经统一 accessor 翻译；Provider/Model/project/session 数据、命令数据以及 Runtime/Application 的真实 message/error/reason/event payload 保持原文。语言切换立即生效，后续 callback fallback 通过稳定翻译函数读取最新语言，不保留旧语言闭包。
+
+Renderer 原有九个 native select 全部替换为同一 `CustomSelect`。组件采用单一 option-focus/listbox 模型：enabled 初始项、roving `tabIndex`、Arrow/Home/End、Enter/Space、Escape、Tab/Shift+Tab、focusout 与 outside pointer 均有明确行为；disabled 项不可聚焦或选择，多实例 ID 唯一。Modal 内第一次 Escape 仅关闭打开的 Select，第二次 Escape 才取消 Modal。
+
+本轮精确验证：
+
+```text
+npm run typecheck  (cwd=desktop)
+-> exit 0
+
+Renderer 定向测试
+-> 45 passed，0 failed
+
+Renderer、Preload、Main、acceptance isolation 定向复审
+-> 55 passed，0 failed
+
+Conda Desktop 完整 npm test（Reviewer 首轮）
+-> 79 passed，0 failed
+
+Python Desktop/协议/架构定向测试
+-> 88 passed，0 failed
+
+Hydrated acceptance：Renderer + isolation + CDP
+-> 54 passed，0 failed
+
+git diff --check
+-> exit 0，仅 line-ending 提示
+```
+
+测试专用 hydrated fixture 仅位于 `desktop/tests` 与 `desktop/scripts`，production entry/import graph 与 bundle isolation 测试证明其不进入生产应用。CDP 使用动态端口、独立 Edge profile、请求 timeout 与 `try/finally`；注入失败测试验证只终止自身浏览器树、socket/pending request 清零且精确 profile 删除。浏览器验证覆盖 CustomSelect 全键盘/焦点行为、Modal focus trap/inert/Cancel/Apply、零模型与多模型 CRUD、Provider rename/delete、API Key transient，以及生产 `App` 配合 test-only fake `DesktopApi` 的 language read/write/即时切换/reload 恢复。六张 canonical 截图位于 `desktop/dist/ui-acceptance/prompt-2/`，覆盖 dark/light、zh/en、narrow 与 Provider modal；控制台错误为 0，未见独立 Models section、双侧栏、Runtime、说明性副标题、乱码或横向裁切。
+
+Sol/medium Reviewer 多轮拦截并复核了多模型 CRUD、零模型 Provider、reasoning effort 非法自由文本、Modal 取消/焦点语义、CustomSelect ARIA/键盘模型、固定文案遗漏、CDP 清理边界、嵌套 Escape 与动态 ID 碰撞，最终输出 `APPROVED`。残余风险：完整 `npm test` 并行执行时 offline Desktop Runtime 曾出现一次时序失败且未自行收尾，该用例独立复跑通过；真实 Electron 菜单角色/快捷键交互仍未验证。本轮不新增 Checklist 勾选，T10 继续保持 `not_implemented`。

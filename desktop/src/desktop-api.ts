@@ -4,6 +4,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 export type JsonObject = { [key: string]: JsonValue };
 
 export type ThemePreference = "system" | "dark" | "light";
+export type LanguagePreference = "zh-CN" | "en";
 export type PanelModePreference = "hidden" | "docked" | "floating";
 
 export interface WindowBoundsPreference {
@@ -24,6 +25,7 @@ export interface PinnedSessionPreference { projectKey: string; sessionId: string
 
 export interface DesktopPreferences {
   theme: ThemePreference;
+  language: LanguagePreference;
   windowBounds: WindowBoundsPreference;
   panelMode: PanelModePreference;
   recentProjects: RecentProjectPreference[];
@@ -36,6 +38,7 @@ export interface DesktopPreferences {
 
 export const PREFERENCE_KEYS = [
   "theme",
+  "language",
   "windowBounds",
   "panelMode",
   "recentProjects",
