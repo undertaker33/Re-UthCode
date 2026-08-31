@@ -96,7 +96,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .conversation-actions { display: flex; gap: 2px; }
 .text-button { border: 0; border-radius: 6px; padding: 6px 8px; color: var(--muted); background: transparent; font-size: 11px; }
 
-.timeline { position: absolute; inset: 50px 0 0; overflow: auto; padding: 34px 30px 188px; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.timeline { position: absolute; inset: 50px 0 0; overflow: auto; padding: 34px 30px max(188px, calc(var(--composer-height, 0px) + 30px)); scroll-padding-bottom: max(188px, calc(var(--composer-height, 0px) + 30px)); scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .timeline-entry, .timeline-notice, .todo-strip { width: min(820px, calc(100% - 20px)); margin-inline: auto; }
 .timeline-entry { margin-bottom: 26px; }
 .timeline-entry > header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
@@ -124,11 +124,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .todo-strip li { color: var(--muted); font-size: 12px; }
 
 .composer { position: absolute; right: max(24px, calc((100% - 820px) / 2)); bottom: 18px; left: max(24px, calc((100% - 820px) / 2)); z-index: 5; border: 1px solid var(--line-strong); border-radius: 15px; padding: 9px 11px 8px; background: var(--surface); box-shadow: 0 18px 44px var(--shadow); }
-.composer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.composer-selectors { display: flex; align-items: center; gap: 5px; }
-.composer-selectors button, .composer-selectors select { min-height: 27px; border: 0; border-radius: 6px; padding: 0 7px; color: var(--muted); background: transparent; font-size: 10px; }
-.composer-selectors button:hover, .composer-selectors select:hover, .composer-selectors .is-plan { color: var(--text); background: var(--raised); }
-.composer-state { color: var(--faint); font-size: 10px; text-transform: uppercase; }
+.composer-toolbar { display: flex; min-width: 0; align-items: center; gap: 9px; margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+.composer-selectors { display: flex; min-width: 0; align-items: center; }
+.composer-selectors .custom-select { width: 138px; }
+.composer-state { min-width: 0; overflow: hidden; color: var(--faint); font-size: 10px; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.composer-model { display: flex; min-width: 0; align-items: center; gap: 8px; margin-left: auto; }
+.composer-model .custom-select { width: clamp(138px, 22vw, 230px); min-width: 0; }
+.composer-model .custom-select__trigger { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.context-ring { position: relative; display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
+.context-ring svg { position: absolute; inset: 0; width: 32px; height: 32px; transform: rotate(-90deg); }
+.context-ring circle { fill: none; stroke-width: 2.5; }
+.context-ring__track { stroke: var(--line-strong); }
+.context-ring__progress { stroke: var(--accent-strong); stroke-linecap: round; transition: stroke-dashoffset 180ms ease, stroke 180ms ease; }
+.context-ring.is-warning { color: var(--danger); }
+.context-ring.is-warning .context-ring__progress { stroke: var(--danger); }
+.context-ring.is-critical .context-ring__progress { stroke: var(--danger); }
 .composer-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
 .composer textarea { min-height: 52px; max-height: 150px; resize: vertical; border: 0; padding: 9px 3px 3px; color: var(--text); background: transparent; line-height: 1.5; }
 .composer textarea:focus { outline: 0; }
@@ -136,9 +146,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-actions button { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; color: var(--muted); background: var(--raised); font-size: 11px; }
 .composer-actions button:last-child { border-color: var(--accent); color: #fff; background: #5158c9; }
 .composer-hint { margin: 4px 2px 0; color: var(--faint); font-size: 9px; }
-.command-menu { position: absolute; right: 0; bottom: calc(100% + 7px); left: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 12px 30px var(--shadow); }
+.command-menu { position: absolute; right: 0; bottom: calc(100% + 7px); left: 0; max-height: min(340px, calc(100vh - 110px)); overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 12px 30px var(--shadow); }
 .command-menu button { display: flex; width: 100%; justify-content: space-between; border: 0; border-bottom: 1px solid var(--line); padding: 8px 10px; color: var(--text); background: transparent; text-align: left; }
-.command-menu button:hover { background: var(--raised); }
+.command-menu button:hover, .command-menu button.is-active { background: var(--raised); }
+.command-menu button:disabled { color: var(--faint); background: transparent; }
+.command-menu button small { margin-left: 12px; color: var(--muted); }
+.command-menu > p { margin: 0; border-top: 1px solid var(--line); padding: 8px 10px; color: var(--faint); font-size: 10px; }
 
 .runtime-panel { height: 100vh; overflow: auto; border-left: 1px solid var(--line); padding: 15px; background: var(--sidebar); }
 .runtime-panel--docked { position: relative; width: 318px; }
@@ -256,11 +269,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .app-shell { --sidebar-width: 196px; }
   .timeline { padding-inline: 16px; }
   .timeline-entry, .timeline-notice, .todo-strip { width: 100%; }
-  .app-shell.panel-docked .timeline { padding-bottom: 286px; }
+  .app-shell.panel-docked .timeline { padding-bottom: 286px; padding-bottom: max(286px, calc(var(--composer-height, 0px) + 34px)); scroll-padding-bottom: max(286px, calc(var(--composer-height, 0px) + 34px)); }
   .app-shell.panel-docked .composer { padding: 9px; }
-  .app-shell.panel-docked .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
-  .app-shell.panel-docked .composer-selectors { min-width: 0; flex-wrap: wrap; }
-  .app-shell.panel-docked .composer-state { justify-self: start; }
+  .app-shell.panel-docked .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+  .app-shell.panel-docked .composer-selectors { min-width: 0; }
+  .app-shell.panel-docked .composer-selectors .custom-select { width: min(138px, 100%); }
+  .app-shell.panel-docked .composer-state { justify-self: end; }
+  .app-shell.panel-docked .composer-model { grid-column: 1 / -1; justify-content: flex-end; margin-left: 0; }
+  .app-shell.panel-docked .composer-model .custom-select { width: min(230px, calc(100% - 40px)); }
   .app-shell.panel-docked .composer-input { display: flex; min-width: 0; flex-direction: column; align-items: stretch; gap: 6px; }
   .app-shell.panel-docked .composer textarea { width: 100%; min-width: 0; min-height: 72px; resize: vertical; overflow-wrap: normal; word-break: normal; }
   .app-shell.panel-docked .composer-actions { flex-wrap: wrap; justify-content: flex-end; }

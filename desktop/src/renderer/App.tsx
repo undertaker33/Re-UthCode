@@ -152,6 +152,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [send]);
 
+  const refreshConfiguration = useCallback(async () => {
+    try {
+      const result = asObject(await send("settings.get", {}));
+      dispatch({ type: "settings_loaded", configuration: asObject(result.configuration) as ConfigurationView });
+    } catch {
+      // An unconfigured Runtime is expected to reject this supplementary read;
+      // the explicit Settings flow still reports the actionable error.
+    }
+  }, [send]);
+
   const openProjectPath = useCallback(async (path: string) => {
     try {
       const result = await send("project.open", { path });
@@ -162,6 +172,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await persist("recentProjects", projectPreferences(next));
       await persist("selectedProjectKey", path);
       await refreshCatalog(path);
+      await refreshRuntimeStatus();
+      await refreshConfiguration();
     } catch (error) {
       const existing = stateRef.current.projects.find((project) => project.projectKey === path);
       const project = existing ?? { path, projectKey: path, alias: path.split(/[\\/]/u).filter(Boolean).pop() || path, pinned: false, sessions: [], catalogFresh: false };
@@ -172,7 +184,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "runtime_error", message: errorMessage(error, t("projectOpenFailed")), state: "configuration_required" });
       dispatch({ type: "set_view", view: "settings" });
     }
-  }, [persist, refreshCatalog, send]);
+  }, [persist, refreshCatalog, refreshConfiguration, send]);
 
   useEffect(() => {
     if (!api) {
@@ -181,7 +193,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
     let cancelled = false;
     const unsubscribe = api.subscribeAgentEvents((event) => {
-      if (!cancelled) dispatch({ type: "agent_event", event });
+      if (cancelled) return;
+      dispatch({ type: "agent_event", event });
+      if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled") void refreshRuntimeStatus();
     });
     void Promise.all([
       api.readPreference("theme"),
@@ -202,11 +216,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         void send("runtime.initialize", { workdir: selected.path }).then((result) => {
           if (cancelled) return;
           dispatch({ type: "runtime_initialized", result });
+          void refreshConfiguration();
           void refreshRuntimeStatus();
           void refreshCatalog(selected.path);
           if (selectedSessionId) {
             void send("session.resume", { session_id: selectedSessionId }).then((resumed) => {
-              if (!cancelled) dispatch({ type: "session_resumed", result: resumed });
+              if (!cancelled) {
+                dispatch({ type: "session_resumed", result: resumed });
+                void refreshRuntimeStatus();
+              }
             }).catch((error) => {
               if (!cancelled) dispatch({ type: "notice", text: errorMessage(error, t("sessionResumeFailed")) });
             });
@@ -270,6 +288,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         }
       }
       await refreshCatalog(project.projectKey);
+      await refreshRuntimeStatus();
     } catch (error) {
       dispatch({ type: "runtime_error", message: errorMessage(error, t("sessionOpenFailed")), state: "ready" });
     }
@@ -300,6 +319,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (action.type === "session_changed" && typeof action.session_id === "string") {
         await persist("selectedSessionId", action.session_id);
         await refreshCatalog(stateRef.current.selectedProjectKey ?? "");
+        await refreshRuntimeStatus();
       }
       if (action.type === "quit_interface") {
         await api.closeShell();
@@ -569,9 +589,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <button type="button" className="icon-button" title={t("toggleRuntime")} aria-label={t("toggleRuntime")} onClick={toggleRuntime}><UiIcon name="panel" /></button>
         </div>
       </header>
-      <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} />
+      <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`} />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
-      <Composer state={state} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
+      <Composer state={state} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
     </>
   );
 

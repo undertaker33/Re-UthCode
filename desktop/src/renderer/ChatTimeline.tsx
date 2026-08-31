@@ -1,11 +1,28 @@
-import type { ElementType, ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, type ElementType, type ReactNode, type UIEvent } from "react";
 import type { TimelineEntry, TodoItem } from "./state";
 import { useTranslation, type TranslationKey } from "./i18n";
+
+/** Pixels from the end that still count as being at the bottom. */
+export const TIMELINE_NEAR_BOTTOM_THRESHOLD = 72;
+
+export function isNearBottom(
+  element: Pick<HTMLElement, "scrollTop" | "scrollHeight" | "clientHeight">,
+  threshold = TIMELINE_NEAR_BOTTOM_THRESHOLD,
+): boolean {
+  const remaining = element.scrollHeight - element.clientHeight - element.scrollTop;
+  return remaining <= Math.max(0, threshold);
+}
+
+export function scrollTimelineToBottom(element: Pick<HTMLElement, "scrollTop" | "scrollHeight" | "clientHeight">): void {
+  element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+}
 
 export interface ChatTimelineProps {
   entries: TimelineEntry[];
   todo: TodoItem[];
   notice?: string | null;
+  /** Changes only when a Session/Project view is replaced, not on streaming. */
+  sessionKey?: string;
 }
 
 function safeHref(value: string): string | null {
@@ -167,10 +184,44 @@ function localText(value: string, t: (key: TranslationKey) => string): string {
   return value;
 }
 
-export function ChatTimeline({ entries, todo, notice }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, sessionKey = "default" }: ChatTimelineProps) {
   const { t } = useTranslation();
+  const timelineRef = useRef<HTMLElement>(null);
+  const followTail = useRef(true);
+  const previousSessionKey = useRef<string | null>(null);
+
+  useLayoutEffect(() => {
+    const element = timelineRef.current;
+    if (!element) return;
+    const sessionChanged = previousSessionKey.current !== sessionKey;
+    previousSessionKey.current = sessionKey;
+    if (sessionChanged) followTail.current = true;
+    if (sessionChanged || followTail.current) scrollTimelineToBottom(element);
+  }, [entries, notice, sessionKey, todo]);
+
+  useEffect(() => {
+    const element = timelineRef.current;
+    if (!element) return undefined;
+    const syncTail = () => {
+      if (followTail.current) scrollTimelineToBottom(element);
+    };
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncTail);
+    observer?.observe(element);
+    // ResizeObserver covers layout changes from the docked/floating panel. The
+    // window listener is only a local geometry update fallback for older shells.
+    window.addEventListener("resize", syncTail);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", syncTail);
+    };
+  }, []);
+
+  const onScroll = (event: UIEvent<HTMLElement>) => {
+    followTail.current = isNearBottom(event.currentTarget);
+  };
+
   return (
-    <section className="timeline" aria-label={t("chatTimeline")}>
+    <section ref={timelineRef} className="timeline" aria-label={t("chatTimeline")} data-session-key={sessionKey} onScroll={onScroll}>
       {notice && <p className="timeline-notice" role="status">{localText(notice, t)}</p>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
       {entries.map((entry) => (
