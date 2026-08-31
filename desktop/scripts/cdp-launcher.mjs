@@ -19,7 +19,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, win32 } from "node:path";
@@ -29,6 +29,7 @@ const WORKSPACE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const REQUIRED_PATH_ENV = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"];
 const WINDOWS_PROFILE_ENV = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"];
 const OUTPUT_FLAGS = new Set(["--log", "--ready-file", "--log-file", "--user-data-dir"]);
+const ROOT_RECEIPT_FLAG = "--root-receipt";
 const LAUNCH_MODES = new Set(["isolated", "electron"]);
 const MANAGED_ENV_KEYS = new Set([...WINDOWS_PROFILE_ENV, "UTHCODE_CONFIG_PATH"].map((name) => name.toUpperCase()));
 
@@ -50,6 +51,14 @@ function assertRootedPath(label, value, root) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is required`);
   if (!isWithin(value, root)) throw new Error(`${label} escapes isolated root`);
   if (isWithin(value, WORKSPACE_ROOT) && label === "HOME") throw new Error("HOME cannot be the workspace");
+}
+
+function assertRootReceiptPath(value) {
+  if (typeof value !== "string" || !value.trim()) throw new Error("root receipt is required");
+  if (samePath(value, tmpdir()) || samePath(value, WORKSPACE_ROOT)) throw new Error("root receipt must be a file path");
+  if (!isWithin(value, tmpdir()) && !isWithin(value, WORKSPACE_ROOT)) {
+    throw new Error("root receipt must be under the system temp or workspace");
+  }
 }
 
 export function assertCdpLaunchEnvironment({ root, env, outputPaths = [], mode = "isolated", userDataDir }) {
@@ -167,9 +176,10 @@ function outputPathsFromArgs(args) {
   return paths;
 }
 
-export async function spawnIsolatedCommand({ command, args = [], cwd = DESKTOP_ROOT, envOverrides = {}, stdio = "inherit", prefix, mode = "isolated" } = {}) {
+export async function spawnIsolatedCommand({ command, args = [], cwd = DESKTOP_ROOT, envOverrides = {}, stdio = "inherit", prefix, mode = "isolated", rootReceipt } = {}) {
   if (!command) throw new Error("launcher command is required");
   validateEnvOverrides(envOverrides);
+  if (rootReceipt) assertRootReceiptPath(rootReceipt);
   if (mode === "electron") rejectCallerUserDataDir(args);
   const context = await createIsolatedCdpContext({ prefix, envOverrides, mode });
   const launchArgs = mode === "electron" ? electronArgs(args, context.userDataDir) : args;
@@ -181,16 +191,19 @@ export async function spawnIsolatedCommand({ command, args = [], cwd = DESKTOP_R
       userDataDir: mode === "electron" ? context.userDataDir : undefined,
       outputPaths: outputPathsFromArgs(launchArgs),
     });
+    if (rootReceipt) await writeFile(rootReceipt, `${context.root}\n`, "utf8");
   } catch (error) {
     await context.cleanup();
+    if (rootReceipt) await rm(rootReceipt, { force: true });
     throw error;
   }
   let child;
   try {
     child = spawn(command, launchArgs, { cwd, env: context.env, stdio, windowsHide: true });
-    return { child, context };
+    return { child, context, rootReceipt };
   } catch (error) {
     await context.cleanup();
+    if (rootReceipt) await rm(rootReceipt, { force: true });
     throw error;
   }
 }
@@ -206,9 +219,16 @@ function parseCli(argv) {
   if (separator < 0 || separator === argv.length - 1) throw new Error("launcher requires a command after --");
   const envOverrides = {};
   let mode = "isolated";
+  let rootReceipt;
   for (let index = 0; index < separator; index += 1) {
     if (argv[index] === "--electron") {
       mode = "electron";
+      continue;
+    }
+    if (argv[index] === ROOT_RECEIPT_FLAG) {
+      rootReceipt = argv[index + 1];
+      if (!rootReceipt) throw new Error("--root-receipt requires a path");
+      index += 1;
       continue;
     }
     if (argv[index] !== "--env") throw new Error(`unknown launcher option: ${argv[index]}`);
@@ -216,7 +236,7 @@ function parseCli(argv) {
     envOverrides[name] = value;
     index += 1;
   }
-  return { envOverrides, mode, command: argv[separator + 1], args: argv.slice(separator + 2) };
+  return { envOverrides, mode, rootReceipt, command: argv[separator + 1], args: argv.slice(separator + 2) };
 }
 
 function waitForChild(child) {
@@ -246,10 +266,13 @@ async function main() {
   } finally {
     if (shutdownTimer) clearTimeout(shutdownTimer);
     await launched.context.cleanup();
+    if (parsed.rootReceipt) await rm(parsed.rootReceipt, { force: true });
   }
 }
 
-main().catch(() => {
-  // Preflight failures intentionally produce no output and spawn no child.
-  process.exitCode = 1;
-});
+if (process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url))) {
+  main().catch(() => {
+    // Preflight failures intentionally produce no output and spawn no child.
+    process.exitCode = 1;
+  });
+}

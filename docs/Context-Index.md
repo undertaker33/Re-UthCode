@@ -90,7 +90,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W05 已实现配置、Bridge、Electron shell、Renderer、打包链；W06 的 package、make、固定端口 CDP/离线链路和 Desktop 自动化测试已有通过证据（Forge 使用本地 Electron cache 与内置 checksums）；Windows 干净机 Installer、首配/对话/卸载、完整 Feature Parity 与人工 UI 清单仍未验证，Checklist 第 87、116、119 项未完成，保持 `not_implemented` |
+| T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W05 已实现配置、Bridge、Electron shell、Renderer、打包链；W06 已完成 `npm ci`、Python/Desktop 全量回归、Runtime/PyInstaller smoke、package、make、Installer 自动测试和真实 packaged Electron 中英文 CDP 视觉验收；Windows 无系统 Python 干净机 Installer、真实 Provider 首配/对话/卸载、完整 Feature Parity 与人工 UI 清单仍未验证，Checklist 第 87、119 项未完成，保持 `not_implemented` |
 
 ## 跨层最短链路
 

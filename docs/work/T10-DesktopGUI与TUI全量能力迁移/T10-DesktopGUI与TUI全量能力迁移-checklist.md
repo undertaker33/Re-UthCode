@@ -113,7 +113,7 @@
 - [x] `rg -n "Subagent|Multi-Agent|Worktree|Git Diff|MCP|Skill|Auto Update|Tray|Windows Service|FastAPI|WebSocket|Named Pipe|gRPC" src/uthcode desktop/src`不存在 T10 未来能力入口/协议占位，必要否定语义命中在 Feedback 说明。
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，将精确 passed/failed/skipped 写入 W06 Feedback。
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`、`conda run --no-capture-output -n re-uthcode python -m pip check`、`git diff --check`，全部退出码 0。
-- [ ] 在 `desktop` 重新执行 `npm ci`、typecheck、unit/integration/E2E、build、package、make，并重跑 PyInstaller smoke 与 Installer 关键 E2E，精确结果写入 W06 Feedback。
+- [x] 在 `desktop` 重新执行 `npm ci`、typecheck、unit/integration/E2E、build、package、make，并重跑 PyInstaller smoke 与 Installer 关键 E2E，精确结果写入 W06 Feedback。
 - [x] `README.md`、用户手册、A04/命中的 A02/A03/TUI 当前事实、`docs/Context-Index.md` 与最终 `src/ + tests/` 一致；不把 Desktop 规划写成未实现事实。
 - [x] UTF-8 检查覆盖本包、Context Index、Outstanding Debt 和实际修改的 Markdown，均可解码，无 replacement character/常见乱码，fenced code block 成对。
 - [ ] `docs/OutstandingDebtList.md` 已核对且因“能力欠账：无”保持不变；W01～W06 Feedback 齐全、全部 Checklist 有证据后，Context Index 将 T10 标为 `implemented_unarchived`。
