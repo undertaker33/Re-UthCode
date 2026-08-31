@@ -58,6 +58,8 @@ export const RUNTIME_METHODS = [
   "project.sessions",
   "session.new",
   "session.resume",
+  "session.rename",
+  "session.move",
   "turn.start",
   "turn.steer",
   "turn.pause",

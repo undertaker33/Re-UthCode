@@ -82,6 +82,7 @@ from .sessions import (
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
     SessionCatalogEntry,
+    SessionMutation,
     SessionReplayRecord,
 )
 from .tools import ApplicationToolService
@@ -529,6 +530,7 @@ class ApplicationStatus:
     prefix_change_reason: str | None = None
     tool_schema_fingerprint: str | None = None
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    active_session_title: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -545,6 +547,7 @@ class ApplicationStatus:
             "state": self.state,
             "context_usage": self.context_usage.to_dict(),
             "timeline_checkpoint_id": self.timeline_checkpoint_id,
+            "active_session_title": self.active_session_title,
             "instruction_epoch": self.instruction_epoch,
             "compact_count": self.compact_count,
             "stable_prefix_fingerprint": self.stable_prefix_fingerprint,
@@ -759,6 +762,20 @@ class UthCodeApplication:
             session_id,
             replay_builder=self._build_session_replay,
         )
+
+    def rename_session(self, session_id: str, title: str) -> SessionMutation:
+        """Rename a durable Session through the Application boundary."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.rename_session(session_id, title)
+
+    def move_session(self, session_id: str, target_project_key: str) -> SessionMutation:
+        """Move an inactive durable Session to a canonical project key."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.move_session(session_id, target_project_key)
 
     def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return the Application-owned same-project Session Picker data."""
@@ -1029,6 +1046,7 @@ class UthCodeApplication:
                 "status": "not_available",
                 "active": False,
                 "active_session_id": None,
+                "active_session_title": None,
                 "recovery_diagnostics": [],
                 "last_operation": None,
                 "busy": False,
@@ -1339,6 +1357,7 @@ class UthCodeApplication:
             configuration_sources=sources,
             context_usage=usage,
             timeline_checkpoint_id=timeline_checkpoint_id,
+            active_session_title=(active.title if active is not None else None),
             instruction_epoch=instruction_epoch,
             compact_count=compact_count if isinstance(compact_count, int) else 0,
             stable_prefix_fingerprint=stable_prefix_fingerprint,

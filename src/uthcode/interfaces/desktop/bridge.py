@@ -43,6 +43,8 @@ from uthcode.application import (
     RunSnapshot,
     ResumeTurnResponse,
     SessionChanged,
+    SessionMutation,
+    SessionOperationError,
     SessionReplayRecord,
     UserConfigurationWriteRequest,
     UserConfigurationView,
@@ -89,6 +91,8 @@ _METHODS = frozenset(
         "project.sessions",
         "session.new",
         "session.resume",
+        "session.rename",
+        "session.move",
         "turn.start",
         "turn.steer",
         "turn.pause",
@@ -181,6 +185,7 @@ def _safe_value(value: object) -> object:
             ApplicationStatus,
             PauseRequest,
             RunSnapshot,
+            SessionMutation,
             SessionReplayRecord,
             UserConfigurationView,
         ),
@@ -248,6 +253,7 @@ def _catalog_entry(entry: object) -> dict[str, object]:
         "session_id",
         "project_key",
         "last_used_at",
+        "title",
         "preview",
         "timeline_checkpoint_id",
         "transcript_entries",
@@ -257,6 +263,17 @@ def _catalog_entry(entry: object) -> dict[str, object]:
         field: _safe_value(getattr(entry, field, None))
         for field in fields
     }
+
+
+def _session_mutation_value(value: object) -> dict[str, object]:
+    """Project a mutation result without crossing an unknown object boundary."""
+
+    if not isinstance(value, SessionMutation):
+        raise BridgeError("session_error", "Session mutation returned no metadata")
+    projected = _safe_value(value)
+    if not isinstance(projected, dict):  # pragma: no cover - allowlist invariant
+        raise BridgeError("session_error", "Session mutation returned no metadata")
+    return projected
 
 
 def _replay_values(values: object) -> list[object]:
@@ -566,6 +583,10 @@ class DesktopBridge:
             return await self._session_new(params)
         if method == "session.resume":
             return await self._session_resume(params)
+        if method == "session.rename":
+            return await self._session_rename(params)
+        if method == "session.move":
+            return await self._session_move(params)
         if method == "turn.start":
             return await self._turn_start(params)
         if method == "turn.steer":
@@ -875,6 +896,73 @@ class DesktopBridge:
             "restored": True,
             "replay": _replay_values(replay),
             "run": self._snapshot(),
+        }
+
+    async def _session_rename(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"session_id", "title"}, method="session.rename")
+        session_id = _text_param(params, "session_id")
+        title = _text_param(params, "title")
+        self._ensure_no_active(method="session.rename")
+        application = self._require_application()
+        rename = getattr(application, "rename_session", None)
+        if not callable(rename):
+            raise BridgeError("session_error", "Application does not support Session rename")
+        try:
+            metadata = rename(session_id, title)
+        except SessionOperationError as exc:
+            kind = {
+                "busy": "session_busy",
+                "corrupt": "session_corrupt",
+                "unknown": "session_unknown",
+            }.get(exc.kind, "session_error")
+            raise BridgeError(kind, "Session could not be renamed") from None
+        except (TypeError, ValueError):
+            raise BridgeError("invalid_request", "Session title is invalid") from None
+        except Exception:
+            raise BridgeError("session_error", "Session could not be renamed") from None
+        projected = _session_mutation_value(metadata)
+        return {
+            "session_id": _session_identity(projected.get("session_id"), session_id),
+            "title": projected.get("title"),
+            "session": projected,
+        }
+
+    async def _session_move(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(
+            params,
+            {"session_id", "target_project_key"},
+            method="session.move",
+        )
+        session_id = _text_param(params, "session_id")
+        target = _text_param(params, "target_project_key")
+        self._ensure_no_active(method="session.move")
+        # A target is a project identity, not an arbitrary storage path.  The
+        # existing Desktop project boundary canonicalizes it and checks that
+        # it is an actual directory before Application sees it.
+        target_path = _path_value(target, "target_project_key")
+        application = self._require_application()
+        move = getattr(application, "move_session", None)
+        if not callable(move):
+            raise BridgeError("session_error", "Application does not support Session move")
+        try:
+            metadata = move(session_id, str(target_path))
+        except SessionOperationError as exc:
+            kind = {
+                "busy": "session_busy",
+                "corrupt": "session_corrupt",
+                "unknown": "session_unknown",
+            }.get(exc.kind, "session_error")
+            raise BridgeError(kind, "Session could not be moved") from None
+        except (TypeError, ValueError):
+            raise BridgeError("project_not_found", "target project is not trusted") from None
+        except Exception:
+            raise BridgeError("session_error", "Session could not be moved") from None
+        projected = _session_mutation_value(metadata)
+        return {
+            "session_id": _session_identity(projected.get("session_id"), session_id),
+            "project_key": projected.get("project_key"),
+            "title": projected.get("title"),
+            "session": projected,
         }
 
     def _require_run(self) -> object:

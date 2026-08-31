@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Lock
 
 from uthcode.core.history import (
     ActiveCheckpoint,
@@ -30,6 +31,7 @@ from uthcode.integrations.session_files import (
     SessionMetadata,
     SessionSnapshot,
     SessionWriter,
+    normalize_session_title,
 )
 
 from .instructions import InstructionError, InstructionLoader, InstructionStateMetadata
@@ -80,6 +82,7 @@ class SessionReplayRecord:
     status: str | None = None
     is_error: bool = False
     created_at: str | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -110,6 +113,8 @@ class SessionReplayRecord:
             raise ValueError("unsupported replay tool status")
         if not isinstance(self.is_error, bool):
             raise TypeError("replay is_error must be a boolean")
+        if self.title is not None:
+            object.__setattr__(self, "title", normalize_session_title(self.title))
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only the bounded replay contract, never raw parts."""
@@ -127,6 +132,7 @@ class SessionReplayRecord:
             "tool_call_id",
             "status",
             "created_at",
+            "title",
         ):
             field_value = getattr(self, field_name)
             if field_value is not None:
@@ -150,6 +156,31 @@ class SessionCatalogEntry:
     timeline_checkpoint_id: str | None = None
     transcript_entries: int = 0
     corrupt: bool = False
+    title: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionMutation:
+    """Minimal Application projection returned by Session mutations."""
+
+    session_id: str
+    project_key: str
+    title: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session mutation session_id must be a non-empty string")
+        if not isinstance(self.project_key, str) or not self.project_key.strip():
+            raise ValueError("session mutation project_key must be a non-empty string")
+        if self.title is not None:
+            object.__setattr__(self, "title", normalize_session_title(self.title))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "project_key": self.project_key,
+            "title": self.title,
+        }
 
 
 @dataclass(slots=True)
@@ -191,6 +222,10 @@ class ApplicationSession:
     @property
     def project_key(self) -> str:
         return self.snapshot.project_key
+
+    @property
+    def title(self) -> str | None:
+        return self.snapshot.title
 
     @property
     def snapshot(self) -> SessionSnapshot:
@@ -375,6 +410,12 @@ class ApplicationSessionService:
         self.instruction_loader = instruction_loader
         self._active: ApplicationSession | None = None
         self._last_operation: dict[str, object] | None = None
+        # Move receipts are deliberately process-local.  They allow only the
+        # Application instance that completed a move to retry the same
+        # converged request; restart recovery relies on the durable owner
+        # instead of inventing a second journal or registry.
+        self._move_lock = Lock()
+        self._move_receipts: dict[tuple[str, str], SessionMutation] = {}
 
     @property
     def active_session(self) -> ApplicationSession | None:
@@ -393,6 +434,7 @@ class ApplicationSessionService:
             "status": "active" if active is not None else "idle",
             "active": active is not None,
             "active_session_id": active.session_id if active is not None else None,
+            "active_session_title": active.title if active is not None else None,
             "recovery_diagnostics": recovery,
             "last_operation": last,
             "busy": bool(isinstance(last, Mapping) and last.get("kind") == "busy"),
@@ -504,6 +546,91 @@ class ApplicationSessionService:
         key = self.project_key if project_key is None else project_key
         return self.store.list_metadata(project_key=key)
 
+    def rename_session(self, session_id: str, title: str) -> SessionMutation:
+        """Persist a Session title without rewriting its durable history."""
+
+        # Validate before opening a writer so invalid input cannot create a
+        # transient lock or change last-used state.
+        normalized_title = normalize_session_title(title)
+        active = self._active
+        try:
+            if active is not None and active.session_id == session_id:
+                metadata = active._writer.update_title(normalized_title)
+                # A resumed Application Session keeps its safe replay in
+                # memory. Refresh only that projection so a rename is
+                # immediately visible without touching durable history.
+                active._set_replay(
+                    tuple(
+                        replace(record, title=metadata.title)
+                        for record in active.replay
+                    )
+                )
+                return _session_mutation(metadata)
+            with self.store.open_writer(
+                session_id,
+                expected_project_key=self.project_key,
+            ) as writer:
+                return _session_mutation(writer.update_title(normalized_title))
+        except SessionFileError as exc:
+            raise _session_operation_error(exc, session_id=session_id) from exc
+        except OSError as exc:
+            raise SessionOperationError("storage", session_id=session_id) from exc
+
+    def move_session(self, session_id: str, target_project_key: str) -> SessionMutation:
+        """Move one inactive Session by atomically changing its membership."""
+
+        target = _canonical_project_key(target_project_key)
+        active = self._active
+        if active is not None and active.session_id == session_id:
+            # The held writer represents an open Session.  Do not implicitly
+            # close or interrupt it in order to change project authority.
+            raise SessionOperationError("busy", session_id=session_id)
+        receipt_key = (session_id, target)
+        with self._move_lock:
+            receipt = self._move_receipts.get(receipt_key)
+            if receipt is not None:
+                # Re-open under the writer lock before honoring the receipt so
+                # a concurrent move cannot make an old success look current.
+                try:
+                    with self.store.open_writer(
+                        session_id,
+                        expected_project_key=target,
+                    ) as writer:
+                        if writer.metadata.project_key != target:
+                            raise SessionOperationError(
+                                "unknown",
+                                session_id=session_id,
+                            )
+                        refreshed = _session_mutation(writer.metadata)
+                        self._move_receipts[receipt_key] = refreshed
+                        return refreshed
+                except SessionOperationError:
+                    raise
+                except SessionFileError as exc:
+                    raise _session_operation_error(exc, session_id=session_id) from exc
+                except OSError as exc:
+                    raise SessionOperationError("storage", session_id=session_id) from exc
+            try:
+                with self.store.open_writer(
+                    session_id,
+                    expected_project_key=self.project_key,
+                ) as writer:
+                    # A Session already owned by this Application's project is
+                    # a safe no-op and becomes a receipt for future retries.
+                    result = _session_mutation(
+                        writer.metadata
+                        if writer.metadata.project_key == target
+                        else writer.update_project_key(target)
+                    )
+            except SessionOperationError:
+                raise
+            except SessionFileError as exc:
+                raise _session_operation_error(exc, session_id=session_id) from exc
+            except OSError as exc:
+                raise SessionOperationError("storage", session_id=session_id) from exc
+            self._move_receipts[receipt_key] = result
+            return result
+
     def list_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return same-project Sessions with durable ordering and bounded previews."""
 
@@ -520,6 +647,7 @@ class ApplicationSessionService:
                         session_id=metadata.session_id,
                         project_key=metadata.project_key,
                         last_used_at=metadata.last_used_at,
+                        title=metadata.title,
                         preview="[Session recovery unavailable]",
                         corrupt=True,
                     )
@@ -530,6 +658,7 @@ class ApplicationSessionService:
                     session_id=metadata.session_id,
                     project_key=metadata.project_key,
                     last_used_at=metadata.last_used_at,
+                    title=metadata.title,
                     preview=_first_user_preview(snapshot),
                     timeline_checkpoint_id=(
                         snapshot.timeline.active_checkpoint.turn_id
@@ -749,6 +878,7 @@ __all__ = [
     "TimelineAppendOutcome",
     "TranscriptAppendOutcome",
     "SessionCatalogEntry",
+    "SessionMutation",
     "SessionReplayRecord",
     "SessionActiveError",
     "SessionOperationError",
@@ -773,6 +903,27 @@ def _normalize_replay(
             raise ValueError("replay records must be ordered by durable sequence")
         previous_sequence = record.sequence
     return records
+
+
+def _session_mutation(metadata: SessionMetadata) -> SessionMutation:
+    """Project integration metadata to the Application mutation contract."""
+
+    return SessionMutation(
+        session_id=metadata.session_id,
+        project_key=metadata.project_key,
+        title=metadata.title,
+    )
+
+
+def _canonical_project_key(value: object) -> str:
+    """Resolve a target project key through the existing filesystem boundary."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("target_project_key must be a non-empty string")
+    candidate = Path(value).expanduser().resolve(strict=False)
+    if not candidate.is_dir():
+        raise ValueError("target_project_key must identify an existing project directory")
+    return str(candidate)
 
 
 def _entry_parts(entry: TranscriptEntry) -> tuple[object, ...]:
@@ -878,6 +1029,7 @@ def _project_replay(
                             status=status,
                             is_error=is_error,
                             created_at=entry.created_at,
+                            title=snapshot.title,
                         )
                     )
                     continue
@@ -910,6 +1062,7 @@ def _project_replay(
                         kind=kind,
                         text=part.text,
                         created_at=entry.created_at,
+                        title=snapshot.title,
                     )
                 )
     return _normalize_replay(records, snapshot.session_id)
