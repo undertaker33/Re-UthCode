@@ -9,6 +9,7 @@ import type {
   RecentProjectPreference,
   PinnedSessionPreference,
   ThemePreference,
+  LanguagePreference,
   WindowBoundsPreference,
 } from "./desktop-api";
 import { PREFERENCE_KEYS, isPreferenceKey } from "./desktop-api";
@@ -17,6 +18,7 @@ type DesktopPreferences = ApiDesktopPreferences;
 
 export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = {
   theme: "system",
+  language: "zh-CN",
   windowBounds: { width: 1280, height: 800, maximized: false },
   panelMode: "docked",
   recentProjects: [],
@@ -44,6 +46,7 @@ export class PreferenceValidationError extends Error {
 function clonePreferences(value: DesktopPreferences): DesktopPreferences {
   return {
     theme: value.theme,
+    language: value.language,
     windowBounds: { ...value.windowBounds },
     panelMode: value.panelMode,
     recentProjects: value.recentProjects.map((item) => ({ ...item })),
@@ -71,6 +74,11 @@ function validateTheme(value: unknown): ThemePreference {
   if (value !== "system" && value !== "dark" && value !== "light") {
     throw new PreferenceValidationError("theme must be system, dark, or light");
   }
+  return value;
+}
+
+function validateLanguage(value: unknown): LanguagePreference {
+  if (value !== "zh-CN" && value !== "en") throw new PreferenceValidationError("language must be zh-CN or en");
   return value;
 }
 
@@ -199,6 +207,7 @@ function validateDocument(value: unknown): DesktopPreferences {
   }
   const result = clonePreferences(DEFAULT_DESKTOP_PREFERENCES);
   if (source.theme !== undefined) result.theme = validateTheme(source.theme);
+  if (source.language !== undefined) result.language = validateLanguage(source.language);
   if (source.windowBounds !== undefined) result.windowBounds = validateWindowBounds(source.windowBounds);
   if (source.panelMode !== undefined) result.panelMode = validatePanelMode(source.panelMode);
   if (source.recentProjects !== undefined) result.recentProjects = validateRecentProjects(source.recentProjects);
@@ -242,6 +251,7 @@ export class DesktopPreferencesStore {
     let normalized: unknown;
     switch (key) {
       case "theme": normalized = validateTheme(value); break;
+      case "language": normalized = validateLanguage(value); break;
       case "windowBounds": normalized = validateWindowBounds(value, current.windowBounds); break;
       case "panelMode": normalized = validatePanelMode(value); break;
       case "recentProjects": normalized = validateRecentProjects(value); break;

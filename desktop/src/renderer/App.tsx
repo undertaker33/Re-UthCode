@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import type { DesktopApi, DesktopPreferences, JsonObject, JsonValue, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { RuntimePanel } from "./RuntimePanel";
@@ -8,6 +8,7 @@ import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface"
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
 import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
 import { UiIcon } from "./UiIcon";
+import { LanguageProvider, translate } from "./i18n";
 
 export interface AppProps {
   api?: DesktopApi;
@@ -99,13 +100,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const stateRef = useRef(state);
   stateRef.current = state;
   const api = runtimeApi(explicitApi);
+  const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
-    if (!api) throw new Error("Desktop API is unavailable");
+    if (!api) throw new Error(t("desktopApiUnavailable"));
     return api.requestRuntime(method, params);
   }, [api]);
 
-  const persist = useCallback(async (key: "theme" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
+  const persist = useCallback(async (key: "theme" | "language" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
     if (!api) return;
     try {
       await api.writePreference(key as never, value as never);
@@ -121,7 +123,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const sessions = Array.isArray(result.sessions) ? result.sessions : [];
       dispatch({ type: "catalog_refreshed", projectKey, sessions });
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Session catalog unavailable") });
+      dispatch({ type: "notice", text: errorMessage(error, t("sessionCatalogUnavailable")) });
     }
   }, [send]);
 
@@ -151,7 +153,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), selectedProjectKey: path, selectedSessionId: null } });
       await persist("recentProjects", projectPreferences(projects));
       await persist("selectedProjectKey", path);
-      dispatch({ type: "runtime_error", message: errorMessage(error, "Project could not be opened"), state: "configuration_required" });
+      dispatch({ type: "runtime_error", message: errorMessage(error, t("projectOpenFailed")), state: "configuration_required" });
       dispatch({ type: "set_view", view: "settings" });
     }
   }, [persist, refreshCatalog, send]);
@@ -167,6 +169,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     });
     void Promise.all([
       api.readPreference("theme"),
+      api.readPreference("language"),
       api.readPreference("panelMode"),
       api.readPreference("recentProjects"),
       api.readPreference("projectAliases"),
@@ -174,9 +177,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("pinnedSessions"),
       api.readPreference("selectedProjectKey"),
       api.readPreference("selectedSessionId"),
-    ]).then(([theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId]) => {
+    ]).then(([theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId]) => {
       if (cancelled) return;
-      dispatch({ type: "hydrate_preferences", preferences: { theme, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId } });
+      dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId } });
       const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
       if (selected) {
         void send("runtime.initialize", { workdir: selected.path }).then((result) => {
@@ -188,17 +191,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
             void send("session.resume", { session_id: selectedSessionId }).then((resumed) => {
               if (!cancelled) dispatch({ type: "session_resumed", result: resumed });
             }).catch((error) => {
-              if (!cancelled) dispatch({ type: "notice", text: errorMessage(error, "Selected Session could not be resumed") });
+              if (!cancelled) dispatch({ type: "notice", text: errorMessage(error, t("sessionResumeFailed")) });
             });
           }
         }).catch((error) => {
-          if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, "Runtime could not start"), state: "configuration_required" });
+          if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, t("runtimeStartFailed")), state: "configuration_required" });
         });
       } else {
         dispatch({ type: "runtime_state", state: "ready" });
       }
     }).catch((error) => {
-      if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, "Desktop preferences unavailable"), state: "ready" });
+      if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, t("preferencesUnavailable")), state: "ready" });
     });
     return () => {
       cancelled = true;
@@ -212,7 +215,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const path = await api.openProject();
       if (path) await openProjectPath(path);
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Project picker unavailable") });
+      dispatch({ type: "notice", text: errorMessage(error, t("projectPickerUnavailable")) });
     }
   }, [api, openProjectPath]);
 
@@ -251,7 +254,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
       await refreshCatalog(project.projectKey);
     } catch (error) {
-      dispatch({ type: "runtime_error", message: errorMessage(error, "Session could not be opened"), state: "ready" });
+      dispatch({ type: "runtime_error", message: errorMessage(error, t("sessionOpenFailed")), state: "ready" });
     }
   }, [api, closeActiveTurn, persist, refreshCatalog, send]);
 
@@ -285,7 +288,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await api.closeShell();
       }
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Command could not be executed") });
+      dispatch({ type: "notice", text: errorMessage(error, t("commandFailed")) });
     }
   }, [api, persist, refreshCatalog, refreshRuntimeStatus, send]);
 
@@ -302,7 +305,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         : await send("turn.start", { prompt: text });
       dispatch({ type: "turn_accepted", run: asObject(result).run, steering, text });
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be started") });
+      dispatch({ type: "notice", text: errorMessage(error, t("turnStartFailed")) });
     }
   }, [api, executeCommand, send]);
 
@@ -323,7 +326,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await send("turn.resume", { response });
     } catch (error) {
       dispatch({ type: "interaction_submitting", value: false });
-      dispatch({ type: "notice", text: errorMessage(error, "Interaction could not be submitted") });
+      dispatch({ type: "notice", text: errorMessage(error, t("interactionSubmitFailed")) });
     }
   }, [api, send]);
 
@@ -332,7 +335,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       await send("turn.cancel", {});
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be cancelled") });
+      dispatch({ type: "notice", text: errorMessage(error, t("turnCancelFailed")) });
     }
   }, [api, send]);
 
@@ -341,7 +344,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       await send("turn.pause", {});
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, "Turn could not be paused") });
+      dispatch({ type: "notice", text: errorMessage(error, t("turnPauseFailed")) });
     }
   }, [api, send]);
 
@@ -372,6 +375,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     void persist("recentProjects", projectPreferences(projects));
     void persist("pinnedProjectKeys", projects.filter((item) => item.pinned).map((item) => item.projectKey));
     void persist("pinnedSessions", pinnedSessions);
+  }, [persist]);
+  const setLanguage = useCallback((language: LanguagePreference) => {
+    dispatch({ type: "hydrate_preferences", preferences: { language } });
+    void persist("language", language);
   }, [persist]);
 
   const toggleSessionPin = useCallback((project: ProjectState, session: SessionSummary) => {
@@ -415,13 +422,13 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await persist("selectedSessionId", null);
       }
     } catch (error) {
-      dispatch({ type: "runtime_error", message: errorMessage(error, "Project could not be removed"), state: "ready" });
+      dispatch({ type: "runtime_error", message: errorMessage(error, t("projectRemoveFailed")), state: "ready" });
     }
   }, [closeActiveTurn, persist, refreshCatalog, send]);
 
   const openExplorer = useCallback((project: ProjectState) => {
     if (!api) return;
-    void api.openProjectInExplorer(project.path).catch((error) => dispatch({ type: "notice", text: errorMessage(error, "Explorer could not be opened") }));
+    void api.openProjectInExplorer(project.path).catch((error) => dispatch({ type: "notice", text: errorMessage(error, t("explorerOpenFailed")) }));
   }, [api]);
 
   const loadSettings = useCallback(async () => {
@@ -434,14 +441,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const result = asObject(await send("settings.get", {}));
       dispatch({ type: "settings_loaded", configuration: (asObject(result.configuration) as ConfigurationView) });
     } catch (error) {
-      dispatch({ type: "settings_error", message: errorMessage(error, "Configuration is not initialized") });
+      dispatch({ type: "settings_error", message: errorMessage(error, t("configUnavailable")) });
     }
   }, [api, send]);
 
   const saveSettings = useCallback(async (request: ConfigurationWrite) => {
     if (!api || stateRef.current.activeTurn) {
-      dispatch({ type: "settings_error", message: "Finish the active Turn before saving settings" });
-      throw new Error("Finish the active Turn before saving settings");
+      dispatch({ type: "settings_error", message: t("finishTurnBeforeSave") });
+      throw new Error(t("finishTurnBeforeSave"));
     }
     const projectKey = stateRef.current.selectedProjectKey;
     const sessionId = stateRef.current.selectedSessionId;
@@ -461,9 +468,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await refreshRuntimeStatus();
         await refreshCatalog(projectKey);
       }
-      dispatch({ type: "notice", text: "Settings saved" });
+      dispatch({ type: "notice", text: t("settingsSaved") });
     } catch (error) {
-      dispatch({ type: "settings_error", message: errorMessage(error, "Configuration could not be saved") });
+      dispatch({ type: "settings_error", message: errorMessage(error, t("settingsSaveFailed")) });
       throw error;
     } finally {
       dispatch({ type: "settings_saving", value: false });
@@ -471,16 +478,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [api, refreshCatalog, refreshRuntimeStatus, send]);
 
   const content = state.view === "settings" ? (
-    <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} />
+    <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
   ) : (
     <>
       <header className="conversation-bar">
         <div className="conversation-title">
           <span className="conversation-presence" aria-hidden="true" />
-          <h1>{state.selectedSessionId ? `Session ${state.selectedSessionId.slice(0, 8)}` : "New conversation"}</h1>
+          <h1>{state.selectedSessionId ? `${t("session")} ${state.selectedSessionId.slice(0, 8)}` : t("newConversation")}</h1>
         </div>
         <div className="conversation-actions">
-          <button type="button" className="icon-button" title="Toggle Runtime" aria-label="Toggle Runtime panel" onClick={toggleRuntime}><UiIcon name="panel" /></button>
+          <button type="button" className="icon-button" title={t("toggleRuntime")} aria-label={t("toggleRuntime")} onClick={toggleRuntime}><UiIcon name="panel" /></button>
         </div>
       </header>
       <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} />
@@ -490,12 +497,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   );
 
   const themeClass = `theme-${state.theme}`;
-  return (
+  return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
       {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
-      <main aria-label="UthCode conversation workspace">{content}</main>
+      <main aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && <RuntimePanel state={state} onPanelModeChange={setPanelMode} />}
-      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — Open Settings</button>}
+      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — {t("openSettings")}</button>}
     </div>
-  );
+  </LanguageProvider>;
 }

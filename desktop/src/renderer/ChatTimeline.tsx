@@ -1,5 +1,6 @@
 import type { ElementType, ReactNode } from "react";
 import type { TimelineEntry, TodoItem } from "./state";
+import { useTranslation, type TranslationKey } from "./i18n";
 
 export interface ChatTimelineProps {
   entries: TimelineEntry[];
@@ -141,28 +142,44 @@ export function renderMarkdown(source: string): ReactNode {
   return blocks;
 }
 
-function entryLabel(entry: TimelineEntry): string {
-  if (entry.kind === "user") return "You";
-  if (entry.kind === "steering") return "Steering";
-  if (entry.kind === "reasoning") return "Reasoning";
-  if (entry.kind === "tool") return entry.toolName || "Tool";
-  if (entry.kind === "plan") return "Plan";
-  if (entry.kind === "status") return "Runtime";
-  return "UthCode";
+function entryLabel(entry: TimelineEntry, t: (key: TranslationKey) => string): string {
+  if (entry.kind === "user") return t("you");
+  if (entry.kind === "steering") return t("steering");
+  if (entry.kind === "reasoning") return t("reasoningLabel");
+  if (entry.kind === "tool") return entry.toolName || t("toolLabel");
+  if (entry.kind === "plan") return t("plan");
+  if (entry.kind === "status") return t("statusLabel");
+  return t("assistantLabel");
+}
+
+function localText(value: string, t: (key: TranslationKey) => string): string {
+  const exact: Partial<Record<string, TranslationKey>> = { "Session resumed": "sessionResumed", running: "running", failed: "failed", completed: "completed", "Steering requested": "steeringRequested", "Steering applied": "steeringApplied", "Pausing…": "pausing", "Interaction answered": "interactionAnswered", "Turn cancelled": "turnCancelled", "New Session": "newSessionNotice" };
+  if (exact[value]) return t(exact[value]!);
+  const waiting = value.match(/^Waiting for (permission|plan review|provider retry|user input|turn pause)$/u);
+  if (waiting) {
+    const keys = { permission: "permissionInteraction", "plan review": "planReviewInteraction", "provider retry": "providerRetryInteraction", "user input": "userInputInteraction", "turn pause": "turnPauseInteraction" } as const;
+    return `${t("waitingFor")} ${t(keys[waiting[1] as keyof typeof keys])}`;
+  }
+  if (value.startsWith("Turn failed: ")) {
+    const reason = value.slice("Turn failed: ".length);
+    return `${t("turnFailed")}: ${reason === "runtime error" ? t("runtimeError") : reason}`;
+  }
+  return value;
 }
 
 export function ChatTimeline({ entries, todo, notice }: ChatTimelineProps) {
+  const { t } = useTranslation();
   return (
-    <section className="timeline" aria-label="Chat timeline">
-      {notice && <p className="timeline-notice" role="status">{notice}</p>}
-      {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>Start a conversation in this project.</p></div>}
+    <section className="timeline" aria-label={t("chatTimeline")}>
+      {notice && <p className="timeline-notice" role="status">{localText(notice, t)}</p>}
+      {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
       {entries.map((entry) => (
-        <article key={entry.id} className={`timeline-entry timeline-entry--${entry.kind}`} aria-label={entryLabel(entry)} aria-busy={entry.streaming || undefined}>
-          <header><span>{entryLabel(entry)}</span>{entry.kind === "tool" && <small data-error={entry.isError || undefined}>{entry.status || "running"}</small>}{entry.streaming && <small>writing…</small>}</header>
-          <div className="timeline-content">{entry.kind === "tool" ? <p>{entry.text}{entry.status === "failed" ? " · failed" : entry.status === "completed" ? " · completed" : " · running"}</p> : renderMarkdown(entry.text)}</div>
+        <article key={entry.id} className={`timeline-entry timeline-entry--${entry.kind}`} aria-label={entryLabel(entry, t)} aria-busy={entry.streaming || undefined}>
+          <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small data-error={entry.isError || undefined}>{localText(entry.status || "running", t)}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
+          <div className="timeline-content">{entry.kind === "tool" ? <p>{entry.text} · {localText(entry.status || "running", t)}</p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t)) : renderMarkdown(entry.text)}</div>
         </article>
       ))}
-      {todo.length > 0 && <section className="todo-strip" aria-label="Current tasks"><header><h2>Tasks</h2><span>{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>{item.content}</li>)}</ul></section>}
+      {todo.length > 0 && <section className="todo-strip" aria-label={t("tasks")}><header><h2>{t("tasks")}</h2><span>{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>{item.content}</li>)}</ul></section>}
     </section>
   );
 }

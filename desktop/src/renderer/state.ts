@@ -1,4 +1,4 @@
-import type { AgentEvent, DesktopPreferences, DesktopApi, JsonObject, JsonValue, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 
 export type RuntimeStateName = "booting" | "ready" | "configuration_required" | "failed" | "stopping" | "stopped";
 export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "tool" | "plan" | "status";
@@ -123,6 +123,7 @@ export interface RendererState {
   composerText: string;
   panelMode: PanelModePreference;
   theme: ThemePreference;
+  language: LanguagePreference;
   view: "chat" | "settings";
   configuration: ConfigurationView | null;
   settingsError: string | null;
@@ -160,6 +161,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   composerText: "",
   panelMode: "docked",
   theme: "system",
+  language: "zh-CN",
   view: "chat",
   configuration: null,
   settingsError: null,
@@ -655,6 +657,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         selectedProjectKey: preferences.selectedProjectKey !== undefined ? preferences.selectedProjectKey ?? null : state.selectedProjectKey,
         selectedSessionId: preferences.selectedSessionId !== undefined ? preferences.selectedSessionId ?? null : state.selectedSessionId,
         theme: preferences.theme !== undefined ? (preferences.theme === "dark" || preferences.theme === "light" ? preferences.theme : "system") : state.theme,
+        language: preferences.language !== undefined ? (preferences.language === "en" ? "en" : "zh-CN") : state.language,
         panelMode: preferences.panelMode !== undefined ? (preferences.panelMode === "hidden" || preferences.panelMode === "floating" ? preferences.panelMode : "docked") : state.panelMode,
       };
     }
