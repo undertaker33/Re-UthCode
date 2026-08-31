@@ -20,6 +20,7 @@ from .agent_events import (
     CompletionBlocked,
     FailureReason,
     IterationStarted,
+    PlanContentDelta,
     PlanProposed,
     ReasoningDelta as AgentReasoningDelta,
     ReasoningFinished,
@@ -61,6 +62,9 @@ from .provider import (
     ReasoningPart,
     TextDelta,
     TextPart,
+    ToolCallArgumentsDelta,
+    ToolCallStarted,
+    ToolCallCompleted,
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
@@ -101,6 +105,7 @@ from .planning import (
     TaskState,
     parse_propose_plan_arguments,
     parse_todo_write_arguments,
+    _PlanContentDecoder,
 )
 from .prompt import RuntimePromptContext
 from .tool import (
@@ -1874,6 +1879,7 @@ class AgentTurnExecution:
     ) -> tuple[GenerationCompleted, tuple[str, ...]]:
         response: GenerationCompleted | None = None
         buffered_text_deltas: list[str] = []
+        plan_decoders: dict[str, _PlanContentDecoder | None] = {}
         reasoning_segment = 0
         reasoning_open = False
 
@@ -1941,6 +1947,29 @@ class AgentTurnExecution:
                                 event.text,
                             ),
                         )
+                if isinstance(event, ToolCallStarted):
+                    plan_decoders[event.tool_call_id] = (
+                        _PlanContentDecoder()
+                        if event.name == PROPOSE_PLAN_TOOL_DEFINITION.name
+                        else None
+                    )
+                elif isinstance(event, ToolCallArgumentsDelta):
+                    decoder = plan_decoders.get(event.tool_call_id)
+                    if decoder is not None:
+                        plan_text = decoder.feed(event.arguments_delta)
+                        if plan_text:
+                            self._append(
+                                events,
+                                PlanContentDelta(
+                                    self._state.run_id,
+                                    self._state.turn_id,
+                                    iteration,
+                                    event.tool_call_id,
+                                    plan_text,
+                                ),
+                            )
+                elif isinstance(event, ToolCallCompleted):
+                    plan_decoders.pop(event.tool_call_id, None)
                 if isinstance(event, GenerationCompleted):
                     if self._cancellation.cancelled:
                         raise GenerationCancelled()

@@ -16,6 +16,7 @@ from uthcode.core.planning import (
     TaskItem,
     TaskState,
     TaskStatus,
+    _PlanContentDecoder,
     parse_propose_plan_arguments,
     parse_todo_write_arguments,
 )
@@ -49,6 +50,33 @@ def test_propose_plan_definition_is_strict_and_parser_accepts_only_non_empty_pla
 def test_propose_plan_parser_rejects_invalid_arguments(payload: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         parse_propose_plan_arguments(payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "chunker",
+    (
+        lambda encoded: (encoded,),
+        lambda encoded: (encoded[:1], encoded[1:8], encoded[8:]),
+        lambda encoded: tuple(encoded),
+    ),
+)
+def test_plan_content_decoder_handles_json_boundaries_and_escapes(chunker) -> None:
+    plan_text = 'line 1\nquote " slash \\ 中文 😀'
+    encoded = json.dumps({"plan": plan_text}, ensure_ascii=True, separators=(",", ":"))
+    decoder = _PlanContentDecoder()
+
+    decoded = "".join(decoder.feed(chunk) for chunk in chunker(encoded))
+
+    assert decoded == plan_text
+    assert decoder.finish() is True
+
+
+def test_plan_content_decoder_marks_malformed_stream_incomplete() -> None:
+    decoder = _PlanContentDecoder()
+
+    assert decoder.feed('{"plan":"draft"oops}') == "draft"
+    assert decoder.finish() is False
+    assert decoder.invalid is True
 
 
 def test_planning_enums_are_exact_and_json_safe() -> None:

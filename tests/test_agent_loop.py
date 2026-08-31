@@ -26,6 +26,7 @@ from uthcode.core.agent_events import (
     BehaviorModeChanged,
     CompletionBlocked,
     IterationStarted,
+    PlanContentDelta,
     PlanProposed,
     TaskStateChanged,
     ReasoningDelta,
@@ -86,6 +87,7 @@ from uthcode.core.provider import (
     TextDelta,
     TextPart,
     ToolCallArgumentsDelta,
+    ToolCallCompleted,
     ToolCallPart,
     ToolCallStarted,
     ToolDefinition,
@@ -280,6 +282,37 @@ class PausableProvider:
         yield self.response
 
 
+class PartialPlanStreamProvider:
+    def __init__(self, outcome: str) -> None:
+        self.identity = ProviderIdentity("fake", "partial-plan", "fake-model")
+        self.outcome = outcome
+        self.call_count = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken):
+        del request
+        self.call_count += 1
+        if self.call_count > 1:
+            yield _response(TextPart("closed"))
+            return
+        yield ToolCallStarted("plan-stream", "ProposePlan")
+        yield ToolCallArgumentsDelta("plan-stream", '{"plan":"draft')
+        self.entered.set()
+        if self.outcome == "cancel":
+            await self.release.wait()
+            cancellation.raise_if_cancelled()
+        if self.outcome == "failure":
+            raise ProviderError("provider dropped")
+        if self.outcome == "malformed":
+            yield _response(
+                ToolCallPart("plan-stream", "ProposePlan", {}),
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+            return
+        raise AssertionError(f"unknown partial plan outcome: {self.outcome}")
+
+
 def _loop(
     provider,
     tools: tuple[Tool, ...] = (),
@@ -326,6 +359,16 @@ def _start(loop: AgentLoop, *, ask: bool = False, run_id: str = "run-1", turn_id
         "hello",
         turn_id=turn_id,
         tool_definitions=definitions,
+    )
+
+
+def _start_plan(loop: AgentLoop, *, run_id: str = "run-plan", turn_id: str = "turn-plan"):
+    return loop.start_turn(
+        RunState.initial(run_id, behavior_mode=BehaviorMode.PLAN),
+        "make a plan",
+        turn_id=turn_id,
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=(PROPOSE_PLAN_TOOL_DEFINITION,),
     )
 
 
@@ -1950,6 +1993,147 @@ async def test_t08_plan_candidate_revise_approve_stays_in_one_turn_and_commits_o
     assert captured[1][1].behavior_mode is BehaviorMode.PLAN
     assert captured[1][0][-1] == "ProposePlan"
     assert captured[2][1].plan_state is not None and captured[2][1].plan_state.approved
+
+
+@pytest.mark.asyncio
+async def test_plan_content_delta_decodes_arbitrary_chunks_and_precedes_final_plan_event() -> None:
+    plan_text = 'line 1\nquote " slash \\ 中文 😀'
+    encoded = json.dumps({"plan": plan_text}, ensure_ascii=True, separators=(",", ":"))
+    stream = [
+        ToolCallStarted("plan-1", "ProposePlan"),
+        *(ToolCallArgumentsDelta("plan-1", chunk) for chunk in encoded),
+        ToolCallCompleted("plan-1", "ProposePlan", {"plan": plan_text}),
+        _response(
+            ToolCallPart("plan-1", "ProposePlan", {"plan": plan_text}),
+            finish_reason=FinishReason.TOOL_CALLS,
+        ),
+    ]
+    provider = ScriptedProvider([stream])
+    loop = _loop(provider)
+    execution = loop.start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "make a plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=(PROPOSE_PLAN_TOOL_DEFINITION,),
+    )
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.paused
+    deltas = [event for event in segment.events if isinstance(event, PlanContentDelta)]
+    assert deltas
+    assert all(event.tool_call_id == "plan-1" for event in deltas)
+    assert "".join(event.text for event in deltas) == plan_text
+    assert all("arguments_delta" not in event.to_dict() for event in deltas)
+    proposed_index = next(
+        index for index, event in enumerate(segment.events) if isinstance(event, PlanProposed)
+    )
+    assert max(index for index, event in enumerate(segment.events) if isinstance(event, PlanContentDelta)) < proposed_index
+    assert execution.state.plan_state is not None
+    assert execution.state.plan_state.text == plan_text
+
+
+@pytest.mark.asyncio
+async def test_plan_content_delta_keeps_tool_call_identity_and_ignores_non_plan_tools() -> None:
+    plan_text = "first\nsecond"
+    encoded = json.dumps({"plan": plan_text}, separators=(",", ":"))
+    first, second, third = encoded[:8], encoded[8:15], encoded[15:]
+    stream = [
+        ToolCallStarted("other-1", "ReadFile"),
+        ToolCallArgumentsDelta("other-1", '{"path":"hidden"}'),
+        ToolCallStarted("plan-1", "ProposePlan"),
+        ToolCallArgumentsDelta("plan-1", first),
+        ToolCallStarted("other-2", "TodoWrite"),
+        ToolCallArgumentsDelta("other-2", '{"todos":[]}'),
+        ToolCallCompleted("other-2", "TodoWrite", {"todos": []}),
+        ToolCallArgumentsDelta("plan-1", second),
+        ToolCallArgumentsDelta("plan-1", third),
+        ToolCallCompleted("plan-1", "ProposePlan", {"plan": plan_text}),
+        _response(
+            ToolCallPart("plan-1", "ProposePlan", {"plan": plan_text}),
+            finish_reason=FinishReason.TOOL_CALLS,
+        ),
+    ]
+    provider = ScriptedProvider([stream])
+    execution = _loop(provider).start_turn(
+        RunState.initial("run-1", behavior_mode=BehaviorMode.PLAN),
+        "make a plan",
+        turn_id="turn-1",
+        behavior_mode=BehaviorMode.PLAN,
+        tool_definitions=(PROPOSE_PLAN_TOOL_DEFINITION,),
+    )
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.paused
+    deltas = [event for event in segment.events if isinstance(event, PlanContentDelta)]
+    assert deltas
+    assert {event.tool_call_id for event in deltas} == {"plan-1"}
+    assert "".join(event.text for event in deltas) == plan_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome, expected_status, expected_reason",
+    (
+        ("malformed", RunStatus.COMPLETED, TerminationReason.FINAL_ANSWER),
+        ("failure", RunStatus.FAILED, TerminationReason.PROVIDER_ERROR),
+    ),
+)
+async def test_partial_plan_draft_is_not_committed_after_malformed_or_provider_failure(
+    outcome: str,
+    expected_status: RunStatus,
+    expected_reason: TerminationReason,
+) -> None:
+    provider = PartialPlanStreamProvider(outcome)
+    execution = _start_plan(_loop(provider))
+
+    segment = await execution.run_segment(pause_signal=CancellationToken())
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is expected_status
+    assert segment.result.termination_reason is expected_reason
+    assert provider.call_count == (2 if outcome == "malformed" else 1)
+    deltas = [event for event in segment.events if isinstance(event, PlanContentDelta)]
+    assert [(event.tool_call_id, event.text) for event in deltas] == [("plan-stream", "draft")]
+    assert not any(isinstance(event, PlanProposed) for event in segment.events)
+    final_events = [
+        event
+        for event in segment.events
+        if isinstance(event, AssistantMessageCompleted)
+        and event.kind is AssistantMessageKind.FINAL
+    ]
+    if outcome == "failure":
+        assert not final_events
+    else:
+        assert len(final_events) == 1
+        assert segment.result.final_text == "closed"
+    assert execution.state.plan_state is None
+    if outcome == "failure":
+        assert execution.state.messages == (execution.state.messages[0],)
+
+
+@pytest.mark.asyncio
+async def test_partial_plan_draft_is_not_committed_when_cancelled_mid_stream() -> None:
+    provider = PartialPlanStreamProvider("cancel")
+    execution = _start_plan(_loop(provider))
+    running = asyncio.create_task(execution.run_segment(pause_signal=CancellationToken()))
+
+    await provider.entered.wait()
+    assert execution.cancel() is True
+    provider.release.set()
+    segment = await running
+
+    assert segment.terminal and segment.result is not None
+    assert segment.result.status is RunStatus.CANCELLED
+    assert segment.result.termination_reason is TerminationReason.USER_CANCELLED
+    assert provider.call_count == 1
+    deltas = [event for event in segment.events if isinstance(event, PlanContentDelta)]
+    assert [(event.tool_call_id, event.text) for event in deltas] == [("plan-stream", "draft")]
+    assert not any(isinstance(event, PlanProposed) for event in segment.events)
+    assert execution.state.plan_state is None
+    assert execution.state.messages == (execution.state.messages[0],)
 
 
 @pytest.mark.asyncio

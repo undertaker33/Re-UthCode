@@ -38,6 +38,7 @@ from uthcode.core.agent_events import (
     agent_event_from_dict,
     agent_event_from_json,
     TurnPausing,
+    PlanContentDelta,
 )
 from uthcode.core.interaction import PauseKind, PauseReason
 from uthcode.core.planning import BehaviorMode, TaskItem, TaskState, TaskStatus
@@ -78,6 +79,7 @@ def _events() -> tuple[AgentEvent, ...]:
             1,
             TaskState((TaskItem("verify", TaskStatus.IN_PROGRESS),)),
         ),
+        PlanContentDelta("run-1", "turn-1", 1, "plan-call-1", "Partial plan"),
         PlanProposed("run-1", "turn-1", 1, 2, "Complete replacement plan"),
         CompletionBlocked("run-1", "turn-1", 1, 2),
         UserSteeringRequested("run-1", "turn-1", "steer-1"),
@@ -238,6 +240,7 @@ def test_t08_events_are_strict_display_safe_and_carry_required_projection() -> N
     events = (
         BehaviorModeChanged("run", "turn", BehaviorMode.PLAN, BehaviorMode.DEFAULT),
         TaskStateChanged("run", "turn", 3, task_state),
+        PlanContentDelta("run", "turn", 3, "plan-call", "Partial plan"),
         PlanProposed("run", "turn", 3, 4, "Full Plan v4"),
         CompletionBlocked("run", "turn", 3, 2),
         UserSteeringRequested("run", "turn", "steer-secret-free"),
@@ -255,10 +258,18 @@ def test_t08_events_are_strict_display_safe_and_carry_required_projection() -> N
             agent_event_from_dict({**payload, "unexpected": True})
 
     assert events[1].to_dict()["task_state"] == task_state.to_dict()
-    assert events[2].to_dict()["revision"] == 4
-    assert events[2].to_dict()["plan_text"] == "Full Plan v4"
-    assert "text" not in events[4].to_dict()
+    assert events[2].to_dict() == {
+        "type": "plan_content_delta",
+        "run_id": "run",
+        "turn_id": "turn",
+        "iteration": 3,
+        "tool_call_id": "plan-call",
+        "text": "Partial plan",
+    }
+    assert events[3].to_dict()["revision"] == 4
+    assert events[3].to_dict()["plan_text"] == "Full Plan v4"
     assert "text" not in events[5].to_dict()
+    assert "text" not in events[6].to_dict()
 
 
 @pytest.mark.parametrize(
@@ -268,6 +279,8 @@ def test_t08_events_are_strict_display_safe_and_carry_required_projection() -> N
         lambda: TaskStateChanged("run", "turn", 0, TaskState()),
         lambda: PlanProposed("run", "turn", 1, 0, "plan"),
         lambda: PlanProposed("run", "turn", 1, 1, ""),
+        lambda: PlanContentDelta("run", "turn", 1, "", "plan"),
+        lambda: PlanContentDelta("run", "turn", 1, "call", ""),
         lambda: CompletionBlocked("run", "turn", 1, 0),
         lambda: UserSteeringRequested("run", "turn", ""),
         lambda: UserSteeringApplied("run", "turn", ""),

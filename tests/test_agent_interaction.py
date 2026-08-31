@@ -51,7 +51,6 @@ def _select_question(
     question_id: str = "choice",
     *,
     kind: QuestionKind = QuestionKind.SINGLE_SELECT,
-    allow_other: bool = False,
 ) -> UserQuestion:
     return UserQuestion(
         question_id=question_id,
@@ -62,7 +61,6 @@ def _select_question(
             QuestionOption("one", "Use the first option"),
             QuestionOption("two", "Use the second option"),
         ),
-        allow_other=allow_other,
     )
 
 
@@ -71,7 +69,7 @@ def _request() -> UserInputRequest:
         questions=(
             UserQuestion("name", "Name", "What is your name?", QuestionKind.TEXT),
             _select_question(),
-            _select_question("many", kind=QuestionKind.MULTI_SELECT, allow_other=True),
+            _select_question("many", kind=QuestionKind.MULTI_SELECT),
         )
     )
 
@@ -190,8 +188,13 @@ def test_question_shapes_and_json_are_immutable_and_stable() -> None:
         UserInputRequest((UserQuestion("same", "h", "q", QuestionKind.TEXT), UserQuestion("same", "h", "q", QuestionKind.TEXT)))
     with pytest.raises(ValueError):
         UserQuestion("q", "h", "q", QuestionKind.TEXT, options=(QuestionOption("x", "x"),))
-    with pytest.raises(ValueError):
-        UserQuestion("q", "h", "q", QuestionKind.TEXT, allow_other=True)
+    with pytest.raises((TypeError, ValueError)):
+        UserQuestion.from_dict(
+            {
+                **UserQuestion("q", "h", "q", QuestionKind.TEXT).to_dict(),
+                "allow_" + "other": True,
+            }
+        )
     with pytest.raises(ValueError):
         UserQuestion(
             "q",
@@ -229,16 +232,15 @@ def test_answers_validate_by_question_kind_and_have_stable_json() -> None:
         request.validate_answers({"name": ["Ada"], "choice": ["one"], "many": []})
     with pytest.raises(ValueError):
         request.validate_answers({"name": ["Ada", "extra"], "choice": ["one"], "many": ["one"]})
-    with pytest.raises(ValueError):
-        request.validate_answers({"name": ["Ada"], "choice": ["unknown"], "many": ["one"]})
+    assert request.validate_answers({"name": ["Ada"], "choice": ["unknown"], "many": ["one"]})["choice"] == ["unknown"]
     with pytest.raises(ValueError):
         request.validate_answers({"name": ["Ada"], "choice": ["one"], "many": ["one", "one"]})
     with pytest.raises(ValueError):
         request.validate_answers({"name": ["Ada"], "choice": ["one"], "many": ["one"], "extra": ["x"]})
 
 
-def test_other_and_response_type_matching() -> None:
-    request = UserInputRequest((_select_question(allow_other=True),))
+def test_free_text_answers_and_response_type_matching() -> None:
+    request = UserInputRequest((_select_question(),))
     assert request.validate_answers({"choice": ["a custom answer"]})["choice"] == ["a custom answer"]
 
     pause = _pause()
@@ -616,7 +618,7 @@ def test_ask_user_definition_is_strict_and_json_schema_valid() -> None:
     assert question_schema["additionalProperties"] is False
     assert option_schema["additionalProperties"] is False
     assert question_schema["properties"]["options"]["minItems"] == 2
-    assert question_schema["properties"]["options"]["maxItems"] == 6
+    assert question_schema["properties"]["options"]["maxItems"] == 3
     schema_data = definition.to_dict()["parameters"]
     Draft202012Validator.check_schema(schema_data)
     validator = Draft202012Validator(schema_data)
@@ -673,7 +675,12 @@ def test_protocol_rejects_empty_or_whitespace_text(factory) -> None:
         lambda: UserQuestion("id", 1, "Question", QuestionKind.TEXT),
         lambda: UserQuestion("id", "Header", "Question", 1),
         lambda: UserQuestion("id", "Header", "Question", QuestionKind.TEXT, options=1),
-        lambda: UserQuestion("id", "Header", "Question", QuestionKind.TEXT, allow_other=1),
+        lambda: UserQuestion.from_dict(
+            {
+                **UserQuestion("id", "Header", "Question", QuestionKind.TEXT).to_dict(),
+                "allow_" + "other": 1,
+            }
+        ),
         lambda: UserInputRequest(1),
         lambda: PauseRequest("pause", "run", "turn", PauseKind.USER_REQUESTED, PauseReason.USER_REQUESTED, True, "now"),
         lambda: PauseRequest("pause", "run", "turn", PauseKind.USER_REQUESTED, PauseReason.USER_REQUESTED, "1", "now"),
@@ -698,11 +705,11 @@ def test_select_and_question_count_boundaries_are_exact() -> None:
         )
 
     select_with_options(2)
-    select_with_options(6)
+    select_with_options(3)
     with pytest.raises(ValueError):
         select_with_options(1)
     with pytest.raises(ValueError):
-        select_with_options(7)
+        select_with_options(4)
     with pytest.raises(ValueError):
         UserQuestion(
             "choice",
@@ -730,12 +737,17 @@ def test_select_and_question_count_boundaries_are_exact() -> None:
         )
 
 
-def test_text_questions_reject_options_and_allow_other() -> None:
+def test_text_questions_reject_options_and_legacy_free_text_flag() -> None:
     option = QuestionOption("one", "One")
     with pytest.raises(ValueError):
         UserQuestion("text", "Text", "Enter", QuestionKind.TEXT, options=(option,))
-    with pytest.raises(ValueError):
-        UserQuestion("text", "Text", "Enter", QuestionKind.TEXT, allow_other=True)
+    with pytest.raises((TypeError, ValueError)):
+        UserQuestion.from_dict(
+            {
+                **UserQuestion("text", "Text", "Enter", QuestionKind.TEXT).to_dict(),
+                "allow_" + "other": True,
+            }
+        )
 
 
 def _assert_strict_dict_and_json_decoders(

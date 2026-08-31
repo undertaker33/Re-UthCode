@@ -2,20 +2,20 @@
 
 ## T01：AskUser Core 合同硬切
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_agent_interaction.py tests/test_tui.py -q`，全部用例通过。
-- [ ] 构造 text、single-select、multi-select 与 1～4 题请求，确认 text 无 options、select 只接受 2～3 个结构化 options，第 4 个 option 被拒绝。
-- [ ] 对 single-select 与 multi-select 提交不命中 option label 的非空答案，确认 Core typed response 校验通过；空答案、重复 question id、缺失 question id 仍被拒绝。
-- [ ] 对旧 JSON/tool payload 注入 `allow_other`，确认新合同拒绝；执行 `rg -n "allow_other" src tests desktop/src desktop/tests`，active source/tests 返回 0 条。
-- [ ] TUI 与 Desktop Renderer 测试确认每个选择题始终出现自由输入路径，提交后恢复原 Turn，cancel 仍走 typed cancel。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_agent_interaction.py tests/test_tui.py -q`，全部用例通过。
+- [x] 构造 text、single-select、multi-select 与 1～4 题请求，确认 text 无 options、select 只接受 2～3 个结构化 options，第 4 个 option 被拒绝。
+- [x] 对 single-select 与 multi-select 提交不命中 option label 的非空答案，确认 Core typed response 校验通过；空答案、重复 question id、缺失 question id 仍被拒绝。
+- [x] 对旧 JSON/tool payload 注入 `allow_other`，确认新合同拒绝；执行 `rg -n "allow_other" src tests desktop/src desktop/tests`，active source/tests 返回 0 条。
+- [x] TUI 与 Desktop Renderer 测试确认每个选择题始终出现自由输入路径，提交后恢复原 Turn，cancel 仍走 typed cancel。
 
 ## T02：Plan 真流式公共事件
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_planning.py tests/test_agent_events.py tests/test_agent_loop.py -q`，全部用例通过。
-- [ ] `PlanContentDelta` 完成 dict/JSON round-trip，字段含 Run/Turn/iteration/tool-call identity 与自然语言 text，payload 不含 `arguments_delta`、raw JSON 或 Provider SDK 类型。
-- [ ] 以单 chunk、多 chunk、逐字符、key/value 边界、换行、引号、反斜杠和 Unicode escape 输入 Plan 参数流，确认输出只追加新解码文本且最终拼接正确。
-- [ ] 同一 Turn 中混入不同 tool-call identity 与非 `ProposePlan` 工具，确认不会串流或产生 Plan delta。
-- [ ] 合法完成顺序为 delta → `PlanProposed` → Plan Review；malformed、失败与取消只终止 draft，不写正式 PlanState、不产生伪 `PlanProposed`。
-- [ ] 执行否定扫描，确认 Renderer 与公共 AgentEvent 不解析/携带 raw tool argument JSON，生产代码中没有通用 Tool JSON streaming framework。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_planning.py tests/test_agent_events.py tests/test_agent_loop.py -q`，全部用例通过。
+- [x] `PlanContentDelta` 完成 dict/JSON round-trip，字段含 Run/Turn/iteration/tool-call identity 与自然语言 text，payload 不含 `arguments_delta`、raw JSON 或 Provider SDK 类型。
+- [x] 以单 chunk、多 chunk、逐字符、key/value 边界、换行、引号、反斜杠和 Unicode escape 输入 Plan 参数流，确认输出只追加新解码文本且最终拼接正确。
+- [x] 同一 Turn 中混入不同 tool-call identity 与非 `ProposePlan` 工具，确认不会串流或产生 Plan delta。
+- [x] 合法完成顺序为 delta → `PlanProposed` → Plan Review；malformed、失败与取消只终止 draft，不写正式 PlanState、不产生伪 `PlanProposed`。
+- [x] 执行否定扫描，确认 Renderer 与公共 AgentEvent 不解析/携带 raw tool argument JSON，生产代码中没有通用 Tool JSON streaming framework。
 
 ## T03：Application Context / Compact 安全投影
 

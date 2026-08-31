@@ -478,7 +478,7 @@ def test_double_escape_state_is_time_bound() -> None:
     assert esc.consume(11.1) is False
 
 
-def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
+def test_tui_interaction_state_handles_select_multi_free_text_and_review() -> None:
     request = UserInputRequest(
         (
             UserQuestion(
@@ -510,7 +510,6 @@ def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
                     QuestionOption("team", "The team"),
                     QuestionOption("me", "The user"),
                 ),
-                allow_other=True,
             ),
         )
     )
@@ -531,13 +530,12 @@ def test_tui_interaction_state_handles_select_multi_other_and_review() -> None:
 
     assert state.submit_current() is True
     assert state.answers["single"] == ["fast"]
-    state.move(1)
     assert state.toggle_option() is True
     state.move(1)
     assert state.toggle_option() is True
     assert state.submit_current() is True
     assert state.answers["multi"] == ["api", "ui"]
-    state.choose_other()
+    state.choose_free_text()
     state.set_draft("a partner")
     assert state.submit_current() is True
     assert state.mode is InteractionMode.REVIEW
@@ -631,7 +629,7 @@ def test_tui_plan_review_state_approves_or_collects_revision_without_owning_plan
     assert not hasattr(state, "plan_state")
 
 
-def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None:
+def test_tui_interaction_exit_free_text_restores_legal_single_select_focus() -> None:
     question = UserQuestion(
         "mode",
         "Mode",
@@ -641,7 +639,6 @@ def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None
             QuestionOption("fast", "Fast mode"),
             QuestionOption("safe", "Safe mode"),
         ),
-        allow_other=True,
     )
     pause = PauseRequest(
         "pause",
@@ -661,11 +658,11 @@ def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None
     assert state.toggle_option() is True
     state.move(1)
     assert state.option_index == len(question.options)
-    assert state.choose_other() is True
+    assert state.choose_free_text() is True
     state.set_draft("custom")
 
-    assert state.exit_other() is True
-    assert state.other_mode is False
+    assert state.exit_free_text() is True
+    assert state.free_text_mode is False
     assert state.draft == ""
     assert state.option_index == 1
     assert state.selected_options == {1}
@@ -673,10 +670,10 @@ def test_tui_interaction_exit_other_restores_legal_single_select_focus() -> None
 
     state.open_pause(pause)
     state.move(len(question.options))
-    assert state.choose_other() is True
+    assert state.choose_free_text() is True
     state.set_draft("custom")
-    assert state.exit_other() is True
-    assert state.other_mode is False
+    assert state.exit_free_text() is True
+    assert state.free_text_mode is False
     assert state.draft == ""
     assert state.option_index == 0
     assert state.selected_options == set()
@@ -2456,7 +2453,7 @@ async def test_tui_pause_question_panel_submits_through_application_turn() -> No
 
 
 @pytest.mark.asyncio
-async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
+async def test_real_tui_single_free_text_escape_enter_returns_to_ordinary_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCallPart(
@@ -2473,7 +2470,6 @@ async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
                         {"label": "fast", "description": "Fast"},
                         {"label": "safe", "description": "Safe"},
                     ],
-                    "allow_other": True,
                 }
             ]
         },
@@ -2522,13 +2518,13 @@ async def test_real_tui_single_other_escape_enter_returns_to_ordinary_option(
         tui.interaction.move(len(question.options))
         assert tui.interaction.option_index == len(question.options)
         assert tui.interaction.toggle_option() is True
-        assert tui.interaction.other_mode is True
+        assert tui.interaction.free_text_mode is True
         pipe.send_text("custom-owner")
         await _wait_until(lambda: tui.buffer.text == "custom-owner")
 
         pipe.send_text("\x1b[27u")
         await _wait_until(
-            lambda: not tui.interaction.other_mode
+            lambda: not tui.interaction.free_text_mode
             and tui.buffer.text == ""
             and 0 <= tui.interaction.option_index < len(question.options),
             attempts=500,
@@ -2668,7 +2664,7 @@ async def test_real_tui_question_back_restores_buffer_and_draft_without_resuming
 
 
 @pytest.mark.asyncio
-async def test_real_tui_question_back_restores_other_and_selection_state() -> None:
+async def test_real_tui_question_back_restores_free_text_and_selection_state() -> None:
     call = ToolCallPart(
         "ask-options",
         "AskUserQuestion",
@@ -2709,7 +2705,6 @@ async def test_real_tui_question_back_restores_other_and_selection_state() -> No
                         {"label": "team", "description": "The team"},
                         {"label": "me", "description": "The user"},
                     ],
-                    "allow_other": True,
                 },
             ]
         },
@@ -2763,7 +2758,7 @@ async def test_real_tui_question_back_restores_other_and_selection_state() -> No
         await _wait_until(
             lambda: tui.interaction.current_question is not None
             and tui.interaction.current_question.question_id == "other"
-            and tui.interaction.other_mode
+            and tui.interaction.free_text_mode
             and tui.buffer.text == "custom-owner"
         )
         assert tui.buffer.cursor_position == len("custom-owner")
