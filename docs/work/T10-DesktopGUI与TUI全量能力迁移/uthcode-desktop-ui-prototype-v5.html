@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UthCode Desktop UI Engineering Prototype</title>
+<style>
+:root{
+  --bg:#141414;--panel:#1b1b1b;--panel2:#222;--panel3:#2a2a2a;--hover:#303030;
+  --border:#333;--text:#eeeeee;--muted:#969696;--soft:#6f6f6f;
+  --accent:#7b8cff;--ok:#45c486;--warn:#e69a51;--danger:#e66a6a;
+  --sidebar:286px;--inspector:318px;--top:50px;--composer-w:820px;
+  font-family:Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;background:#0d0d0d;color:var(--text);overflow:hidden}
+button,input,textarea{font:inherit}
+button{color:inherit}
+.app{height:100vh;min-width:1080px;background:var(--bg);display:grid;grid-template-columns:var(--sidebar) 1fr;grid-template-rows:var(--top) 1fr;position:relative}
+.app.sidebar-collapsed{--sidebar:64px}
+.sidebar{grid-row:1/3;grid-column:1;background:#181818;border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;z-index:40}
+.sidebar-top{flex:0 0 auto;padding:12px 12px 8px}
+.brand-row{height:36px;display:flex;align-items:center;justify-content:space-between;padding:0 7px}
+.brand{font-size:18px;font-weight:650;white-space:nowrap}
+.icon-btn{border:0;background:transparent;border-radius:7px;min-width:30px;height:30px;cursor:pointer;color:#aaa}
+.icon-btn:hover{background:#292929;color:#fff}
+.primary-btn,.nav-row,.session-row,.project-row{height:36px;border-radius:8px;display:flex;align-items:center;gap:9px;padding:0 10px;cursor:pointer;white-space:nowrap;overflow:hidden}
+.primary-btn:hover,.nav-row:hover,.session-row:hover,.project-row:hover{background:#292929}
+.project-row.active,.session-row.active{background:#2d2d2d}
+.section-title{color:#707070;font-size:12px;font-weight:650;margin:17px 10px 7px;text-transform:uppercase;letter-spacing:.03em}
+.sidebar-middle{flex:1;overflow:auto;padding:0 8px 12px;scrollbar-width:thin;scrollbar-color:#484848 transparent}
+.project-block{margin-bottom:8px}
+.project-header-row,.project-session-row,.recent-session-row,.pinned-row{
+  height:36px;border-radius:8px;display:flex;align-items:center;gap:9px;padding:0 10px;cursor:pointer;white-space:nowrap;overflow:hidden;position:relative
+}
+.project-header-row:hover,.project-session-row:hover,.recent-session-row:hover,.pinned-row:hover{background:#292929}
+.project-header-row.active,.project-session-row.active,.recent-session-row.active{background:#2d2d2d}
+.project-header-row .project-name,.project-session-row .session-title,.recent-session-row .session-title,.pinned-row .pinned-title{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1
+}
+.project-sessions{padding-left:18px}
+.project-session-row{font-size:13px;height:34px}
+.item-action{
+  width:24px;height:24px;border:0;background:transparent;color:#666;border-radius:6px;cursor:pointer;opacity:0;flex:none;padding:0
+}
+.project-header-row:hover .item-action,.project-session-row:hover .item-action{opacity:1}
+.item-action:hover{background:#3a3a3a;color:#ddd}
+.item-action.pinned{opacity:1;color:#aaa}
+.session-status{width:7px;height:7px;border-radius:50%;background:#666;flex:none}
+.project-session-row.active .session-status,.recent-session-row.active .session-status{background:var(--accent)}
+.pinned-row{font-size:13px}
+.pinned-kind{color:#666;font-size:11px;flex:none}
+.recent-project{color:#656565;font-size:11px;max-width:76px;overflow:hidden;text-overflow:ellipsis}
+.project-preview{position:fixed;width:360px;background:#2a2a2a;border:1px solid #404040;border-radius:12px;padding:13px 14px;box-shadow:0 12px 34px #0008;z-index:91;display:none;pointer-events:none}
+.project-preview.show{display:block}
+.project-preview-head{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+.project-preview-head strong{font-size:15px}
+.project-preview-line{display:flex;gap:9px;align-items:flex-start;color:#aaa;font-size:12px;padding:6px 0;border-top:1px solid #373737}
+.project-preview-line:first-of-type{border-top:0}
+.project-preview-line .label{color:#777;min-width:45px}
+
+.project-tree-host{display:flex;flex-direction:column;gap:4px}
+.project-block.pinned-block{margin-bottom:6px}
+.project-header-row{padding-right:6px}
+.project-header-row .project-actions{display:flex;align-items:center;gap:2px;flex:none}
+.project-action-btn{
+  width:27px;height:27px;border:0;background:transparent;color:#737373;border-radius:6px;
+  display:grid;place-items:center;cursor:pointer;padding:0;opacity:0
+}
+.project-header-row:hover .project-action-btn,.project-action-btn.menu-open{opacity:1}
+.project-action-btn:hover{background:#3a3a3a;color:#ddd}
+.project-action-btn svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.5;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.project-header-row .chevron{width:14px;color:#666;font-size:11px;flex:none;transition:transform .12s ease}
+.project-block.state-collapsed .chevron{transform:rotate(-90deg)}
+.project-block.state-collapsed .project-sessions,
+.project-block.state-collapsed .project-footer{display:none}
+.project-block.state-five .project-session-row:nth-child(n+6){display:none}
+.project-block.state-all .project-session-row{display:flex}
+.project-footer{display:flex;align-items:center;height:30px;color:#777;font-size:12px;padding-left:37px;border-radius:7px;cursor:pointer}
+.project-footer:hover{background:#252525;color:#aaa}
+.project-footer.hidden{display:none}
+.project-session-row .session-actions{display:flex;align-items:center;flex:none}
+.session-more{
+  width:24px;height:24px;border:0;background:transparent;color:#666;border-radius:6px;display:grid;place-items:center;cursor:pointer;opacity:0
+}
+.project-session-row:hover .session-more{opacity:1}
+.project-menu{
+  position:fixed;width:238px;background:#222;border:1px solid #3b3b3b;border-radius:10px;padding:6px;
+  box-shadow:0 14px 38px #000a;z-index:120;display:none
+}
+.project-menu.show{display:block}
+.project-menu .menu-sep{height:1px;background:#3a3a3a;margin:5px 0}
+.project-menu-row{
+  height:38px;border-radius:7px;padding:0 10px;display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px
+}
+.project-menu-row:hover{background:#363636}
+.project-menu-row.danger{color:#e28787}
+.project-menu-icon{width:18px;text-align:center;color:#aaa}
+.project-name-input{
+  flex:1;background:#202020;border:1px solid #4b4b4b;border-radius:6px;color:#eee;padding:4px 7px;min-width:0;outline:none
+}
+.new-session-flash{animation:newSessionFlash .8s ease}
+@keyframes newSessionFlash{0%{background:#46506e}100%{background:transparent}}
+.sidebar-bottom{flex:0 0 auto;border-top:1px solid var(--border);padding:8px}
+.user-btn{height:40px;border-radius:8px;display:flex;align-items:center;gap:9px;padding:0 9px;cursor:pointer}
+.user-btn:hover{background:#292929}
+.avatar{width:24px;height:24px;border-radius:50%;background:#c64d3d;display:grid;place-items:center;font-size:10px}
+.user-menu{position:absolute;left:8px;bottom:56px;width:250px;background:#2a2a2a;border:1px solid #3a3a3a;border-radius:12px;padding:8px;box-shadow:0 12px 35px #0009;z-index:100;display:none}
+.user-menu.show{display:block}
+.menu-row{height:38px;border-radius:7px;display:flex;align-items:center;gap:10px;padding:0 10px;cursor:pointer}
+.menu-row:hover{background:#3a3a3a}
+
+.topbar{grid-column:2;grid-row:1;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:10px;background:#171717;z-index:30}
+.topbar-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.topbar-actions{display:flex;gap:6px}
+
+.workspace{grid-column:2;grid-row:2;position:relative;min-width:0;min-height:0;background:#151515}
+.workspace.docked{padding-right:var(--inspector)}
+.chat-scroller{position:absolute;inset:0;overflow:auto;padding:34px 28px 190px;scrollbar-width:thin;scrollbar-color:#444 transparent}
+.chat-column{width:min(var(--composer-w),calc(100% - 70px));margin:0 auto}
+.message{margin:0 0 26px}
+.user-wrap{display:flex;justify-content:flex-end}
+.user-bubble{max-width:72%;background:#303030;border-radius:18px;padding:13px 16px;line-height:1.55}
+.agent{line-height:1.72;color:#e9e9e9}
+.agent h2{font-size:18px;margin:0 0 10px}
+.agent h3{font-size:15px;margin:20px 0 8px}
+.agent p{margin:8px 0}
+.agent ul{margin:8px 0;padding-left:22px}
+.agent code{font-family:"Cascadia Mono","SFMono-Regular",Consolas,monospace;background:#252525;padding:2px 5px;border-radius:4px;font-size:.92em}
+.type-row{display:flex;align-items:center;gap:8px;color:#858585;font-size:13px;margin:14px 0}
+.type-row.error{color:#c97b7b}.type-row.warn{color:#aaa}
+.reasoning{color:#aaa;font-size:13px;border-left:2px solid #414141;padding-left:12px;margin:12px 0 18px}
+.tool-block{border-left:2px solid #3d3d3d;padding:3px 0 3px 12px;margin:10px 0;color:#bdbdbd;font-size:13px}
+.tool-line{display:flex;justify-content:space-between;gap:16px;padding:4px 0}
+.tool-line .time{color:#666}
+.markdown-card{border:1px solid #353535;border-radius:12px;background:#1d1d1d;padding:18px;margin-top:12px}
+.divider{height:1px;background:#2c2c2c;margin:16px 0}
+
+.composer-stack{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);width:min(var(--composer-w),calc(100% - 70px));z-index:26}
+.interaction-surface{display:none;background:#2b2b2b;border:1px solid #3b3b3b;border-bottom:0;border-radius:16px 16px 0 0;padding:16px 16px 12px;box-shadow:0 -8px 25px #0004}
+.interaction-surface.show{display:block}
+.interaction-title{font-weight:650;margin-bottom:12px}
+.choice{min-height:46px;border:1px solid #3b3b3b;border-radius:10px;background:#303030;margin:7px 0;padding:9px 12px;display:flex;align-items:center;gap:12px;cursor:pointer}
+.choice:hover{background:#383838}
+.choice .n{width:25px;height:25px;border:1px solid #555;border-radius:50%;display:grid;place-items:center;color:#aaa;font-size:12px;flex:none}
+.choice-main{flex:1}.choice-main small{display:block;color:#8b8b8b;margin-top:2px}
+.inline-actions{display:flex;gap:8px;margin-top:10px}
+.action{border:1px solid #444;background:#333;border-radius:9px;padding:8px 12px;cursor:pointer}
+.action:hover{background:#3b3b3b}.action.primary{background:#e8e8e8;color:#111}.action.danger{color:#e58c8c}
+.composer{height:108px;background:#292929;border:1px solid #3b3b3b;border-radius:16px;padding:12px 14px 10px;display:flex;flex-direction:column}
+.interaction-surface.show + .composer{border-radius:0 0 16px 16px;border-top-color:#343434}
+.composer textarea{flex:1;border:0;outline:0;resize:none;background:transparent;color:#eee;min-height:45px}
+.composer textarea::placeholder{color:#737373}
+.composer-bottom{display:flex;align-items:center;gap:10px;height:32px}
+.control{border:0;background:transparent;color:#b9b9b9;border-radius:8px;padding:6px 8px;cursor:pointer}
+.control:hover{background:#343434;color:#fff}
+.control.permission{color:#e69a51}
+.control.model{margin-left:auto}
+.send{width:34px;height:34px;border-radius:50%;border:0;background:#f4f4f4;color:#111;font-weight:700;cursor:pointer}
+.todo-pill{position:absolute;left:50%;bottom:118px;transform:translateX(-50%);background:#292929;border:1px solid #3b3b3b;border-radius:18px;padding:7px 13px;font-size:12px;color:#bdbdbd;cursor:default;z-index:28}
+.todo-pop{position:absolute;left:50%;bottom:151px;transform:translateX(-50%);width:430px;background:#292929;border:1px solid #3b3b3b;border-radius:13px;padding:9px;display:none;box-shadow:0 12px 32px #0008;z-index:29}
+.todo-anchor:hover .todo-pop{display:block}
+.todo-list{font-size:12px;color:#bdbdbd}.todo-item{padding:7px 8px;border-radius:7px;display:flex;gap:8px}.todo-item:hover{background:#333}.todo-item .state{width:16px}
+.todo-item.done{color:#8c8c8c}.todo-item.active{color:#eee}
+
+.slash-menu{position:absolute;left:0;right:0;bottom:118px;background:#292929;border:1px solid #3b3b3b;border-radius:14px;padding:8px;max-height:400px;overflow:auto;display:none;box-shadow:0 12px 35px #0009}
+.slash-menu.show{display:block}
+.slash-row{height:42px;border-radius:8px;display:grid;grid-template-columns:180px 1fr;align-items:center;padding:0 12px;color:#d7d7d7}
+.slash-row:hover,.slash-row.active{background:#3a3a3a}
+.slash-desc{color:#858585;font-size:12px}
+
+.inspector{position:absolute;width:var(--inspector);background:#2a2a2a;border:1px solid #3b3b3b;border-radius:14px;z-index:35;box-shadow:0 12px 36px #0007;overflow:hidden}
+.inspector.hidden{display:none}
+.inspector.floating{right:18px;top:20px;height:auto;max-height:620px}
+.inspector.docked{right:0;top:0;bottom:0;border-radius:0;border-top:0;border-bottom:0;border-right:0;box-shadow:none;width:var(--inspector)}
+.inspector-head{height:44px;display:flex;align-items:center;padding:0 8px 0 14px;border-bottom:1px solid #393939;cursor:grab;font-weight:650}
+.inspector-head .spacer{flex:1}
+.inspector-window-actions{display:flex;align-items:center;gap:2px}
+.inspector-window-btn{width:28px;height:28px;border:0;background:transparent;border-radius:6px;color:#aaa;display:grid;place-items:center;cursor:pointer;line-height:1;padding:0}
+.inspector-window-btn:hover{background:#3a3a3a;color:#fff}
+.inspector-window-btn svg{width:14px;height:14px;display:block;stroke:currentColor;stroke-width:1.55;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.inspector-window-btn.hide-btn svg{width:13px;height:13px}
+.inspector-section{padding:12px 14px;border-bottom:1px solid #393939}
+.inspector-title{color:#888;font-size:12px;margin-bottom:8px}
+.info-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;font-size:13px}
+.info-row span:last-child{color:#a9a9a9;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.session-preview{position:fixed;width:340px;background:#2a2a2a;border:1px solid #404040;border-radius:12px;padding:13px 14px;box-shadow:0 12px 34px #0008;z-index:90;display:none;pointer-events:none}
+.session-preview.show{display:block}
+.session-preview strong{display:block;margin-bottom:8px}.session-preview small{color:#888;display:block;margin:4px 0}
+
+.settings-view{display:none;height:100%;grid-column:1/3;grid-row:1/3;background:#151515;grid-template-columns:286px 1fr}
+.settings-view.show{display:grid}
+.settings-sidebar{background:#191919;border-right:1px solid var(--border);padding:12px 10px;overflow:auto}
+.back-app{height:36px;padding:0 10px;border-radius:8px;display:flex;align-items:center;cursor:pointer;color:#aaa}.back-app:hover{background:#292929;color:#fff}
+.settings-search{margin:10px 0 12px;width:100%;background:#272727;border:1px solid #333;border-radius:8px;color:#ddd;padding:9px 10px;outline:0}
+.settings-cat{height:36px;border-radius:8px;padding:0 10px;display:flex;align-items:center;cursor:pointer}.settings-cat:hover,.settings-cat.active{background:#303030}
+.settings-content{overflow:auto;padding:60px 8vw}
+.settings-inner{max-width:860px;margin:auto}
+.settings-inner h1{font-size:26px}
+.settings-note{color:#888;font-size:13px;margin-bottom:28px}
+.setting-group{border:1px solid #363636;border-radius:12px;overflow:hidden;background:#1d1d1d;margin:16px 0}
+.setting-row{min-height:62px;border-bottom:1px solid #333;display:flex;align-items:center;padding:10px 14px;gap:20px}.setting-row:last-child{border-bottom:0}
+.setting-label{flex:1}.setting-label small{display:block;color:#808080;margin-top:4px}
+.setting-value{color:#bbb}
+.fake-select{border:1px solid #444;border-radius:8px;padding:7px 10px;background:#2a2a2a}
+.toggle{width:38px;height:22px;border-radius:12px;background:#3c3c3c;padding:3px}.toggle.on{background:#367dcc}.toggle:after{content:"";display:block;width:16px;height:16px;border-radius:50%;background:white;transform:translateX(0)}.toggle.on:after{transform:translateX(16px)}
+
+.collapsed .brand,.collapsed .primary-btn span,.collapsed .section-title,.collapsed .project-name,.collapsed .session-title,.collapsed .pinned-title,.collapsed .pinned-kind,.collapsed .recent-project,.collapsed .user-name,.collapsed .nav-text,.collapsed .expand-project{display:none}
+.collapsed .primary-btn,.collapsed .project-header-row,.collapsed .project-session-row,.collapsed .recent-session-row,.collapsed .pinned-row{justify-content:center;padding:0}
+.collapsed .project-sessions{padding-left:0}
+.collapsed .item-action{display:none}
+.collapsed .sidebar-middle{padding-left:8px;padding-right:8px}
+.collapsed .user-btn{justify-content:center}
+.note-badge{display:inline-block;color:#9b9b9b;font-size:11px;border:1px solid #3b3b3b;padding:2px 6px;border-radius:999px}
+
+@media (max-width:1250px){
+  :root{--composer-w:700px;--inspector:280px;--sidebar:250px}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-top">
+      <div class="brand-row"><div class="brand">UthCode</div><button class="icon-btn" id="collapseSidebar">≪</button></div>
+      <div class="primary-btn" id="newChat"><b>＋</b><span>新对话</span></div>
+      <div class="primary-btn" id="openProject"><b>▣</b><span>打开项目…</span></div>
+    </div>
+    <div class="sidebar-middle">
+      <div class="section-title">置顶</div>
+      <div id="pinnedHost" class="project-tree-host"></div>
+
+      <div class="section-title">项目</div>
+      <div id="projectsHost" class="project-tree-host"></div>
+
+      <div class="section-title">最近</div>
+      <div id="recentHost"></div>
+    </div>
+    <div class="sidebar-bottom">
+      <div class="user-btn" id="userBtn"><span class="avatar">UL</span><span class="user-name">Lý Thu Lan</span><span style="margin-left:auto;color:#777">⋯</span></div>
+    </div>
+  </aside>
+
+  <header class="topbar">
+    <div class="topbar-title" id="conversationTitle">TUI 回复链路梳理</div>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="toggleInspector" title="信息栏">☷</button>
+      <button class="icon-btn" id="showAsk" title="AskUser">?</button>
+      <button class="icon-btn" id="showPlan" title="Plan Review">P</button>
+      <button class="icon-btn" id="showPermission" title="Permission">!</button>
+    </div>
+  </header>
+
+  <main class="workspace" id="workspace">
+    <div class="chat-scroller" id="chatScroller">
+      <div class="chat-column">
+        <div class="message user-wrap">
+          <div class="user-bubble">界面基本没问题，其余的你到 jsonl 中看看是否正常。</div>
+        </div>
+
+        <div class="message agent">
+          <div class="type-row">◷ 已处理 12 分钟 35 秒</div>
+          <div class="type-row warn">▣ 上下文已自动压缩</div>
+          <div class="reasoning">我会把你提供的 Session 当作人工验收样本，只读取 durable 的 metadata.json、transcript.jsonl、timeline.jsonl，重点核对消息顺序、reasoning/final 分离、工具结果与恢复后的继续对话。</div>
+          <div class="type-row">⌁ 正在重新连接 5/5</div>
+          <div class="type-row error">request timed out</div>
+          <p>我会按当前工作区的实际记录继续检查，不改写历史文件。</p>
+          <div class="tool-block">
+            <div class="tool-line"><span>▣ 运行了命令 · 读取 transcript.jsonl</span><span class="time">1.2s</span></div>
+            <div class="tool-line"><span>▣ 运行了命令 · 读取 timeline.jsonl</span><span class="time">0.8s</span></div>
+            <div class="tool-line"><span>▣ 运行了命令 · 校验 durable 顺序</span><span class="time">2.1s</span></div>
+          </div>
+          <h2>JSONL 与生产 replay 投影校验通过</h2>
+          <p>当前 Session 的 durable entry 顺序连续，<code>user / reasoning / final / tool_call / tool_result</code> 类型分离正常。</p>
+          <h3>重点结论</h3>
+          <ul>
+            <li>reasoning 与 final 正文没有发生重复落盘。</li>
+            <li>ToolCall 与 ToolResult 顺序与 call 顺序一致。</li>
+            <li>恢复 Session 后可继续同一个逻辑链，不需要创建“恢复页”。</li>
+          </ul>
+        </div>
+
+        <div class="message user-wrap">
+          <div class="user-bubble">继续看 Application 的安全 replay 投影。</div>
+        </div>
+
+        <div class="message agent">
+          <div class="type-row">思考</div>
+          <div class="reasoning">接下来只检查 Application 暴露给 Interface 的 display-safe 投影，不让 Desktop 直接读取 Integration 层存储。</div>
+          <div class="tool-block"><div class="tool-line"><span>▣ 运行了命令 · 检查 SessionCatalogEntry</span><span class="time">0.7s</span></div></div>
+          <p>Application 边界可以继续复用。Desktop 只需要消费安全 DTO 和 AgentEvent，不需要新建第二套事件协议。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer-stack" id="composerStack">
+      <div class="slash-menu" id="slashMenu"></div>
+
+      <div class="interaction-surface" id="interactionSurface"></div>
+
+      <div class="composer">
+        <textarea id="composerInput" placeholder="输入消息，输入 / 使用指令"></textarea>
+        <div class="composer-bottom">
+          <button class="control">＋</button>
+          <button class="control permission" id="permissionControl">◉ Default</button>
+          <button class="control model" id="modelControl">5.6 Sol 中⌄</button>
+          <button class="send" id="sendBtn">↑</button>
+        </div>
+      </div>
+
+      <div class="todo-anchor" id="todoAnchor">
+        <div class="todo-pill">◔ 第 6 / 7 步</div>
+        <div class="todo-pop">
+          <div class="todo-list">
+            <div class="todo-item done"><span class="state">✓</span><span>W01 Prompt/context boundary</span></div>
+            <div class="todo-item done"><span class="state">✓</span><span>W02 reasoning/history contract</span></div>
+            <div class="todo-item done"><span class="state">✓</span><span>W03 session replay/lifecycle</span></div>
+            <div class="todo-item done"><span class="state">✓</span><span>W04 process/tool activity</span></div>
+            <div class="todo-item done"><span class="state">✓</span><span>W05 TUI stream/resume</span></div>
+            <div class="todo-item active"><span class="state">◔</span><span>W06 integration/delivery</span></div>
+            <div class="todo-item"><span class="state">○</span><span>Verify full package and update docs</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="inspector floating" id="inspector">
+      <div class="inspector-head" id="inspectorDrag">
+        <span>运行信息</span><span class="spacer"></span>
+        <div class="inspector-window-actions">
+          <button class="inspector-window-btn hide-btn" id="hideInspector" title="隐藏" aria-label="隐藏">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 10.75h7"/></svg>
+          </button>
+          <button class="inspector-window-btn mode-btn" id="modeInspector" title="停靠到右侧" aria-label="停靠到右侧">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.25" y="3.25" width="9.5" height="9.5" rx="1.2"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="inspector-section">
+        <div class="inspector-title">当前工作区</div>
+        <div class="info-row"><span>项目</span><span id="infoProject">D:\project\Re-UthCode</span></div>
+        <div class="info-row"><span>Session</span><span id="infoSession">TUI 回复链路梳理</span></div>
+        <div class="info-row"><span>Turn</span><span>running</span></div>
+      </div>
+      <div class="inspector-section">
+        <div class="inspector-title">当前运行配置</div>
+        <div class="info-row"><span>模型</span><span>5.6 Sol</span></div>
+        <div class="info-row"><span>Permission</span><span>Default</span></div>
+        <div class="info-row"><span>Mode</span><span>Default</span></div>
+      </div>
+      <div class="inspector-section">
+        <div class="inspector-title">Context</div>
+        <div class="info-row"><span>Usage</span><span>68%</span></div>
+        <div class="info-row"><span>Compact</span><span>已执行 1 次</span></div>
+      </div>
+    </aside>
+  </main>
+
+  <div class="user-menu" id="userMenu">
+    <div class="menu-row"><b>◔</b><span>使用情况</span><span style="margin-left:auto;color:#aaa">剩余 68%</span></div>
+    <div class="menu-row" id="openSettings"><b>⚙</b><span>设置</span></div>
+    <div class="menu-row"><b>↪</b><span>退出登录</span></div>
+  </div>
+
+  <div class="session-preview" id="sessionPreview">
+    <strong id="previewTitle"></strong>
+    <small id="previewProject">项目：D:\project\Re-UthCode</small>
+    <small id="previewTime"></small>
+    <small id="previewText"></small>
+  </div>
+  <div class="project-preview" id="projectPreview">
+    <div class="project-preview-head"><span>▱</span><strong id="projectPreviewName">Re-UthCode</strong></div>
+    <div class="project-preview-line"><span class="label">路径</span><span id="projectPreviewPath">D:\project\Re-UthCode</span></div>
+    <div class="project-preview-line"><span class="label">会话</span><span id="projectPreviewCount">7 个</span></div>
+    <div class="project-preview-line"><span class="label">状态</span><span id="projectPreviewPin">已置顶</span></div>
+  </div>
+  <div class="project-menu" id="projectMenu">
+    <div class="project-menu-row" data-action="pin"><span class="project-menu-icon">⌖</span><span id="projectMenuPinText">置顶</span></div>
+    <div class="project-menu-row" data-action="rename"><span class="project-menu-icon">✎</span><span>编辑名称</span></div>
+    <div class="menu-sep"></div>
+    <div class="project-menu-row" data-action="explorer"><span class="project-menu-icon">▱</span><span>在资源管理器中打开</span></div>
+    <div class="menu-sep"></div>
+    <div class="project-menu-row danger" data-action="remove"><span class="project-menu-icon">×</span><span>移除项目</span></div>
+  </div>
+</div>
+
+<section class="settings-view" id="settingsView">
+  <aside class="settings-sidebar">
+    <div class="back-app" id="backApp">← 返回应用</div>
+    <input class="settings-search" placeholder="搜索设置…">
+    <div class="section-title">设置</div>
+    <div class="settings-cat active">常规</div>
+    <div class="settings-cat">模型与提供商</div>
+    <div class="settings-cat">权限与安全</div>
+    <div class="settings-cat">会话与历史</div>
+    <div class="settings-cat">界面与编辑器</div>
+    <div class="settings-cat">工具与终端</div>
+    <div class="settings-cat">上下文与性能</div>
+    <div class="settings-cat">日志与诊断</div>
+    <div class="settings-cat">关于</div>
+  </aside>
+  <main class="settings-content">
+    <div class="settings-inner">
+      <h1>常规</h1>
+      <div class="settings-note">这里只表现“现有配置能力的 GUI 化入口”。具体字段最终应以当前基线中的 config.toml / Application 能力为准，不预留未来配置。</div>
+      <div class="setting-group">
+        <div class="setting-row"><div class="setting-label">默认模型<small>新建会话时默认使用的模型。</small></div><div class="fake-select">5.6 Sol⌄</div></div>
+        <div class="setting-row"><div class="setting-label">默认工作目录<small>Desktop 启动时可从这里选择最近使用的项目路径。</small></div><div class="setting-value">D:\project\Re-UthCode　<button class="action">更改</button></div></div>
+        <div class="setting-row"><div class="setting-label">权限默认模式<small>用于新建 Run 的默认 Permission Mode。</small></div><div class="fake-select">Default⌄</div></div>
+        <div class="setting-row"><div class="setting-label">自动恢复上次 Session<small>启动 Desktop 后恢复上次打开的 Session。</small></div><div class="toggle on"></div></div>
+        <div class="setting-row"><div class="setting-label">上下文预算显示<small>在运行信息中展示 Context Usage。</small></div><div class="toggle on"></div></div>
+      </div>
+      <h1 style="font-size:20px;margin-top:34px">界面</h1>
+      <div class="setting-group">
+        <div class="setting-row"><div class="setting-label">主题<small>Desktop 本地界面主题。</small></div><div class="fake-select">深色⌄</div></div>
+        <div class="setting-row"><div class="setting-label">语言<small>Desktop UI 显示语言。</small></div><div class="fake-select">简体中文⌄</div></div>
+      </div>
+    </div>
+  </main>
+</section>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const app=$('#app'), sidebar=$('#sidebar'), workspace=$('#workspace');
+const input=$('#composerInput'), slash=$('#slashMenu'), surface=$('#interactionSurface');
+const inspector=$('#inspector'), settings=$('#settingsView');
+
+const commands=[
+ ['/help','显示帮助与现有 Slash Commands'],
+ ['/clear','清空当前界面的可见输出'],
+ ['/model','查看或切换当前模型'],
+ ['/permission','查看或切换权限模式'],
+ ['/status','查看当前 Session / Run 状态'],
+ ['/quit','退出当前应用'],
+ ['/compact','压缩当前会话上下文'],
+ ['/plan','进入 Plan Mode'],
+ ['/new','新建 Session'],
+ ['/resume','恢复已有 Session'],
+ ['/do','从 Plan 返回默认执行模式']
+];
+slash.innerHTML=commands.map((c,i)=>`<div class="slash-row ${i===0?'active':''}"><b>${c[0]}</b><span class="slash-desc">${c[1]}</span></div>`).join('');
+
+$('#collapseSidebar').onclick=()=>{app.classList.toggle('sidebar-collapsed');sidebar.classList.toggle('collapsed');$('#collapseSidebar').textContent=app.classList.contains('sidebar-collapsed')?'≫':'≪'};
+$('#userBtn').onclick=(e)=>{e.stopPropagation();$('#userMenu').classList.toggle('show')};
+document.addEventListener('click',()=>$('#userMenu').classList.remove('show'));
+$('#userMenu').onclick=e=>e.stopPropagation();
+
+const preview=$('#sessionPreview');
+const projectPreview=$('#projectPreview');
+const projectMenu=$('#projectMenu');
+
+const projectStore=[
+  {
+    id:'project-reuth',name:'Re-UthCode',path:'D:\\project\\Re-UthCode',pinned:true,view:'five',
+    sessions:[
+      {id:'session-tui',title:'TUI 回复链路梳理',preview:'JSONL transcript / timeline / replay 行为验证',time:'刚刚',pinned:false},
+      {id:'session-t09-3',title:'T09-3 上下文工程调优',preview:'256K Context 与 Compact 协议验证',time:'21:42',pinned:true},
+      {id:'session-plan',title:'Plan Mode 行为验证',preview:'Plan / Approve / Revise / Cancel 交互回归',time:'昨天',pinned:false},
+      {id:'session-perm',title:'权限流程回归',preview:'allow once / session / reject 行为验证',time:'昨天',pinned:false},
+      {id:'session-compact',title:'/compact 行为检查',preview:'Compact 触发、摘要与恢复后的上下文行为',time:'2 天前',pinned:false},
+      {id:'session-model',title:'模型切换测试',preview:'模型目录与当前 Run 模型切换验证',time:'3 天前',pinned:false},
+      {id:'session-resume',title:'Session 恢复验证',preview:'Session catalog / resume / replay 行为验证',time:'4 天前',pinned:false},
+    ]
+  },
+  {
+    id:'project-uth',name:'UthCode',path:'D:\\project\\UthCode',pinned:false,view:'five',
+    sessions:[
+      {id:'session-hook',title:'Hook 运行时边界',preview:'受限拦截型 Hook 语义整理',time:'5 天前',pinned:false},
+      {id:'session-todo',title:'TodoTool 行为探索',preview:'Todo / Plan / 长任务规划交互探索',time:'6 天前',pinned:false},
+      {id:'session-permission-old',title:'Permission 规则梳理',preview:'deny > ask > allow 与 Session 授权规则',time:'1 周前',pinned:false},
+    ]
+  },
+  {
+    id:'project-harness',name:'harness-v2',path:'C:\\Users\\93445\\Desktop\\harness工程治理\\harness-v2',pinned:false,view:'collapsed',
+    sessions:[
+      {id:'session-h1',title:'当前项目中的 uth-sp 系列为...',preview:'项目治理与提示词整理',time:'1 周前',pinned:false},
+      {id:'session-h2',title:'对于 lwdev 和正式任务的界...',preview:'开发流程与正式任务边界',time:'1 周前',pinned:false},
+      {id:'session-h3',title:'当前走正式任务时，agent...',preview:'正式任务执行与 agent 行为',time:'1 周前',pinned:false},
+      {id:'session-h4',title:'评估当前治理体系',preview:'治理体系审查',time:'2 周前',pinned:false},
+      {id:'session-h5',title:'评估仓库公开与开源协议',preview:'仓库公开策略',time:'2 周前',pinned:false},
+      {id:'session-h6',title:'工程治理补充',preview:'补充治理约束',time:'2 周前',pinned:false},
+    ]
+  }
+];
+
+let currentSessionId='session-tui';
+let currentProjectId='project-reuth';
+let menuProjectId=null;
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;' }[m]));
+}
+function findProject(id){return projectStore.find(p=>p.id===id)}
+function findSession(id){
+  for(const p of projectStore){
+    const s=p.sessions.find(s=>s.id===id);
+    if(s)return {project:p,session:s};
+  }
+  return null;
+}
+function visibleUnpinnedSessions(project){
+  return project.sessions.filter(s=>!s.pinned);
+}
+function getRecentSessions(){
+  const result=[];
+  for(const p of projectStore){
+    if(p.pinned) continue; // pinned project is already fully moved up
+    for(const s of p.sessions){
+      if(!s.pinned) result.push({project:p,session:s});
+    }
+  }
+  return result.slice(0,5);
+}
+
+function projectBlockHtml(project,isPinnedArea){
+  const sessions=project.sessions.filter(s=>{
+    // When a project itself is pinned, its whole content moves with it.
+    // Individual session pin state is ignored visually inside the pinned project.
+    if(project.pinned)return true;
+    return !s.pinned;
+  });
+  const sessionRows=sessions.map((s,i)=>`
+    <div class="project-session-row ${s.id===currentSessionId?'active':''}" data-session-id="${s.id}" data-index="${i}">
+      <span class="session-status"></span>
+      <span class="session-title">${escapeHtml(s.title)}</span>
+      <span class="session-actions">
+        <button class="session-more" title="${s.pinned?'取消置顶':'置顶'}" data-pin-session="${s.id}">⌖</button>
+      </span>
+    </div>`).join('');
+  const needsAll=sessions.length>5;
+  const stateClass=project.view==='collapsed'?'state-collapsed':project.view==='all'?'state-all':'state-five';
+  return `<div class="project-block ${stateClass} ${isPinnedArea?'pinned-block':''}" data-project-block="${project.id}">
+    <div class="project-header-row ${project.id===currentProjectId?'active':''}" data-project-id="${project.id}">
+      <span class="chevron">▾</span><span>▱</span><span class="project-name">${escapeHtml(project.name)}</span>
+      <span class="project-actions">
+        <button class="project-action-btn new-session-btn" title="新建会话" data-new-session="${project.id}">
+          <svg viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></svg>
+        </button>
+        <button class="project-action-btn menu-btn" title="项目菜单" data-menu-project="${project.id}">
+          <svg viewBox="0 0 16 16"><circle cx="4" cy="8" r=".8" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".8" fill="currentColor" stroke="none"/><circle cx="12" cy="8" r=".8" fill="currentColor" stroke="none"/></svg>
+        </button>
+      </span>
+    </div>
+    <div class="project-sessions">${sessionRows || '<div style="color:#666;font-size:12px;padding:6px 10px 6px 28px">暂无会话</div>'}</div>
+    <div class="project-footer ${needsAll?'':'hidden'}" data-expand-all="${project.id}">${project.view==='all'?'收起为最近 5 个':'展开显示'}</div>
+  </div>`;
+}
+
+function pinnedSessionHtml(project,session){
+  return `<div class="project-session-row ${session.id===currentSessionId?'active':''}" data-session-id="${session.id}" data-pinned-standalone="true">
+    <span class="session-status"></span><span class="session-title">${escapeHtml(session.title)}</span>
+    <span class="recent-project">${escapeHtml(project.name)}</span>
+    <span class="session-actions"><button class="session-more" title="取消置顶" data-pin-session="${session.id}">⌖</button></span>
+  </div>`;
+}
+
+function renderSidebarTree(){
+  const pinnedHost=$('#pinnedHost'),projectsHost=$('#projectsHost'),recentHost=$('#recentHost');
+
+  let pinnedHtml='';
+  for(const p of projectStore.filter(p=>p.pinned)) pinnedHtml+=projectBlockHtml(p,true);
+  for(const p of projectStore.filter(p=>!p.pinned)){
+    for(const s of p.sessions.filter(s=>s.pinned)) pinnedHtml+=pinnedSessionHtml(p,s);
+  }
+  pinnedHost.innerHTML=pinnedHtml || '<div style="color:#666;font-size:12px;padding:6px 10px">暂无置顶</div>';
+
+  projectsHost.innerHTML=projectStore.filter(p=>!p.pinned).map(p=>projectBlockHtml(p,false)).join('') ||
+    '<div style="color:#666;font-size:12px;padding:6px 10px">暂无项目</div>';
+
+  recentHost.innerHTML=getRecentSessions().map(({project,session})=>`
+    <div class="recent-session-row ${session.id===currentSessionId?'active':''}" data-session-id="${session.id}">
+      <span>◯</span><span class="session-title">${escapeHtml(session.title)}</span><span class="recent-project">${escapeHtml(project.name)}</span>
+    </div>`).join('') || '<div style="color:#666;font-size:12px;padding:6px 10px">暂无最近会话</div>';
+
+  bindSidebarTreeEvents();
+}
+
+function openProjectHover(project,row){
+  const r=row.getBoundingClientRect();
+  $('#projectPreviewName').textContent=project.name;
+  $('#projectPreviewPath').textContent=project.path;
+  $('#projectPreviewCount').textContent=project.sessions.length+' 个';
+  $('#projectPreviewPin').textContent=project.pinned?'已置顶':'未置顶';
+  projectPreview.style.left=(r.right+10)+'px';
+  projectPreview.style.top=Math.max(8,Math.min(window.innerHeight-190,r.top-8))+'px';
+  projectPreview.classList.add('show');
+}
+
+function openSessionHover(project,session,row){
+  const r=row.getBoundingClientRect();
+  $('#previewTitle').textContent=session.title;
+  $('#previewProject').textContent='项目：'+project.name;
+  $('#previewTime').textContent='最近使用：'+session.time;
+  $('#previewText').textContent='摘要：'+session.preview;
+  preview.style.left=(r.right+10)+'px';
+  preview.style.top=Math.max(8,Math.min(window.innerHeight-160,r.top-10))+'px';
+  preview.classList.add('show');
+}
+
+function selectSession(project,session){
+  currentProjectId=project.id;
+  currentSessionId=session.id;
+  $('#conversationTitle').textContent=session.title;
+  $('#infoSession').textContent=session.title;
+  $('#infoProject').textContent=project.path;
+  renderSidebarTree();
+}
+
+function toggleProject(project){
+  currentProjectId=project.id;
+  $('#infoProject').textContent=project.path;
+  project.view = project.view==='collapsed' ? 'five' : 'collapsed';
+  renderSidebarTree();
+}
+
+function createSession(project){
+  const id='session-new-'+Date.now();
+  project.sessions.unshift({id,title:'新会话',preview:'刚刚创建的空 Session',time:'刚刚',pinned:false});
+  project.view='five';
+  currentProjectId=project.id;
+  currentSessionId=id;
+  $('#conversationTitle').textContent='新会话';
+  $('#infoSession').textContent='新会话';
+  $('#infoProject').textContent=project.path;
+  renderSidebarTree();
+  requestAnimationFrame(()=>{
+    const row=document.querySelector(`[data-session-id="${id}"]`);
+    if(row){row.classList.add('new-session-flash');row.scrollIntoView({block:'nearest'});}
+  });
+}
+
+function toggleSessionPin(sessionId){
+  const found=findSession(sessionId);if(!found)return;
+  found.session.pinned=!found.session.pinned;
+  renderSidebarTree();
+}
+
+function toggleProjectPin(project){
+  project.pinned=!project.pinned;
+  // Moving an entire project to pinned makes child standalone pins redundant.
+  if(project.pinned) project.sessions.forEach(s=>s.pinned=false);
+  renderSidebarTree();
+}
+
+function openProjectMenu(project,anchorOrPoint){
+  menuProjectId=project.id;
+  $('#projectMenuPinText').textContent=project.pinned?'取消置顶':'置顶';
+  const menu=projectMenu;
+  let x,y;
+  if(anchorOrPoint instanceof MouseEvent){
+    x=anchorOrPoint.clientX;y=anchorOrPoint.clientY;
+  }else{
+    const r=anchorOrPoint.getBoundingClientRect();x=r.right-4;y=r.bottom+4;
+  }
+  menu.style.left=Math.min(window.innerWidth-250,Math.max(6,x))+'px';
+  menu.style.top=Math.min(window.innerHeight-210,Math.max(6,y))+'px';
+  menu.classList.add('show');
+  $$('.menu-btn').forEach(b=>b.classList.toggle('menu-open',b.dataset.menuProject===project.id));
+}
+
+function closeProjectMenu(){
+  projectMenu.classList.remove('show');menuProjectId=null;
+  $$('.menu-btn').forEach(b=>b.classList.remove('menu-open'));
+}
+
+function renameProject(project){
+  const name=prompt('编辑项目名称：',project.name);
+  if(name && name.trim()){project.name=name.trim();renderSidebarTree();}
+}
+
+function removeProject(project){
+  if(!confirm(`从 UthCode Desktop 中移除项目“${project.name}”？\\n不会删除磁盘上的文件。`))return;
+  const i=projectStore.findIndex(p=>p.id===project.id);
+  if(i>=0)projectStore.splice(i,1);
+  if(currentProjectId===project.id){
+    currentProjectId=projectStore[0]?.id||'';
+    currentSessionId=projectStore[0]?.sessions[0]?.id||'';
+  }
+  renderSidebarTree();
+}
+
+function bindSidebarTreeEvents(){
+  $$('.project-header-row').forEach(row=>{
+    const project=findProject(row.dataset.projectId);
+    row.onclick=e=>{
+      if(e.target.closest('.project-actions'))return;
+      toggleProject(project);
+    };
+    row.onmouseenter=()=>openProjectHover(project,row);
+    row.onmouseleave=()=>projectPreview.classList.remove('show');
+    row.oncontextmenu=e=>{e.preventDefault();projectPreview.classList.remove('show');openProjectMenu(project,e)};
+  });
+
+  $$('[data-new-session]').forEach(btn=>btn.onclick=e=>{
+    e.stopPropagation();createSession(findProject(btn.dataset.newSession));
+  });
+
+  $$('[data-menu-project]').forEach(btn=>btn.onclick=e=>{
+    e.stopPropagation();openProjectMenu(findProject(btn.dataset.menuProject),btn);
+  });
+
+  $$('[data-expand-all]').forEach(el=>el.onclick=e=>{
+    e.stopPropagation();
+    const p=findProject(el.dataset.expandAll);
+    p.view=p.view==='all'?'five':'all';
+    renderSidebarTree();
+  });
+
+  $$('.project-session-row[data-session-id],.recent-session-row[data-session-id]').forEach(row=>{
+    const found=findSession(row.dataset.sessionId); if(!found)return;
+    row.onclick=e=>{
+      if(e.target.closest('[data-pin-session]'))return;
+      selectSession(found.project,found.session);
+    };
+    row.onmouseenter=()=>openSessionHover(found.project,found.session,row);
+    row.onmouseleave=()=>preview.classList.remove('show');
+  });
+
+  $$('[data-pin-session]').forEach(btn=>btn.onclick=e=>{
+    e.stopPropagation();toggleSessionPin(btn.dataset.pinSession);
+  });
+}
+
+projectMenu.onclick=e=>{
+  const row=e.target.closest('[data-action]'); if(!row)return;
+  const project=findProject(menuProjectId); if(!project)return;
+  const action=row.dataset.action;
+  closeProjectMenu();
+  if(action==='pin')toggleProjectPin(project);
+  if(action==='rename')renameProject(project);
+  if(action==='explorer')alert('工程参考行为：调用 Desktop 主进程在资源管理器中打开\\n\\n'+project.path);
+  if(action==='remove')removeProject(project);
+};
+document.addEventListener('click',e=>{if(!e.target.closest('#projectMenu')&&!e.target.closest('[data-menu-project]'))closeProjectMenu()});
+window.addEventListener('blur',closeProjectMenu);
+
+$('#openProject').onclick=()=>{
+  const p=prompt('输入项目绝对路径：','D:\\project\\NewProject'); if(!p)return;
+  const name=p.replace(/[\\\\/]+$/,'').split(/[\\\\/]/).pop()||'Project';
+  projectStore.unshift({id:'project-'+Date.now(),name,path:p,pinned:false,view:'five',sessions:[]});
+  renderSidebarTree();
+};
+
+renderSidebarTree();
+
+input.addEventListener('input',()=>{
+  const v=input.value.trimStart();
+  slash.classList.toggle('show',v.startsWith('/'));
+});
+input.addEventListener('keydown',e=>{if(e.key==='Escape')slash.classList.remove('show')});
+$$('.slash-row').forEach(row=>row.onclick=()=>{input.value=row.querySelector('b').textContent+' ';slash.classList.remove('show');input.focus()});
+
+function showInteraction(kind){
+  surface.className='interaction-surface show';
+  if(kind==='ask'){
+    surface.innerHTML=`<div class="interaction-title">如果现在可以立刻获得一样东西，你会选什么？</div>
+      <div class="choice"><span class="n">1</span><div class="choice-main"><b>一顿美食</b> <span class="note-badge">推荐</span><small>立即享受一顿想吃的饭。</small></div><span>→</span></div>
+      <div class="choice"><span class="n">2</span><div class="choice-main"><b>一小时自由时间</b><small>不被打扰地做任何想做的事。</small></div><span>→</span></div>
+      <div class="choice"><span class="n">3</span><div class="choice-main"><b>一个新技能</b><small>马上掌握一项实用能力。</small></div><span>→</span></div>
+      <div class="inline-actions"><button class="action">✎ 其他回答</button><button class="action" style="margin-left:auto" onclick="clearInteraction()">跳过</button></div>`;
+  }
+  if(kind==='plan'){
+    surface.innerHTML=`<div class="interaction-title">实施此计划？</div>
+      <div class="choice"><span class="n">1</span><div class="choice-main"><b>是，实施此计划</b></div><span>→</span></div>
+      <div class="choice"><span class="n">2</span><div class="choice-main"><b>否，并告诉 UthCode 应该如何做不同</b></div><span>→</span></div>
+      <div class="inline-actions"><button class="action" onclick="clearInteraction()">取消</button></div>`;
+  }
+  if(kind==='permission'){
+    surface.innerHTML=`<div class="interaction-title">允许执行此操作？</div>
+      <div style="color:#aaa;font-size:13px;margin-bottom:10px"><b style="color:#eee">WriteFile</b> · docs/work/T10.md<br>原因：写入当前任务生成的文档<br>范围：工作区内单个文件</div>
+      <div class="inline-actions"><button class="action danger" onclick="clearInteraction()">Reject</button><button class="action" onclick="clearInteraction()">Allow Once</button><button class="action primary" onclick="clearInteraction()">Allow for Session</button></div>`;
+  }
+}
+window.clearInteraction=()=>{surface.className='interaction-surface';surface.innerHTML=''};
+$('#showAsk').onclick=()=>showInteraction('ask');
+$('#showPlan').onclick=()=>showInteraction('plan');
+$('#showPermission').onclick=()=>showInteraction('permission');
+
+const AUTO_HIDE_BREAKPOINT = 1240;
+let inspectorMode = 'floating';       // last/desired visible mode: floating | docked
+let manualInspectorHidden = false;    // explicit user action
+let autoInspectorHidden = false;      // responsive rule
+let drag=false,ox=0,oy=0;
+
+function renderInspectorState(){
+  const mustHide = manualInspectorHidden || autoInspectorHidden;
+  inspector.classList.remove('floating','docked','hidden');
+
+  if(mustHide){
+    inspector.classList.add('hidden');
+    workspace.classList.remove('docked');
+  }else{
+    inspector.classList.add(inspectorMode);
+    workspace.classList.toggle('docked',inspectorMode==='docked');
+  }
+
+  // Mode icon follows the current visible/remembered mode:
+  // □ = enlarge/dock to the only supported dock zone (right)
+  // ❐ = restore to floating window
+  const modeBtn=$('#modeInspector');
+  if(inspectorMode==='floating'){
+    modeBtn.innerHTML='<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.25" y="3.25" width="9.5" height="9.5" rx="1.2"/></svg>';
+    modeBtn.title='停靠到右侧';
+    modeBtn.setAttribute('aria-label','停靠到右侧');
+  }else{
+    modeBtn.innerHTML='<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="3.25" width="7.5" height="7.5" rx="1.1"/><path d="M3.25 5.25v7.5h7.5"/></svg>';
+    modeBtn.title='切换为悬浮窗';
+    modeBtn.setAttribute('aria-label','切换为悬浮窗');
+  }
+
+  const topToggle=$('#toggleInspector');
+  if(autoInspectorHidden){
+    topToggle.title='窗口过窄，运行信息已自动隐藏';
+    topToggle.style.opacity='.45';
+  }else if(manualInspectorHidden){
+    topToggle.title='显示运行信息';
+    topToggle.style.opacity='1';
+  }else{
+    topToggle.title='运行信息';
+    topToggle.style.opacity='1';
+  }
+}
+
+function setVisibleInspectorMode(mode){
+  if(mode!=='floating' && mode!=='docked') return;
+  inspectorMode=mode;
+  manualInspectorHidden=false;
+  inspector.style.left='';
+  inspector.style.top='';
+  inspector.style.right='';
+  renderInspectorState();
+}
+
+function userHideInspector(){
+  manualInspectorHidden=true;
+  renderInspectorState();
+}
+
+function showInspector(){
+  manualInspectorHidden=false;
+  renderInspectorState();
+}
+
+function checkInspectorResponsive(){
+  const nextAutoHidden = window.innerWidth < AUTO_HIDE_BREAKPOINT;
+  if(nextAutoHidden === autoInspectorHidden) return;
+  autoInspectorHidden = nextAutoHidden;
+  renderInspectorState();
+}
+
+// Right-top inspector controls.
+$('#modeInspector').onclick=(e)=>{
+  e.stopPropagation();
+  setVisibleInspectorMode(inspectorMode==='floating' ? 'docked' : 'floating');
+};
+$('#hideInspector').onclick=(e)=>{
+  e.stopPropagation();
+  userHideInspector();
+};
+
+// App top-bar entry is retained so a manually hidden panel can be shown again.
+// If responsive auto-hide is active, it remains hidden until the viewport is wide enough.
+$('#toggleInspector').onclick=()=>{
+  if(manualInspectorHidden) showInspector();
+  else if(!autoInspectorHidden) userHideInspector();
+};
+
+$('#inspectorDrag').addEventListener('mousedown',e=>{
+  // Window control buttons must not start dragging.
+  if(e.target.closest('.inspector-window-actions')) return;
+  if(!inspector.classList.contains('floating'))return;
+  drag=true;
+  const r=inspector.getBoundingClientRect();
+  ox=e.clientX-r.left;oy=e.clientY-r.top;
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove',e=>{
+  if(!drag)return;
+  const w=workspace.getBoundingClientRect();
+  let x=e.clientX-w.left-ox, y=e.clientY-w.top-oy;
+  x=Math.max(8,Math.min(w.width-inspector.offsetWidth-8,x));
+  y=Math.max(8,Math.min(w.height-inspector.offsetHeight-8,y));
+  inspector.style.left=x+'px';
+  inspector.style.right='auto';
+  inspector.style.top=y+'px';
+});
+
+window.addEventListener('mouseup',()=>{
+  if(!drag)return;
+  drag=false;
+
+  // Only one dock zone exists: the right edge.
+  const w=workspace.getBoundingClientRect();
+  const r=inspector.getBoundingClientRect();
+  if(w.right-r.right<50){
+    setVisibleInspectorMode('docked');
+  }
+});
+
+window.addEventListener('resize',checkInspectorResponsive);
+checkInspectorResponsive();
+renderInspectorState();
+
+$('#openSettings').onclick=()=>{app.style.display='none';settings.classList.add('show')};
+$('#backApp').onclick=()=>{settings.classList.remove('show');app.style.display='grid'};
+$$('.settings-cat').forEach(c=>c.onclick=()=>{$$('.settings-cat').forEach(x=>x.classList.remove('active'));c.classList.add('active')});
+$$('.toggle').forEach(t=>t.onclick=()=>t.classList.toggle('on'));
+
+$('#sendBtn').onclick=()=>{if(!input.value.trim())return;alert('工程参考：这里触发 Application send/steer，而不是由 Renderer 自己执行业务逻辑。');input.value='';slash.classList.remove('show')};
+</script>
+</body>
+</html>

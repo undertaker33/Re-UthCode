@@ -137,3 +137,17 @@ W04 T04 -> T05 -> T06 -> T07 已在 W03 合并基线 `106b405` 上完成 Rendere
 - 本轮没有发现 W02 Bridge/Protocol 公共边界缺口；没有修改 Core、Provider、Tool、Session Store 或新增 authority。真实 Electron Windows/native picker、配置首配、三 Session 连续人工切换、窄屏视觉/键盘人工验收仍未验证；原型 `uthcode-desktop-ui-prototype-v5.html` 仍缺失。
 - Checklist 仅保留已有精确自动化证据勾选，未把本轮 SSR/单元测试扩大成真实 Electron/E2E 勾选；未修改冻结 Checklist 文字或顺序。
 - 完成交付前清理精确路径 `desktop/node_modules`、`desktop/dist`（以及若存在的 `.tmp-webpack-renderer`），不删除源码、文档或未知文件；随后对本 Feedback/Checklist 执行 UTF-8 guard，并执行 `git diff --check`。
+
+## 返工第 18 轮：新增人工反馈的冻结边界冲突（暂停实施）
+
+用户在真实 Desktop 人工验收中报告了 Session 跨项目移动、Slash 交互、Context 统计与自动压缩、Composer、侧栏菜单和 Settings 信息架构等问题。其中大部分属于既有 W04 Feature Parity 的实现缺陷，可以在用户决策完成后继续返工；当前尚未修改生产代码。
+
+以下三项与冻结 T10 产品语义或验收矩阵发生实质冲突，已按 `docs/rules/WorkPackageRules.md` 停止相关范围实施并交由用户决定：
+
+- 冻结 Feature Parity Matrix 要求 GUI Slash completion/execute 覆盖 `/help`、`/clear`、`/permission`、`/quit`、`/resume`；新增反馈要求这些命令不在 GUI 中出现。
+- 冻结视觉约束禁止 Settings 使用卡片式分组；新增反馈允许按参考图使用卡片背景。
+- 冻结 Context 规则按当前模型配置、Provider 上限与 256K 默认值解析有效窗口；新增反馈提出模型配置 1M 时仍以 256K 自动压缩，需要确认固定产品上限还是仅修复现有自动压缩失效。
+
+在用户明确拍板并决定是否终止、重新生成当前冻结工作包前，不派发 Worker，不修改冻结的 Spec、Tasks、Prompt 或 Checklist，也不以局部兼容逻辑同时保留两套行为。
+
+用户随后确认：GUI 隐藏上述五个 Slash 候选但保留 GUI 原生能力；Settings 允许轻量分组背景；Context 以配置窗口为准并保留两个自动压缩入口和 Low Water 完成水位；不重新生成 T10，而是新建独立 F02 原始任务书。相关需求已转入 `docs/work/F02-DesktopGUI交互与上下文缺陷修复.md`，本轮不再拆分或实施，T10 冻结文件保持不变。
