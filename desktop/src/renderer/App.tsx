@@ -52,8 +52,24 @@ function projectPreferences(projects: ProjectState[]): DesktopPreferences["recen
     path: project.path,
     alias: project.alias,
     pinned: project.pinned,
-    lastOpenedAt: project.lastOpenedAt,
+    ...(project.lastOpenedAt ? { lastOpenedAt: project.lastOpenedAt } : {}),
   }));
+}
+
+/** Remove every Desktop-local reference to a project without touching disk. */
+export function projectNavigationPreferences(
+  projects: readonly ProjectState[],
+  pinnedSessions: DesktopPreferences["pinnedSessions"],
+  expandedProjects: DesktopPreferences["expandedProjects"] = {},
+): Pick<DesktopPreferences, "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "expandedProjects"> {
+  const projectKeys = new Set(projects.map((project) => project.projectKey));
+  return {
+    recentProjects: projectPreferences([...projects]),
+    projectAliases: Object.fromEntries(projects.map((project) => [project.projectKey, project.alias])),
+    pinnedProjectKeys: projects.filter((project) => project.pinned).map((project) => project.projectKey),
+    pinnedSessions: pinnedSessions.filter((item) => projectKeys.has(item.projectKey)),
+    expandedProjects: Object.fromEntries(Object.entries(expandedProjects).filter(([projectKey]) => projectKeys.has(projectKey))),
+  };
 }
 
 type RuntimeRequest = (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject) => Promise<JsonValue>;
@@ -107,7 +123,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     return api.requestRuntime(method, params);
   }, [api]);
 
-  const persist = useCallback(async (key: "theme" | "language" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
+  const persist = useCallback(async (key: "theme" | "language" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "expandedProjects" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
     if (!api) return;
     try {
       await api.writePreference(key as never, value as never);
@@ -175,11 +191,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("projectAliases"),
       api.readPreference("pinnedProjectKeys"),
       api.readPreference("pinnedSessions"),
+      api.readPreference("expandedProjects"),
       api.readPreference("selectedProjectKey"),
       api.readPreference("selectedSessionId"),
-    ]).then(([theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId]) => {
+    ]).then(([theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId]) => {
       if (cancelled) return;
-      dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, selectedProjectKey, selectedSessionId } });
+      dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId } });
       const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
       if (selected) {
         void send("runtime.initialize", { workdir: selected.path }).then((result) => {
@@ -358,6 +375,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     void persist("panelMode", panelMode);
   }, [persist]);
 
+  const setProjectExpanded = useCallback((projectKey: string, expanded: boolean) => {
+    // Expansion is navigation metadata only.  Accept updates from rendered
+    // Project rows, but never let an arbitrary key become a trusted Project.
+    if (!stateRef.current.projects.some((project) => project.projectKey === projectKey)) return;
+    const expandedProjects = { ...stateRef.current.expandedProjects, [projectKey]: expanded };
+    dispatch({ type: "hydrate_preferences", preferences: { expandedProjects } });
+    void persist("expandedProjects", expandedProjects);
+  }, [persist]);
+
   const toggleRuntime = useCallback(() => {
     setPanelMode(stateRef.current.panelMode === "hidden" ? "floating" : "hidden");
   }, [setPanelMode]);
@@ -382,6 +408,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const toggleSessionPin = useCallback((project: ProjectState, session: SessionSummary) => {
+    // A pinned Project is the sole navigation owner of its child Sessions;
+    // keep the preference invariant even if a caller bypasses the menu.
     if (project.pinned) return;
     const current = stateRef.current.pinnedSessions;
     const exists = current.some((item) => item.projectKey === project.projectKey && item.sessionId === session.session_id);
@@ -392,13 +420,56 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     void persist("pinnedSessions", pinnedSessions);
   }, [persist]);
 
+  const renameSession = useCallback(async (project: ProjectState, session: SessionSummary, title: string) => {
+    if (stateRef.current.activeTurn) {
+      dispatch({ type: "notice", text: t("sessionRenameActive") });
+      return;
+    }
+    try {
+      const result = await send("session.rename", { session_id: session.session_id, title });
+      dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, t("sessionRenameFailed")) });
+    }
+  }, [send]);
+
+  const moveSession = useCallback(async (project: ProjectState, session: SessionSummary, target: ProjectState) => {
+    if (stateRef.current.activeTurn || stateRef.current.selectedSessionId === session.session_id) {
+      dispatch({ type: "notice", text: stateRef.current.activeTurn ? t("sessionMoveActive") : t("sessionMoveBusy") });
+      return;
+    }
+    try {
+      const result = await send("session.move", { session_id: session.session_id, target_project_key: target.projectKey });
+      dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
+      const pinnedSessions = stateRef.current.pinnedSessions.map((item) => item.projectKey === project.projectKey && item.sessionId === session.session_id ? { ...item, projectKey: target.projectKey } : item);
+      await persist("pinnedSessions", pinnedSessions);
+      if (stateRef.current.selectedProjectKey === project.projectKey) await refreshCatalog(project.projectKey);
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, t("sessionMoveFailed")) });
+    }
+  }, [persist, refreshCatalog, send]);
+
+  const copySessionId = useCallback(async (session: SessionSummary) => {
+    if (!api) return;
+    try {
+      await api.copySessionId(session.session_id);
+      dispatch({ type: "notice", text: t("copiedSessionId") });
+    } catch (error) {
+      dispatch({ type: "notice", text: errorMessage(error, t("copySessionIdFailed")) });
+    }
+  }, [api]);
+
   const removeProject = useCallback(async (project: ProjectState) => {
     const current = stateRef.current;
     const removal = projectRemovalPlan(current.projects, current.selectedProjectKey, project.projectKey);
+    const navigation = projectNavigationPreferences(removal.remaining, current.pinnedSessions, current.expandedProjects);
     if (!removal.current) {
-      const remaining = removal.remaining;
-      dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(remaining) } });
-      await persist("recentProjects", projectPreferences(remaining));
+      dispatch({ type: "hydrate_preferences", preferences: navigation });
+      await persist("recentProjects", navigation.recentProjects);
+      await persist("projectAliases", navigation.projectAliases);
+      await persist("pinnedProjectKeys", navigation.pinnedProjectKeys);
+      await persist("pinnedSessions", navigation.pinnedSessions);
+      await persist("expandedProjects", navigation.expandedProjects);
       return;
     }
 
@@ -408,16 +479,24 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (replacement) {
         const opened = await send("project.open", { path: replacement.path });
         dispatch({ type: "project_opened", result: opened });
-        dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(removal.remaining), selectedProjectKey: replacement.projectKey, selectedSessionId: null } });
-        await persist("recentProjects", projectPreferences(removal.remaining));
+        dispatch({ type: "hydrate_preferences", preferences: { ...navigation, selectedProjectKey: replacement.projectKey, selectedSessionId: null } });
+        await persist("recentProjects", navigation.recentProjects);
+        await persist("projectAliases", navigation.projectAliases);
+        await persist("pinnedProjectKeys", navigation.pinnedProjectKeys);
+        await persist("pinnedSessions", navigation.pinnedSessions);
+        await persist("expandedProjects", navigation.expandedProjects);
         await persist("selectedProjectKey", replacement.projectKey);
         await persist("selectedSessionId", null);
         await refreshCatalog(replacement.projectKey);
       } else {
         await send("runtime.shutdown", {});
         dispatch({ type: "workspace_cleared" });
-        dispatch({ type: "hydrate_preferences", preferences: { recentProjects: [], selectedProjectKey: null, selectedSessionId: null } });
+        dispatch({ type: "hydrate_preferences", preferences: { ...navigation, selectedProjectKey: null, selectedSessionId: null } });
         await persist("recentProjects", []);
+        await persist("projectAliases", {});
+        await persist("pinnedProjectKeys", []);
+        await persist("pinnedSessions", []);
+        await persist("expandedProjects", {});
         await persist("selectedProjectKey", null);
         await persist("selectedSessionId", null);
       }
@@ -499,7 +578,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const themeClass = `theme-${state.theme}`;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
-      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && <RuntimePanel state={state} onPanelModeChange={setPanelMode} />}
       {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — {t("openSettings")}</button>}

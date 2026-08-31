@@ -32,6 +32,8 @@ export interface DesktopPreferences {
   projectAliases: Record<string, string>;
   pinnedProjectKeys: string[];
   pinnedSessions: PinnedSessionPreference[];
+  /** UI-only per-project Session tree expansion state; never a trust source. */
+  expandedProjects: Record<string, boolean>;
   selectedProjectKey: string | null;
   selectedSessionId: string | null;
 }
@@ -45,6 +47,7 @@ export const PREFERENCE_KEYS = [
   "projectAliases",
   "pinnedProjectKeys",
   "pinnedSessions",
+  "expandedProjects",
   "selectedProjectKey",
   "selectedSessionId",
 ] as const;
@@ -82,6 +85,7 @@ export interface AgentEvent {
 export interface DesktopApi {
   openProject(): Promise<string | null>;
   openProjectInExplorer(projectPath: string): Promise<void>;
+  copySessionId(sessionId: string): Promise<void>;
   closeShell(): Promise<void>;
   requestRuntime(method: RuntimeMethod, params: JsonObject): Promise<JsonValue>;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;

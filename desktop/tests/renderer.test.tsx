@@ -1,18 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+import { JSDOM } from "jsdom";
 
 import {
   applyProjectOpened,
+  applySessionMutation,
   applySessionResumed,
   createInitialState,
   replayToTimeline,
   reduceRendererState,
   sessionLabel,
+  type ProjectState,
+  type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
+import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
+import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, renderMarkdown } from "../src/renderer/ChatTimeline";
 import { Composer, applyCompletion } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
@@ -21,6 +28,44 @@ import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/R
 import { CustomSelect, customSelectConsumesEscape, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
 
+async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
+  const dom = new JSDOM("<!doctype html><html><body><button id=before>Before</button><div id=root></div><button id=after>After</button></body></html>", { url: "http://localhost/" });
+  const container = dom.window.document.getElementById("root");
+  assert.ok(container);
+  let root!: Root;
+  const globalObject = globalThis as unknown as Record<string, unknown>;
+  const bindings: Record<string, unknown> = {
+    window: dom.window,
+    document: dom.window.document,
+    navigator: dom.window.navigator,
+    Node: dom.window.Node,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    Event: dom.window.Event,
+    MouseEvent: dom.window.MouseEvent,
+    KeyboardEvent: dom.window.KeyboardEvent,
+    PointerEvent: dom.window.PointerEvent ?? dom.window.MouseEvent,
+    getComputedStyle: dom.window.getComputedStyle,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  };
+  const previous = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(bindings)) {
+    previous.set(key, globalObject[key]);
+    Object.defineProperty(globalObject, key, { configurable: true, writable: true, value });
+  }
+  root = createRoot(container);
+  try {
+    return await callback(dom, container, root);
+  } finally {
+    act(() => { root.unmount(); });
+    dom.window.close();
+    for (const [key, value] of previous) {
+      if (value === undefined) delete globalObject[key];
+      else Object.defineProperty(globalObject, key, { configurable: true, writable: true, value });
+    }
+  }
+}
 function renderLanguage(language: "zh-CN" | "en", element: React.ReactNode): string {
   return renderToStaticMarkup(<LanguageProvider value={language}>{element}</LanguageProvider>);
 }
@@ -47,7 +92,7 @@ function contrastRatio(foreground: string, background: string): number {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
-test("T04 replay is ordered and session labels use preview then short id", () => {
+test("T04 replay is ordered and session labels use title, preview, then short id", () => {
   const records = [
     replayRecord(5, "assistant", "answer"),
     replayRecord(1, "user", "prompt"),
@@ -57,6 +102,7 @@ test("T04 replay is ordered and session labels use preview then short id", () =>
   ];
   const timeline = replayToTimeline(records);
   assert.deepEqual(timeline.map((entry) => entry.text), ["prompt", "continue", "thinking", "Bash completed", "answer"]);
+  assert.equal(sessionLabel({ session_id: "session-1", title: "Persistent title", preview: "A useful preview" }), "Persistent title");
   assert.equal(sessionLabel({ session_id: "session-1", preview: "A useful preview" }), "A useful preview");
   assert.equal(sessionLabel({ session_id: "abcdef1234567890", preview: "" }), "abcdef12");
 });
@@ -133,12 +179,12 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.match(appMarkup, /first/);
   assert.match(appMarkup, />已置顶</);
   assert.match(appMarkup, />项目</);
-  assert.match(appMarkup, /aria-label="移除 One"/);
-  assert.match(appMarkup, /已置顶会话/);
-  assert.match(appMarkup, /title="取消置顶 second" aria-label="取消置顶 second"/);
-  assert.equal((appMarkup.match(/>second</gu) ?? []).length, 1);
+  assert.match(appMarkup, /aria-label="更多操作 One"/);
+  assert.doesNotMatch(appMarkup, /已置顶会话/);
+  assert.doesNotMatch(appMarkup, /aria-label="移除 One"/);
+  assert.equal((appMarkup.match(/>second</gu) ?? []).length, 0);
   assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
-  assert.doesNotMatch(appMarkup, /aria-label="置顶 会话 first"/);
+  assert.doesNotMatch(appMarkup, /aria-label="置顶 first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
     const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
     assert.match(panelMarkup, /aria-label="Runtime information"/);
@@ -153,6 +199,282 @@ test("project groups, session state, and Runtime projections remain connected", 
   }
 });
 
+test("sidebar session grouping keeps catalog order, pins above five ordinary rows, and expands explicitly", () => {
+  const sessions = [
+    { session_id: "s1", preview: "one" },
+    { session_id: "s2", preview: "two" },
+    { session_id: "s3", preview: "three" },
+    { session_id: "s4", preview: "four" },
+    { session_id: "s5", preview: "five" },
+    { session_id: "s6", preview: "six" },
+    { session_id: "pinned", preview: "pinned", pinned: true },
+  ];
+  const collapsed = sessionGroups(sessions, false);
+  assert.deepEqual(collapsed.pinned.map((session) => session.session_id), ["pinned"]);
+  assert.deepEqual(collapsed.visibleOrdinary.map((session) => session.session_id), sessions.slice(0, MAX_VISIBLE_SESSIONS).map((session) => session.session_id));
+  assert.equal(collapsed.hiddenCount, 1);
+  const expanded = sessionGroups(sessions, true);
+  assert.deepEqual(expanded.visibleOrdinary.map((session) => session.session_id), ["s1", "s2", "s3", "s4", "s5", "s6"]);
+
+  const state = createInitialState({
+    projects: [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions, catalogFresh: true }],
+    selectedProjectKey: "C:/one",
+    selectedSessionId: "s6",
+  });
+  const renamed = applySessionMutation(state, "C:/one", { session_id: "s6", title: "renamed", session: { session_id: "s6", title: "renamed" } });
+  assert.deepEqual(renamed.projects[0]?.sessions.map((session) => session.session_id), sessions.map((session) => session.session_id));
+  assert.equal(renamed.projects[0]?.sessions[5]?.preview, "six");
+});
+
+test("production Sidebar keeps selected rows visible, restores expansion, and exposes non-modal menus", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const expansionWrites: Array<{ projectKey: string; expanded: boolean }> = [];
+    const pinWrites: string[] = [];
+    const sessionPinWrites: string[] = [];
+    const copiedIds: string[] = [];
+    const sessions: SessionSummary[] = Array.from({ length: 6 }, (_, index) => ({ session_id: `s${index + 1}`, preview: `session-${index + 1}` }));
+    const project = (items: SessionSummary[] = sessions): ProjectState => ({ path: "C:/source", projectKey: "C:/source", alias: "Source", pinned: false, sessions: items, catalogFresh: true });
+    const renderSidebar = async (items: ProjectState[], selectedSessionId: string | null = null, expandedProjects: Record<string, boolean> = {}, key = "sidebar") => {
+      act(() => {
+        root.render(<LanguageProvider value="en"><Sidebar
+          key={key}
+          projects={items}
+          selectedProjectKey={items[0]?.projectKey ?? null}
+          selectedSessionId={selectedSessionId}
+          activeTurn={false}
+          expandedProjects={expandedProjects}
+          onProjectExpandedChange={(projectKey, expanded) => expansionWrites.push({ projectKey, expanded })}
+          onNewSession={() => undefined}
+          onOpenProject={() => undefined}
+          onOpenProjectSession={() => undefined}
+          onResumeSession={() => undefined}
+          onAliasChange={() => undefined}
+          onTogglePin={(item) => pinWrites.push(item.projectKey)}
+          onOpenExplorer={() => undefined}
+          onRemoveProject={() => undefined}
+          onToggleSessionPin={(item, session) => sessionPinWrites.push(`${item.projectKey}:${session.session_id}`)}
+          onRenameSession={() => undefined}
+          onMoveSession={() => undefined}
+          onCopySessionId={(session) => copiedIds.push(session.session_id)}
+          onOpenSettings={() => undefined}
+        /></LanguageProvider>);
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const visibleSessionIds = (scope: ParentNode = container) => Array.from(scope.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)"), (button) => button.textContent?.trim() ?? "");
+    const mockRect = (element: HTMLElement, rect: { left: number; right: number; top: number; bottom: number }) => {
+      element.getBoundingClientRect = () => ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top, x: rect.left, y: rect.top, toJSON: () => ({}) }) as DOMRect;
+    };
+    const openMenu = async (trigger: HTMLButtonElement) => {
+      act(() => { trigger.click(); });
+      await tick();
+      await tick();
+      return container.querySelector<HTMLElement>(".sidebar-menu");
+    };
+    const keydown = async (element: HTMLElement, key: string, shiftKey = false) => {
+      let event!: KeyboardEvent;
+      act(() => {
+        event = new dom.window.KeyboardEvent("keydown", { key, shiftKey, bubbles: true, cancelable: true });
+        element.dispatchEvent(event);
+      });
+      await tick();
+      return event;
+    };
+    const keyboardActivate = async (element: HTMLButtonElement, key: string) => {
+      element.focus();
+      let event!: KeyboardEvent;
+      act(() => {
+        event = new dom.window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+        element.dispatchEvent(event);
+        // JSDOM dispatches keydown but does not synthesize the native button
+        // click that Enter/Space produce in a browser, so mirror that UA step.
+        if (!event.defaultPrevented) element.click();
+      });
+      await tick();
+      await tick();
+      return event;
+    };
+    const focusablesOutsideMenu = () => Array.from(container.ownerDocument.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])"))
+      .filter((element) => !element.closest(".sidebar-menu"));
+
+    // Explicit "show more" survives a component rebuild through the typed
+    // preference projection, while a selected sixth row is derived visible
+    // without changing the source array order.
+    await renderSidebar([project()], null, {});
+    const more = container.querySelector<HTMLButtonElement>(".session-more");
+    assert.ok(more);
+    act(() => { more.click(); });
+    await tick();
+    assert.deepEqual(expansionWrites.at(-1), { projectKey: "C:/source", expanded: true });
+    await renderSidebar([project()], null, { "C:/source": true }, "reloaded-sidebar");
+    assert.deepEqual(visibleSessionIds(), sessions.map((session) => session.preview));
+    await renderSidebar([project()], "s6", {}, "selected-sixth");
+    assert.deepEqual(visibleSessionIds(), sessions.map((session) => session.preview));
+    const selectedRow = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line")).find((button) => button.textContent?.includes("session-6"));
+    assert.ok(selectedRow, "selected sixth session must be present in the DOM");
+    assert.equal(selectedRow?.classList.contains("is-selected"), true);
+    const recentRows = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent .recent-line"), (button) => button.querySelectorAll("span")[1]?.textContent ?? "");
+    assert.deepEqual(recentRows, sessions.map((session) => session.preview));
+
+    // Project click and Session right-click share one anchored menu instance.
+    const projectTrigger = container.querySelector<HTMLButtonElement>(".project-menu-anchor .menu-trigger");
+    const sessionTrigger = container.querySelector<HTMLButtonElement>(".session-menu-trigger");
+    assert.ok(projectTrigger);
+    assert.ok(sessionTrigger);
+    const projectAnchor = projectTrigger?.closest<HTMLElement>(".project-menu-anchor");
+    const sessionAnchor = sessionTrigger?.closest<HTMLElement>(".session-menu-anchor");
+    assert.ok(projectAnchor);
+    assert.ok(sessionAnchor);
+    mockRect(projectAnchor, { left: 900, right: 980, top: 700, bottom: 720 });
+    mockRect(sessionAnchor, { left: 900, right: 980, top: 700, bottom: 720 });
+    const projectMenu = await openMenu(projectTrigger);
+    assert.ok(projectMenu);
+    assert.equal(container.querySelectorAll(".sidebar-menu").length, 1);
+    const projectItems = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    assert.equal(document.activeElement, projectItems()[0]);
+    await keydown(projectItems()[0]!, "ArrowDown");
+    assert.equal(document.activeElement, projectItems()[1]);
+    await keydown(projectItems()[1]!, "ArrowUp");
+    assert.equal(document.activeElement, projectItems()[0]);
+    await keydown(projectItems()[0]!, "End");
+    assert.equal(document.activeElement, projectItems().at(-1));
+    await keydown(projectItems().at(-1)!, "Home");
+    assert.equal(document.activeElement, projectItems()[0]);
+    act(() => { projectItems()[0]?.click(); });
+    await tick();
+    assert.deepEqual(pinWrites, ["C:/source"]);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, projectTrigger);
+
+    // Real keyboard activation uses both browser button keys: Enter opens a
+    // Project menu and Space activates its focused item; Space opens a Session
+    // menu and Enter activates its focused item. Both actions close and
+    // return focus to their originating trigger.
+    await keyboardActivate(projectTrigger, "Enter");
+    assert.equal(container.querySelectorAll(".sidebar-menu").length, 1);
+    const keyboardProjectItems = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    assert.equal(document.activeElement, keyboardProjectItems[0]);
+    await keyboardActivate(keyboardProjectItems[0]!, " ");
+    assert.deepEqual(pinWrites, ["C:/source", "C:/source"]);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, projectTrigger);
+
+    await keyboardActivate(sessionTrigger, " ");
+    assert.equal(container.querySelectorAll(".sidebar-menu").length, 1);
+    const keyboardSessionItems = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    assert.equal(document.activeElement, keyboardSessionItems[0]);
+    await keyboardActivate(keyboardSessionItems[0]!, "Enter");
+    assert.deepEqual(sessionPinWrites, ["C:/source:s1"]);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, sessionTrigger);
+
+    act(() => {
+      sessionAnchor?.dispatchEvent(new dom.window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }));
+    });
+    await tick();
+    await tick();
+    assert.equal(container.querySelectorAll(".sidebar-menu").length, 1);
+    assert.match(container.querySelector<HTMLElement>(".sidebar-menu")?.getAttribute("aria-label") ?? "", /session-1/u);
+    const sessionItems = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    act(() => { document.body.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true })); });
+    await tick();
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, sessionTrigger);
+
+    await openMenu(sessionTrigger);
+    act(() => { document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+    await tick();
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, sessionTrigger);
+
+    await openMenu(sessionTrigger);
+    const tabMenuItems = sessionItems();
+    const nextFocusable = focusablesOutsideMenu();
+    const triggerIndex = nextFocusable.indexOf(sessionTrigger);
+    const expectedAfter = nextFocusable[triggerIndex + 1];
+    tabMenuItems[0]?.focus();
+    const tabEvent = await keydown(tabMenuItems[0]!, "Tab");
+    assert.equal(tabEvent.defaultPrevented, true);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, expectedAfter);
+
+    await openMenu(sessionTrigger);
+    const shiftTabMenuItems = sessionItems();
+    const previousFocusable = focusablesOutsideMenu();
+    const previousTriggerIndex = previousFocusable.indexOf(sessionTrigger);
+    const expectedBefore = previousFocusable[previousTriggerIndex - 1];
+    shiftTabMenuItems[0]?.focus();
+    const shiftTabEvent = await keydown(shiftTabMenuItems[0]!, "Tab", true);
+    assert.equal(shiftTabEvent.defaultPrevented, true);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, expectedBefore);
+
+    const lowMenu = await openMenu(sessionTrigger);
+    assert.ok(lowMenu);
+    assert.ok(Number.parseFloat(lowMenu?.style.left ?? "0") >= 8);
+    assert.ok(Number.parseFloat(lowMenu?.style.top ?? "9999") < 700, "menu should flip above a low viewport anchor");
+    const copy = sessionItems().find((button) => button.textContent?.includes("Copy session ID"));
+    assert.ok(copy);
+    act(() => { copy?.click(); });
+    await tick();
+    assert.deepEqual(copiedIds, ["s1"]);
+    assert.equal(container.querySelector(".sidebar-menu"), null);
+    assert.equal(document.activeElement, sessionTrigger);
+  });
+});
+
+test("catalog refresh updates session rows in place instead of sorting a resumed row to the head", () => {
+  const initial = createInitialState({
+    projects: [{
+      path: "C:/one",
+      projectKey: "C:/one",
+      alias: "One",
+      pinned: false,
+      sessions: [
+        { session_id: "s1", preview: "one", last_used_at: "2026-08-01" },
+        { session_id: "s2", preview: "two", last_used_at: "2026-08-02" },
+        { session_id: "s3", preview: "three", last_used_at: "2026-08-03" },
+      ],
+      catalogFresh: true,
+    }],
+  });
+  const refreshed = reduceRendererState(initial, {
+    type: "catalog_refreshed",
+    projectKey: "C:/one",
+    sessions: [
+      { session_id: "s3", preview: "three updated", last_used_at: "2026-08-04" },
+      { session_id: "s2", preview: "two updated", last_used_at: "2026-08-05" },
+      { session_id: "s1", preview: "one updated", last_used_at: "2026-08-06" },
+      { session_id: "s4", preview: "new", last_used_at: "2026-08-07" },
+    ],
+  });
+  assert.deepEqual(refreshed.projects[0]?.sessions.map((session) => session.session_id), ["s1", "s2", "s3", "s4"]);
+  assert.equal(refreshed.projects[0]?.sessions[0]?.preview, "one updated");
+});
+
+test("session mutation moves one catalog row to the target without changing its identity or history projection", () => {
+  const initial = createInitialState({
+    projects: [
+      { path: "C:/source", projectKey: "C:/source", alias: "Source", pinned: false, sessions: [{ session_id: "move-me", title: "Keep title", preview: "Keep preview", transcript_entries: 7, pinned: true }], catalogFresh: true },
+      { path: "C:/target", projectKey: "C:/target", alias: "Target", pinned: false, sessions: [{ session_id: "existing", preview: "Existing" }], catalogFresh: true },
+    ],
+    pinnedSessions: [{ projectKey: "C:/source", sessionId: "move-me" }],
+  });
+  const moved = applySessionMutation(initial, "C:/source", {
+    session_id: "move-me",
+    project_key: "C:/target",
+    title: "Keep title",
+    session: { session_id: "move-me", project_key: "C:/target", title: "Keep title" },
+  });
+  assert.deepEqual(moved.projects[0]?.sessions, []);
+  assert.deepEqual(moved.projects[1]?.sessions.map((session) => session.session_id), ["existing", "move-me"]);
+  assert.equal(moved.projects[1]?.sessions[1]?.title, "Keep title");
+  assert.equal(moved.projects[1]?.sessions[1]?.preview, "Keep preview");
+  assert.equal(moved.projects[1]?.sessions[1]?.transcript_entries, 7);
+  assert.deepEqual(moved.pinnedSessions, [{ projectKey: "C:/target", sessionId: "move-me" }]);
+});
+
 test("project pinning absorbs independent Session pins into the project tree", () => {
   const projects = [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions: [{ session_id: "s1", pinned: true }], catalogFresh: true }];
   const plan = projectPinPlan(projects, [{ projectKey: "C:/one", sessionId: "s1" }, { projectKey: "C:/two", sessionId: "s2" }], "C:/one");
@@ -161,6 +483,25 @@ test("project pinning absorbs independent Session pins into the project tree", (
   const normalized = reduceRendererState(createInitialState({ projects }), { type: "hydrate_preferences", preferences: { recentProjects: [{ path: "C:/one", pinned: true }], pinnedProjectKeys: ["C:/one"], pinnedSessions: [{ projectKey: "C:/one", sessionId: "s1" }] } });
   assert.deepEqual(normalized.pinnedSessions, []);
   assert.equal(normalized.projects[0].sessions[0].pinned, false);
+});
+
+test("project removal prunes only Desktop navigation preferences and never implies disk deletion", () => {
+  const projects = [
+    { path: "C:/keep", projectKey: "C:/keep", alias: "Keep", pinned: true, sessions: [], catalogFresh: true },
+    { path: "C:/remove", projectKey: "C:/remove", alias: "Remove", pinned: false, sessions: [], catalogFresh: true },
+  ];
+  const navigation = projectNavigationPreferences([projects[0]], [
+    { projectKey: "C:/keep", sessionId: "keep-session" },
+    { projectKey: "C:/remove", sessionId: "remove-session" },
+  ], { "C:/keep": true, "C:/remove": false });
+  assert.deepEqual(navigation.recentProjects, [{ path: "C:/keep", alias: "Keep", pinned: true }]);
+  assert.deepEqual(navigation.projectAliases, { "C:/keep": "Keep" });
+  assert.deepEqual(navigation.pinnedProjectKeys, ["C:/keep"]);
+  assert.deepEqual(navigation.pinnedSessions, [{ projectKey: "C:/keep", sessionId: "keep-session" }]);
+  assert.deepEqual(navigation.expandedProjects, { "C:/keep": true });
+  // The helper only returns preference projections; it has no filesystem
+  // operation or project-directory mutation side effect.
+  assert.equal(projects[1].path, "C:/remove");
 });
 
 test("T05 reducer keeps event order, replaces assistant preview, and settles tools once", () => {

@@ -9,6 +9,7 @@ export interface SessionSummary {
   session_id: string;
   project_key?: string;
   last_used_at?: string;
+  title?: string | null;
   preview?: string;
   timeline_checkpoint_id?: string | null;
   transcript_entries?: number;
@@ -106,6 +107,7 @@ export interface RendererState {
   run: RunProjection | null;
   permissionMode: PermissionModeProjection;
   pinnedSessions: DesktopPreferences["pinnedSessions"];
+  expandedProjects: DesktopPreferences["expandedProjects"];
   currentModelRef: string | null;
   modelCandidates: string[];
   modelPickerOpen: boolean;
@@ -144,6 +146,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   run: null,
   permissionMode: "unknown",
   pinnedSessions: [],
+  expandedProjects: {},
   currentModelRef: null,
   modelCandidates: [],
   modelPickerOpen: false,
@@ -176,6 +179,7 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
     ...DEFAULT_RENDERER_STATE,
     ...overrides,
     projects: overrides.projects?.map((project) => ({ ...project, sessions: [...project.sessions] })) ?? [],
+    expandedProjects: overrides.expandedProjects ? { ...overrides.expandedProjects } : {},
     timeline: overrides.timeline?.map((entry) => ({ ...entry })) ?? [],
     todo: overrides.todo?.map((item) => ({ ...item })) ?? [],
     diagnostics: overrides.diagnostics ? [...overrides.diagnostics] : [],
@@ -205,7 +209,9 @@ function shortId(value: string): string {
   return value.length > 8 ? value.slice(0, 8) : value;
 }
 
-export function sessionLabel(session: Pick<SessionSummary, "session_id" | "preview">): string {
+export function sessionLabel(session: Pick<SessionSummary, "session_id" | "preview" | "title">): string {
+  const title = nonEmptyText(session.title);
+  if (title) return title;
   const preview = nonEmptyText(session.preview);
   return preview ?? shortId(session.session_id);
 }
@@ -218,6 +224,7 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
     session_id: sessionId,
     project_key: nonEmptyText(source?.project_key) ?? fallbackProjectKey,
     last_used_at: textValue(source?.last_used_at),
+    title: source?.title === null ? null : textValue(source?.title) || null,
     preview: textValue(source?.preview),
     timeline_checkpoint_id: typeof source?.timeline_checkpoint_id === "string" ? source.timeline_checkpoint_id : null,
     transcript_entries: typeof source?.transcript_entries === "number" ? source.transcript_entries : 0,
@@ -228,6 +235,29 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
 function applySessionPins(sessions: SessionSummary[], projectKey: string, pinnedSessions: DesktopPreferences["pinnedSessions"]): SessionSummary[] {
   const pinned = new Set(pinnedSessions.filter((item) => item.projectKey === projectKey).map((item) => item.sessionId));
   return sessions.map((session) => ({ ...session, pinned: pinned.has(session.session_id) }));
+}
+
+/**
+ * Catalog authority may order metadata by last-used time.  That is useful for
+ * a cold project open, but a refresh must not make selecting or resuming an
+ * existing row move it to another position in the navigation.  Reconcile
+ * known rows in their existing order and append only genuinely new rows.
+ */
+function preserveSessionOrder(previous: readonly SessionSummary[], incoming: readonly SessionSummary[]): SessionSummary[] {
+  const incomingById = new Map(incoming.map((session) => [session.session_id, session]));
+  const existingIds = new Set<string>();
+  const kept = previous.flatMap((session) => {
+    const next = incomingById.get(session.session_id);
+    if (!next) return [];
+    existingIds.add(session.session_id);
+    return [next];
+  });
+  const added = incoming.filter((session) => {
+    if (existingIds.has(session.session_id)) return false;
+    existingIds.add(session.session_id);
+    return true;
+  });
+  return [...kept, ...added];
 }
 
 function normalizeProjectPath(value: unknown): string | null {
@@ -334,9 +364,10 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
   const path = normalizeProjectPath(project.path);
   if (!path) return { ...state, runtimeError: "Project path is unavailable" };
   const existing = state.projects.find((item) => item.projectKey === path);
-  const sessions = Array.isArray(source.sessions)
+  const incomingSessions = Array.isArray(source.sessions)
     ? source.sessions.map((item) => normalizeSession(item, path)).filter((item): item is SessionSummary => item !== null)
     : [];
+  const sessions = preserveSessionOrder(existing?.sessions ?? [], incomingSessions);
   const nextRun = normalizeRun(source.run);
   return {
     ...permissionUnknownAtRunBoundary(replaceProject(state, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, state.pinnedSessions), catalogFresh: true }), nextRun),
@@ -354,7 +385,9 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
 }
 
 export function applyCatalogRefreshed(state: RendererState, projectKey: string, values: readonly unknown[]): RendererState {
-  const sessions = applySessionPins(values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null), projectKey, state.pinnedSessions);
+  const previous = state.projects.find((item) => item.projectKey === projectKey)?.sessions ?? [];
+  const incoming = values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null);
+  const sessions = applySessionPins(preserveSessionOrder(previous, incoming), projectKey, state.pinnedSessions);
   const replaced = replaceProject(state, projectFromPath(projectKey, state.projects.find((item) => item.projectKey === projectKey)));
   return {
     ...replaced,
@@ -380,6 +413,67 @@ export function applySessionResumed(state: RendererState, result: unknown): Rend
     notice: "Session resumed",
     ...(projectKey ? { projects: state.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
   };
+}
+
+/**
+ * Apply the minimal SessionMutation projection without sorting either the
+ * source or destination catalog.  Session selection and mutation responses
+ * must never make an ordinary row jump to the head of a list.
+ */
+export function applySessionMutation(
+  state: RendererState,
+  sourceProjectKey: string,
+  result: unknown,
+): RendererState {
+  const source = resultRecord(result);
+  const sessionId = nonEmptyText(source.session_id);
+  if (!sessionId) return state;
+  const destinationProjectKey = nonEmptyText(source.project_key) ?? sourceProjectKey;
+  const sourceProject = state.projects.find((project) => project.projectKey === sourceProjectKey);
+  const sourceSession = sourceProject?.sessions.find((session) => session.session_id === sessionId);
+  const response = asRecord(source.session);
+  const responseSession = normalizeSession(response, destinationProjectKey);
+  const titleProvided = Object.prototype.hasOwnProperty.call(source, "title");
+  // Mutation responses are intentionally minimal.  Merge them onto the
+  // catalog row so a rename/move cannot erase the preview, checkpoint, or
+  // transcript metadata that the catalog already supplied.
+  const session = sourceSession
+    ? {
+      ...sourceSession,
+      project_key: destinationProjectKey,
+      ...(response && Object.prototype.hasOwnProperty.call(response, "last_used_at") ? { last_used_at: textValue(response.last_used_at) } : {}),
+      ...(response && Object.prototype.hasOwnProperty.call(response, "title") ? { title: response.title === null ? null : textValue(response.title) || null } : {}),
+      ...(response && Object.prototype.hasOwnProperty.call(response, "preview") ? { preview: textValue(response.preview) } : {}),
+      ...(response && Object.prototype.hasOwnProperty.call(response, "timeline_checkpoint_id") ? { timeline_checkpoint_id: typeof response.timeline_checkpoint_id === "string" ? response.timeline_checkpoint_id : null } : {}),
+      ...(response && Object.prototype.hasOwnProperty.call(response, "transcript_entries") ? { transcript_entries: typeof response.transcript_entries === "number" ? response.transcript_entries : 0 } : {}),
+      ...(response && Object.prototype.hasOwnProperty.call(response, "corrupt") ? { corrupt: response.corrupt === true } : {}),
+      ...(titleProvided && !response ? { title: source.title === null ? null : textValue(source.title) || null } : {}),
+    }
+    : responseSession;
+  if (!session) return state;
+  const existingPinned = sourceSession?.pinned === true || state.pinnedSessions.some((item) => item.projectKey === sourceProjectKey && item.sessionId === sessionId);
+  const pinnedSessions = destinationProjectKey === sourceProjectKey
+    ? state.pinnedSessions
+    : state.pinnedSessions.map((item) => item.projectKey === sourceProjectKey && item.sessionId === sessionId
+      ? { ...item, projectKey: destinationProjectKey }
+      : item);
+  const projects = state.projects.map((project) => {
+    if (project.projectKey === sourceProjectKey && destinationProjectKey !== sourceProjectKey) {
+      return { ...project, sessions: project.sessions.filter((item) => item.session_id !== sessionId) };
+    }
+    if (project.projectKey !== destinationProjectKey) return project;
+    if (destinationProjectKey === sourceProjectKey) {
+      return {
+        ...project,
+        sessions: project.sessions.map((item) => item.session_id === sessionId
+          ? { ...item, ...session, pinned: existingPinned }
+          : item),
+      };
+    }
+    const withoutMoved = project.sessions.filter((item) => item.session_id !== sessionId);
+    return { ...project, sessions: [...withoutMoved, { ...session, pinned: existingPinned }] };
+  });
+  return { ...state, projects, pinnedSessions };
 }
 
 function appendStatus(state: RendererState, text: string, status: TimelineStatus = "info"): RendererState {
@@ -603,6 +697,7 @@ export type RendererAction =
   | { type: "project_opened"; result: unknown }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[] }
   | { type: "session_resumed"; result: unknown }
+  | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
   | { type: "session_new"; sessionId: string; run: unknown }
   | { type: "agent_event"; event: AgentEvent }
   | { type: "interaction_submitting"; value: boolean }
@@ -654,6 +749,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         ...state,
         projects: normalizedProjects,
         pinnedSessions,
+        expandedProjects: preferences.expandedProjects !== undefined ? { ...preferences.expandedProjects } : state.expandedProjects,
         selectedProjectKey: preferences.selectedProjectKey !== undefined ? preferences.selectedProjectKey ?? null : state.selectedProjectKey,
         selectedSessionId: preferences.selectedSessionId !== undefined ? preferences.selectedSessionId ?? null : state.selectedSessionId,
         theme: preferences.theme !== undefined ? (preferences.theme === "dark" || preferences.theme === "light" ? preferences.theme : "system") : state.theme,
@@ -687,6 +783,8 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return applyCatalogRefreshed(state, action.projectKey, action.sessions);
     case "session_resumed":
       return applySessionResumed(state, action.result);
+    case "session_mutated":
+      return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new":
       return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, turnStatus: "idle", pendingInteraction: null, notice: "New Session", runtimeError: null };
     case "agent_event":

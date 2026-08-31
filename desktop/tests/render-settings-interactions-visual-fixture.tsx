@@ -14,10 +14,10 @@ const configuration = {
   models: { "openai/codex": { provider_profile_id: "openai", remote_id: "gpt-5.6-codex", display_name: "Codex", context_window: 128000, max_output_tokens: 8192, reasoning_effort: "low" }, "a/b": { provider_profile_id: "multi", remote_id: "claude-sonnet", display_name: "Slash", context_window: 200000, max_output_tokens: 8192, reasoning_effort: "low" }, "a-b": { provider_profile_id: "multi", remote_id: "claude-haiku", display_name: "Dash", context_window: 200000, max_output_tokens: 4096, reasoning_effort: null }, "中文/模型": { provider_profile_id: "multi", remote_id: "claude-chinese", display_name: "中文", context_window: 200000, max_output_tokens: 4096, reasoning_effort: "medium" } },
 };
 declare global { interface Window { fixtureEvidence: { reads: string[]; writes: Array<[string, unknown]>; saves: unknown[]; preferences: DesktopPreferences } } }
-const preferences: DesktopPreferences = { theme: "dark", language: sessionStorage.getItem("uthcode.fixture.api.language") === "en" ? "en" : "zh-CN", windowBounds: { width: 1200, height: 800, maximized: false }, panelMode: "hidden", recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], selectedProjectKey: null, selectedSessionId: null };
+const preferences: DesktopPreferences = { theme: "dark", language: sessionStorage.getItem("uthcode.fixture.api.language") === "en" ? "en" : "zh-CN", windowBounds: { width: 1200, height: 800, maximized: false }, panelMode: "hidden", recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
 window.fixtureEvidence = { reads: [], writes: [], saves: [], preferences };
 const fakeApi: DesktopApi = {
-  openProject: async () => null, openProjectInExplorer: async () => undefined, closeShell: async () => undefined,
+  openProject: async () => null, openProjectInExplorer: async () => undefined, copySessionId: async () => undefined, closeShell: async () => undefined,
   requestRuntime: async (method, params) => method === "settings.save" ? (window.fixtureEvidence.saves.push(params), { configuration }) : method === "settings.get" ? { configuration } : {},
   subscribeAgentEvents: () => () => undefined,
   readPreference: async <K extends PreferenceKey>(key: K) => { window.fixtureEvidence.reads.push(key); return window.fixtureEvidence.preferences[key]; },
