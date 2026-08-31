@@ -14,6 +14,8 @@ from uthcode.application import (
     SessionMutation,
     SessionOperationError,
     TextPart,
+    ToolCallPart,
+    ToolResultPart,
     UthCodeApplication,
 )
 from uthcode.application.history import _transcript_entries_for_message
@@ -240,7 +242,7 @@ def test_move_changes_only_authoritative_membership_and_is_target_idempotent(
         assert resumed.title == "保留标题"
 
 
-def test_move_rejects_active_session_and_failed_metadata_write_keeps_state(
+def test_move_open_idle_session_and_failed_metadata_write_keeps_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,14 +257,14 @@ def test_move_rejects_active_session_and_failed_metadata_write_keeps_state(
         store=store,
     )
     active = service.resume_session_for_command("busy")
-    try:
-        with pytest.raises(SessionOperationError) as busy:
-            service.move_session("busy", target_key)
-        assert busy.value.kind == "busy"
-    finally:
-        active.close()
+    moved = service.move_session("busy", target_key)
+    assert moved.project_key == target_key
+    assert service.active_session is None
+    assert store.read_session("busy", expected_project_key=target_key).project_key == target_key
+    active.close()  # the successful move already released this writer
 
-    metadata_path = store.session_path("busy") / "metadata.json"
+    store.create_session("rename-failure", project_key=source_key, title="原始")
+    metadata_path = store.session_path("rename-failure") / "metadata.json"
     before = metadata_path.read_bytes()
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
@@ -272,10 +274,10 @@ def test_move_rejects_active_session_and_failed_metadata_write_keeps_state(
 
     monkeypatch.setattr(session_files, "_atomic_write_json", fail_write)
     with pytest.raises(SessionOperationError) as failed:
-        service.rename_session("busy", "新标题")
+        service.rename_session("rename-failure", "新标题")
     assert failed.value.kind == "storage"
     assert metadata_path.read_bytes() == before
-    assert store.read_session("busy", expected_project_key=source_key).title == "原始"
+    assert store.read_session("rename-failure", expected_project_key=source_key).title == "原始"
 
 
 def test_move_write_failure_keeps_project_history_title_and_tool_bytes(
@@ -322,6 +324,109 @@ def test_move_write_failure_keeps_project_history_title_and_tool_bytes(
     assert snapshot.title == "原始标题"
     assert service.project_replay("move-failure")[0].text == "不可丢失的历史"
     assert store.read_tool_result("move-failure", tool_reference.ref).content == before_tool_result
+
+
+def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
+    tmp_path: Path,
+) -> None:
+    source, _target, store = _paths(tmp_path)
+    source_key = str(source.resolve())
+    store.create_session("plan-replay", project_key=source_key)
+    entries = []
+    entries.extend(_user_transcript("plan-replay", "开始"))
+    entries.extend(
+        _transcript_entries_for_message(
+            "plan-replay",
+            "turn-plan",
+            2,
+            Message("assistant", (ToolCallPart("plan-1", "ProposePlan", {"plan": "先检查，再验证"}),)),
+        )
+    )
+    entries.extend(
+        _transcript_entries_for_message(
+            "plan-replay",
+            "turn-plan",
+            3,
+            Message("tool", (ToolResultPart("plan-1", "private approval body"),)),
+        )
+    )
+    entries.extend(
+        _transcript_entries_for_message(
+            "plan-replay",
+            "turn-malformed",
+            4,
+            Message("assistant", (ToolCallPart("plan-2", "ProposePlan", {"plan": 7}),)),
+        )
+    )
+    entries.extend(
+        _transcript_entries_for_message(
+            "plan-replay",
+            "turn-malformed",
+            5,
+            Message("tool", (ToolResultPart("plan-2", "malformed private body"),)),
+        )
+    )
+    entries.extend(
+        _transcript_entries_for_message(
+            "plan-replay",
+            "turn-pending",
+            6,
+            Message("assistant", (ToolCallPart("plan-3", "ProposePlan", {"plan": "unfinished"}),)),
+        )
+    )
+    with store.open_writer("plan-replay", expected_project_key=source_key) as writer:
+        writer.append_transcript(tuple(entries))
+
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=source_key,
+        instruction_loader=None,
+        store=store,
+    )
+    replay = service.project_replay("plan-replay")
+    plans = [record for record in replay if record.kind == "plan"]
+    assert len(plans) == 1
+    assert plans[0].text == "先检查，再验证"
+    assert plans[0].tool_name == "ProposePlan"
+    serialized = json.dumps([record.to_dict() for record in replay], ensure_ascii=False)
+    assert "private approval body" not in serialized
+    assert "malformed private body" not in serialized
+    assert "unfinished" not in serialized
+
+
+def test_open_idle_move_failure_keeps_source_writer_and_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, target, store = _paths(tmp_path)
+    source_key = str(source.resolve())
+    target_key = str(target.resolve())
+    store.create_session("active-move-failure", project_key=source_key)
+    service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=source_key,
+        instruction_loader=None,
+        store=store,
+    )
+    active = service.resume_session_for_command("active-move-failure")
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated active move metadata failure")
+
+    import uthcode.integrations.session_files as session_files
+
+    monkeypatch.setattr(session_files, "_atomic_write_json", fail_write)
+    with pytest.raises(SessionOperationError) as failed:
+        service.move_session("active-move-failure", target_key)
+    assert failed.value.kind == "storage"
+    assert service.active_session is active
+    assert active.project_key == source_key
+    assert store.read_session(
+        "active-move-failure",
+        expected_project_key=source_key,
+    ).project_key == source_key
+    monkeypatch.undo()
+    active.close()
 
 
 def test_move_receipt_is_instance_local_and_same_target_converges_concurrently(
@@ -527,15 +632,17 @@ async def test_real_bridge_maps_application_membership_busy_and_storage_errors(
 
         store.create_session("bridge-busy", project_key=source_key, title="忙碌")
         active = application.resume_session_for_command("bridge-busy")
+        bridge._active_handle = object()
         busy = await bridge.handle_request(
             RequestEnvelope(
-                "busy-move",
+                "busy-move-active-turn",
                 "session.move",
                 {"session_id": "bridge-busy", "target_project_key": target_key},
             )
         )
         assert busy.ok is False
-        assert busy.error is not None and busy.error.kind == "session_busy"
+        assert busy.error is not None and busy.error.kind == "turn_active"
+        bridge._active_handle = None
         active.close()
 
         store.create_session("bridge-failure", project_key=source_key, title="失败前")

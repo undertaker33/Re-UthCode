@@ -1075,13 +1075,18 @@ async def test_resume_hydrate_is_ordered_bounded_and_does_not_enter_live_stream(
     records = tuple(
         SessionReplayRecord(
             "resume-1", index, "turn-1", kind, text=text,
-            tool_name="Bash" if kind == "tool" else None,
-            tool_call_id=f"call-{index}" if kind == "tool" else None,
-            status="finished" if kind == "tool" else None,
+            tool_name=(
+                "Bash" if kind == "tool" else "ProposePlan" if kind == "plan" else None
+            ),
+            tool_call_id=(
+                f"call-{index}" if kind in {"tool", "plan"} else None
+            ),
+            status="finished" if kind in {"tool", "plan"} else None,
         )
         for index, (kind, text) in enumerate(
-            (("user", "你好"), ("reasoning", "先想"),
-             ("assistant", "回答"), ("tool", "dir")),
+             (("user", "你好"), ("reasoning", "先想"),
+              ("assistant", "回答"), ("plan", "# 安全计划\n- 保留身份"),
+              ("tool", "dir")),
             start=1,
         )
     )
@@ -1106,13 +1111,63 @@ async def test_resume_hydrate_is_ordered_bounded_and_does_not_enter_live_stream(
     )
 
     plain = Text.from_ansi("".join(emits)).plain
-    assert plain.index("你好") < plain.index("先想") < plain.index("回答") < plain.index("Bash")
+    assert (
+        plain.index("你好")
+        < plain.index("先想")
+        < plain.index("回答")
+        < plain.index("UthCode · Plan")
+        < plain.index("Bash")
+    )
     assert plain.count("你好") == 1
     assert plain.count("先想") == 1
     assert plain.count("回答") == 1
+    assert plain.count("安全计划") == 1
+    assert "Plan v" not in plain
+    assert "ProposePlan" not in plain
     assert plain.count("dir") == 1
     assert not tui._streams
     assert yields == 0  # one batch is not required to yield
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_does_not_synthesize_plan_revision_across_turns() -> None:
+    application = _application()
+    tui = UthCodeTUI(application, terminal_output=RecordingOutput())
+    records = (
+        SessionReplayRecord(
+            "resume-plan-a",
+            1,
+            "run-a-turn-1",
+            "plan",
+            "# first plan",
+            tool_name="ProposePlan",
+            tool_call_id="plan-a",
+            status="finished",
+        ),
+        SessionReplayRecord(
+            "resume-plan-b",
+            2,
+            "run-b-turn-9",
+            "plan",
+            "# second plan",
+            tool_name="ProposePlan",
+            tool_call_id="plan-b",
+            status="finished",
+        ),
+    )
+    emits: list[str] = []
+
+    async def capture(value: str) -> None:
+        emits.append(value)
+
+    tui._emit = capture  # type: ignore[method-assign]
+    await tui._hydrate_replay(records)
+
+    plain = Text.from_ansi("".join(emits)).plain
+    assert plain.count("UthCode · Plan") == 2
+    assert plain.count("first plan") == 1
+    assert plain.count("second plan") == 1
+    assert "Plan v" not in plain
 
 
 @pytest.mark.asyncio

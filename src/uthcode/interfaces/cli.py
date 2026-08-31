@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -198,9 +199,13 @@ async def _stream_exec(
     stderr: TextIO,
 ) -> int:
     try:
-        ensure_session = getattr(application, "ensure_session", None)
+        ensure_session = getattr(application, "ensure_session_async", None)
+        if not callable(ensure_session):
+            ensure_session = getattr(application, "ensure_session", None)
         if callable(ensure_session):
-            ensure_session()
+            result = ensure_session()
+            if inspect.isawaitable(result):
+                await result
         run: AgentRun = application.create_run()
         turn: TurnHandle = run.start_turn(prompt)
         projection = _ExecProjection()

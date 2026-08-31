@@ -72,7 +72,7 @@ from uthcode.core.compaction import CompactionEpoch, TimelineAgingEpoch
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
-from .context import ApplicationContextService
+from .context import ApplicationContextService, CompactionStatus, ContextStatus
 from .instructions import InstructionLoader
 from .history import _transcript_entries_for_message
 from .runtime_context import ApplicationRuntimeContext
@@ -531,6 +531,8 @@ class ApplicationStatus:
     tool_schema_fingerprint: str | None = None
     diagnostics: Mapping[str, object] = field(default_factory=dict)
     active_session_title: str | None = None
+    context_status: ContextStatus = field(default_factory=ContextStatus.unavailable)
+    compaction_status: CompactionStatus = field(default_factory=CompactionStatus)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -546,6 +548,8 @@ class ApplicationStatus:
             ],
             "state": self.state,
             "context_usage": self.context_usage.to_dict(),
+            "context_status": self.context_status.to_dict(),
+            "compaction_status": self.compaction_status.to_dict(),
             "timeline_checkpoint_id": self.timeline_checkpoint_id,
             "active_session_title": self.active_session_title,
             "instruction_epoch": self.instruction_epoch,
@@ -677,6 +681,18 @@ class UthCodeApplication:
             if configuration is not None
             else provider.identity.model
         )
+        self._model_state_generation = 0
+        self._last_provider_limits: ModelLimits | None = None
+        self._last_provider_limits_model: str | None = None
+        self._last_provider_limits_provider: ProviderPort | None = None
+        self._context_budget_snapshot: tuple[
+            int,
+            ProviderPort,
+            str,
+            ContextBudget,
+        ] | None = None
+        self._request_boundary_counts: dict[tuple[str, str], int] = {}
+        self._context_service.set_context_budget(self._context_budget_for_projection())
 
     @property
     def provider(self) -> ProviderPort:
@@ -738,12 +754,22 @@ class UthCodeApplication:
     def context_usage(self, snapshot=None):
         """Return the same dynamic usage projection for headless callers."""
 
-        return self._context_service.usage(snapshot)
+        if snapshot is not None:
+            return self._context_service.usage(snapshot)
+        context = self._context_service.context_status
+        return ContextUsage(
+            context.used_tokens,
+            context.budget_tokens,
+            available=context.available,
+        )
 
     def create_session(self, session_id: str | None = None) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.create_session(session_id)
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
+        session = self._session_service.create_session(session_id)
+        self._refresh_context_for_session(session, context_budget=context_budget)
+        return session
 
     def ensure_session(self) -> ApplicationSession | None:
         """Open a fresh durable Session for an interactive entry point."""
@@ -755,13 +781,26 @@ class UthCodeApplication:
             return active
         return self.new_session_for_command()
 
+    async def ensure_session_async(self) -> ApplicationSession | None:
+        """Open a fresh Session without blocking an interface event loop."""
+
+        if self._session_service is None:
+            return None
+        active = self._session_service.active_session
+        if active is not None:
+            return active
+        return await self.new_session_for_command_async()
+
     def resume_session(self, session_id: str) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.resume_session(
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
+        session = self._session_service.resume_session(
             session_id,
             replay_builder=self._build_session_replay,
         )
+        self._refresh_context_for_session(session, context_budget=context_budget)
+        return session
 
     def rename_session(self, session_id: str, title: str) -> SessionMutation:
         """Rename a durable Session through the Application boundary."""
@@ -775,7 +814,15 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.move_session(session_id, target_project_key)
+        active = self._session_service.active_session
+        moving_active = active is not None and active.session_id == session_id
+        result = self._session_service.move_session(session_id, target_project_key)
+        if moving_active and self._session_service.active_session is None:
+            # The source Application no longer owns this Session, so its
+            # Context projection must not continue presenting the released
+            # transcript as the current working set.
+            self._context_service.clear_context()
+        return result
 
     def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return the Application-owned same-project Session Picker data."""
@@ -789,8 +836,35 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
         session = self._session_service.create_session_for_command()
-        self._refresh_context_for_session(session)
+        self._refresh_context_for_session(session, context_budget=context_budget)
+        return session
+
+    async def new_session_for_command_async(
+        self,
+        *,
+        context_budget: ContextBudget | None = None,
+    ) -> ApplicationSession:
+        """Resolve Context before committing a new durable Session."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        if context_budget is None:
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
+        elif not isinstance(context_budget, ContextBudget):
+            raise TypeError("context_budget must be a ContextBudget or None")
+        elif not self._context_budget_snapshot_matches(context_budget):
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
+        session = self._session_service.create_session_for_command()
+        await self._refresh_context_for_session_async(
+            session,
+            context_budget=context_budget,
+        )
         return session
 
     def resume_session_for_command(self, session_id: str) -> ApplicationSession:
@@ -798,11 +872,42 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
         session = self._session_service.resume_session_for_command(
             session_id,
             replay_builder=self._build_session_replay,
         )
-        self._refresh_context_for_session(session)
+        self._refresh_context_for_session(session, context_budget=context_budget)
+        return session
+
+    async def resume_session_for_command_async(
+        self,
+        session_id: str,
+        *,
+        context_budget: ContextBudget | None = None,
+    ) -> ApplicationSession:
+        """Resolve Context before committing a durable Session switch."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        if context_budget is None:
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
+        elif not isinstance(context_budget, ContextBudget):
+            raise TypeError("context_budget must be a ContextBudget or None")
+        elif not self._context_budget_snapshot_matches(context_budget):
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
+        session = self._session_service.resume_session_for_command(
+            session_id,
+            replay_builder=self._build_session_replay,
+        )
+        await self._refresh_context_for_session_async(
+            session,
+            context_budget=context_budget,
+        )
         return session
 
     def session_replay(
@@ -859,6 +964,9 @@ class UthCodeApplication:
             model_profile.max_output_tokens if model_profile is not None else None,
         )
         provider_limits = await _resolve_model_limits_async(provider, remote_model_id)
+        self._last_provider_limits = provider_limits
+        self._last_provider_limits_model = remote_model_id
+        self._last_provider_limits_provider = provider
         budget = resolve_context_budget(
             configured_input_limit=configured_input_limit,
             provider_limits=provider_limits,
@@ -905,6 +1013,7 @@ class UthCodeApplication:
                 if budget.provider_max_output is not None
                 else budget.compaction_output_reserve
             ),
+            trigger="manual",
         )
         if not result.changed and result.failure in {"no_safe_epoch", "no_reduction"}:
             # A low-pressure/manual no-op is a successful no-change outcome;
@@ -916,6 +1025,7 @@ class UthCodeApplication:
                 failure=None,
             )
             self._context_service.finalize_compaction(result)
+            self._context_service.finish_compaction(result, trigger="manual")
         return result
 
     def _commit_timeline_candidate(
@@ -1217,6 +1327,12 @@ class UthCodeApplication:
             self._record_transcript_persistence(outcome)
             return outcome
 
+        # The durable Transcript changed before the terminal Run result is
+        # projected.  Invalidate any prior exact Context measurement now;
+        # _complete_turn may restore exact only after it has released the
+        # active-turn owner and received the matching terminal Usage.
+        self._context_service.refresh_context_estimate()
+
         append_failures = (
             (append_outcome.failure_stage,)
             if append_outcome.failure_stage is not None
@@ -1280,19 +1396,55 @@ class UthCodeApplication:
             self._history_persistence_diagnostics.get("committed_turns", 0)
         ) + 1
 
-    def _record_formal_run_usage(self, usage: Usage) -> None:
+    def _record_formal_run_usage(
+        self,
+        usage: Usage,
+        *,
+        exact_request_boundary: bool = False,
+    ) -> None:
         """Project one terminal AgentRun's observed cumulative Usage.
 
         ``AgentRun`` owns the terminal-result boundary, while this Application
         method owns the diagnostics state.  A terminal Turn with no observed
         Provider Usage does not erase the last observable projection, so
         cancel/failure paths cannot manufacture a measurement or hide a prior
-        one merely by constructing an empty default ``Usage``.
+        one merely by constructing an empty default ``Usage``.  The Core
+        ``TurnResult`` usage is cumulative across Provider iterations; it is
+        promoted to an exact Context measurement only when the caller proves
+        that this terminal result represents one completed request boundary.
         """
 
+        if not isinstance(exact_request_boundary, bool):
+            raise TypeError("exact_request_boundary must be a boolean")
         projection = public_usage_diagnostics(usage)
         if projection.get("status") == "available":
             self._provider_usage_diagnostics = projection
+            input_tokens = projection.get("input_tokens")
+            if (
+                exact_request_boundary
+                and isinstance(input_tokens, int)
+                and not isinstance(input_tokens, bool)
+            ):
+                # A cumulative multi-iteration Turn is not the current
+                # request boundary.  Only AgentRun's explicit single-request
+                # proof may upgrade the Context estimate to exact.
+                self._context_service.record_exact_usage(input_tokens)
+
+    def _consume_request_boundary_count(
+        self,
+        run_id: str,
+        turn_id: str,
+    ) -> int | None:
+        """Consume the number of successfully prepared Provider requests.
+
+        Core ``TurnResult`` intentionally reports cumulative usage rather than
+        a request-attempt counter.  The Application request-preparation
+        boundary is therefore the narrowest fact available here: a retry of
+        the same Core iteration prepares a second request and must keep the
+        terminal projection as an estimate.
+        """
+
+        return self._request_boundary_counts.pop((run_id, turn_id), None)
 
     def status(self) -> ApplicationStatus:
         profile = self.current_provider_profile
@@ -1303,7 +1455,12 @@ class UthCodeApplication:
         )
         sources = self._configuration.sources if self._configuration is not None else ()
         snapshot = self._context_service.last_snapshot
-        usage = self._context_service.usage(snapshot)
+        context_status = self._context_service.context_status
+        usage = ContextUsage(
+            context_status.used_tokens,
+            context_status.budget_tokens,
+            available=context_status.available,
+        )
         active = (
             self._session_service.active_session
             if self._session_service is not None
@@ -1356,6 +1513,8 @@ class UthCodeApplication:
             provider_identity=self._provider.identity,
             configuration_sources=sources,
             context_usage=usage,
+            context_status=context_status,
+            compaction_status=self._context_service.compaction_status,
             timeline_checkpoint_id=timeline_checkpoint_id,
             active_session_title=(active.title if active is not None else None),
             instruction_epoch=instruction_epoch,
@@ -1367,19 +1526,290 @@ class UthCodeApplication:
             diagnostics=diagnostics,
         )
 
-    def _refresh_context_for_session(self, session: ApplicationSession) -> None:
+    def _context_budget_for_projection(
+        self,
+        *,
+        resolve_provider: bool = False,
+    ) -> ContextBudget:
+        """Resolve the same effective budget used by the next formal request.
+
+        Resume and other synchronous Session boundaries are formal APIs for
+        callers without an event loop, while Provider limits resolvers may be
+        asynchronous.  Reuse a previously frozen limit when one exists;
+        otherwise resolve the endpoint through the synchronous bridge below.
+        A running interface loop must use the async Session boundary so an
+        awaitable resolver remains on that loop.
+        """
+
+        model_profile = self.current_model
+        remote_model_id = (
+            model_profile.remote_id
+            if model_profile is not None
+            else self._provider.identity.model
+        )
+        provider_limits = (
+            self._last_provider_limits
+            if self._last_provider_limits_model == remote_model_id
+            and self._last_provider_limits_provider is self._provider
+            else None
+        )
+        if provider_limits is None and resolve_provider:
+            provider_limits = self._resolve_model_limits_sync(remote_model_id)
+            if provider_limits is not None:
+                self._last_provider_limits = provider_limits
+                self._last_provider_limits_model = remote_model_id
+                self._last_provider_limits_provider = self._provider
+        return resolve_context_budget(
+            configured_input_limit=(
+                model_profile.context_window if model_profile is not None else None
+            ),
+            provider_limits=provider_limits,
+            requested_output_reserve=_effective_output_reserve(
+                None,
+                model_profile.max_output_tokens if model_profile is not None else None,
+            ),
+        )
+
+    async def _context_budget_for_projection_async(
+        self,
+        *,
+        resolve_provider: bool = False,
+    ) -> ContextBudget:
+        """Resolve a Session projection budget on the caller's event loop."""
+
+        # Provider metadata resolution is an await boundary.  A concurrent
+        # model selection may therefore replace both the provider object and
+        # model ref while this method is suspended.  Never cache or return a
+        # budget derived from the stale snapshot; retry once against the
+        # current identity, then fail with a stable boundary error rather than
+        # overwriting the current model's Context status.
+        for attempt in range(2):
+            state_snapshot = self._model_state_snapshot()
+            model_profile = self.current_model
+            provider = self._provider
+            remote_model_id = (
+                model_profile.remote_id
+                if model_profile is not None
+                else provider.identity.model
+            )
+            provider_limits = (
+                self._last_provider_limits
+                if self._last_provider_limits_model == remote_model_id
+                and self._last_provider_limits_provider is provider
+                else None
+            )
+            if provider_limits is None and resolve_provider:
+                try:
+                    resolved_limits = await _resolve_model_limits_async(
+                        provider,
+                        remote_model_id,
+                    )
+                except Exception:
+                    # A status refresh cannot manufacture a ceiling from a
+                    # failed metadata probe; retain the existing configured/
+                    # default budget and let the formal request apply its own
+                    # Provider error semantics.
+                    resolved_limits = None
+                if not self._model_state_matches(state_snapshot):
+                    if attempt == 1:
+                        raise RuntimeError(
+                            "model changed during Context budget preflight"
+                        )
+                    continue
+                provider_limits = resolved_limits
+                if provider_limits is not None:
+                    self._last_provider_limits = provider_limits
+                    self._last_provider_limits_model = remote_model_id
+                    self._last_provider_limits_provider = provider
+            if not self._model_state_matches(state_snapshot):
+                if attempt == 1:
+                    raise RuntimeError("model changed during Context budget preflight")
+                continue
+            budget = resolve_context_budget(
+                configured_input_limit=(
+                    model_profile.context_window if model_profile is not None else None
+                ),
+                provider_limits=provider_limits,
+                requested_output_reserve=_effective_output_reserve(
+                    None,
+                    model_profile.max_output_tokens if model_profile is not None else None,
+                ),
+            )
+            self._context_budget_snapshot = (
+                state_snapshot[0],
+                state_snapshot[1],
+                state_snapshot[2],
+                budget,
+            )
+            return budget
+        raise RuntimeError("model changed during Context budget preflight")
+
+    def _model_state_snapshot(self) -> tuple[int, ProviderPort, str]:
+        """Capture the minimal identity needed across an async metadata await."""
+
+        return (
+            self._model_state_generation,
+            self._provider,
+            self._current_model_ref,
+        )
+
+    def _model_state_matches(
+        self,
+        snapshot: tuple[int, ProviderPort, str],
+    ) -> bool:
+        return (
+            snapshot[0] == self._model_state_generation
+            and snapshot[1] is self._provider
+            and snapshot[2] == self._current_model_ref
+        )
+
+    def _context_budget_snapshot_matches(self, budget: ContextBudget) -> bool:
+        snapshot = self._context_budget_snapshot
+        return bool(
+            snapshot is not None
+            and snapshot[0] == self._model_state_generation
+            and snapshot[1] is self._provider
+            and snapshot[2] == self._current_model_ref
+            and snapshot[3] is budget
+        )
+
+    async def preflight_session_context_async(self) -> ContextBudget:
+        """Resolve a Session boundary budget without mutating Session state."""
+
+        return await self._context_budget_for_projection_async(resolve_provider=True)
+
+    def _resolve_model_limits_sync(
+        self,
+        remote_model_id: str,
+        *,
+        provider: ProviderPort | None = None,
+        strict: bool = False,
+    ) -> ModelLimits | None:
+        """Resolve an optional async Provider ceiling at a sync boundary.
+
+        Application Session APIs are intentionally synchronous for non-async
+        callers because their writer-lock and durable metadata transitions are
+        synchronous.  A running interface loop must use the async Session
+        boundary instead; blocking that loop or invoking the Provider from a
+        second loop would violate Provider client loop affinity.
+        """
+
+        target_provider = self._provider if provider is None else provider
+        resolver = getattr(target_provider, "resolve_model_limits", None)
+        if not callable(resolver):
+            return None
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = False
+        else:
+            running_loop = True
+
+        if running_loop and (
+            inspect.iscoroutinefunction(resolver)
+            or inspect.iscoroutinefunction(getattr(resolver, "__call__", None))
+        ):
+            raise RuntimeError(
+                "async Provider model limits require an async Session boundary"
+            )
+
+        if strict:
+            candidate = resolver(remote_model_id)
+        else:
+            try:
+                candidate = resolver(remote_model_id)
+            except Exception:
+                return None
+        if not inspect.isawaitable(candidate):
+            if strict:
+                return _validate_model_limits(candidate)
+            try:
+                return _validate_model_limits(candidate)
+            except (TypeError, ValueError):
+                return None
+
+        if not running_loop:
+            if strict:
+                candidate = asyncio.run(candidate)
+            else:
+                try:
+                    candidate = asyncio.run(candidate)
+                except (Exception, CancelledError):
+                    return None
+        else:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError(
+                "async Provider model limits require an async Session boundary"
+            )
+        if strict:
+            return _validate_model_limits(candidate)
+        try:
+            return _validate_model_limits(candidate)
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_model_limits_sync_strict(
+        self,
+        remote_model_id: str,
+        *,
+        provider: ProviderPort | None = None,
+    ) -> ModelLimits | None:
+        """Resolve model-selection limits without hiding preflight failures."""
+
+        return self._resolve_model_limits_sync(
+            remote_model_id,
+            provider=provider,
+            strict=True,
+        )
+
+    def _refresh_context_for_session(
+        self,
+        session: ApplicationSession,
+        *,
+        context_budget: ContextBudget | None = None,
+    ) -> None:
         """Refresh the stable Application usage projection at a Session boundary."""
 
+        if context_budget is None:
+            context_budget = self._context_budget_for_projection(resolve_provider=True)
         self._context_service.compile(
             instruction_loader=self._instruction_loader,
             transcript=session.transcript,
             timeline=session.timeline,
             tool_definitions=self.tool_definitions(),
+            context_budget=context_budget,
             preserve_request_diagnostics=True,
         )
 
-    def select_model(self, model_ref: str) -> ModelProfile:
-        """Switch Provider and model only after candidate and persistence succeed."""
+    async def _refresh_context_for_session_async(
+        self,
+        session: ApplicationSession,
+        *,
+        context_budget: ContextBudget | None = None,
+    ) -> None:
+        """Refresh Session Context after awaiting the Provider ceiling in-loop."""
+
+        if context_budget is None:
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
+        self._context_service.compile(
+            instruction_loader=self._instruction_loader,
+            transcript=session.transcript,
+            timeline=session.timeline,
+            tool_definitions=self.tool_definitions(),
+            context_budget=context_budget,
+            preserve_request_diagnostics=True,
+        )
+
+    def _model_selection_candidate(
+        self,
+        model_ref: str,
+    ) -> tuple[ModelProfile, ProviderPort]:
+        """Validate and build a model candidate without changing Application state."""
 
         if self._configuration is None:
             raise ValueError("model selection requires an EffectiveConfig")
@@ -1396,11 +1826,129 @@ class UthCodeApplication:
         )
         if not isinstance(candidate_provider, ProviderPort):
             raise TypeError("Provider builder must return a ProviderPort")
-        if self._model_writer is not None:
-            self._model_writer(model_ref)
-        self._provider = candidate_provider
-        self._current_model_ref = model_ref
+        return candidate_model, candidate_provider
+
+    @staticmethod
+    def _model_context_budget(
+        model: ModelProfile,
+        provider_limits: ModelLimits | None,
+    ) -> ContextBudget:
+        """Build a target model budget without committing it to Context state."""
+
+        return resolve_context_budget(
+            configured_input_limit=model.context_window,
+            provider_limits=provider_limits,
+            requested_output_reserve=_effective_output_reserve(
+                None,
+                model.max_output_tokens,
+            ),
+        )
+
+    def _commit_model_selection(
+        self,
+        candidate_model: ModelProfile,
+        candidate_provider: ProviderPort,
+        provider_limits: ModelLimits | None,
+        context_budget: ContextBudget,
+    ) -> ModelProfile:
+        """Commit one fully preflighted model candidate at one boundary."""
+
+        old_provider = self._provider
+        old_model_ref = self._current_model_ref
+        old_model_state_generation = self._model_state_generation
+        old_provider_limits = self._last_provider_limits
+        old_provider_limits_model = self._last_provider_limits_model
+        old_provider_limits_provider = self._last_provider_limits_provider
+        old_context_budget_snapshot = self._context_budget_snapshot
+        writer_committed = False
+        try:
+            # The user-config writer is itself atomic.  It is intentionally
+            # called only after candidate Provider/limit validation and before
+            # publishing the in-memory model identity.  If the synchronous
+            # Context commit below fails, restore the old root preference
+            # before returning the failure to the command boundary.
+            if self._model_writer is not None:
+                self._model_writer(candidate_model.model_ref)
+                writer_committed = True
+            self._provider = candidate_provider
+            self._current_model_ref = candidate_model.model_ref
+            self._last_provider_limits = provider_limits
+            self._last_provider_limits_model = candidate_model.remote_id
+            self._last_provider_limits_provider = candidate_provider
+            active = (
+                self._session_service.active_session
+                if self._session_service is not None
+                else None
+            )
+            if active is not None:
+                self._refresh_context_for_session(
+                    active,
+                    context_budget=context_budget,
+                )
+            else:
+                self._context_service.set_context_budget(context_budget)
+            self._model_state_generation += 1
+            self._context_budget_snapshot = (
+                self._model_state_generation,
+                candidate_provider,
+                candidate_model.model_ref,
+                context_budget,
+            )
+        except BaseException:
+            # Context compilation is synchronous and normally cannot be
+            # interrupted between state writes.  Restore the Application
+            # identity if a validation/invariant failure nevertheless occurs.
+            self._provider = old_provider
+            self._current_model_ref = old_model_ref
+            self._model_state_generation = old_model_state_generation
+            self._last_provider_limits = old_provider_limits
+            self._last_provider_limits_model = old_provider_limits_model
+            self._last_provider_limits_provider = old_provider_limits_provider
+            self._context_budget_snapshot = old_context_budget_snapshot
+            if writer_committed and self._model_writer is not None:
+                try:
+                    self._model_writer(old_model_ref)
+                except Exception:
+                    # The configured writer is atomic in the production path;
+                    # preserve the original failure if a custom writer also
+                    # refuses the compensating write.
+                    pass
+            raise
         return candidate_model
+
+    def select_model(self, model_ref: str) -> ModelProfile:
+        """Synchronously select a model for callers without an event loop."""
+
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = self._resolve_model_limits_sync_strict(
+            candidate_model.remote_id,
+            provider=candidate_provider,
+        )
+        context_budget = self._model_context_budget(candidate_model, provider_limits)
+        return self._commit_model_selection(
+            candidate_model,
+            candidate_provider,
+            provider_limits,
+            context_budget,
+        )
+
+    async def select_model_async(self, model_ref: str) -> ModelProfile:
+        """Select a model after resolving its Provider ceiling on this loop."""
+
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = await _resolve_model_limits_async(
+            candidate_provider,
+            candidate_model.remote_id,
+        )
+        context_budget = self._model_context_budget(candidate_model, provider_limits)
+        # No await follows this point: cancellation can only interrupt the
+        # resolver preflight, before config/model/limit/Context publication.
+        return self._commit_model_selection(
+            candidate_model,
+            candidate_provider,
+            provider_limits,
+            context_budget,
+        )
 
     def _start_agent_turn(
         self,
@@ -1423,6 +1971,12 @@ class UthCodeApplication:
         callable are captured before Core receives the Turn, so a later model
         switch cannot alter an active Turn.
         """
+
+        # A new Turn invalidates any exact usage from the previous terminal
+        # boundary before Core can emit its first event.
+        self._context_service.refresh_context_estimate()
+        request_boundary_key = (state.run_id, turn_id)
+        self._request_boundary_counts[request_boundary_key] = 0
 
         provider = self._provider
         model_ref = self._current_model_ref
@@ -1526,6 +2080,7 @@ class UthCodeApplication:
                     if frozen_budget.provider_max_output is not None
                     else frozen_budget.compaction_output_reserve
                 ),
+                trigger="overflow",
             )
             compaction_note.update(
                 {
@@ -1583,6 +2138,9 @@ class UthCodeApplication:
                     provider,
                     remote_model_id,
                 )
+                self._last_provider_limits = frozen_provider_limits
+                self._last_provider_limits_model = remote_model_id
+                self._last_provider_limits_provider = provider
                 frozen_budget = resolve_context_budget(
                     configured_input_limit=configured_input_limit,
                     provider_limits=frozen_provider_limits,
@@ -1872,6 +2430,7 @@ class UthCodeApplication:
                             else None
                         )
                     ),
+                    trigger="auto",
                 )
                 final_gate = authoritative_gate_after_compaction
                 if final_gate is None:
@@ -1977,6 +2536,7 @@ class UthCodeApplication:
                             if frozen_budget.provider_max_output is not None
                             else frozen_budget.compaction_output_reserve
                         ),
+                        trigger="auto",
                     )
                 except ContextRequestSafetyError:
                     aging_note.update(
@@ -2010,12 +2570,14 @@ class UthCodeApplication:
                 await run_l4_if_needed(gate_from_request(initial_request))
                 if cancellation.cancelled:
                     raise CancelledError()
-                return await _prepare_counted_request_async(
+                prepared_request = await _prepare_counted_request_async(
                     provider,
                     compose,
                     finalize,
                     on_counted_request=on_counted_request,
                 )
+                self._request_boundary_counts[request_boundary_key] += 1
+                return prepared_request
             except GenerationCancelled:
                 # AgentLoop treats asyncio cancellation as the cooperative
                 # cancellation channel around request preparation.  A

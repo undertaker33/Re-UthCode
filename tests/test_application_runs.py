@@ -415,6 +415,26 @@ async def test_context_limits_resolve_once_per_turn_and_refresh_next_turn() -> N
     ] == ["default", "default", "provider"]
 
 
+def test_application_status_uses_configured_context_window_before_first_turn() -> None:
+    config = EffectiveConfig(
+        default_model="configured/ref",
+        providers={"configured": ProviderProfile("configured", ProviderKind.FAKE)},
+        models={
+            "configured/ref": ModelProfile(
+                "configured/ref",
+                "configured",
+                "remote-configured",
+                context_window=1_000_000,
+            )
+        },
+    )
+    application = UthCodeApplication(FakeProvider(), configuration=config)
+    status = application.status().context_status
+    assert status.available is False
+    assert status.measurement == "unavailable"
+    assert status.budget_tokens == 1_000_000
+
+
 @pytest.mark.asyncio
 async def test_context_compilation_failure_is_projected_without_provider_details(
     monkeypatch: pytest.MonkeyPatch,
@@ -1341,7 +1361,8 @@ async def test_application_driver_exposes_pending_after_paused_event_and_resumes
 @pytest.mark.asyncio
 async def test_application_network_retry_rejects_stale_response_without_mutating_pending() -> None:
     provider = _FailThenProvider(NetworkError("offline"), _response(TextPart("done"), usage=Usage(1, 1)))
-    run = UthCodeApplication(provider).create_run()
+    application = UthCodeApplication(provider)
+    run = application.create_run()
     handle = run.start_turn("retry")
     events_task = asyncio.create_task(_collect(handle))
     for _ in range(100):
@@ -1364,6 +1385,7 @@ async def test_application_network_retry_rejects_stale_response_without_mutating
     assert len([event for event in events if isinstance(event, IterationStarted)]) == 1
     assert len([event for event in events if isinstance(event, UsageUpdated)]) == 1
     assert len([event for event in events if isinstance(event, TurnResumed)]) == 1
+    assert application.status().context_status.measurement == "estimate"
 
 
 @pytest.mark.asyncio

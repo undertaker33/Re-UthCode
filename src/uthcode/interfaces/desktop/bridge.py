@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+import inspect
 from pathlib import Path
 import shlex
 import sys
@@ -19,6 +20,8 @@ from typing import TextIO
 from uthcode.application import (
     AgentEvent,
     ApplicationStatus,
+    CompactionStatus,
+    ContextStatus,
     ApplicationRuntimeContext,
     PauseRequest,
     BehaviorModeSelected,
@@ -183,6 +186,8 @@ def _safe_value(value: object) -> object:
         value,
         (
             ApplicationStatus,
+            ContextStatus,
+            CompactionStatus,
             PauseRequest,
             RunSnapshot,
             SessionMutation,
@@ -289,7 +294,7 @@ def _replay_values(values: object) -> list[object]:
         _safe_value(record)
         for record in records
         if isinstance(record, SessionReplayRecord)
-        and record.kind in {"user", "steering", "reasoning", "assistant", "tool"}
+        and record.kind in {"user", "steering", "reasoning", "assistant", "tool", "plan"}
     ]
 
 
@@ -842,17 +847,35 @@ class DesktopBridge:
         _require_params(params, set(), method="session.new")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
-        await self._close_active_for_boundary()
         application = self._application
+        # Resolve the Application budget before cancelling any active Turn;
+        # a cancelled resolver must leave the source Run and Session intact.
+        context_budget: object | None = None
+        preflight = getattr(application, "preflight_session_context_async", None)
+        if callable(preflight):
+            try:
+                context_budget = preflight()
+                if inspect.isawaitable(context_budget):
+                    context_budget = await context_budget
+            except Exception:
+                raise BridgeError("session_error", "Session context could not be prepared") from None
+        await self._close_active_for_boundary()
         # create_run loads the immutable permission rules for the next Run.
         # Stage it before the Application Session mutation so a loader/create
         # failure cannot leave a new Session paired with the old Run.
         candidate_run = self._fresh_session_run(application)
-        create = getattr(application, "new_session_for_command", None)
+        create = getattr(application, "new_session_for_command_async", None)
+        if not callable(create):
+            create = getattr(application, "new_session_for_command", None)
         if not callable(create):
             raise BridgeError("session_error", "Application does not support Sessions")
         try:
-            session = create()
+            if context_budget is None:
+                session = create()
+            else:
+                session = create(context_budget=context_budget)
+            if inspect.isawaitable(session):
+                session = await session
         except Exception as exc:
             kind = getattr(exc, "kind", None)
             raise BridgeError(
@@ -871,14 +894,32 @@ class DesktopBridge:
         session_id = _text_param(params, "session_id")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
-        await self._close_active_for_boundary()
         application = self._application
+        # Resolve the Application budget before cancelling any active Turn;
+        # a cancelled resolver must leave the source Run and Session intact.
+        context_budget: object | None = None
+        preflight = getattr(application, "preflight_session_context_async", None)
+        if callable(preflight):
+            try:
+                context_budget = preflight()
+                if inspect.isawaitable(context_budget):
+                    context_budget = await context_budget
+            except Exception:
+                raise BridgeError("session_error", "Session context could not be prepared") from None
+        await self._close_active_for_boundary()
         candidate_run = self._fresh_session_run(application)
-        resume = getattr(application, "resume_session_for_command", None)
+        resume = getattr(application, "resume_session_for_command_async", None)
+        if not callable(resume):
+            resume = getattr(application, "resume_session_for_command", None)
         if not callable(resume):
             raise BridgeError("session_error", "Application does not support Sessions")
         try:
-            session = resume(session_id)
+            if context_budget is None:
+                session = resume(session_id)
+            else:
+                session = resume(session_id, context_budget=context_budget)
+            if inspect.isawaitable(session):
+                session = await session
         except Exception as exc:
             kind = getattr(exc, "kind", None)
             raise BridgeError(
@@ -991,10 +1032,14 @@ class DesktopBridge:
         application = self._application
         if application is None:
             raise BridgeError("application_required", "Application is not initialized")
-        ensure = getattr(application, "ensure_session", None)
+        ensure = getattr(application, "ensure_session_async", None)
+        if not callable(ensure):
+            ensure = getattr(application, "ensure_session", None)
         if callable(ensure):
             try:
-                ensure()
+                result = ensure()
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 raise BridgeError("session_error", "Session could not be opened") from None
         run = self._require_run()

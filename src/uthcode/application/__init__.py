@@ -27,7 +27,7 @@ from .generation import (
     failure_message,
     pause_message,
 )
-from .context import ApplicationContextService
+from .context import ApplicationContextService, CompactionStatus, ContextStatus
 from .instructions import (
     InstructionAuthorization,
     InstructionBlock,
@@ -160,6 +160,8 @@ __all__ = [
     "ApplicationStatus",
     "ApplicationRuntimeContext",
     "ApplicationContextService",
+    "ContextStatus",
+    "CompactionStatus",
     "ApplicationSession",
     "ApplicationSessionService",
     "TimelineAppendOutcome",

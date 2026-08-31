@@ -23,6 +23,7 @@ from uthcode.core.provider import (
     ToolCallPart,
     ToolResultPart,
 )
+from uthcode.core.planning import parse_propose_plan_arguments
 from uthcode.integrations.session_files import (
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
@@ -52,7 +53,9 @@ class SessionOperationError(RuntimeError):
         super().__init__(kind)
 
 
-_REPLAY_KINDS = frozenset({"user", "steering", "reasoning", "assistant", "tool"})
+_REPLAY_KINDS = frozenset(
+    {"user", "steering", "reasoning", "assistant", "tool", "plan"}
+)
 _REPLAY_TOOL_STATUSES = frozenset(
     {
         "succeeded",
@@ -577,16 +580,55 @@ class ApplicationSessionService:
             raise SessionOperationError("storage", session_id=session_id) from exc
 
     def move_session(self, session_id: str, target_project_key: str) -> SessionMutation:
-        """Move one inactive Session by atomically changing its membership."""
+        """Move a Session while preserving the writer ownership invariant.
+
+        An open idle Session already has the only writer lock that can safely
+        update its metadata.  Synchronize close-time state and perform the
+        membership update under that lock, then release the source owner only
+        after the update succeeds.  Active Turn rejection remains the Bridge
+        boundary; this service deliberately has no second Turn state machine.
+        """
 
         target = _canonical_project_key(target_project_key)
-        active = self._active
-        if active is not None and active.session_id == session_id:
-            # The held writer represents an open Session.  Do not implicitly
-            # close or interrupt it in order to change project authority.
-            raise SessionOperationError("busy", session_id=session_id)
         receipt_key = (session_id, target)
         with self._move_lock:
+            active = self._active
+            if active is not None and active.session_id == session_id:
+                # A target equal to the current owner is a safe no-op.  Still
+                # synchronize close-time state so this boundary has the same
+                # metadata durability as an ordinary move.
+                try:
+                    active._prepare_close()
+                    if active.project_key == target:
+                        result = _session_mutation(active._writer.metadata)
+                        self._move_receipts[receipt_key] = result
+                        self._record_operation("move", "success", session_id)
+                        return result
+                    if active.project_key != self.project_key:
+                        raise SessionOperationError("unknown", session_id=session_id)
+                    result = _session_mutation(active._writer.update_project_key(target))
+                    # The metadata update is durable before ownership is
+                    # released.  No optimistic source/target swap is exposed
+                    # while the writer still belongs to this Application.
+                    active._release_after_sync()
+                except SessionOperationError as exc:
+                    self._record_operation("move", "failed", session_id, kind=exc.kind)
+                    raise
+                except SessionFileError as exc:
+                    error = _session_operation_error(exc, session_id=session_id)
+                    self._record_operation("move", "failed", session_id, kind=error.kind)
+                    raise error from exc
+                except OSError as exc:
+                    error = SessionOperationError("storage", session_id=session_id)
+                    self._record_operation("move", "failed", session_id, kind=error.kind)
+                    raise error from exc
+                except Exception as exc:
+                    error = SessionOperationError("storage", session_id=session_id)
+                    self._record_operation("move", "failed", session_id, kind=error.kind)
+                    raise error from exc
+                self._move_receipts[receipt_key] = result
+                self._record_operation("move", "success", session_id)
+                return result
             receipt = self._move_receipts.get(receipt_key)
             if receipt is not None:
                 # Re-open under the writer lock before honoring the receipt so
@@ -975,6 +1017,8 @@ def _project_replay(
 
     records: list[SessionReplayRecord] = []
     calls: dict[str, tuple[str, str]] = {}
+    plan_call_ids: set[str] = set()
+    plans: dict[str, tuple[int, str, str, str | None]] = {}
     user_seen: set[str] = set()
     legacy_message_ids: set[tuple[str, str, str]] = set()
     for unit in snapshot.transcript.semantic_units(complete_only=True):
@@ -999,6 +1043,23 @@ def _project_replay(
             for part in _entry_parts(entry):
                 sequence = entry.sequence
                 if isinstance(part, ToolCallPart):
+                    if part.name == "ProposePlan":
+                        # A Plan is replayable only after its complete
+                        # semantic unit has a successful ToolResult.  Keep
+                        # no raw arguments and suppress malformed/failed
+                        # ProposePlan results below.
+                        plan_call_ids.add(part.tool_call_id)
+                        try:
+                            plan_text = parse_propose_plan_arguments(part.arguments)
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                        plans[part.tool_call_id] = (
+                            sequence,
+                            entry.turn_id,
+                            plan_text,
+                            entry.created_at,
+                        )
+                        continue
                     summary = (
                         tool_summary(part)
                         if tool_summary is not None
@@ -1012,6 +1073,30 @@ def _project_replay(
                     )
                     continue
                 if isinstance(part, ToolResultPart):
+                    if part.tool_call_id in plan_call_ids:
+                        plan = plans.pop(part.tool_call_id, None)
+                        plan_status, plan_is_error = _replay_tool_status(part)
+                        if (
+                            plan is not None
+                            and not plan_is_error
+                            and plan_status in {"succeeded", "success", "finished"}
+                        ):
+                            plan_sequence, plan_turn_id, plan_text, plan_created_at = plan
+                            records.append(
+                                SessionReplayRecord(
+                                    session_id=snapshot.session_id,
+                                    sequence=plan_sequence,
+                                    turn_id=plan_turn_id,
+                                    kind="plan",
+                                    text=plan_text,
+                                    tool_name="ProposePlan",
+                                    tool_call_id=part.tool_call_id,
+                                    is_error=False,
+                                    created_at=plan_created_at,
+                                    title=snapshot.title,
+                                )
+                            )
+                        continue
                     name, summary = calls.pop(
                         part.tool_call_id,
                         ("Tool", "Tool completed"),

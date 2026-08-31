@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import shlex
 import sys
 import time
@@ -717,7 +718,19 @@ class UthCodeTUI:
             self.activity = "steering…"
             self._invalidate()
             return
-        self._start_turn(text)
+        ensure_async = getattr(self.application, "ensure_session_async", None)
+        if callable(ensure_async):
+            try:
+                ensured = ensure_async()
+                if inspect.isawaitable(ensured):
+                    await ensured
+            except Exception:
+                self.activity = "error"
+                await self._show_error("无法创建 Session；可以继续输入")
+                return
+            self._start_turn(text, _session_ready=True)
+        else:
+            self._start_turn(text)
 
     async def _apply_command_outcome(
         self,
@@ -786,15 +799,16 @@ class UthCodeTUI:
                 await self._hydrate_replay(action.replay)
         self._invalidate()
 
-    def _start_turn(self, prompt: str) -> bool:
-        ensure_session = getattr(self.application, "ensure_session", None)
-        if callable(ensure_session):
-            try:
-                ensure_session()
-            except Exception:
-                self.activity = "error"
-                self._spawn(self._show_error("无法创建 Session；可以继续输入"))
-                return False
+    def _start_turn(self, prompt: str, *, _session_ready: bool = False) -> bool:
+        if not _session_ready:
+            ensure_session = getattr(self.application, "ensure_session", None)
+            if callable(ensure_session):
+                try:
+                    ensure_session()
+                except Exception:
+                    self.activity = "error"
+                    self._spawn(self._show_error("无法创建 Session；可以继续输入"))
+                    return False
         self._reset_stream_projection()
         self.interaction.close()
         try:
@@ -1462,7 +1476,7 @@ class UthCodeTUI:
         """Append safe Application replay records in bounded UI batches."""
 
         values = tuple(records)  # type: ignore[arg-type]
-        allowed = {"user", "steering", "reasoning", "assistant", "tool"}
+        allowed = {"user", "steering", "reasoning", "assistant", "tool", "plan"}
         if any(getattr(record, "kind", None) not in allowed for record in values):
             raise ValueError("Application returned an invalid Session replay record")
         batch_size = 32
@@ -1480,6 +1494,10 @@ class UthCodeTUI:
                     writes.append(self._renderer.reasoning_message(text))
                 elif kind == "assistant":
                     writes.append(self._renderer.agent_message(text))
+                elif kind == "plan":
+                    writes.append(
+                        self._renderer.agent_message(text, role="UthCode · Plan")
+                    )
                 else:
                     writes.append(
                         self._renderer.tool(

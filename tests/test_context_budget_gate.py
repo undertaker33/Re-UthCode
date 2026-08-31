@@ -367,6 +367,11 @@ async def test_idle_manual_compact_uses_default_resolver(tmp_path) -> None:
 
     assert result.changed is False
     assert result.failure is None
+    assert application.status().compaction_status.to_dict() == {
+        "state": "no_change",
+        "trigger": "manual",
+        "changed": False,
+    }
 
 
 def test_final_accounting_includes_instruction_messages_tools_and_framing() -> None:

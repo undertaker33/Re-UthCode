@@ -72,7 +72,7 @@ def _model_candidates(application: object | None) -> Iterable[str]:
     )
 
 
-def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
+async def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
     application = context.application
     if not context.invocation.args:
         return OpenModelPicker()
@@ -90,11 +90,15 @@ def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
             f"未知模型：{model_ref}；可用模型：{choices}"
         )
 
-    select_model = getattr(application, "select_model", None)
+    select_model = getattr(application, "select_model_async", None)
+    if not callable(select_model):
+        select_model = getattr(application, "select_model", None)
     if not callable(select_model):
         raise CommandExecutionError("Application 不支持模型切换")
     try:
-        select_model(model_ref)
+        result = select_model(model_ref)
+        if inspect.isawaitable(result):
+            await result
     except Exception:
         raise CommandExecutionError(_MODEL_SWITCH_FAILURE) from None
     return ModelSelected(model_ref)
@@ -284,13 +288,17 @@ async def _compact(context: CommandContext) -> str:
     )
 
 
-def _new_session(context: CommandContext) -> SessionChanged:
+async def _new_session(context: CommandContext) -> SessionChanged:
     application = context.application
-    create = getattr(application, "new_session_for_command", None)
+    create = getattr(application, "new_session_for_command_async", None)
+    if not callable(create):
+        create = getattr(application, "new_session_for_command", None)
     if not callable(create):
         raise CommandExecutionError("/new 需要 Application Session")
     try:
         session = create()
+        if inspect.isawaitable(session):
+            session = await session
     except SessionOperationError as exc:
         raise _session_error(exc) from None
     except Exception:
@@ -298,16 +306,20 @@ def _new_session(context: CommandContext) -> SessionChanged:
     return SessionChanged(str(session.session_id), restored=False)
 
 
-def _resume_session(context: CommandContext) -> OpenSessionPicker | SessionChanged:
+async def _resume_session(context: CommandContext) -> OpenSessionPicker | SessionChanged:
     application = context.application
     session_id = context.invocation.args[0] if context.invocation.args else None
     if session_id is None:
         return OpenSessionPicker()
-    resume = getattr(application, "resume_session_for_command", None)
+    resume = getattr(application, "resume_session_for_command_async", None)
+    if not callable(resume):
+        resume = getattr(application, "resume_session_for_command", None)
     if not callable(resume):
         raise CommandExecutionError("/resume 需要 Application Session")
     try:
         session = resume(session_id)
+        if inspect.isawaitable(session):
+            session = await session
     except SessionOperationError as exc:
         raise _session_error(exc, session_id=session_id) from None
     except Exception:
