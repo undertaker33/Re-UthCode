@@ -418,6 +418,24 @@ test("theme preference writes update the native Electron chrome for dark light a
   remove();
 });
 
+test("desktop preference persistence accepts only UI metadata and never stores a secret sentinel", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "uthcode-preference-secret-boundary-"));
+  const sentinel = "w04-secret-sentinel";
+  const store = new DesktopPreferencesStore(join(directory, "desktop-preferences.json"));
+  try {
+    await store.write("theme", "dark");
+    const content = await readFile(store.filePath, "utf8");
+    assert.equal(content.includes(sentinel), false);
+    await assert.rejects(
+      store.write("api_key" as never, sentinel as never),
+      /unknown preference/u,
+    );
+    assert.equal((await readFile(store.filePath, "utf8")).includes(sentinel), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("production Runtime wiring projects diagnostics and idle failures without native details", () => {
   const sent: unknown[] = [];
   const targetWindow = {

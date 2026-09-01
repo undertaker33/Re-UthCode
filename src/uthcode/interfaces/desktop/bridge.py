@@ -55,6 +55,7 @@ from uthcode.application import (
     create_application,
     create_builtin_registry,
     load_effective_config,
+    read_user_api_key,
     read_user_configuration,
     write_user_configuration,
 )
@@ -105,6 +106,7 @@ _METHODS = frozenset(
         "command.execute",
         "status.get",
         "settings.get",
+        "settings.reveal_api_key",
         "settings.save",
     }
 )
@@ -163,6 +165,24 @@ def _text_param(params: Mapping[str, object], field: str) -> str:
     return value
 
 
+_SECRET_FIELD_NAMES = frozenset(
+    {
+        "api_key",
+        "api_key_value",
+        "secret",
+        "secret_value",
+        "password",
+        "access_token",
+        "refresh_token",
+    }
+)
+
+
+def _is_secret_field(name: str) -> bool:
+    normalized = name.casefold().replace("-", "_")
+    return normalized in _SECRET_FIELD_NAMES or normalized.endswith("_api_key")
+
+
 def _safe_value(value: object) -> object:
     """Project only JSON values and explicitly safe Application DTOs.
 
@@ -178,7 +198,7 @@ def _safe_value(value: object) -> object:
         return {
             key: _safe_value(item)
             for key, item in value.items()
-            if isinstance(key, str)
+            if isinstance(key, str) and not _is_secret_field(key)
         }
     if isinstance(value, (list, tuple)):
         return [_safe_value(item) for item in value]
@@ -618,6 +638,8 @@ class DesktopBridge:
             except ConfigurationError:
                 raise BridgeError("configuration_error", "user configuration is invalid") from None
             return {"configuration": _safe_value(view)}
+        if method == "settings.reveal_api_key":
+            return await self._settings_reveal_api_key(params)
         if method == "settings.save":
             return await self._settings_save(params)
         raise BridgeError("unknown_method", "unknown Desktop method")
@@ -1318,6 +1340,43 @@ class DesktopBridge:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
         return {"configuration": _safe_value(view)}
 
+    async def _settings_reveal_api_key(
+        self,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Return one explicitly requested saved key expression.
+
+        This is the only Desktop response that may contain a configured API
+        key expression.  The Application reader is user-config-only and does
+        not resolve ``env:`` references or inspect Runtime Provider state.
+        """
+
+        _require_params(params, {"provider_profile_id"}, method="settings.reveal_api_key")
+        provider_profile_id = _text_param(params, "provider_profile_id")
+        try:
+            value = read_user_api_key(
+                provider_profile_id,
+                home=self._home,
+            )
+        except ConfigurationInitializationRequired:
+            raise BridgeError(
+                "configuration_required",
+                "user configuration is not initialized",
+            ) from None
+        except ConfigurationError:
+            # Do not return provider IDs, paths, parser diagnostics, or any
+            # exception text: all errors are intentionally secret-free.
+            raise BridgeError(
+                "configuration_error",
+                "saved API key could not be read",
+            ) from None
+        except Exception:
+            raise BridgeError(
+                "configuration_error",
+                "saved API key could not be read",
+            ) from None
+        return {"api_key": value}
+
     async def _consume_turn(self, handle: object) -> None:
         events = getattr(handle, "events", None)
         if not callable(events):
@@ -1334,7 +1393,9 @@ class DesktopBridge:
             async for event in stream:
                 if not isinstance(event, AgentEvent):
                     raise RuntimeError("invalid event")
-                payload = event.to_dict()
+                payload = _safe_value(event.to_dict())
+                if not isinstance(payload, dict):
+                    raise RuntimeError("invalid event projection")
                 self._publish(AgentEventEnvelope(payload))
             result_method = getattr(handle, "result", None)
             if not callable(result_method):

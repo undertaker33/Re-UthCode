@@ -18,7 +18,7 @@ const preferences: DesktopPreferences = { theme: "dark", language: sessionStorag
 window.fixtureEvidence = { reads: [], writes: [], saves: [], preferences };
 const fakeApi: DesktopApi = {
   openProject: async () => null, openProjectInExplorer: async () => undefined, copySessionId: async () => undefined, closeShell: async () => undefined,
-  requestRuntime: async (method, params) => method === "settings.save" ? (window.fixtureEvidence.saves.push(params), { configuration }) : method === "settings.get" ? { configuration } : {},
+  requestRuntime: async (method, params) => method === "settings.save" ? (window.fixtureEvidence.saves.push(params), { configuration }) : method === "settings.get" ? { configuration } : method === "settings.reveal_api_key" ? { api_key: "env:W04_FIXTURE_KEY" } : {},
   subscribeAgentEvents: () => () => undefined,
   readPreference: async <K extends PreferenceKey>(key: K) => { window.fixtureEvidence.reads.push(key); return window.fixtureEvidence.preferences[key]; },
   writePreference: async <K extends PreferenceKey>(key: K, value: DesktopPreferences[K]) => { window.fixtureEvidence.writes.push([key, value]); window.fixtureEvidence.preferences[key] = value as never; if (key === "language") sessionStorage.setItem("uthcode.fixture.api.language", String(value)); return { ...window.fixtureEvidence.preferences }; },
@@ -29,7 +29,7 @@ function Fixture() {
   const requestedLanguage = query.get("lang");
   const [language, setLanguage] = useState<LanguagePreference>(() => requestedLanguage === "en" || requestedLanguage === "zh-CN" ? requestedLanguage : "zh-CN");
   const state = createInitialState({ runtimeState: "ready", theme, language, configuration, settingsLoaded: true });
-  return <LanguageProvider value={language}><div className={`theme-${theme}`}><SettingsView state={state} onBack={() => undefined} onSave={(request) => { window.fixtureEvidence.saves.push(request); }} onThemeChange={setTheme} onLanguageChange={setLanguage} /></div></LanguageProvider>;
+  return <LanguageProvider value={language}><div className={`theme-${theme}`}><SettingsView state={state} onRevealApiKey={async () => "env:W04_FIXTURE_KEY"} onBack={() => undefined} onSave={(request) => { window.fixtureEvidence.saves.push(request); }} onThemeChange={setTheme} onLanguageChange={setLanguage} /></div></LanguageProvider>;
 }
 function SelectHarness() {
   const [value, setValue] = useState("");

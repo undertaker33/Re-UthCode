@@ -28,7 +28,7 @@ function usageLabel(usage: ContextUsageProjection | undefined, t: (key: Translat
     : `${t("unavailable")} · ${budget}`;
 }
 export function stateLabel(value: string, t: (key: TranslationKey) => string): string {
-  const keys: Partial<Record<string, TranslationKey>> = { ready: "ready", idle: "idle", default: "default", auto: "auto", full_access: "fullAccess", booting: "booting", initializing: "initializing", configuration_required: "configurationRequired", stopped: "stopped", running: "running", pausing: "pausing", paused: "paused", failed: "failed", completed: "completed", no_change: "noChange", cancelled: "cancelled", unknown: "unknown", plan: "plan", manual: "manual", overflow: "overflow", estimate: "estimate", exact: "exact" };
+  const keys: Partial<Record<string, TranslationKey>> = { ready: "ready", idle: "idle", default: "default", auto: "auto", full_access: "fullAccess", booting: "booting", restarting: "restarting", initializing: "initializing", configuration_required: "configurationRequired", stopped: "stopped", running: "running", pausing: "pausing", paused: "paused", failed: "failed", completed: "completed", no_change: "noChange", cancelled: "cancelled", unknown: "unknown", plan: "plan", manual: "manual", overflow: "overflow", estimate: "estimate", exact: "exact" };
   return keys[value] ? t(keys[value]!) : value;
 }
 

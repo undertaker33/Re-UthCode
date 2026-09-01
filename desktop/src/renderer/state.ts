@@ -1,6 +1,6 @@
 import type { AgentEvent, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 
-export type RuntimeStateName = "booting" | "ready" | "configuration_required" | "failed" | "stopping" | "stopped";
+export type RuntimeStateName = "booting" | "restarting" | "ready" | "configuration_required" | "failed" | "stopping" | "stopped";
 export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "tool" | "plan" | "status";
 export type TimelineStatus = "streaming" | "running" | "completed" | "failed" | "cancelled" | "info";
 export type PermissionModeProjection = "unknown" | "default" | "auto" | "full_access";
@@ -475,7 +475,7 @@ function resultRecord(value: unknown): Record<string, JsonValue> {
   return asRecord(value) ?? {};
 }
 
-export function applyProjectOpened(state: RendererState, result: unknown): RendererState {
+export function applyProjectOpened(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
   const source = resultRecord(result);
   const project = resultRecord(source.project);
   const path = normalizeProjectPath(project.path);
@@ -498,7 +498,7 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
     pendingInteraction: null,
     contextUsage: contextUsageAtBoundary(),
     sessionViewRevision: state.sessionViewRevision + 1,
-    runtimeState: "ready",
+    runtimeState: preserveRuntimeState ? state.runtimeState : "ready",
     runtimeError: null,
     view: "chat",
   };
@@ -515,7 +515,7 @@ export function applyCatalogRefreshed(state: RendererState, projectKey: string, 
   };
 }
 
-export function applySessionResumed(state: RendererState, result: unknown): RendererState {
+export function applySessionResumed(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
   const source = resultRecord(result);
   const sessionId = nonEmptyText(source.session_id);
   if (!sessionId) return { ...state, runtimeError: "Session identity is unavailable" };
@@ -533,6 +533,7 @@ export function applySessionResumed(state: RendererState, result: unknown): Rend
     contextUsage: contextUsageAtBoundary(),
     sessionViewRevision: state.sessionViewRevision + 1,
     runtimeError: null,
+    runtimeState: preserveRuntimeState ? state.runtimeState : "ready",
     notice: "Session resumed",
     ...(projectKey ? { projects: state.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
   };
@@ -730,7 +731,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (eventRunId && state.run?.run_id && eventRunId !== state.run.run_id) return state;
   if (type === "runtime_state") {
     const runtimeState = payload.state;
-    const allowed: RuntimeStateName[] = ["booting", "ready", "configuration_required", "failed", "stopping", "stopped"];
+    const allowed: RuntimeStateName[] = ["booting", "restarting", "ready", "configuration_required", "failed", "stopping", "stopped"];
     return { ...state, runtimeState: allowed.includes(runtimeState as RuntimeStateName) ? runtimeState as RuntimeStateName : state.runtimeState };
   }
   if (type === "runtime_diagnostic") return { ...state, diagnostics: [...state.diagnostics, "Python Runtime emitted a diagnostic"].slice(-10) };
@@ -911,12 +912,12 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
 export type RendererAction =
   | { type: "hydrate_preferences"; preferences: Partial<DesktopPreferences> }
   | { type: "runtime_state"; state: RuntimeStateName; error?: string | null }
-  | { type: "runtime_initialized"; result: unknown }
+  | { type: "runtime_initialized"; result: unknown; preserveRuntimeState?: boolean }
   | { type: "status_loaded"; result: unknown }
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
-  | { type: "project_opened"; result: unknown }
+  | { type: "project_opened"; result: unknown; preserveRuntimeState?: boolean }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
-  | { type: "session_resumed"; result: unknown }
+  | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
   | { type: "session_new"; sessionId: string; run: unknown }
   | { type: "agent_event"; event: AgentEvent }
@@ -978,13 +979,13 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       };
     }
     case "runtime_state":
-      return { ...state, runtimeState: action.state, runtimeError: action.error ?? state.runtimeError };
+      return { ...state, runtimeState: action.state, runtimeError: action.error !== undefined ? action.error : state.runtimeError };
     case "runtime_initialized": {
       const source = resultRecord(action.result);
       const run = normalizeRun(source.run);
       return {
         ...state,
-        runtimeState: "ready",
+        runtimeState: action.preserveRuntimeState ? state.runtimeState : "ready",
         runtimeError: null,
         ...(run ? { run, permissionMode: permissionModeOf(run) } : { permissionMode: "unknown" as const }),
       };
@@ -1010,11 +1011,11 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
     case "project_opened":
-      return applyProjectOpened(state, action.result);
+      return applyProjectOpened(state, action.result, action.preserveRuntimeState);
     case "catalog_refreshed":
       return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
     case "session_resumed":
-      return applySessionResumed(state, action.result);
+      return applySessionResumed(state, action.result, action.preserveRuntimeState);
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new":
