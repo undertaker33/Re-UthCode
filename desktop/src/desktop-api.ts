@@ -72,6 +72,7 @@ export const RUNTIME_METHODS = [
   "command.execute",
   "status.get",
   "settings.get",
+  "settings.reveal_api_key",
   "settings.save",
 ] as const;
 

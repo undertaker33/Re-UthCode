@@ -95,7 +95,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration">;
+  state: Pick<RendererState, "runtimeState" | "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration">;
   onChange: (text: string) => void;
   onSubmit: (text: string) => void | Promise<void>;
   onCommand: (text: string) => void | Promise<void>;
@@ -116,10 +116,11 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   const pending = state.pendingInteraction !== null;
   const terminalStatusPending = state.terminalStatusPending;
   const compactionRunning = state.compactionStatus.state === "running";
-  const inputLocked = pending || terminalStatusPending || compactionRunning;
+  const runtimeRestarting = state.runtimeState === "restarting";
+  const inputLocked = pending || terminalStatusPending || compactionRunning || runtimeRestarting;
   const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
-    if (pending || terminalStatusPending || !slashMode) return [];
+    if (pending || terminalStatusPending || runtimeRestarting || !slashMode) return [];
     if (state.argumentCandidates.length > 0) return state.argumentCandidates.map((value) => ({ value, display: value }));
     return state.commandCandidates
       .filter((candidate) => {
@@ -131,7 +132,7 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
         display: candidate.display,
         description: candidate.description,
       }));
-  }, [pending, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
+  }, [pending, runtimeRestarting, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
   const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.display ?? ""}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
 
   useEffect(() => {
@@ -228,20 +229,20 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
       <div className="composer-input">
-        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} />
+        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={runtimeRestarting ? t("runtimeRestarting") : pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} aria-describedby={runtimeRestarting ? "composer-state" : undefined} />
         <div className="composer-actions">
-          {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
-          {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()}><UiIcon name="stop" />{t("cancel")}</button>}
-          <button type="button" title={pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} aria-label={pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+          {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={inputLocked || state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
+          {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()} disabled={inputLocked}><UiIcon name="stop" />{t("cancel")}</button>}
+          <button type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
         </div>
       </div>
       <div className="composer-toolbar">
         <div className="composer-selectors">
-          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={pending || terminalStatusPending || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
+          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
-        <output className="composer-state">{pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
+        <output id="composer-state" className="composer-state">{runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
         <div className="composer-model">
-          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={pending || terminalStatusPending || state.activeTurn} options={modelOptions} />
+          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />
         </div>
       </div>

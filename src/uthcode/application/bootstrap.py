@@ -13,6 +13,7 @@ from uthcode.integrations.config.loader import (
     ConfigurationError as IntegrationConfigurationError,
     ConfigurationInitializationRequired as IntegrationConfigurationInitializationRequired,
     load_config_data,
+    read_user_config_api_key,
     read_user_config_view_data,
     resolve_user_home,
 )
@@ -121,6 +122,25 @@ def read_user_configuration(
         models=models_raw if isinstance(models_raw, Mapping) else {},
         path=path,
     )
+
+
+def read_user_api_key(
+    provider_profile_id: str,
+    *,
+    home: str | PathLike[str] | None = None,
+) -> str | None:
+    """Read one saved API key expression for the explicit Provider identity.
+
+    The Integration reader returns literals and ``env:NAME`` references as
+    configured.  It deliberately does not resolve environment variables or
+    read the Runtime Provider's ``SecretValue``.
+    """
+
+    path = _user_config_path(home)
+    try:
+        return read_user_config_api_key(path, provider_profile_id)
+    except IntegrationConfigurationError as exc:
+        raise _map_integration_configuration_error(exc) from None
 
 
 def _user_write_payload(
@@ -423,6 +443,7 @@ __all__ = [
     "ConfigurationInitializationRequired",
     "create_application",
     "load_effective_config",
+    "read_user_api_key",
     "read_user_configuration",
     "write_user_configuration",
 ]

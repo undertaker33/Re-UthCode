@@ -25,6 +25,11 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
   const optionSignature = options.map((option) => `${option.value}\u0000${option.label}\u0000${option.disabled ? "1" : "0"}`).join("\u0001");
   useEffect(() => { if (!open) setActive(initialEnabledOption(options, value)); }, [open, optionSignature, value]);
   useEffect(() => { if (open && active >= 0) optionRefs.current[active]?.focus(); }, [open, active]);
+  useEffect(() => {
+    if (!disabled || !open) return;
+    setOpen(false);
+    trigger.current?.blur();
+  }, [disabled, open]);
   const updatePlacement = () => {
     const element = trigger.current;
     if (!element || typeof window === "undefined") return;

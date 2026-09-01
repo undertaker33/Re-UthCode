@@ -61,15 +61,15 @@
 
 ## T07：Settings 语义、API Key reveal 与页面结构修复
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_configuration.py tests/test_desktop_bridge.py -q` 与 Desktop preload/Settings tests，全部通过。
-- [ ] 普通 `settings.get`、status、events、diagnostics、errors、preferences、logs 和 snapshots 均不含 API Key；只有用户显式调用 `settings.reveal_api_key(provider_profile_id)` 的成功 response 可携带当前配置表示。
-- [ ] literal Key reveal 返回 literal；`env:VARIABLE_NAME` reveal 只返回引用字符串且不解析环境变量；unknown provider 与读取失败返回稳定无秘密错误。
-- [ ] 点击 eye/reveal/hide 不标记 touched/dirty、不触发 save；未编辑 Key 的保存请求不含旧明文且保留现有配置。
-- [ ] 用户实际编辑 Key 后 replacement/touched=true；保存失败保留 replacement 草稿，保存成功按既有配置写入边界收敛。
-- [ ] 关闭 Provider modal、离开 Settings、runtime rebootstrap 与组件卸载后 revealed cache 被清除，明文不进入 reducer 持久 state 或 DesktopPreferences。
-- [ ] 空配置、新 Provider、一个 Provider 多 Models、Model 增删/默认选择、display-name fallback 均通过；DOM/文案中不出现可编辑 `model_ref`、`model`/`model-1` placeholder、清除 Key或“已配置”旧交互。
-- [ ] Settings 复用全局 sidebar 宽度并按分类独立 page/section；Provider/Model modal 的 keyboard/focus/tooltip/ARIA、zh/en 与 dark/light 均通过。
-- [ ] 执行 `rg -n "renameModelRef|model-1|clearKey" desktop/src/renderer desktop/tests`，生产旧路径为 0，测试中的否定断言逐条可解释。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_configuration.py tests/test_desktop_bridge.py -q` 与 Desktop preload/Settings tests，全部通过。
+- [x] 普通 `settings.get`、status、events、diagnostics、errors、preferences、logs 和 snapshots 均不含 API Key；只有用户显式调用 `settings.reveal_api_key(provider_profile_id)` 的成功 response 可携带当前配置表示。
+- [x] literal Key reveal 返回 literal；`env:VARIABLE_NAME` reveal 只返回引用字符串且不解析环境变量；unknown provider 与读取失败返回稳定无秘密错误。
+- [x] 点击 eye/reveal/hide 不标记 touched/dirty、不触发 save；未编辑 Key 的保存请求不含旧明文且保留现有配置。
+- [x] 用户实际编辑 Key 后 replacement/touched=true；保存失败保留 replacement 草稿，保存成功按既有配置写入边界收敛。
+- [x] 关闭 Provider modal、离开 Settings、runtime rebootstrap 与组件卸载后 revealed cache 被清除，明文不进入 reducer 持久 state 或 DesktopPreferences。
+- [x] 空配置、新 Provider、一个 Provider 多 Models、Model 增删/默认选择、display-name fallback 均通过；DOM/文案中不出现可编辑 `model_ref`、`model`/`model-1` placeholder、清除 Key或“已配置”旧交互。
+- [x] Settings 复用全局 sidebar 宽度并按分类独立 page/section；Provider/Model modal 的 keyboard/focus/tooltip/ARIA、zh/en 与 dark/light 均通过。
+- [x] 执行 `rg -n "renameModelRef|model-1|clearKey" desktop/src/renderer desktop/tests`，生产旧路径为 0，测试中的否定断言逐条可解释。
 
 ## T08：GUI 越界、冗余、不可达与过度抽象审查
 

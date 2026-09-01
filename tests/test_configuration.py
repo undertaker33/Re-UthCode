@@ -18,6 +18,7 @@ from uthcode.application import (
     UserConfigurationView,
     UserConfigurationWriteRequest,
     create_application,
+    read_user_api_key,
     read_user_configuration,
     write_user_configuration,
     load_effective_config,
@@ -643,6 +644,68 @@ def test_user_configuration_view_is_available_before_application_bootstrap(
     assert set(view.models) == {"slot-1", "slot-2", "slot-3"}
     assert all(not provider.api_key_configured for provider in view.providers.values())
     assert "slot-1-secret" not in repr(view)
+
+
+@pytest.mark.parametrize(
+    ("expression", "environment_name", "environment_value"),
+    [
+        ("literal-configured-key", None, None),
+        ("env:W04_CONFIGURED_KEY", "W04_CONFIGURED_KEY", "resolved-secret-must-not-return"),
+    ],
+)
+def test_user_api_key_reveal_reads_only_the_saved_expression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expression: str,
+    environment_name: str | None,
+    environment_value: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    if environment_name is None:
+        monkeypatch.delenv("W04_CONFIGURED_KEY", raising=False)
+    else:
+        monkeypatch.setenv(environment_name, environment_value or "")
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{expression}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    revealed = read_user_api_key("remote", home=home)
+
+    assert revealed == expression
+    assert revealed != environment_value
+
+
+def test_user_api_key_reveal_unknown_provider_is_safe_configuration_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "remote/ref"
+
+[providers.remote]
+kind = "fake"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="Provider profile was not found"):
+        read_user_api_key("missing", home=home)
 
 
 def test_semantically_invalid_toml_still_returns_editable_safe_view(

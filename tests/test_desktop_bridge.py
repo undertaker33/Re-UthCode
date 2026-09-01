@@ -13,6 +13,8 @@ import pytest
 import uthcode.interfaces.desktop.bridge as bridge_module
 
 from uthcode.application import (
+    AgentEvent,
+    ApplicationStatus,
     ApplicationRuntimeContext,
     ApplicationSessionService,
     BehaviorMode,
@@ -31,6 +33,7 @@ from uthcode.application import (
     PlanReviewResponse,
     PermissionMode,
     ProviderResponse,
+    ProviderIdentity,
     QuestionKind,
     RetryProviderResponse,
     ResumeTurnResponse,
@@ -1298,6 +1301,103 @@ async def test_status_projection_drops_native_exception_and_secret_values() -> N
 
 
 @pytest.mark.asyncio
+async def test_secret_sentinel_stays_out_of_all_non_reveal_bridge_projections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "w04-secret-sentinel"
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{sentinel}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+
+    class UnsafeSnapshotRun(_FakeRun):
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "run_id": "run-safe",
+                "api_key": sentinel,
+                "nested": {"access_token": sentinel},
+            }
+
+    class UnsafeProjectionApplication(_FakeApplication):
+        def create_run(self) -> UnsafeSnapshotRun:
+            run = UnsafeSnapshotRun()
+            self.runs.append(run)
+            return run
+
+    application = UnsafeProjectionApplication()
+    application.status = lambda: ApplicationStatus(  # type: ignore[attr-defined]
+        current_model="remote/ref",
+        provider_profile="remote",
+        provider_identity=ProviderIdentity("remote", "openai_responses", "remote"),
+        configuration_sources=(),
+        diagnostics={
+            "api_key": sentinel,
+            "nested": {"secret": sentinel},
+            "safe": "retained",
+        },
+    )
+    bridge = DesktopBridge(application=application, home=home)
+
+    settings = await bridge.handle_request(RequestEnvelope("sentinel-settings", "settings.get", {}))
+    status = await bridge.handle_request(RequestEnvelope("sentinel-status", "status.get", {}))
+    assert settings.ok is True and status.ok is True
+    assert sentinel not in json.dumps(settings.to_dict(), ensure_ascii=False)
+    assert sentinel not in json.dumps(status.to_dict(), ensure_ascii=False)
+    assert status.result is not None and status.result["application"]["diagnostics"] == {  # type: ignore[index]
+        "nested": {},
+        "safe": "retained",
+    }
+    assert status.result["runtime"]["run"]["run_id"] == "run-safe"  # type: ignore[index]
+    assert status.result["runtime"]["run"]["nested"] == {}  # type: ignore[index]
+
+    class UnsafeEvent(AgentEvent):
+        event_type = "unsafe_event"
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "type": self.event_type,
+                "run_id": self.run_id,
+                "turn_id": self.turn_id,
+                "api_key": sentinel,
+            }
+
+    event_handle = _EventHandle(UnsafeEvent("run-safe", "turn-safe"))
+    bridge._active_handle = event_handle
+    bridge._turn_task = asyncio.create_task(bridge._consume_turn(event_handle))
+    await bridge.wait_for_idle()
+    events = bridge.drain_outbox()
+    assert sentinel not in json.dumps([item.to_dict() for item in events], ensure_ascii=False)
+    assert events[0].event == {  # type: ignore[union-attr]
+        "type": "unsafe_event",
+        "run_id": "run-safe",
+        "turn_id": "turn-safe",
+    }
+
+    def fail_settings(*_args: object, **_kwargs: object) -> object:
+        raise bridge_module.ConfigurationError(sentinel)
+
+    monkeypatch.setattr(bridge_module, "read_user_configuration", fail_settings)
+    failed = await bridge.handle_request(RequestEnvelope("sentinel-error", "settings.get", {}))
+    assert failed.ok is False
+    assert failed.error is not None and failed.error.kind == "configuration_error"
+    assert sentinel not in json.dumps(failed.to_dict(), ensure_ascii=False)
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_run_permission_mode_is_added_to_safe_runtime_and_command_projections() -> None:
     class ProjectedRun(_FakeRun):
         def snapshot(self) -> dict[str, object]:
@@ -1460,6 +1560,97 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
     request = captured[0]
     assert "raw-native-secret" not in repr(request)
     assert "raw-native-secret" not in json.dumps(result.to_dict())
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expression", "environment_name", "environment_value"),
+    [
+        ("bridge-literal-configured-key", None, None),
+        ("env:W04_BRIDGE_CONFIGURED_KEY", "W04_BRIDGE_CONFIGURED_KEY", "bridge-resolved-secret"),
+    ],
+)
+async def test_settings_reveal_api_key_is_the_only_secret_bearing_bridge_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expression: str,
+    environment_name: str | None,
+    environment_value: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    if environment_name is None:
+        monkeypatch.delenv("W04_BRIDGE_CONFIGURED_KEY", raising=False)
+    else:
+        monkeypatch.setenv(environment_name, environment_value or "")
+    user.write_text(
+        f'''default_model = "remote/ref"
+
+[providers.remote]
+kind = "openai_responses"
+api_key = "{expression}"
+
+[models."remote/ref"]
+provider = "remote"
+remote_id = "remote"
+''',
+        encoding="utf-8",
+    )
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+
+    settings = await bridge.handle_request(RequestEnvelope("settings-safe", "settings.get", {}))
+    revealed = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-reveal",
+            "settings.reveal_api_key",
+            {"provider_profile_id": "remote"},
+        )
+    )
+
+    encoded_settings = json.dumps(settings.to_dict(), ensure_ascii=False)
+    assert expression not in encoded_settings
+    if environment_value is not None:
+        assert environment_value not in encoded_settings
+    assert revealed.ok is True
+    assert revealed.result == {"api_key": expression}
+    if environment_value is not None:
+        assert environment_value not in json.dumps(revealed.to_dict(), ensure_ascii=False)
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_reveal_api_key_maps_unknown_and_read_failures_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = DesktopBridge(application=_FakeApplication())
+
+    unknown = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-reveal-unknown",
+            "settings.reveal_api_key",
+            {"provider_profile_id": "missing"},
+        )
+    )
+    assert unknown.ok is False
+    assert unknown.error is not None and unknown.error.kind == "configuration_error"
+    assert "missing" not in unknown.error.message
+
+    def fail(*_args: object, **_kwargs: object) -> str:
+        raise bridge_module.ConfigurationError("raw-secret-read-failure")
+
+    monkeypatch.setattr(bridge_module, "read_user_api_key", fail)
+    failed = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-reveal-failure",
+            "settings.reveal_api_key",
+            {"provider_profile_id": "remote"},
+        )
+    )
+    assert failed.ok is False
+    assert failed.error is not None and failed.error.kind == "configuration_error"
+    assert "raw-secret-read-failure" not in json.dumps(failed.to_dict())
     await bridge.shutdown()
 
 

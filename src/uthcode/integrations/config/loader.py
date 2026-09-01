@@ -432,6 +432,57 @@ def read_user_config_view_data(
     return _safe_user_mapping(_read_mapping(target))
 
 
+def read_user_config_api_key(
+    path: str | os.PathLike[str] | Path,
+    provider_profile_id: str,
+) -> str | None:
+    """Read one saved user-level API key expression without resolving it.
+
+    This is intentionally separate from the display-safe configuration view
+    and from normal Provider loading.  A literal is returned as written;
+    ``env:NAME`` is returned as the configured reference and is never looked
+    up in the process environment.  Callers must provide the Provider
+    identity explicitly so this helper cannot enumerate or return other
+    profiles.
+    """
+
+    target = _physical_path(path)
+    if not isinstance(provider_profile_id, str) or not provider_profile_id.strip():
+        raise ConfigurationError(
+            "provider profile id must be a non-empty string",
+            path=target,
+            field="provider_profile_id",
+        )
+    if not target.is_file():
+        raise ConfigurationError("user configuration was not found", path=target)
+    mapping = _read_mapping(target)
+    raw_providers = _require_table(mapping.get("providers", {}), path=target, field="providers")
+    raw_profile = raw_providers.get(provider_profile_id)
+    if raw_profile is None:
+        raise ConfigurationError(
+            "Provider profile was not found",
+            path=target,
+            field=f"providers.{provider_profile_id}",
+        )
+    profile = _require_table(
+        raw_profile,
+        path=target,
+        field=f"providers.{provider_profile_id}",
+    )
+    value = profile.get("api_key")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # Reuse syntax validation only; unlike normal config loading this does not
+    # read an environment variable or construct SecretValue.
+    _validate_api_key_expression(
+        value,
+        path=target,
+        field=f"providers.{provider_profile_id}.api_key",
+    )
+    assert isinstance(value, str)
+    return value
+
+
 def _blank(value: object) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
@@ -863,6 +914,7 @@ __all__ = [
     "discover_scoped_paths",
     "load_config_data",
     "physical_path",
+    "read_user_config_api_key",
     "read_user_config_view_data",
     "resolve_user_home",
     "validate_user_config_mapping",

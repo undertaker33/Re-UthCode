@@ -18,6 +18,7 @@ from .bootstrap import (
     ConfigurationInitializationRequired,
     create_application,
     load_effective_config,
+    read_user_api_key,
     read_user_configuration,
     write_user_configuration,
 )
@@ -284,6 +285,7 @@ __all__ = [
     "failure_message",
     "create_builtin_registry",
     "load_effective_config",
+    "read_user_api_key",
     "read_user_configuration",
     "write_user_configuration",
     "parse_command",

@@ -24,7 +24,7 @@ import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Si
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
-import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, renameModelRef, renameProviderId, settingsSaveRequest, withoutRecordKey } from "../src/renderer/SettingsView";
+import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
 import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/RuntimePanel";
 import { CustomSelect, customSelectConsumesEscape, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
@@ -1428,15 +1428,15 @@ test("T06 Provider Retry and user Pause render only typed continuation/cancel co
 
 test("T07 Settings uses the current configuration view and does not render secret values", () => {
   const state = createInitialState({ configuration: { default_model: "fake/model", default_permission_mode: "auto", providers: { fake: { provider_profile_id: "fake", kind: "fake", base_url: null, api_key_configured: false } }, models: { "fake/model": { model_ref: "fake/model", provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
-  assert.match(markup, /Provider 与模型|默认项|界面|关于/);
-  assert.match(markup, /fake\/model/);
+  const markup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, /协议与模型|默认项|界面|关于/);
+  assert.match(markup, />Model</);
   assert.doesNotMatch(markup, /sk-live-secret|api_key=|secret value/u);
 });
 
 test("T07 rebuilt Settings and typed interactions keep accessible continuous and narrow layouts", async () => {
   const state = createInitialState({ runtimeState: "ready", theme: "light", configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", api_key_configured: true } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model" } } }, settingsLoaded: true });
-  const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
   assert.match(settingsMarkup, /aria-label="设置"/u);
   for (const id of ["providers", "defaults", "interface", "about"]) {
     assert.match(settingsMarkup, new RegExp(`href="#settings-${id}"`));
@@ -1444,17 +1444,20 @@ test("T07 rebuilt Settings and typed interactions keep accessible continuous and
   }
   assert.doesNotMatch(settingsMarkup, /aria-current=/u);
   assert.match(settingsMarkup, /class="provider-row"[^>]*fake/u);
-  assert.match(settingsMarkup, /fake\/model/u);
-  assert.match(settingsMarkup, /已配置/u);
+  assert.match(settingsMarkup, />model</u);
+  assert.match(settingsMarkup, /API Key 已保存/u);
+  assert.doesNotMatch(settingsMarkup, /已配置/u);
   assert.doesNotMatch(settingsMarkup, /<select|legacy-settings-editor/u);
   const permission = { kind: "permission_required", pauseId: "pause-a11y", runId: "run-a11y", turnId: "turn-a11y", request: { permission_id: "permission-a11y", choices: ["once", "reject"] } } as const;
   const interactionMarkup = renderLanguage("en", <InteractionSurface interaction={permission} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(interactionMarkup, /aria-label="Permission approval"/u);
   assert.match(interactionMarkup, /type="button"/u);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
-  assert.match(css, /\.settings-view\s*\{[^}]*grid-template-columns:\s*220px minmax\(0, 1fr\)/s);
+  assert.match(css, /\.settings-view\s*\{[^}]*grid-template-columns:\s*var\(--sidebar-width, 220px\) minmax\(0, 1fr\)/s);
   assert.match(css, /\.settings-section\s*\{[^}]*border-top:\s*1px solid var\(--line\)/s);
   assert.match(css, /@media \(max-width:\s*900px\)[\s\S]*?\.settings-view\s*\{[^}]*grid-template-columns:\s*1fr/s);
+  assert.match(css, /settings-modal-rise|settings-modal-fade/u);
+  assert.match(css, /prefers-reduced-motion/u);
   assert.match(css, /\.interaction-surface\s*\{[^}]*border-top:\s*2px solid var\(--accent\)/s);
 });
 
@@ -1481,6 +1484,1142 @@ test("T07 four-field setup writes a valid OpenAI-compatible candidate without gu
   assert.deepEqual(request.models?.model, { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
 });
 
+test("T07 saved API key reveal is explicit, transient, and cleared with the protocol modal", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const saves: ConfigurationWrite[] = [];
+    const onRevealApiKey = async (providerId: string) => {
+        const method = "settings.reveal_api_key";
+        const params = { provider_profile_id: providerId };
+        calls.push({ method, params });
+        return "env:W04_RENDERER_TEST_KEY";
+      };
+    const state = createInitialState({ configuration: { default_model: "provider/model", default_permission_mode: "default", providers: { provider: { kind: "openai_compat", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } }, settingsLoaded: true });
+    const render = () => act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={onRevealApiKey} onBack={() => undefined} onSave={(request) => { saves.push(request); }} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    render();
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(row);
+    act(() => { row!.click(); });
+    await tick();
+    const input = container.querySelector<HTMLInputElement>("#modal-api-key");
+    const show = container.querySelector<HTMLButtonElement>('button[aria-label="Show saved API key"]');
+    assert.ok(input);
+    assert.ok(show);
+    assert.equal(input!.type, "password");
+    act(() => { show!.click(); });
+    await tick();
+    assert.deepEqual(calls, [{ method: "settings.reveal_api_key", params: { provider_profile_id: "provider" } }]);
+    assert.equal(input!.type, "text");
+    assert.equal(input!.value, "env:W04_RENDERER_TEST_KEY");
+    assert.equal(saves.length, 0, "revealing a saved key must not mark settings dirty");
+    const hide = container.querySelector<HTMLButtonElement>('button[aria-label="Hide saved API key"]');
+    assert.ok(hide);
+    act(() => { hide!.click(); });
+    await tick();
+    assert.equal(input!.type, "password");
+    assert.equal(saves.length, 0, "hiding a saved key must not trigger a write");
+    const apply = container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Apply"]');
+    assert.ok(apply);
+    act(() => { apply!.click(); });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    await tick();
+    const providerRequest = saves[0]?.providers?.provider;
+    assert.ok(providerRequest);
+    assert.equal(providerRequest.api_key, undefined, "the revealed value must never enter an untouched write");
+    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(reopened);
+    act(() => { reopened!.click(); });
+    await tick();
+    const showAgain = container.querySelector<HTMLButtonElement>('button[aria-label="Show saved API key"]');
+    assert.ok(showAgain);
+    act(() => { showAgain!.click(); });
+    await tick();
+    assert.equal(calls.length, 2, "closing the protocol modal clears the reveal cache");
+    void dom;
+  });
+});
+
+test("T07 replacement key remains after a failed save and is the only key-bearing write", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let rejectedRequest: ConfigurationWrite | null = null;
+    const onRevealApiKey = async () => null;
+    const state = createInitialState({ configuration: { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } }, settingsLoaded: true });
+    const onSave = (request: ConfigurationWrite) => { rejectedRequest = request; throw new Error("save rejected"); };
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={onRevealApiKey} onBack={() => undefined} onSave={onSave} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(row);
+    act(() => { row!.click(); });
+    await tick();
+    const input = container.querySelector<HTMLInputElement>("#modal-api-key");
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(input);
+    assert.ok(setter);
+    act(() => {
+      input!.focus();
+      setter!.call(input, "replacement-only");
+      input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "replacement-only" }));
+      input!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await tick();
+    const apply = container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Apply"]');
+    assert.ok(apply);
+    act(() => { apply!.click(); });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    await tick();
+    assert.equal(rejectedRequest?.providers?.provider?.api_key, "replacement-only");
+    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(reopened);
+    act(() => { reopened!.click(); });
+    await tick();
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "replacement-only", "a failed save keeps the replacement in the modal");
+  });
+});
+
+test("T07 a delayed reveal response cannot repopulate a closed protocol modal", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let calls = 0;
+    let resolveReveal: ((value: string) => void) | null = null;
+    const onRevealApiKey = async () => {
+      calls += 1;
+      return await new Promise<string>((resolve) => { resolveReveal = resolve; });
+    };
+    const state = createInitialState({ configuration: { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } }, settingsLoaded: true });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={onRevealApiKey} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(row);
+    act(() => { row!.click(); });
+    await tick();
+    const show = container.querySelector<HTMLButtonElement>('button[aria-label="Show saved API key"]');
+    assert.ok(show);
+    act(() => { show!.click(); });
+    await tick();
+    assert.equal(calls, 1);
+    const close = container.querySelector<HTMLButtonElement>('.provider-modal > header button[title="Cancel"]');
+    assert.ok(close);
+    act(() => { close!.click(); });
+    await tick();
+    assert.equal(container.querySelector('[role="dialog"]'), null);
+    resolveReveal?.("env:STALE_REVEAL");
+    await tick();
+    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(reopened);
+    act(() => { reopened!.click(); });
+    await tick();
+    const showAgain = container.querySelector<HTMLButtonElement>('button[aria-label="Show saved API key"]');
+    assert.ok(showAgain);
+    act(() => { showAgain!.click(); });
+    await tick();
+    assert.equal(calls, 2);
+    resolveReveal?.("env:FRESH_REVEAL");
+    await tick();
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "env:FRESH_REVEAL");
+  });
+});
+
+test("T07 empty settings and model profiles use display labels without exposing internal references", async () => {
+  const emptyState = createInitialState({ configuration: {}, settingsLoaded: true });
+  const emptyMarkup = renderLanguage("en", <SettingsView state={emptyState} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(emptyMarkup, /No protocols yet/u);
+  assert.doesNotMatch(emptyMarkup, new RegExp(["model" + "-1", "modal-new-model-ref", "settings-advanced"].join("|"), "u"));
+  const zhMarkup = renderLanguage("zh-CN", <SettingsView state={emptyState} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(zhMarkup, /暂无协议/u);
+  assert.doesNotMatch(zhMarkup, /已配置|清除 Key/u);
+  const multiState = createInitialState({ configuration: { default_model: "provider/primary", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/primary": { provider_profile_id: "provider", remote_id: "remote-primary", display_name: "Primary" }, "provider/secondary": { provider_profile_id: "provider", remote_id: "remote-secondary", display_name: "" } } }, settingsLoaded: true });
+  const multiMarkup = renderLanguage("en", <SettingsView state={multiState} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(multiMarkup, /Primary/u);
+  assert.match(multiMarkup, /Primary \+1/u);
+  assert.doesNotMatch(multiMarkup, /provider\/primary|provider\/secondary/u);
+});
+
+test("T07 protocol model modal supports add, default, edit, delete, and focus-safe close", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const saves: ConfigurationWrite[] = [];
+    const state = createInitialState({ configuration: { default_model: "provider/primary", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/primary": { provider_profile_id: "provider", remote_id: "remote-primary", display_name: "Primary" }, "provider/secondary": { provider_profile_id: "provider", remote_id: "remote-secondary", display_name: "Secondary" } } }, settingsLoaded: true });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={(request) => saves.push(request)} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await tick();
+    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(providerRow);
+    providerRow!.focus();
+    act(() => { providerRow!.click(); });
+    await tick();
+    const providerDialog = () => container.querySelector<HTMLElement>('.provider-modal[aria-labelledby$="protocol-title"]');
+    assert.equal(container.querySelectorAll(".settings-model-row").length, 2);
+    assert.ok(providerDialog());
+    assert.equal((dom.window.document.activeElement as HTMLElement)?.id, "modal-protocol");
+    const editSecondary = container.querySelector<HTMLButtonElement>('button[aria-label="Edit model Secondary"]');
+    assert.ok(editSecondary);
+    act(() => { editSecondary!.click(); });
+    await tick();
+    const modelDialog = container.querySelector<HTMLElement>(".model-modal");
+    assert.ok(modelDialog);
+    assert.equal(modelDialog!.getAttribute("aria-modal"), "true");
+    assert.equal(providerDialog()!.getAttribute("aria-hidden"), "true", "the covered Provider modal is hidden from the accessibility tree");
+    assert.equal(providerDialog()!.getAttribute("aria-modal"), null, "only the top-level nested modal is aria-modal");
+    assert.equal((providerDialog() as HTMLElement & { inert?: boolean }).inert, true, "the covered Provider modal is inert");
+    assert.equal(container.querySelectorAll('[role="dialog"][aria-modal="true"]').length, 1);
+    assert.doesNotMatch(modelDialog!.textContent ?? "", /provider\/secondary|__uthcode_model_/u);
+    const modalFocusable = Array.from(modelDialog!.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [role="button"]:not([aria-disabled="true"])'));
+    assert.ok(modalFocusable.length > 2);
+    modalFocusable.at(-1)!.focus();
+    act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Tab" })); });
+    assert.equal(dom.window.document.activeElement, modalFocusable[0], "Tab wraps within the nested modal");
+    modalFocusable[0]!.focus();
+    act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Tab", shiftKey: true })); });
+    assert.equal(dom.window.document.activeElement, modalFocusable.at(-1), "Shift+Tab wraps within the nested modal");
+    const cancelModel = modelDialog!.querySelector<HTMLButtonElement>('button[title="Cancel"]');
+    assert.ok(cancelModel);
+    const makeDefault = modelDialog!.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    assert.ok(makeDefault);
+    assert.equal(makeDefault!.checked, false);
+    act(() => { makeDefault!.click(); });
+    assert.equal(makeDefault!.checked, true);
+    act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Escape" })); });
+    await tick();
+    assert.equal(container.querySelector(".model-modal"), null);
+    assert.equal(dom.window.document.activeElement, editSecondary, "Escape restores focus to the model row that opened the modal");
+    const saveBeforeAdd = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(saveBeforeAdd);
+    act(() => { saveBeforeAdd!.click(); });
+    await tick();
+    assert.equal(saves.at(-1)?.default_model, "provider/primary", "Cancel restores default_model before global Save");
+    const addModel = providerDialog()!.querySelector<HTMLButtonElement>('button[title="Add model"]');
+    assert.ok(addModel);
+    act(() => { addModel!.click(); });
+    await tick();
+    const newModelDialog = container.querySelector<HTMLElement>(".model-modal");
+    assert.ok(newModelDialog);
+    assert.match(newModelDialog!.textContent ?? "", /Unnamed model/u);
+    const remoteInput = newModelDialog!.querySelector<HTMLInputElement>('input[id$="-remote"]');
+    assert.ok(remoteInput);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(setter);
+    act(() => {
+      remoteInput!.focus();
+      setter!.call(remoteInput, "remote-added");
+      remoteInput!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "remote-added" }));
+      remoteInput!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      remoteInput!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      remoteInput!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await tick();
+    const applyModel = newModelDialog!.querySelector<HTMLButtonElement>('button[title="Apply"]');
+    assert.ok(applyModel);
+    act(() => { applyModel!.click(); });
+    await tick();
+    assert.equal(container.querySelectorAll(".settings-model-row").length, 3);
+    assert.match(container.querySelector(".settings-model-list")?.textContent ?? "", /remote-added/u);
+    const addedRemove = Array.from(container.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove model"]')).find((button) => button.getAttribute("aria-label")?.includes("remote-added"));
+    assert.ok(addedRemove);
+    act(() => { addedRemove!.click(); });
+    await tick();
+    assert.equal(container.querySelectorAll(".settings-model-row").length, 2);
+    const providerCancel = providerDialog()!.querySelector<HTMLButtonElement>('button[title="Cancel"]');
+    assert.ok(providerCancel);
+    act(() => { providerCancel!.click(); });
+    await tick();
+    assert.equal(container.querySelector('[role="dialog"]'), null);
+  });
+});
+
+test("T07 provider URL and model display name preserve edit-time spaces and normalize at Apply/Save", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const saves: ConfigurationWrite[] = [];
+    const state = createInitialState({ configuration: { default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Existing" } } }, settingsLoaded: true });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={(request) => saves.push(request)} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(providerRow);
+    act(() => { providerRow!.click(); });
+    await tick();
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(setter);
+    const baseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
+    assert.ok(baseUrl);
+    act(() => {
+      baseUrl!.focus();
+      setter!.call(baseUrl, "  https://gateway.example/v1  ");
+      baseUrl!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "  https://gateway.example/v1  " }));
+      baseUrl!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      baseUrl!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      baseUrl!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await tick();
+    assert.equal(baseUrl!.value, "  https://gateway.example/v1  ", "Base URL editing retains surrounding spaces until Apply");
+    const editModel = container.querySelector<HTMLButtonElement>('button[aria-label="Edit model Existing"]');
+    assert.ok(editModel);
+    act(() => { editModel!.click(); });
+    await tick();
+    const displayName = container.querySelector<HTMLInputElement>('input[id$="-display"]');
+    assert.ok(displayName);
+    act(() => {
+      displayName!.focus();
+      setter!.call(displayName, " My Model ");
+      displayName!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: " My Model " }));
+      displayName!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      displayName!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      displayName!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await tick();
+    assert.equal(displayName!.value, " My Model ", "display name editing retains spaces and the real internal space");
+    const applyModel = container.querySelector<HTMLElement>(".model-modal button[title=\"Apply\"]") as HTMLButtonElement | null;
+    assert.ok(applyModel);
+    act(() => { applyModel!.click(); });
+    await tick();
+    const applyProvider = container.querySelector<HTMLElement>(".provider-modal:not(.model-modal) footer button[title=\"Apply\"]") as HTMLButtonElement | null;
+    assert.ok(applyProvider);
+    act(() => { applyProvider!.click(); });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    await tick();
+    assert.equal(saves.at(-1)?.providers?.provider?.base_url, "https://gateway.example/v1");
+    assert.equal(saves.at(-1)?.models?.["provider/model"]?.display_name, "My Model");
+  });
+});
+
+test("T07 durable Settings save clears transient secrets even when Runtime recovery fails", async () => {
+  type RecoveryFailure = "project.open" | "session.resume" | "status.get" | "project.sessions";
+  const config = { default_model: "provider/model", default_permission_mode: "default" as const, providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
+  const project: ProjectState = { path: "C:/settings-project", projectKey: "C:/settings-project", alias: "Settings project", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
+  const preferences: DesktopPreferences = {
+    theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+    recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
+  };
+  const runScenario = async (failure: RecoveryFailure, replacement = false, deferFailure = false) => withRendererDom(async (dom, container, root) => {
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    const saveRequests: JsonObject[] = [];
+    let savingStarted = false;
+    let rejectDeferredFailure: ((reason?: unknown) => void) | null = null;
+    const deferredFailure = new Promise<never>((_resolve, reject) => { rejectDeferredFailure = reject; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "settings.save") {
+          savingStarted = true;
+          saveRequests.push(params.request as JsonObject);
+          return { configuration: config };
+        }
+        if (savingStarted && method === failure) {
+          if (deferFailure && failure === "project.open") return await deferredFailure;
+          throw new Error(`synthetic ${failure} failure`);
+        }
+        if (method === "settings.get") return { configuration: config };
+        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
+        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        if (method === "status.get") return { active_turn: false };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: project.sessions[0]?.session_id ?? null });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await tick();
+    await tick();
+    if (replacement) {
+      const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
+      assert.ok(providerRow);
+      act(() => { providerRow!.click(); });
+      await tick();
+      const input = container.querySelector<HTMLInputElement>("#modal-api-key");
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      assert.ok(input);
+      assert.ok(setter);
+      act(() => {
+        input!.focus();
+        setter!.call(input, "w04-replacement-only");
+        input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "w04-replacement-only" }));
+        input!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+        input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await tick();
+      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      assert.ok(applyProvider);
+      act(() => { applyProvider!.click(); });
+      await tick();
+    }
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    if (deferFailure) {
+      await tick();
+      assert.equal(save!.disabled, false, "Settings saving ends at the durable write while Runtime recovery is pending");
+      const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+      assert.ok(reopened);
+      act(() => { reopened!.click(); });
+      await tick();
+      assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "transient key is cleared before deferred Runtime recovery settles");
+      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      assert.ok(applyProvider);
+      act(() => { applyProvider!.click(); });
+      await tick();
+      rejectDeferredFailure?.(new Error(`synthetic ${failure} failure`));
+    }
+    for (let index = 0; index < 8; index += 1) await tick();
+    assert.equal(container.querySelector(".settings-view__error"), null, "durable save does not become a Settings error after recovery failure");
+    const recoveryMessage = container.querySelector(".settings-view__runtime-error")?.textContent
+      ?? container.querySelector("#runtime-panel [role=alert]")?.textContent
+      ?? "";
+    assert.match(recoveryMessage, /Settings were saved/u, "Runtime recovery failure is presented independently from the durable Settings result");
+    assert.ok(calls.some((call) => call.method === failure), `save recovery reaches ${failure}`);
+    assert.equal(saveRequests.length, 1);
+    if (replacement) {
+      assert.equal(saveRequests[0]?.providers?.provider?.api_key, "w04-replacement-only");
+      const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+      assert.ok(reopened);
+      act(() => { reopened!.click(); });
+      await tick();
+      assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "a durable save does not repopulate the saved plaintext after recovery failure");
+      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      assert.ok(applyProvider);
+      act(() => { applyProvider!.click(); });
+      await tick();
+      const secondSave = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+      assert.ok(secondSave);
+      act(() => { secondSave!.click(); });
+      for (let index = 0; index < 8; index += 1) await tick();
+      assert.equal(saveRequests.length, 2);
+      assert.equal(saveRequests[1]?.providers?.provider?.api_key, undefined, "a later Save cannot resubmit the cleared plaintext");
+      assert.doesNotMatch(JSON.stringify(saveRequests[1]), /w04-replacement-only/u);
+    }
+  });
+  await runScenario("project.open", true, true);
+  await runScenario("session.resume");
+  await runScenario("status.get");
+  await runScenario("project.sessions");
+});
+
+test("T07 durable Settings Save locks the real Settings DOM and clears an A draft after success", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const config = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+    };
+    const project: ProjectState = { path: "C:/settings-dom-success", projectKey: "C:/settings-dom-success", alias: "Settings DOM success", pinned: false, sessions: [], catalogFresh: true };
+    const preferences: DesktopPreferences = {
+      theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: null,
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    const saveRequests: JsonObject[] = [];
+    let resolveSave: ((value: JsonObject) => void) | null = null;
+    let resolveShutdown: ((value: JsonObject) => void) | null = null;
+    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
+    const pendingShutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "settings.save") {
+          saveRequests.push(params.request as JsonObject);
+          return pendingSave;
+        }
+        if (method === "runtime.shutdown") return pendingShutdown;
+        if (method === "runtime.initialize") return { run: null };
+        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        if (method === "status.get") return { active_turn: false };
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      // Keep preference bootstrap from opening a second lifecycle owner; this
+      // fixture supplies the selected Project as its authoritative state.
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({ language: "en", theme: "light", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    const setInput = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      assert.ok(setter);
+      if (input.isConnected) input.focus();
+      setter!.call(input, value);
+      input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    };
+
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(providerRow);
+    act(() => { providerRow!.click(); });
+    await tick();
+    const baseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
+    const apiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
+    const modelEdit = container.querySelector<HTMLButtonElement>(".settings-model-row__actions button[title^=\"Edit model\"]");
+    assert.ok(baseUrl && apiKey && modelEdit);
+    act(() => {
+      setInput(baseUrl!, " https://gateway.example/v1 ");
+      setInput(apiKey!, "draft-a");
+    });
+    await tick();
+    // Open an existing Model modal so Save also closes the nested modal and
+    // its input handlers are exercised after the lifecycle starts.
+    act(() => { modelEdit!.click(); });
+    await tick();
+    const modelRemote = container.querySelector<HTMLInputElement>(".model-modal input[id$=\"-remote\"]");
+    const addModel = container.querySelector<HTMLButtonElement>(".provider-modal:not(.model-modal) .settings-subsection__heading > button[title=\"Add model\"]");
+    assert.ok(modelRemote && addModel);
+
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    const settings = container.querySelector<HTMLElement>(".settings-view");
+    assert.equal(settings?.getAttribute("aria-busy"), "true");
+    assert.equal(settings?.getAttribute("aria-describedby"), "settings-busy-status");
+    assert.match(container.querySelector<HTMLElement>(".settings-view__busy-status")?.textContent ?? "", /Saving settings…/u);
+    assert.equal(dom.window.document.activeElement, container.querySelector("#settings-busy-status"), "busy status receives focus while the modal is closed");
+    assert.equal(container.querySelector("[role=dialog]"), null, "Save closes both provider and nested Model modal");
+    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
+    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 0, "Runtime recovery waits for durable Save");
+    assert.equal(saveRequests[0]?.providers?.provider?.api_key, "draft-a");
+
+    const addProvider = container.querySelector<HTMLButtonElement>(".row-add--inline");
+    const triggers = Array.from(container.querySelectorAll<HTMLButtonElement>(".settings-view .custom-select__trigger"));
+    const back = container.querySelector<HTMLButtonElement>(".settings-view__back");
+    const cancel = container.querySelector<HTMLButtonElement>('.settings-actions button[title="Cancel"]');
+    assert.ok(addProvider && back && cancel);
+    assert.equal(addProvider!.disabled, true);
+    assert.equal(providerRow!.disabled, true);
+    assert.equal(triggers.length, 4);
+    assert.ok(triggers.every((trigger) => trigger.disabled), "permission/default/theme/language controls are disabled");
+    assert.equal(back!.disabled, true);
+    assert.equal(cancel!.disabled, true);
+    assert.equal(save!.disabled, true);
+
+    // These are the real DOM entry points captured before Save. Native
+    // disabled controls and detached modal controls must not create a B draft
+    // or mutate A while the durable request is pending.
+    act(() => {
+      providerRow!.click();
+      addProvider!.click();
+      triggers.forEach((trigger) => trigger.click());
+      back!.click();
+      cancel!.click();
+      addModel!.click();
+      setInput(baseUrl!, " B provider ");
+      setInput(apiKey!, "draft-b");
+      setInput(modelRemote!, "model-b");
+    });
+    await tick();
+    assert.equal(container.querySelector("[role=dialog]"), null);
+    assert.equal(container.querySelectorAll(".provider-row").length, 1, "Add Provider and Provider row remain inert");
+    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1, "blocked entries do not issue a second Save");
+
+    resolveSave?.({
+      configuration: {
+        ...config,
+        providers: { provider: { ...config.providers.provider } },
+        models: { "provider/model": { ...config.models["provider/model"] } },
+      },
+    });
+    for (let index = 0; index < 8; index += 1) await tick();
+    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "false");
+    assert.equal(container.querySelector(".settings-view__busy-status"), null);
+    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
+    assert.equal(dom.window.document.activeElement, container.querySelector(".settings-actions .save-button"), "Save regains focus at the durable boundary");
+    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
+
+    // settings_loaded resets the visible draft and clears the transient key;
+    // the still-pending Runtime recovery must not reintroduce it.
+    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(reopened);
+    act(() => { reopened!.click(); });
+    await tick();
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "durable success clears the A replacement");
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-base-url")?.value, "https://gateway.example/v1");
+    assert.equal(container.querySelectorAll(".settings-model-row").length, 1, "no B model draft was created");
+    act(() => { container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Cancel"]')?.click(); });
+    await tick();
+
+    resolveShutdown?.({});
+    for (let index = 0; index < 16; index += 1) await tick();
+    assert.equal(container.querySelector<HTMLElement>(".settings-view__runtime-status"), null);
+  });
+});
+
+test("T07 durable Settings Save failure keeps the A draft after the modal closes and re-enables editing", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const config = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let rejectSave: ((reason?: unknown) => void) | null = null;
+    const pendingSave = new Promise<JsonObject>((_resolve, reject) => { rejectSave = reject; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "settings.save") return pendingSave;
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    const setInput = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      assert.ok(setter);
+      if (input.isConnected) input.focus();
+      setter!.call(input, value);
+      input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    };
+
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(providerRow);
+    act(() => { providerRow!.click(); });
+    await tick();
+    const baseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
+    const apiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
+    assert.ok(baseUrl && apiKey);
+    act(() => {
+      setInput(baseUrl!, " A draft ");
+      setInput(apiKey!, "draft-a");
+    });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "true");
+    assert.equal(container.querySelector("[role=dialog]"), null);
+    rejectSave?.(new Error("synthetic durable failure"));
+    for (let index = 0; index < 10; index += 1) await tick();
+    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
+    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "false");
+    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /synthetic durable failure/u);
+    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
+
+    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(reopened);
+    act(() => { reopened!.click(); });
+    await tick();
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-base-url")?.value, " A draft ", "durable failure retains A's edit-time spaces");
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "draft-a", "durable failure retains A's replacement");
+    assert.equal(container.querySelectorAll(".provider-row").length, 1);
+    assert.equal(container.querySelectorAll(".settings-model-row").length, 1);
+    const editedBaseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
+    const editedApiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
+    assert.ok(editedBaseUrl && editedApiKey);
+    act(() => {
+      setInput(editedBaseUrl!, " A draft edited ");
+      setInput(editedApiKey!, "draft-a-edited");
+    });
+    await tick();
+    assert.equal(editedBaseUrl!.value, " A draft edited ", "the retained A draft remains editable");
+    assert.equal(editedApiKey!.value, "draft-a-edited", "the retained replacement remains editable");
+  });
+});
+
+test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets newer navigation supersede stale recovery", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+    };
+    const first: ProjectState = { path: "C:/pending-save-a", projectKey: "C:/pending-save-a", alias: "Pending A", pinned: false, sessions: [{ session_id: "session-a" }], catalogFresh: true };
+    const second: ProjectState = { path: "C:/pending-save-b", projectKey: "C:/pending-save-b", alias: "Pending B", pinned: false, sessions: [], catalogFresh: true };
+    const preferences: DesktopPreferences = {
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      recentProjects: [{ path: first.path, alias: first.alias }, { path: second.path, alias: second.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: first.projectKey, selectedSessionId: "session-a",
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let resolveSave: ((value: JsonObject) => void) | null = null;
+    let resolveShutdown: ((value: JsonObject) => void) | null = null;
+    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
+    const pendingShutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "settings.save") return pendingSave;
+        if (method === "runtime.shutdown") return pendingShutdown;
+        if (method === "runtime.initialize") return { run: null };
+        if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
+        if (method === "session.resume") return { session_id: "session-a", replay: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        if (method === "status.get") return { active_turn: false };
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      // Prevent preference bootstrap from creating an unrelated lifecycle
+      // owner; this test controls the selected Project explicitly.
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [first, second], selectedProjectKey: first.projectKey, selectedSessionId: "session-a" });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 4; index += 1) await tick();
+
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    const back = container.querySelector<HTMLButtonElement>(".settings-view__back");
+    const cancel = container.querySelector<HTMLButtonElement>('.settings-actions button[title="Cancel"]');
+    assert.ok(save && back && cancel);
+    act(() => { save!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.deepEqual(calls.map((call) => call.method), ["settings.save"], "the durable RPC is issued only after the new lifecycle owner is installed");
+    assert.equal(save!.disabled, true);
+    assert.equal(back!.disabled, true, "Back is gated while the durable request is pending");
+    assert.equal(cancel!.disabled, true, "Cancel is gated while the durable request is pending");
+    act(() => { back!.click(); cancel!.click(); });
+    await tick();
+    assert.ok(container.querySelector(".settings-view"), "a pending Save cannot leave Settings through Back or Cancel");
+
+    // Durable success releases transient Settings saving immediately, but the
+    // same owner remains in Runtime shutdown until its projection recovery is
+    // either completed or superseded.
+    resolveSave?.({ configuration: config });
+    for (let index = 0; index < 6; index += 1) await tick();
+    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
+    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
+
+    // Back is now allowed at the durable boundary. Selecting Project B takes
+    // the next generation, so A's late shutdown completion cannot continue to
+    // initialize/open/resume A or overwrite B's owner state.
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-view__back")?.click(); });
+    await tick();
+    const projectButton = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select")).find((button) => button.textContent?.includes("Pending B"));
+    assert.ok(projectButton);
+    act(() => { projectButton!.click(); });
+    for (let index = 0; index < 5; index += 1) await tick();
+    assert.equal(calls.filter((call) => call.method === "project.open").length, 0, "Project B waits for A's already-issued shutdown rather than racing it");
+    resolveShutdown?.({});
+    for (let index = 0; index < 16; index += 1) await tick();
+    assert.deepEqual(calls.filter((call) => ["runtime.initialize", "project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? null]), [["project.open", second.path]], "stale A recovery cannot publish or continue after B takes ownership");
+    assert.equal(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent?.includes("Ready"), true);
+  });
+});
+
+test("T07 durable Save failure releases its lifecycle owner without starting Runtime recovery", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
+    const calls: string[] = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        calls.push(method);
+        if (method === "settings.save") throw new Error("synthetic durable failure");
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 3; index += 1) await tick();
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
+    for (let index = 0; index < 8; index += 1) await tick();
+    assert.deepEqual(calls, ["settings.save"], "a failed durable Save never starts project recovery");
+    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /synthetic durable failure/u);
+    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false, "failure returns Save to an actionable state");
+    assert.equal(container.querySelector<HTMLElement>(".settings-view__runtime-status"), null, "failed Save leaves no stuck restarting state");
+  });
+});
+
+test("T07 unmount invalidates a pending durable Save without continuing its old recovery", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
+    const calls: string[] = [];
+    let resolveSave: ((value: JsonObject) => void) | null = null;
+    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        calls.push(method);
+        if (method === "settings.save") return pendingSave;
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, selectedProjectKey: "C:/detached-save", selectedSessionId: "session-1" });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 3; index += 1) await tick();
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
+    await tick();
+    assert.deepEqual(calls, ["settings.save"]);
+    act(() => { root.unmount(); });
+    resolveSave?.({ configuration: config });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.deepEqual(calls, ["settings.save"], "unmount prevents a late durable response from starting project recovery");
+  });
+});
+
+test("T07 newer durable Save supersedes a blocked recovery without concurrent Runtime ownership", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+    };
+    const project: ProjectState = { path: "C:/save-ownership", projectKey: "C:/save-ownership", alias: "Save ownership", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
+    const preferences: DesktopPreferences = {
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
+    };
+    const calls: string[] = [];
+    let saveCalls = 0;
+    let shutdownCalls = 0;
+    let resolveFirstShutdown: ((value: JsonObject) => void) | null = null;
+    const firstShutdown = new Promise<JsonObject>((resolve) => { resolveFirstShutdown = resolve; });
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        calls.push(method);
+        if (method === "settings.save") {
+          saveCalls += 1;
+          return { configuration: config };
+        }
+        if (method === "runtime.shutdown") {
+          shutdownCalls += 1;
+          if (shutdownCalls === 1) eventListener?.({ type: "runtime_state", state: "ready" });
+          return shutdownCalls === 1 ? firstShutdown : {};
+        }
+        if (method === "runtime.initialize") return { run: null };
+        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
+        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        if (method === "status.get") return { active_turn: false };
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: "session-1" });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 6; index += 1) await tick();
+    const save = () => {
+      const button = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+      assert.ok(button);
+      act(() => { button!.click(); });
+    };
+    save();
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(saveCalls, 1);
+    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
+    save();
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(saveCalls, 1, "the next durable Save waits behind the first owner instead of racing its in-flight Runtime RPC");
+    assert.equal(shutdownCalls, 1, "the second recovery waits for the first in-flight lifecycle RPC");
+    resolveFirstShutdown?.({});
+    for (let index = 0; index < 14; index += 1) await tick();
+    assert.equal(saveCalls, 2, "the next durable Save is issued only after the stale owner settles");
+    assert.equal(shutdownCalls, 2);
+    const lifecycle = calls.slice(calls.indexOf("settings.save")).filter((method) => ["runtime.shutdown", "runtime.initialize", "project.open", "session.resume"].includes(method));
+    assert.deepEqual(lifecycle, ["runtime.shutdown", "runtime.shutdown", "runtime.initialize", "project.open", "session.resume"], "the stale Save cannot publish or continue its old lifecycle");
+    assert.equal(container.querySelector(".settings-view__runtime-status"), null, "the terminal recovery state leaves restarting");
+    assert.equal(container.querySelector(".settings-view__runtime-error"), null, "a stale recovery does not surface a late error");
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u, "the newest Runtime owner reaches ready");
+  });
+});
+
+test("T07 completed lifecycle owner releases ordinary refreshes and runtime events", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+    };
+    const project: ProjectState = { path: "C:/lifecycle-terminal", projectKey: "C:/lifecycle-terminal", alias: "Lifecycle terminal", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
+    const preferences: DesktopPreferences = {
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let resolveShutdown: ((value: JsonObject) => void) | null = null;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const shutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "settings.save") return { configuration: config };
+        if (method === "runtime.shutdown") return await shutdown;
+        if (method === "runtime.initialize") return { run: null };
+        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
+        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
+        if (method === "project.sessions") return { sessions: [{ session_id: "session-1", preview: "refreshed" }] };
+        if (method === "status.get") return { active_turn: false };
+        if (method === "settings.get") return { configuration: config };
+        if (method === "command.complete") return { candidates: [{ value: "/model", display: "/model" }], argument_candidates: [] };
+        if (method === "command.execute") return { ui_action: { type: "session_changed", session_id: "session-1" } };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      // Keep preference bootstrap from starting a second lifecycle owner; the
+      // test supplies the selected project as its authoritative initial state.
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({
+      language: "en", view: "settings", runtimeState: "ready", configuration: config, settingsLoaded: true,
+      composerText: "/", commandCandidates: [{ value: "/model", display: "/model" }], projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
+      run: { run_id: "run-recovery", turn_id: "turn-recovery", status: "idle" },
+    });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
+    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
+
+    // Transport lifecycle envelopes cannot replace the explicit restarting
+    // state while the recovery owner is still pending.
+    act(() => { eventListener?.({ type: "runtime_state", state: "ready" }); });
+    await tick();
+    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
+    const beforeStaleTerminal = calls.length;
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-recovery", turn_id: "turn-recovery" }); });
+    await tick();
+    assert.equal(calls.slice(beforeStaleTerminal).filter((call) => call.method === "status.get").length, 0, "a terminal event cannot start a status RPC during lifecycle recovery");
+
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-view__back")?.click(); });
+    await tick();
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+    const modelTrigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
+    assert.ok(textarea && send && modelTrigger);
+    assert.equal(textarea!.disabled, true, "returning to chat keeps Composer locked during recovery");
+    assert.equal(container.querySelector<HTMLElement>(".composer")?.getAttribute("aria-disabled"), "true");
+    assert.equal(container.querySelector(".command-menu"), null, "slash completion is hidden during recovery");
+    const beforeBlockedChat = calls.length;
+    act(() => { send!.click(); modelTrigger!.click(); });
+    await tick();
+    assert.equal(calls.length, beforeBlockedChat, "chat buttons cannot issue Runtime RPC while recovery is pending");
+
+    resolveShutdown?.({});
+    for (let index = 0; index < 18; index += 1) await tick();
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u, "terminal lifecycle completion leaves Runtime ready");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "terminal lifecycle completion releases Composer");
+    const completion = container.querySelector<HTMLButtonElement>(".command-menu button");
+    assert.ok(completion, "completion controls return after recovery terminal");
+    const beforeCompletion = calls.length;
+    act(() => { completion!.click(); });
+    await tick();
+    assert.ok(calls.slice(beforeCompletion).some((call) => call.method === "command.complete"), "completion resumes after recovery terminal");
+
+    const setter = Object.getOwnPropertyDescriptor((_dom.window.HTMLTextAreaElement as typeof HTMLTextAreaElement).prototype, "value")?.set;
+    assert.ok(setter);
+    const beforeCommand = calls.length;
+    act(() => {
+      setter!.call(textarea, "/switch");
+      textarea!.dispatchEvent(new _dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "/switch" }));
+      textarea!.dispatchEvent(new _dom.window.Event("input", { bubbles: true }));
+    });
+    await tick();
+    act(() => { send!.click(); });
+    for (let index = 0; index < 6; index += 1) await tick();
+    const afterCommand = calls.slice(beforeCommand).map((call) => call.method);
+    assert.ok(afterCommand.includes("command.execute"), "command entry resumes after recovery terminal");
+    assert.ok(afterCommand.includes("status.get"), "ordinary status refresh resumes after owner cleanup");
+    assert.ok(afterCommand.includes("project.sessions"), "ordinary catalog refresh resumes after owner cleanup");
+
+    act(() => { eventListener?.({ type: "runtime_state", state: "stopped" }); });
+    await tick();
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Stopped/u, "runtime_state events are accepted after owner cleanup");
+    act(() => { eventListener?.({ type: "runtime_state", state: "ready" }); });
+    await tick();
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
+
+    const settings = container.querySelector<HTMLButtonElement>('button[title="Open Settings"]');
+    assert.ok(settings);
+    const beforeSettings = calls.length;
+    act(() => { settings!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.ok(calls.slice(beforeSettings).some((call) => call.method === "settings.get"), "settings refresh resumes after owner cleanup");
+  });
+});
+
+test("T07 navigation supersedes blocked recovery and unmount suppresses late lifecycle writes", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
+    const first: ProjectState = { path: "C:/recovery-project", projectKey: "C:/recovery-project", alias: "Recovery", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
+    const second: ProjectState = { path: "C:/navigation-project", projectKey: "C:/navigation-project", alias: "Navigation", pinned: false, sessions: [], catalogFresh: true };
+    const calls: string[] = [];
+    let shutdownCalls = 0;
+    let resolveFirstShutdown: ((value: JsonObject) => void) | null = null;
+    let resolveSecondShutdown: ((value: JsonObject) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push(method);
+        if (method === "settings.save") return { configuration: config };
+        if (method === "runtime.shutdown") {
+          shutdownCalls += 1;
+          if (shutdownCalls === 1) return new Promise<JsonObject>((resolve) => { resolveFirstShutdown = resolve; });
+          if (shutdownCalls === 2) return new Promise<JsonObject>((resolve) => { resolveSecondShutdown = resolve; });
+          return {};
+        }
+        if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
+        if (method === "runtime.initialize") return { run: null };
+        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        if (method === "status.get") return { active_turn: false };
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      // Reject preference bootstrap so the initial selected Project remains the
+      // supplied test state; this test is about the lifecycle queue itself.
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [first, second], selectedProjectKey: first.projectKey, selectedSessionId: "session-1" });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(shutdownCalls, 1);
+    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions button[title=\"Cancel\"]")?.click(); });
+    await tick();
+    const projectButton = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select")).find((button) => button.textContent?.includes("Navigation"));
+    assert.ok(projectButton);
+    act(() => { projectButton!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(shutdownCalls, 1, "navigation waits for the blocked recovery RPC instead of racing it");
+    resolveFirstShutdown?.({});
+    for (let index = 0; index < 14; index += 1) await tick();
+    assert.equal(calls.filter((method) => method === "project.open").length, 1);
+    assert.equal(calls.filter((method) => method === "session.resume").length, 0, "the stale recovery cannot resume the old session");
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
+
+    // A second blocked recovery is invalidated by unmount. Its in-flight
+    // shutdown may settle, but no late project/session lifecycle call follows.
+    act(() => { container.querySelector<HTMLButtonElement>("button[title=\"Open Settings\"]")?.click(); });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    for (let index = 0; index < 4; index += 1) await tick();
+    assert.equal(shutdownCalls, 2);
+    act(() => { root.unmount(); });
+    resolveSecondShutdown?.({});
+    for (let index = 0; index < 6; index += 1) await tick();
+    assert.equal(calls.filter((method) => method === "project.open").length, 1, "unmount invalidates the detached recovery before project.open");
+  });
+});
+
+test("T07 duplicate Save clicks issue one durable request", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
+    let resolveSave: ((value: JsonObject) => void) | null = null;
+    let saveCalls = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "settings.save") {
+          saveCalls += 1;
+          return new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
+        }
+        if (method === "settings.get") return { configuration: config };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); save!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(saveCalls, 1);
+    resolveSave?.({ configuration: config });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+  });
+});
+
 test("Prompt 2 provider editor groups and preserves every existing model field", () => {
   assert.equal(modelFieldId("dialog", "a/b", "remote"), "dialog-0061-002f-0062-remote");
   assert.equal(modelFieldId("dialog", "a/b", "remote"), modelFieldId("dialog", "a/b", "remote"));
@@ -1495,12 +2634,14 @@ test("Prompt 2 provider editor groups and preserves every existing model field",
   const request = settingsSaveRequest(draft, {}, {});
   assert.deepEqual(request.models?.primary, draft.models.primary);
   assert.deepEqual(request.models?.secondary, draft.models.secondary);
+  const staleRequest = settingsSaveRequest({ ...draft, providers: { provider: { kind: "openai_compat", api_key: "stale-revealed-value" } } }, {}, {});
+  assert.equal(staleRequest.providers?.provider?.api_key, undefined);
 });
 
 test("T07 missing optional model fields stay null instead of becoming invalid empty strings", () => {
   const state = createInitialState({ configuration: { default_model: "provider/model", default_permission_mode: "default", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
-  assert.match(markup, /provider\/model/u);
+  const markup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, />served-model</u);
   const request = settingsSaveRequest({ default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1" } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } } }, {}, {});
   assert.deepEqual(request.models?.["provider/model"], { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
   assert.doesNotMatch(JSON.stringify(request), /"display_name":""/u);
@@ -1535,6 +2676,11 @@ test("main workspace visual contract keeps 16px SVGs and readable theme tokens",
   assert.match(css, /\.timeline-entry--user \.timeline-content\s*\{[^}]*color:\s*#fff;[^}]*background:\s*#4a50b8/s);
   assert.match(css, /@media \(prefers-color-scheme: light\)[\s\S]*\.theme-system[\s\S]*--text:\s*#202027/s);
   assert.match(css, /\.theme-light\s*\{[^}]*--bg:\s*#f5f5f7;[^}]*--accent:\s*#565fd7/s);
+  assert.match(css, /\.settings-view__busy-status::before\s*\{[^}]*content:\s*"";[^}]*animation:\s*settings-save-spin/s);
+  assert.match(css, /\.settings-view\[aria-busy="true"\][^}]*opacity:\s*1[^}]*background:\s*var\(--raised\)/s);
+  assert.match(css, /@keyframes\s+settings-save-spin\s*\{[^}]*transform:\s*rotate\(360deg\)/s);
+  assert.ok(contrastRatio("#aaaab4", "#2b2b2f") >= 4.5, "dark busy disabled text remains readable on raised controls");
+  assert.ok(contrastRatio("#5f606b", "#e3e3e9") >= 4.5, "light busy disabled text remains readable on raised controls");
   for (const background of ["#1d1d1f", "#18181a", "#242427", "#2b2b2f"]) assert.ok(contrastRatio("#9696a1", background) >= 4.5);
   for (const background of ["#f5f5f7", "#ececef", "#ffffff", "#e3e3e9"]) assert.ok(contrastRatio("#5b5c67", background) >= 4.5);
 });
@@ -1602,6 +2748,21 @@ test("T04 rebootstrap stops at every failed lifecycle boundary", async () => {
     }, "C:/Projects/one", "durable-session", () => undefined, () => undefined));
     assert.deepEqual(calls, lifecycle.slice(0, lifecycle.indexOf(failedMethod) + 1));
   }
+});
+
+test("T07 rebootstrap ownership stops stale lifecycle calls and callbacks", async () => {
+  let owned = true;
+  const calls: string[] = [];
+  const opened: unknown[] = [];
+  const resumed: unknown[] = [];
+  await assert.rejects(rebootstrapProject(async (method) => {
+    calls.push(method);
+    if (method === "runtime.initialize") owned = false;
+    return { project: { path: "C:/Projects/stale" }, sessions: [], run: null };
+  }, "C:/Projects/stale", "session-stale", (result) => opened.push(result), (result) => resumed.push(result), () => owned), /no longer current/u);
+  assert.deepEqual(calls, ["runtime.shutdown", "runtime.initialize"]);
+  assert.deepEqual(opened, []);
+  assert.deepEqual(resumed, []);
 });
 
 test("T04 project removal distinguishes non-current retention from current switching/clearing", () => {
@@ -1726,38 +2887,16 @@ test("T06 runtime initialization updates permission from its safe Run projection
 
 test("T07 Settings exposes editable schema IDs and model context/token limits", () => {
   const state = createInitialState({ configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", base_url: null, api_key_configured: false } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none" } } }, settingsLoaded: true });
-  const markup = renderToStaticMarkup(<SettingsView state={state} api={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
-  assert.match(markup, /fake\/model/);
+  const markup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(markup, />Model</);
   assert.doesNotMatch(markup, /context window|max output tokens|legacy-settings-editor/i);
   assert.equal(parseOptionalPositiveInteger("128000"), 128000);
   assert.equal(parseOptionalPositiveInteger(""), null);
-  const renamedProvider = renameProviderId({ providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } }, providerOriginalIds: { fake: "fake" } }, "fake", "local");
-  assert.equal(renamedProvider.models?.["fake/model"]?.provider_profile_id, "local");
-  assert.deepEqual(renamedProvider.provider_renames, { fake: "local" });
-  const renamedAgain = renameProviderId(renamedProvider, "local", "cloud");
-  assert.deepEqual(renamedAgain.provider_renames, { fake: "cloud" });
-  assert.deepEqual(configurationRequest(renamedProvider).provider_renames, { fake: "local" });
-  assert.equal(configurationRequest(renamedProvider).providerOriginalIds, undefined);
-  const returnedToOriginal = renameProviderId(renamedAgain, "cloud", "fake");
-  assert.equal(returnedToOriginal.provider_renames, undefined);
-  assert.deepEqual(returnedToOriginal.providerOriginalIds, { fake: "fake" });
-
-  const draftProvider = renameProviderId({ providers: { provider: { kind: "fake" } } }, "provider", "local");
-  assert.equal(draftProvider.provider_renames, undefined);
-
-  const movedA = renameProviderId({
-    providers: { A: { kind: "fake" }, B: { kind: "fake" } },
-    models: { "a/model": { provider_profile_id: "A" }, "b/model": { provider_profile_id: "B" } },
-    providerOriginalIds: { A: "A", B: "B" },
-  }, "A", "X");
-  const movedBatch = renameProviderId(movedA, "B", "A");
-  assert.deepEqual(movedBatch.provider_renames, { A: "X", B: "A" });
-  assert.deepEqual(Object.keys(movedBatch.providers ?? {}).sort(), ["A", "X"]);
-  assert.equal(movedBatch.models?.["a/model"]?.provider_profile_id, "X");
-  assert.equal(movedBatch.models?.["b/model"]?.provider_profile_id, "A");
-  const renamedModel = renameModelRef({ default_model: "fake/model", models: { "fake/model": { provider_profile_id: "local" } } }, "fake/model", "local/model");
-  assert.equal(renamedModel.default_model, "local/model");
-  assert.ok(renamedModel.models?.["local/model"]);
+  const identityDraft = { providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } } };
+  const identityRequest = configurationRequest(identityDraft);
+  assert.deepEqual(Object.keys(identityRequest.providers ?? {}), ["fake"], "provider identity stays as the configuration key");
+  assert.equal(identityRequest.models?.["fake/model"]?.provider_profile_id, "fake");
+  assert.doesNotMatch(markup, /model_ref|modelReference|Profile ID|配置 ID/u);
 });
 
 test("Prompt 1 hidden Runtime is restored only from the chat header", () => {
@@ -1788,6 +2927,8 @@ test("Prompt 2 locale resources have exact parity and custom select skips disabl
   assert.match(source, /event\.stopPropagation\(\)/u);
   const settingsSource = require("node:fs").readFileSync(new URL("../src/renderer/SettingsView.tsx", import.meta.url), "utf8");
   assert.match(settingsSource, /event\.defaultPrevented/u);
+  const forbiddenRendererTokens = ["rename" + "ModelRef", "model" + "-1", "clear" + "Key"];
+  for (const token of forbiddenRendererTokens) assert.doesNotMatch(settingsSource + require("node:fs").readFileSync(new URL("../src/renderer/locales/en.ts", import.meta.url), "utf8"), new RegExp(token.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   const selectMarkup = renderToStaticMarkup(<><CustomSelect value="a" label="First" options={[{ value: "a", label: "A" }]} onChange={() => undefined} /><CustomSelect value="b" label="Second" options={[{ value: "b", label: "B" }]} onChange={() => undefined} /></>);
   assert.match(selectMarkup, /aria-haspopup="listbox"/u);
   assert.match(selectMarkup, /aria-expanded="false"/u);
@@ -2283,6 +3424,26 @@ test("T05 Composer gates ordinary sends on the Application compaction status", (
   const settled = createInitialState({ composerText: "continue", compactionStatus: { state: "completed", trigger: "manual", changed: true } });
   const settledMarkup = renderLanguage("en", <Composer state={settled} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.doesNotMatch(settledMarkup, /<textarea[^>]*disabled=""/u);
+});
+
+test("T07 Composer locks every chat control while Runtime recovery owns the lifecycle", () => {
+  const restarting = createInitialState({
+    language: "en",
+    runtimeState: "restarting",
+    composerText: "/",
+    commandCandidates: [{ value: "/model", display: "/model" }],
+    activeTurn: true,
+  });
+  const markup = renderLanguage("en", <Composer state={restarting} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
+  assert.match(markup, /class="composer"[^>]*aria-disabled="true"/u);
+  assert.match(markup, /placeholder="Runtime is restarting…"/u);
+  assert.match(markup, /<textarea[^>]*disabled=""/u);
+  assert.match(markup, /<button[^>]*title="Runtime is restarting…"[^>]*disabled=""/u);
+  assert.match(markup, /<button[^>]*title="Pause"[^>]*disabled=""/u);
+  assert.match(markup, /<button[^>]*title="Cancel"[^>]*disabled=""/u);
+  assert.match(markup, /<button[^>]*title="Default permission"[^>]*disabled=""/u);
+  assert.match(markup, /<button[^>]*title="Model"[^>]*disabled=""/u);
+  assert.doesNotMatch(markup, /class="command-menu"/u, "slash completion cannot issue a completion request during recovery");
 });
 
 test("Prompt 4 theme and responsive CSS contracts cover context ring and composer", async () => {
