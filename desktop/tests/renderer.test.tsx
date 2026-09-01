@@ -1557,7 +1557,7 @@ test("T05 Composer exposes separate steering, pause, cancel, and Python-backed c
   assert.match(markup, /引导/);
   assert.match(markup, /暂停/);
   assert.match(markup, /取消/);
-  assert.match(markup, /Select a model/);
+  assert.match(markup, /查看或切换当前模型/);
   assert.match(markup, /id="composer-state"[^>]*role="status"[^>]*aria-live="polite"/u);
   assert.doesNotMatch(markup, /full command list|hard-coded/);
 });
@@ -3789,7 +3789,7 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     const replacementArea = container.querySelector<HTMLTextAreaElement>("textarea");
     assert.ok(replacementArea);
     const replacementOptions = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button"));
-    assert.deepEqual(replacementOptions().map((button) => button.textContent?.split(" — ")[0]), ["/model"]);
+    assert.deepEqual(replacementOptions().map((button) => button.querySelector("span")?.textContent), ["/model"]);
     const replacementEvent = await press(replacementArea!, "Enter");
     assert.equal(replacementEvent.defaultPrevented, true);
     assert.deepEqual(changes.at(-1), "  /model ");
@@ -3831,6 +3831,64 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     const keyCodeEvent = await press(imeArea!, "Enter", { keyCode: 229 });
     assert.equal(keyCodeEvent.defaultPrevented, false);
     assert.equal(submitted.length, 0);
+  });
+});
+
+test("T06 slash completion uses canonical values and locale-only descriptions", async () => {
+  const candidates = [
+    { value: "/model", canonical: "model", display: "/model — 查看或切换当前模型", description: "查看或切换当前模型" },
+    { value: "/status", canonical: "status", display: "/status — 显示当前 Application 状态", description: "显示当前 Application 状态" },
+    { value: "/compact", canonical: "compact", display: "/compact — 压缩上下文", description: "压缩上下文" },
+    { value: "/plan", canonical: "plan", display: "/plan — 进入规划模式", description: "进入规划模式" },
+    { value: "/new", canonical: "new", display: "/new — 创建新会话", description: "创建新会话" },
+    { value: "/do", canonical: "do", display: "/do — 进入默认执行模式", description: "进入默认执行模式" },
+    { value: "/mystery", canonical: "mystery", display: "/mystery — 未知命令说明", description: "未知命令说明" },
+  ];
+  const state = createInitialState({ composerText: "/", commandCandidates: candidates });
+  const expected = {
+    "/model": { en: "View or switch the current model", zh: "查看或切换当前模型" },
+    "/status": { en: "Show current Application status", zh: "显示当前 Application 状态" },
+    "/compact": { en: "Compact context", zh: "压缩上下文" },
+    "/plan": { en: "Enter planning mode", zh: "进入规划模式" },
+    "/new": { en: "Create a new Session", zh: "创建新会话" },
+    "/do": { en: "Enter default execution mode", zh: "进入默认执行模式" },
+  } as const;
+
+  await withRendererDom(async (_dom, container, root) => {
+    const renderComposer = async (language: "zh-CN" | "en") => {
+      act(() => {
+        root.render(<LanguageProvider value={language}><Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} /></LanguageProvider>);
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    const readOptions = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button")).map((button) => ({
+      label: button.querySelector("span")?.textContent ?? "",
+      description: button.querySelector("small")?.textContent ?? null,
+      text: button.textContent ?? "",
+    }));
+
+    await renderComposer("en");
+    const english = readOptions();
+    assert.deepEqual(english.map((option) => option.label), ["/model", "/status", "/compact", "/plan", "/new", "/do", "/mystery"]);
+    for (const option of english.slice(0, 6)) {
+      assert.equal(option.description, expected[option.label as keyof typeof expected].en);
+      assert.equal(option.text, `${option.label}${option.description}`);
+      assert.doesNotMatch(option.text, /[\u4e00-\u9fff]/u, `English command option leaked Chinese text: ${option.text}`);
+      assert.doesNotMatch(option.text, /\s—\s/u, "the candidate display field must not be rendered");
+    }
+    assert.equal(english.at(-1)?.description, null, "unknown candidates use a non-duplicating value-only fallback");
+    assert.equal(english.at(-1)?.text, "/mystery");
+
+    await renderComposer("zh-CN");
+    const chinese = readOptions();
+    assert.deepEqual(chinese.map((option) => option.label), english.map((option) => option.label));
+    for (const option of chinese.slice(0, 6)) {
+      assert.equal(option.description, expected[option.label as keyof typeof expected].zh);
+      assert.equal(option.text, `${option.label}${option.description}`);
+    }
+    assert.equal(chinese.at(-1)?.description, null, "unknown descriptions are not copied from the Application prose");
+    assert.equal(chinese.at(-1)?.text, "/mystery");
   });
 });
 
