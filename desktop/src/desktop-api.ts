@@ -111,12 +111,18 @@ export function isJsonValue(value: unknown, seen = new Set<object>()): value is 
   if (typeof value !== "object") return false;
   if (seen.has(value)) return false;
   seen.add(value);
-  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, seen));
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return false;
-  return Object.entries(value).every(
-    ([key, item]) => typeof key === "string" && isJsonValue(item, seen),
-  );
+  try {
+    if (Array.isArray(value)) return value.every((item) => isJsonValue(item, seen));
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    return Object.entries(value).every(
+      ([key, item]) => typeof key === "string" && isJsonValue(item, seen),
+    );
+  } finally {
+    // ``seen`` tracks the current recursion path, not every object visited.
+    // Shared JSON sub-objects are valid; only a back-edge is a cycle.
+    seen.delete(value);
+  }
 }
 
 export function isJsonObject(value: unknown): value is JsonObject {

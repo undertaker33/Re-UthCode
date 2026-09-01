@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from enum import Enum
 import inspect
+import math
 from pathlib import Path
 import shlex
 import sys
@@ -19,16 +21,17 @@ from typing import TextIO
 
 from uthcode.application import (
     AgentEvent,
+    agent_event_from_dict,
     ApplicationStatus,
-    CompactionStatus,
-    ContextStatus,
     ApplicationRuntimeContext,
     PauseRequest,
+    BehaviorMode,
     BehaviorModeSelected,
     ClearTranscript,
     CommandDispatcher,
     CommandOutcome,
     CommandParser,
+    CompletionCandidate,
     ConfigurationError,
     ConfigurationInitializationRequired,
     CompletionEngine,
@@ -39,6 +42,7 @@ from uthcode.application import (
     OpenSessionPicker,
     OutcomeStatus,
     PermissionApprovalResponse,
+    PermissionMode,
     PermissionModeSelected,
     PlanReviewResponse,
     QuitInterface,
@@ -46,6 +50,7 @@ from uthcode.application import (
     RunSnapshot,
     ResumeTurnResponse,
     SessionChanged,
+    SessionCatalogEntry,
     SessionMutation,
     SessionOperationError,
     SessionReplayRecord,
@@ -165,77 +170,212 @@ def _text_param(params: Mapping[str, object], field: str) -> str:
     return value
 
 
-_SECRET_FIELD_NAMES = frozenset(
+
+
+_INVALID = object()
+
+# This is one Desktop wire contract, not a second AgentEvent schema.  The
+# Core parser remains authoritative for event type, required fields, enums,
+# and nested public DTOs.  New Core fields are intentionally ignored here
+# until Desktop has a consumer for them.
+_EVENT_OUTPUT_FIELDS = frozenset(
     {
-        "api_key",
-        "api_key_value",
-        "secret",
-        "secret_value",
-        "password",
-        "access_token",
-        "refresh_token",
+        "type",
+        "run_id",
+        "turn_id",
+        "message_id",
+        "message",
+        "iteration",
+        "segment_index",
+        "text",
+        "kind",
+        "usage",
+        "previous_mode",
+        "behavior_mode",
+        "task_state",
+        "revision",
+        "plan_text",
+        "tool_call_id",
+        "unfinished_count",
+        "steering_id",
+        "pause_id",
+        "reason",
+        "request",
+        "pause",
+        "batch_id",
+        "tool_call_ids",
+        "tool_name",
+        "command",
+        "status",
+        "is_error",
+        "final_text",
+        "termination_reason",
+        "failure_reason",
     }
+)
+_SNAPSHOT_FIELDS = frozenset(
+    {
+        "run_id",
+        "turn_id",
+        "iteration_count",
+        "tool_call_count",
+        "consecutive_unknown_tools",
+        "usage",
+        "behavior_mode",
+        "status",
+        "termination_reason",
+        "permission_mode",
+    }
+)
+_USAGE_OUTPUT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+_STATUS_OUTPUT_FIELDS = (
+    "current_model",
+    "provider_profile",
+    "provider_identity",
+    "state",
+    "context_usage",
+    "context_status",
+    "compaction_status",
+    "timeline_checkpoint_id",
+    "active_session_title",
+    "instruction_epoch",
+    "compact_count",
+    "stable_prefix_fingerprint",
+    "prefix_changed",
+    "prefix_change_reason",
+    "tool_schema_fingerprint",
+)
+_CONFIGURATION_OUTPUT_FIELDS = (
+    "default_model",
+    "default_permission_mode",
+    "providers",
+    "models",
+)
+_PAUSE_OUTPUT_FIELDS = (
+    "pause_id",
+    "run_id",
+    "turn_id",
+    "kind",
+    "reason",
+    "iteration",
+    "created_at",
+    "tool_call_id",
+    "user_input_request",
+    "permission_request",
+    "plan_review_request",
+)
+_REPLAY_OUTPUT_FIELDS = (
+    "session_id",
+    "sequence",
+    "turn_id",
+    "kind",
+    "text",
+    "tool_name",
+    "tool_call_id",
+    "status",
+    "is_error",
+    "created_at",
+    "title",
 )
 
 
-def _is_secret_field(name: str) -> bool:
-    normalized = name.casefold().replace("-", "_")
-    return normalized in _SECRET_FIELD_NAMES or normalized.endswith("_api_key")
+def _text(value: object, *, optional: bool = False, non_empty: bool = False) -> object:
+    if value is None and optional:
+        return None
+    return value if isinstance(value, str) and (not non_empty or bool(value.strip())) else _INVALID
 
 
-def _safe_value(value: object) -> object:
-    """Project only JSON values and explicitly safe Application DTOs.
+def _boolean(value: object, *, optional: bool = False) -> object:
+    if value is None and optional:
+        return None
+    return value if isinstance(value, bool) else _INVALID
 
-    Do not discover ``to_dict`` by module name.  Provider/Core models such as
-    ``ToolResultPart`` intentionally remain opaque at this boundary; only the
-    small public DTOs whose contracts are safe for an interface may be
-    serialized here.
-    """
 
-    if value is None or isinstance(value, (str, bool, int, float)):
+def _enum_value(value: object, enum_type: type[Enum]) -> object:
+    try:
+        return enum_type(value).value
+    except (TypeError, ValueError):
+        return _INVALID
+
+
+def _dto_payload(value: object, expected_type: type[object]) -> Mapping[str, object] | None:
+    if type(value) is not expected_type:
+        return None
+    try:
+        raw = value.to_dict()  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping) or not all(isinstance(key, str) for key in raw):
+        return None
+    return raw
+
+
+def _json_safe(value: object) -> object:
+    """Keep only JSON values after a typed DTO has chosen its fields."""
+
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _INVALID
     if isinstance(value, Mapping):
-        return {
-            key: _safe_value(item)
-            for key, item in value.items()
-            if isinstance(key, str) and not _is_secret_field(key)
-        }
-    if isinstance(value, (list, tuple)):
-        return [_safe_value(item) for item in value]
-    if isinstance(
-        value,
-        (
-            ApplicationStatus,
-            ContextStatus,
-            CompactionStatus,
-            PauseRequest,
-            RunSnapshot,
-            SessionMutation,
-            SessionReplayRecord,
-            UserConfigurationView,
-        ),
-    ):
+        result: dict[str, object] = {}
         try:
-            return _safe_value(value.to_dict())
+            items = value.items()
+            for key, item in items:
+                if not isinstance(key, str):
+                    return _INVALID
+                projected = _json_safe(item)
+                if projected is _INVALID:
+                    return _INVALID
+                result[key] = projected
         except Exception:
-            return None
-    if isinstance(value, Path):
-        return str(value)
-    # Unknown objects include SDK payloads and exception instances.  They
-    # have no public Application projection and must never cross the process
-    # boundary through ``str``/``repr``.
-    return None
+            return _INVALID
+        return result
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            projected = _json_safe(item)
+            if projected is _INVALID:
+                return _INVALID
+            result.append(projected)
+        return result
+    return _INVALID
+
+
+def _project_fields(value: object, fields: tuple[str, ...] | frozenset[str]) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        selected = {key: value[key] for key in fields if key in value}
+    except Exception:
+        return None
+    projected = _json_safe(selected)
+    return projected if isinstance(projected, dict) else None
+
+
+def _dto_fields(
+    value: object,
+    expected_type: type[object],
+    fields: tuple[str, ...] | frozenset[str],
+) -> dict[str, object] | None:
+    raw = _dto_payload(value, expected_type)
+    return None if raw is None else _project_fields(raw, fields)
 
 
 def _permission_mode_value(run: object) -> str | None:
-    """Read only the Run's allowlisted permission-mode projection."""
-
     try:
-        mode = getattr(run, "permission_mode", None)
-        value = getattr(mode, "value", mode)
+        value = _enum_value(getattr(run, "permission_mode", None), PermissionMode)
     except Exception:
         return None
-    return value if value in {"default", "auto", "full_access"} else None
+    return None if value is _INVALID else value  # type: ignore[return-value]
 
 
 def _action_value(action: object | None) -> dict[str, object] | None:
@@ -252,71 +392,140 @@ def _action_value(action: object | None) -> dict[str, object] | None:
     if isinstance(action, QuitInterface):
         return {"type": "quit_interface"}
     if isinstance(action, ModelSelected):
-        return {"type": "model_selected", "model_ref": action.model_ref}
+        model = _text(action.model_ref, non_empty=True)
+        return {"type": "model_selected", "model_ref": model} if model is not _INVALID else {"type": "ui_action"}
     if isinstance(action, BehaviorModeSelected):
-        return {"type": "behavior_mode_selected", "mode": action.mode.value}
+        mode = _enum_value(action.mode, BehaviorMode)
+        return {"type": "behavior_mode_selected", "mode": mode} if mode is not _INVALID else {"type": "ui_action"}
     if isinstance(action, PermissionModeSelected):
-        return {
-            "type": "permission_mode_selected",
-            "mode": action.mode.value,
-            "warning": action.warning,
-        }
+        mode = _enum_value(action.mode, PermissionMode)
+        warning = _text(action.warning, optional=True)
+        return (
+            {"type": "permission_mode_selected", "mode": mode, "warning": warning}
+            if mode is not _INVALID and warning is not _INVALID
+            else {"type": "ui_action"}
+        )
     if isinstance(action, SessionChanged):
-        return {
-            "type": "session_changed",
-            "session_id": action.session_id,
-            "restored": action.restored,
-        }
-    # An unknown UiAction is not allowed to cross the wire with its Python
-    # object representation.  The built-in registry currently has no other
-    # actions, but returning a stable marker keeps the protocol safe.
+        session_id = _text(action.session_id, non_empty=True)
+        restored = _boolean(action.restored)
+        return (
+            {"type": "session_changed", "session_id": session_id, "restored": restored}
+            if session_id is not _INVALID and restored is not _INVALID
+            else {"type": "ui_action"}
+        )
     return {"type": "ui_action"}
 
 
-def _catalog_entry(entry: object) -> dict[str, object]:
-    fields = (
-        "session_id",
-        "project_key",
-        "last_used_at",
-        "title",
-        "preview",
-        "timeline_checkpoint_id",
-        "transcript_entries",
-        "corrupt",
-    )
-    return {
-        field: _safe_value(getattr(entry, field, None))
-        for field in fields
+def _catalog_entry(entry: object) -> dict[str, object] | None:
+    if type(entry) is not SessionCatalogEntry:
+        return None
+    values = {
+        "session_id": entry.session_id,
+        "project_key": entry.project_key,
+        "last_used_at": entry.last_used_at,
+        "preview": entry.preview,
+        "timeline_checkpoint_id": entry.timeline_checkpoint_id,
+        "transcript_entries": entry.transcript_entries,
+        "corrupt": entry.corrupt,
+        "title": entry.title,
     }
+    projected = _json_safe(values)
+    return projected if isinstance(projected, dict) else None
+
+
+def _catalog_entries(values: tuple[object, ...]) -> list[dict[str, object]]:
+    result = [_catalog_entry(value) for value in values]
+    if any(value is None for value in result):
+        raise BridgeError("session_error", "Session catalog unavailable")
+    return [value for value in result if value is not None]
 
 
 def _session_mutation_value(value: object) -> dict[str, object]:
-    """Project a mutation result without crossing an unknown object boundary."""
-
-    if not isinstance(value, SessionMutation):
-        raise BridgeError("session_error", "Session mutation returned no metadata")
-    projected = _safe_value(value)
-    if not isinstance(projected, dict):  # pragma: no cover - allowlist invariant
+    projected = _dto_fields(value, SessionMutation, ("session_id", "project_key", "title"))
+    if projected is None:
         raise BridgeError("session_error", "Session mutation returned no metadata")
     return projected
 
 
 def _replay_values(values: object) -> list[object]:
-    """Keep only Application-owned durable records at the process edge."""
-
     if isinstance(values, (str, bytes, bytearray)):
         return []
     try:
         records = tuple(values)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return []
-    return [
-        _safe_value(record)
-        for record in records
-        if isinstance(record, SessionReplayRecord)
-        and record.kind in {"user", "steering", "reasoning", "assistant", "tool", "plan"}
-    ]
+    result: list[object] = []
+    for record in records:
+        if type(record) is not SessionReplayRecord:
+            continue
+        projected = _dto_fields(record, SessionReplayRecord, _REPLAY_OUTPUT_FIELDS)
+        if projected is not None:
+            result.append(projected)
+    return result
 
+
+def _application_status(value: object) -> dict[str, object] | None:
+    """Top-level status allowlist; diagnostics and configuration paths are never returned."""
+
+    return _dto_fields(value, ApplicationStatus, _STATUS_OUTPUT_FIELDS)
+
+
+def _configuration(value: object) -> dict[str, object] | None:
+    return _dto_fields(value, UserConfigurationView, _CONFIGURATION_OUTPUT_FIELDS)
+
+
+def _strings(value: object, *, non_empty: bool = False) -> list[str] | None:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, (list, tuple)):
+        return None
+    result: list[str] = []
+    for item in value:
+        projected = _text(item, non_empty=non_empty)
+        if projected is _INVALID:
+            return None
+        result.append(projected)  # type: ignore[arg-type]
+    return result
+
+
+def _completion_candidate(value: object) -> dict[str, object] | None:
+    if type(value) is not CompletionCandidate:
+        return None
+    fields_value = {
+        "canonical": _text(value.canonical, non_empty=True),
+        "display": _text(value.display, non_empty=True),
+        "description": _text(value.description),
+        "aliases": _strings(value.aliases, non_empty=True),
+        "usage": _text(value.usage, non_empty=True),
+        "argument_prompt": _text(value.argument_prompt),
+        "matched_alias": _text(value.matched_alias, optional=True),
+    }
+    if any(value is _INVALID for value in fields_value.values()) or fields_value["aliases"] is None:
+        return None
+    return {"value": f"/{fields_value['canonical']}", **fields_value}
+
+
+def _event(value: object) -> dict[str, object] | None:
+    if not isinstance(value, AgentEvent):
+        return None
+    try:
+        # Rehydrate through Core's parser so this adapter never duplicates
+        # AgentEvent's required fields, enum coercion, or nested DTO rules.
+        parsed = agent_event_from_dict(value.to_dict())
+        raw = parsed.to_dict()
+    except Exception:
+        return None
+    return _project_fields(raw, _EVENT_OUTPUT_FIELDS)
+
+
+def _snapshot(value: object) -> dict[str, object] | None:
+    result = _dto_fields(value, RunSnapshot, _SNAPSHOT_FIELDS)
+    if result is None:
+        return None
+    if "usage" in result:
+        usage = _project_fields(result["usage"], _USAGE_OUTPUT_FIELDS)
+        if usage is None:
+            return None
+        result["usage"] = usage
+    return result
 
 def _session_identity(value: object, fallback: str | None = None) -> str:
     if isinstance(value, str) and value.strip():
@@ -479,17 +688,15 @@ class DesktopBridge:
             return None
         if value is None:
             return None
-        projected = _safe_value(value)
+        projected = _snapshot(value)
         if strict and projected is None:
             raise BridgeError("projection_error", "Run projection unavailable")
-        if not isinstance(projected, dict):
+        if projected is None:
             if strict:
                 raise BridgeError("projection_error", "Run projection unavailable")
             return None
-        # RunSnapshot intentionally remains a Core-safe state DTO.  The
-        # current permission strategy belongs to the Application-owned Run,
-        # so add only its allowlisted scalar to this existing safe projection.
-        projected.pop("permission_mode", None)
+        # The current permission strategy belongs to the Application-owned
+        # Run, so add only its allowlisted scalar to this existing projection.
         permission_mode = _permission_mode_value(run)
         if permission_mode is not None:
             projected["permission_mode"] = permission_mode
@@ -504,12 +711,10 @@ class DesktopBridge:
 
     def _runtime_result(self) -> dict[str, object]:
         application = self._application
-        runtime_context = getattr(application, "runtime_context", None)
-        workdir = getattr(runtime_context, "workdir", None)
+        state = self._state if isinstance(self._state, str) else "failed"
         return {
-            "state": self._state,
+            "state": state,
             "application": application is not None,
-            "workdir": _safe_value(workdir if workdir is not None else self._workdir),
             "run": self._snapshot(),
         }
 
@@ -525,10 +730,16 @@ class DesktopBridge:
         result: dict[str, object] = {
             "runtime": self._runtime_result(),
             "active_turn": self._active_handle is not None,
-            "pending_pause": _safe_value(self._pending_pause()),
+            "pending_pause": _dto_fields(
+                self._pending_pause(),
+                PauseRequest,
+                _PAUSE_OUTPUT_FIELDS,
+            ),
         }
         if application_status is not None:
-            result["application"] = _safe_value(application_status)
+            projected = _application_status(application_status)
+            if projected is not None:
+                result["application"] = projected
         return result
 
     @staticmethod
@@ -603,7 +814,7 @@ class DesktopBridge:
             return await self._project_open(params)
         if method == "project.sessions":
             _require_params(params, set(), method=method)
-            return {"sessions": [_catalog_entry(item) for item in self._application_sessions()]}
+            return {"sessions": _catalog_entries(self._application_sessions())}
         if method == "session.new":
             return await self._session_new(params)
         if method == "session.resume":
@@ -637,7 +848,7 @@ class DesktopBridge:
                 raise BridgeError("configuration_required", "user configuration is not initialized") from None
             except ConfigurationError:
                 raise BridgeError("configuration_error", "user configuration is invalid") from None
-            return {"configuration": _safe_value(view)}
+            return {"configuration": _configuration(view)}
         if method == "settings.reveal_api_key":
             return await self._settings_reveal_api_key(params)
         if method == "settings.save":
@@ -789,10 +1000,7 @@ class DesktopBridge:
             candidate_run = self._create_run(candidate)
             candidate_dispatcher = CommandDispatcher(self._registry, candidate)
             candidate_completion = CompletionEngine(self._registry, candidate)
-            candidate_sessions = [
-                _catalog_entry(item)
-                for item in self._application_sessions_for(candidate)
-            ]
+            candidate_sessions = _catalog_entries(self._application_sessions_for(candidate))
             candidate_snapshot = self._snapshot_for(candidate_run, strict=True)
         except ConfigurationInitializationRequired:
             raise BridgeError("configuration_required", "project configuration is not initialized") from None
@@ -1201,24 +1409,22 @@ class DesktopBridge:
             )
         except Exception:
             raise BridgeError("completion_error", "command completion unavailable") from None
-        result_candidates = [
-            {
-                "value": candidate.value,
-                "canonical": candidate.canonical,
-                "display": candidate.display,
-                "description": candidate.description,
-                "aliases": list(candidate.aliases),
-                "usage": candidate.usage,
-                "argument_prompt": candidate.argument_prompt,
-                "matched_alias": candidate.matched_alias,
-            }
-            for candidate in candidates
-        ]
+        result_candidates: list[dict[str, object]] = []
+        for candidate in candidates:
+            projected = _completion_candidate(candidate)
+            if projected is None:
+                raise BridgeError("completion_error", "command completion unavailable")
+            result_candidates.append(projected)
+        projected_arguments = _strings(argument_candidates, non_empty=True)
+        usage = _text(self._completion.usage_for(invocation), optional=True)
+        argument_prompt = _text(self._completion.argument_prompt_for(invocation), optional=True)
+        if projected_arguments is None or usage is _INVALID or argument_prompt is _INVALID:
+            raise BridgeError("completion_error", "command completion unavailable")
         return {
             "candidates": result_candidates,
-            "argument_candidates": list(argument_candidates),
-            "usage": self._completion.usage_for(invocation),
-            "argument_prompt": self._completion.argument_prompt_for(invocation),
+            "argument_candidates": projected_arguments,
+            "usage": usage,
+            "argument_prompt": argument_prompt,
         }
 
     async def _command_execute(self, params: Mapping[str, object]) -> dict[str, object]:
@@ -1294,11 +1500,17 @@ class DesktopBridge:
 
     @staticmethod
     def _command_result(outcome: CommandOutcome) -> dict[str, object]:
-        status = outcome.status.value if isinstance(outcome.status, OutcomeStatus) else str(outcome.status)
+        if not isinstance(outcome, CommandOutcome):
+            raise BridgeError("command_error", "command result is invalid")
+        status = _enum_value(outcome.status, OutcomeStatus)
+        output = _text(outcome.output, optional=True)
+        error = _text(outcome.error, optional=True)
+        if status is _INVALID or output is _INVALID or error is _INVALID:
+            raise BridgeError("command_error", "command result is invalid")
         return {
             "status": status,
-            "output": outcome.output,
-            "error": outcome.error,
+            "output": output,
+            "error": error,
             "ui_action": _action_value(outcome.ui_action),
         }
 
@@ -1338,7 +1550,7 @@ class DesktopBridge:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
         except Exception:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
-        return {"configuration": _safe_value(view)}
+        return {"configuration": _configuration(view)}
 
     async def _settings_reveal_api_key(
         self,
@@ -1393,8 +1605,8 @@ class DesktopBridge:
             async for event in stream:
                 if not isinstance(event, AgentEvent):
                     raise RuntimeError("invalid event")
-                payload = _safe_value(event.to_dict())
-                if not isinstance(payload, dict):
+                payload = _event(event)
+                if payload is None:
                     raise RuntimeError("invalid event projection")
                 self._publish(AgentEventEnvelope(payload))
             result_method = getattr(handle, "result", None)

@@ -68,35 +68,6 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-export type IdleWaitResult =
-  | { state: "idle"; result: JsonValue }
-  | { state: "unavailable" | "timeout" };
-
-export interface IdleWaitOptions {
-  pollIntervalMs?: number;
-  maxAttempts?: number;
-  signal?: AbortSignal;
-}
-
-/** Wait only for the Bridge's explicit active_turn=false authority. */
-export async function waitForIdle(api: DesktopApi, options: IdleWaitOptions = {}): Promise<IdleWaitResult> {
-  const pollIntervalMs = options.pollIntervalMs ?? 25;
-  const maxAttempts = options.maxAttempts ?? 20;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (options.signal?.aborted) return { state: "unavailable" };
-    try {
-      const result = await api.requestRuntime("status.get", {});
-      const value = asObject(result);
-      if (value.active_turn === false) return { state: "idle", result };
-      if (value.active_turn !== true) return { state: "unavailable" };
-    } catch {
-      return { state: "unavailable" };
-    }
-    if (attempt + 1 < maxAttempts) await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-  }
-  return { state: "timeout" };
-}
-
 export type AuthoritativeIdleResult =
   | { state: "idle"; result: JsonValue }
   | { state: "cancelled" };
@@ -290,6 +261,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const runtimeOwnerRef = useRef<RuntimeOperationOwner | null>(null);
   const runtimeOperationTailRef = useRef<Promise<void>>(Promise.resolve());
   const settingsSaveInFlightRef = useRef(false);
+  const sessionMutationGenerationRef = useRef(0);
+  const sessionMutationSequenceRef = useRef(0);
+  const sessionMutationInFlightRef = useRef<number | null>(null);
+  const commandInFlightRef = useRef(false);
+  const interactionSubmitRef = useRef<string | null>(null);
+  const cancelInFlightRef = useRef(false);
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
 
   useEffect(() => {
@@ -345,6 +322,27 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       && stateRef.current.runtimeState !== "restarting";
   }, [waitForRuntimeLifecycleIdle]);
 
+  const beginSessionMutation = useCallback((): { sequence: number; generation: number } | null => {
+    if (sessionMutationInFlightRef.current !== null) {
+      dispatch({ type: "notice", text: t("sessionMutationBusy") });
+      return null;
+    }
+    const generation = sessionMutationGenerationRef.current + 1;
+    sessionMutationGenerationRef.current = generation;
+    const sequence = sessionMutationSequenceRef.current + 1;
+    sessionMutationSequenceRef.current = sequence;
+    sessionMutationInFlightRef.current = sequence;
+    // One gate covers both durable Session mutation methods.
+    dispatch({ type: "session_mutation_busy", value: true });
+    return { sequence, generation };
+  }, [t]);
+
+  const endSessionMutation = useCallback((sequence: number) => {
+    if (sessionMutationInFlightRef.current !== sequence) return;
+    sessionMutationInFlightRef.current = null;
+    if (mountedRef.current) dispatch({ type: "session_mutation_busy", value: false });
+  }, []);
+
   const refreshCatalog = useCallback(async (projectKey: string, reason: SessionOrderReason = "catalog_refresh", focusSessionId?: string, reportFailure = true, isOwned?: RuntimeOwnershipCheck): Promise<boolean> => {
     if (isOwned) {
       if (!isOwned()) return false;
@@ -352,6 +350,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       const result = asObject(await send("project.sessions", {}));
       if (isOwned && !isOwned()) return false;
+      if (!isOwned && (runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return false;
       const sessions = Array.isArray(result.sessions) ? result.sessions : [];
       dispatch({ type: "catalog_refreshed", projectKey, sessions, reason, focusSessionId });
       return true;
@@ -361,6 +360,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [send, t, waitForRuntimeLifecycleIdle]);
 
+  const reconcileSessionMutation = useCallback(async (projectKey: string, sequence: number): Promise<void> => {
+    // ``project.sessions`` is authoritative only for the Application's
+    // current project. Never apply that response to a different project after
+    // navigation; the next explicit project.open will reload its catalog.
+    if (!mountedRef.current || sessionMutationInFlightRef.current !== sequence) return;
+    if (stateRef.current.selectedProjectKey !== projectKey) return;
+    await refreshCatalog(projectKey, "catalog_refresh", undefined, false);
+  }, [refreshCatalog]);
+
   const refreshRuntimeStatus = useCallback(async (isOwned?: RuntimeOwnershipCheck): Promise<boolean> => {
     if (isOwned) {
       if (!isOwned()) return false;
@@ -368,6 +376,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       const result = await send("status.get", {});
       if (isOwned && !isOwned()) return false;
+      if (!isOwned && (runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return false;
       dispatch({ type: "status_loaded", result });
       return true;
     } catch {
@@ -440,12 +449,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       // A Core turn_started event is not itself an accepted boundary. Only
       // an already accepted run/turn (or the current known Run) may replace
       // poll ownership; a mismatched event must not cancel a live poll.
-      if (!latestMatches()) return;
+      if (!hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId }) || !latestMatches()) return;
       latestTurnRef.current = { runId: eventRunId, turnId: eventTurnId };
       cancelTerminalStatusPoll();
     }
     const terminal = event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled";
-    if (terminal && !latestMatches()) return;
+    if (terminal && (!hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId }) || !latestMatches())) return;
     dispatch({ type: "agent_event", event });
     if (terminal) {
       // The terminal event is published before the Bridge releases its
@@ -462,6 +471,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       const result = asObject(await send("settings.get", {}));
       if (isOwned && !isOwned()) return;
+      if (!isOwned && (runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
       dispatch({ type: "settings_loaded", configuration: asObject(result.configuration) as ConfigurationView });
     } catch {
       // An unconfigured Runtime is expected to reject this supplementary read;
@@ -726,11 +736,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [resumeSession]);
 
   const executeCommand = useCallback(async (text: string) => {
-    if (!text.trim() || !api) return;
+    if (!text.trim() || !api || commandInFlightRef.current) return;
     if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+    const generation = runtimeGenerationRef.current;
+    const isCurrent = () => mountedRef.current && runtimeGenerationRef.current === generation && runtimeOwnerRef.current === null;
+    if (!isCurrent() || commandInFlightRef.current) return;
+    commandInFlightRef.current = true;
     try {
       const result = await send("command.execute", { text });
+      if (!isCurrent()) return;
       dispatch({ type: "command_result", result });
       const source = asObject(result);
       const action = asObject(source.ui_action);
@@ -738,9 +753,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       // safe Context/Compaction projection once here; completion deltas never
       // trigger status RPCs.
       await refreshRuntimeStatus();
+      if (!isCurrent()) return;
       if (action.type === "open_model_picker") {
         try {
           const completion = asObject(await send("command.complete", { prefix: "/model " }));
+          if (!isCurrent()) return;
           const values = Array.isArray(completion.argument_candidates) ? completion.argument_candidates.filter((value): value is string => typeof value === "string") : [];
           dispatch({ type: "model_candidates", values });
         } catch {
@@ -749,15 +766,20 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
       if (action.type === "session_changed" && typeof action.session_id === "string") {
         await persist("selectedSessionId", action.session_id);
+        if (!isCurrent()) return;
         const reason: SessionOrderReason = action.restored === true ? "session_resume" : "session_new";
         await refreshCatalog(stateRef.current.selectedProjectKey ?? "", reason, action.session_id);
+        if (!isCurrent()) return;
         await refreshRuntimeStatus();
       }
       if (action.type === "quit_interface") {
+        if (!isCurrent()) return;
         await api.closeShell();
       }
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("commandFailed")) });
+      if (isCurrent()) dispatch({ type: "notice", text: errorMessage(error, t("commandFailed")) });
+    } finally {
+      commandInFlightRef.current = false;
     }
   }, [api, persist, refreshCatalog, refreshRuntimeStatus, send, waitForRuntimeUserAccess]);
 
@@ -811,37 +833,50 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     if (!api || !prefix.trimStart().startsWith("/")) return;
     if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+    const generation = runtimeGenerationRef.current;
+    const isCurrent = () => mountedRef.current && runtimeGenerationRef.current === generation && runtimeOwnerRef.current === null;
+    if (!isCurrent()) return;
     try {
       const result = await send("command.complete", { prefix });
+      if (!isCurrent()) return;
       dispatch({ type: "command_candidates", result });
     } catch {
-      dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } });
+      if (isCurrent()) dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } });
     }
   }, [api, send, waitForRuntimeUserAccess]);
 
   const sendInteraction = useCallback(async (response: JsonObject) => {
-    if (!api || !stateRef.current.pendingInteraction) return;
+    const pending = stateRef.current.pendingInteraction;
+    if (!api || !pending || interactionSubmitRef.current === pending.pauseId) return;
     if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
-    if (!stateRef.current.pendingInteraction) return;
+    if (!stateRef.current.pendingInteraction || stateRef.current.pendingInteraction.pauseId !== pending.pauseId) return;
+    interactionSubmitRef.current = pending.pauseId;
     dispatch({ type: "interaction_submitting", value: true });
     try {
       await send("turn.resume", { response });
     } catch (error) {
       dispatch({ type: "interaction_submitting", value: false });
       dispatch({ type: "notice", text: errorMessage(error, t("interactionSubmitFailed")) });
+    } finally {
+      if (interactionSubmitRef.current === pending.pauseId) interactionSubmitRef.current = null;
     }
   }, [api, send, waitForRuntimeUserAccess]);
 
   const cancelTurn = useCallback(async () => {
+    if (cancelInFlightRef.current) return;
     pendingTurnStartRef.current = null;
     if (!api) return;
     if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+    if (cancelInFlightRef.current) return;
+    cancelInFlightRef.current = true;
     try {
       await send("turn.cancel", {});
     } catch (error) {
       dispatch({ type: "notice", text: errorMessage(error, t("turnCancelFailed")) });
+    } finally {
+      cancelInFlightRef.current = false;
     }
   }, [api, send, waitForRuntimeUserAccess]);
 
@@ -928,33 +963,78 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "notice", text: t("sessionRenameActive") });
       return;
     }
-    if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
-      && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+    const mutation = beginSessionMutation();
+    if (!mutation) return;
+    const { sequence, generation: mutationGeneration } = mutation;
+    const runtimeGeneration = runtimeGenerationRef.current;
     try {
+      if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
+        && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+      if (!mountedRef.current || sessionMutationInFlightRef.current !== sequence || sessionMutationGenerationRef.current !== mutationGeneration || runtimeGenerationRef.current !== runtimeGeneration) {
+        await reconcileSessionMutation(project.projectKey, sequence);
+        return;
+      }
       const result = await send("session.rename", { session_id: session.session_id, title });
-      dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
+      const current = mountedRef.current
+        && sessionMutationInFlightRef.current === sequence
+        && sessionMutationGenerationRef.current === mutationGeneration
+        && runtimeGenerationRef.current === runtimeGeneration
+        && runtimeOwnerRef.current === null;
+      if (current) dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
+      else await reconcileSessionMutation(project.projectKey, sequence);
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("sessionRenameFailed")) });
+      await reconcileSessionMutation(project.projectKey, sequence);
+      if (mountedRef.current && sessionMutationInFlightRef.current === sequence) {
+        dispatch({ type: "notice", text: errorMessage(error, t("sessionRenameFailed")) });
+      }
+    } finally {
+      endSessionMutation(sequence);
     }
-  }, [send, t, waitForRuntimeUserAccess]);
+  }, [beginSessionMutation, endSessionMutation, reconcileSessionMutation, send, t, waitForRuntimeUserAccess]);
 
   const moveSession = useCallback(async (project: ProjectState, session: SessionSummary, target: ProjectState) => {
     if (stateRef.current.activeTurn || stateRef.current.terminalStatusPending) {
       dispatch({ type: "notice", text: t("sessionMoveActive") });
       return;
     }
-    if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
-      && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+    const mutation = beginSessionMutation();
+    if (!mutation) return;
+    const { sequence, generation: mutationGeneration } = mutation;
+    const runtimeGeneration = runtimeGenerationRef.current;
     try {
+      if ((runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")
+        && (!(await waitForRuntimeUserAccess()) || runtimeOwnerRef.current || stateRef.current.runtimeState === "restarting")) return;
+      if (!mountedRef.current || sessionMutationInFlightRef.current !== sequence || sessionMutationGenerationRef.current !== mutationGeneration || runtimeGenerationRef.current !== runtimeGeneration) {
+        await reconcileSessionMutation(project.projectKey, sequence);
+        return;
+      }
       const result = await send("session.move", { session_id: session.session_id, target_project_key: target.projectKey });
+      const current = mountedRef.current
+        && sessionMutationInFlightRef.current === sequence
+        && sessionMutationGenerationRef.current === mutationGeneration
+        && runtimeGenerationRef.current === runtimeGeneration
+        && runtimeOwnerRef.current === null;
+      if (!current) {
+        await reconcileSessionMutation(project.projectKey, sequence);
+        return;
+      }
       dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
       const pinnedSessions = stateRef.current.pinnedSessions.map((item) => item.projectKey === project.projectKey && item.sessionId === session.session_id ? { ...item, projectKey: target.projectKey } : item);
       await persist("pinnedSessions", pinnedSessions);
+      if (!mountedRef.current || sessionMutationInFlightRef.current !== sequence || sessionMutationGenerationRef.current !== mutationGeneration || runtimeGenerationRef.current !== runtimeGeneration || runtimeOwnerRef.current) {
+        await reconcileSessionMutation(project.projectKey, sequence);
+        return;
+      }
       if (stateRef.current.selectedProjectKey === project.projectKey) await refreshCatalog(project.projectKey);
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("sessionMoveFailed")) });
+      await reconcileSessionMutation(project.projectKey, sequence);
+      if (mountedRef.current && sessionMutationInFlightRef.current === sequence) {
+        dispatch({ type: "notice", text: errorMessage(error, t("sessionMoveFailed")) });
+      }
+    } finally {
+      endSessionMutation(sequence);
     }
-  }, [persist, refreshCatalog, send, t, waitForRuntimeUserAccess]);
+  }, [beginSessionMutation, endSessionMutation, persist, reconcileSessionMutation, refreshCatalog, send, t, waitForRuntimeUserAccess]);
 
   const copySessionId = useCallback(async (session: SessionSummary) => {
     if (!api) return;
@@ -1167,7 +1247,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const themeClass = `theme-${state.theme}`;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
-      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
       {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — {t("openSettings")}</button>}

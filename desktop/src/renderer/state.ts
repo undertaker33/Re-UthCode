@@ -128,6 +128,8 @@ export interface RendererState {
   selectedSessionId: string | null;
   timeline: TimelineEntry[];
   todo: TodoItem[];
+  /** Latest TaskState iteration applied for the visible Turn. */
+  todoIteration: number;
   run: RunProjection | null;
   contextUsage: ContextUsageProjection;
   compactionStatus: CompactionStatusProjection;
@@ -140,6 +142,8 @@ export interface RendererState {
   activeTurn: boolean;
   /** A terminal event was rendered, but Application has not released its active handle yet. */
   terminalStatusPending: boolean;
+  /** A Session rename/move RPC is the single in-flight mutation authority. */
+  sessionMutationBusy: boolean;
   turnStatus: "idle" | "running" | "pausing" | "paused" | "completed" | "failed" | "cancelled";
   pendingInteraction: PendingInteraction | null;
   completionBlocked: string | null;
@@ -173,6 +177,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   selectedSessionId: null,
   timeline: [],
   todo: [],
+  todoIteration: 0,
   run: null,
   contextUsage: { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" },
   compactionStatus: { state: "idle", trigger: null, changed: null },
@@ -184,6 +189,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   modelPickerOpen: false,
   activeTurn: false,
   terminalStatusPending: false,
+  sessionMutationBusy: false,
   turnStatus: "idle",
   pendingInteraction: null,
   completionBlocked: null,
@@ -492,6 +498,7 @@ export function applyProjectOpened(state: RendererState, result: unknown, preser
     selectedSessionId: null,
     timeline: [],
     todo: [],
+    todoIteration: 0,
     activeTurn: false,
     terminalStatusPending: false,
     turnStatus: "idle",
@@ -526,6 +533,7 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
     selectedSessionId: sessionId,
     timeline: replayToTimeline(Array.isArray(source.replay) ? source.replay : []),
     todo: [],
+    todoIteration: 0,
     activeTurn: false,
     terminalStatusPending: false,
     turnStatus: "idle",
@@ -606,10 +614,11 @@ export function applySessionMutation(
     pinnedSessions,
     ...(selectedSourceSession
       ? {
-        selectedSessionId: null,
-        timeline: [],
-        todo: [],
-        activeTurn: false,
+         selectedSessionId: null,
+         timeline: [],
+         todo: [],
+         todoIteration: 0,
+         activeTurn: false,
         terminalStatusPending: false,
         turnStatus: "idle" as const,
         pendingInteraction: null,
@@ -710,6 +719,7 @@ function updateAssistantFinal(state: RendererState, event: Record<string, JsonVa
   const id = eventId("assistant", event);
   const current = state.timeline.findIndex((entry) => entry.id === id);
   if (current >= 0) {
+    if (state.timeline[current]?.status === "completed" && !state.timeline[current]?.streaming) return state;
     return updateTimelineEntry(state, id, (entry) => ({ ...entry, text, status: "completed", streaming: false }));
   }
   const previousAssistant = [...state.timeline].reverse().find((entry) => entry.kind === "assistant" && entry.turnId === textValue(event.turn_id) && entry.streaming);
@@ -722,13 +732,70 @@ function updateAssistantFinal(state: RendererState, event: Record<string, JsonVa
   };
 }
 
+function isSettledTurn(state: RendererState): boolean {
+  return state.terminalStatusPending || state.turnStatus === "completed" || state.turnStatus === "failed" || state.turnStatus === "cancelled";
+}
+
+const IDENTITY_REQUIRED_EVENT_TYPES = new Set([
+  "turn_started",
+  "reasoning_started",
+  "reasoning_delta",
+  "reasoning_finished",
+  "assistant_message_delta",
+  "assistant_message_completed",
+  "tool_started",
+  "tool_finished",
+  "task_state_changed",
+  "plan_content_delta",
+  "plan_proposed",
+  "completion_blocked",
+  "user_steering_requested",
+  "user_steering_applied",
+  "turn_pausing",
+  "user_input_requested",
+  "turn_paused",
+  "turn_resumed",
+  "turn_completed",
+  "turn_failed",
+  "turn_cancelled",
+]);
+
+const SETTLED_TURN_EVENT_TYPES = new Set([
+  "reasoning_started",
+  "reasoning_delta",
+  "reasoning_finished",
+  "assistant_message_delta",
+  "assistant_message_completed",
+  "tool_started",
+  "tool_finished",
+  "task_state_changed",
+  "plan_content_delta",
+  "plan_proposed",
+  "completion_blocked",
+  "user_steering_requested",
+  "user_steering_applied",
+  "turn_pausing",
+  "user_input_requested",
+  "turn_paused",
+  "turn_resumed",
+]);
+
 function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererState {
   const payload = event as Record<string, JsonValue>;
   const type = textValue(payload.type);
-  const turnId = textValue(payload.turn_id);
+  const turnId = nonEmptyText(payload.turn_id) ?? "";
   const eventRunId = nonEmptyText(payload.run_id);
+  const currentRunId = nonEmptyText(state.run?.run_id);
+  const currentTurnId = nonEmptyText(state.run?.turn_id);
   if (eventRunId && state.ignoredRunIds.includes(eventRunId)) return state;
-  if (eventRunId && state.run?.run_id && eventRunId !== state.run.run_id) return state;
+  if (eventRunId && currentRunId && eventRunId !== currentRunId) return state;
+  // Agent events are scoped to a complete Run/Turn identity. Runtime-only
+  // diagnostics are the sole unscoped events. Once the Application has
+  // established the visible Turn, a missing or mismatched identity must not
+  // mutate that Turn's projection.
+  if (currentRunId && currentTurnId && IDENTITY_REQUIRED_EVENT_TYPES.has(type) && (!eventRunId || !turnId || eventRunId !== currentRunId || turnId !== currentTurnId)) return state;
+  if (currentTurnId && IDENTITY_REQUIRED_EVENT_TYPES.has(type) && turnId !== currentTurnId) return state;
+  if (isSettledTurn(state) && SETTLED_TURN_EVENT_TYPES.has(type)) return state;
   if (type === "runtime_state") {
     const runtimeState = payload.state;
     const allowed: RuntimeStateName[] = ["booting", "restarting", "ready", "configuration_required", "failed", "stopping", "stopped"];
@@ -743,6 +810,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
       terminalStatusPending: false,
       turnStatus: "running",
       run: { ...(state.run ?? {}), run_id: textValue(payload.run_id), turn_id: turnId, status: "running" },
+      ...(currentRunId !== eventRunId || currentTurnId !== turnId ? { todo: [], todoIteration: 0 } : {}),
       runtimeError: null,
       completionBlocked: null,
       notice: null,
@@ -760,7 +828,10 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (type === "reasoning_delta") {
     const id = eventId("reasoning", payload);
     const existing = state.timeline.find((entry) => entry.id === id);
-    if (existing) return updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), streaming: true }));
+    if (existing) {
+      if (!existing.streaming) return state;
+      return updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), streaming: true }));
+    }
     return { ...state, timeline: [...state.timeline, { id, kind: "reasoning", text: textValue(payload.text), turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_finished") {
@@ -772,7 +843,10 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const text = textValue(payload.text);
     const reasoningClosed = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     const existing = reasoningClosed.timeline.find((entry) => entry.id === id);
-    if (existing) return updateTimelineEntry(reasoningClosed, id, (entry) => ({ ...entry, text: entry.text + text, status: "streaming", streaming: true }));
+    if (existing) {
+      if (!existing.streaming) return state;
+      return updateTimelineEntry(reasoningClosed, id, (entry) => ({ ...entry, text: entry.text + text, status: "streaming", streaming: true }));
+    }
     return { ...reasoningClosed, timeline: [...reasoningClosed.timeline, { id, kind: "assistant", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "assistant_message_completed") {
@@ -799,6 +873,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const status: TimelineStatus = cancelled ? "cancelled" : failed ? "failed" : "completed";
     const endedAt = Date.now();
     const existing = state.timeline.find((entry) => entry.id === id);
+    if (existing && existing.status !== "running") return state;
     let next = existing
       ? updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError, endedAt, startedAt: entry.startedAt ?? endedAt }))
       : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, startedAt: endedAt, endedAt }] };
@@ -808,6 +883,9 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     return next;
   }
   if (type === "task_state_changed") {
+    const iteration = positiveInteger(payload.iteration);
+    if (state.todoIteration > 0 && iteration === null) return state;
+    if (iteration !== null && iteration < state.todoIteration) return state;
     const taskState = asRecord(payload.task_state);
     const items: TodoItem[] = Array.isArray(taskState?.items)
       ? taskState.items
@@ -818,7 +896,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
           return { content: textValue(item.content), status };
         })
       : [];
-    return { ...state, todo: items };
+    return { ...state, todo: items, ...(iteration !== null ? { todoIteration: iteration } : {}) };
   }
   if (type === "plan_content_delta") {
     const runId = eventRunId;
@@ -922,6 +1000,7 @@ export type RendererAction =
   | { type: "session_new"; sessionId: string; run: unknown }
   | { type: "agent_event"; event: AgentEvent }
   | { type: "interaction_submitting"; value: boolean }
+  | { type: "session_mutation_busy"; value: boolean }
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
   | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string }
@@ -1019,11 +1098,13 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new":
-      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, terminalStatusPending: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
+      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
     case "agent_event":
       return reduceAgentEvent(state, action.event);
     case "interaction_submitting":
       return state.pendingInteraction ? { ...state, pendingInteraction: { ...state.pendingInteraction, submitting: action.value } } : state;
+    case "session_mutation_busy":
+      return { ...state, sessionMutationBusy: action.value };
     case "command_candidates": {
       const source = resultRecord(action.result);
       const candidates = Array.isArray(source.candidates) ? source.candidates.map((item) => asRecord(item)).filter((item): item is Record<string, JsonValue> => item !== null).map((item) => ({ ...item, value: textValue(item.value) })) : [];
@@ -1034,7 +1115,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
     case "turn_accepted": {
       const acceptedRun = normalizeRun(action.run);
-      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null }) };
+      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0 }) };
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, turnId: next.run?.turn_id, status: "completed" }], nextStatusId: next.nextStatusId + 1 };
     }
@@ -1044,7 +1125,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const actionValue = asRecord(source.ui_action);
       const sessionChanged = actionValue?.type === "session_changed";
       if (sessionChanged && typeof actionValue.session_id === "string") {
-        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
+        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: output || null, notice: output || null, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: output || null, composerText: "" };
@@ -1079,6 +1160,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         selectedSessionId: null,
         timeline: [],
         todo: [],
+        todoIteration: 0,
         run: null,
         contextUsage: contextUsageAtBoundary(),
         permissionMode: "unknown",

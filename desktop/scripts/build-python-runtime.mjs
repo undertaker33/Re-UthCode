@@ -137,10 +137,13 @@ async function smokeBundledRuntime({ command = runtimeExecutable, args = [] } = 
     assertSmokeResponse(responses, "t08-session", "session.new");
     const status = assertSmokeResponse(responses, "t08-status", "status");
     assertSmokeResponse(responses, "t08-shutdown", "shutdown");
-    const contextDiagnostics = status.result?.application?.diagnostics?.context;
+    const applicationStatus = status.result?.application;
+    const contextStatus = applicationStatus?.context_status;
     if (
-      contextDiagnostics?.status !== "available" ||
-      typeof contextDiagnostics.stable_prefix_fingerprint !== "string"
+      contextStatus?.available !== true ||
+      contextStatus.source !== "context_compiler" ||
+      typeof applicationStatus?.stable_prefix_fingerprint !== "string" ||
+      applicationStatus.stable_prefix_fingerprint.length === 0
     ) {
       throw new Error("Runtime smoke did not compile an Application context from the bundled prompt asset");
     }

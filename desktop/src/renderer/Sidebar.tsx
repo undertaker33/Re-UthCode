@@ -11,6 +11,7 @@ export interface SidebarProps {
   selectedProjectKey: string | null;
   selectedSessionId: string | null;
   activeTurn: boolean;
+  sessionMutationBusy?: boolean;
   expandedProjects: Record<string, boolean>;
   onProjectExpandedChange: (projectKey: string, expanded: boolean) => void;
   onNewSession: () => void;
@@ -404,16 +405,23 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
     && menuTarget.sessionId === session.session_id
     && menuTarget.variant === variant;
   // A selected Session may be moved while it is idle.  The Application is
-  // the authority for the mutation; only an active Turn blocks the action.
-  const busy = props.activeTurn;
+  // the authority for the mutation; an active Turn and another pending
+  // mutation both block the action.
+  const busy = props.activeTurn || props.sessionMutationBusy === true;
   const moveTargets = props.projects.filter((item) => item.projectKey !== project.projectKey);
-  const moveDisabledReason = props.activeTurn ? t("sessionMoveActive") : undefined;
+  const moveDisabledReason = props.activeTurn
+    ? t("sessionMoveActive")
+    : props.sessionMutationBusy
+      ? t("sessionMutationBusy")
+      : undefined;
   const canMutate = !session.corrupt;
   const renameDisabledReason = !canMutate
     ? t("sessionCorrupt")
     : props.activeTurn
       ? t("sessionRenameActive")
-      : undefined;
+      : props.sessionMutationBusy
+        ? t("sessionMutationBusy")
+        : undefined;
   const actions: MenuAction[] = [
     {
       id: "toggle-pin",
@@ -429,7 +437,7 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
       id: "rename",
       label: t("rename"),
       icon: "edit",
-      disabled: !canMutate || props.activeTurn,
+      disabled: !canMutate || busy,
       disabledReason: renameDisabledReason,
       onSelect: () => {
         setDraft(session.title ?? session.preview ?? "");
@@ -479,6 +487,8 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
       {editing ? <input
         className="session-title-input"
         autoFocus
+        disabled={props.sessionMutationBusy === true}
+        aria-busy={props.sessionMutationBusy === true ? "true" : undefined}
         aria-label={`${t("rename")} ${sessionLabel(session)}`}
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
@@ -541,5 +551,5 @@ export function Sidebar(props: SidebarProps) {
     },
     [props.projects, props.selectedSessionId],
   );
-  return <aside className="sidebar" aria-label={t("projects")}><header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header><div className="sidebar-primary"><button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button><button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button></div><nav className="sidebar-scroll"><Group title={t("pinned")} projects={pinned} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Group title={t("projects")} projects={projects} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Recent entries={recent} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />{props.projects.length === 0 && <p className="empty-line">{t("openProject")}</p>}</nav><footer className="sidebar-footer"><button type="button" title={t("openSettings")} onClick={props.onOpenSettings}><UiIcon name="settings" />{t("settings")}</button></footer></aside>;
+  return <aside className="sidebar" aria-label={t("projects")} aria-busy={props.sessionMutationBusy === true ? "true" : undefined}><header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header><div className="sidebar-primary"><button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button><button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button></div><nav className="sidebar-scroll"><Group title={t("pinned")} projects={pinned} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Group title={t("projects")} projects={projects} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Recent entries={recent} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />{props.projects.length === 0 && <p className="empty-line">{t("openProject")}</p>}</nav><footer className="sidebar-footer"><button type="button" title={t("openSettings")} onClick={props.onOpenSettings}><UiIcon name="settings" />{t("settings")}</button></footer></aside>;
 }
