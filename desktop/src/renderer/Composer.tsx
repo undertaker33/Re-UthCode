@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { ConfigurationView, ContextUsageProjection, PermissionModeProjection, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
-import { useTranslation } from "./i18n";
+import { useTranslation, type TranslationKey } from "./i18n";
 import { stateLabel } from "./RuntimePanel";
 import { UiIcon } from "./UiIcon";
 
@@ -18,9 +18,26 @@ export function permissionSelectValue(mode: PermissionModeProjection): string {
 
 type CompletionOption = {
   value: string;
-  display?: string;
   description?: string;
 };
+
+// Completion descriptions are presentation-only. The Application-provided
+// candidate value remains the command label and execution input; this map
+// only replaces registry prose with the active locale for known commands.
+const localizedCommandDescriptionKeys: Partial<Record<string, TranslationKey>> = {
+  "/model": "commandDescriptionModel",
+  "/status": "commandDescriptionStatus",
+  "/compact": "commandDescriptionCompact",
+  "/plan": "commandDescriptionPlan",
+  "/new": "commandDescriptionNew",
+  "/do": "commandDescriptionDo",
+};
+
+function localizedCommandDescription(value: string, translate: (key: TranslationKey) => string): string | undefined {
+  const command = value.trim().split(/\s+/u)[0]?.toLowerCase() ?? "";
+  const key = localizedCommandDescriptionKeys[command];
+  return key ? translate(key) : undefined;
+}
 
 /** Move through completion options with the same cyclic model as CustomSelect. */
 export function nextCompletionIndex(options: readonly CompletionOption[], current: number, step: 1 | -1): number {
@@ -121,19 +138,18 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
     if (pending || terminalStatusPending || runtimeRestarting || !slashMode) return [];
-    if (state.argumentCandidates.length > 0) return state.argumentCandidates.map((value) => ({ value, display: value }));
+    if (state.argumentCandidates.length > 0) return state.argumentCandidates.map((value) => ({ value }));
     return state.commandCandidates
       .filter((candidate) => {
-        const value = (candidate.canonical || candidate.value || "").trim().split(/\s+/u)[0];
+        const value = candidate.value.trim().split(/\s+/u)[0] ?? "";
         return !hiddenCommands.has(value.startsWith("/") ? value : `/${value}`);
       })
       .map((candidate) => ({
         value: candidate.value,
-        display: candidate.display,
-        description: candidate.description,
+        description: localizedCommandDescription(candidate.value, t),
       }));
-  }, [pending, runtimeRestarting, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
-  const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.display ?? ""}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
+  }, [language, pending, runtimeRestarting, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
+  const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
 
   useEffect(() => {
     setActiveCompletion(edgeCompletionIndex(candidates, false));
@@ -225,7 +241,7 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   return (
     <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined}>
       {completionOpen && candidates.length > 0 && <div className="command-menu" role="listbox" aria-label={t("commandCompletion")}>
-        {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display || candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
+        {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
       <div className="composer-input">

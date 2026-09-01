@@ -389,3 +389,49 @@
 - `conda run --no-capture-output -n re-uthcode npx tsx --test --test-name-pattern="buffers synchronous turn.start" tests/renderer.test.tsx`（cwd `desktop`）：exit code 0，**1 test / 1 pass / 0 fail**。
 - `conda run --no-capture-output -n re-uthcode npm test`（cwd `desktop`）：首次全量在同步 `turn.start` buffer 用例出现一次退避计数时序失败（`statusCalls` 实际 3、断言 2），随后同一代码立即重跑通过；最终 **147 tests / 147 pass / 0 fail / 0 skipped**，包含 Renderer、Main/Preload、Runtime process、CDP isolation、packaging 与 T08 smoke。
 - `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；最终 Checklist 与本 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
+
+## 第 8 轮复审：命令候选 locale 投影与结果 DTO 审计（2026-09-02，真实 EOF 追加）
+
+本轮只处理 W06 复审重新派发的 Renderer 命令展示范围；本节在文件真实 EOF 追加，未移动、删除或改写任何历史记录，未执行任何 Git 写操作。
+
+### 已实施
+
+- `desktop/src/renderer/Composer.tsx` 的候选菜单以 Application 返回的 `candidate.value` 作为唯一命令标签，不再渲染 `candidate.display`；因此 `/compact — 压缩上下文` 不会在标签中重复出现。候选选择和提交仍使用该 `value`，Renderer 没有复制命令执行、解析或注册 authority。
+- 已知 `/model`、`/status`、`/compact`、`/plan`、`/new`、`/do` 的候选说明改为 Renderer 仅展示用的 locale key 映射，zh-CN/en 各自从现有资源读取；未知候选不复制 Application 的 `display/description`，使用不重复的 value-only fallback。参数候选同样只显示 value。
+- `desktop/src/renderer/locales/en.ts` 与 `desktop/src/renderer/locales/zh-CN.ts` 增加六个命令说明并保持资源 parity；`desktop/tests/renderer.test.tsx` 更新旧的 display 断言并新增真实 React DOM 测试，覆盖六个已知命令、未知候选、zh-CN/en、canonical label、无 `—`/无重复 DOM、无 English 中文泄漏，以及原有 keyboard/IME/选择路径。
+
+### command.execute DTO 缺口与停止范围
+
+- 只读核实当前真实合同：Bridge `command.complete` 候选包含 `value/canonical/display/description`；Bridge `command.execute` 的 `_command_result` 仅返回 `status/output/error/ui_action`，没有 `command_kind`、`result_kind`、`message_code` 或等价稳定身份。`ui_action.type` 只覆盖带 UI action 的命令。
+- Application 当前 `/compact` 成功/no-change 文本来自无结构化 code 的中文 `output`，且没有 `ui_action`；`/status` 的命令结果同样是 actionless output。二者都只能看到通用 `status=success`，无法从 result DTO 唯一判断具体产品 message。按 Prompt 的 DTO 缺口规则，本轮停止 actionless command-result 的 English 本地化子范围，不使用输出字符串猜测，也不复制命令 registry；因此 packaged English `/compact` terminal 的中文 output 仍是明确遗留风险，需范围外 Application/Bridge 提供 canonical command 或稳定 result/message code 后再收口。`/new`、`/plan`、`/do`、`/model` 的主要返回是稳定 `ui_action.type`，本轮未伪造新的结果 authority。
+- 未修改 `src/uthcode/interfaces/desktop/bridge.py`、Application/Python、Main/Preload、CDP harness、W06 docs/checklist、Settings T07 生产逻辑或 T10 文件；未因缺口创建 TS fallback/第二 store。
+
+### 本轮 Checklist 与精确验证
+
+- 冻结 Checklist 未修改、未新增勾选。本轮 W03 既有已勾选项保持原状；本轮候选 zh/en/未知 DOM 证据未被冒充为 Windows/Electron packaged、真实 computed layout/zoom、真实 IME/reduced-motion 或 actionless command-result 本地化证据。上述真实人工/DTO 缺口继续保持未完成状态。
+- `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd `desktop`）：exit code 0，`tsc --noEmit` 通过。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd `desktop`）：exit code 0，**109 tests / 109 pass / 0 fail / 0 skipped**。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/cdp-isolation.test.ts`（cwd `desktop`）：exit code 0，**8 tests / 8 pass / 0 fail / 0 skipped**；未复现 `driver_failure`。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd `desktop`）：exit code 0，**148 tests / 148 pass / 0 fail / 0 skipped**；包含 Renderer、Main/Preload、Runtime process、CDP isolation、packaging 与 T08 smoke。
+- `git diff --check`：本轮结果 exit code 0，无 whitespace error；UTF-8 guard 结果在本节末尾追加。全程未执行 commit、push、merge、rebase、tag、release、分支切换或归档。
+
+### 本轮未验证项与风险
+
+- 未验证真实 Windows/Electron dev/packaged GUI 的 computed overflow、DPI/100%/125%/150% zoom、真实 IME、系统 reduced-motion、人工 keyboard/mouse 矩阵或 Provider 网络；本轮 JSDOM 只证明真实 React DOM 的候选 label/description/locale contract。
+- `command.execute` actionless output 的 English 本地化仍受上述公共 DTO 缺口阻塞；不得把 `/compact`/`/status` 的输入文本或中文 output 字符串当作 Renderer 命令/结果 authority。该风险已明确报告，需由授权范围外的公共 DTO 变更解决。
+
+### 第 8 轮 UTF-8 guard 实际结果（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；Checklist 与本 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
+
+### W03 范围 Checklist 精确快照（本轮未改勾选）
+
+本轮完成时，W03 负责范围已有且仅已有下列已验证项；以下是 Feedback 快照，不是对冻结 Checklist 的改写或新增勾选：
+
+- T05 `[x]` Desktop `typecheck` 与全量测试证据；`[x]` Context ring/Runtime 只消费 Application status authority；`[x]` message/tool/timeline/compact 只在权威边界刷新 status 且 terminal/result race 不读陈旧最终状态；`[x]` manual compact running 的 Composer gate 与 terminal 恢复；`[x]` Session refresh/resume/rename 保持顺序、new message/pin 才提升。
+- T06 `[x]` Slash Arrow/Home/End/Enter/Tab/Escape、IME、select flip 与 focus restoration；`[x]` Tool 同一 row、elapsed 冻结及 icon/text/ARIA；`[x]` Todo replace-all 单一浮层；`[x]` Plan draft/final/review/failure/cancel；`[x]` AskUser 多题、review、typed response 与 cancel。
+- 本轮新增候选 zh/en/unknown DOM contract 测试没有使真实 Windows/packaged、150% zoom、真实 IME/reduced-motion、actionless result locale 或其他原为 `[ ]` 的 Checklist 项变成已验证；历史章节与 Checklist 均保持原状。
+
+### 第 8 轮最终 EOF guard 重跑
+
+- 在本节全部内容追加完成后再次执行 `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；最终 Checklist 与 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
