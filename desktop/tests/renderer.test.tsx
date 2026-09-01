@@ -20,7 +20,7 @@ import {
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
+import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, safeErrorMessage } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
@@ -169,6 +169,125 @@ test("semantic shell mounts without prototype state", () => {
   assert.match(markup, /Runtime/);
   assert.doesNotMatch(markup, /Log out|Usage|account|Hover preview|demo/u);
   assert.doesNotMatch(markup, /prompt\(|confirm\(/u);
+});
+
+test("T08 renderer error projection keeps transport details out of both localized UIs", () => {
+  const failures: unknown[] = [
+    Object.assign(new Error("Runtime request settings.get failed: user config not initialized"), { name: "RuntimeRequestError" }),
+    { name: "RuntimeRequestError", message: "RuntimeRequestError: settings.get /private/config.toml" },
+    { error: { name: "RuntimeRequestError", message: "preference.write failed: EPERM C:\\Users\\user\\config.toml" } },
+    { code: "EPERM", message: "native rejection from sandbox bundle" },
+    "unknown native rejection",
+    null,
+  ];
+  for (const language of ["zh-CN", "en"] as const) {
+    const fallback = translate(language, "settingsSaveFailed");
+    for (const failure of failures) {
+      assert.equal(safeErrorMessage(failure, fallback), fallback);
+      assert.doesNotMatch(safeErrorMessage(failure, fallback), /RuntimeRequestError|settings\.get|preference\.write|EPERM|sandbox bundle|config\.toml|native rejection/u);
+    }
+  }
+});
+
+test("T08 App presents localized safe fallbacks for settings, preference, and bundled Runtime failures", async () => {
+  const projectPath = "C:/sandbox-project";
+  const preferences = (language: "zh-CN" | "en", selectedProjectKey: string | null = null): DesktopPreferences => ({
+    theme: "system",
+    language,
+    windowBounds: { width: 1100, height: 760, maximized: false },
+    panelMode: "docked",
+    recentProjects: selectedProjectKey ? [{ path: selectedProjectKey }] : [],
+    projectAliases: {},
+    pinnedProjectKeys: [],
+    pinnedSessions: [],
+    expandedProjects: {},
+    selectedProjectKey,
+    selectedSessionId: null,
+  });
+  const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+
+  for (const language of ["zh-CN", "en"] as const) {
+    await withRendererDom(async (_dom, container, root) => {
+      const stored = preferences(language);
+      const rawSettingsGet = "RuntimeRequestError: settings.get user config not initialized /private/config.toml";
+      const rawPreferenceWrite = "Error: preference.write EPERM C:\\Users\\user\\config.toml";
+      const rawSave = "RuntimeRequestError: settings.save native rejection RuntimeRequestError";
+      const api: DesktopApi = {
+        openProject: async () => null,
+        openProjectInExplorer: async () => undefined,
+        copySessionId: async () => undefined,
+        closeShell: async () => undefined,
+        requestRuntime: async (method) => {
+          if (method === "settings.get") throw new Error(rawSettingsGet);
+          if (method === "settings.save") throw new Error(rawSave);
+          return {};
+        },
+        subscribeAgentEvents: () => () => undefined,
+        readPreference: async (key) => stored[key],
+        writePreference: async () => { throw new Error(rawPreferenceWrite); },
+      };
+      const configuration = {
+        default_model: "provider/model",
+        default_permission_mode: "default" as const,
+        providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
+        models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
+      };
+      const state = createInitialState({ language, view: "settings", configuration, settingsLoaded: true });
+      act(() => { root.render(<App initialState={state} api={api} />); });
+      for (let index = 0; index < 4; index += 1) await flush();
+
+      const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+      assert.ok(save);
+      act(() => { save!.click(); });
+      for (let index = 0; index < 10; index += 1) await flush();
+      const saveError = container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "";
+      assert.equal(saveError, translate(language, "settingsSaveFailed"));
+      assert.doesNotMatch(container.textContent ?? "", /RuntimeRequestError|settings\.save|native rejection|config\.toml/u);
+
+      const theme = Array.from(container.querySelectorAll<HTMLButtonElement>(".custom-select__trigger"))
+        .find((button) => button.title === translate(language, "theme"));
+      assert.ok(theme);
+      act(() => { theme!.click(); });
+      await flush();
+      const alternateTheme = container.querySelector<HTMLButtonElement>(`[role="option"][title="${language === "en" ? "Light" : "浅色"}"]`);
+      assert.ok(alternateTheme);
+      act(() => { alternateTheme!.click(); });
+      for (let index = 0; index < 4; index += 1) await flush();
+      act(() => { container.querySelector<HTMLButtonElement>(`.settings-view__back[title="${translate(language, "back")}"]`)?.click(); });
+      await flush();
+      assert.match(container.querySelector<HTMLElement>(".timeline-notice")?.textContent ?? "", new RegExp(language === "en" ? "Desktop preferences are unavailable" : "桌面偏好不可用", "u"));
+      assert.doesNotMatch(container.textContent ?? "", /EPERM|preference\.write|config\.toml|RuntimeRequestError|native rejection/u);
+
+      const settingsButton = container.querySelector<HTMLButtonElement>(`.sidebar-footer button[title="${translate(language, "openSettings")}"]`);
+      assert.ok(settingsButton);
+      act(() => { settingsButton!.click(); });
+      for (let index = 0; index < 8; index += 1) await flush();
+      const settingsError = container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "";
+      assert.equal(settingsError, translate(language, "configUnavailable"));
+      assert.doesNotMatch(container.textContent ?? "", /RuntimeRequestError|settings\.get|user config not initialized|config\.toml/u);
+    });
+  }
+
+  await withRendererDom(async (_dom, container, root) => {
+    const stored = preferences("en", projectPath);
+    const rawSandboxFailure = "RuntimeBoundaryError: bundled Runtime sandbox launch failed at C:\\resources\\uthcode-runtime";
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "runtime.initialize") throw new Error(rawSandboxFailure);
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => stored[key],
+      writePreference: async () => stored,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en" })} api={api} />); });
+    for (let index = 0; index < 12; index += 1) await flush();
+    assert.match(container.querySelector<HTMLElement>(".configuration-banner")?.textContent ?? "", /Runtime could not start/u);
+    assert.doesNotMatch(container.textContent ?? "", /RuntimeBoundaryError|sandbox launch failed|uthcode-runtime|resources/u);
+  });
 });
 
 test("project groups, session state, and Runtime projections remain connected", () => {
@@ -2457,7 +2576,8 @@ test("T07 durable Settings Save failure keeps the A draft after the modal closes
     for (let index = 0; index < 10; index += 1) await tick();
     assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
     assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "false");
-    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /synthetic durable failure/u);
+    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /Configuration could not be saved/u);
+    assert.doesNotMatch(container.textContent ?? "", /synthetic durable failure/u);
     assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
 
     const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
@@ -2593,7 +2713,8 @@ test("T07 durable Save failure releases its lifecycle owner without starting Run
     act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
     for (let index = 0; index < 8; index += 1) await tick();
     assert.deepEqual(calls, ["settings.save"], "a failed durable Save never starts project recovery");
-    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /synthetic durable failure/u);
+    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /Configuration could not be saved/u);
+    assert.doesNotMatch(container.textContent ?? "", /synthetic durable failure/u);
     assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false, "failure returns Save to an actionable state");
     assert.equal(container.querySelector<HTMLElement>(".settings-view__runtime-status"), null, "failed Save leaves no stuck restarting state");
   });
