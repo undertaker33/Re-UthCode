@@ -399,10 +399,13 @@ def _action_value(action: object | None) -> dict[str, object] | None:
         return {"type": "behavior_mode_selected", "mode": mode} if mode is not _INVALID else {"type": "ui_action"}
     if isinstance(action, PermissionModeSelected):
         mode = _enum_value(action.mode, PermissionMode)
-        warning = _text(action.warning, optional=True)
+        # The warning is Application-owned prose (currently Chinese).  It is
+        # intentionally represented as a boolean semantic flag so Renderer
+        # locale resources, rather than command output, own the copy.
+        warning = action.warning is not None
         return (
             {"type": "permission_mode_selected", "mode": mode, "warning": warning}
-            if mode is not _INVALID and warning is not _INVALID
+            if mode is not _INVALID
             else {"type": "ui_action"}
         )
     if isinstance(action, SessionChanged):
@@ -1457,7 +1460,7 @@ class DesktopBridge:
             raise BridgeError("command_error", "command dispatch failed") from None
         if outcome is None:
             raise BridgeError("usage_error", "input is not a Slash command")
-        result = self._command_result(outcome)
+        result = self._command_result(outcome, invocation=invocation)
         action = outcome.ui_action
         if isinstance(action, SessionChanged):
             # Dispatcher owns the transactional Application Session switch;
@@ -1469,8 +1472,6 @@ class DesktopBridge:
                 # Session/Run mismatch this boundary prevents.
                 raise BridgeError("session_error", "Session Run could not be prepared")
             self._run = candidate_run
-            result["replay"] = _replay_values(action.replay)
-            result["run"] = self._snapshot()
         elif isinstance(action, BehaviorModeSelected):
             run = self._require_run()
             setter = getattr(run, "set_behavior_mode", None)
@@ -1488,9 +1489,26 @@ class DesktopBridge:
                     setter(action.mode)
                 except Exception:
                     raise BridgeError("command_error", "permission mode could not be selected") from None
-            result["run"] = self._snapshot()
         elif isinstance(action, QuitInterface):
             await self.shutdown(publish_state=True)
+        # Build the params only after Application/UI actions have settled, so
+        # Session and compaction projections describe the authoritative new
+        # boundary.  The helper never inspects CommandOutcome.output/error.
+        result["params"] = self._command_params(
+            invocation.canonical,
+            action,
+            result["status"],
+        )
+        if isinstance(action, SessionChanged):
+            params_value = result["params"]
+            if isinstance(params_value, dict):
+                params_value["replay"] = _replay_values(action.replay)
+                params_value["run"] = self._snapshot()
+        elif isinstance(action, PermissionModeSelected):
+            params_value = result["params"]
+            if isinstance(params_value, dict):
+                params_value["run"] = self._snapshot()
+        self._finalize_command_code(result)
         return result
 
     def _require_application(self) -> object:
@@ -1499,20 +1517,135 @@ class DesktopBridge:
         return self._application
 
     @staticmethod
-    def _command_result(outcome: CommandOutcome) -> dict[str, object]:
+    def _command_result(
+        outcome: CommandOutcome,
+        *,
+        invocation: object | None = None,
+    ) -> dict[str, object]:
         if not isinstance(outcome, CommandOutcome):
             raise BridgeError("command_error", "command result is invalid")
         status = _enum_value(outcome.status, OutcomeStatus)
-        output = _text(outcome.output, optional=True)
-        error = _text(outcome.error, optional=True)
-        if status is _INVALID or output is _INVALID or error is _INVALID:
+        if status is _INVALID:
             raise BridgeError("command_error", "command result is invalid")
+        source_invocation = invocation if invocation is not None else outcome.invocation
+        canonical = getattr(source_invocation, "canonical", None)
+        definition = getattr(source_invocation, "definition", None)
+        command = canonical if isinstance(canonical, str) and definition is not None else "unknown"
+        if status == OutcomeStatus.SUCCESS.value:
+            code = "command_completed"
+        elif status == OutcomeStatus.UNKNOWN_COMMAND.value:
+            code = "command_unavailable"
+        elif status == OutcomeStatus.USAGE_ERROR.value:
+            code = "command_usage_error"
+        else:
+            code = "command_failed"
         return {
+            "command": command,
             "status": status,
-            "output": output,
-            "error": error,
+            "code": code,
+            "params": {},
             "ui_action": _action_value(outcome.ui_action),
         }
+
+    def _command_params(
+        self,
+        canonical: str | None,
+        action: object | None,
+        status: object,
+    ) -> dict[str, object]:
+        """Return the narrow, semantic params consumed by Desktop UI.
+
+        Application command handlers intentionally continue to return their
+        existing text for CLI/TUI.  This boundary does not parse or forward
+        that text; known Desktop commands are projected from their canonical
+        invocation, typed UI action, and existing safe status projection.
+        """
+
+        if status != OutcomeStatus.SUCCESS.value:
+            return {}
+        if canonical == "status":
+            # `/status` and `status.get` must be the same safe source.  The
+            # built-in command's diagnostic string is intentionally ignored.
+            return self._status_result()
+        if canonical == "help":
+            # Desktop already exposes canonical command values through
+            # `command.complete`; the current UI only needs the localized
+            # semantic notice for `/help`.  Do not ship an unconsumed command
+            # list that would become a second help contract.
+            return {}
+        if canonical == "compact":
+            # Compaction result details are read from Application.status(),
+            # never inferred from its localized handler output.
+            try:
+                status_result = self._status_result()
+            except BridgeError:
+                return {}
+            application = status_result.get("application")
+            if not isinstance(application, Mapping):
+                return {}
+            compaction = application.get("compaction_status")
+            if not isinstance(compaction, Mapping):
+                return {}
+            projected = _json_safe(dict(compaction))
+            return {"compaction_status": projected} if isinstance(projected, dict) else {}
+
+        projected_action = _action_value(action)
+        if not isinstance(projected_action, dict):
+            return {}
+        params = {
+            key: value
+            for key, value in projected_action.items()
+            if key != "type"
+        }
+        projected = _json_safe(params)
+        return projected if isinstance(projected, dict) else {}
+
+    @staticmethod
+    def _finalize_command_code(result: dict[str, object]) -> None:
+        """Choose a stable result code without reading free-form text."""
+
+        if result.get("status") != OutcomeStatus.SUCCESS.value:
+            return
+        command = result.get("command")
+        action = result.get("ui_action")
+        action_type = action.get("type") if isinstance(action, Mapping) else None
+        if action_type == "clear_transcript":
+            result["code"] = "transcript_cleared"
+        elif action_type == "open_model_picker":
+            result["code"] = "model_picker_opened"
+        elif action_type == "open_permission_picker":
+            result["code"] = "permission_picker_opened"
+        elif action_type == "open_session_picker":
+            result["code"] = "session_picker_opened"
+        elif action_type == "model_selected":
+            result["code"] = "model_selected"
+        elif action_type == "behavior_mode_selected":
+            result["code"] = "behavior_mode_selected"
+        elif action_type == "permission_mode_selected":
+            result["code"] = "permission_mode_selected"
+        elif action_type == "session_changed":
+            params = result.get("params")
+            restored = params.get("restored") if isinstance(params, Mapping) else False
+            result["code"] = "session_resumed" if restored is True else "session_created"
+        elif action_type == "quit_interface":
+            result["code"] = "interface_quit"
+        elif command == "status":
+            result["code"] = "status_ready"
+        elif command == "compact":
+            params = result.get("params")
+            compaction = params.get("compaction_status") if isinstance(params, Mapping) else None
+            state = compaction.get("state") if isinstance(compaction, Mapping) else None
+            changed = compaction.get("changed") if isinstance(compaction, Mapping) else None
+            if state == "no_change" or changed is False:
+                result["code"] = "compact_no_change"
+            elif state == "cancelled":
+                result["code"] = "compact_cancelled"
+            elif state == "failed":
+                result["code"] = "compact_failed"
+            else:
+                result["code"] = "compact_completed"
+        elif command == "help":
+            result["code"] = "help_ready"
 
     async def _settings_save(self, params: Mapping[str, object]) -> dict[str, object]:
         configuration_fields = {

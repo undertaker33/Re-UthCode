@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
-import { isJsonValue } from "../src/desktop-api";
+import { isDesktopCommandResult, isJsonValue } from "../src/desktop-api";
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject } from "../src/desktop-api";
 
 import {
@@ -20,7 +20,7 @@ import {
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, safeErrorMessage } from "../src/renderer/App";
+import { App, commandResultNotice, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, safeErrorMessage } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
@@ -967,7 +967,7 @@ test("T05 App routes direct commands and waits for terminal status authority", a
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
-        if (method === "command.execute") return { ui_action: { type: "command_executed" }, output: "compact complete" };
+        if (method === "command.execute") return { command: "compact", status: "success", code: "compact_completed", params: {}, ui_action: { type: "command_executed" } };
         if (method === "status.get") {
           if (terminalStatusPoll) {
             const active = terminalStatusCalls < 2;
@@ -1017,6 +1017,97 @@ test("T08 DesktopApi JSON validation accepts shared data and rejects cycles", ()
   const cyclic: Record<string, unknown> = {};
   cyclic.self = cyclic;
   assert.equal(isJsonValue(cyclic), false, "a recursive back-edge is not valid JSON");
+});
+
+test("T09 typed command results localize semantic codes and reject free-form output", () => {
+  const typed = { command: "compact", status: "success", code: "compact_completed", params: {}, ui_action: null };
+  assert.equal(isDesktopCommandResult(typed), true);
+  assert.equal(isDesktopCommandResult({ ...typed, output: "native/private output" }), false);
+  assert.equal(commandResultNotice({ ...typed, output: "native/private output" }, (key) => translate("en", key)), "Compaction · completed");
+  assert.equal(commandResultNotice({ ...typed, code: "compact_no_change" }, (key) => translate("zh-CN", key)), "上下文压缩 · 无变化");
+
+  const state = reduceRendererState(createInitialState(), {
+    type: "command_result",
+    result: { ...typed, ui_action: { type: "clear_transcript" }, output: "native/private output", error: "native error" },
+  });
+  assert.equal(state.notice, null, "the reducer does not promote free-form command text");
+  assert.equal(state.commandOutput, null, "command output is renderer-localized, never Application prose");
+  assert.equal(state.timeline.length, 0);
+});
+
+test("T09 App consumes typed status params through the localized RuntimePanel", async () => {
+  const statusParams = {
+    runtime: { state: "ready", application: true, run: null, workdir: "STATUS-WORKDIR-SENTINEL" },
+    active_turn: false,
+    pending_pause: null,
+    application: {
+      current_model: "remote/visible",
+      provider_profile: "remote",
+      context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" },
+      compaction_status: { state: "completed", trigger: "manual", changed: true },
+      configuration_sources: [{ kind: "project", path: "STATUS-PATH-SENTINEL" }],
+      diagnostics: { private: "STATUS-DIAGNOSTICS-SENTINEL" },
+      workdir: "STATUS-WORKDIR-SENTINEL",
+    },
+  };
+  for (const [language, expected] of [
+    ["en", { runtime: "Ready", notice: "Runtime information", context: "12 / 100 · estimate", compaction: "completed · Manual" }],
+    ["zh-CN", { runtime: "就绪", notice: "运行时信息", context: "12 / 100 · 估算", compaction: "已完成 · 手动" }],
+  ] as const) {
+    await withRendererDom(async (_dom, container, root) => {
+      const preferences: DesktopPreferences = {
+        theme: "system",
+        language,
+        windowBounds: { width: 1100, height: 760, maximized: false },
+        panelMode: "hidden",
+        recentProjects: [],
+        projectAliases: {},
+        pinnedProjectKeys: [],
+        pinnedSessions: [],
+        expandedProjects: {},
+        selectedProjectKey: null,
+        selectedSessionId: null,
+      };
+      const calls: string[] = [];
+      const api: DesktopApi = {
+        openProject: async () => null,
+        openProjectInExplorer: async () => undefined,
+        copySessionId: async () => undefined,
+        closeShell: async () => undefined,
+        requestRuntime: async (method) => {
+          calls.push(method);
+          if (method === "command.execute") return { command: "status", status: "success", code: "status_ready", params: statusParams, ui_action: null };
+          // The command's typed params are the authority for this assertion;
+          // an empty follow-up response must not erase the visible facts.
+          if (method === "status.get") return {};
+          return {};
+        },
+        subscribeAgentEvents: () => () => undefined,
+        readPreference: async (key) => preferences[key],
+        writePreference: async () => preferences,
+      };
+      act(() => { root.render(<App initialState={createInitialState({ language, runtimeState: "ready", composerText: "/status", panelMode: "hidden" })} api={api} />); });
+      const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await act(async () => { await tick(); await tick(); });
+      const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+      assert.ok(send);
+      act(() => { send!.click(); });
+      await act(async () => { await tick(); await tick(); });
+
+      const panel = container.querySelector<HTMLElement>("#runtime-panel");
+      assert.ok(panel);
+      assert.notEqual(panel?.className, "runtime-panel runtime-panel--hidden", "status should open the existing Runtime panel when it was hidden");
+      const panelText = panel?.textContent ?? "";
+      assert.match(panelText, new RegExp(expected.runtime, "u"));
+      assert.match(panelText, /remote\/visible/u);
+      assert.match(panelText, new RegExp(expected.context, "u"));
+      assert.match(panelText, new RegExp(expected.compaction, "u"));
+      assert.match(container.querySelector<HTMLElement>(".timeline-notice")?.textContent ?? "", new RegExp(expected.notice, "u"));
+      assert.equal(calls.filter((method) => method === "status.get").length, 0, "status command must render its typed projection without a second RPC");
+      const rendered = container.textContent ?? "";
+      assert.doesNotMatch(rendered, /STATUS-(?:WORKDIR|PATH|DIAGNOSTICS)-SENTINEL/u);
+    });
+  }
 });
 
 test("T05 terminal convergence retries transient failures with backoff past one wait window", async () => {
@@ -2955,7 +3046,7 @@ test("T07 completed lifecycle owner releases ordinary refreshes and runtime even
         if (method === "status.get") return { active_turn: false };
         if (method === "settings.get") return { configuration: config };
         if (method === "command.complete") return { candidates: [{ value: "/model", display: "/model" }], argument_candidates: [] };
-        if (method === "command.execute") return { ui_action: { type: "session_changed", session_id: "session-1" } };
+        if (method === "command.execute") return { command: "new", status: "success", code: "session_created", params: {}, ui_action: { type: "session_changed", session_id: "session-1", restored: false } };
         return {};
       },
       subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
@@ -3224,7 +3315,7 @@ test("Runtime model uses only the Application status and model-selection project
   let state = createInitialState();
   state = reduceRendererState(state, { type: "status_loaded", result: { application: { current_model: "provider/authoritative" } } });
   assert.equal(state.currentModelRef, "provider/authoritative");
-  state = reduceRendererState(state, { type: "command_result", result: { ui_action: { type: "model_selected", model_ref: "provider/selected" }, output: "selected" } });
+  state = reduceRendererState(state, { type: "command_result", result: { command: "model", status: "success", code: "model_selected", params: { model_ref: "provider/selected" }, ui_action: { type: "model_selected", model_ref: "provider/selected" } } });
   assert.equal(state.currentModelRef, "provider/selected");
   state = reduceRendererState(state, { type: "status_loaded", result: { application: { current_model: "" }, raw_provider_payload: "secret" } });
   assert.equal(state.currentModelRef, "provider/selected");
@@ -3390,7 +3481,7 @@ test("T06 permission projection is cleared at fresh Run boundaries and only set 
   assert.equal(state.permissionMode, "unknown");
   const markup = renderToStaticMarkup(<Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.match(markup, /不可用|Unavailable/);
-  state = reduceRendererState(state, { type: "command_result", result: { ui_action: { type: "permission_mode_selected", mode: "auto" }, output: "Permission mode: auto" } });
+  state = reduceRendererState(state, { type: "command_result", result: { command: "permission", status: "success", code: "permission_mode_selected", params: { mode: "auto", warning: false }, ui_action: { type: "permission_mode_selected", mode: "auto", warning: false } } });
   assert.equal(state.permissionMode, "auto");
 });
 
@@ -3404,7 +3495,7 @@ test("T06 permission projection follows safe Run snapshots and ignores settings 
   assert.equal(state.permissionMode, "full_access");
   state = reduceRendererState(state, { type: "session_new", sessionId: "session-one", run: { run_id: "run-session", permission_mode: "auto" } });
   assert.equal(state.permissionMode, "auto");
-  state = reduceRendererState(state, { type: "command_result", result: { ui_action: { type: "permission_mode_selected", mode: "default" }, run: { run_id: "run-session", permission_mode: "full_access" }, output: "Permission mode: default" } });
+  state = reduceRendererState(state, { type: "command_result", result: { command: "permission", status: "success", code: "permission_mode_selected", params: { run: { run_id: "run-session", permission_mode: "full_access" } }, ui_action: { type: "permission_mode_selected", mode: "default", warning: false } } });
   assert.equal(state.permissionMode, "full_access");
   state = reduceRendererState(state, { type: "turn_accepted", run: { run_id: "run-session", turn_id: "turn-one", permission_mode: "default" }, steering: false });
   assert.equal(state.permissionMode, "default");
