@@ -238,3 +238,99 @@ W06 packaged 中文截图暴露了 W05 范围的 UI 错误投影缺陷：Rendere
 - 本轮未修改 Checklist 的文字、结构、编号或 W06 部分；本轮新增证据只记录在本 Feedback。W05 新 P1 已关闭，未将真实 packaged 人工截图、DPI/zoom、Provider、键鼠/IME 或其它 T10/W06 acceptance 伪记为通过。
 - 仍未执行真实 Electron dev/packaged 人工矩阵；这些属于 T10/W06 的验收边界，不影响本轮 Renderer 错误投影自动回归。内部诊断不会由本轮新增到 UI。
 - 本轮 EOF 追加后执行 `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：`OK: 2 file(s) passed UTF-8 guard`。
+
+## 返工轮次五：W03 路由的 typed command-result 与 `/status` 安全收口（2026-09-02，真实 EOF 追加）
+
+本节对应 W03 按其 Prompt 停止后重新派发到 W05 T09 的范围；仅追加在本文件真实 EOF，未修改 W03/W01～W04/W06 Feedback 或 Checklist，未执行任何 Git 写操作。
+
+### P1-CMD-01 关闭：Desktop command-result 不再透传自然语言
+
+- `src/uthcode/interfaces/desktop/bridge.py` 的 `command.execute` 现在只返回 `command`、`status`、稳定 `code`、窄 `params` 与 `ui_action`；`CommandOutcome.output/error` 只继续留在 Application 命令层供 CLI/TUI 使用，不读取、不序列化、不向 Renderer 透传。Parser 已解析的 canonical/definition 是命令身份来源，未知命令统一为 `command=unknown`、`code=command_unavailable`，不回显原始命令名、参数、native/private 错误或异常文本。
+- 已知 Desktop 命令由语义投影生成稳定 code：`status_ready`、`compact_completed/no_change/cancelled/failed`、`session_created/session_resumed`、`model_selected`、`behavior_mode_selected`、`permission_mode_selected`、各 Picker、`transcript_cleared`、`help_ready` 和 `interface_quit`；失败/用法错误使用通用 `command_failed/command_usage_error`。`/compact` 的状态只从安全 Application status 投影读取，不解析中文输出；`Session` replay/run 与 permission run 置于 params 内并复用既有 DTO 投影。
+- `PermissionModeSelected` 的 Application 中文 warning 改为安全布尔语义标记，Renderer 通过 zh-CN/en locale 生成文案；没有把 Application prose 作为跨层合同。`desktop/src/renderer/App.tsx` 只接受 `isDesktopCommandResult` 验证的结果并按 code 本地化，`state.ts` 不再读取任何 `output/error`，未知 code 也只显示稳定本地化 fallback；未修改 Composer locale 展示逻辑。
+- `desktop/src/desktop-api.ts` 新增 `DesktopCommandResult`、状态类型和严格顶层 guard（拒绝额外的 `output/error` 字段）。Bridge `/status` 的 params 直接复用 `status.get` 的 `_status_result()`；普通 status 继续排除 diagnostics、configuration source path、workdir 和 private/native/provider payload。`/status`、`/compact`、unknown/error sentinel 回归证明秘密与诊断不进入公开 command result。
+
+### 修改、保留与唯一生产链
+
+- 本轮修改：`src/uthcode/interfaces/desktop/bridge.py`、`tests/test_desktop_bridge.py`、`desktop/src/desktop-api.ts`、`desktop/src/renderer/App.tsx`、`desktop/src/renderer/state.ts`、`desktop/src/renderer/locales/en.ts`、`desktop/src/renderer/locales/zh-CN.ts`、`desktop/tests/renderer.test.tsx`。现有 Application command handlers、CLI/TUI 输出和唯一链 `Renderer → DesktopApi → 既有 transport → Bridge → Application → Core` 保持不变。
+- 本轮未修改：`desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts`、T10 工作包、CDP harness、current-facts、Composer.tsx 及 W01～W04/W06 记录；未新增 Desktop Core facade、第二 runtime/state system、Manager/Store/EventBus/Registry/Protocol 或重复命令 registry。未执行 commit/push/merge/rebase/tag/release/归档。
+
+### 本轮精确验证
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py`：59 passed、0 failed、exit 0。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd=`desktop`）：110 passed、0 failed、0 skipped、exit 0；新增 typed command-result、zh/en 本地化和 free-form output 否定回归。
+- `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd=`desktop`）：exit 0。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）：149 passed、0 failed、0 skipped、exit 0；包含正式 bundled Runtime smoke、Windows packaging、Runtime transport、Renderer 与 CDP isolation。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q`：1448 passed、3 skipped、0 failed、exit 0（167.08s）。`conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`：23 passed、0 failed、exit 0；`python -m compileall -q src tests`：exit 0；`python -m pip check`：exit 0，`No broken requirements found.`。
+- 负向扫描确认生产 Bridge/Renderer 无 `source.output/source.error/result.output/result.error/outcome.output/outcome.error` 读取；`git diff --check` exit 0（仅既有 LF/CRLF 转换 warning）。`git diff --name-only -- desktop/src/main.ts desktop/src/preload.ts desktop/src/python-runtime.ts` 与 `git diff --name-only -- docs/work/T10-DesktopGUI与TUI全量能力迁移` 均为空。
+
+### Checklist、未关闭风险与 UTF-8
+
+- 本轮没有修改 Checklist 的文字、结构、编号或勾选；没有把 JSDOM/自动化结果冒充真实 packaged GUI、DPI/zoom、IME、reduced-motion 或人工验收。W05 本轮 P1/P2 finding 已关闭；没有发现需停止并重新派发 W01～W04 产品缺陷。
+- 仍未执行真实 Electron dev/packaged 窗口的宽窄布局、dark/light、zh-CN/en、100%/125%/150% zoom、键鼠/IME、真实 Provider 与 AskUser/Plan/Tool/Compact/Session/Key 人工矩阵，这些继续属于 T10/W06 验收边界。
+- 本节追加完成后将执行 UTF-8 guard；实际输出在下一个 EOF 子节记录。
+
+### 本轮 UTF-8 guard 实际结果（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；Feedback 与 Checklist 均无 replacement character、常见乱码或不平衡 Markdown fence。
+
+### 本轮最终验证补充（真实 EOF 追加）
+
+- 为移除 Renderer 对旧 top-level `run/replay` 双轨兼容后的最终工作树重新执行：`conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd=`desktop`）exit 0；`conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd=`desktop`）110 passed、0 failed、0 skipped；`conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）149 passed、0 failed、0 skipped、exit 0。
+- 最终 Python/架构验证结果保持：`conda run --no-capture-output -n re-uthcode python -m pytest -q` 为 1448 passed、3 skipped、0 failed；`tests/test_architecture_boundaries.py` 为 23 passed、0 failed；compileall、pip check、`git diff --check` 均通过。此次补充仍未修改 Checklist、冻结边界或其他 Worker Feedback。
+
+### 最终 UTF-8 guard 重跑（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`。
+
+## 返工轮次六：复审1 status/help Renderer 消费修复（2026-09-02，真实 EOF 追加）
+
+### 复审 finding、范围与处置
+
+复审指出上一轮虽然已经建立 typed `/status` command-result，却只在 Renderer notice 中显示固定的“Runtime information”，没有消费其中的安全状态字段；同时 `/help` 返回了当前 UI 没有调用方的 `commands` 参数。本轮仅修复 W05 T09 的 Renderer 集成与 Bridge 投影，不修改 W03/W06 或 W01～W04 Feedback/Checklist，不修改 Composer 展示、Main/Preload/Python runtime、CDP、T10 或 current-facts，也未执行任何 Git 写操作。
+
+### P1-STATUS-01 关闭：typed status 进入现有 RuntimePanel
+
+- `desktop/src/renderer/state.ts` 的 `command_result` 对 `status_ready` 直接把 typed `params` 送入既有 `status_loaded` 投影，因此 RuntimePanel 使用同一套安全状态边界显示 Runtime 状态、current model、context used/budget/measurement 与 compaction state；runtime state 只接受已知 `RuntimeStateName`，缺失或未知字段不编造值。
+- `/compact` 的 typed `compaction_status` 也在同一 reducer 边界更新既有 compaction projection；所有 Renderer command-result 路径继续不读取 `output`、`error` 或任何自然语言 Application 文本。
+- `desktop/src/renderer/App.tsx` 在 `/status` 已携带与 `status.get` 相同的安全 projection 时不再发第二次 status RPC，避免空/迟到响应抹掉刚消费的 typed facts。RuntimePanel 继续由既有 locale 资源负责中英文标签和值状态展示。
+- `desktop/src/renderer/desktop-api.ts` 的严格 typed guard、Bridge 的 status allowlist 和现有 application status 来源未放宽；diagnostics、configuration source/path、workdir、private/native/provider payload 仍不进入 UI。
+
+### P2-HELP-01 关闭：删除未消费的 help command-list 参数
+
+- Bridge `/help` 现在只返回稳定 `help_ready` 语义 code 和空 `params`；当前 Desktop 已通过 `command.complete` 消费 canonical command/locale description，因此不再维护第二套无调用方的 help command-list contract。CLI/TUI 的既有 `/help` Application 文本输出保持不变。
+- `tests/test_desktop_bridge.py` 补充 `/help` 空 params 断言，确保没有重复或未消费字段；Renderer 继续只用 `help_ready` 生成 locale-owned `commandHelp` notice。
+
+### 真实 App/reducer 回归与边界
+
+- `desktop/tests/renderer.test.tsx` 新增真实 App DOM 回归：分别以 `en` 与 `zh-CN` 执行 typed `/status`，断言 Runtime 状态、`remote/visible`、`12 / 100` 与 estimate/估算、completed/已完成和 manual/手动在 RuntimePanel 可见；status command 不依赖第二个 `status.get`，并断言 `STATUS-WORKDIR/PATH/DIAGNOSTICS-SENTINEL` 不在 DOM。该回归同时覆盖 `command_result → status_loaded → RuntimePanel` reducer/集成链。
+- `/status` 缺少安全字段时仍由既有 normalize boundary 显示 unavailable/保持当前权威状态，不用 diagnostics/path/private 反推展示；`/help` 没有 UI 不消费的 command-list 字段。
+
+### 本轮修改、唯一生产链与精确验证
+
+- 本轮修改：`src/uthcode/interfaces/desktop/bridge.py`、`tests/test_desktop_bridge.py`、`desktop/src/renderer/state.ts`、`desktop/src/renderer/App.tsx`、`desktop/tests/renderer.test.tsx`；Feedback 仅在真实 EOF 追加。本轮没有改动 Checklist、Composer、Main/Preload/Python runtime、CDP、T10/current-facts 或其他 Worker Feedback。
+- 唯一生产链仍为 `Renderer → DesktopApi → 既有 transport → Bridge → Application → Core`；没有新增 Runtime/状态系统、第二 help registry、自然语言解析或重复安全 DTO。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py`：59 passed、0 failed、exit 0。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd=`desktop`）：111 passed、0 failed、0 skipped、exit 0；`conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd=`desktop`）：exit 0。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）：150 passed、0 failed、0 skipped、exit 0；包含正式 bundled Runtime smoke、Windows packaging、Runtime transport、Renderer 与 CDP isolation。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q`：1448 passed、3 skipped、0 failed、exit 0（162.75s）；`tests/test_architecture_boundaries.py`：23 passed、0 failed；`python -m compileall -q src tests` 与 `python -m pip check` 均 exit 0，后者输出 `No broken requirements found.`。
+- 负向/边界扫描：生产 scoped code 无 `source.output/source.error/result.output/result.error/outcome.output/outcome.error` 读取；无 unconsumed Desktop help command-list contract；`git diff --check` 无 whitespace error（仅既有 CRLF 转换提示）。冻结路径 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 T10 均无 diff。
+
+### Checklist、未关闭风险与 UTF-8
+
+- Checklist 本轮不改文字、结构、编号或勾选；本轮 P1/P2 finding 已关闭。没有把 JSDOM/自动化结果冒充真实 packaged Electron、DPI/zoom、IME、reduced-motion、真实 Provider 或人工 AskUser/Plan/Tool/Compact/Session/Key 验收。
+- 仍未执行真实 Electron dev/packaged 窗口的宽窄布局、dark/light、zh-CN/en、键鼠/IME、zoom、reduced-motion 与真实 Provider 人工矩阵；这些继续属于既有 T10/W06 acceptance 边界。
+- 本节追加后将执行 UTF-8 guard，实际输出在下一个真实 EOF 子节记录。
+
+### 本轮 UTF-8 guard 实际结果（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；Feedback 与 Checklist 均通过 UTF-8、乱码标记与 Markdown fence 检查。
+
+### 本轮最终实现补充（真实 EOF 追加）
+
+- 为覆盖 RuntimePanel 原先处于 `hidden` 的实际 UI 路径，`App.executeCommand` 在收到 `status_ready` 后仅临时 dispatch 现有 `set_panel_mode` 为宽屏 `docked`、窄屏 `floating`；不调用 `persist`，用户原有隐藏偏好不被改写。新的中英文 App DOM 回归以 hidden 初态验证面板打开后安全 status facts 可见，且空的后续 `status.get` 不会覆盖 typed 结果。
+- 最终重跑 `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd=`desktop`）：exit 0；`conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）：150 passed、0 failed、0 skipped、exit 0。Python/架构/compileall/pip、负向扫描与冻结边界结果同上节。
+
+### 最终 UTF-8 guard 重跑（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`。

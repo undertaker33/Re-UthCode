@@ -18,11 +18,14 @@ from uthcode.application import (
     ApplicationRuntimeContext,
     ApplicationSessionService,
     BehaviorMode,
+    BehaviorModeSelected,
+    CommandOutcome,
     ConfigSource,
     EffectiveConfig,
     GenerationCompleted,
     Message,
     ModelProfile,
+    OpenModelPicker,
     PermissionApprovalChoice,
     PermissionApprovalRequest,
     PermissionApprovalResponse,
@@ -33,6 +36,7 @@ from uthcode.application import (
     PlanReviewRequest,
     PlanReviewResponse,
     PermissionMode,
+    PermissionModeSelected,
     ProviderResponse,
     ProviderIdentity,
     QuestionKind,
@@ -42,6 +46,7 @@ from uthcode.application import (
     RunStatus,
     SessionReplayRecord,
     FailureReason,
+    OutcomeStatus,
     TerminationReason,
     TextDelta,
     TextPart,
@@ -1486,7 +1491,7 @@ async def test_run_permission_mode_is_added_to_safe_runtime_and_command_projecti
     )
     assert selected.ok is True
     assert selected.result is not None
-    assert selected.result["run"]["permission_mode"] == "full_access"  # type: ignore[index]
+    assert selected.result["params"]["run"]["permission_mode"] == "full_access"  # type: ignore[index]
     assert application.runs[0].permission_mode is PermissionMode.FULL_ACCESS
     await bridge.shutdown()
 
@@ -1548,13 +1553,80 @@ async def test_session_changed_wire_projection_has_one_replay_location() -> None
 
     assert result.ok is True
     assert result.result is not None
-    assert result.result["replay"] == []
+    assert result.result["params"]["replay"] == []
     assert result.result["ui_action"] == {
         "type": "session_changed",
         "session_id": application.session_id,
         "restored": False,
     }
     assert "replay" not in result.result["ui_action"]
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_command_result_is_typed_and_drops_free_form_status_and_errors() -> None:
+    output_sentinel = "COMMAND-OUTPUT-PRIVATE-SENTINEL"
+    path_sentinel = Path("C:/private/config.toml")
+    application = _FakeApplication()
+    application.status = lambda: ApplicationStatus(  # type: ignore[attr-defined]
+        current_model="fake/ref",
+        provider_profile="fake",
+        provider_identity=ProviderIdentity("fake", "fake", "fake"),
+        configuration_sources=(ConfigSource("project", path_sentinel),),
+        diagnostics={"private": output_sentinel, "path": path_sentinel},
+    )
+    bridge = DesktopBridge(application=application)
+
+    async def dispatch(invocation: object, *, application: object | None = None) -> CommandOutcome:
+        canonical = getattr(invocation, "canonical", None)
+        if canonical is None:
+            return CommandOutcome(
+                OutcomeStatus.UNKNOWN_COMMAND,
+                error=output_sentinel,
+                invocation=invocation,  # type: ignore[arg-type]
+            )
+        action: object | None = None
+        if canonical == "plan":
+            action = BehaviorModeSelected(BehaviorMode.PLAN)
+        elif canonical == "do":
+            action = BehaviorModeSelected(BehaviorMode.DEFAULT)
+        elif canonical == "model":
+            action = OpenModelPicker()
+        elif canonical == "permission":
+            action = PermissionModeSelected(PermissionMode.FULL_ACCESS, warning=output_sentinel)
+        return CommandOutcome(
+            OutcomeStatus.SUCCESS,
+            output=output_sentinel,
+            ui_action=action,  # type: ignore[arg-type]
+            invocation=invocation,  # type: ignore[arg-type]
+        )
+
+    bridge._dispatcher.dispatch_async = dispatch  # type: ignore[method-assign]
+    for index, text in enumerate(("/status", "/compact", "/plan", "/do", "/model", "/permission full_access", "/help", "/unknown")):
+        result = await bridge.handle_request(
+            RequestEnvelope(f"typed-command-{index}", "command.execute", {"text": text})
+        )
+        assert result.ok is True
+        assert result.result is not None
+        wire = json.dumps(result.to_dict(), ensure_ascii=False)
+        assert output_sentinel not in wire
+        assert str(path_sentinel) not in wire
+        assert "output" not in result.result
+        assert "error" not in result.result
+        assert isinstance(result.result["command"], str)
+        assert isinstance(result.result["code"], str)
+        assert isinstance(result.result["params"], dict)
+        if text == "/help":
+            assert result.result["params"] == {}
+
+    status = await bridge.handle_request(RequestEnvelope("typed-status", "status.get", {}))
+    command_status = await bridge.handle_request(
+        RequestEnvelope("typed-status-command", "command.execute", {"text": "/status"})
+    )
+    assert status.ok is True and command_status.ok is True
+    assert command_status.result is not None and status.result is not None
+    assert command_status.result["code"] == "status_ready"
+    assert command_status.result["params"] == status.result
     await bridge.shutdown()
 
 

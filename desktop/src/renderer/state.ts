@@ -249,6 +249,15 @@ function positiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+function runtimeStateFromProjection(value: unknown): RuntimeStateName | null {
+  const source = asRecord(value);
+  const state = source?.state;
+  return state === "booting" || state === "restarting" || state === "ready" || state === "configuration_required"
+    || state === "failed" || state === "stopping" || state === "stopped"
+    ? state
+    : null;
+}
+
 /** Normalize the Application-owned Context status without manufacturing a limit. */
 export function normalizeContextUsage(value: unknown): ContextUsageProjection {
   const source = asRecord(value);
@@ -1004,7 +1013,7 @@ export type RendererAction =
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
   | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string }
-  | { type: "command_result"; result: unknown }
+  | { type: "command_result"; result: unknown; notice?: string | null }
   | { type: "composer_text"; text: string }
   | { type: "clear_timeline" }
   | { type: "workspace_cleared" }
@@ -1072,6 +1081,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "status_loaded": {
       const source = resultRecord(action.result);
       const application = asRecord(source.application);
+      const runtimeState = runtimeStateFromProjection(source.runtime);
       const currentModelRef = nonEmptyText(application?.current_model);
       const contextValue = application?.context_status;
       const compactionValue = application && Object.prototype.hasOwnProperty.call(application, "compaction_status")
@@ -1080,6 +1090,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
       return {
         ...state,
+        ...(runtimeState ? { runtimeState } : {}),
         ...(source.active_turn === true || source.active_turn === false ? { activeTurn } : {}),
         ...(source.active_turn === false ? { terminalStatusPending: false } : {}),
         ...(currentModelRef ? { currentModelRef } : {}),
@@ -1121,16 +1132,45 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     }
     case "command_result": {
       const source = resultRecord(action.result);
-      const output = textValue(source.output) || textValue(source.error);
+      // Command results are a typed Desktop contract.  Never render
+      // Application `output`/`error` text here: CLI/TUI prose stays on their
+      // own interface boundary, while Renderer notices come from locale-owned
+      // semantic codes supplied by App.
+      const params = asRecord(source.params);
+      const notice = action.notice ?? null;
       const actionValue = asRecord(source.ui_action);
+      // `/status` carries the same safe projection as `status.get`.  Consume
+      // that typed payload directly so the command does not depend on a
+      // second status RPC (which may be unavailable or stale) before the
+      // existing RuntimePanel can render its localized facts.
+      if (source.code === "status_ready") {
+        const projected = reduceRendererState(state, {
+          type: "status_loaded",
+          result: params ?? {},
+        });
+        return { ...projected, commandOutput: notice, notice, composerText: "" };
+      }
+      // `/compact` returns only its safe compaction DTO.  Apply it at the
+      // same typed boundary; no command prose is needed to update the panel.
+      if (params && Object.prototype.hasOwnProperty.call(params, "compaction_status")) {
+        return {
+          ...state,
+          compactionStatus: normalizeCompactionStatus(params.compaction_status),
+          commandOutput: notice,
+          notice,
+          composerText: "",
+        };
+      }
       const sessionChanged = actionValue?.type === "session_changed";
       if (sessionChanged && typeof actionValue.session_id === "string") {
-        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
-        return { ...next, commandOutput: output || null, notice: output || null, composerText: "", modelPickerOpen: false };
+        const replay = params?.replay;
+        const run = params?.run;
+        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run }) : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
+        return { ...next, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
-      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: output || null, composerText: "" };
+      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: notice, composerText: "" };
       if (actionValue?.type === "behavior_mode_selected" || actionValue?.type === "permission_mode_selected" || actionValue?.type === "model_selected") {
-        const projectedRun = normalizeRun(source.run);
+        const projectedRun = normalizeRun(params?.run);
         const projectedPermission = permissionModeOf(projectedRun);
         const permissionMode = projectedPermission !== "unknown"
           ? projectedPermission
@@ -1144,10 +1184,10 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         const contextUsage = actionValue.type === "model_selected"
           ? contextUsageAtBoundary()
           : state.contextUsage;
-        return { ...state, run, permissionMode, currentModelRef, contextUsage, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
+        return { ...state, run, permissionMode, currentModelRef, contextUsage, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
-      if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: output || null, notice: output || null, composerText: "" };
-      return { ...state, commandOutput: output || null, notice: output || null, composerText: "" };
+      if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: notice, notice, composerText: "" };
+      return { ...state, commandOutput: notice, notice, composerText: "" };
     }
     case "composer_text":
       return { ...state, composerText: action.text };

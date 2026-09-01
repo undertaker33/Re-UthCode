@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { isDesktopCommandResult } from "../desktop-api";
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
@@ -70,6 +71,67 @@ function eventMatchesIdentity(event: AgentEvent, identity: { runId: string; turn
  */
 export function safeErrorMessage(_error: unknown, fallback: string): string {
   return fallback;
+}
+
+/**
+ * Translate the Bridge's semantic command result without ever consuming
+ * Application output/error text.  Params are used only as typed flags; the
+ * visible copy remains owned by the current Renderer locale.
+ */
+export function commandResultNotice(
+  value: unknown,
+  localize: (key: Parameters<typeof translate>[1]) => string,
+): string | null {
+  const source = asObject(value);
+  const code = stringValue(source.code);
+  switch (code) {
+    case "status_ready":
+      return localize("runtimeInformation");
+    case "help_ready":
+      return localize("commandHelp");
+    case "compact_completed":
+      return `${localize("compaction")} · ${localize("completed")}`;
+    case "compact_no_change":
+      return `${localize("compaction")} · ${localize("noChange")}`;
+    case "compact_cancelled":
+      return `${localize("compaction")} · ${localize("cancelled")}`;
+    case "compact_failed":
+      return `${localize("compaction")} · ${localize("failed")}`;
+    case "session_created":
+      return localize("newSessionNotice");
+    case "session_resumed":
+      return localize("sessionResumed");
+    case "model_selected":
+      return localize("commandModelSelected");
+    case "behavior_mode_selected":
+      return localize("commandModeSelected");
+    case "permission_mode_selected": {
+      const params = asObject(source.params);
+      return params.warning === true
+        ? localize("commandPermissionWarning")
+        : localize("commandPermissionSelected");
+    }
+    case "model_picker_opened":
+      return localize("chooseModel");
+    case "permission_picker_opened":
+      return localize("permission");
+    case "session_picker_opened":
+      return localize("session");
+    case "transcript_cleared":
+      return null;
+    case "command_unavailable":
+    case "command_usage_error":
+    case "command_failed":
+      return localize("commandFailed");
+    case "interface_quit":
+      return null;
+    case "command_completed":
+      return localize("commandCompleted");
+    default:
+      // A future Bridge code must remain safe and localized even before this
+      // Renderer version learns its detailed presentation.
+      return source.status === "success" ? localize("commandCompleted") : localize("commandFailed");
+  }
 }
 
 export type AuthoritativeIdleResult =
@@ -767,13 +829,27 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       const result = await send("command.execute", { text });
       if (!isCurrent()) return;
-      dispatch({ type: "command_result", result });
+      if (!isDesktopCommandResult(result)) {
+        dispatch({ type: "notice", text: t("commandFailed") });
+        return;
+      }
+      dispatch({ type: "command_result", result, notice: commandResultNotice(result, t) });
       const source = asObject(result);
+      // `/status` is a read-only query, but its typed facts must be visible
+      // even when the user previously hid the optional Runtime panel.  Open
+      // only the existing panel for this response and do not persist the
+      // temporary presentation choice.
+      if (source.code === "status_ready" && stateRef.current.panelMode === "hidden") {
+        dispatch({ type: "set_panel_mode", panelMode: narrowViewportRef.current ? "floating" : "docked" });
+      }
       const action = asObject(source.ui_action);
       // Command outcomes are explicit Application boundaries.  Refresh the
       // safe Context/Compaction projection once here; completion deltas never
       // trigger status RPCs.
-      await refreshRuntimeStatus();
+      // `/status` already carries the exact same safe projection as
+      // `status.get`; avoid a second request that could replace the freshly
+      // rendered facts with an empty/late response.
+      if (source.code !== "status_ready") await refreshRuntimeStatus();
       if (!isCurrent()) return;
       if (action.type === "open_model_picker") {
         try {
