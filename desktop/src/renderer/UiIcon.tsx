@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status";
+export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send";
 
 export function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -18,6 +18,12 @@ export function UiIcon({ name }: { name: UiIconName }) {
     panel: <><rect x="2.75" y="3.25" width="10.5" height="9.5" rx="1.2" /><path d="M8.5 3.25v9.5" /></>,
     compact: <path d="M3.25 5.25h9.5M5.25 8h5.5M6.5 10.75h3" />,
     status: <><circle cx="8" cy="8" r="5.25" /><path d="M8 5v3.5l2.25 1.25" /></>,
+    check: <path d="m3.25 8.2 2.8 2.8 6.7-6.7" />,
+    warning: <><path d="m8 2.75 5.25 10.5H2.75z" /><path d="M8 6v3M8 10.75v.25" /></>,
+    todo: <><rect x="3" y="3" width="10" height="10" rx="1.2" /><path d="M5.5 8h5M5.5 10.5h3" /></>,
+    pause: <><path d="M5 3.25v9.5M11 3.25v9.5" strokeWidth="1.8" /></>,
+    stop: <rect x="4" y="4" width="8" height="8" rx="1" />,
+    send: <><path d="m2.75 7.75 10.5-5-3 10.5-2.1-4.2z" /><path d="m8.15 9.05 5.1-6.3" /></>,
   };
   return <svg className="ui-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }

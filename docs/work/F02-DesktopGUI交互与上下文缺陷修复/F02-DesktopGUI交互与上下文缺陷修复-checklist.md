@@ -39,23 +39,23 @@
 
 ## T05：Desktop 命令、Context 与 Session 投影收口
 
-- [ ] 执行 `cd desktop; npm run typecheck; npm test`，记录命令、exit code 与精确 passed/failed 数量。
-- [ ] 执行 `rg -n "DEFAULT_CONTEXT_WINDOW|configuredContextWindow" desktop/src/renderer`，Renderer 业务 authority 命中为 0；Context ring 与 Runtime panel 只消费 Application status。
-- [ ] message/tool/timeline/compact 变化后只在权威收口边界刷新 status；逐字符 delta 不调用 status RPC，Turn terminal/result 竞态测试不读取陈旧最终状态。
+- [x] 执行 `cd desktop; npm run typecheck; npm test`，记录命令、exit code 与精确 passed/failed 数量。
+- [x] 执行 `rg -n "DEFAULT_CONTEXT_WINDOW|configuredContextWindow" desktop/src/renderer`，Renderer 业务 authority 命中为 0；Context ring 与 Runtime panel 只消费 Application status。
+- [x] message/tool/timeline/compact 变化后只在权威收口边界刷新 status；逐字符 delta 不调用 status RPC，Turn terminal/result 竞态测试不读取陈旧最终状态。
 - [ ] 输入 `/` 时 clear/quit/resume/permission/help 不出现在 Desktop candidate menu，但 Application command registry 仍保留；compact/new/plan/do 选择后直接执行且不调用 `turn.start` 发送 Slash 文本。
 - [ ] `/model` 与 Composer model picker 使用同一 Application catalog；`/status` 只渲染安全用户字段，不输出 diagnostics/private payload。
-- [ ] manual compact running 时普通 send 被禁用，terminal 后恢复；界面 activity 仅来自 Application CompactionStatus。
+- [x] manual compact running 时普通 send 被禁用，terminal 后恢复；界面 activity 仅来自 Application CompactionStatus。
 - [ ] 当前 selected Session move 成功后 selection/timeline 清空，source/target 导航按 mutation/后续 authoritative catalog 收敛；失败时 UI 不移动。
-- [ ] resume/rename/refresh 不改变现有 Session 行顺序；new 置于 regular 顶部，只有新 durable message/pin 允许重排；超过五项时 selected 第六项仍可见且前五不乱。
+- [x] resume/rename/refresh 不改变现有 Session 行顺序；new 置于 regular 顶部，只有新 durable message/pin 允许重排；超过五项时 selected 第六项仍可见且前五不乱。
 
 ## T06：Chat、Tool、Todo、AskUser、Plan 交互完成
 
-- [ ] Renderer tests 覆盖 Slash ArrowUp/Down `scrollIntoView(nearest)`、Home/End/Enter/Tab/Escape、IME composing、menu/select collision flip 与 focus restoration。
+- [x] Renderer tests 覆盖 Slash ArrowUp/Down `scrollIntoView(nearest)`、Home/End/Enter/Tab/Escape、IME composing、menu/select collision flip 与 focus restoration。
 - [ ] Composer/Runtime 控件在 keyboard-only 下可达，icon、tooltip、ARIA 和非颜色状态齐全；窄屏、100%/125%/150% zoom 无横向裁切。
-- [ ] ToolStarted/ToolFinished 使用同一 DOM row；running elapsed 持续增长，success/failure/cancelled 时冻结，状态同时有 icon/text/ARIA。
-- [ ] 连续 TaskStateChanged 只 replace-all 更新一个 Todo 浮层；默认 compact，hover/focus expand，不出现第二 Todo store 或冗长状态 label。
-- [ ] 连续 `PlanContentDelta` 只追加同一 turn/tool-call draft block；`PlanProposed` 原地封口，Plan Review 独立显示；failure/cancel 不残留 running 或新增第二 block。
-- [ ] AskUser tests 覆盖 1～4 题、text/single/multi、自由输入、prev/next 答案保留、最终 review、一次 typed submit 与 cancel；界面不存在“返回聊天”伪状态。
+- [x] ToolStarted/ToolFinished 使用同一 DOM row；running elapsed 持续增长，success/failure/cancelled 时冻结，状态同时有 icon/text/ARIA。
+- [x] 连续 TaskStateChanged 只 replace-all 更新一个 Todo 浮层；默认 compact，hover/focus expand，不出现第二 Todo store 或冗长状态 label。
+- [x] 连续 `PlanContentDelta` 只追加同一 turn/tool-call draft block；`PlanProposed` 原地封口，Plan Review 独立显示；failure/cancel 不残留 running 或新增第二 block。
+- [x] AskUser tests 覆盖 1～4 题、text/single/multi、自由输入、prev/next 答案保留、最终 review、一次 typed submit 与 cancel；界面不存在“返回聊天”伪状态。
 - [ ] dark/light、zh-CN/en 与 `prefers-reduced-motion` 测试通过；关闭非必要动画后业务行为、键盘路径和焦点不变。
 - [ ] 执行 DOM identity/重复行否定断言，确认同一 Tool、Todo、AskUser、Plan 事实均只对应一个视觉实体。
 
