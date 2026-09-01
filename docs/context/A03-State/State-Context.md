@@ -22,6 +22,8 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` L4/L5、manual `/compact` 和 ordinary overflow recovery 复用同一 Application Context orchestrator；Compact request tool-free、bounded、使用冻结或当前模型，并在 commit 前通过 Hard Gate。成功 transaction 先写 Fine/Macro，最后写 `ActiveCheckpoint`；失败、取消、无 safe epoch 和 unknown durability 不产生伪提交。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
+- `[FACT]` `PlanContentDelta` 是公开的、按 Run/Turn/iteration/tool-call identity 归属的自然语言增量事件；Renderer 只消费解码后的 text，随后由 `PlanProposed` 封口并进入 typed Plan Review，不接触 Provider raw JSON 或 `arguments_delta`。
+- `[FACT]` Application `status()` 提供安全的 `context_status` 与 `compaction_status` 投影；Context ring、Runtime panel 和 Compact 状态只消费这些 Application 事实，不在 Interface 维护第二份 Context/Compaction authority。
 - `[BOUNDARY]` Session v3 持久化 metadata（schema 3）、Transcript、Timeline、Tool Result ref、writer lock 和 Instruction State；record envelope 仍为 schema 2。v1/v2 明确 incompatible，不迁移、不双读；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## 权威源码索引
@@ -145,6 +147,8 @@ implemented context:
   Context Gates              = Pressure Estimate/Auto Gate + Preflight Safety Count/Hard Gate
   Compact                    = bounded L4/L5, manual no-op/success, one overflow retry
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
+  Plan stream                = PlanContentDelta text projection -> PlanProposed -> typed Plan Review
+  Status projection          = Application context_status + compaction_status
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
 not implemented context:

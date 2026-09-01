@@ -34,6 +34,8 @@ const requestTimeoutMs = Number(option("request-timeout-ms", "5000"));
 const flow = option("flow", "basic");
 const planChoice = option("plan-choice", "approve");
 const delayAction = option("delay-action", "pause");
+const askQuestionCount = Number(option("ask-question-count", "4"));
+const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const skipQuit = process.argv.includes("--no-quit");
 const screenshotDir = option("screenshot-dir");
 const fixtureHtml = option("fixture-html");
@@ -94,10 +96,9 @@ async function writeAcceptanceReport(status, error) {
   await writeFile(resolve(reportPath), JSON.stringify(report, null, 2), "utf8");
 }
 
-async function capture(session, name) {
+async function recordScreenshot(session, name, result) {
   if (!screenshotDir) return;
   await mkdir(screenshotDir, { recursive: true });
-  const result = await session.send("Page.captureScreenshot", { format: "png", fromSurface: true });
   const screenshot = Buffer.from(result.data, "base64");
   const path = resolve(screenshotDir, `${name}.png`);
   await writeFile(path, screenshot);
@@ -111,6 +112,13 @@ async function capture(session, name) {
   const evidence = { name, path, bytes: screenshot.byteLength, sha256: createHash("sha256").update(screenshot).digest("hex"), ...state, language: observedLanguage ?? state.language };
   screenshots.push(evidence);
   writeLog("screenshot_saved", { ...evidence, screenshotDir });
+}
+
+async function capture(session, name) {
+  if (!screenshotDir) return;
+  await session.send("Page.bringToFront");
+  const result = await session.send("Page.captureScreenshot", { format: "png", fromSurface: true });
+  await recordScreenshot(session, name, result);
 }
 
 function remainingBudget(label) {
@@ -151,6 +159,7 @@ class CdpSession {
     this.socket = new globalThis.WebSocket(webSocketUrl);
     this.nextId = 1;
     this.pending = new Map();
+    this.debuggerPauseWaiters = [];
     const openTimeoutMs = Math.min(requestTimeoutMs, remainingBudget("CDP WebSocket open"));
     this.open = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`CDP WebSocket open timed out after ${openTimeoutMs}ms`)), openTimeoutMs);
@@ -191,6 +200,10 @@ class CdpSession {
             (electronDiagnostic ? consoleDiagnostics : consoleErrors).push(eventEvidence);
           }
           writeLog("console_event", eventEvidence);
+        } else if (message.method === "Debugger.paused") {
+          writeLog("debugger_paused", { reason: message.params?.reason ?? null });
+          const waiter = this.debuggerPauseWaiters.shift();
+          if (waiter) waiter.resolve(message.params ?? {});
         } else if (message.method === "Runtime.exceptionThrown") {
           const exceptionEvidence = {
             text: message.params?.exceptionDetails?.text ?? "exception",
@@ -210,6 +223,7 @@ class CdpSession {
     this.socket.addEventListener("close", () => {
       for (const pending of this.pending.values()) pending.reject(new Error("CDP WebSocket closed"));
       this.pending.clear();
+      for (const waiter of this.debuggerPauseWaiters.splice(0)) waiter.reject(new Error("CDP WebSocket closed"));
     });
   }
 
@@ -247,6 +261,29 @@ class CdpSession {
     });
     if (result.exceptionDetails) throw new Error(`Renderer evaluation failed: ${result.exceptionDetails.text ?? "exception"}`);
     return result.result?.value;
+  }
+
+  async waitForDebuggerPause(timeoutMs) {
+    await this.open;
+    return new Promise((resolve, reject) => {
+      let waiter;
+      const timer = setTimeout(() => {
+        const index = this.debuggerPauseWaiters.indexOf(waiter);
+        if (index >= 0) this.debuggerPauseWaiters.splice(index, 1);
+        reject(new Error(`Debugger pause timed out after ${timeoutMs}ms`));
+      }, Math.max(1, timeoutMs));
+      waiter = {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      this.debuggerPauseWaiters.push(waiter);
+    });
   }
 
   close() {
@@ -321,47 +358,259 @@ async function waitForInteraction(session, label, selector) {
   return waitFor(session, label, `Boolean(document.querySelector(${JSON.stringify(selector)}))`);
 }
 
+async function assertResponsiveLayout(session, label) {
+  const evidence = await evaluateAction(session, label, `(() => {
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const rect = (element) => element ? element.getBoundingClientRect().toJSON() : null;
+    const within = (value) => Boolean(value) && value.left >= -1 && value.top >= -1 && value.right <= window.innerWidth + 1 && value.bottom <= window.innerHeight + 1;
+    const overlaps = (left, right) => Boolean(left && right) && left.left < right.right && left.right > right.left && left.top < right.bottom && left.bottom > right.top;
+    const composer = document.querySelector('.composer');
+    // The Composer aria-label is localized; its structural landmark is part
+    // of the renderer contract and remains stable across en/zh acceptance.
+    const input = document.querySelector('.composer textarea');
+    const send = composer?.querySelector('.composer-actions button:last-child');
+    const settings = [...document.querySelectorAll('.sidebar-footer button')].find((item) => visible(item));
+    const settingsView = document.querySelector('.settings-view');
+    input?.focus();
+    const composerRect = rect(composer);
+    const inputRect = rect(input);
+    const sendRect = rect(send);
+    const settingsRect = rect(settings);
+    const settingsViewRect = rect(settingsView);
+    const overflow = document.documentElement.scrollWidth > document.documentElement.clientWidth + 1 || document.body.scrollWidth > document.body.clientWidth + 1;
+    const focusOk = document.activeElement === input;
+    const visibleSettingsRect = settingsViewRect ?? settingsRect;
+    return { ok: Boolean(visible(composer) && visible(input) && visible(send) && within(composerRect) && within(inputRect) && within(sendRect) && (!visibleSettingsRect || within(visibleSettingsRect)) && !overlaps(sendRect, visibleSettingsRect) && !overflow && focusOk), viewport: { width: window.innerWidth, height: window.innerHeight }, overflow, focus: document.activeElement?.getAttribute('aria-label') ?? null, composer: composerRect, input: inputRect, send: sendRect, settings: visibleSettingsRect };
+  })()`);
+  if (!evidence?.ok) throw new Error(`${label} failed: ${JSON.stringify(evidence)}`);
+  writeLog("assertion_pass", { description: label, value: evidence });
+  return evidence;
+}
+
+async function assertSingleDomEntity(session, label, selector, expectedCount = 1) {
+  const count = await evaluateAction(session, label, `document.querySelectorAll(${JSON.stringify(selector)}).length`);
+  if (count !== expectedCount) throw new Error(`${label} expected ${expectedCount} DOM entit${expectedCount === 1 ? 'y' : 'ies'}, observed ${count}`);
+  writeLog("assertion_pass", { description: label, value: { selector, count } });
+}
+
+async function assertCommandCandidate(session, inputValue, expectedPrefix = inputValue.trim()) {
+  const label = expectedPrefix || inputValue.trim();
+  await setInput(session, "Message UthCode", inputValue);
+  await waitFor(session, `${label} completion`, `Boolean([...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').trim().startsWith(${JSON.stringify(expectedPrefix)})))`);
+  const candidate = await evaluateAction(session, `read ${label} completion`, `(() => { const item = [...document.querySelectorAll('.command-menu button')].find((entry) => (entry.textContent || '').trim().startsWith(${JSON.stringify(expectedPrefix)})); return item ? (item.textContent || '').trim() : null; })()`);
+  if (!candidate) throw new Error(`${label} completion candidate was not readable`);
+  await evaluateAction(session, `keyboard navigate ${label} completion`, `(() => { const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]'); if (!input) return false; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true })); return true; })()`);
+  await waitFor(session, `${label} keyboard completion focus`, "Boolean(document.querySelector('.command-menu button.is-active'))");
+  await evaluateAction(session, `dismiss ${label} completion`, `(() => { const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]'); if (!input) return false; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); return true; })()`);
+  await waitFor(session, `${label} completion dismissed`, "!document.querySelector('.command-menu')");
+  await setInput(session, "Message UthCode", "");
+  writeLog("assertion_pass", { description: `${label} completion candidate and keyboard path`, value: candidate });
+}
+
+function commandDescriptionExpectations() {
+  return requestedLanguage === "zh-CN"
+    ? { "/compact": "压缩上下文", "/status": "显示当前 Application 状态" }
+    : { "/compact": "Compact context", "/status": "Show current Application status" };
+}
+
+async function assertLocalizedCommandMenu(session) {
+  const expected = commandDescriptionExpectations();
+  await setInput(session, "Message UthCode", "/");
+  await waitFor(session, "localized slash command menu", "Boolean(document.querySelector('.command-menu'))");
+  const menu = await evaluateAction(session, "read localized slash command menu", `(() => {
+    const expectedValues = ${JSON.stringify(Object.keys(expected))};
+    const rows = [...document.querySelectorAll('.command-menu button')].map((item) => ({
+      value: item.querySelector('span')?.textContent?.trim() || '',
+      description: item.querySelector('small')?.textContent?.trim() || '',
+      text: (item.textContent || '').trim(),
+    }));
+    const selected = rows.filter((row) => expectedValues.includes(row.value));
+    return { rows, selected };
+  })()`);
+  const counts = Object.fromEntries(Object.keys(expected).map((value) => [value, menu.selected.filter((row) => row.value === value).length]));
+  const descriptions = Object.fromEntries(menu.selected.map((row) => [row.value, row.description]));
+  const menuText = menu.selected.map((row) => row.text).join(" ");
+  const forbiddenDescriptions = requestedLanguage === "zh-CN"
+    ? ["Compact context", "Show current Application status"]
+    : ["压缩上下文", "显示当前 Application 状态"];
+  const duplicate = Object.entries(counts).find(([, count]) => count !== 1);
+  if (duplicate) throw new Error(`slash candidate ${duplicate[0]} expected exactly one canonical row, observed ${duplicate[1]}`);
+  for (const [value, description] of Object.entries(expected)) {
+    if (descriptions[value] !== description) throw new Error(`slash candidate ${value} description mismatch: ${JSON.stringify(descriptions[value])}`);
+  }
+  if (forbiddenDescriptions.some((value) => menuText.includes(value))) throw new Error(`slash command menu mixed locales: ${menuText}`);
+  await evaluateAction(session, "keyboard navigate localized slash command menu", `(() => {
+    const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    if (!input) return false;
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true }));
+    return true;
+  })()`);
+  await waitFor(session, "localized slash command keyboard focus", "Boolean(document.querySelector('.command-menu button.is-active'))");
+  await evaluateAction(session, "dismiss localized slash command menu", `(() => {
+    const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    if (!input) return false;
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+    return true;
+  })()`);
+  await waitFor(session, "localized slash command menu dismissed", "!document.querySelector('.command-menu')");
+  await setInput(session, "Message UthCode", "");
+  writeLog("assertion_pass", { description: `canonical slash candidates localized without duplicates (${requestedLanguage})`, value: { counts, descriptions } });
+}
+
+async function runResponsiveHealthFlow(session) {
+  await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+  for (const width of [680, 520]) {
+    await session.send("Emulation.setDeviceMetricsOverride", { width, height: 800, deviceScaleFactor: 1, mobile: false });
+    for (const pageScaleFactor of [1, 1.25, 1.5]) {
+      await session.send("Emulation.setPageScaleFactor", { pageScaleFactor });
+      await assertResponsiveLayout(session, `responsive layout ${width}px @ ${pageScaleFactor}x reduced motion`);
+    }
+  }
+  await session.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  await session.send("Emulation.setEmulatedMedia", { features: [] });
+  writeLog("assertion_pass", { description: "responsive health restored" });
+}
+
 async function submitAskUserFlow(session) {
   await waitForInteraction(session, "AskUser questions", '[aria-label="Questions"]');
   await waitFor(session, "AskUser first question", "document.querySelector('[aria-label=\"Questions\"] h2')?.textContent?.includes('Fixture choice')");
-  await setInput(session, "Fixture choice other", "custom fixture path");
-  await clickLabelText(session, "Other");
-  await waitFor(session, "AskUser choice complete", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Next') && !item.disabled))");
-  await clickText(session, "Next");
+  await assertSingleDomEntity(session, "AskUser questions single DOM entity", '[aria-label="Questions"]');
+  await capture(session, "ask-user-questions");
+  if (![1, 2, 3, 4].includes(askQuestionCount)) throw new Error(`AskUser question count must be 1-4, got ${askQuestionCount}`);
+  await setQuestionFreeInput(session, "custom fixture path");
+  if (askQuestionCount > 1) {
+    await waitFor(session, "AskUser choice complete", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Next') && !item.disabled))");
+    await clickText(session, "Next");
+  } else {
+    await waitFor(session, "AskUser one-question review enabled", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Review') && !item.disabled))");
+  }
 
-  await waitFor(session, "AskUser text question", "Boolean(document.querySelector('input[aria-label=\"Fixture note\"]'))");
-  await setInput(session, "Fixture note", "CDP note");
-  await waitFor(session, "AskUser text complete", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Next') && !item.disabled))");
-  await clickText(session, "Next");
+  if (askQuestionCount >= 2) {
+    await waitFor(session, "AskUser text question", "Boolean(document.querySelector('input[aria-label=\"Fixture note\"]'))");
+    await setInput(session, "Fixture note", "CDP note");
+    if (askQuestionCount > 2) {
+      await waitFor(session, "AskUser text complete", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Next') && !item.disabled))");
+      await clickText(session, "Next");
+    } else {
+      await waitFor(session, "AskUser two-question review enabled", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Review') && !item.disabled))");
+    }
+  }
 
-  await waitFor(session, "AskUser multi-select question", "Boolean(document.querySelector('input[aria-label=\"Fixture tags other\"]'))");
-  await clickLabelText(session, "README");
-  await clickLabelText(session, "tests");
-  await setInput(session, "Fixture tags other", "docs");
-  await clickLabelText(session, "Other");
-  await waitFor(session, "AskUser review enabled", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Review') && !item.disabled))");
+  if (askQuestionCount >= 3) {
+    await waitFor(session, "AskUser multi-select question", "Boolean(document.querySelector('input.question-free-input')) && document.querySelector('[aria-label=\"Questions\"] h2')?.textContent?.includes('Fixture tags')");
+    await clickLabelText(session, "README");
+    await clickLabelText(session, "tests");
+    await setQuestionFreeInput(session, "docs");
+    if (askQuestionCount > 3) {
+      await waitFor(session, "AskUser multi-select complete", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Next') && !item.disabled))");
+      await clickText(session, "Next");
+    } else {
+      await waitFor(session, "AskUser review enabled", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Review') && !item.disabled))");
+    }
+  }
+
+  if (askQuestionCount === 4) {
+    await waitFor(session, "AskUser final text question", "Boolean(document.querySelector('input[aria-label=\"Fixture summary\"]'))");
+    await setInput(session, "Fixture summary", "CDP acceptance");
+    await waitFor(session, "AskUser review enabled", "Boolean([...document.querySelectorAll('button')].find((item) => item.textContent?.includes('Review') && !item.disabled))");
+  }
   await clickText(session, "Review");
   await waitFor(session, "AskUser answer review", "document.querySelector('[aria-label=\"Questions\"] h2')?.textContent?.includes('Review answers')");
+  await assertSingleDomEntity(session, "AskUser review single DOM entity", '[aria-label="Questions"]');
+  await capture(session, "ask-user-review");
   await clickText(session, "Submit answers");
   await waitFor(session, `AskUser same-turn continuation ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
+  await capture(session, "ask-user-complete");
 }
 
-async function submitToolFlow(session, expectedToolText) {
+async function submitToolFlow(session, expectedToolText, expectedToolRows = 1) {
   await waitFor(session, "Tool completion or permission", `document.body?.innerText?.includes(${JSON.stringify(expectedToolText)}) || Boolean(document.querySelector('[aria-label=\"Permission approval\"]'))`);
+  await capture(session, "tool-result");
   const permissionShown = await evaluateAction(session, "inspect Permission surface", "Boolean(document.querySelector('[aria-label=\"Permission approval\"]'))");
   if (permissionShown) {
     writeLog("assertion_pass", { description: "dynamic Permission surface" });
     await clickText(session, "Allow once");
   }
   await waitFor(session, `Tool result ${expectedToolText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedToolText)})`);
+  await assertSingleDomEntity(session, "Tool timeline DOM rows", '.timeline-entry--tool', expectedToolRows);
+}
+
+async function submitTodoFlow(session, expectedToolText) {
+  await waitFor(session, "Todo projection", "Boolean(document.querySelector('.todo-strip')) && document.querySelector('.todo-strip')?.innerText?.includes('Inspect fixture evidence')");
+  await capture(session, "todo-strip");
+  await waitFor(session, `Todo continuation ${expectedToolText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedToolText)})`);
+  await assertSingleDomEntity(session, "Todo single DOM strip", '.todo-strip');
+  await capture(session, "todo-complete");
+}
+
+async function installPlanDraftBreakpoint(session) {
+  await session.send("Debugger.enable");
+  await session.evaluate(`(() => {
+    window.__uthcodePlanDraftObserver?.disconnect?.();
+    window.__uthcodePlanDraftHit = false;
+    const isPartialDraft = () => {
+      const entry = document.querySelector('.timeline-entry--plan');
+      const text = entry?.textContent || '';
+      return Boolean(entry && entry.getAttribute('aria-busy') === 'true' && text.includes('Read the fi') && !document.querySelector('[aria-label="Plan review"]'));
+    };
+    const observer = new MutationObserver(() => {
+      if (window.__uthcodePlanDraftHit || !isPartialDraft()) return;
+      window.__uthcodePlanDraftHit = true;
+      // The CDP debugger pause freezes the real renderer immediately after
+      // the draft commit, before the adjacent Review pause can repaint.
+      debugger;
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+    window.__uthcodePlanDraftObserver = observer;
+    return true;
+  })()`);
+}
+
+async function capturePlanDraftAtBreakpoint(session) {
+  const remaining = remainingBudget("Plan partial draft visible");
+  try {
+    const paused = await session.waitForDebuggerPause(remaining);
+    writeLog("assertion_pass", { description: "Plan partial draft visible", value: { debuggerPaused: true, reason: paused.reason ?? null } });
+    if (screenshotDir) {
+      await session.send("Page.bringToFront");
+      const screenshot = await session.send("Page.captureScreenshot", { format: "png", fromSurface: true });
+      await session.send("Debugger.resume");
+      await recordScreenshot(session, "plan-draft-partial", screenshot);
+    } else {
+      await session.send("Debugger.resume");
+    }
+    return true;
+  } catch (error) {
+    writeLog("assertion_info", { description: "Plan draft debugger pause unavailable; using DOM wait", reason: error instanceof Error ? error.message : String(error) });
+    return false;
+  } finally {
+    try { await session.send("Debugger.disable"); } catch { /* page may already be closing */ }
+    try { await session.evaluate("window.__uthcodePlanDraftObserver?.disconnect?.(); delete window.__uthcodePlanDraftObserver;"); } catch { /* page may already be closing */ }
+  }
 }
 
 async function submitPlanFlow(session, expectedToolText) {
+  const capturedAtBreakpoint = await capturePlanDraftAtBreakpoint(session);
+  if (!capturedAtBreakpoint) {
+    await waitFor(session, "Plan partial draft visible", "(() => { const entry = document.querySelector('.timeline-entry--plan'); const text = entry?.textContent || ''; return Boolean(entry && entry.getAttribute('aria-busy') === 'true' && text.includes('Read the fi') && !document.querySelector('[aria-label=\"Plan review\"]')); })()");
+    await capture(session, "plan-draft-partial");
+  }
+  await assertSingleDomEntity(session, "Plan draft single DOM row", '.timeline-entry--plan');
+  writeLog("assertion_pass", { description: "Plan partial prefix is visible before Review" });
   await waitForInteraction(session, "Plan review", '[aria-label="Plan review"]');
+  await assertSingleDomEntity(session, "Plan review single DOM surface", '[aria-label="Plan review"]');
+  await capture(session, "plan-review");
   if (planChoice === "revise") {
     await setInput(session, "Revision feedback", "Use the fixture README only");
     await clickText(session, "Revise plan");
-    await waitFor(session, "revised plan review", "Boolean(document.querySelector('[aria-label=\"Plan review\"]'))");
+    await waitFor(session, "revised plan review", "(() => { const surface = document.querySelector('[aria-label=\"Plan review\"]'); const revision = surface?.querySelector('h2')?.textContent || ''; const approve = [...(surface?.querySelectorAll('button') || [])].find((item) => (item.textContent || '').includes('Approve and execute')); return Boolean(surface && surface.getAttribute('aria-busy') !== 'true' && revision.includes('2') && approve && !approve.disabled); })()");
+    await capture(session, "plan-review-revised");
     await clickText(session, "Approve and execute");
   } else if (planChoice === "cancel") {
     await clickText(session, "Cancel turn");
@@ -370,7 +619,8 @@ async function submitPlanFlow(session, expectedToolText) {
   } else {
     await clickText(session, "Approve and execute");
   }
-  await submitToolFlow(session, expectedToolText);
+  await assertSingleDomEntity(session, "Plan visual rows per ProposePlan call", '.timeline-entry--plan', planChoice === "revise" ? 2 : 1);
+  await submitToolFlow(session, expectedToolText, planChoice === "revise" ? 2 : 1);
 }
 
 async function submitFailureFlow(session) {
@@ -384,11 +634,12 @@ async function submitFailureFlow(session) {
 }
 
 async function submitDelayedFlow(session) {
-  await waitFor(session, "delayed turn controls", "Boolean(document.querySelector('button.pause-button')) && Boolean(document.querySelector('button.cancel-button'))");
+  await waitFor(session, "delayed turn controls", "Boolean(document.querySelector('button[aria-label=\"Pause\"]')) && Boolean(document.querySelector('button[aria-label=\"Cancel\"]'))");
+  await capture(session, "delayed-controls");
   if (delayAction === "cancel") {
     writeLog("action", { action: "click_text", text: "Cancel" });
     await clickText(session, "Cancel");
-    await waitFor(session, "delayed turn cancellation", "!document.querySelector('button.cancel-button') && document.body?.innerText?.includes('cancelled')");
+    await waitFor(session, "delayed turn cancellation", "!document.querySelector('button[aria-label=\"Cancel\"]') && document.body?.innerText?.includes('cancelled')");
     return;
   }
   await clickText(session, "Pause");
@@ -400,26 +651,24 @@ async function submitDelayedFlow(session) {
 async function submitSessionsFlow(session) {
   await waitFor(session, `first session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture request') && text.includes(${JSON.stringify(expectedText)}); })()`);
 
-  await clickText(session, "New chat");
-  await waitFor(session, "second conversation header", "document.querySelector('h1')?.textContent?.includes('Session') || document.querySelector('h1')?.textContent?.includes('New conversation')");
-  await waitFor(session, "second composer ready", "Boolean(document.querySelector('textarea[aria-label=\"Message UthCode\"]'))");
-  await setInput(session, "Message UthCode", "cdp fixture session two");
-  await waitFor(session, "second message ready", "!document.querySelector('button.send-button')?.disabled");
-  await clickText(session, "Send");
-  await waitFor(session, `second session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture session two') && text.includes(${JSON.stringify(expectedText)}); })()`);
-
-  await clickText(session, "New chat");
-  await waitFor(session, "third conversation header", "document.querySelector('h1')?.textContent?.includes('Session') || document.querySelector('h1')?.textContent?.includes('New conversation')");
-  await waitFor(session, "third composer ready", "Boolean(document.querySelector('textarea[aria-label=\"Message UthCode\"]'))");
-  await setInput(session, "Message UthCode", "cdp fixture session three");
-  await waitFor(session, "third message ready", "!document.querySelector('button.send-button')?.disabled");
-  await clickText(session, "Send");
-  await waitFor(session, `third session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture session three') && text.includes(${JSON.stringify(expectedText)}); })()`);
-  await waitFor(session, "three session rows", "document.querySelectorAll('button.session-row:not(.session-row--new)').length >= 3 && [...document.querySelectorAll('button.session-row:not(.session-row--new)')].some((item) => (item.textContent || '').includes('cdp fixture session two')) && [...document.querySelectorAll('button.session-row:not(.session-row--new)')].some((item) => (item.textContent || '').includes('cdp fixture request'))");
+  const sessionPrompts = ["cdp fixture session two", "cdp fixture session three", "cdp fixture session four", "cdp fixture session five", "cdp fixture session six"];
+  for (const [index, prompt] of sessionPrompts.entries()) {
+    const ordinal = index + 2;
+    await clickText(session, "New chat");
+    await waitFor(session, `${ordinal}th conversation header`, "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+    await waitFor(session, `${ordinal}th Session persisted`, "Boolean(document.querySelector('button.session-line:not(.new-session-line)'))");
+    await waitFor(session, `${ordinal}th composer ready`, "Boolean(document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'))");
+    await setInput(session, "Message UthCode", prompt);
+    await waitFor(session, `${ordinal}th message ready`, "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
+    await clickText(session, "Send");
+    await waitFor(session, `${ordinal}th session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes(${JSON.stringify(prompt)}) && text.includes(${JSON.stringify(expectedText)}); })()`);
+  }
+  await waitFor(session, "session rows beyond five", "document.querySelectorAll('button.session-line:not(.new-session-line)').length >= 6 && [...document.querySelectorAll('button.session-line:not(.new-session-line)')].some((item) => (item.textContent || '').includes('cdp fixture session six')) && [...document.querySelectorAll('button.session-line:not(.new-session-line)')].some((item) => (item.textContent || '').includes('cdp fixture request'))");
+  await capture(session, "sessions-over-five");
 
   writeLog("action", { action: "select_session", label: "cdp fixture session two" });
   const switched = await evaluateAction(session, "select second session", `(() => {
-    const rows = [...document.querySelectorAll('button.session-row:not(.session-row--new)')];
+    const rows = [...document.querySelectorAll('button.session-line:not(.new-session-line)')];
     const row = rows.find((item) => (item.textContent || '').includes('cdp fixture session two'));
     if (!row) return false;
     row.click();
@@ -430,7 +679,7 @@ async function submitSessionsFlow(session) {
 
   writeLog("action", { action: "select_session", label: "cdp fixture request" });
   const replayed = await evaluateAction(session, "select first session for replay", `(() => {
-    const rows = [...document.querySelectorAll('button.session-row:not(.session-row--new)')];
+    const rows = [...document.querySelectorAll('button.session-line:not(.new-session-line)')];
     const row = rows.find((item) => (item.textContent || '').includes('cdp fixture request'));
     if (!row) return false;
     row.click();
@@ -440,9 +689,119 @@ async function submitSessionsFlow(session) {
   await waitFor(session, "first session replay", "document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText?.includes('cdp fixture request')");
 
   await setInput(session, "Message UthCode", "cdp fixture replay continuation");
-  await waitFor(session, "replayed message ready", "!document.querySelector('button.send-button')?.disabled");
+  await waitFor(session, "replayed message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
   await clickText(session, "Send");
   await waitFor(session, `replayed session continuation ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture replay continuation') && text.includes(${JSON.stringify(expectedText)}); })()`);
+  await submitCompactCommand(session);
+}
+
+async function setQuestionFreeInput(session, value) {
+  remainingBudget("set AskUser free-text answer");
+  writeLog("action", { action: "set_question_free_input", valueLength: value.length });
+  const changed = await evaluateAction(session, "set AskUser free-text answer", `(() => {
+    const element = document.querySelector('input.question-free-input');
+    if (!element) return false;
+    element.focus();
+    const prototype = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (descriptor?.set) descriptor.set.call(element, ${JSON.stringify(value)});
+    else element.value = ${JSON.stringify(value)};
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  if (!changed) throw new Error("AskUser free-text input not found");
+}
+
+async function submitCompactCommand(session) {
+  await setInput(session, "Message UthCode", "/compact");
+  await waitFor(session, "compact command completion", "Boolean([...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/compact')))");
+  await capture(session, "compact-command-menu");
+  const selected = await evaluateAction(session, "select compact command", `(() => {
+    const option = [...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/compact'));
+    if (!option) return false;
+    option.click();
+    return true;
+  })()`);
+  if (!selected) throw new Error("/compact completion was not available");
+  await waitFor(session, "compact command selected", "document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]')?.value.trim() === '/compact' && !document.querySelector('.command-menu')");
+  await evaluateAction(session, "execute compact command", `(() => {
+    const element = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    if (!element) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    return true;
+  })()`);
+  await waitFor(session, "compact command settled", "document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]')?.value.trim() === '' && !document.querySelector('.composer[aria-disabled=\"true\"]')");
+  const expected = requestedLanguage === "zh-CN"
+    ? { heading: "上下文压缩", states: ["已完成", "无变化", "已取消", "失败"], forbidden: ["Compaction", "completed", "No change", "cancelled"] }
+    : { heading: "Compaction", states: ["completed", "No change", "cancelled", "failed"], forbidden: ["上下文压缩", "已完成", "无变化", "已取消"] };
+  await waitFor(session, "localized compact terminal", `(() => { const text = document.querySelector('.timeline-notice')?.textContent || ''; return text.includes(${JSON.stringify(expected.heading)}) && ${JSON.stringify(expected.states)}.some((value) => text.includes(value)); })()`);
+  const terminal = await evaluateAction(session, "read localized compact terminal", `(() => ({ text: document.querySelector('.timeline-notice')?.textContent?.trim() || '', count: document.querySelectorAll('.timeline-notice').length }))()`);
+  if (terminal.count !== 1 || !terminal.text.includes(expected.heading) || expected.forbidden.some((value) => terminal.text.includes(value))) {
+    throw new Error(`compact terminal is not a single localized notice: ${JSON.stringify(terminal)}`);
+  }
+  await capture(session, "compact-terminal");
+  writeLog("assertion_pass", { description: `typed /compact has one localized terminal (${requestedLanguage})`, value: terminal });
+}
+
+async function submitSettingsRevealFlow(session) {
+  await waitFor(session, "Settings provider row", "Boolean(document.querySelector('.provider-row'))");
+  const opened = await evaluateAction(session, "open fixture provider settings", "(() => { const row = document.querySelector('.provider-row'); if (!row) return false; row.click(); return true; })()");
+  if (!opened) throw new Error("fixture provider row not found");
+  await waitFor(session, "Provider API key control", "Boolean(document.querySelector('#modal-api-key')) && Boolean(document.querySelector('button.api-key-toggle'))");
+  await assertSingleDomEntity(session, "Provider settings single DOM modal", '.provider-modal');
+  await waitFor(session, "saved API key reveal enabled", "Boolean(document.querySelector('button.api-key-toggle:not([disabled])'))");
+  await evaluateAction(session, "reveal saved API key", "(() => { const button = document.querySelector('button.api-key-toggle'); if (!button) return false; button.click(); return true; })()");
+  await waitFor(session, "saved API key revealed", "document.querySelector('#modal-api-key')?.type === 'text' && document.querySelector('#modal-api-key')?.value === 'env:UTHCODE_CDP_FIXTURE_KEY'");
+  await capture(session, "settings-api-key-revealed");
+  await evaluateAction(session, "hide saved API key", "(() => { const button = document.querySelector('button.api-key-toggle'); if (!button) return false; button.click(); return true; })()");
+  await waitFor(session, "saved API key hidden", "document.querySelector('#modal-api-key')?.type === 'password' && document.querySelector('#modal-api-key')?.value === ''");
+  await evaluateAction(session, "close provider settings", "(() => { const button = document.querySelector('.provider-modal header button'); if (!button) return false; button.click(); return true; })()");
+  await waitFor(session, "Provider settings closed", "!document.querySelector('.provider-modal')");
+  await capture(session, "settings-api-key-hidden");
+  writeLog("assertion_pass", { description: "saved API key reveal/hide uses narrow Settings path" });
+}
+
+async function submitStatusCommand(session) {
+  await setInput(session, "Message UthCode", "/status");
+  await waitFor(session, "status command completion", "Boolean([...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/status')))" );
+  const selected = await evaluateAction(session, "select status command", `(() => {
+    const option = [...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/status'));
+    if (!option) return false;
+    option.click();
+    return true;
+  })()`);
+  if (!selected) throw new Error("/status completion was not available");
+  await waitFor(session, "status command selected", "document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]')?.value.trim() === '/status' && !document.querySelector('.command-menu')");
+  await evaluateAction(session, "execute status command", `(() => {
+    const element = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    if (!element) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    return true;
+  })()`);
+  const expectedNotice = requestedLanguage === "zh-CN" ? "运行时信息" : "Runtime information";
+  await waitFor(session, "localized status command output", `Boolean(document.querySelector('.timeline-notice')?.textContent?.includes(${JSON.stringify(expectedNotice)}))`);
+  const statusView = await evaluateAction(session, "read typed status projection", `(() => {
+    const facts = [...document.querySelectorAll('.runtime-facts > div')].map((row) => ({
+      label: row.querySelector('dt')?.textContent?.trim() || '',
+      value: row.querySelector('dd')?.textContent?.trim() || '',
+    }));
+    return {
+      notice: document.querySelector('.timeline-notice')?.textContent?.trim() || '',
+      noticeCount: document.querySelectorAll('.timeline-notice').length,
+      facts,
+      body: document.body?.innerText || '',
+    };
+  })()`);
+  const modelLabel = requestedLanguage === "zh-CN" ? "模型" : "Model";
+  const model = statusView.facts.find((item) => item.label === modelLabel)?.value;
+  if (statusView.noticeCount !== 1 || statusView.notice !== expectedNotice) throw new Error(`typed /status notice is not a single localized message: ${JSON.stringify(statusView.notice)}`);
+  if (model !== "fixture/fixture-model") throw new Error(`typed /status safe model param was not projected: ${JSON.stringify(model)}`);
+  const forbidden = /RuntimeRequestError|EPERM|native|diagnostic|configuration[_ ]?(?:source|path)|file:\/\/|[A-Za-z]:[\\/]/iu;
+  if (forbidden.test(statusView.body)) throw new Error(`typed /status exposed a native/free-form/path/diagnostic value: ${statusView.body}`);
+  writeLog("assertion_pass", { description: `typed /status shows safe params only (${requestedLanguage})`, value: { notice: statusView.notice, model, facts: statusView.facts } });
 }
 
 async function setInput(session, label, value) {
@@ -450,7 +809,9 @@ async function setInput(session, label, value) {
   writeLog("action", { action: "set_input", label, valueLength: value.length });
   const changed = await evaluateAction(session, `set input ${label}`, `(() => {
     const wanted = ${JSON.stringify(label)};
-    const element = [...document.querySelectorAll("input,textarea")].find((item) => item.getAttribute("aria-label") === wanted);
+    const aliases = { "Message UthCode": ["Message UthCode", "发送给 UthCode"] };
+    const labels = aliases[wanted] ?? [wanted];
+    const element = [...document.querySelectorAll("input,textarea")].find((item) => labels.includes(item.getAttribute("aria-label") || ""));
     if (!element) return false;
     element.focus();
     const prototype = Object.getPrototypeOf(element);
@@ -502,6 +863,11 @@ async function setSelect(session, label, value) {
     }, 0));
   })()`);
   if (!changed) throw new Error(`select not found: ${label}`);
+  // Settings persistence is intentionally fire-and-forget in the renderer.
+  // Let each real preference write finish before the next DOM control change;
+  // otherwise the packaged Windows profile can receive concurrent atomic
+  // renames and report an EPERM that is caused by this driver burst.
+  await sleep(300);
 }
 
 async function bodyText(session) {
@@ -510,7 +876,7 @@ async function bodyText(session) {
 
 async function run() {
   flowDeadline = Date.now() + timeoutMs;
-  writeLog("driver_start", { argv: process.argv.slice(2), cdpPort, timeoutMs, requestTimeoutMs, flow, planChoice, delayAction });
+  writeLog("driver_start", { argv: process.argv.slice(2), cdpPort, timeoutMs, requestTimeoutMs, flow, planChoice, delayAction, askQuestionCount });
   const target = await waitForTarget();
   targetEvidence = { id: target.id, url: target.url, type: target.type };
   const session = new CdpSession(target.webSocketDebuggerUrl);
@@ -522,15 +888,39 @@ async function run() {
     // stable structural landmark so CDP acceptance works in both zh-CN/en.
     await waitFor(session, "UthCode shell", "Boolean(document.querySelector('.sidebar'))");
     await waitFor(session, "Composer", "Boolean(document.querySelector('.composer textarea'))");
+    if (flow !== "visual-fixture" && flow !== "visual") {
+      await waitFor(session, "Runtime ready", "(() => { const text = document.querySelector('.runtime-panel h2')?.textContent || ''; return text.includes('Ready') || text.includes('就绪'); })()");
+    }
 
     if (requestedLanguage) {
-      const languageSet = await evaluateAction(session, "set requested language", `(async()=>{if(typeof window.uthcode?.writePreference !== "function") return false; await window.uthcode.writePreference("language", ${JSON.stringify(requestedLanguage)}); return true})()`);
-      if (!languageSet) throw new Error("language preference API is unavailable in the packaged Renderer");
+      const currentLanguage = await evaluateAction(session, "read initial language", "typeof window.uthcode?.readPreference === \"function\" ? window.uthcode.readPreference(\"language\") : null");
+      if (currentLanguage !== requestedLanguage) {
+        const languageSet = await evaluateAction(session, "set requested language", `(async()=>{if(typeof window.uthcode?.writePreference !== "function") return false; await window.uthcode.writePreference("language", ${JSON.stringify(requestedLanguage)}); return true})()`);
+        if (!languageSet) throw new Error("language preference API is unavailable in the packaged Renderer");
+      } else {
+        observedLanguage = currentLanguage;
+        writeLog("assertion_pass", { description: "requested language already initialized by fixture preferences", value: currentLanguage });
+      }
+      // Reload even when the requested language is already present.  This
+      // keeps the packaged acceptance boundary identical for en/zh and lets
+      // the runner remove its bootstrap seed only after the fresh document
+      // has consumed it.
+      const previousDocumentOrigin = await evaluateAction(session, "read document origin before language reload", "performance.timeOrigin");
       await session.send("Page.reload", { ignoreCache: true });
-      await waitFor(session, "UthCode shell after language reload", "Boolean(document.querySelector('.sidebar'))");
-      await waitFor(session, "Composer after language reload", "Boolean(document.querySelector('.composer textarea'))");
+      await waitFor(session, "UthCode shell after language reload", `performance.timeOrigin !== ${JSON.stringify(previousDocumentOrigin)} && document.readyState === 'complete' && Boolean(document.querySelector('.sidebar'))`);
+      await waitFor(session, "Composer after language reload", "document.readyState === 'complete' && Boolean(document.querySelector('.composer textarea'))");
       observedLanguage = await evaluateAction(session, "read requested language", "typeof window.uthcode?.readPreference === \"function\" ? window.uthcode.readPreference(\"language\") : null");
       if (!observedLanguage) throw new Error("language preference read API is unavailable in the packaged Renderer");
+      if (observedLanguage !== requestedLanguage) throw new Error(`requested language ${requestedLanguage} was not observed: ${observedLanguage}`);
+      writeLog("assertion_pass", { description: "read requested language", value: observedLanguage });
+      if (flow !== "visual-fixture" && flow !== "visual") {
+        await waitFor(session, "Runtime ready after language reload", "(() => { const text = document.querySelector('.runtime-panel h2')?.textContent || ''; return text.includes('Ready') || text.includes('就绪'); })()");
+        await waitFor(session, "restored Project", "Boolean(document.querySelector('button.project-select'))");
+        await waitFor(session, "new Session action", "Boolean(document.querySelector('button.new-session-line'))");
+      }
+      // Give the packaged runner time to remove its bootstrap-only preference
+      // seed after the language boundary, before the first durable UI mutation.
+      await sleep(250);
     }
 
     if (flow === "visual-fixture") {
@@ -555,6 +945,8 @@ async function run() {
       await setSelect(session, "theme", "dark");
       await clickText(session, "Back to chat");
       await capture(session, "main-dark-docked");
+      await assertResponsiveLayout(session, "dark wide layout");
+      await runResponsiveHealthFlow(session);
       await setSelect(session, "Runtime panel layout", "floating");
       await capture(session, "main-dark-floating");
       await setSelect(session, "Runtime panel layout", "hidden");
@@ -563,6 +955,8 @@ async function run() {
       await setSelect(session, "theme", "light");
       await clickText(session, "Back to chat");
       await capture(session, "main-light");
+      await assertResponsiveLayout(session, "light wide layout");
+      await runResponsiveHealthFlow(session);
       await session.send("Emulation.setDeviceMetricsOverride", { width: 760, height: 640, deviceScaleFactor: 1, mobile: false });
       await capture(session, "main-narrow");
       await session.send("Emulation.clearDeviceMetricsOverride");
@@ -583,17 +977,43 @@ async function run() {
 
     // New Session -> real Provider request -> streamed AgentEvent projection.
     await clickText(session, "New chat");
-    await waitFor(session, "new conversation header", "document.querySelector('h1')?.textContent?.includes('Session') || document.querySelector('h1')?.textContent?.includes('New conversation')");
+    await waitFor(session, "new conversation header", "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+    await waitFor(session, "new Session persisted", "Boolean(document.querySelector('button.session-line:not(.new-session-line)'))");
+    await assertCommandCandidate(session, "/new");
+    await assertCommandCandidate(session, "/do");
+    await assertCommandCandidate(session, "/mod", "/model");
+    await assertCommandCandidate(session, "/model ", "fixture/fixture-model");
+    await assertLocalizedCommandMenu(session);
     if (flow === "plan") {
-      await clickText(session, "DEFAULT");
-      await waitFor(session, "plan mode selected", "document.querySelector('button.mode-button')?.textContent?.includes('PLAN')");
+      await setInput(session, "Message UthCode", "/plan");
+      await waitFor(session, "plan command completion", "Boolean([...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/plan'))) ");
+      const selectedPlanCommand = await evaluateAction(session, "select plan command", `(() => {
+        const option = [...document.querySelectorAll('.command-menu button')].find((item) => (item.textContent || '').includes('/plan'));
+        if (!option) return false;
+        option.click();
+        return true;
+      })()`);
+      if (!selectedPlanCommand) throw new Error("/plan completion was not available");
+      await waitFor(session, "plan command selected", "document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]')?.value.trim() === '/plan' && !document.querySelector('.command-menu')");
+      await evaluateAction(session, "execute plan command", `(() => {
+        const element = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+        if (!element) return false;
+        element.focus();
+        element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+        return true;
+      })()`);
+      await waitFor(session, "plan mode selected", "[...document.querySelectorAll('.runtime-facts dd')].some((item) => (item.textContent || '').trim() === 'PLAN')");
     }
     await setInput(session, "Message UthCode", "cdp fixture request");
+    await waitFor(session, "message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
+    if (flow === "plan") await installPlanDraftBreakpoint(session);
     await clickText(session, "Send");
-    if (flow === "ask") {
+    if (flow === "ask" || flow === "ask-one") {
       await submitAskUserFlow(session);
     } else if (flow === "tool") {
       await submitToolFlow(session, expectedText);
+    } else if (flow === "todo") {
+      await submitTodoFlow(session, expectedText);
     } else if (flow === "permission") {
       await waitForInteraction(session, "dynamic Permission surface", '[aria-label="Permission approval"]');
       await clickText(session, "Allow once");
@@ -606,6 +1026,9 @@ async function run() {
       await submitDelayedFlow(session);
     } else if (flow === "sessions") {
       await submitSessionsFlow(session);
+    } else if (flow === "commands") {
+      await waitFor(session, `Provider output ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
+      await submitCompactCommand(session);
     } else {
       await waitFor(session, `Provider output ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
     }
@@ -614,16 +1037,20 @@ async function run() {
     // controls; no renderer state or IPC protocol is injected by the driver.
     await clickText(session, "Settings");
     await waitFor(session, "Settings view", "Boolean(document.querySelector('.settings-view'))");
+    if (flow !== "visual" && flow !== "shell") await submitSettingsRevealFlow(session);
     await setSelect(session, "theme", "dark");
     await waitFor(session, "dark theme", "document.querySelector('.app-shell')?.classList.contains('theme-dark')");
-    await clickSelector(session, '[aria-label="Toggle Runtime panel"]');
-    await waitFor(session, "floating runtime panel", "document.querySelector('.app-shell')?.classList.contains('panel-floating')");
-    await clickSelector(session, '[aria-label="Toggle Runtime panel"]');
-    await waitFor(session, "hidden runtime panel", "document.querySelector('.app-shell')?.classList.contains('panel-hidden')");
     await clickText(session, "Back to chat");
     await waitFor(session, "chat after settings", "Boolean(document.querySelector('.composer textarea'))");
-    await clickText(session, "Status");
-    await waitFor(session, "status output", "document.body?.innerText?.includes('Runtime') || document.body?.innerText?.includes('status')");
+    await setSelect(session, "Runtime panel layout", "floating");
+    await waitFor(session, "floating runtime panel", "document.querySelector('.app-shell')?.classList.contains('panel-floating')");
+    await setSelect(session, "Runtime panel layout", "hidden");
+    await waitFor(session, "hidden runtime panel", "document.querySelector('.app-shell')?.classList.contains('panel-hidden')");
+    await setSelect(session, "Runtime panel layout", "docked");
+    await waitFor(session, "docked runtime panel", "document.querySelector('.app-shell')?.classList.contains('panel-docked')");
+    await runResponsiveHealthFlow(session);
+    await submitStatusCommand(session);
+    await sleep(750);
     const visibleText = await bodyText(session);
     if (/fixture-secret|raw-native-secret|api[_ -]?key\s*[:=]\s*fixture/i.test(visibleText)) throw new Error("secret-like fixture value appeared in Renderer text");
     writeLog("assertion_pass", { description: "Renderer contains no fixture secret" });

@@ -34,6 +34,14 @@ UthCode 当前共实现 **11 个 Tool 名称**：6 个默认执行工具、2 个
 
 这些 Tool 不走普通 Tool Registry 的执行路径，而是由 Agent Core 识别并更新运行状态。
 
+### `AskUserQuestion` 合同
+
+`AskUserQuestion` 一次请求包含 1—4 个问题。`text` 问题不携带 options；`single-select` 与 `multi-select` 必须各自提供 2—3 个结构化选项。Renderer 对选择题始终提供自由文本输入，非空自由文本可以与选项答案一起按正常 typed response 提交。当前合同不再包含旧的 `allow_other` 字段或 “Other” 选项分支。
+
+### Plan 流式事件
+
+Plan 草稿通过公开的 `PlanContentDelta` 事件增量投影自然语言文本，并在完成后产生 `PlanProposed`，随后进入 typed Plan Review。Renderer 不消费 Provider 原始 JSON 或 `arguments_delta`；事件携带 Run、Turn、iteration 和 tool-call identity，保证同一草稿按调用边界追加。
+
 ## 不同模式下的可见数量
 
 | 模式 | 向模型提供的 Tool | 数量 |
