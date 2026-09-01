@@ -95,24 +95,24 @@
 
 ## T10：[端到端验证] Desktop 人工与自动验收
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，记录精确 passed/failed/skipped 和 exit code。
-- [ ] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，记录精确结果；确认 Settings acceptance isolation 测试实际被正式脚本覆盖或单独明确执行。
-- [ ] 更新并运行现有 CDP fixture/driver，AskUser 新合同、Plan stream/review、Tool/Todo、Compact、Session >5 与 Settings reveal 场景均不依赖旧 `allow_other` fixture。
-- [ ] 运行现有 packaged/CDP acceptance runner，确认不再只固定覆盖不足的 visual 子流；沿用 isolated launcher、bounded deadline，不创建第二 harness。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，记录精确 passed/failed/skipped 和 exit code。
+- [x] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，记录精确结果；确认 Settings acceptance isolation 测试实际被正式脚本覆盖或单独明确执行。
+- [x] 更新并运行现有 CDP fixture/driver，AskUser 新合同、Plan stream/review、Tool/Todo、Compact、Session >5 与 Settings reveal 场景均不依赖旧 `allow_other` fixture。
+- [x] 运行现有 packaged/CDP acceptance runner，确认不再只固定覆盖不足的 visual 子流；沿用 isolated launcher、bounded deadline，不创建第二 harness。
 - [ ] 在 Windows Desktop dev shell 与 packaged app 分别验证 dark/light、zh-CN/en、wide/narrow、keyboard-only/mouse、IME、100%/125%/150% zoom、reduced motion。
 - [ ] 人工验证 AskUser 1题/4题、Plan stream/review/change/cancel、Tool success/fail/cancel、manual compact no-change/fail、Session >5/move/restart+resume 和 API Key reveal/hide/untouched/replacement。
 - [ ] 检查无 dropdown flicker/overlap、横向 crop、focus loss、duplicate timeline row、乱码或错误 Session reorder。
-- [ ] 需要真实 Provider、干净 Windows 或其他当前不可用条件的场景均在 W06 Feedback 写明环境、未验证原因和风险；未运行项没有被勾选或描述为通过。
+- [x] 需要真实 Provider、干净 Windows 或其他当前不可用条件的场景均在 W06 Feedback 写明环境、未验证原因和风险；未运行项没有被勾选或描述为通过。
 
 ## T11：[遗留负担清理] 否定扫描、文档与全量回归
 
-- [ ] 执行 `rg -n "allow_other" src tests desktop/src desktop/tests desktop/scripts`，active 旧合同命中为 0；历史冻结文件命中不修改并在 Feedback 解释。
-- [ ] 执行 `rg -n "DEFAULT_CONTEXT_WINDOW|configuredContextWindow|renameModelRef|model-1|arguments_delta" desktop/src desktop/tests desktop/scripts`，被替代 Renderer/UI/raw 路径命中为 0或逐条证明是合法否定测试。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`、`python -m compileall -q src tests`、`python -m pip check` 与 `git diff --check`，全部退出码 0。
-- [ ] 重新执行 Python full suite、Desktop typecheck/tests 与必要 CDP/packaged 回归，精确结果写入 W06 Feedback。
-- [ ] `docs/Tools.md`、A02、A03、A04/TUI（仅实际事实受影响时）和 `docs/Context-Index.md` 与最终代码一致；T10 冻结文件无修改。
-- [ ] `docs/OutstandingDebtList.md` 已核对且保持原内容，F02 Spec/Feedback 明确“能力欠账：无”且未触发 Persistent Runtime Recovery。
-- [ ] W01～W06 Feedback 齐全，分别说明实际改动、机制、文件、精确测试、Checklist、偏差、未完成项、风险和清理结果；返工只追加。
-- [ ] 对 F02 工作包和所有实际修改 Markdown 运行 UTF-8 guard，确认可解码、无 replacement/常见乱码、fenced code block 成对。
-- [ ] 全量盘点 `docs/work/` 与 archive 后更新 Context Index：T10 仍按冻结 Checklist 事实分类；F02 只有本 Checklist 全部完成且 Feedback 齐全时才标 `implemented_unarchived`，否则为 `not_implemented`。
-- [ ] 未自动归档 F02/T10，未执行未经用户明确要求的 Git commit、push、merge、rebase、tag 或 release，且用户原有未跟踪构建缓存保持不动。
+- [x] 执行 `rg -n "allow_other" src tests desktop/src desktop/tests desktop/scripts`，active 旧合同命中为 0；历史冻结文件命中不修改并在 Feedback 解释。
+- [x] 执行 `rg -n "DEFAULT_CONTEXT_WINDOW|configuredContextWindow|renameModelRef|model-1|arguments_delta" desktop/src desktop/tests desktop/scripts`，被替代 Renderer/UI/raw 路径命中为 0或逐条证明是合法否定测试。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`、`python -m compileall -q src tests`、`python -m pip check` 与 `git diff --check`，全部退出码 0。
+- [x] 重新执行 Python full suite、Desktop typecheck/tests 与必要 CDP/packaged 回归，精确结果写入 W06 Feedback。
+- [x] `docs/Tools.md`、A02、A03、A04/TUI（仅实际事实受影响时）和 `docs/Context-Index.md` 与最终代码一致；T10 冻结文件无修改。
+- [x] `docs/OutstandingDebtList.md` 已核对且保持原内容，F02 Spec/Feedback 明确“能力欠账：无”且未触发 Persistent Runtime Recovery。
+- [x] W01～W06 Feedback 齐全，分别说明实际改动、机制、文件、精确测试、Checklist、偏差、未完成项、风险和清理结果；返工只追加。
+- [x] 对 F02 工作包和所有实际修改 Markdown 运行 UTF-8 guard，确认可解码、无 replacement/常见乱码、fenced code block 成对。
+- [x] 全量盘点 `docs/work/` 与 archive 后更新 Context Index：T10 仍按冻结 Checklist 事实分类；F02 只有本 Checklist 全部完成且 Feedback 齐全时才标 `implemented_unarchived`，否则为 `not_implemented`。
+- [x] 未自动归档 F02/T10，未执行未经用户明确要求的 Git commit、push、merge、rebase、tag 或 release，且用户原有未跟踪构建缓存保持不动。

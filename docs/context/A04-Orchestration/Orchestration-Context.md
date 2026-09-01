@@ -20,7 +20,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息，但直到真实普通输入或显式 Session 命令才创建持久 Session；`uthcode exec` 每次创建一个 Run 和一个 Turn，并在真实 prompt 前惰性 ensure。
-- `[FACT]` Windows Desktop 通过 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 `src/uthcode/interfaces/desktop/bridge.py` 接入同一个 Application/Run/Turn/AgentEvent 链；Renderer 只投影 Bridge 的安全结果，配置、Session、Command 和 typed Interaction 不在 TypeScript 中复制。
+- `[FACT]` Windows Desktop 通过 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 `src/uthcode/interfaces/desktop/bridge.py` 接入同一个 Application/Run/Turn/AgentEvent 链；Renderer 只投影 Bridge 的安全结果，配置、Session、Command 和 typed Interaction 不在 TypeScript 中复制。Bridge 暴露 Application 的 `context_status`/`compaction_status` 安全投影以及 AskUser、Permission、Plan、Pause、Retry typed interaction；Context ring、Runtime panel 和交互控件不取得 Core/Application 内部 authority。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
 
@@ -159,7 +159,7 @@ implemented:
   /compact
 ```
 
-命令注册表只保留上述已实现命令，每个定义都有 handler；未注册的 Slash 名称返回普通 `UNKNOWN_COMMAND`。Dispatcher 只提供异步入口。`/compact` 进入正式 Session use case，并与 automatic L4/L5 复用同一 Application orchestrator；`/plan` 与 `/do` 已由同一 Registry 选择 Behavior Mode，`/build` 只是 `/do` alias。Plan/Task/Steering 状态仍由 Core/Application 权威链路持有，不由命令或 TUI 复制。
+命令注册表只保留上述已实现命令，每个定义都有 handler；未注册的 Slash 名称返回普通 `UNKNOWN_COMMAND`。Dispatcher 只提供异步入口。`/compact` 进入正式 Session use case，并与 automatic L4/L5 复用同一 Application orchestrator；`/plan` 与 `/do` 已由同一 Registry 选择 Behavior Mode，`/build` 只是 `/do` alias。Plan/Task/Steering 状态仍由 Core/Application 权威链路持有，不由命令或 TUI 复制；`/plan`、`/do`、`/compact` 与 `/status` 的 completion/execution 均经由 Application command/use-case 边界，不在 Renderer 另建命令或状态入口。
 
 ## 编排不变量
 

@@ -162,7 +162,7 @@ active Turn 接受 Steering 后，用户文本立即作为一条新的 user reco
 
 暂停只属于当前进程、当前内存 Run 的活动 Turn。对话根页面连续按两次 `Esc` 后，状态栏先显示 `pausing…`，到达安全边界后显示 `paused` 并打开临时动作层。动作层提供 `Resume` 或 `Cancel current turn`；网络/限流暂停提供 `Retry` 或 `Cancel current turn`。暂停期间仍保留原 `TurnHandle`，不会启动第二个 Turn，也不会产生第二个 `TurnStarted`。
 
-模型调用 `AskUserQuestion` 时，TUI 打开临时问题面板。面板支持文本、单选、多选和 `Other`，可用方向键导航、返回上一题、查看答案汇总并在确认后一次性提交。提交只调用 Application 公共 `TurnHandle.resume(...)`，问题答案和 pending pause 不在 TUI 形成第二份权威状态；答案正文也不会写入工具活动或永久系统消息。
+模型调用 `AskUserQuestion` 时，TUI 打开临时问题面板。面板支持文本、单选、多选；单选/多选始终提供自由文本输入，但不再有旧的 `Other`/`allow_other` 分支。用户可用方向键导航、返回上一题、查看答案汇总并在确认后一次性提交。提交只调用 Application 公共 `TurnHandle.resume(...)`，问题答案和 pending pause 不在 TUI 形成第二份权威状态；答案正文也不会写入工具活动或永久系统消息。
 
 Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resume 通道。选择修订时只收集非空修改点并提交精确 revision response；选择批准后同一 handle 恢复，TUI 不自行改写 Run/Plan/Task 状态。选择 Cancel 仍走当前 Turn 的既有取消收口。
 
