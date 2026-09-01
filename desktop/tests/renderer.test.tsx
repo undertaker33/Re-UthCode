@@ -5,6 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
+import { isJsonValue } from "../src/desktop-api";
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject } from "../src/desktop-api";
 
 import {
@@ -19,7 +20,7 @@ import {
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, waitForIdle } from "../src/renderer/App";
+import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
@@ -241,7 +242,7 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
     const copiedIds: string[] = [];
     const sessions: SessionSummary[] = Array.from({ length: 6 }, (_, index) => ({ session_id: `s${index + 1}`, preview: `session-${index + 1}` }));
     const project = (items: SessionSummary[] = sessions): ProjectState => ({ path: "C:/source", projectKey: "C:/source", alias: "Source", pinned: false, sessions: items, catalogFresh: true });
-    const renderSidebar = async (items: ProjectState[], selectedSessionId: string | null = null, expandedProjects: Record<string, boolean> = {}, key = "sidebar") => {
+    const renderSidebar = async (items: ProjectState[], selectedSessionId: string | null = null, expandedProjects: Record<string, boolean> = {}, key = "sidebar", sessionMutationBusy = false) => {
       act(() => {
         root.render(<LanguageProvider value="en"><Sidebar
           key={key}
@@ -249,6 +250,7 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
           selectedProjectKey={items[0]?.projectKey ?? null}
           selectedSessionId={selectedSessionId}
           activeTurn={false}
+          sessionMutationBusy={sessionMutationBusy}
           expandedProjects={expandedProjects}
           onProjectExpandedChange={(projectKey, expanded) => expansionWrites.push({ projectKey, expanded })}
           onNewSession={() => undefined}
@@ -428,6 +430,23 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
     assert.deepEqual(copiedIds, ["s1"]);
     assert.equal(container.querySelector(".sidebar-menu"), null);
     assert.equal(document.activeElement, sessionTrigger);
+
+    // A durable Session rename/move is single-flight.  The busy projection is
+    // exposed on the navigation root and disables both mutation actions,
+    // including the target-specific Move entry.
+    const target = { path: "C:/target", projectKey: "C:/target", alias: "Target", pinned: false, sessions: [], catalogFresh: true } satisfies ProjectState;
+    await renderSidebar([project(), target], "s1", {}, "busy-sidebar", true);
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), "true");
+    const busyTrigger = container.querySelector<HTMLButtonElement>(".session-menu-trigger");
+    assert.ok(busyTrigger);
+    await openMenu(busyTrigger!);
+    const busyItems = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    const busyRename = busyItems.find((button) => button.textContent?.includes("Rename"));
+    const busyMove = busyItems.find((button) => button.textContent?.includes("Move to project Target"));
+    assert.equal(busyRename?.disabled, true);
+    assert.equal(busyMove?.disabled, true);
+    assert.match(busyRename?.getAttribute("aria-label") ?? "", /already in progress/u);
+    assert.match(busyMove?.getAttribute("title") ?? "", /already in progress/u);
   });
 });
 
@@ -500,6 +519,246 @@ test("T05 session presentation reasons preserve refresh/resume/rename order and 
   assert.deepEqual(state.timeline, []);
 });
 
+test("T05 App single-flights Session mutations and applies only the accepted move", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const sourcePath = "C:/source";
+    const targetPath = "C:/target";
+    const sourceSession = { session_id: "move-a", project_key: sourcePath, title: "Original", preview: "Original preview", last_used_at: "2026-08-01", transcript_entries: 2 };
+    let moveCalls = 0;
+    let renameCalls = 0;
+    let catalogCalls = 0;
+    let resolveMove: ((value: JsonValue) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "session.move") {
+          moveCalls += 1;
+          return await new Promise<JsonValue>((resolve) => { resolveMove = resolve; });
+        }
+        if (method === "session.rename") {
+          renameCalls += 1;
+          return { session_id: "move-a", project_key: sourcePath, title: "Should not run" };
+        }
+        if (method === "project.sessions") {
+          catalogCalls += 1;
+          return { sessions: [] };
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined as never,
+      writePreference: async () => undefined as never,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [
+        { path: sourcePath, projectKey: sourcePath, alias: "Source", pinned: false, sessions: [sourceSession], catalogFresh: true },
+        { path: targetPath, projectKey: targetPath, alias: "Target", pinned: false, sessions: [], catalogFresh: true },
+      ],
+      selectedProjectKey: sourcePath,
+      selectedSessionId: sourceSession.session_id,
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const openSessionMenu = async () => {
+      const trigger = container.querySelector<HTMLButtonElement>(".project-item .session-menu-trigger");
+      assert.ok(trigger);
+      act(() => { trigger.click(); });
+      await flush();
+      return Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"));
+    };
+    await flush();
+
+    const moveItems = await openSessionMenu();
+    const moveItem = moveItems.find((button) => button.textContent?.includes("Move to project Target"));
+    assert.ok(moveItem);
+    act(() => { moveItem!.click(); });
+    await flush();
+    assert.equal(moveCalls, 1, "the first move owns the only mutation RPC");
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), "true");
+
+    // A second Move and Rename are disabled while A is waiting, so neither a
+    // stale menu nor a second click can produce another side effect.
+    const blockedItems = await openSessionMenu();
+    const blockedRename = blockedItems.find((button) => button.textContent?.includes("Rename"));
+    const blockedMove = blockedItems.find((button) => button.textContent?.includes("Move to project Target"));
+    assert.equal(blockedRename?.disabled, true);
+    assert.equal(blockedMove?.disabled, true);
+    act(() => { blockedRename?.click(); blockedMove?.click(); });
+    assert.equal(moveCalls, 1);
+    assert.equal(renameCalls, 0);
+
+    assert.ok(resolveMove);
+    act(() => {
+      resolveMove!({
+        session_id: "move-a",
+        project_key: targetPath,
+        title: "Moved",
+        session: { session_id: "move-a", project_key: targetPath, title: "Moved" },
+      });
+    });
+    await flush();
+    const target = Array.from(container.querySelectorAll<HTMLElement>(".project-item"))
+      .find((item) => item.textContent?.includes("Target"));
+    assert.ok(target);
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), null);
+    assert.equal(catalogCalls, 1, "accepted Move refreshes the source catalog authority");
+    assert.ok(!container.querySelector<HTMLElement>(".project-item:first-child .session-line")?.textContent?.includes("Original"));
+    const targetDisclosure = target?.querySelector<HTMLButtonElement>(".disclosure");
+    assert.ok(targetDisclosure);
+    act(() => { targetDisclosure!.click(); });
+    await flush();
+    assert.match(target?.textContent ?? "", /Moved/u);
+  });
+});
+
+test("T05 App keeps the original Session projection after a failed mutation", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const sourcePath = "C:/source";
+    const targetPath = "C:/target";
+    const sourceSession = { session_id: "move-fail", project_key: sourcePath, title: "Original", preview: "Original preview", last_used_at: "2026-08-01" };
+    let moveCalls = 0;
+    let rejectMove: ((reason?: unknown) => void) | null = null;
+    let catalogCalls = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "session.move") {
+          moveCalls += 1;
+          return await new Promise<JsonValue>((_resolve, reject) => { rejectMove = reject; });
+        }
+        if (method === "project.sessions") {
+          catalogCalls += 1;
+          return { sessions: [sourceSession] };
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined as never,
+      writePreference: async () => undefined as never,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [
+        { path: sourcePath, projectKey: sourcePath, alias: "Source", pinned: false, sessions: [sourceSession], catalogFresh: true },
+        { path: targetPath, projectKey: targetPath, alias: "Target", pinned: false, sessions: [], catalogFresh: true },
+      ],
+      selectedProjectKey: sourcePath,
+      selectedSessionId: sourceSession.session_id,
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    await flush();
+    const trigger = container.querySelector<HTMLButtonElement>(".project-item .session-menu-trigger");
+    assert.ok(trigger);
+    act(() => { trigger!.click(); });
+    await flush();
+    const move = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"))
+      .find((button) => button.textContent?.includes("Move to project Target"));
+    assert.ok(move);
+    act(() => { move!.click(); });
+    await flush();
+    assert.equal(moveCalls, 1);
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), "true");
+    assert.ok(rejectMove);
+    act(() => { rejectMove!(new Error("move failed")); });
+    await flush();
+    assert.equal(moveCalls, 1, "failure does not retry the side-effect RPC");
+    assert.equal(catalogCalls, 1, "failure reconciles the source catalog once");
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), null);
+    assert.match(container.querySelector<HTMLElement>(".project-item:first-child")?.textContent ?? "", /Original/u);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".project-item:nth-child(2)")?.textContent ?? "", /move-fail/u);
+  });
+});
+
+test("T05 App ignores a late mutation result after navigation changes the Runtime generation", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const sourcePath = "C:/source";
+    const targetPath = "C:/target";
+    const sourceSession = { session_id: "move-late", project_key: sourcePath, title: "Original", preview: "Original preview" };
+    let moveCalls = 0;
+    let resolveMove: ((value: JsonValue) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "session.move") {
+          moveCalls += 1;
+          return await new Promise<JsonValue>((resolve) => { resolveMove = resolve; });
+        }
+        if (method === "project.open") {
+          return { project: { path: String(params.path) }, sessions: [], run: null };
+        }
+        if (method === "project.sessions") return { sessions: [] };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined as never,
+      writePreference: async () => undefined as never,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [
+        { path: sourcePath, projectKey: sourcePath, alias: "Source", pinned: false, sessions: [sourceSession], catalogFresh: true },
+        { path: targetPath, projectKey: targetPath, alias: "Target", pinned: false, sessions: [], catalogFresh: true },
+      ],
+      selectedProjectKey: sourcePath,
+      selectedSessionId: sourceSession.session_id,
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    await flush();
+    const sourceTrigger = container.querySelector<HTMLButtonElement>(".project-item .session-menu-trigger");
+    assert.ok(sourceTrigger);
+    act(() => { sourceTrigger!.click(); });
+    await flush();
+    const move = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item"))
+      .find((button) => button.textContent?.includes("Move to project Target"));
+    assert.ok(move);
+    act(() => { move!.click(); });
+    await flush();
+    assert.equal(moveCalls, 1);
+
+    // Navigation is allowed while the mutation is in flight, but it owns a
+    // newer Runtime generation. The late Move result must not be applied to
+    // the now-selected Target project.
+    const targetSelect = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select"))
+      .find((button) => button.textContent?.includes("Target"));
+    assert.ok(targetSelect);
+    act(() => { targetSelect!.click(); });
+    await flush();
+    assert.match(container.querySelector<HTMLElement>(".project-item.is-active")?.textContent ?? "", /Target/u);
+    assert.ok(resolveMove);
+    act(() => {
+      resolveMove!({
+        session_id: "move-late",
+        project_key: targetPath,
+        title: "Late move",
+        session: { session_id: "move-late", project_key: targetPath, title: "Late move" },
+      });
+    });
+    await flush();
+    assert.equal(moveCalls, 1);
+    assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), null);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".project-item.is-active")?.textContent ?? "", /Late move/u);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".project-item.is-active")?.textContent ?? "", /move-late/u);
+  });
+});
+
 test("T05 App routes direct commands and waits for terminal status authority", async () => {
   await withRendererDom(async (dom, container, root) => {
     const preferences: DesktopPreferences = {
@@ -570,24 +829,12 @@ test("T05 App routes direct commands and waits for terminal status authority", a
   });
 });
 
-test("T05 waitForIdle requires authoritative false and has bounded failure states", async () => {
-  const activeResponses = [{ active_turn: true }, { active_turn: true }, { active_turn: false, application: {} }];
-  let activeCalls = 0;
-  const activeApi = { requestRuntime: async () => activeResponses[activeCalls++] ?? { active_turn: false } } as unknown as DesktopApi;
-  const idle = await waitForIdle(activeApi, { pollIntervalMs: 0, maxAttempts: 4 });
-  assert.equal(idle.state, "idle");
-  assert.equal(activeCalls, 3, "two active observations precede the authoritative false result");
-  assert.equal((idle as { state: "idle"; result: JsonObject }).result.active_turn, false);
-
-  let errorCalls = 0;
-  const errorApi = { requestRuntime: async () => { errorCalls += 1; throw new Error("status unavailable"); } } as unknown as DesktopApi;
-  assert.deepEqual(await waitForIdle(errorApi, { pollIntervalMs: 0, maxAttempts: 4 }), { state: "unavailable" });
-  assert.equal(errorCalls, 1, "an RPC error is not treated as idle and does not spin");
-
-  let timeoutCalls = 0;
-  const timeoutApi = { requestRuntime: async () => { timeoutCalls += 1; return { active_turn: true }; } } as unknown as DesktopApi;
-  assert.deepEqual(await waitForIdle(timeoutApi, { pollIntervalMs: 0, maxAttempts: 3 }), { state: "timeout" });
-  assert.equal(timeoutCalls, 3, "continuous active=true is bounded without enabling input");
+test("T08 DesktopApi JSON validation accepts shared data and rejects cycles", () => {
+  const shared = { label: "shared" };
+  assert.equal(isJsonValue({ first: shared, second: shared }), true, "reused JSON values are valid when they are not cyclic");
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  assert.equal(isJsonValue(cyclic), false, "a recursive back-edge is not valid JSON");
 });
 
 test("T05 terminal convergence retries transient failures with backoff past one wait window", async () => {
@@ -767,6 +1014,7 @@ test("T05 steering keeps the Bridge nested Run DTO separate from flat turn.start
 test("T05 buffers synchronous turn.start stdout until the flat accepted identity and replays once", async () => {
   await withRendererDom(async (_dom, container, root) => {
     let statusCalls = 0;
+    let allowIdle = false;
     let eventListener: ((event: AgentEvent) => void) | null = null;
     const api: DesktopApi = {
       openProject: async () => null,
@@ -788,9 +1036,9 @@ test("T05 buffers synchronous turn.start stdout until the flat accepted identity
         }
         if (method !== "status.get") return Promise.resolve({});
         statusCalls += 1;
-        return Promise.resolve(statusCalls === 1
-          ? { active_turn: true }
-          : { active_turn: false, application: { context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } } });
+        return Promise.resolve(allowIdle
+          ? { active_turn: false, application: { context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } } }
+          : { active_turn: true });
       },
       subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
       readPreference: async () => undefined,
@@ -804,8 +1052,13 @@ test("T05 buffers synchronous turn.start stdout until the flat accepted identity
     assert.equal(container.querySelectorAll(".timeline-entry--assistant").length, 1, "buffered delta and terminal replay settle one assistant row");
     assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /sync prompt[\s\S]*sync final/u);
     assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /other run/u, "buffered events from another Run are discarded");
-    assert.equal(statusCalls, 1, "buffered terminal starts one poll after accepted identity");
+    // The renderer test file runs its independent DOM fixtures concurrently;
+    // under a loaded scheduler the first 25ms backoff may elapse before these
+    // two zero-delay flushes return.  The invariant is one initial request and
+    // at most one follow-up for the active->idle response pair.
+    assert.ok(statusCalls >= 1 && statusCalls <= 2, "buffered terminal starts one bounded poll after accepted identity");
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "active authority keeps Composer locked before status idle");
+    allowIdle = true;
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 70)); });
     assert.equal(statusCalls, 2, "the buffered terminal poll reaches authoritative false");
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "buffered stdout does not lose terminal unlock");
@@ -985,6 +1238,55 @@ test("T05 reducer keeps event order, replaces assistant preview, and settles too
   assert.equal(state.timeline.find((entry) => entry.kind === "reasoning")?.streaming, false);
 });
 
+test("T08 reducer rejects stale same-Run events from an older Turn", () => {
+  const current = createInitialState({
+    activeTurn: true,
+    turnStatus: "running",
+    run: { run_id: "run-1", turn_id: "turn-2", status: "running" },
+    todo: [{ content: "current task", status: "in_progress" }],
+    todoIteration: 3,
+  });
+  const staleEvents = [
+    { type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "old-answer", text: "stale" },
+    { type: "task_state_changed", run_id: "run-1", turn_id: "turn-1", iteration: 4, task_state: { items: [{ content: "old task", status: "completed" }] } },
+    { type: "turn_completed", run_id: "run-1", turn_id: "turn-1", final_text: "old final" },
+  ];
+  for (const event of staleEvents) {
+    assert.equal(reduceRendererState(current, { type: "agent_event", event }), current, `stale ${event.type} must not mutate the current Turn`);
+  }
+});
+
+test("T08 reducer ignores late stream data and duplicate tool terminals", () => {
+  let state = createInitialState();
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+  state = reduceRendererState(state, event({ type: "reasoning_delta", run_id: "run-1", turn_id: "turn-1", message_id: "reason-1", text: "thinking" }));
+  state = reduceRendererState(state, event({ type: "reasoning_finished", run_id: "run-1", turn_id: "turn-1", message_id: "reason-1" }));
+  assert.equal(reduceRendererState(state, event({ type: "reasoning_delta", run_id: "run-1", turn_id: "turn-1", message_id: "reason-1", text: "late" })), state);
+
+  state = reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", text: "answer" }));
+  state = reduceRendererState(state, event({ type: "assistant_message_completed", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", message: { role: "assistant", parts: [{ type: "text", text: "answer" }] } }));
+  assert.equal(reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", text: "late" })), state);
+
+  state = reduceRendererState(state, event({ type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash" }));
+  state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "completed", is_error: false }));
+  const completedTool = state.timeline.find((entry) => entry.kind === "tool");
+  assert.ok(completedTool?.endedAt);
+  assert.equal(reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "failed", is_error: true })), state);
+  assert.equal(state.timeline.find((entry) => entry.kind === "tool")?.endedAt, completedTool?.endedAt);
+
+  state = reduceRendererState(state, event({ type: "turn_completed", run_id: "run-1", turn_id: "turn-1", final_text: "final" }));
+  assert.equal(reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "late-answer", text: "late" })), state);
+});
+
+test("T08 TaskState projection keeps the newest iteration", () => {
+  let state = createInitialState({ run: { run_id: "run-1", turn_id: "turn-1", status: "running" }, activeTurn: true, turnStatus: "running" });
+  const event = (iteration: number, content: string) => ({ type: "agent_event" as const, event: { type: "task_state_changed", run_id: "run-1", turn_id: "turn-1", iteration, task_state: { items: [{ content, status: "in_progress" }] } } });
+  state = reduceRendererState(state, event(3, "newest"));
+  state = reduceRendererState(state, event(2, "older"));
+  assert.deepEqual(state.todo, [{ content: "newest", status: "in_progress" }]);
+  assert.equal(state.todoIteration, 3);
+});
+
 test("T05 failed and cancelled turns discard incomplete assistant previews", () => {
   let state = createInitialState();
   state = reduceRendererState(state, { type: "agent_event", event: { type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", iteration: 1, text: "unfinished" } });
@@ -1046,6 +1348,7 @@ test("T05 Composer exposes separate steering, pause, cancel, and Python-backed c
   assert.match(markup, /暂停/);
   assert.match(markup, /取消/);
   assert.match(markup, /Select a model/);
+  assert.match(markup, /id="composer-state"[^>]*role="status"[^>]*aria-live="polite"/u);
   assert.doesNotMatch(markup, /full command list|hard-coded/);
 });
 
@@ -1203,6 +1506,25 @@ test("T06 Interaction Surface uses dynamic Permission choices and never assumes 
   assert.doesNotMatch(markup, /Allow for session/);
   const sessionMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...interaction, request: { ...interaction.request, choices: ["once", "session", "reject"] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(sessionMarkup, /Allow for session/);
+});
+
+test("T08 Interaction Surface submits one response and blocks cancel while submitting", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const submitted: JsonObject[] = [];
+    let cancelled = 0;
+    const interaction = { kind: "permission_required", pauseId: "pause-submit", runId: "run-submit", turnId: "turn-submit", request: { permission_id: "permission", choices: ["once", "reject"] } } as const;
+    act(() => {
+      root.render(<LanguageProvider value="en"><InteractionSurface interaction={interaction} onSubmit={(response) => submitted.push(response)} onCancel={() => { cancelled += 1; }} /></LanguageProvider>);
+    });
+    const allow = container.querySelector<HTMLButtonElement>('button[title="Allow once"]');
+    assert.ok(allow);
+    act(() => { allow!.click(); allow!.click(); });
+    assert.equal(submitted.length, 1, "rapid duplicate clicks keep one typed resume request");
+    const escape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { container.querySelector<HTMLElement>('[role="dialog"]')?.dispatchEvent(escape); });
+    assert.equal(escape.defaultPrevented, true);
+    assert.equal(cancelled, 0, "Escape cannot race an in-flight response");
+  });
 });
 
 test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flow", async () => {
@@ -2673,7 +2995,8 @@ test("main workspace visual contract keeps 16px SVGs and readable theme tokens",
   assert.match(markup, /class="timeline-entry timeline-entry--user"/);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.ui-icon\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;[^}]*stroke-width:\s*1\.35/s);
-  assert.match(css, /\.timeline-entry--user \.timeline-content\s*\{[^}]*color:\s*#fff;[^}]*background:\s*#4a50b8/s);
+  assert.match(css, /\.timeline-entry--user \.timeline-content\s*\{[^}]*color:\s*var\(--on-accent\);[^}]*background:\s*var\(--accent-user\)/s);
+  assert.match(css, /--accent-user:\s*#4a50b8;[^\n]*--accent-action:\s*#5158c9;[^\n]*--on-accent:\s*#fff/s);
   assert.match(css, /@media \(prefers-color-scheme: light\)[\s\S]*\.theme-system[\s\S]*--text:\s*#202027/s);
   assert.match(css, /\.theme-light\s*\{[^}]*--bg:\s*#f5f5f7;[^}]*--accent:\s*#565fd7/s);
   assert.match(css, /\.settings-view__busy-status::before\s*\{[^}]*content:\s*"";[^}]*animation:\s*settings-save-spin/s);

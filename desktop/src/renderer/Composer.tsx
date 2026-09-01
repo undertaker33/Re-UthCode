@@ -240,7 +240,7 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
         <div className="composer-selectors">
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
-        <output id="composer-state" className="composer-state">{runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
+        <output id="composer-state" className="composer-state" role="status" aria-live="polite">{runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
         <div className="composer-model">
           <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />

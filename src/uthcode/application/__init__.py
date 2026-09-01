@@ -80,6 +80,7 @@ from uthcode.core.interaction import (
 )
 from uthcode.core import (
     AgentEvent,
+    agent_event_from_dict,
     BehaviorMode,
     BehaviorModeChanged,
     CancellationToken,
@@ -172,6 +173,7 @@ __all__ = [
     "SessionOperationError",
     "SessionReplayRecord",
     "AgentEvent",
+    "agent_event_from_dict",
     "AgentRun",
     "ArgumentSpec",
     "BehaviorMode",

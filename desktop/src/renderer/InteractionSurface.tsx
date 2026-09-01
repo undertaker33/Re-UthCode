@@ -134,11 +134,23 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
   useEffect(() => {
     if (!interaction.submitting) submitLock.current = false;
   }, [interaction.submitting]);
+  const submitResponse = (response: JsonObject) => {
+    if (interaction.submitting || submitLock.current) return;
+    submitLock.current = true;
+    void onSubmit(response);
+  };
+  const cancelInteraction = () => {
+    // A response is already in flight; cancellation would create a second
+    // competing resume/cancel request for the same Pause identity.
+    if (interaction.submitting || submitLock.current) return;
+    void onCancel();
+  };
   const handleSurfaceKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
-      void onCancel();
+      if (interaction.submitting || submitLock.current) return;
+      cancelInteraction();
       return;
     }
     if (event.key !== "Tab") return;
@@ -161,7 +173,7 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
       first.focus();
     }
   };
-  const modalProps = { ref: surfaceRef, tabIndex: -1, onKeyDown: handleSurfaceKeyDown };
+  const modalProps = { ref: surfaceRef, tabIndex: -1, onKeyDown: handleSurfaceKeyDown, "aria-busy": interaction.submitting || undefined };
   useEffect(() => {
     if (typeof document === "undefined") return undefined;
     const surface = surfaceRef.current;
@@ -226,15 +238,14 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
     const completeAnswer = selected.length > 0 && selected.every((value) => value.trim().length > 0);
     const submit = () => {
       if (interaction.submitting || submitLock.current) return;
-      submitLock.current = true;
       const normalized = Object.fromEntries(questions.map((item) => [item.question_id, answers[item.question_id] ?? []]));
-      void onSubmit(buildUserInputResponse(interaction, normalized));
+      submitResponse(buildUserInputResponse(interaction, normalized));
     };
     return (
       <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("questions")}>
         <div className="interaction-surface__header"><div><p className="eyebrow">{t("inputRequired")}</p><h2>{review ? t("reviewAnswers") : question.header}</h2></div><span aria-live="polite">{review ? t("review") : `${step + 1} / ${questions.length}`}</span></div>
         {review ? <div className="answer-review">{questions.map((item) => <div key={item.question_id}><h3>{item.header}</h3><p>{(answers[item.question_id] ?? []).join(", ") || "—"}</p></div>)}</div> : <div className="question-body" aria-live="polite"><p>{question.question}</p>{question.kind === "text" && <input autoFocus value={selected[0] ?? ""} onChange={(event) => setSelected([event.target.value])} aria-label={question.header} />}{(question.kind === "single_select" || question.kind === "multi_select") && <div className="question-options">{(question.options ?? []).map((option) => <label key={option.label}><input type={question.kind === "single_select" ? "radio" : "checkbox"} name={question.question_id} checked={selected.includes(option.label)} onChange={() => setSelected(question.kind === "single_select" ? [option.label] : selected.includes(option.label) ? selected.filter((item) => item !== option.label) : [...selected, option.label])} /><span><strong>{option.label}</strong><small>{option.description}</small></span></label>)}<input className="question-free-input" autoFocus value={freeValue} placeholder={t("provideAnotherAnswer")} onChange={(event) => setFreeValue(event.target.value)} aria-label={`${question.header} ${t("provideAnotherAnswer")}`} /></div>}</div>}
-        <div className="interaction-actions">{!review && <button type="button" title={t("previous")} onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0}>{t("previous")}</button>}{review && <button type="button" title={t("editAnswers")} onClick={() => setReview(false)}>{t("editAnswers")}</button>}{!review && step < questions.length - 1 && <button type="button" title={t("next")} onClick={() => setStep(step + 1)} disabled={!completeAnswer}>{t("next")}</button>}{!review && step === questions.length - 1 && <button type="button" title={t("review")} onClick={() => setReview(true)} disabled={!completeAnswer}>{t("review")}</button>}{review && <button type="button" className="accent-button" title={t("submitAnswers")} onClick={submit} disabled={interaction.submitting}>{t("submitAnswers")}</button>}<button type="button" className="danger-button" title={t("cancelTurn")} onClick={() => void onCancel()}>{t("cancelTurn")}</button></div>
+        <div className="interaction-actions">{!review && <button type="button" title={t("previous")} onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0 || interaction.submitting}>{t("previous")}</button>}{review && <button type="button" title={t("editAnswers")} onClick={() => setReview(false)} disabled={interaction.submitting}>{t("editAnswers")}</button>}{!review && step < questions.length - 1 && <button type="button" title={t("next")} onClick={() => setStep(step + 1)} disabled={!completeAnswer || interaction.submitting}>{t("next")}</button>}{!review && step === questions.length - 1 && <button type="button" title={t("review")} onClick={() => setReview(true)} disabled={!completeAnswer || interaction.submitting}>{t("review")}</button>}{review && <button type="button" className="accent-button" title={t("submitAnswers")} onClick={submit} disabled={interaction.submitting}>{t("submitAnswers")}</button>}<button type="button" className="danger-button" title={t("cancelTurn")} onClick={cancelInteraction} disabled={interaction.submitting}>{t("cancelTurn")}</button></div>
       </section>
     );
   }
@@ -243,16 +254,16 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
     const permission = asRecord(request);
     const choices = Array.isArray(permission.choices) ? permission.choices.filter((choice): choice is string => typeof choice === "string") : [];
     const permissionId = typeof permission.permission_id === "string" ? permission.permission_id : "";
-    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("permissionApproval")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("permissionRequired")}</p><h2>{String(permission.tool ?? t("tool"))}</h2></div><span>{String(permission.action ?? t("reviewAction"))}</span></div><p className="interaction-copy">{String(permission.reason ?? t("approvalReason"))}</p><div className="interaction-actions">{choices.map((choice) => <button type="button" title={choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")} key={choice} className={choice === "reject" ? "danger-button" : "accent-button"} onClick={() => void onSubmit(buildPermissionResponse(interaction, permissionId, choice))} disabled={interaction.submitting}>{choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")}</button>)}</div></section>;
+    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("permissionApproval")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("permissionRequired")}</p><h2>{String(permission.tool ?? t("tool"))}</h2></div><span>{String(permission.action ?? t("reviewAction"))}</span></div><p className="interaction-copy">{String(permission.reason ?? t("approvalReason"))}</p><div className="interaction-actions">{choices.map((choice) => <button type="button" title={choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")} key={choice} className={choice === "reject" ? "danger-button" : "accent-button"} onClick={() => submitResponse(buildPermissionResponse(interaction, permissionId, choice))} disabled={interaction.submitting}>{choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")}</button>)}</div></section>;
   }
 
   if (interaction.kind === "plan_review_required") {
     const plan = asRecord(request);
     const revision = typeof plan.revision === "number" ? plan.revision : 1;
-    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("planReview")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("planReview")}</p><h2>{t("revision")} {revision}</h2></div><span>{t("beforeExecution")}</span></div><div className="interaction-plan">{String(plan.plan_text ?? "")}</div><div className="interaction-actions"><button type="button" title={t("approve")} className="accent-button" onClick={() => void onSubmit(buildPlanResponse(interaction, revision, "approve"))} disabled={interaction.submitting}>{t("approve")}</button><button type="button" title={t("revise")} onClick={() => { if (planFeedback.trim()) void onSubmit(buildPlanResponse(interaction, revision, "revise", planFeedback.trim())); }} disabled={interaction.submitting || !planFeedback.trim()}>{t("revise")}</button><input value={planFeedback} onChange={(event) => setPlanFeedback(event.target.value)} placeholder={t("revisionFeedback")} aria-label={t("revisionFeedback")} /><button type="button" title={t("cancelTurn")} className="danger-button" onClick={() => void onCancel()}>{t("cancelTurn")}</button></div></section>;
+    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("planReview")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("planReview")}</p><h2>{t("revision")} {revision}</h2></div><span>{t("beforeExecution")}</span></div><div className="interaction-plan">{String(plan.plan_text ?? "")}</div><div className="interaction-actions"><button type="button" title={t("approve")} className="accent-button" onClick={() => submitResponse(buildPlanResponse(interaction, revision, "approve"))} disabled={interaction.submitting}>{t("approve")}</button><button type="button" title={t("revise")} onClick={() => { if (planFeedback.trim()) submitResponse(buildPlanResponse(interaction, revision, "revise", planFeedback.trim())); }} disabled={interaction.submitting || !planFeedback.trim()}>{t("revise")}</button><input value={planFeedback} onChange={(event) => setPlanFeedback(event.target.value)} placeholder={t("revisionFeedback")} aria-label={t("revisionFeedback")} disabled={interaction.submitting} /><button type="button" title={t("cancelTurn")} className="danger-button" onClick={cancelInteraction} disabled={interaction.submitting}>{t("cancelTurn")}</button></div></section>;
   }
 
-  if (interaction.kind === "provider_unavailable") return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("providerRetry")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("providerUnavailable")}</p><h2>{t("connectionPaused")}</h2></div><span>{interaction.reason ?? "retry"}</span></div><div className="interaction-actions"><button type="button" title={t("retry")} className="accent-button" onClick={() => void onSubmit(buildRetryResponse(interaction))} disabled={interaction.submitting}>{t("retry")}</button><button type="button" title={t("cancelTurn")} className="danger-button" onClick={() => void onCancel()}>{t("cancelTurn")}</button></div></section>;
+  if (interaction.kind === "provider_unavailable") return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("providerRetry")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("providerUnavailable")}</p><h2>{t("connectionPaused")}</h2></div><span>{interaction.reason ?? "retry"}</span></div><div className="interaction-actions"><button type="button" title={t("retry")} className="accent-button" onClick={() => submitResponse(buildRetryResponse(interaction))} disabled={interaction.submitting}>{t("retry")}</button><button type="button" title={t("cancelTurn")} className="danger-button" onClick={cancelInteraction} disabled={interaction.submitting}>{t("cancelTurn")}</button></div></section>;
 
-  return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("turnPaused")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("turnPaused")}</p><h2>{t("readyToContinue")}</h2></div><span>{interaction.reason ?? "user_requested"}</span></div><div className="interaction-actions"><button type="button" title={t("continue")} className="accent-button" onClick={() => void onSubmit(buildResumeResponse(interaction))} disabled={interaction.submitting}>{t("continue")}</button><button type="button" title={t("cancelTurn")} className="danger-button" onClick={() => void onCancel()}>{t("cancelTurn")}</button></div></section>;
+  return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("turnPaused")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("turnPaused")}</p><h2>{t("readyToContinue")}</h2></div><span>{interaction.reason ?? "user_requested"}</span></div><div className="interaction-actions"><button type="button" title={t("continue")} className="accent-button" onClick={() => submitResponse(buildResumeResponse(interaction))} disabled={interaction.submitting}>{t("continue")}</button><button type="button" title={t("cancelTurn")} className="danger-button" onClick={cancelInteraction} disabled={interaction.submitting}>{t("cancelTurn")}</button></div></section>;
 }

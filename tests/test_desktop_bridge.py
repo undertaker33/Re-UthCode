@@ -18,6 +18,7 @@ from uthcode.application import (
     ApplicationRuntimeContext,
     ApplicationSessionService,
     BehaviorMode,
+    ConfigSource,
     EffectiveConfig,
     GenerationCompleted,
     Message,
@@ -37,6 +38,8 @@ from uthcode.application import (
     QuestionKind,
     RetryProviderResponse,
     ResumeTurnResponse,
+    RunSnapshot,
+    RunStatus,
     SessionReplayRecord,
     FailureReason,
     TerminationReason,
@@ -48,7 +51,11 @@ from uthcode.application import (
     Usage,
     UthCodeApplication,
 )
-from uthcode.core.agent_events import ToolFinished, TurnFailed
+from uthcode.core.agent_events import (
+    ToolFinished,
+    TurnFailed,
+    agent_event_from_dict as core_agent_event_from_dict,
+)
 from uthcode.core.permission import Effect, ResourceScope, RuleSet
 from uthcode.application import ToolResultPart
 from uthcode.integrations.providers.fake import FakeProvider
@@ -1305,7 +1312,23 @@ async def test_secret_sentinel_stays_out_of_all_non_reveal_bridge_projections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sentinel = "w04-secret-sentinel"
+    sentinels = {
+        name: f"w04-{name}-sentinel"
+        for name in (
+            "api_key",
+            "diagnostics",
+            "session_path",
+            "provider_response",
+            "sdk_response",
+            "config_source",
+            "raw_provider_payload",
+            "arguments_delta",
+            "private_body",
+            "native_payload",
+            "exception",
+        )
+    }
+    sentinel = sentinels["api_key"]
     home = tmp_path / "home"
     user = home / ".uthcode" / "config.toml"
     user.parent.mkdir(parents=True)
@@ -1328,7 +1351,16 @@ remote_id = "remote"
             return {
                 "run_id": "run-safe",
                 "api_key": sentinel,
-                "nested": {"access_token": sentinel},
+                "diagnostics": sentinels["diagnostics"],
+                "session_path": home / "sessions.sqlite",
+                "provider_response": {"raw": sentinels["provider_response"]},
+                "sdk_response": sentinels["sdk_response"],
+                "config_source": home / "private-config.toml",
+                "raw_provider_payload": sentinels["raw_provider_payload"],
+                "arguments_delta": sentinels["arguments_delta"],
+                "private_body": sentinels["private_body"],
+                "native_payload": object(),
+                "exception": RuntimeError(sentinels["exception"]),
             }
 
     class UnsafeProjectionApplication(_FakeApplication):
@@ -1342,10 +1374,19 @@ remote_id = "remote"
         current_model="remote/ref",
         provider_profile="remote",
         provider_identity=ProviderIdentity("remote", "openai_responses", "remote"),
-        configuration_sources=(),
+        configuration_sources=(ConfigSource("project", home / "private-config.toml"),),
         diagnostics={
             "api_key": sentinel,
-            "nested": {"secret": sentinel},
+            "diagnostics": sentinels["diagnostics"],
+            "session_path": home / "sessions.sqlite",
+            "provider_response": {"raw": sentinels["provider_response"]},
+            "sdk_response": sentinels["sdk_response"],
+            "config_source": home / "private-config.toml",
+            "raw_provider_payload": sentinels["raw_provider_payload"],
+            "arguments_delta": sentinels["arguments_delta"],
+            "private_body": sentinels["private_body"],
+            "native_payload": object(),
+            "exception": RuntimeError(sentinels["exception"]),
             "safe": "retained",
         },
     )
@@ -1354,24 +1395,35 @@ remote_id = "remote"
     settings = await bridge.handle_request(RequestEnvelope("sentinel-settings", "settings.get", {}))
     status = await bridge.handle_request(RequestEnvelope("sentinel-status", "status.get", {}))
     assert settings.ok is True and status.ok is True
-    assert sentinel not in json.dumps(settings.to_dict(), ensure_ascii=False)
-    assert sentinel not in json.dumps(status.to_dict(), ensure_ascii=False)
-    assert status.result is not None and status.result["application"]["diagnostics"] == {  # type: ignore[index]
-        "nested": {},
-        "safe": "retained",
-    }
-    assert status.result["runtime"]["run"]["run_id"] == "run-safe"  # type: ignore[index]
-    assert status.result["runtime"]["run"]["nested"] == {}  # type: ignore[index]
+    settings_wire = json.dumps(settings.to_dict(), ensure_ascii=False)
+    status_wire = json.dumps(status.to_dict(), ensure_ascii=False)
+    assert all(value not in settings_wire for value in sentinels.values())
+    assert all(value not in status_wire for value in sentinels.values())
+    assert status.result is not None
+    application_status = status.result["application"]  # type: ignore[index]
+    assert "diagnostics" not in application_status  # type: ignore[operator]
+    assert "configuration_sources" not in application_status  # type: ignore[operator]
+    assert status.result["runtime"]["run"] is None  # type: ignore[index]
 
     class UnsafeEvent(AgentEvent):
-        event_type = "unsafe_event"
+        event_type = "turn_completed"
 
         def to_dict(self) -> dict[str, object]:
             return {
                 "type": self.event_type,
                 "run_id": self.run_id,
                 "turn_id": self.turn_id,
-                "api_key": sentinel,
+                "final_text": "safe-looking event",
+                "diagnostics": sentinels["diagnostics"],
+                "session_path": home / "sessions.sqlite",
+                "provider_response": sentinels["provider_response"],
+                "sdk_response": sentinels["sdk_response"],
+                "config_source": home / "private-config.toml",
+                "raw_provider_payload": sentinels["raw_provider_payload"],
+                "arguments_delta": sentinels["arguments_delta"],
+                "private_body": sentinels["private_body"],
+                "native_payload": object(),
+                "exception": RuntimeError(sentinels["exception"]),
             }
 
     event_handle = _EventHandle(UnsafeEvent("run-safe", "turn-safe"))
@@ -1379,12 +1431,10 @@ remote_id = "remote"
     bridge._turn_task = asyncio.create_task(bridge._consume_turn(event_handle))
     await bridge.wait_for_idle()
     events = bridge.drain_outbox()
-    assert sentinel not in json.dumps([item.to_dict() for item in events], ensure_ascii=False)
-    assert events[0].event == {  # type: ignore[union-attr]
-        "type": "unsafe_event",
-        "run_id": "run-safe",
-        "turn_id": "turn-safe",
-    }
+    event_wire = json.dumps([item.to_dict() for item in events], ensure_ascii=False)
+    assert all(value not in event_wire for value in sentinels.values())
+    assert [item.type for item in events] == ["runtime_state"]
+    assert events[0].state == "failed"  # type: ignore[union-attr]
 
     def fail_settings(*_args: object, **_kwargs: object) -> object:
         raise bridge_module.ConfigurationError(sentinel)
@@ -1400,8 +1450,18 @@ remote_id = "remote"
 @pytest.mark.asyncio
 async def test_run_permission_mode_is_added_to_safe_runtime_and_command_projections() -> None:
     class ProjectedRun(_FakeRun):
-        def snapshot(self) -> dict[str, object]:
-            return {"run_id": "run-safe", "status": "running"}
+        def snapshot(self) -> RunSnapshot:
+            return RunSnapshot(
+                run_id="run-safe",
+                turn_id="turn-safe",
+                iteration_count=0,
+                tool_call_count=0,
+                consecutive_unknown_tools=0,
+                usage=Usage(),
+                behavior_mode=BehaviorMode.DEFAULT,
+                status=RunStatus.RUNNING,
+                termination_reason=None,
+            )
 
     class PermissionApplication(_FakeApplication):
         def create_run(self) -> ProjectedRun:
@@ -1447,6 +1507,34 @@ async def test_status_projection_drops_real_tool_result_part_content() -> None:
     assert content not in encoded
     assert '"type": "tool_result"' not in encoded
     await bridge.shutdown()
+
+
+def test_event_projection_delegates_round_trip_validation_to_core_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = ToolFinished(
+        "run-parser",
+        "turn-parser",
+        1,
+        "batch-parser",
+        "call-parser",
+        "Bash",
+        "echo safe",
+        "succeeded",
+        False,
+    )
+    seen: list[object] = []
+
+    def parse(payload: object) -> object:
+        seen.append(payload)
+        return core_agent_event_from_dict(payload)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bridge_module, "agent_event_from_dict", parse)
+
+    projected = bridge_module._event(event)
+
+    assert projected == event.to_dict()
+    assert seen == [event.to_dict()]
 
 
 @pytest.mark.asyncio

@@ -73,25 +73,25 @@
 
 ## T08：GUI 越界、冗余、不可达与过度抽象审查
 
-- [ ] 对 `desktop/src/**`、`src/uthcode/interfaces/desktop/**` 与 F02 新公共投影修改点完成按 P0/P1/P2/P3 分级审查，finding、证据、处置和验证写入 W05 Feedback。
-- [ ] F02 范围内 P0/P1/P2 finding 全部关闭；未关闭项为 0 后才进入 T09。
-- [ ] stale RPC、project/session 切换污染、Plan tool-call 混流、duplicate/out-of-order event、compact input gate、Settings rollback 与 focus restoration 均有测试或可复核证据。
-- [ ] Renderer 不计算 Context safety、不修改 durable Session、不复制 Permission/Mode/Todo/Plan authority、不把 Slash 伪装用户消息；Bridge 不绕 Application 访问 Core mutable state/Session files。
-- [ ] API Key、raw Provider/tool private body、internal diagnostics、Session path 与 native exception 不穿过非授权 Interface payload。
-- [ ] 执行无调用方 export/helper、重复 normalize/project、旧 action/locale/CSS/fixture、catch 后不可达 fallback 的扫描并删除真实遗留。
-- [ ] `App.tsx`、`state.ts`、`SettingsView.tsx` 的保留/拆分理由记录在 Feedback；新增私有模块均有当前调用方与测试，旧入口已删除。
-- [ ] 执行 `rg -n "DesktopManager|SessionManager|SessionStore|ContextManager|ContextEngine|PlanManager|TodoManager|EventBus|PluginRegistry|TransportFactory" src/uthcode desktop/src tests desktop/tests`，无 F02 新增生产抽象命中。
-- [ ] 执行 Python architecture tests、Desktop typecheck/tests 与 `git diff --check`，全部通过。
+- [x] 对 `desktop/src/**`、`src/uthcode/interfaces/desktop/**` 与 F02 新公共投影修改点完成按 P0/P1/P2/P3 分级审查，finding、证据、处置和验证写入 W05 Feedback。
+- [x] F02 范围内 P0/P1/P2 finding 全部关闭；未关闭项为 0 后才进入 T09。
+- [x] stale RPC、project/session 切换污染、Plan tool-call 混流、duplicate/out-of-order event、compact input gate、Settings rollback 与 focus restoration 均有测试或可复核证据。
+- [x] Renderer 不计算 Context safety、不修改 durable Session、不复制 Permission/Mode/Todo/Plan authority、不把 Slash 伪装用户消息；Bridge 不绕 Application 访问 Core mutable state/Session files。
+- [x] API Key、raw Provider/tool private body、internal diagnostics、Session path 与 native exception 不穿过非授权 Interface payload。
+- [x] 执行无调用方 export/helper、重复 normalize/project、旧 action/locale/CSS/fixture、catch 后不可达 fallback 的扫描并删除真实遗留。
+- [x] `App.tsx`、`state.ts`、`SettingsView.tsx` 的保留/拆分理由记录在 Feedback；新增私有模块均有当前调用方与测试，旧入口已删除。
+- [x] 执行 `rg -n "DesktopManager|SessionManager|SessionStore|ContextManager|ContextEngine|PlanManager|TodoManager|EventBus|PluginRegistry|TransportFactory" src/uthcode desktop/src tests desktop/tests`，无 F02 新增生产抽象命中。
+- [x] 执行 Python architecture tests、Desktop typecheck/tests 与 `git diff --check`，全部通过。
 
 ## T09：[接入主流程] Desktop 生产链集成
 
 - [ ] 从真实 Desktop dev shell 验证 `Renderer → DesktopApi → Main/Preload → DesktopBridge → Application → Core`，请求/Run/Turn/pause/tool-call identity 和事件顺序一致。
-- [ ] AskUser request → typed response → 同一 Turn continue 通过；Plan delta → final → Review → approve/revise/cancel 通过且没有 raw JSON。
-- [ ] Context/Compact status、open idle Session move/Plan replay、direct Slash/model/status、Settings reveal/save/rebootstrap、Todo/Tool/BehaviorMode 均走唯一生产链。
-- [ ] active Turn、pending interaction、compact running 与 stale response 门禁均从现有权威收敛，不创建第二 Turn/Run/Application。
-- [ ] 执行否定扫描，确认被替代的 candidate 特判、伪 command user message、Context/Plan/Session/Settings 双入口为 0。
-- [ ] `git diff --name-only -- docs/work/T10-DesktopGUI与TUI全量能力迁移` 返回空；`git diff --name-only -- desktop/src/main.ts desktop/src/preload.ts desktop/src/python-runtime.ts` 也返回空，证明冻结工作包和明确保留 transport 文件没有无授权修改。
-- [ ] T08 的所有已关闭 finding 在集成后复查仍为关闭，无新增 F02 范围 P0/P1/P2。
+- [x] AskUser request → typed response → 同一 Turn continue 通过；Plan delta → final → Review → approve/revise/cancel 通过且没有 raw JSON。
+- [x] Context/Compact status、open idle Session move/Plan replay、direct Slash/model/status、Settings reveal/save/rebootstrap、Todo/Tool/BehaviorMode 均走唯一生产链。
+- [x] active Turn、pending interaction、compact running 与 stale response 门禁均从现有权威收敛，不创建第二 Turn/Run/Application。
+- [x] 执行否定扫描，确认被替代的 candidate 特判、伪 command user message、Context/Plan/Session/Settings 双入口为 0。
+- [x] `git diff --name-only -- docs/work/T10-DesktopGUI与TUI全量能力迁移` 返回空；`git diff --name-only -- desktop/src/main.ts desktop/src/preload.ts desktop/src/python-runtime.ts` 也返回空，证明冻结工作包和明确保留 transport 文件没有无授权修改。
+- [x] T08 的所有已关闭 finding 在集成后复查仍为关闭，无新增 F02 范围 P0/P1/P2。
 
 ## T10：[端到端验证] Desktop 人工与自动验收
 
