@@ -97,7 +97,7 @@ export function RuntimePanel({ state, onPanelModeChange, id = "runtime-panel", v
         <div><dt>{t("session")}</dt><dd>{state.selectedSessionId ? state.selectedSessionId.slice(0, 8) : "—"}</dd></div>
       </dl>
       {state.completionBlocked && <p>{state.completionBlocked.replace(/^Completion blocked: (\d+) unfinished task\(s\)$/u, (_, count: string) => `${t("completionBlockedLabel")}: ${count} ${t("unfinishedTasks")}`)}</p>}
-      {state.runtimeError && <p role="alert">{state.runtimeError}</p>}
+      {visible && state.runtimeError && <p className="runtime-panel__error" data-runtime-error-owner="runtime-panel" role="alert">{state.runtimeError}</p>}
       {state.diagnostics.length > 0 && <p>{t("diagnosticsAvailable")} ({state.diagnostics.length})</p>}
     </aside>
   );

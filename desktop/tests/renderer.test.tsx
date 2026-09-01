@@ -285,8 +285,71 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
     };
     act(() => { root.render(<App initialState={createInitialState({ language: "en" })} api={api} />); });
     for (let index = 0; index < 12; index += 1) await flush();
-    assert.match(container.querySelector<HTMLElement>(".configuration-banner")?.textContent ?? "", /Runtime could not start/u);
+    assert.match(container.querySelector<HTMLElement>(".runtime-panel__error")?.textContent ?? "", /Runtime could not start/u);
     assert.doesNotMatch(container.textContent ?? "", /RuntimeBoundaryError|sandbox launch failed|uthcode-runtime|resources/u);
+  });
+});
+
+test("T06 Runtime error owns one accessible DOM entity across renderer modes", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const scenarios = [
+      { width: 1100, panelMode: "docked" as const, owner: "runtime-panel" },
+      { width: 1100, panelMode: "floating" as const, owner: "runtime-panel" },
+      { width: 760, panelMode: "docked" as const, owner: "runtime-panel" },
+      { width: 1100, panelMode: "hidden" as const, owner: "timeline" },
+      { width: 680, panelMode: "docked" as const, owner: "timeline" },
+      { width: 608, panelMode: "docked" as const, owner: "timeline" },
+      { width: 533, panelMode: "docked" as const, owner: "timeline" },
+      { width: 520, panelMode: "floating" as const, owner: "runtime-panel" },
+      { width: 507, panelMode: "docked" as const, owner: "timeline" },
+      { width: 500, panelMode: "hidden" as const, owner: "timeline" },
+    ];
+    const themes = ["dark", "light"] as const;
+    const languages = ["en", "zh-CN"] as const;
+    let renderIndex = 0;
+    for (const theme of themes) {
+      for (const language of languages) {
+        for (const scenario of scenarios) {
+          Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: scenario.width });
+          const error = translate(language, "runtimeStartFailed");
+          const state = createInitialState({ language, theme, panelMode: scenario.panelMode, runtimeState: "configuration_required", runtimeError: error, notice: error });
+          const stored: DesktopPreferences = { theme, language, windowBounds: { width: scenario.width, height: 800, maximized: false }, panelMode: scenario.panelMode, recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
+          const api: DesktopApi = { openProject: async () => null, openProjectInExplorer: async () => undefined, copySessionId: async () => undefined, closeShell: async () => undefined, requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key], writePreference: async () => stored };
+          act(() => { root.render(<App key={`${theme}-${language}-${scenario.width}-${scenario.panelMode}-${renderIndex++}`} initialState={state} api={api} />); });
+          await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+
+          const runtimeError = container.querySelector<HTMLElement>("[data-runtime-error-owner]");
+          assert.ok(runtimeError, `${theme}/${language}/${scenario.width}/${scenario.panelMode} should render an error`);
+          assert.equal(runtimeError?.getAttribute("data-runtime-error-owner"), scenario.owner);
+          assert.equal(container.querySelectorAll<HTMLElement>("[data-runtime-error-owner]").length, 1, "one Runtime error has one visual owner");
+          assert.equal(container.querySelectorAll<HTMLElement>('[role="alert"]').length, 1, "one Runtime error has one alert region");
+          assert.equal(container.querySelector(".configuration-banner"), null, "the old fixed bottom banner is gone");
+          assert.match(runtimeError?.textContent ?? "", new RegExp(error.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+
+          const composer = container.querySelector<HTMLElement>(".composer");
+          assert.ok(composer);
+          if (scenario.owner === "timeline") {
+            const notice = container.querySelector<HTMLElement>(".timeline-runtime-error");
+            assert.ok(notice);
+            assert.equal(notice?.parentElement?.classList.contains("timeline"), true);
+            assert.equal(notice?.getAttribute("role"), "alert");
+            const openSettings = notice?.querySelector<HTMLButtonElement>("button");
+            assert.ok(openSettings, "configuration error keeps a reachable settings action");
+            assert.equal(openSettings?.textContent, translate(language, "openSettings"));
+            act(() => { openSettings?.focus(); });
+            assert.equal(dom.window.document.activeElement, openSettings);
+          } else {
+            assert.equal(container.querySelector(".timeline-runtime-error"), null, "visible Runtime owns the error");
+            const runtimePanel = container.querySelector<HTMLElement>("#runtime-panel");
+            assert.equal(runtimeError?.closest("#runtime-panel"), runtimePanel);
+            assert.equal(runtimePanel?.getAttribute("aria-hidden"), null);
+            const panelError = runtimePanel?.querySelector<HTMLElement>(".runtime-panel__error");
+            assert.ok(panelError);
+          }
+          assert.equal(container.querySelector<HTMLElement>(".composer textarea")?.disabled, false, "error presentation must not disable the main Composer");
+        }
+      }
+    }
   });
 });
 
@@ -1283,6 +1346,34 @@ test("T05 Runtime drawer restores focus when a wide docked panel becomes hidden 
     assert.equal(toggle?.getAttribute("aria-expanded"), "false");
     assert.equal(runtime?.getAttribute("aria-hidden"), "true");
     assert.equal(dom.window.document.activeElement, toggle, "responsive hiding restores focus instead of leaving it in the hidden panel");
+  });
+});
+
+test("T06 responsive Runtime error owner handoff preserves focus across a real resize", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 680 });
+    const error = translate("en", "runtimeStartFailed");
+    act(() => {
+      root.render(<App initialState={createInitialState({ language: "en", panelMode: "docked", runtimeState: "configuration_required", runtimeError: error, notice: error })} api={undefined} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const timelineError = container.querySelector<HTMLElement>(".timeline-runtime-error");
+    const openSettings = timelineError?.querySelector<HTMLButtonElement>("button");
+    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    assert.ok(timelineError && openSettings && toggle);
+    assert.equal(container.querySelector("#runtime-panel")?.getAttribute("aria-hidden"), "true");
+    act(() => { openSettings!.focus(); });
+    assert.equal(dom.window.document.activeElement, openSettings);
+
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 760 });
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+
+    assert.equal(container.querySelector(".timeline-runtime-error"), null, "wide docked Runtime becomes the sole error owner");
+    assert.equal(container.querySelector("#runtime-panel")?.getAttribute("aria-hidden"), null);
+    assert.equal(container.querySelectorAll<HTMLElement>("[data-runtime-error-owner]").length, 1);
+    assert.equal(dom.window.document.activeElement, toggle, "owner handoff restores focus to the stable Runtime toggle");
+    assert.equal(toggle?.getAttribute("aria-expanded"), "true");
   });
 });
 
@@ -3902,9 +3993,15 @@ test("Prompt 4 theme and responsive CSS contracts cover context ring and compose
   assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.runtime-panel--floating\s*\{[^}]*width:\s*min\(304px, calc\(100vw - 16px\)\)/);
   assert.doesNotMatch(css, /@media \(max-width: 520px\)[\s\S]*?\.sidebar[^}]*display:\s*none/);
   assert.match(css, /\.runtime-panel--floating\s*\{[^}]*background:\s*var\(--surface\)[^}]*box-shadow:/);
+  assert.match(css, /\.timeline-runtime-error\s*\{[^}]*position:\s*sticky;[^}]*overflow:\s*auto;[^}]*background:\s*var\(--surface\)/s);
+  assert.match(css, /\.runtime-panel__error\s*\{[^}]*border-left:\s*3px solid var\(--danger\);[^}]*background:\s*var\(--surface\)/s);
+  assert.match(css, /@media \(max-width: 520px\)[\s\S]*?\.timeline-runtime-error\s*\{[^}]*flex-wrap:\s*wrap/);
+  assert.doesNotMatch(css, /\.configuration-banner\s*\{/u);
   assert.match(css, /\.runtime-heading h2 \.ui-icon\s*\{[^}]*color:\s*var\(--accent-strong\)/);
   assert.match(css, /--composer-height/);
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?scroll-behavior:\s*auto[\s\S]*?transition-duration:\s*0\.01ms/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "dark" })} api={undefined} />), /theme-dark/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "light" })} api={undefined} />), /theme-light/);
+  assert.ok(contrastRatio("#f0f0f3", "#242427") >= 4.5, "dark Runtime error text remains readable on its opaque surface");
+  assert.ok(contrastRatio("#202027", "#ffffff") >= 4.5, "light Runtime error text remains readable on its opaque surface");
 });

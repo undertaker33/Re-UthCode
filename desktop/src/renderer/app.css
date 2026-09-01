@@ -100,7 +100,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .text-button { border: 0; border-radius: 6px; padding: 6px 8px; color: var(--muted); background: transparent; font-size: 11px; }
 
 .timeline { position: absolute; inset: 50px 0 0; overflow: auto; padding: 34px 30px max(188px, calc(var(--composer-height, 0px) + 30px)); scroll-padding-bottom: max(188px, calc(var(--composer-height, 0px) + 30px)); scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
-.timeline-entry, .timeline-notice, .todo-strip { width: min(820px, calc(100% - 20px)); margin-inline: auto; }
+.timeline-entry, .timeline-notice, .timeline-runtime-error, .todo-strip { width: min(820px, calc(100% - 20px)); margin-inline: auto; }
 .timeline-entry { margin-bottom: 26px; }
 .timeline-entry > header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
 .timeline-entry > header small { color: var(--muted); font-size: 9px; font-weight: 500; }
@@ -126,6 +126,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .timeline-content table { width: 100%; border-collapse: collapse; }
 .timeline-content th, .timeline-content td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; }
 .timeline-notice { border-left: 2px solid var(--accent); padding: 7px 11px; color: var(--muted); font-size: 12px; }
+.timeline-runtime-error { position: sticky; top: 0; z-index: 3; display: flex; max-height: min(180px, 50vh); align-items: flex-start; gap: 10px; overflow: auto; margin-bottom: 18px; border: 1px solid color-mix(in srgb, var(--danger) 58%, var(--line)); border-left: 3px solid var(--danger); border-radius: 10px; padding: 10px 12px; color: var(--text); background: var(--surface); box-shadow: 0 8px 20px var(--shadow); line-height: 1.45; }
+.timeline-runtime-error > span { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.timeline-runtime-error button { flex: 0 0 auto; min-height: 30px; border: 1px solid var(--danger); border-radius: 7px; padding: 5px 9px; color: var(--text); background: var(--raised); font-size: 11px; }
 .timeline-empty { display: grid; min-height: 50vh; place-content: center; justify-items: center; color: var(--faint); }
 .timeline-empty span { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid var(--line-strong); border-radius: 12px; color: var(--accent-strong); }
 .timeline-empty p { font-size: 12px; }
@@ -186,7 +189,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .runtime-facts > div { display: grid; grid-template-columns: 1fr 1.35fr; gap: 8px; padding: 11px 0; border-bottom: 1px solid var(--line); }
 .runtime-facts dt { color: var(--faint); font-size: 10px; text-transform: uppercase; }
 .runtime-facts dd { overflow: hidden; margin: 0; color: var(--text); text-align: right; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.configuration-banner { position: fixed; right: 22px; bottom: 22px; z-index: 20; border: 1px solid var(--accent); border-radius: 8px; padding: 9px 11px; color: var(--text); background: var(--surface); }
+.runtime-panel__error { margin: 15px 0 0; border: 1px solid color-mix(in srgb, var(--danger) 58%, var(--line)); border-left: 3px solid var(--danger); border-radius: 9px; padding: 9px 11px; color: var(--text); background: var(--surface); overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; }
 
 .settings-view { display: grid; grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr); height: 100vh; overflow: hidden; background: var(--bg); }
 .settings-nav { display: flex; min-width: 0; flex-direction: column; gap: 30px; padding: 22px 16px; border-right: 1px solid var(--line); background: var(--sidebar); }
@@ -321,7 +324,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   body { min-width: 0; }
   .app-shell { --sidebar-width: 196px; }
   .timeline { padding-inline: 16px; }
-  .timeline-entry, .timeline-notice, .todo-strip { width: 100%; }
+  .timeline-entry, .timeline-notice, .timeline-runtime-error, .todo-strip { width: 100%; }
   .app-shell.panel-docked .timeline { padding-bottom: 286px; padding-bottom: max(286px, calc(var(--composer-height, 0px) + 34px)); scroll-padding-bottom: max(286px, calc(var(--composer-height, 0px) + 34px)); }
   .app-shell.panel-docked .composer { padding: 9px; }
   .app-shell.panel-docked .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
@@ -351,6 +354,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 @media (max-width: 520px) {
   .conversation-bar { height: 46px; }
   .timeline { inset: 46px 0 0; padding-bottom: max(208px, calc(var(--composer-height, 0px) + 24px)); scroll-padding-bottom: max(208px, calc(var(--composer-height, 0px) + 24px)); }
+  .timeline-runtime-error { flex-wrap: wrap; gap: 8px; margin-bottom: 14px; padding: 8px 10px; }
+  .timeline-runtime-error button { margin-left: 0; }
   .composer { bottom: 8px; border-radius: 12px; }
   .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
   .composer-model { grid-column: 1 / -1; justify-content: flex-end; margin-left: 0; }

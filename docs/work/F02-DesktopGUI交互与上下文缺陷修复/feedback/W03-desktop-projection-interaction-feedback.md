@@ -340,3 +340,52 @@
 ### 第 5 轮 UTF-8 guard 实际结果（真实 EOF 追加）
 
 - `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；Checklist 与 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
+
+## W06 视觉复审返工（第 6 轮，2026-09-01，真实 EOF 追加）
+
+本轮仅修复 W06 最终视觉复审发现的 Runtime 错误告警布局/重复实体问题；未修改 W05/W06 Feedback、冻结 Checklist 或任何 Git 状态。
+
+### 实际修复
+
+- Runtime 错误改为单一可访问视觉实体：可见的 RuntimePanel（docked/floating）负责渲染 `runtime-panel__error`；hidden 或窄屏 docked（RuntimePanel 不可见）由 Timeline 内联 `timeline-runtime-error` 负责渲染。App 将同一 `runtimeError` 传给 Timeline 仅用于 owner 判定与相同 notice 去重，不创建第二 store；旧 fixed bottom `configuration-banner` 已删除。
+- Timeline 告警位于主区滚动容器顶部，使用 opaque surface、danger 边界、`overflow:auto`、最大高度与 sticky top，不再 fixed 到窗口底部；Composer 继续由现有底部安全 padding 与独立布局承载，RuntimePanel 告警则在其自身滚动面板内，不覆盖 Send/Settings 或主操作。配置错误仍保留可聚焦、按当前 locale 翻译的 Open Settings 按钮。
+- 响应式 CSS 保持 760px docked 主区与 <=680/<=520 窄屏边界，<=520 告警允许换行；dark/light 使用现有 text/surface/danger token，错误文本在两主题 opaque surface 上保持可读，既有 reduced-motion 全局规则继续生效且告警不引入动画。Renderer/locale/CSS 边界外的 Main、Preload、Python、Bridge、CDP 未修改。
+
+### 本轮实际验证与 Checklist
+
+- 新增真实 React DOM contract 测试覆盖 docked/floating/hidden、760/680/608/533/520/507/500 CSS viewport、dark/light、en/zh-CN；断言同一 Runtime 错误恰有一个 owner 与一个 `role=alert`，相同 generic notice 不重复，Runtime error 不禁用 Composer，窄屏 Timeline 告警的设置按钮可聚焦。
+- 测试通过显式 `getBoundingClientRect()` contract 断言 Timeline 告警在 Composer 之上且处于 main 内、RuntimePanel 告警与 Composer 矩形不相交，并补充 CSS sticky/scroll/opaque surface、<=520 wrap、旧 fixed banner 删除、reduced-motion 与颜色对比断言。JSDOM 不计算真实 media/zoom layout，因此这些是 DOM/CSS/矩形 contract，不是 packaged 窗口测量。
+- 本轮没有修改冻结 Checklist，也没有新增勾选。当前 W03 负责范围中原有已勾选项保持不变：T05 的 Desktop typecheck/full evidence、Application Context authority 与 delta 无 status RPC、manual compact/terminal gate、Session presentation ordering；T06 的 Slash/IME/select/focus、Tool same-row/elapsed/ARIA、Todo replace-all、Plan draft/final/failure/cancel、AskUser multi-step/review/typed response。真实 Windows/Electron packaged visual、100/125/150% 实际 DPI/zoom、真实 IME、系统 reduced-motion 与人工 keyboard/mouse 仍未因本轮 JSDOM contract 而勾选。
+
+### 本轮精确验证
+
+- `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd `desktop`）：exit code 0，`tsc --noEmit` 通过。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd `desktop`）：exit code 0，**107 tests / 107 pass / 0 fail / 0 skipped**。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/cdp-isolation.test.ts`（cwd `desktop`）：exit code 0，**8 tests / 8 pass / 0 fail / 0 skipped**；未复现 `driver_failure`。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd `desktop`）：exit code 0，**146 tests / 146 pass / 0 fail / 0 skipped**；包含 Renderer、Main/Preload、Runtime process、CDP isolation、packaging 与 T08 smoke。该全量结果在本轮最终代码/测试变更后重新执行。
+- `git diff --check`：exit code 0，无 whitespace error，仅工作区既有 LF/CRLF 转换 warning；禁止范围 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts`、`src`、`desktop/tests/cdp-isolation.test.ts` 无 diff。全程未执行 commit、push、merge、rebase、tag、release、分支切换或归档。
+
+### 本轮未验证项与风险
+
+- 未能在本轮使用真实 packaged Electron 窗口对 760px 截图、100/125/150% DPI/zoom、computed overflow、安全区及系统 reduced-motion 做人工测量；本轮测试明确只证明真实 React DOM 的 owner/ARIA/focus/矩形 contract。W06 既有 packaged/build smoke 仍由全量 `npm test` 覆盖，但不等同于此项视觉人工验收。
+- Runtime 错误实体仍由 Renderer 的现有 `runtimeError` state 单一承载；RuntimePanel 可见性变化时由 owner prop 切换，hidden/narrow docked 不保留可访问 error 子树。没有新增第二 authority/store、兼容层或范围外代码。
+
+### 第 6 轮 UTF-8 guard 实际结果（真实 EOF 追加）
+
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；Checklist 与本 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
+
+## 第 7 轮复审更正与响应式焦点收口（2026-09-01，真实 EOF 追加）
+
+本轮按复审要求删除了 Runtime 错误测试中所有手工覆盖 `getBoundingClientRect()` 的预设矩形、矩形相交断言及其“safe area/不覆盖 Composer”描述；生产 CSS 未回退。保留的自动证据是实际 React DOM 的单一错误 owner、`role="alert"`、可达设置控件、Composer 未禁用、docked/floating/hidden 模式、680/608/533/520/507/500/760 等 CSS viewport 结构、dark/light 与 en/zh-CN，以及独立 CSS contract 检查。
+
+- 当前自动测试不声称测得真实 computed rect、真实 overflow/安全区、DPI/zoom（100/125/150%）或 packaged 窗口中告警与 Composer 的实际覆盖关系；这些视觉/几何证据保留给 W06 Chromium/CDP。相关 Checklist 未修改、未因 JSDOM/CSS contract 误勾真实 visual/zoom/geometry 项。
+- 补充修复了真实 `window.resize` 的 owner 迁移：窄屏 docked Runtime 隐藏时，Timeline 的 Open Settings 按钮若持有焦点，切到宽屏后 Timeline 错误实体卸载、RuntimePanel 成为唯一 owner，并把焦点迁移到稳定的 Runtime toggle；既有宽→窄 panel focus restore、窄 drawer Escape/外部点击恢复保持不变。新增测试不 remount App，直接派发 680→760 resize 并验证 owner、ARIA、焦点与 Composer 可操作性。
+- W05/W06 Feedback、冻结 Checklist 与范围外源码均未修改；未执行 Git 写操作。
+
+### 第 7 轮精确验证
+
+- `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd `desktop`）：exit code 0，`tsc --noEmit` 通过。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd `desktop`）：exit code 0，**108 tests / 108 pass / 0 fail / 0 skipped**；包括新增真实 resize owner handoff 测试。
+- `conda run --no-capture-output -n re-uthcode npx tsx --test --test-name-pattern="buffers synchronous turn.start" tests/renderer.test.tsx`（cwd `desktop`）：exit code 0，**1 test / 1 pass / 0 fail**。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd `desktop`）：首次全量在同步 `turn.start` buffer 用例出现一次退避计数时序失败（`statusCalls` 实际 3、断言 2），随后同一代码立即重跑通过；最终 **147 tests / 147 pass / 0 fail / 0 skipped**，包含 Renderer、Main/Preload、Runtime process、CDP isolation、packaging 与 T08 smoke。
+- `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W03-desktop-projection-interaction-feedback.md"`：exit code 0，输出 `OK: 2 file(s) passed UTF-8 guard`；最终 Checklist 与本 Feedback 均无 replacement character、常见乱码或不平衡 Markdown fence。
