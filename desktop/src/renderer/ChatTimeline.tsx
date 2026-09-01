@@ -22,6 +22,10 @@ export interface ChatTimelineProps {
   entries: TimelineEntry[];
   todo: TodoItem[];
   notice?: string | null;
+  /** Runtime errors are rendered here only when RuntimePanel is not visible. */
+  runtimeError?: string | null;
+  runtimeErrorVisible?: boolean;
+  onOpenSettings?: () => void;
   /** Changes only when a Session/Project view is replaced, not on streaming. */
   sessionKey?: string;
 }
@@ -202,7 +206,7 @@ function todoStatusLabel(status: TodoItem["status"], t: (key: TranslationKey) =>
   return status === "completed" ? t("completed") : status === "in_progress" ? t("inProgress") : t("pending");
 }
 
-export function ChatTimeline({ entries, todo, notice, sessionKey = "default" }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeErrorVisible = false, onOpenSettings, sessionKey = "default" }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const timelineRef = useRef<HTMLElement>(null);
@@ -216,7 +220,7 @@ export function ChatTimeline({ entries, todo, notice, sessionKey = "default" }: 
     previousSessionKey.current = sessionKey;
     if (sessionChanged) followTail.current = true;
     if (sessionChanged || followTail.current) scrollTimelineToBottom(element);
-  }, [entries, notice, sessionKey, todo]);
+  }, [entries, notice, runtimeError, runtimeErrorVisible, sessionKey, todo]);
 
   useEffect(() => {
     const element = timelineRef.current;
@@ -238,6 +242,10 @@ export function ChatTimeline({ entries, todo, notice, sessionKey = "default" }: 
   const onScroll = (event: UIEvent<HTMLElement>) => {
     followTail.current = isNearBottom(event.currentTarget);
   };
+  // A Runtime failure has one owner in the rendered tree.  If a caller also
+  // leaves the same text in the generic status channel, suppress that exact
+  // duplicate instead of creating two visual/ARIA entities for one failure.
+  const visibleNotice = notice && notice !== runtimeError ? notice : null;
 
   useEffect(() => {
     if (!entries.some((entry) => entry.kind === "tool" && entry.status === "running")) return undefined;
@@ -247,7 +255,11 @@ export function ChatTimeline({ entries, todo, notice, sessionKey = "default" }: 
 
   return (
     <section ref={timelineRef} className="timeline" aria-label={t("chatTimeline")} data-session-key={sessionKey} onScroll={onScroll}>
-      {notice && <p className="timeline-notice" role="status">{localText(notice, t)}</p>}
+      {runtimeError && !runtimeErrorVisible && <div className="timeline-runtime-error" data-runtime-error-owner="timeline" role="alert">
+        <span>{runtimeError}</span>
+        {onOpenSettings && <button type="button" onClick={onOpenSettings}>{t("openSettings")}</button>}
+      </div>}
+      {visibleNotice && <p className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
       {entries.map((entry) => {
         const status = entry.status || "running";

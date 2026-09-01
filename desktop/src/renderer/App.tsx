@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
@@ -256,7 +256,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   stateRef.current = state;
   const api = runtimeApi(explicitApi);
   const [narrowViewport, setNarrowViewport] = useState(() => typeof window !== "undefined" && window.innerWidth <= 680);
+  const narrowViewportRef = useRef(narrowViewport);
   const runtimeToggleRef = useRef<HTMLButtonElement>(null);
+  const runtimeFocusHandoffRef = useRef(false);
   const latestTurnRef = useRef({ runId: state.run?.run_id ?? "", turnId: state.run?.turn_id ?? "" });
   const pendingTurnStartRef = useRef<PendingTurnStart | null>(null);
   const pendingTurnStartSequenceRef = useRef(0);
@@ -285,7 +287,19 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
-    const updateViewport = () => setNarrowViewport(window.innerWidth <= 680);
+    const updateViewport = () => {
+      const nextNarrow = window.innerWidth <= 680;
+      const wasNarrow = narrowViewportRef.current;
+      const activeElement = document.activeElement;
+      if (wasNarrow && !nextNarrow && activeElement?.closest("[data-runtime-error-owner='timeline']")) {
+        // The Timeline owner is removed in the same commit that reveals a
+        // docked RuntimePanel.  Preserve an explicit user focus boundary so
+        // that the DOM mutation cannot strand focus on <body>.
+        runtimeFocusHandoffRef.current = true;
+      }
+      narrowViewportRef.current = nextNarrow;
+      setNarrowViewport(nextNarrow);
+    };
     updateViewport();
     window.addEventListener("resize", updateViewport);
     return () => window.removeEventListener("resize", updateViewport);
@@ -1231,6 +1245,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, []);
 
   const runtimeVisible = state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
+  useLayoutEffect(() => {
+    if (!runtimeVisible || !runtimeFocusHandoffRef.current) return;
+    runtimeFocusHandoffRef.current = false;
+    runtimeToggleRef.current?.focus();
+  }, [runtimeVisible]);
   const runtimeToggleLabel = runtimeVisible ? t("closeRuntime") : t("openRuntime");
   const content = state.view === "settings" ? (
     <SettingsView state={state} onRevealApiKey={revealSettingsApiKey} onBack={backFromSettings} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
@@ -1245,7 +1264,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>
         </div>
       </header>
-      <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`} />
+      <ChatTimeline
+        entries={state.timeline}
+        todo={state.todo}
+        notice={state.notice}
+        runtimeError={state.runtimeError}
+        runtimeErrorVisible={runtimeVisible}
+        onOpenSettings={state.runtimeError ? () => void loadSettings() : undefined}
+        sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
+      />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
       <Composer state={state} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
     </>
@@ -1257,7 +1284,6 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
-      {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — {t("openSettings")}</button>}
     </div>
   </LanguageProvider>;
 }
