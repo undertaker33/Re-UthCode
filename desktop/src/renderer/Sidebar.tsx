@@ -403,13 +403,11 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
     && menuTarget.projectKey === project.projectKey
     && menuTarget.sessionId === session.session_id
     && menuTarget.variant === variant;
-  const busy = props.activeTurn || props.selectedSessionId === session.session_id;
+  // A selected Session may be moved while it is idle.  The Application is
+  // the authority for the mutation; only an active Turn blocks the action.
+  const busy = props.activeTurn;
   const moveTargets = props.projects.filter((item) => item.projectKey !== project.projectKey);
-  const moveDisabledReason = props.activeTurn
-    ? t("sessionMoveActive")
-    : props.selectedSessionId === session.session_id
-      ? t("sessionMoveBusy")
-      : undefined;
+  const moveDisabledReason = props.activeTurn ? t("sessionMoveActive") : undefined;
   const canMutate = !session.corrupt;
   const renameDisabledReason = !canMutate
     ? t("sessionCorrupt")

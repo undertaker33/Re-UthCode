@@ -4,15 +4,24 @@ export type RuntimeStateName = "booting" | "ready" | "configuration_required" | 
 export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "tool" | "plan" | "status";
 export type TimelineStatus = "streaming" | "running" | "completed" | "failed" | "cancelled" | "info";
 export type PermissionModeProjection = "unknown" | "default" | "auto" | "full_access";
+export type ContextMeasurement = "estimate" | "exact" | "unavailable";
+export type CompactionState = "idle" | "running" | "completed" | "no_change" | "failed" | "cancelled";
+export type CompactionTrigger = "manual" | "auto" | "overflow";
 
 /** Safe context usage projection returned by Application.status(). */
 export interface ContextUsageProjection {
   used_tokens: number;
   budget_tokens: number;
   available: boolean;
+  measurement: ContextMeasurement;
+  source: string;
 }
 
-export const DEFAULT_CONTEXT_WINDOW = 256_000;
+export interface CompactionStatusProjection {
+  state: CompactionState;
+  trigger: CompactionTrigger | null;
+  changed: boolean | null;
+}
 
 export interface SessionSummary {
   session_id: string;
@@ -52,7 +61,9 @@ export interface TimelineEntry {
   id: string;
   kind: TimelineKind;
   text: string;
+  runId?: string;
   turnId?: string;
+  iteration?: number;
   messageId?: string;
   toolCallId?: string;
   toolName?: string;
@@ -61,6 +72,10 @@ export interface TimelineEntry {
   isError?: boolean;
   sequence?: number;
   streaming?: boolean;
+  startedAt?: number;
+  endedAt?: number;
+  planRevision?: number;
+  planState?: "draft" | "final" | "failed" | "cancelled";
 }
 
 export interface TodoItem {
@@ -115,6 +130,7 @@ export interface RendererState {
   todo: TodoItem[];
   run: RunProjection | null;
   contextUsage: ContextUsageProjection;
+  compactionStatus: CompactionStatusProjection;
   permissionMode: PermissionModeProjection;
   pinnedSessions: DesktopPreferences["pinnedSessions"];
   expandedProjects: DesktopPreferences["expandedProjects"];
@@ -122,6 +138,8 @@ export interface RendererState {
   modelCandidates: string[];
   modelPickerOpen: boolean;
   activeTurn: boolean;
+  /** A terminal event was rendered, but Application has not released its active handle yet. */
+  terminalStatusPending: boolean;
   turnStatus: "idle" | "running" | "pausing" | "paused" | "completed" | "failed" | "cancelled";
   pendingInteraction: PendingInteraction | null;
   completionBlocked: string | null;
@@ -156,7 +174,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   timeline: [],
   todo: [],
   run: null,
-  contextUsage: { used_tokens: 0, budget_tokens: DEFAULT_CONTEXT_WINDOW, available: false },
+  contextUsage: { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" },
+  compactionStatus: { state: "idle", trigger: null, changed: null },
   permissionMode: "unknown",
   pinnedSessions: [],
   expandedProjects: {},
@@ -164,6 +183,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   modelCandidates: [],
   modelPickerOpen: false,
   activeTurn: false,
+  terminalStatusPending: false,
   turnStatus: "idle",
   pendingInteraction: null,
   completionBlocked: null,
@@ -223,48 +243,55 @@ function positiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
-/**
- * Return the configured model window for the renderer's safe usage display.
- * Application owns the used/available projection; the model configuration
- * owns the context-window limit whenever it is present.
- */
-export function configuredContextWindow(configuration: ConfigurationView | null | undefined, modelRef: string | null | undefined): number {
-  const references = [
-    modelRef?.trim() ?? "",
-    typeof configuration?.default_model === "string" ? configuration.default_model.trim() : "",
-  ];
-  for (const reference of references) {
-    if (!reference) continue;
-    const value = positiveInteger(configuration?.models?.[reference]?.context_window);
-    if (value !== null) return value;
-  }
-  return DEFAULT_CONTEXT_WINDOW;
-}
-
-/** Normalize the Application safe projection without accepting provider usage. */
-export function normalizeContextUsage(value: unknown, fallbackBudget = DEFAULT_CONTEXT_WINDOW): ContextUsageProjection {
+/** Normalize the Application-owned Context status without manufacturing a limit. */
+export function normalizeContextUsage(value: unknown): ContextUsageProjection {
   const source = asRecord(value);
-  // `budget_tokens` is intentionally ignored here. It may be a stale runtime
-  // status field; the configured model window (or the 256k fallback) is the
-  // only renderer limit.
-  const budget = positiveInteger(fallbackBudget) ?? DEFAULT_CONTEXT_WINDOW;
-  const used = typeof source?.used_tokens === "number" && Number.isSafeInteger(source.used_tokens) && source.used_tokens >= 0
+  // Application.status() always serializes this complete DTO.  A partial or
+  // malformed object is not evidence for a new measurement: hide it at the
+  // projection boundary instead of manufacturing an estimate/source.
+  if (!source
+    || !Object.prototype.hasOwnProperty.call(source, "used_tokens")
+    || !Object.prototype.hasOwnProperty.call(source, "budget_tokens")
+    || !Object.prototype.hasOwnProperty.call(source, "available")
+    || !Object.prototype.hasOwnProperty.call(source, "measurement")
+    || !Object.prototype.hasOwnProperty.call(source, "source")) return contextUsageAtBoundary();
+  const budget = positiveInteger(source.budget_tokens);
+  const used = typeof source.used_tokens === "number" && Number.isSafeInteger(source.used_tokens) && source.used_tokens >= 0
     ? source.used_tokens
     : null;
-  const available = source?.available === true && used !== null;
+  const availableValue = typeof source.available === "boolean" ? source.available : null;
+  const measurementValue = source.measurement;
+  const measurement: ContextMeasurement | null = measurementValue === "estimate" || measurementValue === "exact" || measurementValue === "unavailable"
+    ? measurementValue
+    : null;
+  const sourceValue = nonEmptyText(source.source);
+  if (budget === null || used === null || availableValue === null || measurement === null || sourceValue === null) return contextUsageAtBoundary();
+  if ((measurement === "unavailable" && availableValue) || (measurement !== "unavailable" && !availableValue)) return contextUsageAtBoundary();
   return {
-    // Keep the Application's measured usage intact even when a stale or
-    // inconsistent source reports more than the configured window.  The
-    // display may cap its visual ratio, but the safe usage fact itself is not
-    // rewritten by the Renderer.
-    used_tokens: available && used !== null ? used : 0,
+    used_tokens: used,
     budget_tokens: budget,
-    available,
+    available: availableValue,
+    measurement,
+    source: sourceValue,
   };
 }
 
-function contextUsageAtBoundary(state: RendererState): ContextUsageProjection {
-  return { used_tokens: 0, budget_tokens: configuredContextWindow(state.configuration, state.currentModelRef), available: false };
+function contextUsageAtBoundary(): ContextUsageProjection {
+  return { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" };
+}
+
+function normalizeCompactionStatus(value: unknown): CompactionStatusProjection {
+  const source = asRecord(value);
+  const stateValue = source?.state;
+  const state: CompactionState = stateValue === "running" || stateValue === "completed" || stateValue === "no_change" || stateValue === "failed" || stateValue === "cancelled"
+    ? stateValue
+    : "idle";
+  const triggerValue = source?.trigger;
+  const trigger: CompactionTrigger | null = triggerValue === "manual" || triggerValue === "auto" || triggerValue === "overflow"
+    ? triggerValue
+    : null;
+  const changed = typeof source?.changed === "boolean" ? source.changed : null;
+  return { state, trigger: state === "idle" ? null : trigger, changed: state === "running" ? null : changed };
 }
 
 function shortId(value: string): string {
@@ -305,7 +332,14 @@ function applySessionPins(sessions: SessionSummary[], projectKey: string, pinned
  * existing row move it to another position in the navigation.  Reconcile
  * known rows in their existing order and append only genuinely new rows.
  */
-function preserveSessionOrder(previous: readonly SessionSummary[], incoming: readonly SessionSummary[]): SessionSummary[] {
+export type SessionOrderReason = "project_open" | "catalog_refresh" | "message" | "session_resume" | "session_new" | "session_pin" | "session_rename";
+
+/**
+ * Keep navigation presentation stable for metadata refreshes and actions that
+ * update a row in place.  New rows are appended; pinning is handled by the
+ * group projection, not by a hidden last-used sort.
+ */
+function preserveSessionOrder(previous: readonly SessionSummary[], incoming: readonly SessionSummary[], reason: SessionOrderReason, focusSessionId?: string): SessionSummary[] {
   const incomingById = new Map(incoming.map((session) => [session.session_id, session]));
   const existingIds = new Set<string>();
   const kept = previous.flatMap((session) => {
@@ -319,7 +353,16 @@ function preserveSessionOrder(previous: readonly SessionSummary[], incoming: rea
     existingIds.add(session.session_id);
     return true;
   });
-  return [...kept, ...added];
+  const stable = [...kept, ...added];
+  if (reason === "session_new") {
+    const addedIds = new Set(added.map((session) => session.session_id));
+    return [...stable.filter((session) => addedIds.has(session.session_id)), ...stable.filter((session) => !addedIds.has(session.session_id))];
+  }
+  if (reason === "message" && focusSessionId) {
+    const focused = stable.find((session) => session.session_id === focusSessionId);
+    if (focused) return [focused, ...stable.filter((session) => session.session_id !== focusSessionId)];
+  }
+  return stable;
 }
 
 function normalizeProjectPath(value: unknown): string | null {
@@ -379,19 +422,31 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
       const source = value as Record<string, JsonValue>;
       const kind = source.kind;
       const normalizedKind: TimelineKind =
-        kind === "user" || kind === "steering" || kind === "reasoning" || kind === "assistant" || kind === "tool"
+        kind === "user" || kind === "steering" || kind === "reasoning" || kind === "assistant" || kind === "tool" || kind === "plan"
           ? kind
           : "status";
       const sequence = typeof source.sequence === "number" ? source.sequence : index + 1;
+      const statusValue = source.status;
+      const terminalStatus: TimelineStatus = statusValue === "failed" || statusValue === "error" || statusValue === "rejected"
+        ? "failed"
+        : statusValue === "cancelled" || statusValue === "canceled"
+          ? "cancelled"
+          : "completed";
       return {
         id: `replay:${sequence}:${index}`,
         kind: normalizedKind,
         text: textValue(source.text),
+        runId: nonEmptyText(source.run_id) ?? undefined,
         turnId: nonEmptyText(source.turn_id) ?? undefined,
+        iteration: positiveInteger(source.iteration) ?? undefined,
         toolCallId: nonEmptyText(source.tool_call_id) ?? undefined,
         toolName: nonEmptyText(source.tool_name) ?? undefined,
-        status: normalizedKind === "tool" ? (source.status === "failed" || source.status === "error" || source.status === "cancelled" ? "failed" : "completed") : "completed",
+        status: normalizedKind === "tool" || normalizedKind === "plan" ? terminalStatus : "completed",
         isError: source.is_error === true,
+        planRevision: typeof source.revision === "number" ? source.revision : undefined,
+        planState: normalizedKind === "plan"
+          ? terminalStatus === "failed" ? "failed" : terminalStatus === "cancelled" ? "cancelled" : "final"
+          : undefined,
         sequence,
       };
     });
@@ -429,7 +484,7 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
   const incomingSessions = Array.isArray(source.sessions)
     ? source.sessions.map((item) => normalizeSession(item, path)).filter((item): item is SessionSummary => item !== null)
     : [];
-  const sessions = preserveSessionOrder(existing?.sessions ?? [], incomingSessions);
+  const sessions = preserveSessionOrder(existing?.sessions ?? [], incomingSessions, "project_open");
   const nextRun = normalizeRun(source.run);
   return {
     ...permissionUnknownAtRunBoundary(replaceProject(state, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, state.pinnedSessions), catalogFresh: true }), nextRun),
@@ -438,9 +493,10 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
     timeline: [],
     todo: [],
     activeTurn: false,
+    terminalStatusPending: false,
     turnStatus: "idle",
     pendingInteraction: null,
-    contextUsage: contextUsageAtBoundary(state),
+    contextUsage: contextUsageAtBoundary(),
     sessionViewRevision: state.sessionViewRevision + 1,
     runtimeState: "ready",
     runtimeError: null,
@@ -448,10 +504,10 @@ export function applyProjectOpened(state: RendererState, result: unknown): Rende
   };
 }
 
-export function applyCatalogRefreshed(state: RendererState, projectKey: string, values: readonly unknown[]): RendererState {
+export function applyCatalogRefreshed(state: RendererState, projectKey: string, values: readonly unknown[], reason: SessionOrderReason = "catalog_refresh", focusSessionId?: string): RendererState {
   const previous = state.projects.find((item) => item.projectKey === projectKey)?.sessions ?? [];
   const incoming = values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null);
-  const sessions = applySessionPins(preserveSessionOrder(previous, incoming), projectKey, state.pinnedSessions);
+  const sessions = applySessionPins(preserveSessionOrder(previous, incoming, reason, focusSessionId), projectKey, state.pinnedSessions);
   const replaced = replaceProject(state, projectFromPath(projectKey, state.projects.find((item) => item.projectKey === projectKey)));
   return {
     ...replaced,
@@ -471,9 +527,10 @@ export function applySessionResumed(state: RendererState, result: unknown): Rend
     timeline: replayToTimeline(Array.isArray(source.replay) ? source.replay : []),
     todo: [],
     activeTurn: false,
+    terminalStatusPending: false,
     turnStatus: "idle",
     pendingInteraction: null,
-    contextUsage: contextUsageAtBoundary(state),
+    contextUsage: contextUsageAtBoundary(),
     sessionViewRevision: state.sessionViewRevision + 1,
     runtimeError: null,
     notice: "Session resumed",
@@ -539,7 +596,27 @@ export function applySessionMutation(
     const withoutMoved = project.sessions.filter((item) => item.session_id !== sessionId);
     return { ...project, sessions: [...withoutMoved, { ...session, pinned: existingPinned }] };
   });
-  return { ...state, projects, pinnedSessions };
+  const selectedSourceSession = destinationProjectKey !== sourceProjectKey
+    && state.selectedProjectKey === sourceProjectKey
+    && state.selectedSessionId === sessionId;
+  return {
+    ...state,
+    projects,
+    pinnedSessions,
+    ...(selectedSourceSession
+      ? {
+        selectedSessionId: null,
+        timeline: [],
+        todo: [],
+        activeTurn: false,
+        terminalStatusPending: false,
+        turnStatus: "idle" as const,
+        pendingInteraction: null,
+        contextUsage: contextUsageAtBoundary(),
+        sessionViewRevision: state.sessionViewRevision + 1,
+      }
+      : {}),
+  };
 }
 
 function appendStatus(state: RendererState, text: string, status: TimelineStatus = "info"): RendererState {
@@ -587,14 +664,43 @@ function updateTimelineEntry(state: RendererState, id: string, update: (entry: T
   return { ...state, timeline };
 }
 
-function settleTerminalTurn(state: RendererState, turnId: string): RendererState {
+function settlePlanEntries(state: RendererState, runId: string, turnId: string, status: "completed" | "failed" | "cancelled"): RendererState {
   return {
     ...state,
-    timeline: state.timeline
-      .map((entry) => entry.turnId === turnId && entry.kind === "reasoning" && entry.streaming
+    timeline: state.timeline.map((entry) => {
+      if (entry.kind !== "plan" || entry.turnId !== turnId || (entry.runId && entry.runId !== runId) || !entry.streaming) return entry;
+      return {
+        ...entry,
+        streaming: false,
+        status,
+        planState: status === "failed" ? "failed" : status === "cancelled" ? "cancelled" : "final",
+      };
+    }),
+  };
+}
+
+function settleTerminalTurn(state: RendererState, runId: string, turnId: string, planStatus: "completed" | "failed" | "cancelled" = "completed"): RendererState {
+  const settledPlans = settlePlanEntries(state, runId, turnId, planStatus);
+  return {
+    ...settledPlans,
+    timeline: settledPlans.timeline
+      .map((entry) => entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "reasoning" && entry.streaming
         ? { ...entry, streaming: false, status: "completed" as TimelineStatus }
         : entry)
-      .filter((entry) => !(entry.turnId === turnId && entry.kind === "assistant" && entry.streaming)),
+      .filter((entry) => !(entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "assistant" && entry.streaming)),
+  };
+}
+
+function planEntriesForIdentity(state: RendererState, runId: string, turnId: string, iteration: number): TimelineEntry[] {
+  return state.timeline.filter((entry) => entry.kind === "plan" && entry.runId === runId && entry.turnId === turnId && entry.iteration === iteration);
+}
+
+function planTerminalForTool(state: RendererState, runId: string, turnId: string, iteration: number, toolCallId: string, status: "failed" | "cancelled"): RendererState {
+  return {
+    ...state,
+    timeline: state.timeline.map((entry) => entry.kind === "plan" && entry.runId === runId && entry.turnId === turnId && entry.iteration === iteration && entry.toolCallId === toolCallId && entry.streaming
+      ? { ...entry, streaming: false, status, planState: status === "failed" ? "failed" : "cancelled" }
+      : entry),
   };
 }
 
@@ -633,6 +739,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const next: RendererState = {
       ...state,
       activeTurn: true,
+      terminalStatusPending: false,
       turnStatus: "running",
       run: { ...(state.run ?? {}), run_id: textValue(payload.run_id), turn_id: turnId, status: "running" },
       runtimeError: null,
@@ -680,15 +787,24 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const id = eventId("tool", payload);
     const closedReasoning = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     if (closedReasoning.timeline.some((entry) => entry.id === id)) return closedReasoning;
-    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false }] };
+    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, startedAt: Date.now() }] };
   }
   if (type === "tool_finished") {
     const id = eventId("tool", payload);
-    const isError = payload.is_error === true;
-    const status = isError ? "failed" : "completed";
+    const rawStatus = textValue(payload.status).toLowerCase();
+    const cancelled = rawStatus === "cancelled" || rawStatus === "canceled" || textValue(payload.termination_reason) === "user_cancelled";
+    const failed = payload.is_error === true || rawStatus === "failed" || rawStatus === "error" || rawStatus === "rejected";
+    const isError = failed;
+    const status: TimelineStatus = cancelled ? "cancelled" : failed ? "failed" : "completed";
+    const endedAt = Date.now();
     const existing = state.timeline.find((entry) => entry.id === id);
-    if (existing) return updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError }));
-    return { ...state, timeline: [...state.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError }] };
+    let next = existing
+      ? updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError, endedAt, startedAt: entry.startedAt ?? endedAt }))
+      : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, startedAt: endedAt, endedAt }] };
+    const iteration = positiveInteger(payload.iteration);
+    const toolCallId = nonEmptyText(payload.tool_call_id);
+    if ((cancelled || failed) && eventRunId && iteration !== null && toolCallId) next = planTerminalForTool(next, eventRunId, turnId, iteration, toolCallId, cancelled ? "cancelled" : "failed");
+    return next;
   }
   if (type === "task_state_changed") {
     const taskState = asRecord(payload.task_state);
@@ -703,8 +819,44 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
       : [];
     return { ...state, todo: items };
   }
+  if (type === "plan_content_delta") {
+    const runId = eventRunId;
+    const iteration = positiveInteger(payload.iteration);
+    const toolCallId = nonEmptyText(payload.tool_call_id);
+    if (!runId || !turnId || iteration === null || !toolCallId) return state;
+    const identityEntries = planEntriesForIdentity(state, runId, turnId, iteration);
+    const finalized = identityEntries.find((entry) => !entry.streaming && entry.planState === "final");
+    if (finalized) return state;
+    const existing = identityEntries.find((entry) => entry.streaming && entry.toolCallId === toolCallId);
+    if (existing) return updateTimelineEntry(state, existing.id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), status: "streaming", streaming: true, planState: "draft" }));
+    const id = `plan-draft:${runId}:${turnId}:${iteration}:${toolCallId}`;
+    if (state.timeline.some((entry) => entry.id === id)) return state;
+    return { ...state, timeline: [...state.timeline, { id, kind: "plan", text: textValue(payload.text), runId, turnId, iteration, toolCallId, status: "streaming", streaming: true, planState: "draft" }] };
+  }
   if (type === "plan_proposed") {
-    return { ...state, timeline: [...state.timeline, { id: `plan:${textValue(payload.run_id)}:${turnId}:${textValue(payload.revision)}`, kind: "plan", text: textValue(payload.plan_text), turnId, status: "completed" }] };
+    const runId = eventRunId;
+    const iteration = positiveInteger(payload.iteration);
+    const revision = positiveInteger(payload.revision);
+    if (!runId || !turnId || iteration === null || revision === null) return state;
+    const identityEntries = planEntriesForIdentity(state, runId, turnId, iteration);
+    const drafts = identityEntries.filter((entry) => entry.streaming);
+    const finalized = identityEntries.filter((entry) => !entry.streaming && entry.planState === "final");
+    // PlanProposed has no tool_call_id in the public event contract.  If an
+    // invalid stream presents two drafts for one identity, do not guess which
+    // one it closes; leave both observable until a disambiguating event.
+    if (drafts.length > 1 || (drafts.length > 0 && finalized.length > 0)) return state;
+    const existing = drafts[0];
+    if (existing) return updateTimelineEntry(state, existing.id, (entry) => ({ ...entry, text: textValue(payload.plan_text), status: "completed", streaming: false, planState: "final", planRevision: revision }));
+    if (finalized.length > 1) return state;
+    if (finalized[0]) {
+      // A later authoritative revision for the same run/turn/iteration keeps one
+      // visual Plan block; equal or older proposals cannot reopen it.
+      if (finalized[0].planRevision === undefined || revision <= finalized[0].planRevision) return state;
+      return updateTimelineEntry(state, finalized[0].id, (entry) => ({ ...entry, text: textValue(payload.plan_text), status: "completed", streaming: false, planState: "final", planRevision: revision }));
+    }
+    const id = `plan:${runId}:${turnId}:${iteration}`;
+    if (state.timeline.some((entry) => entry.id === id)) return state;
+    return { ...state, timeline: [...state.timeline, { id, kind: "plan", text: textValue(payload.plan_text), runId, turnId, iteration, status: "completed", streaming: false, planState: "final", planRevision: revision }] };
   }
   if (type === "completion_blocked") {
     const reason = `Completion blocked: ${numberText(payload.unfinished_count)} unfinished task(s)`;
@@ -714,7 +866,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (type === "user_steering_applied") return appendStatus(state, "Steering applied", "completed");
   if (type === "turn_pausing") return appendStatus({ ...state, turnStatus: "pausing" }, "Pausing…", "info");
   if (type === "user_input_requested") {
-    return { ...state, pendingInteraction: { kind: "user_input_required", pauseId: textValue(payload.pause_id), runId: textValue(payload.run_id), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, request: asRecord(payload.request) ?? undefined, reason: "user_input_required" }, turnStatus: "paused", activeTurn: true };
+    return { ...state, pendingInteraction: { kind: "user_input_required", pauseId: textValue(payload.pause_id), runId: textValue(payload.run_id), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, request: asRecord(payload.request) ?? undefined, reason: "user_input_required" }, turnStatus: "paused", activeTurn: true, terminalStatusPending: false };
   }
   if (type === "turn_paused") {
     const pause = asRecord(payload.pause);
@@ -722,34 +874,36 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const kind = pause.kind;
     const interactionKind: InteractionKind = kind === "user_input_required" || kind === "provider_unavailable" || kind === "permission_required" || kind === "plan_review_required" ? kind : "user_requested";
     const request = asRecord(pause.user_input_request ?? pause.permission_request ?? pause.plan_review_request);
-    const next = { ...state, pendingInteraction: { kind: interactionKind, pauseId: textValue(pause.pause_id), runId: textValue(pause.run_id), turnId: textValue(pause.turn_id), toolCallId: textValue(pause.tool_call_id) || undefined, request: request ?? undefined, reason: textValue(pause.reason), iteration: typeof pause.iteration === "number" ? pause.iteration : undefined }, turnStatus: "paused" as const, activeTurn: true };
+    const next = { ...state, pendingInteraction: { kind: interactionKind, pauseId: textValue(pause.pause_id), runId: textValue(pause.run_id), turnId: textValue(pause.turn_id), toolCallId: textValue(pause.tool_call_id) || undefined, request: request ?? undefined, reason: textValue(pause.reason), iteration: typeof pause.iteration === "number" ? pause.iteration : undefined }, turnStatus: "paused" as const, activeTurn: true, terminalStatusPending: false };
     const label = interactionKind === "permission_required" ? "permission" : interactionKind === "plan_review_required" ? "plan review" : interactionKind === "provider_unavailable" ? "provider retry" : interactionKind === "user_input_required" ? "user input" : "turn pause";
     return appendStatus(next, `Waiting for ${label}`, "info");
   }
-  if (type === "turn_resumed") return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true }, "Interaction answered", "info");
+  if (type === "turn_resumed") return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true, terminalStatusPending: false }, "Interaction answered", "info");
   if (type === "usage_updated") return { ...state, run: { ...(state.run ?? {}), usage: asRecord(payload.usage) ?? undefined } };
   if (type === "behavior_mode_changed") return { ...state, run: { ...(state.run ?? {}), behavior_mode: textValue(payload.behavior_mode) } };
   if (type === "turn_completed") {
-    const timeline = state.timeline
-      .map((entry) => entry.turnId === turnId && entry.kind === "reasoning" && entry.streaming
+    const runId = eventRunId ?? textValue(payload.run_id);
+    const timeline = settlePlanEntries(state, runId, turnId, "completed").timeline
+      .map((entry) => entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "reasoning" && entry.streaming
         ? { ...entry, streaming: false, status: "completed" as TimelineStatus }
         : entry)
-      .filter((entry) => !(entry.turnId === turnId && entry.kind === "assistant" && entry.streaming));
+      .filter((entry) => !(entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "assistant" && entry.streaming));
     let next = { ...state, timeline };
-    next = { ...next, activeTurn: false, turnStatus: "completed", pendingInteraction: null, completionBlocked: null, run: { ...(next.run ?? {}), run_id: textValue(payload.run_id), turn_id: turnId, status: "completed", termination_reason: "final_answer" } };
+    next = { ...next, activeTurn: true, terminalStatusPending: true, turnStatus: "completed", pendingInteraction: null, completionBlocked: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: "completed", termination_reason: "final_answer" } };
     const finalText = textValue(payload.final_text);
     if (finalText) {
       const lastAssistant = [...next.timeline].reverse().find((entry) => entry.kind === "assistant" && entry.turnId === turnId);
       if (lastAssistant) next = updateTimelineEntry(next, lastAssistant.id, (entry) => ({ ...entry, text: finalText, status: "completed", streaming: false }));
-      else next = { ...next, timeline: [...next.timeline, { id: `assistant:final:${textValue(payload.run_id)}:${turnId}`, kind: "assistant", text: finalText, turnId, status: "completed", streaming: false }] };
+      else next = { ...next, timeline: [...next.timeline, { id: `assistant:final:${runId}:${turnId}`, kind: "assistant", text: finalText, runId, turnId, status: "completed", streaming: false }] };
     }
     return next;
   }
   if (type === "turn_failed" || type === "turn_cancelled") {
     const failed = type === "turn_failed";
-    const next = settleTerminalTurn(state, turnId);
+    const runId = eventRunId ?? textValue(payload.run_id);
+    const next = settleTerminalTurn(state, runId, turnId, failed ? "failed" : "cancelled");
     const reason = failed ? `Turn failed: ${textValue(payload.failure_reason) || textValue(payload.termination_reason) || "runtime error"}` : "Turn cancelled";
-    return appendStatus({ ...next, activeTurn: false, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: textValue(payload.run_id), turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled");
+    return appendStatus({ ...next, activeTurn: true, terminalStatusPending: true, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled");
   }
   return state;
 }
@@ -761,7 +915,7 @@ export type RendererAction =
   | { type: "status_loaded"; result: unknown }
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
   | { type: "project_opened"; result: unknown }
-  | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[] }
+  | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
   | { type: "session_resumed"; result: unknown }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
   | { type: "session_new"; sessionId: string; run: unknown }
@@ -839,16 +993,18 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const source = resultRecord(action.result);
       const application = asRecord(source.application);
       const currentModelRef = nonEmptyText(application?.current_model);
-      const selectedModelRef = currentModelRef ?? state.currentModelRef;
-      const contextValue = application && Object.prototype.hasOwnProperty.call(application, "context_usage")
-        ? application.context_usage
+      const contextValue = application?.context_status;
+      const compactionValue = application && Object.prototype.hasOwnProperty.call(application, "compaction_status")
+        ? application.compaction_status
         : undefined;
+      const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
       return {
         ...state,
+        ...(source.active_turn === true || source.active_turn === false ? { activeTurn } : {}),
+        ...(source.active_turn === false ? { terminalStatusPending: false } : {}),
         ...(currentModelRef ? { currentModelRef } : {}),
-        ...(contextValue !== undefined
-          ? { contextUsage: normalizeContextUsage(contextValue, configuredContextWindow(state.configuration, selectedModelRef)) }
-          : {}),
+        contextUsage: normalizeContextUsage(contextValue),
+        ...(compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
       };
     }
     case "runtime_error":
@@ -856,13 +1012,13 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "project_opened":
       return applyProjectOpened(state, action.result);
     case "catalog_refreshed":
-      return applyCatalogRefreshed(state, action.projectKey, action.sessions);
+      return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
     case "session_resumed":
       return applySessionResumed(state, action.result);
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new":
-      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(state), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
+      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], activeTurn: false, terminalStatusPending: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
     case "agent_event":
       return reduceAgentEvent(state, action.event);
     case "interaction_submitting":
@@ -877,7 +1033,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
     case "turn_accepted": {
       const acceptedRun = normalizeRun(action.run);
-      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null }) };
+      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null }) };
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, turnId: next.run?.turn_id, status: "completed" }], nextStatusId: next.nextStatusId + 1 };
     }
@@ -887,7 +1043,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const actionValue = asRecord(source.ui_action);
       const sessionChanged = actionValue?.type === "session_changed";
       if (sessionChanged && typeof actionValue.session_id === "string") {
-        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], activeTurn: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(state), sessionViewRevision: state.sessionViewRevision + 1 };
+        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay: source.replay, run: source.run }) : { ...permissionUnknownAtRunBoundary(state, source.run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: output || null, notice: output || null, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: output || null, composerText: "" };
@@ -904,7 +1060,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
           : projectedRun ?? state.run;
         const currentModelRef = actionValue.type === "model_selected" ? nonEmptyText(actionValue.model_ref) ?? state.currentModelRef : state.currentModelRef;
         const contextUsage = actionValue.type === "model_selected"
-          ? { used_tokens: 0, budget_tokens: configuredContextWindow(state.configuration, currentModelRef), available: false }
+          ? contextUsageAtBoundary()
           : state.contextUsage;
         return { ...state, run, permissionMode, currentModelRef, contextUsage, commandOutput: output || null, notice: actionValue.warning ? textValue(actionValue.warning) : output || null, composerText: "", modelPickerOpen: false };
       }
@@ -923,10 +1079,11 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         timeline: [],
         todo: [],
         run: null,
-        contextUsage: contextUsageAtBoundary(state),
+        contextUsage: contextUsageAtBoundary(),
         permissionMode: "unknown",
         currentModelRef: null,
         activeTurn: false,
+        terminalStatusPending: false,
         turnStatus: "idle",
         pendingInteraction: null,
         completionBlocked: null,
@@ -954,17 +1111,14 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return { ...state, panelMode: action.panelMode };
     case "set_view":
       return { ...state, view: action.view };
-    case "settings_loaded": {
-      const budget = configuredContextWindow(action.configuration, state.currentModelRef);
+    case "settings_loaded":
       return {
         ...state,
         configuration: action.configuration,
-        contextUsage: { ...state.contextUsage, budget_tokens: budget },
         permissionMode: state.run ? state.permissionMode : "unknown",
         settingsLoaded: true,
         settingsError: null,
       };
-    }
     case "settings_error":
       return { ...state, settingsError: action.message };
     case "settings_saving":

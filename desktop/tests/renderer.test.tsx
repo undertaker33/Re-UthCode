@@ -5,13 +5,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
+import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject } from "../src/desktop-api";
 
 import {
   applyProjectOpened,
   applySessionMutation,
   applySessionResumed,
   createInitialState,
-  configuredContextWindow,
   replayToTimeline,
   reduceRendererState,
   sessionLabel,
@@ -19,7 +19,7 @@ import {
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject } from "../src/renderer/App";
+import { App, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, waitForIdle } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
@@ -193,7 +193,7 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
   assert.doesNotMatch(appMarkup, /aria-label="置顶 first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
-    const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", contextUsage: { used_tokens: 1200, budget_tokens: 128000, available: true }, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
+    const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", contextUsage: { used_tokens: 1200, budget_tokens: 128000, available: true, measurement: "estimate", source: "application" }, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
     assert.match(panelMarkup, /aria-label="Runtime information"/);
     assert.match(panelMarkup, new RegExp(`runtime-panel--${panelMode}`));
     assert.match(panelMarkup, /1,200 \/ 128,000/);
@@ -482,6 +482,463 @@ test("session mutation moves one catalog row to the target without changing its 
   assert.deepEqual(moved.pinnedSessions, [{ projectKey: "C:/target", sessionId: "move-me" }]);
 });
 
+test("T05 session presentation reasons preserve refresh/resume/rename order and only elevate new messages", () => {
+  let state = createInitialState({
+    projects: [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions: [{ session_id: "s1" }, { session_id: "s2" }], catalogFresh: true }],
+    selectedProjectKey: "C:/one",
+    selectedSessionId: "s1",
+    timeline: [{ id: "assistant-1", kind: "assistant", text: "old", status: "completed" }],
+  });
+  state = reduceRendererState(state, { type: "catalog_refreshed", projectKey: "C:/one", sessions: [{ session_id: "s2" }, { session_id: "s3" }, { session_id: "s1" }] });
+  assert.deepEqual(state.projects[0]?.sessions.map((session) => session.session_id), ["s1", "s2", "s3"]);
+  state = reduceRendererState(state, { type: "catalog_refreshed", projectKey: "C:/one", sessions: [{ session_id: "s1" }, { session_id: "s2" }, { session_id: "s3" }], reason: "message", focusSessionId: "s2" });
+  assert.deepEqual(state.projects[0]?.sessions.map((session) => session.session_id), ["s2", "s1", "s3"]);
+  state = reduceRendererState(state, { type: "catalog_refreshed", projectKey: "C:/one", sessions: [{ session_id: "s2" }, { session_id: "s4" }, { session_id: "s1" }, { session_id: "s3" }], reason: "session_new", focusSessionId: "s4" });
+  assert.deepEqual(state.projects[0]?.sessions.map((session) => session.session_id), ["s4", "s2", "s1", "s3"]);
+  state = applySessionMutation(state, "C:/one", { session_id: "s1", project_key: "C:/two", session: { session_id: "s1", project_key: "C:/two" } });
+  assert.equal(state.selectedSessionId, null, "moving the selected idle Session clears stale selection");
+  assert.deepEqual(state.timeline, []);
+});
+
+test("T05 App routes direct commands and waits for terminal status authority", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const preferences: DesktopPreferences = {
+      theme: "system",
+      language: "en",
+      windowBounds: { width: 1100, height: 760, maximized: false },
+      panelMode: "docked",
+      recentProjects: [],
+      projectAliases: {},
+      pinnedProjectKeys: [],
+      pinnedSessions: [],
+      expandedProjects: {},
+      selectedProjectKey: null,
+      selectedSessionId: null,
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let terminalStatusPoll = false;
+    let terminalStatusCalls = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "command.execute") return { ui_action: { type: "command_executed" }, output: "compact complete" };
+        if (method === "status.get") {
+          if (terminalStatusPoll) {
+            const active = terminalStatusCalls < 2;
+            terminalStatusCalls += 1;
+            return { active_turn: active, application: { current_model: "local/chat", context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" }, compaction_status: { state: "completed", trigger: "manual", changed: true } } };
+          }
+          return { active_turn: false, application: { current_model: "local/chat", context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" }, compaction_status: { state: "completed", trigger: "manual", changed: true } } };
+        }
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({ composerText: "/compact", commandCandidates: [], language: "en", run: { run_id: "run-1" }, activeTurn: true, turnStatus: "running" });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await act(async () => { await tick(); await tick(); });
+    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    await act(async () => { await tick(); await tick(); });
+    assert.equal(calls.filter((call) => call.method === "command.execute").length, 1);
+    assert.equal(calls.filter((call) => call.method === "turn.start").length, 0, "direct slash commands must not become turn.start prompts");
+    const statusAfterCommand = calls.filter((call) => call.method === "status.get").length;
+    assert.ok(statusAfterCommand >= 1, "command completion should refresh the Application status projection");
+
+    act(() => { eventListener?.({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "message-1", text: "delta" }); });
+    await act(async () => { await tick(); });
+    assert.equal(calls.filter((call) => call.method === "status.get").length, statusAfterCommand, "streaming deltas must not poll status");
+    terminalStatusPoll = true;
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-1", turn_id: "turn-1", final_text: "done" }); });
+    await act(async () => { await tick(); });
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "active status observations keep Composer locked");
+    // The convergence backoff is 25ms then 50ms; leave a small scheduler
+    // margin so the third (authoritative false) observation is deterministic
+    // when the full Desktop suite runs alongside other workers.
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 160)); });
+    assert.ok(terminalStatusCalls >= 3, "terminal status waits through active observations before accepting idle");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "only the final active_turn=false releases Composer");
+  });
+});
+
+test("T05 waitForIdle requires authoritative false and has bounded failure states", async () => {
+  const activeResponses = [{ active_turn: true }, { active_turn: true }, { active_turn: false, application: {} }];
+  let activeCalls = 0;
+  const activeApi = { requestRuntime: async () => activeResponses[activeCalls++] ?? { active_turn: false } } as unknown as DesktopApi;
+  const idle = await waitForIdle(activeApi, { pollIntervalMs: 0, maxAttempts: 4 });
+  assert.equal(idle.state, "idle");
+  assert.equal(activeCalls, 3, "two active observations precede the authoritative false result");
+  assert.equal((idle as { state: "idle"; result: JsonObject }).result.active_turn, false);
+
+  let errorCalls = 0;
+  const errorApi = { requestRuntime: async () => { errorCalls += 1; throw new Error("status unavailable"); } } as unknown as DesktopApi;
+  assert.deepEqual(await waitForIdle(errorApi, { pollIntervalMs: 0, maxAttempts: 4 }), { state: "unavailable" });
+  assert.equal(errorCalls, 1, "an RPC error is not treated as idle and does not spin");
+
+  let timeoutCalls = 0;
+  const timeoutApi = { requestRuntime: async () => { timeoutCalls += 1; return { active_turn: true }; } } as unknown as DesktopApi;
+  assert.deepEqual(await waitForIdle(timeoutApi, { pollIntervalMs: 0, maxAttempts: 3 }), { state: "timeout" });
+  assert.equal(timeoutCalls, 3, "continuous active=true is bounded without enabling input");
+});
+
+test("T05 terminal convergence retries transient failures with backoff past one wait window", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const responses = ["error", "active", "active", "active", "active", "idle"] as const;
+    let statusCalls = 0;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method !== "status.get") return {};
+        const response = responses[statusCalls++] ?? "active";
+        if (response === "error") throw new Error("transient status failure");
+        return response === "idle"
+          ? { active_turn: false, application: { context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } } }
+          : { active_turn: true };
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", composerText: "continue", activeTurn: true, turnStatus: "running", run: { run_id: "run-retry", turn_id: "turn-retry" } });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await act(async () => { await tick(); await tick(); });
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-retry", turn_id: "turn-retry", final_text: "done" }); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 550)); });
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "transient errors and active status keep the Composer locked beyond the old timeout window");
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    assert.equal(statusCalls, 6, "the same background poll survives five backoff intervals before the false authority");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "the recovered authoritative false status eventually releases the Composer");
+  });
+});
+
+test("T05 terminal convergence is cancelled on unmount without a timer or stale status write", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let statusCalls = 0;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async () => { statusCalls += 1; return { active_turn: true }; },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ activeTurn: true, turnStatus: "running", run: { run_id: "run-unmount", turn_id: "turn-unmount" } })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-unmount", turn_id: "turn-unmount", final_text: "done" }); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(statusCalls, 1, "terminal convergence starts with one status request");
+    act(() => { root.render(null); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 90));
+    assert.equal(statusCalls, 1, "unmount aborts the pending backoff and prevents later status writes");
+    assert.equal(container.textContent, "");
+  });
+});
+
+test("T05 accepted flat Run boundaries own consecutive Turn polls and stale turn_started cannot replace them", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let statusCalls = 0;
+    let turnStartCalls = 0;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const idle = { active_turn: false, application: { context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } } };
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "turn.start") {
+          turnStartCalls += 1;
+          // Match the real Bridge: turn.start returns a flat Run DTO.  The
+          // second accepted turn reuses the Run but has a new Turn identity.
+          return turnStartCalls === 1
+            ? { run_id: "run-new", turn_id: "turn-one", status: "running" }
+            : { run_id: "run-new", turn_id: "turn-two", status: "running" };
+        }
+        if (method !== "status.get") return {};
+        statusCalls += 1;
+        return statusCalls % 2 === 1 ? { active_turn: true } : idle;
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", composerText: "new prompt", activeTurn: false, run: { run_id: "run-old", turn_id: "turn-old" } })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(turnStartCalls, 1);
+    assert.equal(container.querySelector<HTMLElement>("#runtime-panel")?.textContent?.includes("run-new"), true, "the flat accepted Application Run becomes the current owner");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, "", "accepted boundary clears the submitted composer draft");
+
+    act(() => { eventListener?.({ type: "turn_started", run_id: "run-new", turn_id: "turn-one", message_id: "message-one", message: { role: "user", parts: [{ type: "text", text: "new prompt" }] } }); });
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /new prompt/u, "accepted turn_started owns the first new user timeline entry");
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-new", turn_id: "turn-one", final_text: "first done" }); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(statusCalls, 1, "the first accepted Turn starts one authoritative poll");
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 70)); });
+    assert.equal(statusCalls, 2, "the first Turn reaches authoritative idle");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "authoritative idle releases the Composer for the next Turn");
+
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    assert.ok(textarea);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value")?.set;
+    assert.ok(setter);
+    act(() => {
+      textarea!.focus();
+      setter!.call(textarea, "second prompt");
+      textarea!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "second prompt" }));
+      textarea!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      // React is imported before the JSDOM window in this suite, so its
+      // legacy controlled-input fallback observes keyup for textareas.
+      textarea!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(textarea?.value, "second prompt");
+    act(() => { container.querySelector<HTMLButtonElement>(".composer-actions button:last-child")?.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(turnStartCalls, 2, "the second same-Run Turn uses the flat turn.start contract");
+
+    act(() => { eventListener?.({ type: "turn_started", run_id: "run-new", turn_id: "turn-two", message_id: "message-two", message: { role: "user", parts: [{ type: "text", text: "second prompt" }] } }); });
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /new prompt[\s\S]*second prompt/u, "the same Run keeps both accepted Turn user entries");
+    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-new", turn_id: "turn-two", final_text: "second done" }); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(statusCalls, 3, "the second Turn owns a new terminal poll");
+
+    // A stale start from the replaced Run is rejected before it can touch
+    // either the reducer or the second Turn's poll ownership.
+    act(() => { eventListener?.({ type: "turn_started", run_id: "run-old", turn_id: "turn-old", message_id: "message-old", message: { role: "user", parts: [{ type: "text", text: "stale old" }] } }); });
+    assert.equal(container.querySelector<HTMLElement>("#runtime-panel")?.textContent?.includes("run-new"), true, "stale start does not replace the accepted Run");
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /stale old/u, "stale start does not add a user timeline entry");
+    assert.equal(statusCalls, 3, "stale start does not cancel or replace the second Turn poll");
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 70)); });
+    assert.equal(statusCalls, 4, "the second Turn poll survives stale events and reaches authoritative idle");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "consecutive Turns do not leave the Composer locked");
+  });
+});
+
+test("T05 steering keeps the Bridge nested Run DTO separate from flat turn.start", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const calls: string[] = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        calls.push(method);
+        if (method === "turn.steer") return { accepted: true, run: { run_id: "run-steer", turn_id: "turn-steer", status: "running" } };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", composerText: "steer this", activeTurn: true, turnStatus: "running", run: { run_id: "run-steer", turn_id: "turn-before" } })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    act(() => { container.querySelector<HTMLButtonElement>(".composer-actions button:last-child")?.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(calls.includes("turn.start"), false, "an active Composer uses turn.steer");
+    assert.equal(calls.filter((method) => method === "turn.steer").length, 1);
+    act(() => { eventListener?.({ type: "turn_started", run_id: "run-steer", turn_id: "turn-steer", message_id: "steer-message", message: { role: "user", parts: [{ type: "text", text: "steering accepted" }] } }); });
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /steer this[\s\S]*steering accepted/u, "the nested steering Run identity is accepted for its next event");
+  });
+});
+
+test("T05 buffers synchronous turn.start stdout until the flat accepted identity and replays once", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let statusCalls = 0;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: (method) => {
+        if (method === "turn.start") {
+          // The Runtime resolves the response and emits the following stdout
+          // events in one synchronous call stack, before App's await
+          // continuation can record the accepted flat identity.
+          return new Promise((resolve) => {
+            resolve({ run_id: "run-sync", turn_id: "turn-sync", status: "running" });
+            eventListener?.({ type: "turn_started", run_id: "run-sync", turn_id: "turn-sync", message_id: "message-sync", message: { role: "user", parts: [{ type: "text", text: "sync prompt" }] } });
+            eventListener?.({ type: "assistant_message_delta", run_id: "run-sync", turn_id: "turn-sync", message_id: "assistant-sync", text: "partial" });
+            eventListener?.({ type: "assistant_message_delta", run_id: "run-other", turn_id: "turn-other", message_id: "assistant-other", text: "other run" });
+            eventListener?.({ type: "turn_completed", run_id: "run-sync", turn_id: "turn-sync", final_text: "sync final" });
+          });
+        }
+        if (method !== "status.get") return Promise.resolve({});
+        statusCalls += 1;
+        return Promise.resolve(statusCalls === 1
+          ? { active_turn: true }
+          : { active_turn: false, application: { context_status: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } } });
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", composerText: "sync prompt", activeTurn: false, run: { run_id: "run-old", turn_id: "turn-old" } })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    act(() => { container.querySelector<HTMLButtonElement>(".composer-actions button:last-child")?.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1, "buffered turn_started replays exactly one user row");
+    assert.equal(container.querySelectorAll(".timeline-entry--assistant").length, 1, "buffered delta and terminal replay settle one assistant row");
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /sync prompt[\s\S]*sync final/u);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /other run/u, "buffered events from another Run are discarded");
+    assert.equal(statusCalls, 1, "buffered terminal starts one poll after accepted identity");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "active authority keeps Composer locked before status idle");
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 70)); });
+    assert.equal(statusCalls, 2, "the buffered terminal poll reaches authoritative false");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "buffered stdout does not lose terminal unlock");
+  });
+});
+
+test("T05 pending turn.start ownership is single-flight and discarded on unmount", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let turnStartCalls = 0;
+    let statusCalls = 0;
+    let resolveStart: ((result: JsonObject) => void) | null = null;
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: (method) => {
+        if (method === "turn.start") {
+          turnStartCalls += 1;
+          return new Promise<JsonObject>((resolve) => {
+            resolveStart = resolve;
+            eventListener?.({ type: "turn_started", run_id: "run-pending", turn_id: "turn-pending", message_id: "pending-message", message: { role: "user", parts: [{ type: "text", text: "pending" }] } });
+          });
+        }
+        if (method === "status.get") {
+          statusCalls += 1;
+          return Promise.resolve({ active_turn: false });
+        }
+        return Promise.resolve({});
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", composerText: "pending", activeTurn: false, run: { run_id: "run-old", turn_id: "turn-old" } })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+    assert.ok(send);
+    act(() => { send!.click(); send!.click(); });
+    assert.equal(turnStartCalls, 1, "a pending turn.start request is single-flight");
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /pending/u, "buffered events are not rendered before accepted identity");
+    act(() => { root.render(null); });
+    act(() => { resolveStart?.({ run_id: "run-pending", turn_id: "turn-pending", status: "running" }); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    assert.equal(statusCalls, 0, "unmount discards the pending event buffer before any terminal poll");
+    assert.equal(container.textContent, "");
+  });
+});
+
+test("T05 narrow viewport structure keeps Sidebar visible and reopens hidden Runtime as a drawer", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 533 });
+    const project: ProjectState = { path: "C:/narrow", projectKey: "C:/narrow", alias: "Narrow", pinned: false, sessions: [], catalogFresh: true };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", theme: "dark", projects: [project], selectedProjectKey: project.projectKey })} api={undefined} />); });
+    const shell = container.querySelector<HTMLElement>(".app-shell");
+    assert.ok(shell);
+    assert.ok(container.querySelector(".sidebar"), "navigation remains available at 533 CSS px");
+    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    assert.ok(toggle);
+    assert.equal(toggle?.getAttribute("aria-controls"), "runtime-panel");
+    assert.equal(toggle?.getAttribute("aria-expanded"), "false");
+    assert.equal(toggle?.getAttribute("aria-label"), "Open Runtime panel");
+    assert.equal(toggle?.querySelector(".sr-only")?.textContent, "Runtime panel closed");
+    act(() => { toggle!.click(); });
+    assert.ok(shell!.classList.contains("panel-floating"), "docked Runtime switches directly to an overlay on narrow viewports");
+    const drawer = container.querySelector<HTMLElement>(".runtime-panel--floating");
+    assert.ok(drawer);
+    const drawerTrigger = drawer?.querySelector<HTMLButtonElement>(".custom-select__trigger");
+    assert.equal(dom.window.document.activeElement, drawerTrigger, "opening the Runtime drawer moves focus into it");
+    assert.equal(toggle?.getAttribute("aria-expanded"), "true");
+    assert.equal(toggle?.getAttribute("aria-label"), "Close Runtime panel");
+    assert.equal(toggle?.querySelector(".sr-only")?.textContent, "Runtime panel open");
+    const escape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { drawerTrigger?.dispatchEvent(escape); });
+    assert.equal(escape.defaultPrevented, true);
+    assert.ok(shell!.classList.contains("panel-hidden"));
+    assert.equal(toggle?.getAttribute("aria-expanded"), "false");
+    assert.equal(dom.window.document.activeElement, toggle, "Escape closes the drawer and restores toggle focus");
+    act(() => { toggle!.click(); });
+    assert.ok(container.querySelector(".runtime-panel--floating"), "hidden Runtime remains reopenable from the conversation bar");
+    const reopened = container.querySelector<HTMLElement>(".runtime-panel--floating");
+    assert.equal(dom.window.document.activeElement, reopened?.querySelector(".custom-select__trigger"));
+    act(() => { dom.window.document.body.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true })); });
+    assert.ok(shell!.classList.contains("panel-hidden"), "outside pointer closes the Runtime drawer");
+    assert.equal(dom.window.document.activeElement, toggle, "outside close restores toggle focus");
+  });
+});
+
+test("T05 Runtime drawer restores focus when a wide docked panel becomes hidden at narrow width", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1100 });
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", panelMode: "docked" })} api={undefined} />); });
+    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const runtime = container.querySelector<HTMLElement>("#runtime-panel");
+    assert.ok(toggle);
+    assert.ok(runtime);
+    const runtimeTrigger = runtime?.querySelector<HTMLButtonElement>(".custom-select__trigger");
+    runtimeTrigger?.focus();
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 533 });
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(toggle?.getAttribute("aria-expanded"), "false");
+    assert.equal(runtime?.getAttribute("aria-hidden"), "true");
+    assert.equal(dom.window.document.activeElement, toggle, "responsive hiding restores focus instead of leaving it in the hidden panel");
+  });
+});
+
+test("T05 wide floating Runtime keeps its three-state layout without drawer dismissal", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1100 });
+    const before = dom.window.document.getElementById("before");
+    before?.focus();
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", panelMode: "floating" })} api={undefined} />); });
+    const shell = container.querySelector<HTMLElement>(".app-shell");
+    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const runtime = container.querySelector<HTMLElement>("#runtime-panel");
+    assert.ok(shell);
+    assert.ok(runtime);
+    assert.equal(shell?.classList.contains("panel-floating"), true);
+    assert.equal(toggle?.getAttribute("aria-expanded"), "true");
+    assert.equal(dom.window.document.activeElement, before, "wide floating layout does not steal focus as a drawer");
+
+    const escape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { dom.window.document.body.dispatchEvent(escape); });
+    act(() => { dom.window.document.body.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true })); });
+    assert.equal(escape.defaultPrevented, false, "wide floating layout does not consume global Escape");
+    assert.equal(shell?.classList.contains("panel-floating"), true, "wide floating layout remains visible after workspace pointerdown");
+    assert.equal(toggle?.getAttribute("aria-expanded"), "true");
+    assert.equal(runtime?.getAttribute("aria-hidden"), null);
+  });
+});
+
 test("project pinning absorbs independent Session pins into the project tree", () => {
   const projects = [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions: [{ session_id: "s1", pinned: true }], catalogFresh: true }];
   const plan = projectPinPlan(projects, [{ projectKey: "C:/one", sessionId: "s1" }, { projectKey: "C:/two", sessionId: "s2" }], "C:/one");
@@ -534,7 +991,14 @@ test("T05 failed and cancelled turns discard incomplete assistant previews", () 
   state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_failed", run_id: "run-1", turn_id: "turn-1", termination_reason: "provider_error", failure_reason: "provider_request" } });
   assert.equal(state.timeline.some((entry) => entry.text === "unfinished"), false);
   assert.equal(state.timeline.some((entry) => entry.text.includes("provider_request")), true);
-  assert.equal(state.activeTurn, false);
+  assert.equal(state.activeTurn, true, "Core terminal event must wait for Application active_turn=false");
+  assert.equal(state.terminalStatusPending, true);
+  state = reduceRendererState(state, { type: "status_loaded", result: { active_turn: true } });
+  assert.equal(state.activeTurn, true);
+  assert.equal(state.terminalStatusPending, true);
+  state = reduceRendererState(state, { type: "status_loaded", result: { active_turn: false } });
+  assert.equal(state.activeTurn, false, "only the Application status boundary releases the gate");
+  assert.equal(state.terminalStatusPending, false);
 });
 
 test("T05 steering and typed pause events remain ordered and visible without exposing request payloads", () => {
@@ -597,12 +1061,129 @@ test("T05 TaskState replaces the visible todo projection and terminal completion
   assert.match(state.timeline.at(-1)?.text ?? "", /final/u);
 });
 
+test("T06 PlanContentDelta uses iteration identity and PlanProposed seals the matching draft", () => {
+  let state = createInitialState();
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: "plan-1", text: "Step " }));
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: "plan-1", text: "one" }));
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 2, tool_call_id: "plan-2", text: "Other" }));
+  const drafts = state.timeline.filter((entry) => entry.kind === "plan");
+  assert.equal(drafts.length, 2);
+  assert.deepEqual(drafts.map((entry) => entry.text), ["Step one", "Other"]);
+  const firstId = drafts[0]?.id;
+  state = reduceRendererState(state, event({ type: "plan_proposed", run_id: "run-1", turn_id: "turn-1", iteration: 1, revision: 3, plan_text: "Step one\nStep two" }));
+  const finalized = state.timeline.find((entry) => entry.id === firstId);
+  assert.equal(state.timeline.filter((entry) => entry.kind === "plan").length, 2);
+  assert.equal(finalized?.text, "Step one\nStep two");
+  assert.equal(finalized?.streaming, false);
+  assert.equal(finalized?.planState, "final");
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: "plan-1", text: "stale" }));
+  assert.equal(state.timeline.find((entry) => entry.id === firstId)?.text, "Step one\nStep two");
+  state = reduceRendererState(state, event({ type: "plan_proposed", run_id: "run-1", turn_id: "turn-1", iteration: 1, revision: 4, plan_text: "Revised step" }));
+  assert.equal(state.timeline.filter((entry) => entry.kind === "plan").length, 2, "a later proposal keeps the same visual Plan entity");
+  assert.equal(state.timeline.find((entry) => entry.id === firstId)?.text, "Revised step");
+});
+
+test("T06 PlanProposed leaves an ambiguous same-iteration pair open", () => {
+  let state = createInitialState();
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: "plan-a", text: "A" }));
+  state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: "plan-b", text: "B" }));
+  state = reduceRendererState(state, event({ type: "plan_proposed", run_id: "run-1", turn_id: "turn-1", iteration: 1, revision: 1, plan_text: "authoritative" }));
+  const drafts = state.timeline.filter((entry) => entry.kind === "plan");
+  assert.equal(drafts.length, 2);
+  assert.equal(drafts.every((entry) => entry.streaming === true && entry.planState === "draft"), true, "missing public tool identity must not close an arbitrary draft");
+});
+
+test("T06 Plan draft failure and cancellation settle the matching draft", () => {
+  for (const status of ["failed", "cancelled"] as const) {
+    let state = createInitialState();
+    const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+    state = reduceRendererState(state, event({ type: "plan_content_delta", run_id: "run-1", turn_id: "turn-1", iteration: 1, tool_call_id: `plan-${status}`, text: "draft" }));
+    state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: `batch-${status}`, tool_call_id: `plan-${status}`, tool_name: "ProposePlan", iteration: 1, status, is_error: status === "failed" }));
+    const plan = state.timeline.find((entry) => entry.kind === "plan");
+    assert.equal(plan?.streaming, false);
+    assert.equal(plan?.status, status);
+    assert.equal(plan?.planState, status);
+  }
+});
+
+test("T06 tool rows freeze elapsed time and settle explicit failure/cancellation", () => {
+  let state = createInitialState();
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+  state = reduceRendererState(state, event({ type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash" }));
+  const started = state.timeline.find((entry) => entry.kind === "tool");
+  assert.equal(started?.status, "running");
+  assert.equal(typeof started?.startedAt, "number");
+  state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "cancelled", is_error: false }));
+  const finished = state.timeline.find((entry) => entry.kind === "tool");
+  assert.equal(state.timeline.filter((entry) => entry.kind === "tool").length, 1);
+  assert.equal(finished?.status, "cancelled");
+  assert.equal(finished?.isError, false);
+  assert.equal(typeof finished?.endedAt, "number");
+  assert.ok((finished?.endedAt ?? 0) >= (finished?.startedAt ?? 0));
+});
+
+test("T06 tool DOM rows expose one status entity with icon, text, ARIA, and frozen elapsed", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const startedAt = Date.now() - 5000;
+    const renderTimeline = (entry: Parameters<typeof ChatTimeline>[0]["entries"]) => {
+      act(() => { root.render(<LanguageProvider value="en"><ChatTimeline entries={entry} todo={[]} /></LanguageProvider>); });
+    };
+    renderTimeline([{ id: "tool-row", kind: "tool", text: "Bash summary", toolName: "Bash", status: "running", streaming: false, startedAt }]);
+    const running = container.querySelector<HTMLElement>(".timeline-entry--tool");
+    assert.ok(running);
+    assert.equal(running?.getAttribute("aria-busy"), "true");
+    assert.equal(running?.querySelector<HTMLElement>('[data-status="running"]')?.textContent?.includes("running"), true);
+    assert.ok(running?.querySelector(".tool-status .ui-icon"));
+    assert.ok(running?.querySelector(".tool-elapsed"));
+    const initialElapsed = Number.parseInt(running?.querySelector(".tool-elapsed")?.textContent?.replace(/\D/gu, "") ?? "0", 10);
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 1050)); });
+    const laterElapsed = Number.parseInt(container.querySelector(".tool-elapsed")?.textContent?.replace(/\D/gu, "") ?? "0", 10);
+    assert.ok(laterElapsed > initialElapsed, "running elapsed must continue increasing");
+    renderTimeline([{ id: "tool-row", kind: "tool", text: "Bash summary", toolName: "Bash", status: "completed", streaming: false, startedAt, endedAt: startedAt + 3000 }]);
+    const completed = container.querySelector<HTMLElement>(".timeline-entry--tool");
+    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1);
+    assert.equal(completed?.getAttribute("aria-busy"), null);
+    assert.equal(completed?.querySelector<HTMLElement>('[data-status="completed"]')?.textContent?.includes("completed"), true);
+    assert.match(completed?.querySelector(".tool-elapsed")?.textContent ?? "", /3s/u);
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 20)); });
+    assert.match(container.querySelector(".tool-elapsed")?.textContent ?? "", /3s/u, "terminal elapsed remains frozen");
+    for (const status of ["failed", "cancelled"] as const) {
+      renderTimeline([{ id: `tool-${status}`, kind: "tool", text: "Bash summary", toolName: "Bash", status, streaming: false, startedAt, endedAt: startedAt + 4000, isError: status === "failed" }]);
+      const terminal = container.querySelector<HTMLElement>(".timeline-entry--tool");
+      assert.equal(terminal?.querySelector<HTMLElement>(`[data-status="${status}"]`) !== null, true);
+      assert.match(terminal?.getAttribute("aria-label") ?? "", new RegExp(status, "iu"));
+      assert.ok(terminal?.querySelector(".tool-status .ui-icon"));
+    }
+  });
+});
+
+test("T06 Todo strip exposes status text and one compact focusable visual entity", async () => {
+  const markup = renderLanguage("en", <ChatTimeline entries={[]} todo={[{ content: "one", status: "in_progress" }, { content: "two", status: "completed" }]} />);
+  assert.match(markup, /class="todo-strip"[^>]*tabindex="0"/);
+  assert.match(markup, /aria-label="Tasks"/);
+  assert.match(markup, /aria-label="one: in progress"/);
+  assert.match(markup, /aria-label="two: completed"/);
+  assert.match(markup, /ui-icon/);
+  const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
+  assert.match(css, /\.todo-strip:hover, \.todo-strip:focus, \.todo-strip:focus-within\s*\{[^}]*max-height:/u);
+});
+
 test("T06 pending interaction blocks Composer commands and keeps typed control identity", () => {
   const pending = createInitialState({ composerText: "/model", activeTurn: true, turnStatus: "paused", pendingInteraction: { kind: "user_requested", pauseId: "p", runId: "r", turnId: "t" }, commandCandidates: [{ value: "/model", description: "model" }] });
   const markup = renderToStaticMarkup(<Composer state={pending} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.match(markup, /等待中/);
   assert.doesNotMatch(markup, /role="listbox"/u);
   assert.doesNotMatch(markup, />引导</u);
+});
+
+test("T05 terminal status pending keeps Composer locked until Application idle", () => {
+  const pending = createInitialState({ composerText: "continue", activeTurn: true, terminalStatusPending: true, turnStatus: "completed" });
+  const markup = renderLanguage("en", <Composer state={pending} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
+  assert.match(markup, /<textarea[^>]*disabled=""/u);
+  assert.match(markup, /title="Waiting"[^>]*disabled=""/u);
+  assert.doesNotMatch(markup, /title="Cancel"/u);
 });
 
 test("T06 typed interaction response builders preserve the same pause identity", () => {
@@ -640,6 +1221,9 @@ test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flo
   const multiMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [{ question_id: "q1", header: "Tags", question: "Pick tags", kind: "multi_select", options: [{ label: "One", description: "first" }, { label: "Two", description: "second" }] }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
   assert.match(multiMarkup, /Pick tags/);
   assert.match(multiMarkup, /Tags Provide another answer/);
+  const fourQuestionMarkup = renderLanguage("en", <InteractionSurface interaction={{ ...inputInteraction, request: { questions: [...inputInteraction.request.questions, { question_id: "extra", header: "Extra", question: "One more answer", kind: "text" }, { question_id: "last", header: "Last", question: "Final answer", kind: "text" }] } }} onSubmit={() => undefined} onCancel={() => undefined} />);
+  assert.match(fourQuestionMarkup, /1 \/ 4/);
+  assert.doesNotMatch(fourQuestionMarkup, /Back to chat|返回聊天/u);
   await withRendererDom(async (dom, container, root) => {
     const submitted: unknown[] = [];
     const cancelled: string[] = [];
@@ -733,7 +1317,7 @@ test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flo
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     assert.equal(tagOptions[0]!.checked, true);
     await setInputValue(freeInput("Tags"), "custom-tag");
-    await clickButton("Back to chat");
+    await clickButton("Previous");
     assert.equal(container.querySelector<HTMLInputElement>('input[name="mode"]')?.checked, true, "previous single option should survive navigation");
     await setInputValue(freeInput("Mode"), "custom-mode");
     assert.equal(freeInput("Mode").value, "custom-mode");
@@ -745,7 +1329,7 @@ test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flo
     const details = container.querySelector<HTMLInputElement>('input[aria-label="Details"]');
     assert.ok(details);
     await setInputValue(details!, "details");
-    await clickButton("Back to chat");
+    await clickButton("Previous");
     assert.equal(freeInput("Tags").value, "custom-tag");
     await clickButton("Next");
     assert.equal(container.querySelector<HTMLInputElement>('input[aria-label="Details"]')?.value, "details");
@@ -753,6 +1337,13 @@ test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flo
     assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /custom-mode/);
     assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /One, custom-tag/);
     assert.match(container.querySelector<HTMLElement>(".answer-review")?.textContent ?? "", /details/);
+    const editAnswers = container.querySelector<HTMLButtonElement>('button[title="Edit answers"]');
+    assert.ok(editAnswers);
+    assert.equal(dom.window.document.activeElement, editAnswers, "entering Review moves focus to its first action");
+    await clickButton("Edit answers");
+    assert.equal(dom.window.document.activeElement, container.querySelector<HTMLInputElement>('input[aria-label="Details"]'), "returning to the last question restores focus inside that question");
+    await clickButton("Review");
+    assert.equal(dom.window.document.activeElement, container.querySelector<HTMLButtonElement>('button[title="Edit answers"]'), "re-entering Review restores its first action focus");
     await clickButton("Submit answers");
     assert.equal(submitted.length, 1, "AskUser should submit exactly once");
     assert.deepEqual(submitted[0], {
@@ -768,10 +1359,58 @@ test("T06 Interaction Surface exposes AskUser controls and preserves its DOM flo
       },
     });
 
+    const escapeInteraction = { ...inputInteraction, pauseId: "pause-escape" };
+    await renderInteraction(escapeInteraction);
+    const askDialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    assert.ok(askDialog);
+    const askEscape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { askDialog!.dispatchEvent(askEscape); });
+    assert.equal(askEscape.defaultPrevented, true, "AskUser Escape remains a typed cancel path");
+    assert.deepEqual(cancelled, ["pause-escape"], "AskUser Escape preserves its pending pause identity");
+
     const cancelInteraction = { ...inputInteraction, pauseId: "pause-cancel" };
     await renderInteraction(cancelInteraction);
     await clickButton("Cancel turn");
-    assert.deepEqual(cancelled, ["pause-cancel"], "cancel should retain the pending pause identity");
+    assert.deepEqual(cancelled, ["pause-escape", "pause-cancel"], "Escape and button cancel should retain each pending pause identity");
+  });
+});
+
+test("T06 modal traps Tab focus, inerts background, restores focus, and handles Escape", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const before = dom.window.document.getElementById("before") as HTMLButtonElement;
+    const after = dom.window.document.getElementById("after") as HTMLButtonElement;
+    before.focus();
+    let cancelled = 0;
+    const interaction = { kind: "permission_required", pauseId: "pause-modal", runId: "run-modal", turnId: "turn-modal", request: { choices: ["once", "reject"] } } as const;
+    act(() => {
+      root.render(<LanguageProvider value="en"><InteractionSurface interaction={interaction} onSubmit={() => undefined} onCancel={() => { cancelled += 1; }} /></LanguageProvider>);
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    assert.ok(dialog);
+    assert.equal(dialog?.getAttribute("aria-modal"), "true");
+    assert.equal((before as HTMLElement & { inert?: boolean }).inert, true);
+    assert.equal((after as HTMLElement & { inert?: boolean }).inert, true);
+    assert.equal(before.getAttribute("aria-hidden"), "true");
+    const buttons = Array.from(dialog!.querySelectorAll<HTMLButtonElement>("button"));
+    assert.equal(buttons.length, 2);
+    buttons[1]!.focus();
+    const tab = new dom.window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    act(() => { buttons[1]!.dispatchEvent(tab); });
+    assert.equal(tab.defaultPrevented, true);
+    assert.equal(dom.window.document.activeElement, buttons[0]);
+    buttons[0]!.focus();
+    const shiftTab = new dom.window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+    act(() => { buttons[0]!.dispatchEvent(shiftTab); });
+    assert.equal(shiftTab.defaultPrevented, true);
+    assert.equal(dom.window.document.activeElement, buttons[1]);
+    const escape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { buttons[0]!.dispatchEvent(escape); });
+    assert.equal(escape.defaultPrevented, true);
+    assert.equal(cancelled, 1);
+    act(() => { root.render(<button id="restored" type="button">Restored</button>); });
+    assert.equal(dom.window.document.activeElement, before);
+    assert.equal((before as HTMLElement & { inert?: boolean }).inert, false);
+    assert.equal(before.getAttribute("aria-hidden"), null);
   });
 });
 
@@ -910,6 +1549,16 @@ test("Runtime model uses only the Application status and model-selection project
   assert.equal(state.currentModelRef, "provider/selected");
 });
 
+test("T05 Runtime context measurement labels come from zh/en locale resources", () => {
+  const state = createInitialState({ contextUsage: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "estimate", source: "application" } });
+  const english = renderLanguage("en", <RuntimePanel state={state} onPanelModeChange={() => undefined} />);
+  const chinese = renderLanguage("zh-CN", <RuntimePanel state={state} onPanelModeChange={() => undefined} />);
+  assert.match(english, /12 \/ 100 · estimate/);
+  assert.match(chinese, /12 \/ 100 · 估算/);
+  assert.doesNotMatch(english, /不可用|估算/u);
+  assert.doesNotMatch(chinese, /Unavailable|estimate/u);
+});
+
 test("T04 settings rebootstrap uses the real Runtime and project/session boundaries", async () => {
   const calls: Array<{ method: string; params: unknown }> = [];
   const opened: unknown[] = [];
@@ -997,6 +1646,8 @@ test("T05 turn_completed settles reasoning while removing only the assistant pre
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "reasoning").map((entry) => ({ text: entry.text, status: entry.status, streaming: entry.streaming })), [{ text: "reasoning tail", status: "completed", streaming: false }]);
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "assistant").map((entry) => entry.text), ["authoritative"]);
   assert.equal(state.timeline.some((entry) => entry.text === "preview"), false);
+  assert.equal(state.activeTurn, true);
+  assert.equal(state.terminalStatusPending, true);
 });
 
 test("T05 failed turns settle reasoning tail while removing only assistant preview", () => {
@@ -1006,6 +1657,8 @@ test("T05 failed turns settle reasoning tail while removing only assistant previ
   state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_failed", run_id: "run-one", turn_id: "turn-one", termination_reason: "provider_error", failure_reason: "provider_request" } });
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "reasoning").map((entry) => ({ text: entry.text, status: entry.status, streaming: entry.streaming })), [{ text: "failed reasoning tail", status: "completed", streaming: false }]);
   assert.equal(state.timeline.some((entry) => entry.text === "failed preview"), false);
+  assert.equal(state.activeTurn, true);
+  assert.equal(state.terminalStatusPending, true);
 });
 
 test("T05 cancelled turns settle reasoning tail while removing only assistant preview", () => {
@@ -1015,6 +1668,8 @@ test("T05 cancelled turns settle reasoning tail while removing only assistant pr
   state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_cancelled", run_id: "run-one", turn_id: "turn-one", termination_reason: "user_cancelled" } });
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "reasoning").map((entry) => ({ text: entry.text, status: entry.status, streaming: entry.streaming })), [{ text: "cancelled reasoning tail", status: "completed", streaming: false }]);
   assert.equal(state.timeline.some((entry) => entry.text === "cancelled preview"), false);
+  assert.equal(state.activeTurn, true);
+  assert.equal(state.terminalStatusPending, true);
 });
 
 test("T06 same-turn AskUser and Plan pauses receive distinct remount keys", () => {
@@ -1107,7 +1762,8 @@ test("T07 Settings exposes editable schema IDs and model context/token limits", 
 
 test("Prompt 1 hidden Runtime is restored only from the chat header", () => {
   const markup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "hidden" })} api={undefined} />);
-  assert.match(markup, /title="切换 Runtime" aria-label="切换 Runtime"/);
+  assert.match(markup, /title="打开 Runtime 面板" aria-label="打开 Runtime 面板"/);
+  assert.match(markup, /aria-expanded="false" aria-controls="runtime-panel"/);
   assert.doesNotMatch(markup, />Open Runtime</);
   assert.doesNotMatch(markup, /Compact Session|Show status/);
 });
@@ -1147,7 +1803,9 @@ test("Prompt 2 locale resources have exact parity and custom select skips disabl
 
 test("T07 Runtime switch and three layout modes remain operational", async () => {
   const dockedMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "docked" })} api={undefined} />);
-  assert.match(dockedMarkup, /aria-label="切换 Runtime"/);
+  assert.match(dockedMarkup, /aria-label="关闭 Runtime 面板"/);
+  assert.match(dockedMarkup, /aria-expanded="true"/);
+  assert.match(dockedMarkup, /aria-controls="runtime-panel"/);
   const floatingMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "floating" })} api={undefined} />);
   assert.match(floatingMarkup, /runtime-panel--floating/);
   const settingsMarkup = renderToStaticMarkup(<App initialState={createInitialState({ view: "settings", panelMode: "docked", settingsLoaded: true })} api={undefined} />);
@@ -1383,7 +2041,10 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
   });
   assert.deepEqual(baseState.commandCandidates.map((candidate) => candidate.value), ["/clear", "/model", "/permission", "/status", "/quit", "/compact", "/plan", "/new", "/resume", "/do", "/help"]);
   assert.equal(nextCompletionIndex(baseState.commandCandidates, 0, 1), 1);
-  assert.equal(nextCompletionIndex(baseState.commandCandidates, 0, -1), 10);
+  const visibleCandidates = baseState.commandCandidates.filter((candidate) => !["/clear", "/quit", "/resume", "/permission", "/help"].includes(candidate.value));
+  assert.deepEqual(visibleCandidates.map((candidate) => candidate.value), ["/model", "/status", "/compact", "/plan", "/new", "/do"]);
+  assert.equal(nextCompletionIndex(visibleCandidates, 0, 1), 1);
+  assert.equal(nextCompletionIndex(visibleCandidates, 0, -1), 5);
   assert.equal(edgeCompletionIndex(baseState.commandCandidates, false), 0);
   assert.equal(edgeCompletionIndex(baseState.commandCandidates, true), 10);
 
@@ -1391,6 +2052,8 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     const changes: string[] = [];
     const submitted: string[] = [];
     const dismissed: number[] = [];
+    const scrollCalls: unknown[] = [];
+    Object.defineProperty(dom.window.HTMLElement.prototype, "scrollIntoView", { configurable: true, value: (options: unknown) => { scrollCalls.push(options); } });
     const renderComposer = async (key: string, state = baseState) => {
       act(() => {
         root.render(<LanguageProvider value="en"><Composer key={key} state={state} onChange={(value) => changes.push(value)} onSubmit={(value) => submitted.push(value)} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} onDismissCompletion={() => dismissed.push(1)} /></LanguageProvider>);
@@ -1419,23 +2082,24 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     assert.equal(activeIndex(), 1);
     await press(textarea!, "ArrowDown");
     assert.equal(activeIndex(), 2);
+    assert.ok(scrollCalls.some((options) => typeof options === "object" && options !== null && (options as { block?: unknown }).block === "nearest"), "active completion should scroll into view with nearest alignment");
     await press(textarea!, "ArrowUp");
     assert.equal(activeIndex(), 1);
     await press(textarea!, "ArrowUp");
     assert.equal(activeIndex(), 0);
     await press(textarea!, "ArrowUp");
-    assert.equal(activeIndex(), 10, "ArrowUp wraps to the last registry candidate");
+    assert.equal(activeIndex(), 5, "ArrowUp wraps to the last visible candidate");
     await press(textarea!, "ArrowDown");
     assert.equal(activeIndex(), 0, "ArrowDown wraps to the first registry candidate");
     await press(textarea!, "Home");
     assert.equal(activeIndex(), 0);
     await press(textarea!, "End");
-    assert.equal(activeIndex(), 10);
+    assert.equal(activeIndex(), 5);
 
     act(() => { options()[1]?.dispatchEvent(new dom.window.MouseEvent("mouseover", { bubbles: true })); });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     assert.equal(activeIndex(), 1, "mouse hover and keyboard active state share one index");
-    act(() => { options()[1]?.click(); });
+    act(() => { options().find((button) => button.textContent?.startsWith("/model"))?.click(); });
     assert.deepEqual(changes.at(-1), "/model ");
     assert.equal(container.querySelector(".command-menu"), null);
 
@@ -1449,7 +2113,7 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     const replacementArea = container.querySelector<HTMLTextAreaElement>("textarea");
     assert.ok(replacementArea);
     const replacementOptions = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".command-menu button"));
-    assert.deepEqual(replacementOptions().map((button) => button.textContent?.split(" — ")[0]), ["/model", "/help"]);
+    assert.deepEqual(replacementOptions().map((button) => button.textContent?.split(" — ")[0]), ["/model"]);
     const replacementEvent = await press(replacementArea!, "Enter");
     assert.equal(replacementEvent.defaultPrevented, true);
     assert.deepEqual(changes.at(-1), "  /model ");
@@ -1461,7 +2125,7 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     assert.ok(enterArea);
     const enterEvent = await press(enterArea!, "Enter");
     assert.equal(enterEvent.defaultPrevented, true);
-    assert.deepEqual(changes.at(-1), "/clear ");
+    assert.deepEqual(changes.at(-1), "/model ");
     assert.equal(submitted.length, 0, "completion Enter must not submit the prompt");
     assert.equal(container.querySelector(".command-menu"), null);
 
@@ -1470,7 +2134,7 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     assert.ok(tabArea);
     const tabEvent = await press(tabArea!, "Tab");
     assert.equal(tabEvent.defaultPrevented, true);
-    assert.deepEqual(changes.at(-1), "/clear ");
+    assert.deepEqual(changes.at(-1), "/model ");
     assert.equal(container.querySelector(".command-menu"), null);
 
     await renderComposer("escape");
@@ -1491,6 +2155,32 @@ test("Prompt 4 slash completion supports cyclic keyboard navigation, mouse selec
     const keyCodeEvent = await press(imeArea!, "Enter", { keyCode: 229 });
     assert.equal(keyCodeEvent.defaultPrevented, false);
     assert.equal(submitted.length, 0);
+  });
+});
+
+test("T06 CustomSelect flips by available geometry and restores trigger focus", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerHeight", { configurable: true, value: 240 });
+    let rect = { top: 20, bottom: 50, left: 0, right: 180 };
+    act(() => {
+      root.render(<LanguageProvider value="en"><CustomSelect value="one" label="Choice" options={[{ value: "one", label: "One" }, { value: "two", label: "Two" }]} onChange={() => undefined} /></LanguageProvider>);
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const trigger = container.querySelector<HTMLButtonElement>(".custom-select__trigger");
+    assert.ok(trigger);
+    trigger!.getBoundingClientRect = () => ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top, x: rect.left, y: rect.top, toJSON: () => ({}) }) as DOMRect;
+    act(() => { trigger!.click(); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.ok(container.querySelector(".custom-select__list.is-below"), "menu should flip below when the lower viewport has more space");
+    rect = { top: 200, bottom: 230, left: 0, right: 180 };
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.ok(container.querySelector(".custom-select__list.is-above"), "menu should return above after the available geometry changes");
+    const option = container.querySelector<HTMLButtonElement>('.custom-select__list button[role="option"]');
+    assert.ok(option);
+    act(() => { option!.click(); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(dom.window.document.activeElement, trigger, "closing a select should restore focus to its trigger");
   });
 });
 
@@ -1538,87 +2228,78 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
   });
 });
 
-test("Prompt 4 context ring uses the safe projection, configured limits, 256K fallback, and accessible tooltip text", () => {
-  const translateEn = (key: "contextUsage" | "contextTokens" | "contextNotStarted") => translate("en", key);
-  const unavailable = renderLanguage("en", <ContextRing usage={{ used_tokens: 0, budget_tokens: 0, available: false }} language="en" fallbackBudget={256000} translate={translateEn} />);
+test("T05 context ring uses only the Application status projection and accessible tooltip text", () => {
+  const translateEn = (key: "contextUsage" | "contextTokens" | "contextNotStarted" | "unavailable") => translate("en", key);
+  const unavailable = renderLanguage("en", <ContextRing usage={{ used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" }} language="en" translate={translateEn} />);
   assert.match(unavailable, /class="context-ring /);
   assert.match(unavailable, /data-used="0"/);
-  assert.match(unavailable, /data-budget="256000"/);
+  assert.match(unavailable, /data-budget="0"/);
   assert.match(unavailable, /data-available="false"/);
-  assert.match(unavailable, /aria-label="Context usage: 0% · 0 \/ 256,000 tokens · not started"/);
-  assert.equal(contextUsagePercent({ used_tokens: 0, budget_tokens: 128000, available: true }, 128000), 0);
-  assert.equal(contextUsagePercent({ used_tokens: 115200, budget_tokens: 128000, available: true }, 128000), 90);
-  const high = renderLanguage("en", <ContextRing usage={{ used_tokens: 115200, budget_tokens: 128000, available: true }} language="en" fallbackBudget={128000} translate={translateEn} />);
+  assert.match(unavailable, /aria-label="Context usage: 0% · Unavailable · not started"/);
+  const estimate = { used_tokens: 0, budget_tokens: 128000, available: true, measurement: "estimate" as const, source: "application" };
+  const highUsage = { used_tokens: 115200, budget_tokens: 128000, available: true, measurement: "estimate" as const, source: "application" };
+  assert.equal(contextUsagePercent(estimate), 0);
+  assert.equal(contextUsagePercent(highUsage), 90);
+  const high = renderLanguage("en", <ContextRing usage={highUsage} language="en" translate={translateEn} />);
   assert.match(high, /class="context-ring is-warning"/);
   assert.match(high, /115,200 \/ 128,000 tokens/);
-  const critical = renderLanguage("zh-CN", <ContextRing usage={{ used_tokens: 128000, budget_tokens: 128000, available: true }} language="zh-CN" fallbackBudget={128000} translate={(key) => translate("zh-CN", key)} />);
+  const critical = renderLanguage("zh-CN", <ContextRing usage={{ used_tokens: 128000, budget_tokens: 128000, available: true, measurement: "exact", source: "application" }} language="zh-CN" translate={(key) => translate("zh-CN", key)} />);
   assert.match(critical, /class="context-ring is-critical"/);
   assert.match(critical, /上下文使用量: 100%/);
   assert.match(critical, /128,000 \/ 128,000 Token/);
-  const overBudget = renderLanguage("en", <ContextRing usage={{ used_tokens: 200000, budget_tokens: 4096, available: true }} language="en" fallbackBudget={128000} translate={translateEn} />);
+  const overBudget = renderLanguage("en", <ContextRing usage={{ used_tokens: 200000, budget_tokens: 4096, available: true, measurement: "exact", source: "application" }} language="en" translate={translateEn} />);
   assert.match(overBudget, /class="context-ring is-critical"/);
   assert.match(overBudget, /data-used="200000"/);
-  assert.match(overBudget, /data-budget="128000"/);
+  assert.match(overBudget, /data-budget="4096"/);
   assert.match(overBudget, /data-percent="100"/);
 });
 
-test("Prompt 4 context usage reducer consumes Application status and respects model configuration", () => {
-  assert.equal(configuredContextWindow({ default_model: "local/chat", models: { "local/chat": { context_window: 96000 } } }, null), 96000);
-  assert.equal(configuredContextWindow({
-    default_model: "fallback/model",
-    models: {
-      "current/model": { context_window: null },
-      "fallback/model": { context_window: 128000 },
-    },
-  }, "current/model"), 128000, "a missing current window falls through to the configured default model");
-  assert.equal(configuredContextWindow({
-    default_model: "fallback/model",
-    models: {
-      "current/model": { context_window: -1 },
-      "fallback/model": { context_window: 128000 },
-    },
-  }, "current/model"), 128000, "an invalid current window falls through to the configured default model");
-  assert.equal(configuredContextWindow({
-    default_model: "fallback/model",
-    models: {
-      "current/model": { context_window: 96000 },
-      "fallback/model": { context_window: 128000 },
-    },
-  }, "current/model"), 96000, "the current model window has priority over the configured default");
-  assert.equal(configuredContextWindow({
-    default_model: "fallback/model",
-    models: {
-      "current/model": { context_window: "128000" },
-      "fallback/model": { context_window: 0 },
-    },
-  }, "current/model"), 256000, "the safe fallback applies when both model windows are invalid");
-  let configured = createInitialState({
-    currentModelRef: "local/chat",
-    configuration: { models: { "local/chat": { context_window: 128000 } } },
-  });
-  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { current_model: "local/chat", context_usage: { used_tokens: 64000, budget_tokens: 4096, available: true } } } });
-  assert.deepEqual(configured.contextUsage, { used_tokens: 64000, budget_tokens: 128000, available: true });
-  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 200000, budget_tokens: 4096, available: true } } } });
-  assert.deepEqual(configured.contextUsage, { used_tokens: 200000, budget_tokens: 128000, available: true });
-  configured = reduceRendererState(configured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 0, budget_tokens: 0, available: false } } } });
-  assert.deepEqual(configured.contextUsage, { used_tokens: 0, budget_tokens: 128000, available: false });
-  let unconfigured = createInitialState();
-  unconfigured = reduceRendererState(unconfigured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 100000, budget_tokens: 4096, available: true } } } });
-  assert.deepEqual(unconfigured.contextUsage, { used_tokens: 100000, budget_tokens: 256000, available: true });
-  unconfigured = reduceRendererState(unconfigured, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 0, budget_tokens: 0, available: false } } } });
-  assert.deepEqual(unconfigured.contextUsage, { used_tokens: 0, budget_tokens: 256000, available: false });
-  configured = reduceRendererState(configured, { type: "settings_loaded", configuration: { models: { "local/chat": { context_window: 96000 } } } });
-  assert.equal(configured.contextUsage.budget_tokens, 96000);
+test("T05 context usage reducer consumes the Application status and ignores the legacy usage field", () => {
+  let state = createInitialState({ currentModelRef: "local/chat", contextUsage: { used_tokens: 9, budget_tokens: 10, available: true, measurement: "estimate", source: "test" } });
+  state = reduceRendererState(state, { type: "status_loaded", result: { application: { current_model: "local/chat", context_usage: { used_tokens: 999, budget_tokens: 1, available: true }, context_status: { used_tokens: 64000, budget_tokens: 4096, available: true, measurement: "exact", source: "application" }, compaction_status: { state: "running", trigger: "manual", changed: null } } } });
+  assert.deepEqual(state.contextUsage, { used_tokens: 64000, budget_tokens: 4096, available: true, measurement: "exact", source: "application" });
+  assert.deepEqual(state.compactionStatus, { state: "running", trigger: "manual", changed: null });
+  state = reduceRendererState(state, { type: "status_loaded", result: { application: { context_usage: { used_tokens: 200000, budget_tokens: 128000, available: true } } } });
+  assert.deepEqual(state.contextUsage, { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" }, "legacy context_usage must not become a second authority");
+  state = reduceRendererState(state, { type: "status_loaded", result: { application: { context_status: { used_tokens: 0, budget_tokens: 2048, available: false, measurement: "unavailable", source: "unavailable" }, compaction_status: { state: "completed", trigger: "manual", changed: true } } } });
+  assert.deepEqual(state.contextUsage, { used_tokens: 0, budget_tokens: 2048, available: false, measurement: "unavailable", source: "unavailable" });
+  assert.deepEqual(state.compactionStatus, { state: "completed", trigger: "manual", changed: true });
+  for (const context_status of [
+    { used_tokens: 1, budget_tokens: 2, available: true, source: "application" },
+    { used_tokens: 1, budget_tokens: 2, available: true, measurement: "mystery", source: "application" },
+    { used_tokens: 1, budget_tokens: 2, available: true, measurement: "estimate", source: "" },
+  ]) {
+    state = reduceRendererState(state, { type: "status_loaded", result: { application: { context_status } } });
+    assert.equal(state.contextUsage.available, false, "incomplete/invalid Context DTO must be unavailable");
+    assert.equal(state.contextUsage.budget_tokens, 0, "invalid Context DTO must not retain a guessed denominator");
+  }
 });
 
-test("Prompt 4 context ring and composer layout remain legible in both themes and narrow layouts", async () => {
+test("T05 Composer gates ordinary sends on the Application compaction status", () => {
+  const running = createInitialState({ composerText: "continue", compactionStatus: { state: "running", trigger: "manual", changed: null } });
+  const runningMarkup = renderLanguage("en", <Composer state={running} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
+  assert.match(runningMarkup, /<textarea[^>]*disabled=""/u);
+  assert.match(runningMarkup, /<button[^>]*title="Send"[^>]*disabled=""/u);
+  const settled = createInitialState({ composerText: "continue", compactionStatus: { state: "completed", trigger: "manual", changed: true } });
+  const settledMarkup = renderLanguage("en", <Composer state={settled} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
+  assert.doesNotMatch(settledMarkup, /<textarea[^>]*disabled=""/u);
+});
+
+test("Prompt 4 theme and responsive CSS contracts cover context ring and composer", async () => {
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.context-ring__track\s*\{\s*stroke:\s*var\(--line-strong\)/);
   assert.match(css, /\.context-ring__progress\s*\{\s*stroke:\s*var\(--accent-strong\)/);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*grid/);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-actions\s*\{[^}]*flex-wrap:\s*wrap/);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-model \.custom-select\s*\{\s*width:\s*min\(230px, calc\(100% - 40px\)\)/);
+  assert.match(css, /@media \(max-width: 680px\)[\s\S]*?grid-template-columns:\s*var\(--sidebar-width\) minmax\(0, 1fr\)/);
+  assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.runtime-panel--docked\s*\{\s*display:\s*none/);
+  assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.runtime-panel--floating\s*\{[^}]*width:\s*min\(304px, calc\(100vw - 16px\)\)/);
+  assert.doesNotMatch(css, /@media \(max-width: 520px\)[\s\S]*?\.sidebar[^}]*display:\s*none/);
+  assert.match(css, /\.runtime-panel--floating\s*\{[^}]*background:\s*var\(--surface\)[^}]*box-shadow:/);
+  assert.match(css, /\.runtime-heading h2 \.ui-icon\s*\{[^}]*color:\s*var\(--accent-strong\)/);
   assert.match(css, /--composer-height/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?scroll-behavior:\s*auto[\s\S]*?transition-duration:\s*0\.01ms/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "dark" })} api={undefined} />), /theme-dark/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "light" })} api={undefined} />), /theme-light/);
 });

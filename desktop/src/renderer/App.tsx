@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
-import type { DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
+import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type SessionOrderReason } from "./state";
 import { UiIcon } from "./UiIcon";
 import { LanguageProvider, translate } from "./i18n";
 
@@ -14,6 +14,8 @@ export interface AppProps {
   api?: DesktopApi;
   initialState?: RendererState;
 }
+
+const RUNTIME_PANEL_ID = "runtime-panel";
 
 function runtimeApi(explicit?: DesktopApi): DesktopApi | undefined {
   if (explicit) return explicit;
@@ -26,6 +28,37 @@ function asObject(value: unknown): JsonObject {
   return {};
 }
 
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function knownIdentityMatches(currentRunId: string, currentTurnId: string, runId: string, turnId: string): boolean {
+  return (!runId || !currentRunId || currentRunId === runId)
+    && (!turnId || !currentTurnId || currentTurnId === turnId);
+}
+
+function hasTurnIdentity(runId: string, turnId: string): boolean {
+  return Boolean(runId || turnId);
+}
+
+function hasCompleteTurnIdentity(identity: { runId: string; turnId: string }): boolean {
+  return identity.runId.trim().length > 0 && identity.turnId.trim().length > 0;
+}
+
+function identityFromRun(value: unknown): { runId: string; turnId: string } {
+  const run = asObject(value);
+  return { runId: stringValue(run.run_id), turnId: stringValue(run.turn_id) };
+}
+
+function eventIdentity(event: AgentEvent): { runId: string; turnId: string } {
+  return { runId: stringValue(event.run_id), turnId: stringValue(event.turn_id) };
+}
+
+function eventMatchesIdentity(event: AgentEvent, identity: { runId: string; turnId: string }): boolean {
+  const current = eventIdentity(event);
+  return current.runId === identity.runId && current.turnId === identity.turnId;
+}
+
 function errorMessage(error: unknown, fallback: string): string {
   if (error && typeof error === "object") {
     const source = error as { message?: unknown; error?: { message?: unknown } };
@@ -35,16 +68,101 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-async function waitForIdle(api: DesktopApi): Promise<void> {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+export type IdleWaitResult =
+  | { state: "idle"; result: JsonValue }
+  | { state: "unavailable" | "timeout" };
+
+export interface IdleWaitOptions {
+  pollIntervalMs?: number;
+  maxAttempts?: number;
+  signal?: AbortSignal;
+}
+
+/** Wait only for the Bridge's explicit active_turn=false authority. */
+export async function waitForIdle(api: DesktopApi, options: IdleWaitOptions = {}): Promise<IdleWaitResult> {
+  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const maxAttempts = options.maxAttempts ?? 20;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (options.signal?.aborted) return { state: "unavailable" };
     try {
-      const value = asObject(await api.requestRuntime("status.get", {}));
-      if (value.active_turn !== true) return;
+      const result = await api.requestRuntime("status.get", {});
+      const value = asObject(result);
+      if (value.active_turn === false) return { state: "idle", result };
+      if (value.active_turn !== true) return { state: "unavailable" };
     } catch {
-      return;
+      return { state: "unavailable" };
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (attempt + 1 < maxAttempts) await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
+  return { state: "timeout" };
+}
+
+export type AuthoritativeIdleResult =
+  | { state: "idle"; result: JsonValue }
+  | { state: "cancelled" };
+
+export interface AuthoritativeIdleOptions {
+  signal: AbortSignal;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+}
+
+type StatusRequestOutcome =
+  | { state: "result"; result: JsonValue }
+  | { state: "error" }
+  | { state: "cancelled" };
+
+function requestStatusWithCancellation(api: DesktopApi, signal: AbortSignal): Promise<StatusRequestOutcome> {
+  if (signal.aborted) return Promise.resolve({ state: "cancelled" });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome: StatusRequestOutcome) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(outcome);
+    };
+    const onAbort = () => finish({ state: "cancelled" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    // Start through a microtask so a test double or an adapter that throws
+    // before returning its Promise is handled like any other transient RPC
+    // failure, without rejecting the long-lived convergence loop.
+    void Promise.resolve().then(() => api.requestRuntime("status.get", {})).then(
+      (result) => finish({ state: "result", result }),
+      () => finish({ state: "error" }),
+    );
+  });
+}
+
+function delayWithCancellation(milliseconds: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => finish(true), Math.max(0, milliseconds));
+    const finish = (completed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Keep checking the authoritative Bridge boundary until idle or cancellation. */
+export async function waitForAuthoritativeIdle(api: DesktopApi, options: AuthoritativeIdleOptions): Promise<AuthoritativeIdleResult> {
+  let delay = Math.max(0, options.initialDelayMs ?? 25);
+  const maxDelay = Math.max(delay, options.maxDelayMs ?? 1000);
+  while (!options.signal.aborted) {
+    const response = await requestStatusWithCancellation(api, options.signal);
+    if (response.state === "cancelled") return { state: "cancelled" };
+    if (response.state === "result" && asObject(response.result).active_turn === false) return { state: "idle", result: response.result };
+    if (!(await delayWithCancellation(delay, options.signal))) return { state: "cancelled" };
+    delay = Math.min(maxDelay, delay > 0 ? delay * 2 : 1);
+  }
+  return { state: "cancelled" };
 }
 
 function projectPreferences(projects: ProjectState[]): DesktopPreferences["recentProjects"] {
@@ -73,6 +191,18 @@ export function projectNavigationPreferences(
 }
 
 type RuntimeRequest = (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject) => Promise<JsonValue>;
+
+interface TerminalStatusPoll {
+  controller: AbortController;
+  runId: string;
+  turnId: string;
+  promise: Promise<AuthoritativeIdleResult>;
+}
+
+interface PendingTurnStart {
+  id: number;
+  events: AgentEvent[];
+}
 
 export function projectRemovalPlan(projects: readonly ProjectState[], selectedProjectKey: string | null, removedProjectKey: string): {
   remaining: ProjectState[];
@@ -116,7 +246,29 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const stateRef = useRef(state);
   stateRef.current = state;
   const api = runtimeApi(explicitApi);
+  const [narrowViewport, setNarrowViewport] = useState(() => typeof window !== "undefined" && window.innerWidth <= 680);
+  const runtimeToggleRef = useRef<HTMLButtonElement>(null);
+  const latestTurnRef = useRef({ runId: state.run?.run_id ?? "", turnId: state.run?.turn_id ?? "" });
+  const pendingTurnStartRef = useRef<PendingTurnStart | null>(null);
+  const pendingTurnStartSequenceRef = useRef(0);
+  const mountedRef = useRef(false);
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pendingTurnStartRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const updateViewport = () => setNarrowViewport(window.innerWidth <= 680);
+    updateViewport();
+    window.addEventListener("resize", updateViewport);
+    return () => window.removeEventListener("resize", updateViewport);
+  }, []);
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
     if (!api) throw new Error(t("desktopApiUnavailable"));
@@ -133,24 +285,93 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [api]);
 
-  const refreshCatalog = useCallback(async (projectKey: string) => {
+  const refreshCatalog = useCallback(async (projectKey: string, reason: SessionOrderReason = "catalog_refresh", focusSessionId?: string) => {
     try {
       const result = asObject(await send("project.sessions", {}));
       const sessions = Array.isArray(result.sessions) ? result.sessions : [];
-      dispatch({ type: "catalog_refreshed", projectKey, sessions });
+      dispatch({ type: "catalog_refreshed", projectKey, sessions, reason, focusSessionId });
     } catch (error) {
       dispatch({ type: "notice", text: errorMessage(error, t("sessionCatalogUnavailable")) });
     }
   }, [send]);
 
-  const refreshRuntimeStatus = useCallback(async () => {
+  const refreshRuntimeStatus = useCallback(async (): Promise<boolean> => {
     try {
       dispatch({ type: "status_loaded", result: await send("status.get", {}) });
+      return true;
     } catch {
       // Runtime status is supplementary safe projection; command and Run
       // authority remain usable when it is temporarily unavailable.
+      return false;
     }
   }, [send]);
+
+  const terminalStatusPollRef = useRef<TerminalStatusPoll | null>(null);
+  const cancelTerminalStatusPoll = useCallback(() => {
+    const current = terminalStatusPollRef.current;
+    if (!current) return;
+    terminalStatusPollRef.current = null;
+    current.controller.abort();
+  }, []);
+
+  const startTerminalStatusConvergence = useCallback((runId: string, turnId: string): Promise<AuthoritativeIdleResult> => {
+    if (!api) return Promise.resolve({ state: "cancelled" });
+    if (!knownIdentityMatches(latestTurnRef.current.runId, latestTurnRef.current.turnId, runId, turnId)) return Promise.resolve({ state: "cancelled" });
+    const existing = terminalStatusPollRef.current;
+    if (existing && existing.runId === runId && existing.turnId === turnId) return existing.promise;
+    cancelTerminalStatusPoll();
+    const controller = new AbortController();
+    const poll: TerminalStatusPoll = {
+      controller,
+      runId,
+      turnId,
+      promise: Promise.resolve({ state: "cancelled" }),
+    };
+    poll.promise = waitForAuthoritativeIdle(api, { signal: controller.signal });
+    terminalStatusPollRef.current = poll;
+    void poll.promise.then(async (idle) => {
+      if (controller.signal.aborted || terminalStatusPollRef.current !== poll) return;
+      if (!knownIdentityMatches(latestTurnRef.current.runId, latestTurnRef.current.turnId, runId, turnId)) {
+        terminalStatusPollRef.current = null;
+        return;
+      }
+      terminalStatusPollRef.current = null;
+      if (idle.state !== "idle") return;
+      dispatch({ type: "status_loaded", result: idle.result });
+      const current = stateRef.current;
+      if (knownIdentityMatches(latestTurnRef.current.runId, latestTurnRef.current.turnId, runId, turnId) && current.selectedProjectKey) await refreshCatalog(current.selectedProjectKey, "message", current.selectedSessionId ?? undefined);
+    });
+    return poll.promise;
+  }, [api, cancelTerminalStatusPoll, refreshCatalog]);
+
+  const processAgentEvent = useCallback((event: AgentEvent) => {
+    const { runId: eventRunId, turnId: eventTurnId } = eventIdentity(event);
+    const latestMatches = () => {
+      const latest = latestTurnRef.current;
+      if (hasTurnIdentity(latest.runId, latest.turnId)) return knownIdentityMatches(latest.runId, latest.turnId, eventRunId, eventTurnId);
+      const current = stateRef.current.run;
+      const currentRunId = current?.run_id ?? "";
+      const currentTurnId = current?.turn_id ?? "";
+      return hasTurnIdentity(currentRunId, currentTurnId) && knownIdentityMatches(currentRunId, currentTurnId, eventRunId, eventTurnId);
+    };
+    if (event.type === "turn_started") {
+      // A Core turn_started event is not itself an accepted boundary. Only
+      // an already accepted run/turn (or the current known Run) may replace
+      // poll ownership; a mismatched event must not cancel a live poll.
+      if (!latestMatches()) return;
+      latestTurnRef.current = { runId: eventRunId, turnId: eventTurnId };
+      cancelTerminalStatusPoll();
+    }
+    const terminal = event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled";
+    if (terminal && !latestMatches()) return;
+    dispatch({ type: "agent_event", event });
+    if (terminal) {
+      // The terminal event is published before the Bridge releases its
+      // active handle. Keep one cancellable, backoff poll alive until the
+      // Application status explicitly reports active_turn=false.
+      void startTerminalStatusConvergence(eventRunId, eventTurnId);
+    }
+  }, [cancelTerminalStatusPoll, startTerminalStatusConvergence]);
 
   const refreshConfiguration = useCallback(async () => {
     try {
@@ -194,8 +415,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     let cancelled = false;
     const unsubscribe = api.subscribeAgentEvents((event) => {
       if (cancelled) return;
-      dispatch({ type: "agent_event", event });
-      if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled") void refreshRuntimeStatus();
+      const pendingStart = pendingTurnStartRef.current;
+      const pendingEventIdentity = eventIdentity(event);
+      if (pendingStart && hasTurnIdentity(pendingEventIdentity.runId, pendingEventIdentity.turnId)) {
+        // Python Runtime can resolve turn.start and synchronously deliver the
+        // following stdout events before the Promise continuation records the
+        // accepted flat identity. Hold scoped events until that boundary is
+        // known; unrelated identities are filtered when the response arrives.
+        pendingStart.events.push(event);
+        return;
+      }
+      processAgentEvent(event);
     });
     void Promise.all([
       api.readPreference("theme"),
@@ -240,9 +470,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     });
     return () => {
       cancelled = true;
+      pendingTurnStartRef.current = null;
+      cancelTerminalStatusPoll();
       unsubscribe();
     };
-  }, [api, refreshRuntimeStatus, send]);
+  }, [api, cancelTerminalStatusPoll, processAgentEvent, refreshCatalog, send, t]);
 
   const openProject = useCallback(async () => {
     if (!api) return;
@@ -254,20 +486,55 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [api, openProjectPath]);
 
-  const closeActiveTurn = useCallback(async () => {
-    if (!api || !stateRef.current.activeTurn) return;
+  const closeActiveTurn = useCallback(async (): Promise<boolean> => {
+    if (!api) return false;
+    if (pendingTurnStartRef.current) return false;
+    const beforeCancel = stateRef.current;
+    const beforeRunId = beforeCancel.run?.run_id ?? "";
+    const beforeTurnId = beforeCancel.run?.turn_id ?? "";
+    const stillOwnsTurn = () => {
+      const current = stateRef.current;
+      if (beforeRunId || beforeTurnId) {
+        return (!beforeRunId || current.run?.run_id === beforeRunId)
+          && (!beforeTurnId || current.run?.turn_id === beforeTurnId);
+      }
+      // An active state without identity is not expected from the Application
+      // DTO, but if it appears, object identity still prevents an old wait
+      // from authorizing a newly started Run.
+      return current.run === beforeCancel.run;
+    };
+    if (!beforeCancel.activeTurn && !beforeCancel.terminalStatusPending) return true;
+    if (beforeCancel.terminalStatusPending && !terminalStatusPollRef.current) {
+      dispatch({ type: "notice", text: t("terminalStatusPending") });
+      return false;
+    }
     try {
-      await send("turn.cancel", {});
+      if (beforeCancel.activeTurn && !beforeCancel.terminalStatusPending) await send("turn.cancel", {});
     } catch {
       // The Bridge owns the terminal error. We still wait for its state before
       // asking it to replace a Session/Application.
     }
-    await waitForIdle(api);
-  }, [api, send]);
+    if (!stillOwnsTurn()) return false;
+    const currentPoll = terminalStatusPollRef.current;
+    const ownedPoll = currentPoll
+      && currentPoll.runId === beforeRunId
+      && currentPoll.turnId === beforeTurnId
+      ? currentPoll
+      : null;
+    if (!ownedPoll && currentPoll) return false;
+    const idle = await (ownedPoll?.promise
+      ?? startTerminalStatusConvergence(beforeRunId, beforeTurnId));
+    if (!stillOwnsTurn()) return false;
+    if (idle.state !== "idle") {
+      dispatch({ type: "notice", text: t("terminalStatusPending") });
+      return false;
+    }
+    return true;
+  }, [api, send, startTerminalStatusConvergence, t]);
 
   const resumeSession = useCallback(async (project: ProjectState, sessionId: string) => {
     if (!api) return;
-    await closeActiveTurn();
+    if (!(await closeActiveTurn())) return;
     try {
       if (stateRef.current.selectedProjectKey !== project.projectKey) {
         const opened = await send("project.open", { path: project.path });
@@ -287,7 +554,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           await persist("selectedSessionId", nextId);
         }
       }
-      await refreshCatalog(project.projectKey);
+      await refreshCatalog(project.projectKey, sessionId ? "session_resume" : "session_new", sessionId || undefined);
       await refreshRuntimeStatus();
     } catch (error) {
       dispatch({ type: "runtime_error", message: errorMessage(error, t("sessionOpenFailed")), state: "ready" });
@@ -306,7 +573,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "command_result", result });
       const source = asObject(result);
       const action = asObject(source.ui_action);
-      if (action.type === "model_selected") void refreshRuntimeStatus();
+      // Command outcomes are explicit Application boundaries.  Refresh the
+      // safe Context/Compaction projection once here; completion deltas never
+      // trigger status RPCs.
+      await refreshRuntimeStatus();
       if (action.type === "open_model_picker") {
         try {
           const completion = asObject(await send("command.complete", { prefix: "/model " }));
@@ -318,7 +588,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
       if (action.type === "session_changed" && typeof action.session_id === "string") {
         await persist("selectedSessionId", action.session_id);
-        await refreshCatalog(stateRef.current.selectedProjectKey ?? "");
+        const reason: SessionOrderReason = action.restored === true ? "session_resume" : "session_new";
+        await refreshCatalog(stateRef.current.selectedProjectKey ?? "", reason, action.session_id);
         await refreshRuntimeStatus();
       }
       if (action.type === "quit_interface") {
@@ -330,21 +601,46 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [api, persist, refreshCatalog, refreshRuntimeStatus, send]);
 
   const submitComposer = useCallback(async (text: string) => {
-    if (!api || !text.trim() || stateRef.current.pendingInteraction) return;
+    if (!api || !mountedRef.current || !text.trim() || pendingTurnStartRef.current || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || stateRef.current.compactionStatus.state === "running") return;
     if (text.trimStart().startsWith("/")) {
       await executeCommand(text.trim());
       return;
     }
     const steering = stateRef.current.activeTurn;
+    const pendingStart = steering ? null : { id: pendingTurnStartSequenceRef.current += 1, events: [] as AgentEvent[] };
+    if (pendingStart) pendingTurnStartRef.current = pendingStart;
     try {
       const result = steering
         ? await send("turn.steer", { text })
         : await send("turn.start", { prompt: text });
-      dispatch({ type: "turn_accepted", run: asObject(result).run, steering, text });
+      if (!mountedRef.current || (pendingStart && pendingTurnStartRef.current !== pendingStart)) return;
+      // Bridge `turn.start` returns a flat Run DTO; only `turn.steer` wraps
+      // that DTO under `run`. Keep the shapes separate and require both
+      // identity components before taking poll ownership.
+      const acceptedRun = steering ? asObject(result).run : result;
+      const acceptedIdentity = identityFromRun(acceptedRun);
+      if (!hasCompleteTurnIdentity(acceptedIdentity)) {
+        if (pendingStart) pendingTurnStartRef.current = null;
+        dispatch({ type: "notice", text: t("turnStartFailed") });
+        return;
+      }
+      const bufferedEvents = pendingStart?.events.filter((event) => eventMatchesIdentity(event, acceptedIdentity)) ?? [];
+      if (pendingStart) pendingTurnStartRef.current = null;
+      // This is the accepted Application boundary. Establish ownership
+      // before Core events arrive, then retire any poll for the replaced Run;
+      // an arbitrary turn_started event cannot do this job safely.
+      latestTurnRef.current = acceptedIdentity;
+      cancelTerminalStatusPoll();
+      dispatch({ type: "turn_accepted", run: acceptedRun, steering, text });
+      // Replaying after the accepted action preserves the exact stdout order
+      // while the reducer queue applies turn_accepted before its events.
+      bufferedEvents.forEach(processAgentEvent);
     } catch (error) {
+      if (!mountedRef.current || (pendingStart && pendingTurnStartRef.current !== pendingStart)) return;
+      if (pendingStart) pendingTurnStartRef.current = null;
       dispatch({ type: "notice", text: errorMessage(error, t("turnStartFailed")) });
     }
-  }, [api, executeCommand, send]);
+  }, [api, cancelTerminalStatusPoll, executeCommand, processAgentEvent, send, t]);
 
   const completeCommand = useCallback(async (prefix: string) => {
     if (!api || !prefix.trimStart().startsWith("/")) return;
@@ -368,6 +664,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [api, send]);
 
   const cancelTurn = useCallback(async () => {
+    pendingTurnStartRef.current = null;
     if (!api) return;
     try {
       await send("turn.cancel", {});
@@ -395,6 +692,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     void persist("panelMode", panelMode);
   }, [persist]);
 
+  const restoreRuntimeToggleFocus = useCallback(() => {
+    runtimeToggleRef.current?.focus();
+  }, []);
+
+  const closeRuntimeDrawer = useCallback(() => {
+    setPanelMode("hidden");
+    restoreRuntimeToggleFocus();
+  }, [restoreRuntimeToggleFocus, setPanelMode]);
+
   const setProjectExpanded = useCallback((projectKey: string, expanded: boolean) => {
     // Expansion is navigation metadata only.  Accept updates from rendered
     // Project rows, but never let an arbitrary key become a trusted Project.
@@ -405,8 +711,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const toggleRuntime = useCallback(() => {
-    setPanelMode(stateRef.current.panelMode === "hidden" ? "floating" : "hidden");
-  }, [setPanelMode]);
+    const current = stateRef.current.panelMode;
+    setPanelMode(current === "hidden" || (current === "docked" && narrowViewport) ? "floating" : "hidden");
+  }, [narrowViewport, setPanelMode]);
 
   const aliasChange = useCallback((projectKey: string, alias: string) => {
     const projects = stateRef.current.projects.map((project) => project.projectKey === projectKey ? { ...project, alias } : project);
@@ -441,7 +748,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const renameSession = useCallback(async (project: ProjectState, session: SessionSummary, title: string) => {
-    if (stateRef.current.activeTurn) {
+    if (stateRef.current.activeTurn || stateRef.current.terminalStatusPending) {
       dispatch({ type: "notice", text: t("sessionRenameActive") });
       return;
     }
@@ -454,8 +761,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [send]);
 
   const moveSession = useCallback(async (project: ProjectState, session: SessionSummary, target: ProjectState) => {
-    if (stateRef.current.activeTurn || stateRef.current.selectedSessionId === session.session_id) {
-      dispatch({ type: "notice", text: stateRef.current.activeTurn ? t("sessionMoveActive") : t("sessionMoveBusy") });
+    if (stateRef.current.activeTurn || stateRef.current.terminalStatusPending) {
+      dispatch({ type: "notice", text: t("sessionMoveActive") });
       return;
     }
     try {
@@ -493,7 +800,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       return;
     }
 
-    await closeActiveTurn();
+    if (!(await closeActiveTurn())) return;
     try {
       const replacement = removal.replacement;
       if (replacement) {
@@ -545,7 +852,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [api, send]);
 
   const saveSettings = useCallback(async (request: ConfigurationWrite) => {
-    if (!api || stateRef.current.activeTurn) {
+    if (!api || stateRef.current.activeTurn || stateRef.current.terminalStatusPending) {
       dispatch({ type: "settings_error", message: t("finishTurnBeforeSave") });
       throw new Error(t("finishTurnBeforeSave"));
     }
@@ -576,6 +883,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [api, refreshCatalog, refreshRuntimeStatus, send]);
 
+  const runtimeVisible = state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
+  const runtimeToggleLabel = runtimeVisible ? t("closeRuntime") : t("openRuntime");
   const content = state.view === "settings" ? (
     <SettingsView state={state} api={api} onBack={() => dispatch({ type: "set_view", view: "chat" })} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
   ) : (
@@ -586,7 +895,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <h1>{state.selectedSessionId ? `${t("session")} ${state.selectedSessionId.slice(0, 8)}` : t("newConversation")}</h1>
         </div>
         <div className="conversation-actions">
-          <button type="button" className="icon-button" title={t("toggleRuntime")} aria-label={t("toggleRuntime")} onClick={toggleRuntime}><UiIcon name="panel" /></button>
+          <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>
         </div>
       </header>
       <ChatTimeline entries={state.timeline} todo={state.todo} notice={state.notice} sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`} />
@@ -598,9 +907,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const themeClass = `theme-${state.theme}`;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
-      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main aria-label={t("workspace")}>{content}</main>
-      {state.view === "chat" && <RuntimePanel state={state} onPanelModeChange={setPanelMode} />}
+      {state.view === "chat" && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
       {state.runtimeError && state.view !== "settings" && state.runtimeState === "configuration_required" && <button type="button" className="configuration-banner" onClick={() => void loadSettings()}>{state.runtimeError} — {t("openSettings")}</button>}
     </div>
   </LanguageProvider>;

@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { ConfigurationView, ContextUsageProjection, PermissionModeProjection, RendererState } from "./state";
-import { configuredContextWindow, DEFAULT_CONTEXT_WINDOW } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation } from "./i18n";
 import { stateLabel } from "./RuntimePanel";
+import { UiIcon } from "./UiIcon";
 
 /** Replace only the token currently being completed, preserving slash aliases. */
 export function applyCompletion(prefix: string, completion: string): string {
@@ -48,44 +48,43 @@ function formatTokens(value: number, language: "zh-CN" | "en"): string {
   return value.toLocaleString(language === "en" ? "en-US" : "zh-CN");
 }
 
-function normalizedContextUsage(value: ContextUsageProjection | undefined, fallbackBudget = DEFAULT_CONTEXT_WINDOW): { used: number; budget: number; available: boolean } {
-  // The Application projection supplies used/available only. The configured
-  // model window (or 256k fallback) remains authoritative for the total.
-  const budget = typeof fallbackBudget === "number" && Number.isSafeInteger(fallbackBudget) && fallbackBudget > 0
-    ? fallbackBudget
-    : DEFAULT_CONTEXT_WINDOW;
-  const used = typeof value?.used_tokens === "number" && Number.isSafeInteger(value.used_tokens) && value.used_tokens >= 0
-    ? value.used_tokens
-    : 0;
-  const available = value?.available === true;
-  return { used: available ? used : 0, budget, available };
+function normalizedContextUsage(value: ContextUsageProjection | undefined): { used: number; budget: number; available: boolean; measurement: ContextUsageProjection["measurement"]; source: string } {
+  const budget = typeof value?.budget_tokens === "number" && Number.isSafeInteger(value.budget_tokens) && value.budget_tokens > 0 ? value.budget_tokens : null;
+  const used = typeof value?.used_tokens === "number" && Number.isSafeInteger(value.used_tokens) && value.used_tokens >= 0 ? value.used_tokens : null;
+  const measurement = value?.measurement === "estimate" || value?.measurement === "exact" || value?.measurement === "unavailable" ? value.measurement : null;
+  const source = typeof value?.source === "string" && value.source.trim().length > 0 ? value.source : null;
+  const available = typeof value?.available === "boolean" ? value.available : null;
+  if (budget === null || used === null || measurement === null || source === null || available === null || (measurement === "unavailable" && available) || (measurement !== "unavailable" && !available)) {
+    return { used: 0, budget: 0, available: false, measurement: "unavailable", source: "unavailable" };
+  }
+  return { used: available ? used : 0, budget, available, measurement, source };
 }
 
-export function contextUsagePercent(value: ContextUsageProjection | undefined, fallbackBudget = DEFAULT_CONTEXT_WINDOW): number {
-  const usage = normalizedContextUsage(value, fallbackBudget);
-  if (!usage.available) return 0;
+export function contextUsagePercent(value: ContextUsageProjection | undefined): number {
+  const usage = normalizedContextUsage(value);
+  if (!usage.available || usage.budget <= 0) return 0;
   return Math.min(100, Math.round((usage.used / usage.budget) * 100));
 }
 
 export interface ContextRingProps {
   usage?: ContextUsageProjection;
   language: "zh-CN" | "en";
-  translate: (key: "contextUsage" | "contextTokens" | "contextNotStarted") => string;
-  fallbackBudget?: number;
+  translate: (key: "contextUsage" | "contextTokens" | "contextNotStarted" | "unavailable") => string;
 }
 
 /** Compact status indicator for the authoritative Application context usage. */
-export function ContextRing({ usage, language, translate, fallbackBudget = DEFAULT_CONTEXT_WINDOW }: ContextRingProps) {
-  const normalized = normalizedContextUsage(usage, fallbackBudget);
-  const percentage = contextUsagePercent(usage, fallbackBudget);
-  const visualRatio = normalized.available ? Math.min(1, Math.max(0, normalized.used / normalized.budget)) : 0;
+export function ContextRing({ usage, language, translate }: ContextRingProps) {
+  const normalized = normalizedContextUsage(usage);
+  const percentage = contextUsagePercent(usage);
+  const visualRatio = normalized.available && normalized.budget > 0 ? Math.min(1, Math.max(0, normalized.used / normalized.budget)) : 0;
   const radius = 12;
   const circumference = 2 * Math.PI * radius;
-  const detail = `${percentage}% · ${formatTokens(normalized.used, language)} / ${formatTokens(normalized.budget, language)} ${translate("contextTokens")}${normalized.available ? "" : ` · ${translate("contextNotStarted")}`}`;
+  const budgetLabel = normalized.budget > 0 ? `${formatTokens(normalized.used, language)} / ${formatTokens(normalized.budget, language)} ${translate("contextTokens")}` : translate("unavailable");
+  const detail = `${percentage}% · ${budgetLabel}${normalized.available ? "" : ` · ${translate("contextNotStarted")}`}`;
   const label = `${translate("contextUsage")}: ${detail}`;
   const tone = normalized.available && percentage >= 100 ? "is-critical" : normalized.available && percentage >= 80 ? "is-warning" : "";
   return (
-    <div className={`context-ring ${tone}`} role="img" aria-label={label} title={label} data-used={normalized.used} data-budget={normalized.budget} data-available={normalized.available} data-percent={percentage}>
+    <div className={`context-ring ${tone}`} role="img" aria-label={label} title={label} data-used={normalized.used} data-budget={normalized.budget} data-available={normalized.available} data-measurement={normalized.measurement} data-source={normalized.source} data-percent={percentage}>
       <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
         <circle className="context-ring__track" cx="16" cy="16" r={radius} />
         <circle className="context-ring__progress" cx="16" cy="16" r={radius} strokeDasharray={circumference} strokeDashoffset={circumference * (1 - visualRatio)} />
@@ -96,7 +95,7 @@ export function ContextRing({ usage, language, translate, fallbackBudget = DEFAU
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "composerText" | "activeTurn" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "currentModelRef" | "configuration">;
+  state: Pick<RendererState, "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration">;
   onChange: (text: string) => void;
   onSubmit: (text: string) => void | Promise<void>;
   onCommand: (text: string) => void | Promise<void>;
@@ -111,24 +110,38 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   const composing = useRef(false);
   const [completionOpen, setCompletionOpen] = useState(true);
   const [activeCompletion, setActiveCompletion] = useState(-1);
+  const completionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const hasText = state.composerText.trim().length > 0;
   const slashMode = state.composerText.trimStart().startsWith("/");
   const pending = state.pendingInteraction !== null;
+  const terminalStatusPending = state.terminalStatusPending;
+  const compactionRunning = state.compactionStatus.state === "running";
+  const inputLocked = pending || terminalStatusPending || compactionRunning;
+  const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
-    if (pending || !slashMode) return [];
+    if (pending || terminalStatusPending || !slashMode) return [];
     if (state.argumentCandidates.length > 0) return state.argumentCandidates.map((value) => ({ value, display: value }));
-    return state.commandCandidates.map((candidate) => ({
-      value: candidate.value,
-      display: candidate.display,
-      description: candidate.description,
-    }));
-  }, [pending, slashMode, state.argumentCandidates, state.commandCandidates]);
+    return state.commandCandidates
+      .filter((candidate) => {
+        const value = (candidate.canonical || candidate.value || "").trim().split(/\s+/u)[0];
+        return !hiddenCommands.has(value.startsWith("/") ? value : `/${value}`);
+      })
+      .map((candidate) => ({
+        value: candidate.value,
+        display: candidate.display,
+        description: candidate.description,
+      }));
+  }, [pending, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
   const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.display ?? ""}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
 
   useEffect(() => {
     setActiveCompletion(edgeCompletionIndex(candidates, false));
     setCompletionOpen(candidates.length > 0);
   }, [candidateSignature]); // candidateSignature avoids resetting keyboard focus on unrelated rerenders.
+
+  useEffect(() => {
+    if (completionOpen && activeCompletion >= 0) completionOptionRefs.current[activeCompletion]?.scrollIntoView?.({ block: "nearest" });
+  }, [activeCompletion, completionOpen]);
 
   useLayoutEffect(() => {
     const element = composerRef.current;
@@ -148,7 +161,6 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
     const refs = new Set<string>();
     if (state.currentModelRef) refs.add(state.currentModelRef);
     for (const model of state.modelCandidates) if (model.trim()) refs.add(model);
-    for (const modelRef of Object.keys(state.configuration?.models ?? {})) refs.add(modelRef);
     return [
       { value: "", label: t("chooseModel"), disabled: true },
       ...[...refs].map((modelRef) => ({ value: modelRef, label: modelDisplayName(state.configuration, modelRef) })),
@@ -156,7 +168,7 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   }, [language, state.configuration, state.currentModelRef, state.modelCandidates]);
 
   const submit = () => {
-    if (pending || !hasText) return;
+    if (inputLocked || !hasText) return;
     void onSubmit(state.composerText);
   };
 
@@ -210,30 +222,29 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   };
 
   return (
-    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={pending || undefined}>
+    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined}>
       {completionOpen && candidates.length > 0 && <div className="command-menu" role="listbox" aria-label={t("commandCompletion")}>
-        {candidates.map((candidate, index) => <button type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display || candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
+        {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display || candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
       <div className="composer-input">
-        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={pending ? t("completeInteraction") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={pending} rows={3} aria-label={t("message")} />
+        <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} />
         <div className="composer-actions">
-          {state.activeTurn && !pending && <button type="button" title={t("pause")} onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}>{t("pause")}</button>}
-          {state.activeTurn && <button type="button" title={t("cancel")} onClick={() => void onCancel()}>{t("cancel")}</button>}
-          <button type="button" title={pending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={pending || !hasText}>{pending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+          {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
+          {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()}><UiIcon name="stop" />{t("cancel")}</button>}
+          <button type="button" title={pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} aria-label={pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
         </div>
       </div>
       <div className="composer-toolbar">
         <div className="composer-selectors">
-          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={pending || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
+          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={pending || terminalStatusPending || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
-        <output className="composer-state">{pending ? t("interactionRequired") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
+        <output className="composer-state">{pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
         <div className="composer-model">
-          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={pending || state.activeTurn} options={modelOptions} />
-          <ContextRing usage={state.contextUsage} language={language} fallbackBudget={configuredContextWindow(state.configuration, state.currentModelRef)} translate={(key) => t(key)} />
+          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={pending || terminalStatusPending || state.activeTurn} options={modelOptions} />
+          <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />
         </div>
       </div>
-      <p className="composer-hint">{t("composerHint")}</p>
     </section>
   );
 }
