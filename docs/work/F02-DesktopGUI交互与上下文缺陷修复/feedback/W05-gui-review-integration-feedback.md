@@ -204,3 +204,37 @@ Reviewer 未批准上一轮，指出两个 W05 范围 P1：Bridge 的通用 `_sa
 - `conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）重跑：141 passed、0 failed、0 skipped、exit 0（包含正式 `build:runtime` smoke 与 windows packaging）。第一次全量仅有既有同步时序测试瞬态失败，重跑稳定通过。
 - 本轮静态边界：生产 Bridge 无 `_EVENT_FIELDS`、`_public_*`、`_safe_value`、`_message`、`_task_state`、`_input_request`、`_permission_request`、`_plan_request`、`_pause` 或重复 enum 集合命中；Architecture 23/23 通过。
 - 仍未执行 Git commit、push、merge、rebase、tag、release 或归档；T09 真实 dev shell 与 T10 人工窗口验收仍按 Checklist 保持未勾选，剩余仅为既有 P3/环境矩阵风险。
+
+## 返工轮次四：W06复审 P1 错误投影修复（2026-09-01）
+
+### 复审 finding、范围与处置
+
+W06 packaged 中文截图暴露了 W05 范围的 UI 错误投影缺陷：Renderer 直接读取拒绝对象的 `message`，因此 `RuntimeRequestError`、Electron IPC method、native rejection、EPERM 和路径细节可能进入产品页面。该缺陷位于 Renderer 的错误呈现边界；本轮只修复 W05 的 App/locale/Renderer 回归，不修改 W06 Feedback/Checklist、W01～W04 Feedback 或冻结的 Main/Preload/Python runtime、CDP、T10、current-facts。
+
+### P1-UI-ERR-01 关闭：稳定安全的本地化错误 fallback
+
+- `desktop/src/renderer/App.tsx` 的 `safeErrorMessage` 不再读取 `Error.message`、嵌套 `error.message` 或任何拒绝对象字段；所有 Runtime、settings、Session、command、Explorer、project picker、interaction 和 Session mutation catch 都只使用调用点提供的 Renderer 本地化 fallback。Transport/Main 可以保留内部错误供非 UI 诊断，但不能把它提升为产品文案。
+- Desktop preference 写入失败现在也只通过 `preferencesUnavailable` 的本地化 notice 呈现；EPERM、native rejection、IPC channel/method、class name 和路径不进入 UI。`settings.get` 未初始化使用可操作的 `configUnavailable`；`settings.save` 使用检查文件权限并重试的提示；bundled Runtime/sandbox 启动失败使用检查内置 Runtime 后重试的提示。
+- `desktop/src/renderer/locales/en.ts` 与 `zh-CN.ts` 为项目打开、Runtime 启动、偏好、项目/Session 操作、配置加载和保存失败补齐稳定的英文/中文可操作文案；未知 rejection 统一回退到对应业务文案，不显示异常原文。
+- `desktop/tests/renderer.test.tsx` 新增 zh/en UI 投影回归，覆盖 `settings.get`/user config not initialized、`preference.write`/EPERM、`settings.save`/native rejection、bundled Runtime/sandbox failure、未知 rejection，并断言截图中的 `RuntimeRequestError`、method、EPERM、native message、路径和 bundle detail 均不出现在 DOM；受影响的 Settings Save 既有测试同步改为验证安全 fallback。
+
+### 唯一生产链与边界
+
+- 复核链为 `Renderer → DesktopApi → 既有 Main/Preload transport → DesktopBridge → Application → Core`。本轮确认 Main/Preload/Runtime transport 的内部错误类型仍只在 IPC rejection/非 UI 边界存在，生产 Renderer 现在在所有 UI catch 处收口；既有 Bridge/Application 安全响应及 sentinel 回归保持有效，因此没有为同一问题新增第二套 transport 或 Bridge schema。
+- 本轮未修改 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts`、CDP scripts、T10 工作包、current-facts、W06 Feedback 或 Checklist；未发现需要停止并重新派发 W01～W04 原 Prompt 的产品缺陷。未执行任何 Git 写操作。
+
+### 本轮精确验证
+
+- `conda run --no-capture-output -n re-uthcode npx tsx --test tests/renderer.test.tsx`（cwd=`desktop`）：106 passed、0 failed、exit 0。
+- `conda run --no-capture-output -n re-uthcode npm run typecheck`（cwd=`desktop`）：exit 0。
+- `conda run --no-capture-output -n re-uthcode npm test`（cwd=`desktop`）：145 passed、0 failed、0 skipped、exit 0；包含正式 `build:runtime` smoke、Windows packaging、Runtime transport、Renderer 和 CDP isolation。
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q`：1447 passed、3 skipped、0 failed，exit 0（265.96s）。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：exit 0；`conda run --no-capture-output -n re-uthcode python -m pip check`：exit 0，`No broken requirements found.`
+- Renderer 错误读取扫描：`rg -n "error\\.message|source\\.message|source\\.error\\?\\.message|String\\(error|error as \\{ message" desktop/src/renderer desktop/src/desktop-api.ts`：无匹配。`safeErrorMessage` 仅返回已本地化 fallback。
+- 冻结边界扫描：`git diff --name-only -- desktop/src/main.ts desktop/src/preload.ts desktop/src/python-runtime.ts` 与 `git diff --name-only -- docs/work/T10-DesktopGUI与TUI全量能力迁移` 均为空；`git diff --check` 无 whitespace error（仅既有 LF/CRLF 转换提示）。
+
+### Checklist、未关闭风险与 UTF-8
+
+- 本轮未修改 Checklist 的文字、结构、编号或 W06 部分；本轮新增证据只记录在本 Feedback。W05 新 P1 已关闭，未将真实 packaged 人工截图、DPI/zoom、Provider、键鼠/IME 或其它 T10/W06 acceptance 伪记为通过。
+- 仍未执行真实 Electron dev/packaged 人工矩阵；这些属于 T10/W06 的验收边界，不影响本轮 Renderer 错误投影自动回归。内部诊断不会由本轮新增到 UI。
+- 本轮 EOF 追加后执行 `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F02-DesktopGUI交互与上下文缺陷修复/feedback/W05-gui-review-integration-feedback.md" "docs/work/F02-DesktopGUI交互与上下文缺陷修复/F02-DesktopGUI交互与上下文缺陷修复-checklist.md"`：`OK: 2 file(s) passed UTF-8 guard`。

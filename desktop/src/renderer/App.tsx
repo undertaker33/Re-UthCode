@@ -59,12 +59,16 @@ function eventMatchesIdentity(event: AgentEvent, identity: { runId: string; turn
   return current.runId === identity.runId && current.turnId === identity.turnId;
 }
 
-function errorMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === "object") {
-    const source = error as { message?: unknown; error?: { message?: unknown } };
-    if (typeof source.error?.message === "string") return source.error.message;
-    if (typeof source.message === "string") return source.message;
-  }
+/**
+ * Project every failed Desktop call to a renderer-owned localized message.
+ *
+ * Main/transport errors deliberately retain their internal kind and message
+ * for diagnostics, and a RuntimeRequestError may include an IPC method,
+ * native exception class, or filesystem detail.  None of those values are a
+ * renderer contract.  Call sites already provide the action-specific,
+ * localized fallback, so an unknown failure must never be promoted to UI.
+ */
+export function safeErrorMessage(_error: unknown, fallback: string): string {
   return fallback;
 }
 
@@ -296,11 +300,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     if (!api) return;
     try {
       await api.writePreference(key as never, value as never);
-    } catch {
+    } catch (error) {
       // Desktop metadata is advisory; a temporary preference failure must not
-      // replace the Application's authoritative state.
+      // replace the Application's authoritative state.  It may still be
+      // actionable for the user, but only through the localized renderer
+      // fallback; native EPERM/path details stay outside the UI boundary.
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("preferencesUnavailable")) });
     }
-  }, [api]);
+  }, [api, t]);
 
   const waitForRuntimeLifecycleIdle = useCallback(async (): Promise<boolean> => {
     while (mountedRef.current) {
@@ -355,7 +362,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "catalog_refreshed", projectKey, sessions, reason, focusSessionId });
       return true;
     } catch (error) {
-      if ((!isOwned || isOwned()) && reportFailure) dispatch({ type: "notice", text: errorMessage(error, t("sessionCatalogUnavailable")) });
+      if ((!isOwned || isOwned()) && reportFailure) dispatch({ type: "notice", text: safeErrorMessage(error, t("sessionCatalogUnavailable")) });
       return false;
     }
   }, [send, t, waitForRuntimeLifecycleIdle]);
@@ -566,7 +573,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await persist("recentProjects", projectPreferences(projects));
       await persist("selectedProjectKey", path);
       if (!isOwned()) return;
-      dispatch({ type: "runtime_error", message: errorMessage(error, t("projectOpenFailed")), state: "configuration_required" });
+      dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("projectOpenFailed")), state: "configuration_required" });
       dispatch({ type: "set_view", view: "settings" });
     });
   }, [api, enqueueRuntimeOperation, persist, refreshCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
@@ -624,13 +631,13 @@ export function App({ api: explicitApi, initialState }: AppProps) {
             await refreshRuntimeStatus(isOwned);
           }
         }, (error, isOwned) => {
-          if (!cancelled && isOwned()) dispatch({ type: "runtime_error", message: errorMessage(error, t("runtimeStartFailed")), state: "configuration_required" });
+          if (!cancelled && isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("runtimeStartFailed")), state: "configuration_required" });
         });
       } else {
         dispatch({ type: "runtime_state", state: "ready" });
       }
     }).catch((error) => {
-      if (!cancelled) dispatch({ type: "runtime_error", message: errorMessage(error, t("preferencesUnavailable")), state: "ready" });
+      if (!cancelled) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("preferencesUnavailable")), state: "ready" });
     });
     return () => {
       cancelled = true;
@@ -646,7 +653,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const path = await api.openProject();
       if (path) await openProjectPath(path);
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("projectPickerUnavailable")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("projectPickerUnavailable")) });
     }
   }, [api, openProjectPath]);
 
@@ -726,7 +733,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await refreshCatalog(project.projectKey, sessionId ? "session_resume" : "session_new", sessionId || undefined, true, isOwned);
       await refreshRuntimeStatus(isOwned);
     }, (error, isOwned) => {
-      if (isOwned()) dispatch({ type: "runtime_error", message: errorMessage(error, t("sessionOpenFailed")), state: "ready" });
+      if (isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("sessionOpenFailed")), state: "ready" });
     });
   }, [api, closeActiveTurn, enqueueRuntimeOperation, persist, refreshCatalog, refreshRuntimeStatus, send, t]);
 
@@ -777,7 +784,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await api.closeShell();
       }
     } catch (error) {
-      if (isCurrent()) dispatch({ type: "notice", text: errorMessage(error, t("commandFailed")) });
+      if (isCurrent()) dispatch({ type: "notice", text: safeErrorMessage(error, t("commandFailed")) });
     } finally {
       commandInFlightRef.current = false;
     }
@@ -825,7 +832,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     } catch (error) {
       if (!mountedRef.current || (pendingStart && pendingTurnStartRef.current !== pendingStart)) return;
       if (pendingStart) pendingTurnStartRef.current = null;
-      dispatch({ type: "notice", text: errorMessage(error, t("turnStartFailed")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("turnStartFailed")) });
     }
   }, [api, cancelTerminalStatusPoll, executeCommand, processAgentEvent, send, t, waitForRuntimeUserAccess]);
 
@@ -857,7 +864,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await send("turn.resume", { response });
     } catch (error) {
       dispatch({ type: "interaction_submitting", value: false });
-      dispatch({ type: "notice", text: errorMessage(error, t("interactionSubmitFailed")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("interactionSubmitFailed")) });
     } finally {
       if (interactionSubmitRef.current === pending.pauseId) interactionSubmitRef.current = null;
     }
@@ -874,7 +881,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       await send("turn.cancel", {});
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("turnCancelFailed")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("turnCancelFailed")) });
     } finally {
       cancelInFlightRef.current = false;
     }
@@ -887,7 +894,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       await send("turn.pause", {});
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("turnPauseFailed")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("turnPauseFailed")) });
     }
   }, [api, send, waitForRuntimeUserAccess]);
 
@@ -985,7 +992,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     } catch (error) {
       await reconcileSessionMutation(project.projectKey, sequence);
       if (mountedRef.current && sessionMutationInFlightRef.current === sequence) {
-        dispatch({ type: "notice", text: errorMessage(error, t("sessionRenameFailed")) });
+        dispatch({ type: "notice", text: safeErrorMessage(error, t("sessionRenameFailed")) });
       }
     } finally {
       endSessionMutation(sequence);
@@ -1029,7 +1036,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     } catch (error) {
       await reconcileSessionMutation(project.projectKey, sequence);
       if (mountedRef.current && sessionMutationInFlightRef.current === sequence) {
-        dispatch({ type: "notice", text: errorMessage(error, t("sessionMoveFailed")) });
+        dispatch({ type: "notice", text: safeErrorMessage(error, t("sessionMoveFailed")) });
       }
     } finally {
       endSessionMutation(sequence);
@@ -1042,7 +1049,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await api.copySessionId(session.session_id);
       dispatch({ type: "notice", text: t("copiedSessionId") });
     } catch (error) {
-      dispatch({ type: "notice", text: errorMessage(error, t("copySessionIdFailed")) });
+      dispatch({ type: "notice", text: safeErrorMessage(error, t("copySessionIdFailed")) });
     }
   }, [api]);
 
@@ -1092,13 +1099,13 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await persist("selectedSessionId", null);
       }
     }, (error, isOwned) => {
-      if (isOwned()) dispatch({ type: "runtime_error", message: errorMessage(error, t("projectRemoveFailed")), state: "ready" });
+      if (isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("projectRemoveFailed")), state: "ready" });
     }, removal.replacement ? "ready" : "stopped");
   }, [closeActiveTurn, enqueueRuntimeOperation, persist, refreshCatalog, send, t]);
 
   const openExplorer = useCallback((project: ProjectState) => {
     if (!api) return;
-    void api.openProjectInExplorer(project.path).catch((error) => dispatch({ type: "notice", text: errorMessage(error, t("explorerOpenFailed")) }));
+    void api.openProjectInExplorer(project.path).catch((error) => dispatch({ type: "notice", text: safeErrorMessage(error, t("explorerOpenFailed")) }));
   }, [api]);
 
   const loadSettings = useCallback(async () => {
@@ -1112,7 +1119,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const result = asObject(await send("settings.get", {}));
       dispatch({ type: "settings_loaded", configuration: (asObject(result.configuration) as ConfigurationView) });
     } catch (error) {
-      dispatch({ type: "settings_error", message: errorMessage(error, t("configUnavailable")) });
+      dispatch({ type: "settings_error", message: safeErrorMessage(error, t("configUnavailable")) });
     }
   }, [api, send, waitForRuntimeLifecycleIdle]);
 
@@ -1207,7 +1214,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await durable;
     } catch (error) {
       if (mountedRef.current && !(error instanceof RuntimeOperationCancelled)) {
-        dispatch({ type: "settings_error", message: errorMessage(error, t("settingsSaveFailed")) });
+        dispatch({ type: "settings_error", message: safeErrorMessage(error, t("settingsSaveFailed")) });
       }
       throw error;
     } finally {
