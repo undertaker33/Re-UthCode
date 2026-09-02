@@ -24,6 +24,9 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
 - `[FACT]` `PlanContentDelta` 是公开的、按 Run/Turn/iteration/tool-call identity 归属的自然语言增量事件；Renderer 只消费解码后的 text，随后由 `PlanProposed` 封口并进入 typed Plan Review，不接触 Provider raw JSON 或 `arguments_delta`。
 - `[FACT]` Application `status()` 提供安全的 `context_status` 与 `compaction_status` 投影；Context ring、Runtime panel 和 Compact 状态只消费这些 Application 事实，不在 Interface 维护第二份 Context/Compaction authority。
+- `[FACT]` 流式 Desktop Event 到达时，Bridge 只把 assistant/reasoning/plan 文本、Task 状态或工具完成摘要交给 Application 记录有界 `live_delta` 估计；Provider 明确 usage 随后可以覆盖为 exact。Renderer 对 live Context/Compact 的缓存和短周期 `status.get` 轮询只用于显示，不改变 Context authority。
+- `[FACT]` Session metadata 的可选 `model_ref` 是持久 Session 事实。模型选择会以同一 Application 边界提交用户级新建默认模型、active Session 模型和 Context；恢复 Session 先预检并只恢复其模型，不倒写用户默认值。
+- `[FACT]` Desktop Renderer 以 `project_key + session_id` 缓存每个 Session 的 timeline、Todo、Run、interaction、Context/Compact 和终态投影，支持后台 Turn 事件在不可见时继续更新。该缓存仅是 Interface state，Session Transcript/Timeline/metadata 仍是唯一持久语义来源。
 - `[BOUNDARY]` Session v3 持久化 metadata（schema 3）、Transcript、Timeline、Tool Result ref、writer lock 和 Instruction State；record envelope 仍为 schema 2。v1/v2 明确 incompatible，不迁移、不双读；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## 权威源码索引
@@ -52,6 +55,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 | committed Transcript | active `ApplicationSession` / `SessionWriter` | request preparation、complete tool batch 和 terminal tail 边界追加；resume 读取当前 Session | `ApplicationSession.transcript`、Context Compiler、HistoryRead |
 | committed Timeline | active `ApplicationSession` / `SessionWriter` | L4/L5 合法 candidate 先写派生 record、最后写 checkpoint；物理记录 append-only，logical view 按最新有效 checkpoint 计算 | Context Compiler、Context diagnostics |
 | Instruction State metadata | `InstructionLoader` + Session metadata | Session create/resume/terminal close 边界 | epoch/fingerprint/reason diagnostics |
+| Session `model_ref` | active `ApplicationSession` / `SessionWriter` | create 时采用用户新建默认值；在 Session 内模型切换时更新；resume 时预检后恢复 | catalog、Session/Bridge 安全投影 |
 | iteration/tool count/usage/status | `RunState` | 当前 Turn；新 Turn 重置 | `RunSnapshot`, `TurnResult` |
 | behavior mode | `RunState` / `AgentRun` idle selection | 当前 Turn；批准 Plan 后切回 DEFAULT，下一 Turn 继承最终 mode | `BehaviorModeChanged`, `Run.behavior_mode` |
 | PlanState / TaskState | `RunState` | 当前 Turn；Plan revision/approval 与 Todo replace-all | `PlanProposed`, `TaskStateChanged`, prompt facts |
@@ -149,6 +153,7 @@ implemented context:
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
   Plan stream                = PlanContentDelta text projection -> PlanProposed -> typed Plan Review
   Status projection          = Application context_status + compaction_status
+  Desktop live display       = Bridge live_delta estimate + Renderer per-Session cache; no authority
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
 not implemented context:

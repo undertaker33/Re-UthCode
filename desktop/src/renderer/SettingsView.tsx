@@ -3,6 +3,7 @@ import type { LanguagePreference, ThemePreference } from "../desktop-api";
 import type { ConfigurationView, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation } from "./i18n";
+import { UiIcon } from "./UiIcon";
 
 export interface SettingsViewProps {
   state: Pick<RendererState, "configuration" | "settingsError" | "settingsSaving" | "settingsLoaded" | "activeTurn" | "runtimeError" | "runtimeState" | "theme" | "language">;
@@ -164,6 +165,7 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [editingModel, setEditingModel] = useState<{ providerId: string; modelRef: string } | null>(null);
   const [providerDeletePending, setProviderDeletePending] = useState(false);
+  const [activeCategory, setActiveCategory] = useState<"providers" | "defaults" | "interface" | "about">("providers");
   const [modelSnapshot, setModelSnapshot] = useState<ModelEditorSnapshot | null>(null);
   const providerModalClose = useRef<HTMLButtonElement>(null);
   const modelModalClose = useRef<HTMLButtonElement>(null);
@@ -514,15 +516,17 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
       <aside ref={settingsNav} className="settings-nav" aria-label={t("settings")}>
         <button type="button" className="settings-view__back" title={t("back")} onClick={onBackWithCleanup} disabled={settingsBusy}>← {t("back")}</button>
         <div><p className="eyebrow">UthCode Desktop</p><h1>{t("settings")}</h1></div>
-        <nav aria-label={t("settingsCategories")}><a href="#settings-providers">{t("providers")}</a><a href="#settings-defaults">{t("defaults")}</a><a href="#settings-interface">{t("interface")}</a><a href="#settings-about">{t("about")}</a></nav>
+        <nav aria-label={t("settingsCategories")}>
+          {(["providers", "defaults", "interface", "about"] as const).map((category) => <a key={category} className={activeCategory === category ? "is-active" : ""} href={`#settings-${category}`} onClick={(event) => { event.preventDefault(); setActiveCategory(category); settingsContent.current?.scrollTo({ top: 0, behavior: "smooth" }); }}>{t(category)}</a>)}
+        </nav>
       </aside>
       <div ref={settingsContent} className="settings-content" aria-disabled={settingsBusy}>
-        <header><div><p className="eyebrow">UthCode Desktop</p><h1>{t("settings")}</h1><p>{t("settingsDescription")}</p></div></header>
+        <header><div><p className="eyebrow">UthCode Desktop</p><h1>{t("settings")}</h1></div></header>
         {state.settingsError && <p className="settings-view__error" role="alert">{state.settingsError}</p>}
         {settingsBusy && <p ref={settingsBusyStatus} id="settings-busy-status" className="settings-view__busy-status" role="status" aria-live="polite" tabIndex={-1}>{t("settingsSaving")}</p>}
         {state.runtimeState === "restarting" && <p className="settings-view__runtime-status" role="status">{t("runtimeRestarting")}</p>}
         {state.runtimeError && <p className="settings-view__runtime-error" role="alert">{state.runtimeError}</p>}
-        <section className="settings-section" id="settings-providers" aria-labelledby="settings-providers-title">
+        <section className={`settings-section${activeCategory === "providers" ? "" : " settings-section--inactive"}`} id="settings-providers" aria-labelledby="settings-providers-title" aria-hidden={activeCategory !== "providers" || undefined}>
           <div className="settings-section__heading"><div><p className="eyebrow">01</p><h2 id="settings-providers-title">{t("providers")}</h2></div><button type="button" className="row-add row-add--inline" title={t("addProvider")} onClick={addProvider} disabled={settingsBusy}>＋ {t("addProvider")}</button></div>
           {providers.length > 0 ? <div className="provider-list">{providers.map(([id, profile]) => {
             const linked = modelsFor(id);
@@ -532,19 +536,19 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
               <span><strong>{id}</strong><small>{t("protocol")} · {stringValue(profile.kind, "openai_compat")}</small></span>
               <span><small>{t("baseUrl")}</small>{stringValue(profile.base_url, "—") || "—"}</span>
               <span><small>{t("model")}</small>{label}{linked.length > 1 ? ` +${linked.length - 1}` : ""}</span>
-              <span className={profile.api_key_configured === true ? "has-api-key" : ""} aria-label={profile.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")} aria-hidden="false">{profile.api_key_configured === true ? "●" : "○"}</span>
+              <span className={`provider-key-state${profile.api_key_configured === true ? " has-api-key" : ""}`} aria-label={profile.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}><UiIcon name={profile.api_key_configured === true ? "check" : "warning"} /><small>{profile.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}</small></span>
             </button>;
           })}</div> : <div className="settings-empty" role="status"><strong>{t("noProviders")}</strong><p>{t("emptySettings")}</p></div>}
         </section>
-        <section className="settings-section" id="settings-defaults" aria-labelledby="settings-defaults-title"><div className="settings-section__heading"><div><p className="eyebrow">02</p><h2 id="settings-defaults-title">{t("defaults")}</h2></div></div>
+        <section className={`settings-section${activeCategory === "defaults" ? "" : " settings-section--inactive"}`} id="settings-defaults" aria-labelledby="settings-defaults-title" aria-hidden={activeCategory !== "defaults" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">02</p><h2 id="settings-defaults-title">{t("defaults")}</h2></div></div>
           <div className="settings-row"><span className="settings-row__label">{t("permission")}</span><CustomSelect label={t("permission")} value={draft.default_permission_mode ?? "default"} options={[{ value: "default", label: t("default") }, { value: "auto", label: t("auto") }]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_permission_mode: value === "auto" ? "auto" : "default" })); }} disabled={settingsBusy} /></div>
           <div className="settings-row"><span className="settings-row__label">{t("defaultModel")}</span><CustomSelect label={t("defaultModel")} value={draft.default_model ?? ""} options={[{ value: "", label: "—" }, ...models.map(([ref, model]) => ({ value: ref, label: modelLabel(model, t("unnamedModel")) }))]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_model: value })); }} disabled={settingsBusy} /></div>
         </section>
-        <section className="settings-section" id="settings-interface" aria-labelledby="settings-interface-title"><div className="settings-section__heading"><div><p className="eyebrow">03</p><h2 id="settings-interface-title">{t("interface")}</h2></div></div>
+        <section className={`settings-section${activeCategory === "interface" ? "" : " settings-section--inactive"}`} id="settings-interface" aria-labelledby="settings-interface-title" aria-hidden={activeCategory !== "interface" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">03</p><h2 id="settings-interface-title">{t("interface")}</h2></div></div>
           <div className="settings-row"><span className="settings-row__label">{t("theme")}</span><CustomSelect label={t("theme")} value={state.theme} options={[{ value: "system", label: t("system") }, { value: "dark", label: t("dark") }, { value: "light", label: t("light") }]} onChange={(value) => { if (!settingsInteractionLocked()) onThemeChange(value as ThemePreference); }} disabled={settingsBusy} /></div>
           <div className="settings-row"><span className="settings-row__label">{t("language")}</span><CustomSelect label={t("language")} value={state.language} options={[{ value: "zh-CN", label: t("chinese") }, { value: "en", label: t("english") }]} onChange={(value) => { if (!settingsInteractionLocked()) onLanguageChange(value as LanguagePreference); }} disabled={settingsBusy} /></div>
         </section>
-        <section className="settings-section" id="settings-about" aria-labelledby="settings-about-title"><div className="settings-section__heading"><div><p className="eyebrow">04</p><h2 id="settings-about-title">{t("about")}</h2></div></div><div className="settings-row"><span className="settings-row__label">{t("product")}</span><span className="settings-row__value">UthCode Desktop</span></div></section>
+        <section className={`settings-section${activeCategory === "about" ? "" : " settings-section--inactive"}`} id="settings-about" aria-labelledby="settings-about-title" aria-hidden={activeCategory !== "about" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">04</p><h2 id="settings-about-title">{t("about")}</h2></div></div><div className="settings-row"><span className="settings-row__label">{t("product")}</span><span className="settings-row__value">UthCode Desktop</span></div></section>
         <div className="settings-actions"><button type="button" title={t("cancel")} onClick={onBackWithCleanup} disabled={settingsBusy}>{t("cancel")}</button><button ref={saveButton} type="button" className="save-button" title={t("save")} onClick={() => void save()} disabled={settingsBusy || state.activeTurn}>{t("save")}</button></div>
       </div>
 
@@ -556,14 +560,14 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
             <div className="settings-row"><label htmlFor="modal-base-url">{t("baseUrl")}</label><input id="modal-base-url" value={stringValue(edited.base_url)} onChange={(event) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, providers: updateRecord(current.providers, editingProvider, "base_url", event.target.value || null) })); }} disabled={settingsBusy} /></div>
             <div className="settings-row settings-row--secret"><label htmlFor="modal-api-key">{t("apiKey")}</label><div>
               <div className="api-key-control"><input id="modal-api-key" type={visibleKeys[editingProvider] ? "text" : "password"} autoComplete="new-password" placeholder={edited.api_key_configured === true ? t("replaceKey") : t("enterKey")} value={touchedKeys[editingProvider] ? replacementKeys[editingProvider] ?? "" : visibleKeys[editingProvider] ? revealedKeys[editingProvider] ?? "" : ""} onChange={(event) => { if (settingsInteractionLocked()) return; setReplacementKeys((current) => ({ ...current, [editingProvider]: event.target.value })); setTouchedKeys((current) => ({ ...current, [editingProvider]: true })); setRevealError((current) => withoutRecordKey(current, editingProvider)); }} aria-describedby="modal-api-key-help" disabled={settingsBusy} />
-                <button type="button" className="api-key-toggle" title={visibleKeys[editingProvider] ? t("hideApiKey") : t("showApiKey")} aria-label={visibleKeys[editingProvider] ? t("hideApiKey") : t("showApiKey")} aria-pressed={visibleKeys[editingProvider] === true} disabled={settingsBusy || edited.api_key_configured !== true || revealPending[editingProvider] === true} onClick={() => void revealApiKey(editingProvider)}><span aria-hidden="true">{visibleKeys[editingProvider] ? "◉" : "◌"}</span></button>
+                <button type="button" className="api-key-toggle" title={visibleKeys[editingProvider] ? t("hideApiKey") : t("showApiKey")} aria-label={visibleKeys[editingProvider] ? t("hideApiKey") : t("showApiKey")} aria-pressed={visibleKeys[editingProvider] === true} disabled={settingsBusy || edited.api_key_configured !== true || revealPending[editingProvider] === true} onClick={() => void revealApiKey(editingProvider)}><UiIcon name={visibleKeys[editingProvider] ? "eye-off" : "eye"} /></button>
               </div>
-              <p id="modal-api-key-help" className="settings-row__hint">{edited.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}</p>
+              <p id="modal-api-key-help" className="sr-only">{edited.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}</p>
               {revealPending[editingProvider] && <p className="settings-row__hint" role="status">{t("revealingApiKey")}</p>}
               {revealError[editingProvider] && <p className="settings-row__hint settings-row__hint--error" role="alert">{t("revealKeyFailed")}</p>}
             </div></div>
-            <section className="settings-models" aria-labelledby={`${modalTitleId}-models`}><div className="settings-subsection__heading"><div><p className="eyebrow">{t("models")}</p><h3 id={`${modalTitleId}-models`}>{t("models")}</h3></div><button type="button" title={t("addModel")} onClick={() => addModel(editingProvider)} disabled={settingsBusy}>＋ {t("addModel")}</button></div>
-              {editedModels.length > 0 ? <div className="settings-model-list">{editedModels.map(([ref, model]) => { const label = modelLabel(model, t("unnamedModel")); return <article className="settings-model-row" key={ref}><div><strong>{label}</strong><small>{modelRemoteLabel(model, t("modelNotConfigured"))}{draft.default_model === ref ? ` · ${t("defaultMarker")}` : ""}</small></div><div className="settings-model-row__actions"><button type="button" title={`${t("editModel")} ${label}`} aria-label={`${t("editModel")} ${label}`} onClick={(event) => editModel(editingProvider, ref, event.currentTarget)} disabled={settingsBusy}>{t("edit")}</button><button type="button" title={`${t("removeModel")} ${label}`} aria-label={`${t("removeModel")} ${label}`} onClick={() => removeModel(ref, editingProvider)} disabled={settingsBusy}>{t("remove")}</button></div></article>; })}</div> : <p className="settings-empty settings-empty--compact">{t("noModels")}</p>}
+            <section className="settings-models" aria-labelledby={`${modalTitleId}-models`}><div className="settings-subsection__heading"><div><p className="eyebrow">{t("models")}</p><h3 id={`${modalTitleId}-models`}>{t("models")}</h3></div><button type="button" className="icon-button" title={t("addModel")} aria-label={t("addModel")} onClick={() => addModel(editingProvider)} disabled={settingsBusy}><UiIcon name="plus" /></button></div>
+              {editedModels.length > 0 ? <div className="settings-model-list">{editedModels.map(([ref, model]) => { const label = modelLabel(model, t("unnamedModel")); return <article className="settings-model-row" key={ref}><div><strong>{label}</strong><small>{modelRemoteLabel(model, t("modelNotConfigured"))}{draft.default_model === ref ? ` · ${t("defaultMarker")}` : ""}</small></div><div className="settings-model-row__actions"><button type="button" title={`${t("editModel")} ${label}`} aria-label={`${t("editModel")} ${label}`} onClick={(event) => editModel(editingProvider, ref, event.currentTarget)} disabled={settingsBusy}><UiIcon name="edit" /></button><button type="button" title={`${t("removeModel")} ${label}`} aria-label={`${t("removeModel")} ${label}`} onClick={() => removeModel(ref, editingProvider)} disabled={settingsBusy}><UiIcon name="trash" /></button></div></article>; })}</div> : <p className="settings-empty settings-empty--compact">{t("noModels")}</p>}
             </section>
             {providerDeletePending && <div className="settings-confirm" role="alert"><p>{t("removeProviderQuestion")}</p><div><button type="button" onClick={() => { removeProvider(editingProvider); finishEditor(); }} disabled={settingsBusy}>{t("remove")}</button><button type="button" onClick={cancelProviderDelete} disabled={settingsBusy}>{t("cancel")}</button></div></div>}
           </div>

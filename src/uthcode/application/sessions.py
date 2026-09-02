@@ -160,6 +160,7 @@ class SessionCatalogEntry:
     transcript_entries: int = 0
     corrupt: bool = False
     title: str | None = None
+    model_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +230,18 @@ class ApplicationSession:
     @property
     def title(self) -> str | None:
         return self.snapshot.title
+
+    @property
+    def model_ref(self) -> str | None:
+        """Return the durable model preference for this Session."""
+
+        return self.metadata.model_ref
+
+    def persist_model_ref(self, model_ref: str | None) -> SessionMetadata:
+        """Persist a model selection while this Session writer is held."""
+
+        self._require_writable()
+        return self._writer.update_model_ref(model_ref)
 
     @property
     def snapshot(self) -> SessionSnapshot:
@@ -443,12 +456,17 @@ class ApplicationSessionService:
             "busy": bool(isinstance(last, Mapping) and last.get("kind") == "busy"),
         }
 
-    def create_session(self, session_id: str | None = None) -> ApplicationSession:
+    def create_session(
+        self,
+        session_id: str | None = None,
+        *,
+        model_ref: str | None = None,
+    ) -> ApplicationSession:
         self._require_no_active_session()
         # Keep Loader state transactional just like the command path: strict
         # include failure must not clear or partially replace the current
         # loader before a Session and its metadata are committed.
-        staged = self._stage_create_session(session_id)
+        staged = self._stage_create_session(session_id, model_ref=model_ref)
         session = self._commit_staged(staged)
         self._record_operation(
             "create",
@@ -461,11 +479,15 @@ class ApplicationSessionService:
     def create_session_for_command(
         self,
         session_id: str | None = None,
+        *,
+        model_ref: str | None = None,
     ) -> ApplicationSession:
         """Map Integration file failures to the Application command boundary."""
 
         try:
-            session = self._commit_staged(self._stage_create_session(session_id))
+            session = self._commit_staged(
+                self._stage_create_session(session_id, model_ref=model_ref)
+            )
             self._record_operation(
                 "create",
                 "success",
@@ -690,6 +712,7 @@ class ApplicationSessionService:
                         project_key=metadata.project_key,
                         last_used_at=metadata.last_used_at,
                         title=metadata.title,
+                        model_ref=metadata.model_ref,
                         preview="[Session recovery unavailable]",
                         corrupt=True,
                     )
@@ -701,6 +724,7 @@ class ApplicationSessionService:
                     project_key=metadata.project_key,
                     last_used_at=metadata.last_used_at,
                     title=metadata.title,
+                    model_ref=metadata.model_ref,
                     preview=_first_user_preview(snapshot),
                     timeline_checkpoint_id=(
                         snapshot.timeline.active_checkpoint.turn_id
@@ -714,6 +738,19 @@ class ApplicationSessionService:
 
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)
+
+    def read_session_for_command(self, session_id: str) -> SessionSnapshot:
+        """Read a Session while translating storage failures at the Application boundary."""
+
+        try:
+            active = self._active
+            if active is not None and active.session_id == session_id:
+                return active.snapshot
+            return self.read_session(session_id)
+        except SessionFileError as exc:
+            raise _session_operation_error(exc, session_id=session_id) from exc
+        except OSError as exc:
+            raise SessionOperationError("storage", session_id=session_id) from exc
 
     def project_replay(
         self,
@@ -753,7 +790,12 @@ class ApplicationSessionService:
                 f"Application Session {self._active.session_id!r} is active; close it before opening another"
             )
 
-    def _stage_create_session(self, session_id: str | None) -> _StagedSession:
+    def _stage_create_session(
+        self,
+        session_id: str | None,
+        *,
+        model_ref: str | None = None,
+    ) -> _StagedSession:
         """Prepare a new Session while leaving the current one untouched."""
 
         candidate_loader: InstructionLoader | None = None
@@ -768,6 +810,7 @@ class ApplicationSessionService:
             session_id,
             project_key=self.project_key,
             instruction_state=state,
+            model_ref=model_ref,
         )
         writer = self.store.open_writer(
             metadata.session_id,

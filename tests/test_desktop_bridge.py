@@ -38,6 +38,8 @@ from uthcode.application import (
     PermissionMode,
     PermissionModeSelected,
     ProviderResponse,
+    ProviderKind,
+    ProviderProfile,
     ProviderIdentity,
     QuestionKind,
     RetryProviderResponse,
@@ -50,6 +52,9 @@ from uthcode.application import (
     TerminationReason,
     TextDelta,
     TextPart,
+    TaskItem,
+    TaskState,
+    TaskStatus,
     UserInputRequest,
     UserInputResponse,
     UserQuestion,
@@ -57,8 +62,11 @@ from uthcode.application import (
     UthCodeApplication,
 )
 from uthcode.core.agent_events import (
+    AssistantMessageDelta,
+    TaskStateChanged,
     ToolFinished,
     TurnFailed,
+    TurnPaused,
     agent_event_from_dict as core_agent_event_from_dict,
 )
 from uthcode.core.permission import Effect, ResourceScope, RuleSet
@@ -145,6 +153,21 @@ class _FakeRun:
         return mode
 
 
+class _ProjectedRun(_FakeRun):
+    def snapshot(self) -> RunSnapshot:
+        return RunSnapshot(
+            run_id="run-project",
+            turn_id="turn-project",
+            iteration_count=0,
+            tool_call_count=0,
+            consecutive_unknown_tools=0,
+            usage=Usage(),
+            behavior_mode=BehaviorMode.DEFAULT,
+            status=RunStatus.RUNNING,
+            termination_reason=None,
+        )
+
+
 class _FakeApplication:
     def __init__(self) -> None:
         self.runs: list[_FakeRun] = []
@@ -229,6 +252,46 @@ class _SessionApplication(_FakeApplication):
             ),
         )
         return SimpleNamespace(session_id=session_id, replay=replay)
+
+
+class _BackgroundSessionApplication(_SessionApplication):
+    """Small configured stand-in that enables the bridge background path."""
+
+    def __init__(self, session_id: str = "session-1", project: Path | None = None) -> None:
+        super().__init__(session_id)
+        self.runtime_context = SimpleNamespace(workdir=project or Path("C:/fake"))
+        self.configuration = EffectiveConfig(
+            default_model="fake/ref",
+            providers={"provider": ProviderProfile("provider", ProviderKind.FAKE)},
+            models={"fake/ref": ModelProfile("fake/ref", "provider", "remote")},
+            sources=(),
+        )
+        self.session_service = SimpleNamespace(
+            active_session=SimpleNamespace(session_id=session_id, model_ref="fake/ref", replay=()),
+        )
+
+    def create_run(self) -> _ProjectedRun:
+        run = _ProjectedRun()
+        self.runs.append(run)
+        return run
+
+    def new_session_for_command(self) -> SimpleNamespace:
+        session = super().new_session_for_command()
+        self.session_service.active_session = SimpleNamespace(
+            session_id=self.session_id,
+            model_ref="fake/ref",
+            replay=(),
+        )
+        return session
+
+    def resume_session_for_command(self, session_id: str) -> SimpleNamespace:
+        session = super().resume_session_for_command(session_id)
+        self.session_service.active_session = SimpleNamespace(
+            session_id=self.session_id,
+            model_ref="fake/ref",
+            replay=session.replay,
+        )
+        return session
 
 
 class _FailingFreshRunApplication(_SessionApplication):
@@ -413,6 +476,235 @@ async def test_pending_pause_accepts_only_matching_typed_resume_and_duplicate_is
     assert duplicate.error.kind in {"stale_response", "duplicate_response"}
     assert len(handle.resume_calls) == 1
 
+
+@pytest.mark.asyncio
+async def test_background_session_events_keep_session_state_and_typed_pause_identity() -> None:
+    application = _BackgroundSessionApplication("session-a")
+    bridge = DesktopBridge(application=application)
+    gate = asyncio.Event()
+
+    class WaitingResultHandle(_EventHandle):
+        async def result(self) -> object:
+            await gate.wait()
+            return SimpleNamespace(run_id="run-1", turn_id="turn-1", status="paused")
+
+    pause = _user_input_pause()
+    handle = WaitingResultHandle(
+        AssistantMessageDelta("run-1", "turn-1", "message-1", 1, "后台输出"),
+        TaskStateChanged(
+            "run-1",
+            "turn-1",
+            1,
+            TaskState((TaskItem("后台任务", TaskStatus.IN_PROGRESS),)),
+        ),
+        TurnPaused("run-1", "turn-1", pause),
+    )
+    runtime = {
+        "application": application,
+        "run": bridge.run,
+        "handle": handle,
+        "task": None,
+        "dispatcher": bridge._dispatcher,
+        "completion": bridge._completion,
+        "closed": False,
+        "status": "running",
+        "project_key": "C:/background",
+    }
+    bridge._background_runtimes["session-a"] = runtime
+    task = asyncio.create_task(
+        bridge._consume_turn(handle, session_id="session-a", project_key="C:/background")
+    )
+    runtime["task"] = task
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if bridge._outbox:
+            break
+
+    assert runtime["status"] == "waiting"
+    assert isinstance(runtime["pending_pause"], dict)
+    events = [item.event for item in bridge.drain_outbox() if item.type == "agent_event"]
+    assert [item["type"] for item in events] == [
+        "assistant_message_delta",
+        "task_state_changed",
+        "turn_paused",
+    ]
+    assert all(item["session_id"] == "session-a" for item in events)
+    assert all(item["project_key"] == "C:/background" for item in events)
+    assert events[-1]["pause"]["pause_id"] == "pause-input"  # type: ignore[index]
+    assert runtime["task_state"] == events[1]["task_state"]
+    projected = bridge._session_state_projection(runtime)
+    assert projected["task_state"] == runtime["task_state"]
+
+    gate.set()
+    await task
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resuming_current_running_session_returns_without_waiting_for_turn_idle() -> None:
+    application = _BackgroundSessionApplication("session-current")
+    bridge = DesktopBridge(application=application)
+    gate = asyncio.Event()
+    bridge._active_handle = _FakeHandle()
+    idle_wait = asyncio.create_task(gate.wait())
+    bridge._turn_task = idle_wait
+
+    result = await asyncio.wait_for(
+        bridge._session_resume_background("session-current"),
+        timeout=0.1,
+    )
+    assert result["session_id"] == "session-current"
+    assert bridge._active_handle is not None
+    assert bridge._turn_task is idle_wait
+
+    idle_wait.cancel()
+    await asyncio.gather(idle_wait, return_exceptions=True)
+    bridge._active_handle = None
+    bridge._turn_task = None
+    await bridge.shutdown()
+
+
+def test_background_runtime_reclaims_only_completed_inactive_pairs() -> None:
+    current = _FakeApplication()
+    completed = _FakeApplication()
+    waiting = _FakeApplication()
+    bridge = DesktopBridge(application=current)
+    bridge._background_runtimes["completed"] = {
+        "application": completed,
+        "run": _FakeRun(),
+        "handle": None,
+        "task": None,
+        "status": "completed",
+        "closed": False,
+    }
+    waiting_handle = _FakeHandle()
+    bridge._background_runtimes["waiting"] = {
+        "application": waiting,
+        "run": _FakeRun(),
+        "handle": waiting_handle,
+        "task": None,
+        "status": "waiting",
+        "closed": False,
+    }
+
+    bridge._reclaim_background_runtimes()
+
+    assert "completed" not in bridge._background_runtimes
+    assert completed.close_calls == 1
+    assert "waiting" in bridge._background_runtimes
+    assert waiting.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_session_new_navigation_reclaims_an_idle_background_runtime() -> None:
+    application = _BackgroundSessionApplication("session-a")
+    candidates: list[_BackgroundSessionApplication] = []
+
+    def factory(path: Path) -> _BackgroundSessionApplication:
+        candidate = _BackgroundSessionApplication("session-new", path)
+        candidates.append(candidate)
+        return candidate
+
+    bridge = DesktopBridge(application=application, application_factory=factory)
+    bridge._background_runtimes["session-a"] = {
+        "application": application,
+        "run": bridge.run,
+        "handle": None,
+        "task": None,
+        "dispatcher": bridge._dispatcher,
+        "completion": bridge._completion,
+        "closed": False,
+        "status": "idle",
+        "project_key": "C:/background",
+    }
+
+    result = await bridge.handle_request(
+        RequestEnvelope("new-idle-navigation", "session.new", {})
+    )
+
+    assert result.ok is True
+    assert candidates
+    assert application.close_calls == 1
+    assert "session-a" not in bridge._background_runtimes
+    assert bridge.application is candidates[0]
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_resume_navigation_reclaims_an_idle_background_runtime() -> None:
+    application = _BackgroundSessionApplication("session-a")
+    target = _BackgroundSessionApplication("session-b")
+    bridge = DesktopBridge(application=application)
+    target_run = target.create_run()
+    bridge._background_runtimes["session-b"] = {
+        "application": target,
+        "run": target_run,
+        "handle": None,
+        "task": None,
+        "dispatcher": bridge._dispatcher,
+        "completion": bridge._completion,
+        "closed": False,
+        "status": "idle",
+        "project_key": "C:/background",
+    }
+
+    result = await bridge.handle_request(
+        RequestEnvelope(
+            "resume-idle-navigation",
+            "session.resume",
+            {"session_id": "session-b"},
+        )
+    )
+
+    assert result.ok is True
+    assert application.close_calls == 1
+    assert "session-a" not in bridge._background_runtimes
+    assert bridge.application is target
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cross_project_switch_parks_active_runtime_without_cancelling_it(
+    tmp_path: Path,
+) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    application = _BackgroundSessionApplication("session-a", project_a)
+    candidates: list[_BackgroundSessionApplication] = []
+
+    def factory(path: Path) -> _BackgroundSessionApplication:
+        candidate = _BackgroundSessionApplication("session-b", path)
+        candidates.append(candidate)
+        return candidate
+
+    bridge = DesktopBridge(application=application, application_factory=factory)
+    bridge._workdir = project_a
+    active_handle = _BlockingHandle()
+    bridge._active_handle = active_handle
+    turn_wait = asyncio.create_task(asyncio.Event().wait())
+    bridge._turn_task = turn_wait
+
+    result = await bridge.handle_request(
+        RequestEnvelope("project-switch", "project.open", {"path": str(project_b)})
+    )
+
+    assert result.ok is True
+    assert candidates
+    assert active_handle.cancel_calls == 0
+    assert application.close_calls == 0
+    assert bridge._active_handle is None
+    assert bridge._turn_task is None
+    parked = bridge._background_runtimes["session-a"]
+    assert parked["handle"] is active_handle
+    assert parked["task"] is turn_wait
+    assert parked["project_key"] == str(project_a)
+
+    turn_wait.cancel()
+    await asyncio.gather(turn_wait, return_exceptions=True)
+    active_handle.cancel()
+    await bridge.shutdown()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

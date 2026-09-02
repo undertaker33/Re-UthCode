@@ -1,12 +1,12 @@
 import { useEffect, useRef } from "react";
 import type { PanelModePreference } from "../desktop-api";
-import type { ContextUsageProjection, RendererState } from "./state";
+import type { ConfigurationView, ContextUsageProjection, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon } from "./UiIcon";
 
 export interface RuntimePanelProps {
-  state: Pick<RendererState, "runtimeState" | "runtimeError" | "run" | "contextUsage" | "compactionStatus" | "permissionMode" | "currentModelRef" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "completionBlocked" | "diagnostics" | "selectedProjectKey" | "selectedSessionId" | "panelMode">;
+  state: Pick<RendererState, "runtimeState" | "runtimeError" | "run" | "contextUsage" | "compactionStatus" | "permissionMode" | "currentModelRef" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "completionBlocked" | "diagnostics" | "selectedProjectKey" | "selectedSessionId" | "panelMode" | "configuration">;
   onPanelModeChange: (mode: PanelModePreference) => void;
   id?: string;
   visible?: boolean;
@@ -30,6 +30,24 @@ function usageLabel(usage: ContextUsageProjection | undefined, t: (key: Translat
 export function stateLabel(value: string, t: (key: TranslationKey) => string): string {
   const keys: Partial<Record<string, TranslationKey>> = { ready: "ready", idle: "idle", default: "default", auto: "auto", full_access: "fullAccess", booting: "booting", restarting: "restarting", initializing: "initializing", configuration_required: "configurationRequired", stopped: "stopped", running: "running", pausing: "pausing", paused: "paused", failed: "failed", completed: "completed", no_change: "noChange", cancelled: "cancelled", unknown: "unknown", plan: "plan", manual: "manual", overflow: "overflow", estimate: "estimate", exact: "exact" };
   return keys[value] ? t(keys[value]!) : value;
+}
+function modelDisplayName(configuration: ConfigurationView | null, modelRef: string | null | undefined): string {
+  const reference = modelRef?.trim();
+  if (!reference) return "";
+  const profile = configuration?.models?.[reference];
+  const display = typeof profile?.display_name === "string" ? profile.display_name.trim() : "";
+  if (display) return display;
+  const remote = typeof profile?.remote_id === "string" ? profile.remote_id.trim() : "";
+  return remote || reference;
+}
+function modelTooltip(configuration: ConfigurationView | null, modelRef: string | null | undefined): string | undefined {
+  const reference = modelRef?.trim();
+  if (!reference) return undefined;
+  const profile = configuration?.models?.[reference];
+  const display = typeof profile?.display_name === "string" ? profile.display_name.trim() : "";
+  if (display) return display;
+  const remote = typeof profile?.remote_id === "string" ? profile.remote_id.trim() : "";
+  return remote || undefined;
 }
 
 export function RuntimePanel({ state, onPanelModeChange, id = "runtime-panel", visible = state.panelMode !== "hidden", drawer = false, onClose, onRestoreToggleFocus }: RuntimePanelProps) {
@@ -88,7 +106,7 @@ export function RuntimePanel({ state, onPanelModeChange, id = "runtime-panel", v
       <dl className="runtime-facts">
         <div><dt>{t("turn")}</dt><dd>{state.terminalStatusPending ? t("terminalStatusPending") : stateLabel(state.activeTurn ? state.turnStatus : "idle", t)}</dd></div>
         <div><dt>{t("runId")}</dt><dd title={state.run?.run_id}>{state.run?.run_id ? state.run.run_id.slice(0, 8) : "—"}</dd></div>
-        <div><dt>{t("model")}</dt><dd title={state.currentModelRef ?? undefined}>{state.currentModelRef ?? "—"}</dd></div>
+        <div><dt>{t("model")}</dt><dd title={modelTooltip(state.configuration, state.currentModelRef)}>{modelDisplayName(state.configuration, state.currentModelRef) || "—"}</dd></div>
         <div><dt>{t("permission")}</dt><dd>{stateLabel(state.permissionMode, t)}</dd></div>
         <div><dt>{t("context")}</dt><dd>{usageLabel(state.contextUsage, t)}</dd></div>
         <div><dt>{t("compaction")}</dt><dd>{stateLabel(state.compactionStatus.state, t)}{state.compactionStatus.trigger ? ` · ${stateLabel(state.compactionStatus.trigger, t)}` : ""}</dd></div>

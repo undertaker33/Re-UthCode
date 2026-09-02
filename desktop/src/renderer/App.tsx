@@ -469,6 +469,26 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [send, waitForRuntimeLifecycleIdle]);
 
+  // Context and compaction are live Run facts, not just terminal summaries.
+  // Poll at a modest cadence while work is active so provider usage and the
+  // lock state stay visible even when no semantic AgentEvent is emitted.
+  useEffect(() => {
+    // Terminal convergence already owns the short active->idle polling loop.
+    // Keep this supplementary cadence for live Turns/compaction only, so a
+    // terminal event cannot race a convergence response with a second status
+    // writer.
+    if (!api || (!state.activeTurn && state.compactionStatus.state !== "running")) return undefined;
+    let cancelled = false;
+    const refresh = () => {
+      if (!cancelled) void refreshRuntimeStatus();
+    };
+    const timer = window.setInterval(refresh, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [api, refreshRuntimeStatus, state.activeTurn, state.compactionStatus.state]);
+
   const terminalStatusPollRef = useRef<TerminalStatusPoll | null>(null);
   const cancelTerminalStatusPoll = useCallback(() => {
     const current = terminalStatusPollRef.current;
@@ -519,6 +539,21 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     // replaced by the shutdown/initialization envelopes emitted by the old
     // owner (notably `stopping`/`stopped`).
     if (event.type === "runtime_state" && runtimeOwnerRef.current) return;
+    const eventSessionId = stringValue(event.session_id);
+    const eventProjectKey = stringValue(event.project_key);
+    const currentState = stateRef.current;
+    const backgroundSession = Boolean(eventSessionId && (
+      !currentState.selectedSessionId
+      || eventSessionId !== currentState.selectedSessionId
+      || Boolean(eventProjectKey && eventProjectKey !== currentState.selectedProjectKey)
+    ));
+    // A background runtime has its own Run/Turn identity.  The reducer keeps
+    // that projection in the per-session cache; it must not be filtered by the
+    // visible session's latest identity or start a visible terminal poll.
+    if (backgroundSession) {
+      dispatch({ type: "agent_event", event });
+      return;
+    }
     const { runId: eventRunId, turnId: eventTurnId } = eventIdentity(event);
     const latestMatches = () => {
       const latest = latestTurnRef.current;
@@ -781,8 +816,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const resumeSession = useCallback(async (project: ProjectState, sessionId: string) => {
     if (!api) return;
+    // Clicking the already-visible row is a presentation no-op.  In
+    // particular, never enqueue a lifecycle operation that waits for its own
+    // active Turn to become idle.
+    if (sessionId
+      && stateRef.current.selectedProjectKey === project.projectKey
+      && stateRef.current.selectedSessionId === sessionId) return;
     await enqueueRuntimeOperation("navigation", async (isOwned) => {
-      if (!(await closeActiveTurn())) throw new RuntimeOperationCancelled();
+      // The bridge keeps an independent runtime per durable Session. Project
+      // navigation also preserves the old runtime, so switching rows/projects
+      // never cancels a background Turn.
       if (!isOwned()) throw new StaleRuntimeOperation();
       if (stateRef.current.selectedProjectKey !== project.projectKey) {
         const opened = await send("project.open", { path: project.path });
@@ -793,6 +836,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (sessionId) {
         const result = await send("session.resume", { session_id: sessionId });
         if (!isOwned()) throw new StaleRuntimeOperation();
+        latestTurnRef.current = identityFromRun(asObject(result).run);
+        cancelTerminalStatusPoll();
         dispatch({ type: "session_resumed", result, preserveRuntimeState: true });
         await persist("selectedSessionId", sessionId);
       } else {
@@ -801,7 +846,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         const source = asObject(result);
         const nextId = typeof source.session_id === "string" ? source.session_id : "";
         if (nextId) {
-          dispatch({ type: "session_new", sessionId: nextId, run: source.run });
+          latestTurnRef.current = identityFromRun(source.run);
+          cancelTerminalStatusPoll();
+          dispatch({ type: "session_new", sessionId: nextId, run: source.run, modelRef: typeof source.model_ref === "string" ? source.model_ref : null });
           await persist("selectedSessionId", nextId);
         }
       }
@@ -811,7 +858,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }, (error, isOwned) => {
       if (isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("sessionOpenFailed")), state: "ready" });
     });
-  }, [api, closeActiveTurn, enqueueRuntimeOperation, persist, refreshCatalog, refreshRuntimeStatus, send, t]);
+  }, [api, cancelTerminalStatusPoll, enqueueRuntimeOperation, persist, refreshCatalog, refreshRuntimeStatus, send, t]);
 
   const newSession = useCallback(async () => {
     const project = stateRef.current.projects.find((item) => item.projectKey === stateRef.current.selectedProjectKey);
@@ -826,6 +873,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const isCurrent = () => mountedRef.current && runtimeGenerationRef.current === generation && runtimeOwnerRef.current === null;
     if (!isCurrent() || commandInFlightRef.current) return;
     commandInFlightRef.current = true;
+    const commandName = text.trimStart().slice(1).split(/\s+/u, 1)[0]?.toLowerCase();
+    if (commandName === "compact") dispatch({ type: "compaction_started", trigger: "manual" });
     try {
       const result = await send("command.execute", { text });
       if (!isCurrent()) return;
@@ -874,6 +923,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await api.closeShell();
       }
     } catch (error) {
+      if (commandName === "compact") dispatch({ type: "command_result", result: { command: "compact", status: "execution_error", code: "compact_failed", params: {}, ui_action: null }, notice: t("commandFailed") });
       if (isCurrent()) dispatch({ type: "notice", text: safeErrorMessage(error, t("commandFailed")) });
     } finally {
       commandInFlightRef.current = false;
@@ -1342,7 +1392,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       </header>
       <ChatTimeline
         entries={state.timeline}
-        todo={state.todo}
+        // TodoWrite is anchored to the composer; keep the timeline focused on
+        // conversation and durable replay records.
+        todo={[]}
         notice={state.notice}
         runtimeError={state.runtimeError}
         runtimeErrorVisible={runtimeVisible}

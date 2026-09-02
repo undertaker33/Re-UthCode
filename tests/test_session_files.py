@@ -63,10 +63,13 @@ def test_session_jsonl_preserves_chinese_user_assistant_reasoning_and_tool_text(
         writer.append_transcript(entries)
         summary = SemanticEntry("turn-中文", "工具摘要：执行成功", (writer.snapshot.transcript.reference(1, 5),), session_id="unicode")
         writer.append_timeline_transaction((summary,), ActiveCheckpoint("turn-中文", ("turn-中文",), session_id="unicode"))
-    recovered = store.read_session("unicode", expected_project_key="中文项目")
+    # A fresh store instance models the post-restart reader and ensures the
+    # persisted UTF-8 payload, rather than an in-process cache, is authoritative.
+    restarted_store = SessionFileStore(tmp_path / "sessions")
+    recovered = restarted_store.read_session("unicode", expected_project_key="中文项目")
     assert recovered.transcript.entries == entries
     assert recovered.timeline.fine_entries[0].summary == "工具摘要：执行成功"
-    replay = ApplicationSessionService(storage_root=tmp_path / "sessions", project_key="中文项目", instruction_loader=None, store=store).project_replay("unicode", tool_summary=lambda part: f"工具摘要：{part.name}")
+    replay = ApplicationSessionService(storage_root=tmp_path / "sessions", project_key="中文项目", instruction_loader=None, store=restarted_store).project_replay("unicode", tool_summary=lambda part: f"工具摘要：{part.name}")
     assert [(record.kind, record.text) for record in replay] == [
         ("user", "你好"),
         ("reasoning", "正在分析中文输入"),
