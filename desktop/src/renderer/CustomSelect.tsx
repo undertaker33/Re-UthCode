@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { UiIcon } from "./UiIcon";
 
 export interface SelectOption { value: string; label: string; disabled?: boolean }
 export interface CustomSelectProps { value: string; options: readonly SelectOption[]; onChange: (value: string) => void; label: string; disabled?: boolean; id?: string; onOpen?: () => void }
@@ -68,7 +69,7 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
   };
   const selected = options.find((item) => item.value === value);
   return <div className="custom-select" ref={root} onKeyDown={keyDown} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) closeMenu(); }}>
-    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}>{selected?.label ?? value}<span aria-hidden="true">⌄</span></button>
+    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}><span className="custom-select__value">{selected?.label ?? value}</span><UiIcon name="chevron" /></button>
     {open && <div id={listId} className={`custom-select__list is-${placement}`} role="listbox" aria-label={label}>{options.map((option, index) => <button ref={(element) => { optionRefs.current[index] = element; }} id={`${listId}-option-${index}`} type="button" role="option" title={option.label} key={option.value} aria-selected={option.value === value} tabIndex={index === active ? 0 : -1} className={index === active ? "is-active" : ""} disabled={option.disabled} onPointerMove={() => { if (!option.disabled) setActive(index); }} onClick={() => choose(index)}>{option.label}</button>)}</div>}
   </div>;
 }

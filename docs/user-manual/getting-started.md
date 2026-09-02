@@ -46,11 +46,15 @@ uthcode exec --cwd C:\work\my-project "解释这个项目的目录结构"
 
 交互界面中输入需求并按 `Enter` 发送；`Shift+Enter` 或 `Ctrl+J` 插入换行，`Ctrl+C` 退出。可用命令见[命令参考](commands.md)。
 
-真实普通请求或显式 `/new`、`/resume` 时才会打开持久 Session；TUI 启动、帮助、状态和 Session Picker 不创建空 Session。terminal Turn 的已提交 Transcript、Timeline、AGENTS 激活元数据和大结果 ref 可在进程结束后通过 `/resume` 由新的 Run/Turn 继续使用。若 Transcript 已落盘而 Instruction State metadata 同步失败，状态 diagnostics 会显示 partial，不会把已提交消息重复送入下一轮；暂停中的 Turn、Permission/AskUser waiter 和 Runtime checkpoint 不会跨进程恢复。未显式配置 `context_window` 时，输入预算从 `256_000` default 开始，并可被 Provider 的可靠上限收紧；`/status` 显示实际来源。
+真实普通请求或显式 `/new`、`/resume` 时才会打开持久 Session；TUI 启动、帮助、状态和 Session Picker 不创建空 Session。terminal Turn 的已提交 Transcript、Timeline、AGENTS 激活元数据和大结果 ref 可在进程结束后通过 `/resume` 由新的 Run/Turn 继续使用。若 Transcript 已落盘而 Instruction State metadata 同步失败，状态 diagnostics 会显示 partial，不会把已提交消息重复送入下一轮；暂停中的 Turn、Permission/AskUser waiter 和 Runtime checkpoint 不会跨进程恢复。每个 Session 可以保存其当前模型；恢复它会采用该模型，但不会把旧选择倒写为新 Session 的默认模型。未显式配置 `context_window` 时，输入预算从 `256_000` default 开始，并可被 Provider 的可靠上限收紧；`/status` 显示实际来源。
 
 ## Windows Desktop
 
 仓库内的 `desktop/` 提供 Windows 11 x64 Desktop shell，通过 Python Runtime JSONL Bridge 复用当前 Application、Session、Run、Turn、Interaction 和 AgentEvent。它与 TUI 共用用户级 `~/.uthcode/config.toml`，不会创建另一套模型、权限或会话事实。
+
+Desktop 的侧栏从当前项目的 Session catalog 打开或新建对话。Session 切换和项目切换不会取消已在另一 Session 中运行的 Turn：该 Turn 会在后台继续，侧栏显示其 running/waiting/completed/failed/cancelled 状态；再次打开该 Session 会恢复其已提交 replay 和当前安全运行时投影。关闭 Desktop 会取消仍在运行的 Turn；跨进程只恢复已提交的 Session 内容，不恢复活动 Turn 或等待中的交互。
+
+Composer 顶部显示当前 Todo，底部可选择模型与权限并查看 Context ring。`/compact` 执行期间普通输入会锁定，Runtime panel 显示 Context 与 Compact 的实时安全状态；这些界面信息来自 Application 投影，而不是 Desktop 自行计算的会话状态。
 
 在已激活 `re-uthcode` 环境的 Windows 机器上从源码启动：
 

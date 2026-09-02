@@ -13,6 +13,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from enum import Enum
 import inspect
+import json
 import math
 from pathlib import Path
 import shlex
@@ -431,6 +432,7 @@ def _catalog_entry(entry: object) -> dict[str, object] | None:
         "transcript_entries": entry.transcript_entries,
         "corrupt": entry.corrupt,
         "title": entry.title,
+        "model_ref": entry.model_ref,
     }
     projected = _json_safe(values)
     return projected if isinstance(projected, dict) else None
@@ -586,6 +588,10 @@ class DesktopBridge:
         self._run: object | None = None
         self._active_handle: object | None = None
         self._turn_task: asyncio.Task[None] | None = None
+        # A selected Session owns its own Application/Run pair.  Keeping
+        # those pairs here lets a background Turn continue while the user
+        # navigates to another Session in the same project.
+        self._background_runtimes: dict[str, dict[str, object]] = {}
         self._outbox: list[Envelope] = []
         self._outbox_signal: asyncio.Event | None = None
         self._seen_request_ids: set[str] = set()
@@ -712,6 +718,190 @@ class DesktopBridge:
         handle = self._active_handle
         return None if handle is None else getattr(handle, "pending_pause", None)
 
+    @staticmethod
+    def _session_id_for_application(application: object | None) -> str | None:
+        service = getattr(application, "session_service", None)
+        active = getattr(service, "active_session", None) if service is not None else None
+        value = getattr(active, "session_id", None)
+        if isinstance(value, str) and value.strip():
+            return value
+        value = getattr(application, "session_id", None)
+        return value if isinstance(value, str) and value.strip() else None
+
+    def _supports_background_sessions(self) -> bool:
+        """Whether this is a real configured Application that can be cloned."""
+
+        application = self._application
+        return bool(
+            application is not None
+            and getattr(application, "session_service", None) is not None
+            and (
+                self._application_factory is not None
+                or isinstance(getattr(application, "configuration", None), EffectiveConfig)
+            )
+        )
+
+    def _remember_current_runtime(self, *, reset_turn_projection: bool = False) -> str | None:
+        session_id = self._session_id_for_application(self._application)
+        if self._application is None or self._run is None:
+            return session_id
+        key = session_id or f"@application:{id(self._application)}"
+        previous = self._background_runtimes.get(key)
+        previous_status = previous.get("status") if isinstance(previous, Mapping) else None
+        previous_pause = previous.get("pending_pause") if isinstance(previous, Mapping) else None
+        previous_task_state = previous.get("task_state") if isinstance(previous, Mapping) else None
+        self._background_runtimes[key] = {
+            "application": self._application,
+            "run": self._run,
+            "handle": self._active_handle,
+            "task": self._turn_task,
+            "dispatcher": self._dispatcher,
+            "completion": self._completion,
+            "closed": False,
+            "status": (
+                "running" if self._active_handle is not None else "idle"
+            ) if reset_turn_projection or not isinstance(previous_status, str) else previous_status,
+            "pending_pause": None if reset_turn_projection else previous_pause,
+            "task_state": None if reset_turn_projection else previous_task_state,
+            "project_key": str(self._workdir),
+        }
+        return session_id
+
+    def _activate_runtime(self, runtime: Mapping[str, object]) -> None:
+        if runtime.get("closed") is True:
+            raise BridgeError("session_error", "Session runtime is no longer available")
+        application = runtime.get("application")
+        run = runtime.get("run")
+        if application is None or run is None:
+            raise BridgeError("session_error", "Session runtime is unavailable")
+        self._application = application
+        self._run = run
+        self._active_handle = runtime.get("handle")
+        task = runtime.get("task")
+        self._turn_task = task if isinstance(task, asyncio.Task) else None
+        dispatcher = runtime.get("dispatcher")
+        completion = runtime.get("completion")
+        if dispatcher is not None:
+            self._dispatcher = dispatcher
+        if completion is not None:
+            self._completion = completion
+
+    def _store_active_runtime(self) -> None:
+        self._remember_current_runtime()
+
+    def _clone_application_for_session(self) -> object:
+        """Build an independent Application sharing the durable Session store."""
+
+        current = self._application
+        if current is None:
+            raise BridgeError("application_required", "Application is not initialized")
+        if self._application_factory is not None:
+            try:
+                return self._application_factory(self._workdir)
+            except Exception:
+                raise BridgeError("session_error", "Session runtime could not be prepared") from None
+        config = None
+        try:
+            if self._config_loader is not None:
+                config = self._config_loader(self._workdir)
+            else:
+                config = load_effective_config(cwd=self._workdir, home=self._home)
+        except Exception:
+            config = getattr(current, "configuration", None)
+        if not isinstance(config, EffectiveConfig):
+            raise BridgeError("session_error", "Session runtime could not be prepared")
+        service = getattr(current, "session_service", None)
+        store = getattr(service, "store", None)
+        context = getattr(current, "runtime_context", None)
+        builder = getattr(current, "_provider_builder", None)
+        writer = getattr(current, "_model_writer", None)
+        try:
+            return create_application(
+                config,
+                provider_builder=builder if callable(builder) else None,
+                model_writer=writer if callable(writer) else None,
+                runtime_context=context if isinstance(context, ApplicationRuntimeContext) else ApplicationRuntimeContext.from_system(workdir=self._workdir),
+                session_store=store,
+            )
+        except Exception:
+            raise BridgeError("session_error", "Session runtime could not be prepared") from None
+
+    def _runtime_for_session(self, session_id: str) -> dict[str, object] | None:
+        runtime = self._background_runtimes.get(session_id)
+        if not isinstance(runtime, dict):
+            return None
+        if runtime.get("closed") is True:
+            self._background_runtimes.pop(session_id, None)
+            return None
+        return runtime
+
+    def _session_state_projection(self, runtime: Mapping[str, object] | None = None) -> dict[str, object]:
+        handle = runtime.get("handle") if runtime is not None else self._active_handle
+        run = runtime.get("run") if runtime is not None else self._run
+        application = runtime.get("application") if runtime is not None else self._application
+        pending = runtime.get("pending_pause") if runtime is not None else None
+        if pending is None and handle is not None:
+            pending = getattr(handle, "pending_pause", None)
+        pending_value = pending if isinstance(pending, Mapping) else _dto_fields(pending, PauseRequest, _PAUSE_OUTPUT_FIELDS)
+        task_state = runtime.get("task_state") if runtime is not None else None
+        if not isinstance(task_state, dict):
+            task_state = None
+        status_method = getattr(application, "status", None)
+        application_status = None
+        if callable(status_method):
+            try:
+                application_status = _application_status(status_method())
+            except Exception:
+                application_status = None
+        projected_run = self._snapshot_for(run)
+        active = handle is not None
+        status = runtime.get("status") if runtime is not None else ("running" if active else "idle")
+        return {
+            "run": projected_run,
+            "active_turn": active,
+            "status": status if isinstance(status, str) else "idle",
+            "pending_pause": pending_value,
+            "task_state": task_state,
+            "application": application_status,
+        }
+
+    def _reclaim_background_runtimes(self) -> None:
+        """Close only completed, inactive runtimes; never revive a closed one."""
+
+        current_application = self._application
+        for key, runtime in list(self._background_runtimes.items()):
+            if runtime.get("application") is current_application:
+                continue
+            if runtime.get("handle") is not None:
+                continue
+            task = runtime.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                continue
+            if runtime.get("status") not in {"idle", "completed", "failed", "cancelled"}:
+                continue
+            runtime["closed"] = True
+            close = getattr(runtime.get("application"), "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    # A closed marker is more important than retaining a stale
+                    # object that could be selected and publish old events.
+                    pass
+            self._background_runtimes.pop(key, None)
+
+    @staticmethod
+    def _session_replay_for_application(application: object | None, session_id: str) -> object:
+        service = getattr(application, "session_service", None)
+        project_replay = getattr(service, "project_replay", None)
+        if callable(project_replay):
+            try:
+                return project_replay(session_id)
+            except Exception:
+                pass
+        active = getattr(service, "active_session", None) if service is not None else None
+        return getattr(active, "replay", ())
+
     def _runtime_result(self) -> dict[str, object]:
         application = self._application
         state = self._state if isinstance(self._state, str) else "failed"
@@ -739,6 +929,12 @@ class DesktopBridge:
                 _PAUSE_OUTPUT_FIELDS,
             ),
         }
+        session_id = self._session_id_for_application(application)
+        if session_id is not None:
+            result["session_id"] = session_id
+            result["project_key"] = str(self._workdir)
+            runtime = self._runtime_for_session(session_id)
+            result["session_state"] = self._session_state_projection(runtime)
         if application_status is not None:
             projected = _application_status(application_status)
             if projected is not None:
@@ -1028,11 +1224,25 @@ class DesktopBridge:
                         pass
             raise BridgeError("project_open_failed", "project could not be opened") from None
 
-        # Only now may the old Turn and Application be released.  If either
-        # boundary fails, the candidate is discarded and the old references
-        # remain installed.
+        # Only now may the old Application be released.  Real configured
+        # Applications have independent Session runtimes: park the current
+        # pair and let its Turn continue while the new project is displayed.
+        # Lightweight/fake Applications retain the synchronous close boundary.
+        parked_old_runtime = False
         try:
-            if self._active_handle is not None:
+            if self._supports_background_sessions() and (
+                self._active_handle is not None
+                or any(runtime.get("handle") is not None for runtime in self._background_runtimes.values())
+            ):
+                self._remember_current_runtime()
+                parked_old_runtime = True
+                # The parked pair owns the old Turn.  Clear the selected
+                # bridge slots before publishing the candidate project so a
+                # new project's Runtime cannot accidentally steer/cancel the
+                # previous project's handle.
+                self._active_handle = None
+                self._turn_task = None
+            elif self._active_handle is not None:
                 await self._close_active_for_boundary()
         except Exception:
             close = getattr(candidate, "close", None)
@@ -1043,7 +1253,7 @@ class DesktopBridge:
                     pass
             raise
         old = self._application
-        if old is not None:
+        if old is not None and not parked_old_runtime:
             close = getattr(old, "close", None)
             if callable(close):
                 try:
@@ -1066,6 +1276,7 @@ class DesktopBridge:
         self._dispatcher = candidate_dispatcher
         self._completion = candidate_completion
         self._state = "ready"
+        self._reclaim_background_runtimes()
         return {
             "project": {"path": str(path)},
             "sessions": candidate_sessions,
@@ -1080,6 +1291,8 @@ class DesktopBridge:
         _require_params(params, set(), method="session.new")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
+        if self._supports_background_sessions():
+            return await self._session_new_background()
         application = self._application
         # Resolve the Application budget before cancelling any active Turn;
         # a cancelled resolver must leave the source Run and Session intact.
@@ -1120,13 +1333,81 @@ class DesktopBridge:
             ) from None
         session_id = _session_identity(getattr(session, "session_id", None))
         self._run = candidate_run
-        return {"session_id": session_id, "restored": False, "replay": [], "run": self._snapshot()}
+        return {
+            "session_id": session_id,
+            "restored": False,
+            "replay": [],
+            "model_ref": getattr(session, "model_ref", None),
+            "active_turn": self._active_handle is not None,
+            "run": self._snapshot(),
+            "session_state": self._session_state_projection(),
+        }
+
+    async def _session_new_background(self) -> dict[str, object]:
+        """Create a Session on a fresh runtime while retaining current Turns."""
+
+        candidate = self._clone_application_for_session()
+        try:
+            candidate_run = self._fresh_session_run(candidate)
+            create = getattr(candidate, "new_session_for_command_async", None)
+            if not callable(create):
+                create = getattr(candidate, "new_session_for_command", None)
+            if not callable(create):
+                raise BridgeError("session_error", "Application does not support Sessions")
+            session = create()
+            if inspect.isawaitable(session):
+                session = await session
+            session_id = _session_identity(getattr(session, "session_id", None))
+            dispatcher = CommandDispatcher(self._registry, candidate)
+            completion = CompletionEngine(self._registry, candidate)
+            self._remember_current_runtime()
+            runtime = {
+                "application": candidate,
+                "run": candidate_run,
+                "handle": None,
+                "task": None,
+                "dispatcher": dispatcher,
+                "completion": completion,
+                "closed": False,
+                "status": "idle",
+                "project_key": str(self._workdir),
+            }
+            self._background_runtimes[session_id] = runtime
+            self._activate_runtime(runtime)
+            self._reclaim_background_runtimes()
+            return {
+                "session_id": session_id,
+                "restored": False,
+                "replay": [],
+                "model_ref": getattr(session, "model_ref", None),
+                "active_turn": self._active_handle is not None,
+                "run": self._snapshot(),
+                "session_state": self._session_state_projection(runtime),
+            }
+        except BridgeError:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
+        except Exception:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise BridgeError("session_error", "Session could not be created") from None
 
     async def _session_resume(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"session_id"}, method="session.resume")
         session_id = _text_param(params, "session_id")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
+        if self._supports_background_sessions():
+            return await self._session_resume_background(session_id)
         application = self._application
         # Resolve the Application budget before cancelling any active Turn;
         # a cancelled resolver must leave the source Run and Session intact.
@@ -1169,8 +1450,107 @@ class DesktopBridge:
             "session_id": restored_id,
             "restored": True,
             "replay": _replay_values(replay),
+            "model_ref": getattr(session, "model_ref", None),
+            "active_turn": self._active_handle is not None,
             "run": self._snapshot(),
+            "session_state": self._session_state_projection(),
         }
+
+    async def _session_resume_background(self, session_id: str) -> dict[str, object]:
+        """Switch runtime ownership without cancelling a background Turn."""
+
+        current_id = self._session_id_for_application(self._application)
+        if current_id == session_id:
+            # Resuming the already-visible Session is not a navigation
+            # boundary. Let its current Turn flush its durable transcript,
+            # but never cancel the handle as the old bridge did.
+            replay = self._session_replay_for_application(self._application, session_id)
+            self._reclaim_background_runtimes()
+            runtime = self._runtime_for_session(session_id)
+            return {
+                "session_id": session_id,
+                "restored": True,
+                "replay": _replay_values(replay),
+                "model_ref": getattr(getattr(getattr(self._application, "session_service", None), "active_session", None), "model_ref", None),
+                "active_turn": self._active_handle is not None,
+                "run": self._snapshot(),
+                "session_state": self._session_state_projection(runtime),
+            }
+        existing = self._runtime_for_session(session_id)
+        if existing is not None:
+            self._remember_current_runtime()
+            self._activate_runtime(existing)
+            replay = self._session_replay_for_application(self._application, session_id)
+            self._reclaim_background_runtimes()
+            return {
+                "session_id": session_id,
+                "restored": True,
+                "replay": _replay_values(replay),
+                "model_ref": getattr(getattr(getattr(self._application, "session_service", None), "active_session", None), "model_ref", None),
+                "active_turn": self._active_handle is not None,
+                "run": self._snapshot(),
+                "session_state": self._session_state_projection(existing),
+            }
+
+        candidate = self._clone_application_for_session()
+        try:
+            candidate_run = self._fresh_session_run(candidate)
+            resume = getattr(candidate, "resume_session_for_command_async", None)
+            if not callable(resume):
+                resume = getattr(candidate, "resume_session_for_command", None)
+            if not callable(resume):
+                raise BridgeError("session_error", "Application does not support Sessions")
+            session = resume(session_id)
+            if inspect.isawaitable(session):
+                session = await session
+            restored_id = _session_identity(getattr(session, "session_id", None), session_id)
+            replay = getattr(session, "replay", ())
+            dispatcher = CommandDispatcher(self._registry, candidate)
+            completion = CompletionEngine(self._registry, candidate)
+            self._remember_current_runtime()
+            runtime = {
+                "application": candidate,
+                "run": candidate_run,
+                "handle": None,
+                "task": None,
+                "dispatcher": dispatcher,
+                "completion": completion,
+                "closed": False,
+                "status": "idle",
+                "project_key": str(self._workdir),
+            }
+            self._background_runtimes[restored_id] = runtime
+            self._activate_runtime(runtime)
+            self._reclaim_background_runtimes()
+            return {
+                "session_id": restored_id,
+                "restored": True,
+                "replay": _replay_values(replay),
+                "model_ref": getattr(session, "model_ref", None),
+                "active_turn": self._active_handle is not None,
+                "run": self._snapshot(),
+                "session_state": self._session_state_projection(runtime),
+            }
+        except BridgeError:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            kind = getattr(exc, "kind", None)
+            raise BridgeError(
+                {"busy": "session_busy", "corrupt": "session_corrupt", "unknown": "session_unknown"}.get(kind, "session_error"),
+                "Session could not be resumed",
+            ) from None
 
     async def _session_rename(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"session_id", "title"}, method="session.rename")
@@ -1252,7 +1632,10 @@ class DesktopBridge:
             raise BridgeError("session_error", "Session Run could not be prepared") from None
 
     def _ensure_no_active(self, *, method: str) -> None:
-        if self._active_handle is not None:
+        if self._active_handle is not None or any(
+            runtime.get("handle") is not None
+            for runtime in self._background_runtimes.values()
+        ):
             raise BridgeError("turn_active", f"{method} is unavailable during an active Turn")
 
     async def _turn_start(self, params: Mapping[str, object]) -> dict[str, object]:
@@ -1286,7 +1669,12 @@ class DesktopBridge:
         if handle is None:
             raise BridgeError("turn_error", "Turn could not be started")
         self._active_handle = handle
-        self._turn_task = asyncio.create_task(self._consume_turn(handle))
+        session_id = self._session_id_for_application(application)
+        self._turn_task = asyncio.create_task(
+            self._consume_turn(handle, session_id=session_id, project_key=str(self._workdir))
+        )
+        if session_id is not None and self._supports_background_sessions():
+            self._remember_current_runtime(reset_turn_projection=True)
         snapshot = self._snapshot() or {}
         return {
             "run_id": snapshot.get("run_id"),
@@ -1504,6 +1892,9 @@ class DesktopBridge:
             if isinstance(params_value, dict):
                 params_value["replay"] = _replay_values(action.replay)
                 params_value["run"] = self._snapshot()
+                active = getattr(getattr(self._application, "session_service", None), "active_session", None)
+                params_value["model_ref"] = getattr(active, "model_ref", None)
+                params_value["active_turn"] = self._active_handle is not None
         elif isinstance(action, PermissionModeSelected):
             params_value = result["params"]
             if isinstance(params_value, dict):
@@ -1722,7 +2113,13 @@ class DesktopBridge:
             ) from None
         return {"api_key": value}
 
-    async def _consume_turn(self, handle: object) -> None:
+    async def _consume_turn(
+        self,
+        handle: object,
+        *,
+        session_id: str | None = None,
+        project_key: str | None = None,
+    ) -> None:
         events = getattr(handle, "events", None)
         if not callable(events):
             self._publish(
@@ -1731,7 +2128,14 @@ class DesktopBridge:
                     ErrorPayload("turn_error", "Turn event stream unavailable"),
                 )
             )
-            self._active_handle = None
+            if self._active_handle is handle:
+                self._active_handle = None
+            runtime = self._runtime_for_session(session_id) if session_id is not None else None
+            if runtime is not None and runtime.get("handle") is handle:
+                runtime["handle"] = None
+                runtime["task"] = None
+                runtime["status"] = "failed"
+            self._reclaim_background_runtimes()
             return
         try:
             stream = events()
@@ -1741,6 +2145,31 @@ class DesktopBridge:
                 payload = _event(event)
                 if payload is None:
                     raise RuntimeError("invalid event projection")
+                if session_id is not None:
+                    payload["session_id"] = session_id
+                if project_key is not None:
+                    payload["project_key"] = project_key
+                runtime = self._runtime_for_session(session_id) if session_id is not None else None
+                if runtime is not None:
+                    if payload.get("task_state") is not None:
+                        runtime["task_state"] = payload.get("task_state")
+                    if payload.get("type") == "turn_paused":
+                        runtime["pending_pause"] = payload.get("pause")
+                        runtime["status"] = "waiting"
+                    elif payload.get("type") == "turn_resumed":
+                        runtime["pending_pause"] = None
+                        runtime["status"] = "running"
+                    elif payload.get("type") in {"turn_completed", "turn_failed", "turn_cancelled"}:
+                        runtime["pending_pause"] = None
+                        runtime["status"] = {
+                            "turn_completed": "completed",
+                            "turn_failed": "failed",
+                            "turn_cancelled": "cancelled",
+                        }[str(payload.get("type"))]
+                self._record_live_context_event(
+                    application=runtime.get("application") if runtime is not None else self._application,
+                    payload=payload,
+                )
                 self._publish(AgentEventEnvelope(payload))
             result_method = getattr(handle, "result", None)
             if not callable(result_method):
@@ -1761,6 +2190,38 @@ class DesktopBridge:
         finally:
             if self._active_handle is handle:
                 self._active_handle = None
+            runtime = self._runtime_for_session(session_id) if session_id is not None else None
+            if runtime is not None and runtime.get("handle") is handle:
+                runtime["handle"] = None
+                runtime["task"] = None
+                if runtime.get("status") not in {"completed", "failed", "cancelled"}:
+                    runtime["status"] = "failed"
+            self._reclaim_background_runtimes()
+
+    @staticmethod
+    def _record_live_context_event(*, application: object | None, payload: Mapping[str, object]) -> None:
+        record = getattr(application, "record_live_context_delta", None)
+        if not callable(record):
+            return
+        event_type = payload.get("type")
+        if event_type in {"assistant_message_delta", "reasoning_delta", "plan_content_delta"}:
+            text = payload.get("text")
+        elif event_type == "task_state_changed":
+            try:
+                text = json.dumps(payload.get("task_state"), ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                text = ""
+        elif event_type == "tool_finished":
+            text = payload.get("tool_name") or payload.get("status")
+        else:
+            text = ""
+        if isinstance(text, str) and text:
+            try:
+                record(text, source="live_delta")
+            except Exception:
+                # Context projection is supplementary to the event stream;
+                # one malformed optional update must not stop a Turn.
+                return
 
     async def shutdown(self, *, publish_state: bool = False) -> None:
         if self._state == "stopped":
@@ -1768,16 +2229,38 @@ class DesktopBridge:
         if publish_state:
             self._state = "stopping"
             self._publish(RuntimeStateEnvelope("stopping"))
-        handle = self._active_handle
-        if handle is not None:
+        handles: list[object] = []
+        if self._active_handle is not None:
+            handles.append(self._active_handle)
+        handles.extend(
+            runtime["handle"]
+            for runtime in self._background_runtimes.values()
+            if runtime.get("handle") is not None
+        )
+        seen_handles: set[int] = set()
+        for handle in handles:
+            if id(handle) in seen_handles:
+                continue
+            seen_handles.add(id(handle))
             cancel = getattr(handle, "cancel", None)
             if callable(cancel):
                 try:
                     cancel()
                 except Exception:
                     pass
-        task = self._turn_task
-        if task is not None and not task.done():
+        tasks: list[asyncio.Task[None]] = []
+        if isinstance(self._turn_task, asyncio.Task):
+            tasks.append(self._turn_task)
+        tasks.extend(
+            runtime["task"]
+            for runtime in self._background_runtimes.values()
+            if isinstance(runtime.get("task"), asyncio.Task)
+        )
+        seen_tasks: set[int] = set()
+        for task in tasks:
+            if id(task) in seen_tasks or task.done():
+                continue
+            seen_tasks.add(id(task))
             try:
                 await asyncio.wait_for(asyncio.shield(task), self._shutdown_timeout)
             except asyncio.TimeoutError:
@@ -1789,8 +2272,19 @@ class DesktopBridge:
                 pass
         self._active_handle = None
         self._turn_task = None
-        application = self._application
-        if application is not None:
+        applications: list[object] = []
+        if self._application is not None:
+            applications.append(self._application)
+        applications.extend(
+            runtime["application"]
+            for runtime in self._background_runtimes.values()
+            if runtime.get("application") is not None
+        )
+        seen_applications: set[int] = set()
+        for application in applications:
+            if id(application) in seen_applications:
+                continue
+            seen_applications.add(id(application))
             close = getattr(application, "close", None)
             if callable(close):
                 try:
@@ -1805,6 +2299,7 @@ class DesktopBridge:
                             )
                         )
                     return
+        self._background_runtimes.clear()
         self._state = "stopped"
         if publish_state:
             self._publish(RuntimeStateEnvelope("stopped"))

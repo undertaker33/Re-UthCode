@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import copy
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -215,6 +216,59 @@ class ApplicationContextService:
         """Return the current safe Compaction lifecycle projection."""
 
         return self._compaction_status
+
+    def capture_state(self) -> dict[str, object]:
+        """Capture mutable projection state for an atomic Application update."""
+
+        return {
+            "last_snapshot": self._last_snapshot,
+            "compact_count": self._compact_count,
+            "compaction_events": copy.deepcopy(self._compaction_events),
+            "last_compaction": copy.deepcopy(self._last_compaction),
+            "last_budget": self._last_budget,
+            "last_gate": copy.deepcopy(self._last_gate),
+            "last_pressure": self._last_pressure,
+            "last_accounting": self._last_accounting,
+            "last_count_fallback": self._last_count_fallback,
+            "context_status": self._context_status,
+            "compaction_status": self._compaction_status,
+        }
+
+    def restore_state(self, value: Mapping[str, object]) -> None:
+        """Restore a state captured by :meth:`capture_state`."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("Context state must be a mapping")
+        self._last_snapshot = value.get("last_snapshot")  # type: ignore[assignment]
+        self._compact_count = int(value.get("compact_count", 0))
+        self._compaction_events = copy.deepcopy(value.get("compaction_events", []))  # type: ignore[assignment]
+        self._last_compaction = copy.deepcopy(value.get("last_compaction"))  # type: ignore[assignment]
+        self._last_budget = value.get("last_budget")  # type: ignore[assignment]
+        self._last_gate = copy.deepcopy(value.get("last_gate"))  # type: ignore[assignment]
+        self._last_pressure = value.get("last_pressure")  # type: ignore[assignment]
+        self._last_accounting = value.get("last_accounting")  # type: ignore[assignment]
+        self._last_count_fallback = value.get("last_count_fallback")  # type: ignore[assignment]
+        self._context_status = value.get("context_status", ContextStatus.unavailable())  # type: ignore[assignment]
+        self._compaction_status = value.get("compaction_status", CompactionStatus())  # type: ignore[assignment]
+
+    def record_live_delta(self, text: str, *, source: str = "live_delta") -> None:
+        """Apply a bounded incremental estimate while a Turn is streaming."""
+
+        if not isinstance(text, str) or not text:
+            return
+        budget = self._last_budget
+        snapshot = self._last_snapshot
+        if budget is None or snapshot is None or budget.effective_input_limit is None:
+            return
+        delta = max(1, int(self._compiler.token_estimator(text)))
+        effective = budget.effective_input_limit
+        self._context_status = ContextStatus(
+            used_tokens=min(effective, self._context_status.used_tokens + delta),
+            budget_tokens=effective,
+            available=True,
+            measurement="estimate",
+            source=source,
+        )
 
     def _refresh_context_estimate(self) -> None:
         """Downgrade the projection after a Context-owned mutation."""

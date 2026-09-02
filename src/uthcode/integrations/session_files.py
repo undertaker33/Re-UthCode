@@ -138,6 +138,10 @@ class SessionMetadata:
     instruction_state: Mapping[str, object] = field(default_factory=dict)
     schema_version: int = SESSION_SCHEMA_VERSION
     title: str | None = None
+    # The selected model is a Session preference.  It is deliberately kept
+    # beside the other small metadata fields so reopening a Session does not
+    # have to infer its model from the process-wide default.
+    model_ref: str | None = None
 
     def __post_init__(self) -> None:
         _validate_session_id(self.session_id)
@@ -149,6 +153,8 @@ class SessionMetadata:
         object.__setattr__(self, "instruction_state", _safe_instruction_state(self.instruction_state))
         if self.title is not None:
             object.__setattr__(self, "title", normalize_session_title(self.title))
+        if self.model_ref is not None:
+            object.__setattr__(self, "model_ref", _require_text(self.model_ref, "model_ref"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -159,6 +165,7 @@ class SessionMetadata:
             "last_used_at": self.last_used_at,
             "instruction_state": dict(self.instruction_state),
             "title": self.title,
+            "model_ref": self.model_ref,
         }
 
     @classmethod
@@ -172,7 +179,7 @@ class SessionMetadata:
         missing = required.difference(value)
         if missing:
             raise SessionCorruptError(f"Session metadata missing fields: {sorted(missing)}")
-        unknown = set(value).difference(required | {"title"})
+        unknown = set(value).difference(required | {"title", "model_ref"})
         if unknown:
             raise SessionCorruptError(f"Session metadata has unknown fields: {sorted(unknown)}")
         try:
@@ -184,6 +191,7 @@ class SessionMetadata:
                 last_used_at=str(value["last_used_at"]),
                 instruction_state=value["instruction_state"],  # type: ignore[arg-type]
                 title=value.get("title"),  # type: ignore[arg-type]
+                model_ref=value.get("model_ref"),  # type: ignore[arg-type]
             )
         except (TypeError, ValueError) as exc:
             raise SessionCorruptError(f"invalid Session metadata: {exc}") from exc
@@ -348,6 +356,7 @@ class SessionFileStore:
         project_key: str,
         instruction_state: Mapping[str, object] | None = None,
         title: str | None = None,
+        model_ref: str | None = None,
     ) -> SessionMetadata:
         identifier = _validate_session_id(session_id or uuid.uuid4().hex)
         normalized_title = (
@@ -371,6 +380,7 @@ class SessionFileStore:
             now,
             instruction_state or {},
             title=normalized_title,
+            model_ref=model_ref,
         )
         _atomic_write_json(path / "metadata.json", metadata.to_dict())
         return metadata
@@ -521,6 +531,17 @@ class SessionWriter:
 
         self._require_writable()
         metadata = replace(self.metadata, title=normalize_session_title(title))
+        self._write_metadata(metadata)
+        return metadata
+
+    def update_model_ref(self, model_ref: str | None) -> SessionMetadata:
+        """Persist the model selected for this Session."""
+
+        self._require_writable()
+        metadata = replace(
+            self.metadata,
+            model_ref=None if model_ref is None else _require_text(model_ref, "model_ref"),
+        )
         self._write_metadata(metadata)
         return metadata
 

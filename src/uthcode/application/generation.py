@@ -84,6 +84,7 @@ from .sessions import (
     SessionCatalogEntry,
     SessionMutation,
     SessionReplayRecord,
+    SessionOperationError,
 )
 from .tools import ApplicationToolService
 from .provider_usage import public_usage_diagnostics
@@ -681,6 +682,10 @@ class UthCodeApplication:
             if configuration is not None
             else provider.identity.model
         )
+        # The active Session model and the process-wide default are separate
+        # pieces of state.  Resuming an older Session may change the active
+        # provider without changing the model used by the next new Session.
+        self._default_model_ref = self._current_model_ref
         self._model_state_generation = 0
         self._last_provider_limits: ModelLimits | None = None
         self._last_provider_limits_model: str | None = None
@@ -717,6 +722,11 @@ class UthCodeApplication:
         """Return the Application-owned Context composition service."""
 
         return self._context_service
+
+    def record_live_context_delta(self, text: str, *, source: str = "live_delta") -> None:
+        """Project one streamed semantic delta into the live Context status."""
+
+        self._context_service.record_live_delta(text, source=source)
 
     @property
     def session_service(self) -> ApplicationSessionService | None:
@@ -766,10 +776,29 @@ class UthCodeApplication:
     def create_session(self, session_id: str | None = None) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        context_budget = self._context_budget_for_projection(resolve_provider=True)
-        session = self._session_service.create_session(session_id)
-        self._refresh_context_for_session(session, context_budget=context_budget)
-        return session
+        state = self._capture_model_context_state()
+        session: ApplicationSession | None = None
+        try:
+            candidate, provider, limits, context_budget = self._preflight_new_session_model()
+            self._preflight_new_session_context(context_budget)
+            session = self._session_service.create_session(
+                session_id,
+                model_ref=self._default_model_ref,
+            )
+            if candidate is not None and provider is not None:
+                self._commit_model_selection(
+                    candidate,
+                    provider,
+                    limits,
+                    context_budget,
+                    persist_default=False,
+                    persist_session=False,
+                    refresh_context=False,
+                )
+            return session
+        except BaseException:
+            self._rollback_new_session(session, state)
+            raise
 
     def ensure_session(self) -> ApplicationSession | None:
         """Open a fresh durable Session for an interactive entry point."""
@@ -794,11 +823,16 @@ class UthCodeApplication:
     def resume_session(self, session_id: str) -> ApplicationSession:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        context_budget = self._context_budget_for_projection(resolve_provider=True)
+        self._preflight_session_model(session_id)
         session = self._session_service.resume_session(
             session_id,
             replay_builder=self._build_session_replay,
         )
+        self._restore_session_model(session)
+        # Resolve the budget after adopting the Session's model.  Resolving it
+        # before the restore would recompile the resumed Session with the
+        # process-wide default model's limits.
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
         self._refresh_context_for_session(session, context_budget=context_budget)
         return session
 
@@ -836,10 +870,28 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        context_budget = self._context_budget_for_projection(resolve_provider=True)
-        session = self._session_service.create_session_for_command()
-        self._refresh_context_for_session(session, context_budget=context_budget)
-        return session
+        state = self._capture_model_context_state()
+        session: ApplicationSession | None = None
+        try:
+            candidate, provider, limits, context_budget = self._preflight_new_session_model()
+            self._preflight_new_session_context(context_budget)
+            session = self._session_service.create_session_for_command(
+                model_ref=self._default_model_ref,
+            )
+            if candidate is not None and provider is not None:
+                self._commit_model_selection(
+                    candidate,
+                    provider,
+                    limits,
+                    context_budget,
+                    persist_default=False,
+                    persist_session=False,
+                    refresh_context=False,
+                )
+            return session
+        except BaseException:
+            self._rollback_new_session(session, state)
+            raise
 
     async def new_session_for_command_async(
         self,
@@ -850,33 +902,45 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        if context_budget is None:
-            context_budget = await self._context_budget_for_projection_async(
-                resolve_provider=True,
-            )
-        elif not isinstance(context_budget, ContextBudget):
+        if context_budget is not None and not isinstance(context_budget, ContextBudget):
             raise TypeError("context_budget must be a ContextBudget or None")
-        elif not self._context_budget_snapshot_matches(context_budget):
-            context_budget = await self._context_budget_for_projection_async(
-                resolve_provider=True,
+        state = self._capture_model_context_state()
+        session: ApplicationSession | None = None
+        try:
+            candidate, provider, limits, prepared_budget = await self._preflight_new_session_model_async(
+                context_budget=context_budget,
             )
-        session = self._session_service.create_session_for_command()
-        await self._refresh_context_for_session_async(
-            session,
-            context_budget=context_budget,
-        )
-        return session
+            self._preflight_new_session_context(prepared_budget)
+            session = self._session_service.create_session_for_command(
+                model_ref=self._default_model_ref,
+            )
+            if candidate is not None and provider is not None:
+                self._commit_model_selection(
+                    candidate,
+                    provider,
+                    limits,
+                    prepared_budget,
+                    persist_default=False,
+                    persist_session=False,
+                    refresh_context=False,
+                )
+            return session
+        except BaseException:
+            self._rollback_new_session(session, state)
+            raise
 
     def resume_session_for_command(self, session_id: str) -> ApplicationSession:
         """Lock/recover the target before committing the Session switch."""
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        context_budget = self._context_budget_for_projection(resolve_provider=True)
+        self._preflight_session_model(session_id)
         session = self._session_service.resume_session_for_command(
             session_id,
             replay_builder=self._build_session_replay,
         )
+        self._restore_session_model(session)
+        context_budget = self._context_budget_for_projection(resolve_provider=True)
         self._refresh_context_for_session(session, context_budget=context_budget)
         return session
 
@@ -891,19 +955,22 @@ class UthCodeApplication:
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
         if context_budget is None:
-            context_budget = await self._context_budget_for_projection_async(
-                resolve_provider=True,
-            )
+            # The target Session may carry its own model preference. Resolve
+            # the provider budget only after the Session is opened/restored so
+            # the caller never compiles it against the old default model.
+            context_budget = None
         elif not isinstance(context_budget, ContextBudget):
             raise TypeError("context_budget must be a ContextBudget or None")
-        elif not self._context_budget_snapshot_matches(context_budget):
-            context_budget = await self._context_budget_for_projection_async(
-                resolve_provider=True,
-            )
+        await self._preflight_session_model_async(session_id)
         session = self._session_service.resume_session_for_command(
             session_id,
             replay_builder=self._build_session_replay,
         )
+        await self._restore_session_model_async(session)
+        if context_budget is None or not self._context_budget_snapshot_matches(context_budget):
+            context_budget = await self._context_budget_for_projection_async(
+                resolve_provider=True,
+            )
         await self._refresh_context_for_session_async(
             session,
             context_budget=context_budget,
@@ -1844,22 +1911,141 @@ class UthCodeApplication:
             ),
         )
 
+    def _preflight_new_session_context(self, context_budget: ContextBudget) -> None:
+        """Compile the empty target Context before creating durable metadata."""
+
+        self._context_service.compile(
+            instruction_loader=self._instruction_loader,
+            transcript=None,
+            timeline=None,
+            tool_definitions=self.tool_definitions(),
+            context_budget=context_budget,
+            preserve_request_diagnostics=True,
+        )
+
+    def _capture_model_context_state(self) -> dict[str, object]:
+        """Capture the mutable model/Context projection before Session creation."""
+
+        return {
+            "provider": self._provider,
+            "model_ref": self._current_model_ref,
+            "default_model_ref": self._default_model_ref,
+            "model_state_generation": self._model_state_generation,
+            "provider_limits": self._last_provider_limits,
+            "provider_limits_model": self._last_provider_limits_model,
+            "provider_limits_provider": self._last_provider_limits_provider,
+            "context_budget_snapshot": self._context_budget_snapshot,
+            "context_state": self._context_service.capture_state(),
+        }
+
+    def _restore_model_context_state(self, state: Mapping[str, object]) -> None:
+        """Restore a pre-Session model/Context projection atomically."""
+
+        self._provider = state["provider"]  # type: ignore[assignment]
+        self._current_model_ref = str(state["model_ref"])
+        self._default_model_ref = str(state["default_model_ref"])
+        self._model_state_generation = int(state["model_state_generation"])
+        self._last_provider_limits = state["provider_limits"]  # type: ignore[assignment]
+        self._last_provider_limits_model = state["provider_limits_model"]  # type: ignore[assignment]
+        self._last_provider_limits_provider = state["provider_limits_provider"]  # type: ignore[assignment]
+        self._context_budget_snapshot = state["context_budget_snapshot"]  # type: ignore[assignment]
+        self._context_service.restore_state(state["context_state"])  # type: ignore[arg-type]
+
+    def _rollback_new_session(
+        self,
+        session: ApplicationSession | None,
+        state: Mapping[str, object],
+    ) -> None:
+        """Release a failed new Session and restore the previous model projection."""
+
+        if session is not None:
+            try:
+                session.close()
+            except BaseException:
+                # A freshly-created Session has no user transcript to sync.
+                # If close-time instruction sync itself fails, release the
+                # staged writer without exposing it as the active Session.
+                close_staged = getattr(session, "_close_staged", None)
+                if callable(close_staged):
+                    try:
+                        close_staged()
+                    except BaseException:
+                        pass
+        self._restore_model_context_state(state)
+
+    def _preflight_new_session_model(
+        self,
+    ) -> tuple[ModelProfile | None, ProviderPort | None, ModelLimits | None, ContextBudget]:
+        """Validate the persisted default before creating its durable metadata."""
+
+        model_ref = self._default_model_ref
+        if model_ref != self._current_model_ref:
+            candidate, provider = self._model_selection_candidate(model_ref)
+            limits = self._resolve_model_limits_sync_strict(
+                candidate.remote_id,
+                provider=provider,
+            )
+            return candidate, provider, limits, self._model_context_budget(candidate, limits)
+        model = self.current_model
+        if model is None:
+            return None, None, None, self._context_budget_for_projection(resolve_provider=True)
+        limits = self._resolve_model_limits_sync_strict(
+            model.remote_id,
+            provider=self._provider,
+        )
+        return None, None, limits, self._model_context_budget(model, limits)
+
+    async def _preflight_new_session_model_async(
+        self,
+        *,
+        context_budget: ContextBudget | None = None,
+    ) -> tuple[ModelProfile | None, ProviderPort | None, ModelLimits | None, ContextBudget]:
+        """Async counterpart that validates Provider limits before metadata creation."""
+
+        model_ref = self._default_model_ref
+        if model_ref != self._current_model_ref:
+            candidate, provider = self._model_selection_candidate(model_ref)
+            limits = await _resolve_model_limits_async(provider, candidate.remote_id)
+            return candidate, provider, limits, self._model_context_budget(candidate, limits)
+        model = self.current_model
+        if model is None:
+            if context_budget is not None and self._context_budget_snapshot_matches(context_budget):
+                return None, None, None, context_budget
+            return None, None, None, await self._context_budget_for_projection_async(resolve_provider=True)
+        if context_budget is not None and self._context_budget_snapshot_matches(context_budget):
+            return None, None, self._last_provider_limits, context_budget
+        limits = await _resolve_model_limits_async(self._provider, model.remote_id)
+        return None, None, limits, self._model_context_budget(model, limits)
+
     def _commit_model_selection(
         self,
         candidate_model: ModelProfile,
         candidate_provider: ProviderPort,
         provider_limits: ModelLimits | None,
         context_budget: ContextBudget,
+        *,
+        persist_default: bool = True,
+        persist_session: bool = True,
+        refresh_context: bool = True,
     ) -> ModelProfile:
         """Commit one fully preflighted model candidate at one boundary."""
 
         old_provider = self._provider
         old_model_ref = self._current_model_ref
+        old_default_model_ref = self._default_model_ref
         old_model_state_generation = self._model_state_generation
         old_provider_limits = self._last_provider_limits
         old_provider_limits_model = self._last_provider_limits_model
         old_provider_limits_provider = self._last_provider_limits_provider
         old_context_budget_snapshot = self._context_budget_snapshot
+        old_context_state = self._context_service.capture_state()
+        active = (
+            self._session_service.active_session
+            if self._session_service is not None
+            else None
+        )
+        old_session_model_ref = active.model_ref if active is not None else None
+        session_committed = False
         writer_committed = False
         try:
             # The user-config writer is itself atomic.  It is intentionally
@@ -1867,25 +2053,25 @@ class UthCodeApplication:
             # publishing the in-memory model identity.  If the synchronous
             # Context commit below fails, restore the old root preference
             # before returning the failure to the command boundary.
-            if self._model_writer is not None:
+            if persist_default and self._model_writer is not None:
                 self._model_writer(candidate_model.model_ref)
                 writer_committed = True
+            if active is not None and persist_session:
+                active.persist_model_ref(candidate_model.model_ref)
+                session_committed = True
             self._provider = candidate_provider
             self._current_model_ref = candidate_model.model_ref
+            if persist_default:
+                self._default_model_ref = candidate_model.model_ref
             self._last_provider_limits = provider_limits
             self._last_provider_limits_model = candidate_model.remote_id
             self._last_provider_limits_provider = candidate_provider
-            active = (
-                self._session_service.active_session
-                if self._session_service is not None
-                else None
-            )
-            if active is not None:
+            if active is not None and refresh_context:
                 self._refresh_context_for_session(
                     active,
                     context_budget=context_budget,
                 )
-            else:
+            elif refresh_context:
                 self._context_service.set_context_budget(context_budget)
             self._model_state_generation += 1
             self._context_budget_snapshot = (
@@ -1894,27 +2080,111 @@ class UthCodeApplication:
                 candidate_model.model_ref,
                 context_budget,
             )
-        except BaseException:
+        except BaseException as original:
             # Context compilation is synchronous and normally cannot be
             # interrupted between state writes.  Restore the Application
             # identity if a validation/invariant failure nevertheless occurs.
             self._provider = old_provider
             self._current_model_ref = old_model_ref
+            self._default_model_ref = old_default_model_ref
             self._model_state_generation = old_model_state_generation
             self._last_provider_limits = old_provider_limits
             self._last_provider_limits_model = old_provider_limits_model
             self._last_provider_limits_provider = old_provider_limits_provider
             self._context_budget_snapshot = old_context_budget_snapshot
+            rollback_errors: list[BaseException] = []
+            try:
+                self._context_service.restore_state(old_context_state)
+            except BaseException as exc:
+                rollback_errors.append(exc)
+            if session_committed and active is not None:
+                try:
+                    active.persist_model_ref(old_session_model_ref)
+                except BaseException as exc:
+                    rollback_errors.append(exc)
             if writer_committed and self._model_writer is not None:
                 try:
                     self._model_writer(old_model_ref)
-                except Exception:
-                    # The configured writer is atomic in the production path;
-                    # preserve the original failure if a custom writer also
-                    # refuses the compensating write.
-                    pass
+                except BaseException as exc:
+                    rollback_errors.append(exc)
+            if rollback_errors:
+                raise RuntimeError("model selection rollback failed") from original
             raise
         return candidate_model
+
+    def _preflight_session_model(self, session_id: str) -> None:
+        """Validate a durable Session model before changing active ownership."""
+
+        if self._session_service is None:
+            return
+        snapshot = self._session_service.read_session_for_command(session_id)
+        model_ref = snapshot.metadata.model_ref
+        if not model_ref or model_ref == self._current_model_ref:
+            return
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = self._resolve_model_limits_sync_strict(
+            candidate_model.remote_id,
+            provider=candidate_provider,
+        )
+        self._model_context_budget(candidate_model, provider_limits)
+
+    async def _preflight_session_model_async(self, session_id: str) -> None:
+        """Async model restore preflight without mutating Session ownership."""
+
+        if self._session_service is None:
+            return
+        snapshot = self._session_service.read_session_for_command(session_id)
+        model_ref = snapshot.metadata.model_ref
+        if not model_ref or model_ref == self._current_model_ref:
+            return
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = await _resolve_model_limits_async(
+            candidate_provider,
+            candidate_model.remote_id,
+        )
+        self._model_context_budget(candidate_model, provider_limits)
+
+    def _restore_session_model(self, session: ApplicationSession) -> None:
+        """Adopt a valid Session model without changing the global default."""
+
+        model_ref = session.model_ref
+        if not model_ref or model_ref == self._current_model_ref:
+            return
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = self._resolve_model_limits_sync_strict(
+            candidate_model.remote_id,
+            provider=candidate_provider,
+        )
+        context_budget = self._model_context_budget(candidate_model, provider_limits)
+        self._commit_model_selection(
+            candidate_model,
+            candidate_provider,
+            provider_limits,
+            context_budget,
+            persist_default=False,
+            persist_session=False,
+        )
+
+    async def _restore_session_model_async(self, session: ApplicationSession) -> None:
+        """Async counterpart of :meth:`_restore_session_model`."""
+
+        model_ref = session.model_ref
+        if not model_ref or model_ref == self._current_model_ref:
+            return
+        candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        provider_limits = await _resolve_model_limits_async(
+            candidate_provider,
+            candidate_model.remote_id,
+        )
+        context_budget = self._model_context_budget(candidate_model, provider_limits)
+        self._commit_model_selection(
+            candidate_model,
+            candidate_provider,
+            provider_limits,
+            context_budget,
+            persist_default=False,
+            persist_session=False,
+        )
 
     def select_model(self, model_ref: str) -> ModelProfile:
         """Synchronously select a model for callers without an event loop."""

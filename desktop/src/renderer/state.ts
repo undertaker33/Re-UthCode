@@ -33,6 +33,9 @@ export interface SessionSummary {
   transcript_entries?: number;
   corrupt?: boolean;
   pinned?: boolean;
+  model_ref?: string | null;
+  /** Live status supplied by the bridge without changing catalog order. */
+  runtime_status?: "idle" | "running" | "waiting" | "completed" | "failed" | "cancelled";
 }
 
 export interface ProjectState {
@@ -137,6 +140,10 @@ export interface RendererState {
   pinnedSessions: DesktopPreferences["pinnedSessions"];
   expandedProjects: DesktopPreferences["expandedProjects"];
   currentModelRef: string | null;
+  /** Durable model identity keyed by Session; never inferred from row order. */
+  sessionModels: Record<string, string>;
+  /** Per-session live projection.  Events are authoritative even off-screen. */
+  sessionRuntime: Record<string, SessionRuntimeSnapshot>;
   modelCandidates: string[];
   modelPickerOpen: boolean;
   activeTurn: boolean;
@@ -169,6 +176,21 @@ export interface RendererState {
   nextStatusId: number;
 }
 
+export interface SessionRuntimeSnapshot {
+  timeline: TimelineEntry[];
+  todo: TodoItem[];
+  todoIteration: number;
+  run: RunProjection | null;
+  contextUsage: ContextUsageProjection;
+  compactionStatus: CompactionStatusProjection;
+  permissionMode: PermissionModeProjection;
+  activeTurn: boolean;
+  terminalStatusPending: boolean;
+  turnStatus: RendererState["turnStatus"];
+  pendingInteraction: PendingInteraction | null;
+  completionBlocked: string | null;
+}
+
 export const DEFAULT_RENDERER_STATE: RendererState = {
   runtimeState: "booting",
   runtimeError: null,
@@ -185,6 +207,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   pinnedSessions: [],
   expandedProjects: {},
   currentModelRef: null,
+  sessionModels: {},
+  sessionRuntime: {},
   modelCandidates: [],
   modelPickerOpen: false,
   activeTurn: false,
@@ -224,6 +248,116 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
     todo: overrides.todo?.map((item) => ({ ...item })) ?? [],
     diagnostics: overrides.diagnostics ? [...overrides.diagnostics] : [],
     ignoredRunIds: overrides.ignoredRunIds ? [...overrides.ignoredRunIds] : [],
+    sessionModels: overrides.sessionModels ? { ...overrides.sessionModels } : {},
+    sessionRuntime: overrides.sessionRuntime
+      ? Object.fromEntries(Object.entries(overrides.sessionRuntime).map(([key, snapshot]) => [key, cloneSessionRuntime(snapshot)]))
+      : {},
+  };
+}
+
+export function sessionRuntimeKey(projectKey: string | null | undefined, sessionId: string): string {
+  return `${projectKey ?? ""}\u0000${sessionId}`;
+}
+
+export function cloneSessionRuntime(snapshot: SessionRuntimeSnapshot): SessionRuntimeSnapshot {
+  return {
+    ...snapshot,
+    timeline: snapshot.timeline.map((entry) => ({ ...entry })),
+    todo: snapshot.todo.map((item) => ({ ...item })),
+    run: snapshot.run ? { ...snapshot.run, usage: snapshot.run.usage ? { ...snapshot.run.usage } : undefined } : null,
+    contextUsage: { ...snapshot.contextUsage },
+    compactionStatus: { ...snapshot.compactionStatus },
+    pendingInteraction: snapshot.pendingInteraction
+      ? { ...snapshot.pendingInteraction, request: snapshot.pendingInteraction.request ? { ...snapshot.pendingInteraction.request } : undefined }
+      : null,
+  };
+}
+
+export function runtimeSnapshotFromState(state: RendererState): SessionRuntimeSnapshot {
+  return cloneSessionRuntime({
+    timeline: state.timeline,
+    todo: state.todo,
+    todoIteration: state.todoIteration,
+    run: state.run,
+    contextUsage: state.contextUsage,
+    compactionStatus: state.compactionStatus,
+    permissionMode: state.permissionMode,
+    activeTurn: state.activeTurn,
+    terminalStatusPending: state.terminalStatusPending,
+    turnStatus: state.turnStatus,
+    pendingInteraction: state.pendingInteraction,
+    completionBlocked: state.completionBlocked,
+  });
+}
+
+function applyRuntimeSnapshot(state: RendererState, snapshot: SessionRuntimeSnapshot): RendererState {
+  return {
+    ...state,
+    timeline: snapshot.timeline.map((entry) => ({ ...entry })),
+    todo: snapshot.todo.map((item) => ({ ...item })),
+    todoIteration: snapshot.todoIteration,
+    run: snapshot.run ? { ...snapshot.run, usage: snapshot.run.usage ? { ...snapshot.run.usage } : undefined } : null,
+    contextUsage: { ...snapshot.contextUsage },
+    compactionStatus: { ...snapshot.compactionStatus },
+    permissionMode: snapshot.permissionMode,
+    activeTurn: snapshot.activeTurn,
+    terminalStatusPending: snapshot.terminalStatusPending,
+    turnStatus: snapshot.turnStatus,
+    pendingInteraction: snapshot.pendingInteraction
+      ? { ...snapshot.pendingInteraction, request: snapshot.pendingInteraction.request ? { ...snapshot.pendingInteraction.request } : undefined }
+      : null,
+    completionBlocked: snapshot.completionBlocked,
+  };
+}
+
+function emptyRuntimeBoundary(state: RendererState): RendererState {
+  return {
+    ...state,
+    timeline: [],
+    todo: [],
+    todoIteration: 0,
+    run: null,
+    contextUsage: contextUsageAtBoundary(),
+    compactionStatus: { state: "idle", trigger: null, changed: null },
+    permissionMode: "unknown",
+    activeTurn: false,
+    terminalStatusPending: false,
+    turnStatus: "idle",
+    pendingInteraction: null,
+    completionBlocked: null,
+  };
+}
+
+function runtimeStatus(snapshot: SessionRuntimeSnapshot): SessionSummary["runtime_status"] {
+  if (snapshot.pendingInteraction || snapshot.turnStatus === "paused" || snapshot.turnStatus === "pausing") return "waiting";
+  if (snapshot.activeTurn && snapshot.turnStatus === "running") return "running";
+  if (snapshot.turnStatus === "failed") return "failed";
+  if (snapshot.turnStatus === "cancelled") return "cancelled";
+  if (snapshot.turnStatus === "completed" || snapshot.terminalStatusPending) return "completed";
+  return "idle";
+}
+
+function updateSessionRuntimeStatus(
+  state: RendererState,
+  projectKey: string | null | undefined,
+  sessionId: string,
+  status: SessionSummary["runtime_status"],
+): RendererState {
+  if (!projectKey) return state;
+  return {
+    ...state,
+    projects: state.projects.map((project) => project.projectKey === projectKey
+      ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session, runtime_status: status } : session) }
+      : project),
+  };
+}
+
+function cacheVisibleRuntime(state: RendererState, projectKey: string | null, sessionId: string | null): RendererState {
+  if (!projectKey || !sessionId) return state;
+  const snapshot = runtimeSnapshotFromState(state);
+  return {
+    ...state,
+    sessionRuntime: { ...state.sessionRuntime, [sessionRuntimeKey(projectKey, sessionId)]: snapshot },
   };
 }
 
@@ -232,8 +366,122 @@ function asRecord(value: unknown): Record<string, JsonValue> | null {
   return value as Record<string, JsonValue>;
 }
 
+const MOJIBAKE_MARKERS = ["Ã", "Â", "â", "ä", "å", "æ", "ç", "è", "é", "ê", "ï¿½", "锟"];
+// These are high-signal characters produced by the common UTF-8-as-GB18030
+// failure mode.  Restricting the reverse-table pass to a marked string keeps
+// normal long Chinese transcripts on the ordinary O(n) normalization path.
+const GB18030_MOJIBAKE_MARKERS = ["浣", "犲", "ソ", "姝", "ｅ", "鍒", "璇", "鎴", "锟"];
+
+let gb18030PairMap: Map<number, Uint8Array> | null | undefined;
+
+/**
+ * Build the small GB18030 two-byte reverse table lazily.  A real-world
+ * mojibake sample such as `浣犲ソ` is UTF-8 bytes decoded as GB18030; unlike
+ * Latin-1 corruption it contains no obvious ASCII marker.  TextDecoder is
+ * available in the renderer, so one bounded table pass lets us recover only
+ * candidates that round-trip to valid UTF-8, without shipping a second
+ * encoding library or changing ordinary Chinese text.
+ */
+function gb18030Pairs(): Map<number, Uint8Array> | null {
+  if (gb18030PairMap !== undefined) return gb18030PairMap;
+  try {
+    const bytes: number[] = [];
+    const pairs: Array<[number, number]> = [];
+    for (let lead = 0x81; lead <= 0xfe; lead += 1) {
+      for (let trail = 0x40; trail <= 0xfe; trail += 1) {
+        if (trail === 0x7f) continue;
+        bytes.push(lead, trail, 0);
+        pairs.push([lead, trail]);
+      }
+    }
+    const decoded = new TextDecoder("gb18030").decode(Uint8Array.from(bytes));
+    const result = new Map<number, Uint8Array>();
+    let offset = 0;
+    for (const [lead, trail] of pairs) {
+      const code = decoded.charCodeAt(offset);
+      if (Number.isFinite(code) && decoded.charCodeAt(offset + 1) === 0) {
+        result.set(code, Uint8Array.of(lead, trail));
+      }
+      offset += 2;
+    }
+    gb18030PairMap = result;
+  } catch {
+    // Some embedded runtimes may not expose GB18030.  Latin-1 recovery and
+    // the authoritative UTF-8 transport remain fully functional there.
+    gb18030PairMap = null;
+  }
+  return gb18030PairMap;
+}
+
+function decodeGb18030MojibakeRun(run: readonly string[]): string | null {
+  if (run.length < 2) return null;
+  const pairs = gb18030Pairs();
+  if (!pairs) return null;
+  const bytes: number[] = [];
+  for (const character of run) {
+    const pair = pairs.get(character.codePointAt(0) ?? -1);
+    if (!pair) return null;
+    bytes.push(pair[0], pair[1]);
+  }
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes));
+    return decoded && decoded !== run.join("") ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function recoverGb18030Mojibake(value: string): string {
+  const characters = [...value];
+  if (characters.length < 2
+    || !characters.some((character) => (character.codePointAt(0) ?? 0) > 0x7f)
+    || !GB18030_MOJIBAKE_MARKERS.some((marker) => value.includes(marker))) return value;
+  let result = "";
+  let index = 0;
+  while (index < characters.length) {
+    let bestLength = 0;
+    let best: string | null = null;
+    const run: string[] = [];
+    for (let end = index; end < characters.length; end += 1) {
+      run.push(characters[end]!);
+      const candidate = decodeGb18030MojibakeRun(run);
+      if (candidate !== null) {
+        bestLength = run.length;
+        best = candidate;
+      }
+    }
+    if (best !== null && bestLength >= 2) {
+      result += best;
+      index += bestLength;
+    } else {
+      result += characters[index]!;
+      index += 1;
+    }
+  }
+  return result;
+}
+
+/** Recover only the common UTF-8-as-Latin-1 display corruption pattern. */
+export function recoverMojibake(value: string): string {
+  let recovered = value;
+  if (MOJIBAKE_MARKERS.some((marker) => value.includes(marker))) {
+    try {
+      if (![...value].some((character) => character.charCodeAt(0) > 255)) {
+        const bytes = Uint8Array.from([...value].map((character) => character.charCodeAt(0)));
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        const sourceScore = MOJIBAKE_MARKERS.reduce((score, marker) => score + value.split(marker).length - 1, 0);
+        const decodedScore = MOJIBAKE_MARKERS.reduce((score, marker) => score + decoded.split(marker).length - 1, 0);
+        if (decodedScore < sourceScore) recovered = decoded;
+      }
+    } catch {
+      // Try the GB18030 path below; malformed Latin-1 text is left intact.
+    }
+  }
+  return recoverGb18030Mojibake(recovered);
+}
+
 function textValue(value: unknown): string {
-  return typeof value === "string" ? value : "";
+  return typeof value === "string" ? recoverMojibake(value) : "";
 }
 
 function numberText(value: unknown): string {
@@ -309,6 +557,83 @@ function normalizeCompactionStatus(value: unknown): CompactionStatusProjection {
   return { state, trigger: state === "idle" ? null : trigger, changed: state === "running" ? null : changed };
 }
 
+function normalizeTodo(value: unknown): TodoItem[] {
+  const source = asRecord(value);
+  const items = Array.isArray(source?.items) ? source.items : [];
+  return items.map((item) => {
+    const row = asRecord(item);
+    return {
+      content: textValue(row?.content),
+      status: row?.status === "completed" || row?.status === "in_progress" ? row.status : "pending",
+    } as TodoItem;
+  });
+}
+
+function normalizePendingInteraction(value: unknown): PendingInteraction | null {
+  const pause = asRecord(value);
+  if (!pause) return null;
+  const rawKind = textValue(pause.kind);
+  const kind: InteractionKind = rawKind === "user_input_required" || rawKind === "provider_unavailable" || rawKind === "permission_required" || rawKind === "plan_review_required"
+    ? rawKind
+    : "user_requested";
+  const request = asRecord(pause.user_input_request ?? pause.permission_request ?? pause.plan_review_request);
+  const pauseId = nonEmptyText(pause.pause_id);
+  const runId = nonEmptyText(pause.run_id);
+  const turnId = nonEmptyText(pause.turn_id);
+  if (!pauseId || !runId || !turnId) return null;
+  return {
+    kind,
+    pauseId,
+    runId,
+    turnId,
+    toolCallId: nonEmptyText(pause.tool_call_id) ?? undefined,
+    request: request ?? undefined,
+    reason: nonEmptyText(pause.reason) ?? undefined,
+    iteration: positiveInteger(pause.iteration) ?? undefined,
+  };
+}
+
+function sessionRuntimeFromSource(source: Record<string, JsonValue>, replay: TimelineEntry[], fallback: SessionRuntimeSnapshot | null): SessionRuntimeSnapshot | null {
+  const sessionState = asRecord(source.session_state);
+  if (!sessionState && !fallback) return null;
+  const root = sessionState ?? {};
+  const run = normalizeRun(root.run ?? source.run) ?? fallback?.run ?? null;
+  const runStatus = textValue(run?.status).toLowerCase();
+  const pending = normalizePendingInteraction(root.pending_pause ?? source.pending_pause) ?? fallback?.pendingInteraction ?? null;
+  const taskState = root.task_state ?? source.task_state;
+  const todo = taskState !== undefined ? normalizeTodo(taskState) : fallback?.todo ?? [];
+  const iterationValue = root.todo_iteration ?? source.todo_iteration;
+  const todoIteration = typeof iterationValue === "number" && Number.isSafeInteger(iterationValue) && iterationValue >= 0
+    ? iterationValue
+    : fallback?.todoIteration ?? 0;
+  const app = asRecord(root.application ?? source.application);
+  const contextValue = app?.context_status ?? root.context_status ?? source.context_status;
+  const compactionValue = app?.compaction_status ?? root.compaction_status ?? source.compaction_status;
+  const activeValue = Object.prototype.hasOwnProperty.call(root, "active_turn") ? root.active_turn : source.active_turn;
+  const activeTurn = activeValue === true || (activeValue !== false && (runStatus === "running" || runStatus === "paused" || runStatus === "pausing"))
+    ? true
+    : activeValue === false ? false : fallback?.activeTurn ?? false;
+  const turnStatus: RendererState["turnStatus"] = activeValue === false
+    ? "idle"
+    : pending
+    ? "paused"
+    : runStatus === "paused" ? "paused" : runStatus === "pausing" ? "pausing" : activeTurn ? "running" : fallback?.turnStatus ?? "idle";
+  return {
+    timeline: fallback?.timeline?.length ? fallback.timeline : replay,
+    todo,
+    todoIteration,
+    run,
+    contextUsage: contextValue !== undefined ? normalizeContextUsage(contextValue) : fallback?.contextUsage ?? contextUsageAtBoundary(),
+    compactionStatus: compactionValue !== undefined ? normalizeCompactionStatus(compactionValue) : fallback?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
+    permissionMode: permissionModeOf(run),
+    activeTurn,
+    terminalStatusPending: activeValue === false ? false : fallback?.terminalStatusPending ?? false,
+    turnStatus,
+    pendingInteraction: pending,
+    completionBlocked: fallback?.completionBlocked ?? null,
+  };
+}
+
 function shortId(value: string): string {
   return value.length > 8 ? value.slice(0, 8) : value;
 }
@@ -333,12 +658,28 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
     timeline_checkpoint_id: typeof source?.timeline_checkpoint_id === "string" ? source.timeline_checkpoint_id : null,
     transcript_entries: typeof source?.transcript_entries === "number" ? source.transcript_entries : 0,
     corrupt: source?.corrupt === true,
+    model_ref: source?.model_ref === null ? null : nonEmptyText(source?.model_ref),
+    runtime_status: source?.runtime_status === "running" || source?.runtime_status === "waiting" || source?.runtime_status === "completed" || source?.runtime_status === "failed" || source?.runtime_status === "cancelled"
+      ? source.runtime_status
+      : "idle",
   };
 }
 
 function applySessionPins(sessions: SessionSummary[], projectKey: string, pinnedSessions: DesktopPreferences["pinnedSessions"]): SessionSummary[] {
   const pinned = new Set(pinnedSessions.filter((item) => item.projectKey === projectKey).map((item) => item.sessionId));
   return sessions.map((session) => ({ ...session, pinned: pinned.has(session.session_id) }));
+}
+
+function mergeSessionModels(
+  existing: Record<string, string>,
+  sessions: readonly SessionSummary[],
+): Record<string, string> {
+  const next = { ...existing };
+  sessions.forEach((session) => {
+    const model = nonEmptyText(session.model_ref);
+    if (model) next[session.session_id] = model;
+  });
+  return next;
 }
 
 /**
@@ -491,18 +832,19 @@ function resultRecord(value: unknown): Record<string, JsonValue> {
 }
 
 export function applyProjectOpened(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
+  const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
   const source = resultRecord(result);
   const project = resultRecord(source.project);
   const path = normalizeProjectPath(project.path);
   if (!path) return { ...state, runtimeError: "Project path is unavailable" };
-  const existing = state.projects.find((item) => item.projectKey === path);
+  const existing = stateWithCache.projects.find((item) => item.projectKey === path);
   const incomingSessions = Array.isArray(source.sessions)
     ? source.sessions.map((item) => normalizeSession(item, path)).filter((item): item is SessionSummary => item !== null)
     : [];
   const sessions = preserveSessionOrder(existing?.sessions ?? [], incomingSessions, "project_open");
   const nextRun = normalizeRun(source.run);
   return {
-    ...permissionUnknownAtRunBoundary(replaceProject(state, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, state.pinnedSessions), catalogFresh: true }), nextRun),
+    ...permissionUnknownAtRunBoundary(replaceProject(stateWithCache, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, stateWithCache.pinnedSessions), catalogFresh: true }), nextRun),
     selectedProjectKey: path,
     selectedSessionId: null,
     timeline: [],
@@ -513,8 +855,9 @@ export function applyProjectOpened(state: RendererState, result: unknown, preser
     turnStatus: "idle",
     pendingInteraction: null,
     contextUsage: contextUsageAtBoundary(),
-    sessionViewRevision: state.sessionViewRevision + 1,
-    runtimeState: preserveRuntimeState ? state.runtimeState : "ready",
+    sessionModels: mergeSessionModels(stateWithCache.sessionModels, sessions),
+    sessionViewRevision: stateWithCache.sessionViewRevision + 1,
+    runtimeState: preserveRuntimeState ? stateWithCache.runtimeState : "ready",
     runtimeError: null,
     view: "chat",
   };
@@ -528,32 +871,55 @@ export function applyCatalogRefreshed(state: RendererState, projectKey: string, 
   return {
     ...replaced,
     projects: replaced.projects.map((item) => item.projectKey === projectKey ? { ...item, sessions, catalogFresh: true } : item),
+    sessionModels: mergeSessionModels(state.sessionModels, sessions),
   };
 }
 
 export function applySessionResumed(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
+  const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
   const source = resultRecord(result);
   const sessionId = nonEmptyText(source.session_id);
   if (!sessionId) return { ...state, runtimeError: "Session identity is unavailable" };
   const projectKey = state.selectedProjectKey;
-  const boundary = permissionUnknownAtRunBoundary(state, source.run);
-  return {
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  const cached = stateWithCache.sessionRuntime[key] ?? null;
+  const replay = replayToTimeline(Array.isArray(source.replay) ? source.replay : []);
+  const sourceSessionState = asRecord(source.session_state);
+  const sourceRun = normalizeRun(sourceSessionState?.run ?? source.run);
+  const sourceRunStatus = textValue(sourceRun?.status).toLowerCase();
+  const canRestoreLiveCache = sourceSessionState !== null
+    || source.active_turn === true
+    || sourceRunStatus === "running" || sourceRunStatus === "paused" || sourceRunStatus === "pausing";
+  const runtime = sessionRuntimeFromSource(source, replay, canRestoreLiveCache ? cached : null);
+  const boundary = permissionUnknownAtRunBoundary(stateWithCache, runtime?.run ?? source.run);
+  const resumedRun = boundary.run;
+  const currentModel = nonEmptyText(source.model_ref);
+  const catalogModel = projectKey
+    ? stateWithCache.projects.find((project) => project.projectKey === projectKey)?.sessions.find((session) => session.session_id === sessionId)?.model_ref
+    : null;
+  const sessionModel = currentModel ?? nonEmptyText(catalogModel);
+  const next: RendererState = {
     ...boundary,
     selectedSessionId: sessionId,
-    timeline: replayToTimeline(Array.isArray(source.replay) ? source.replay : []),
-    todo: [],
-    todoIteration: 0,
-    activeTurn: false,
-    terminalStatusPending: false,
-    turnStatus: "idle",
-    pendingInteraction: null,
-    contextUsage: contextUsageAtBoundary(),
-    sessionViewRevision: state.sessionViewRevision + 1,
+    timeline: runtime?.timeline ?? replay,
+    todo: runtime?.todo ?? [],
+    todoIteration: runtime?.todoIteration ?? 0,
+    activeTurn: runtime?.activeTurn ?? false,
+    terminalStatusPending: runtime?.terminalStatusPending ?? false,
+    turnStatus: runtime?.turnStatus ?? "idle",
+    pendingInteraction: runtime?.pendingInteraction ?? null,
+    contextUsage: runtime?.contextUsage ?? contextUsageAtBoundary(),
+    compactionStatus: runtime?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
+    completionBlocked: runtime?.completionBlocked ?? null,
+    ...(sessionModel ? { currentModelRef: sessionModel, sessionModels: { ...stateWithCache.sessionModels, [sessionId]: sessionModel } } : {}),
+    sessionViewRevision: stateWithCache.sessionViewRevision + 1,
     runtimeError: null,
-    runtimeState: preserveRuntimeState ? state.runtimeState : "ready",
+    runtimeState: preserveRuntimeState ? stateWithCache.runtimeState : "ready",
     notice: "Session resumed",
-    ...(projectKey ? { projects: state.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
+    ...(runtime ? { sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } } : {}),
+    ...(projectKey ? { projects: stateWithCache.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
   };
+  return updateSessionRuntimeStatus(next, projectKey, sessionId, runtime ? runtimeStatus(runtime) : "idle");
 }
 
 /**
@@ -644,6 +1010,26 @@ function appendStatus(state: RendererState, text: string, status: TimelineStatus
     ...state,
     timeline: [...state.timeline, { id, kind: "status", text, status }],
     nextStatusId: state.nextStatusId + 1,
+  };
+}
+
+/**
+ * Keep the visible Context ring moving between throttled status snapshots.
+ * The Application remains authoritative; this small projection is replaced
+ * by the next provider-counted status and is never used as a hard gate.
+ */
+function applyLiveContextDelta(state: RendererState, text: string): RendererState {
+  const usage = state.contextUsage;
+  if (!usage.available || usage.budget_tokens <= 0 || !text) return state;
+  const delta = Math.max(1, Math.ceil([...text].length / 4));
+  return {
+    ...state,
+    contextUsage: {
+      ...usage,
+      used_tokens: Math.min(usage.budget_tokens, usage.used_tokens + delta),
+      measurement: "estimate",
+      source: "turn",
+    },
   };
 }
 
@@ -836,12 +1222,14 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   }
   if (type === "reasoning_delta") {
     const id = eventId("reasoning", payload);
-    const existing = state.timeline.find((entry) => entry.id === id);
+    const text = textValue(payload.text);
+    const withEstimate = applyLiveContextDelta(state, text);
+    const existing = withEstimate.timeline.find((entry) => entry.id === id);
     if (existing) {
       if (!existing.streaming) return state;
-      return updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), streaming: true }));
+      return updateTimelineEntry(withEstimate, id, (entry) => ({ ...entry, text: entry.text + text, streaming: true }));
     }
-    return { ...state, timeline: [...state.timeline, { id, kind: "reasoning", text: textValue(payload.text), turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
+    return { ...withEstimate, timeline: [...withEstimate.timeline, { id, kind: "reasoning", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_finished") {
     const id = eventId("reasoning", payload);
@@ -850,7 +1238,8 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (type === "assistant_message_delta") {
     const id = eventId("assistant", payload);
     const text = textValue(payload.text);
-    const reasoningClosed = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
+    const estimated = applyLiveContextDelta(state, text);
+    const reasoningClosed = { ...estimated, timeline: estimated.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     const existing = reasoningClosed.timeline.find((entry) => entry.id === id);
     if (existing) {
       if (!existing.streaming) return state;
@@ -889,7 +1278,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const iteration = positiveInteger(payload.iteration);
     const toolCallId = nonEmptyText(payload.tool_call_id);
     if ((cancelled || failed) && eventRunId && iteration !== null && toolCallId) next = planTerminalForTool(next, eventRunId, turnId, iteration, toolCallId, cancelled ? "cancelled" : "failed");
-    return next;
+    return applyLiveContextDelta(next, `${textValue(payload.tool_name)} ${textValue(payload.status)}`.trim());
   }
   if (type === "task_state_changed") {
     const iteration = positiveInteger(payload.iteration);
@@ -905,7 +1294,10 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
           return { content: textValue(item.content), status };
         })
       : [];
-    return { ...state, todo: items, ...(iteration !== null ? { todoIteration: iteration } : {}) };
+    return applyLiveContextDelta(
+      { ...state, todo: items, ...(iteration !== null ? { todoIteration: iteration } : {}) },
+      JSON.stringify(taskState ?? {}),
+    );
   }
   if (type === "plan_content_delta") {
     const runId = eventRunId;
@@ -916,10 +1308,10 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const finalized = identityEntries.find((entry) => !entry.streaming && entry.planState === "final");
     if (finalized) return state;
     const existing = identityEntries.find((entry) => entry.streaming && entry.toolCallId === toolCallId);
-    if (existing) return updateTimelineEntry(state, existing.id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), status: "streaming", streaming: true, planState: "draft" }));
+    if (existing) return applyLiveContextDelta(updateTimelineEntry(state, existing.id, (entry) => ({ ...entry, text: entry.text + textValue(payload.text), status: "streaming", streaming: true, planState: "draft" })), textValue(payload.text));
     const id = `plan-draft:${runId}:${turnId}:${iteration}:${toolCallId}`;
     if (state.timeline.some((entry) => entry.id === id)) return state;
-    return { ...state, timeline: [...state.timeline, { id, kind: "plan", text: textValue(payload.text), runId, turnId, iteration, toolCallId, status: "streaming", streaming: true, planState: "draft" }] };
+    return applyLiveContextDelta({ ...state, timeline: [...state.timeline, { id, kind: "plan", text: textValue(payload.text), runId, turnId, iteration, toolCallId, status: "streaming", streaming: true, planState: "draft" }] }, textValue(payload.text));
   }
   if (type === "plan_proposed") {
     const runId = eventRunId;
@@ -967,7 +1359,21 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     return appendStatus(next, `Waiting for ${label}`, "info");
   }
   if (type === "turn_resumed") return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true, terminalStatusPending: false }, "Interaction answered", "info");
-  if (type === "usage_updated") return { ...state, run: { ...(state.run ?? {}), usage: asRecord(payload.usage) ?? undefined } };
+  if (type === "usage_updated") {
+    const usage = asRecord(payload.usage);
+    const inputTokens = usage && typeof usage.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0
+      ? usage.input_tokens
+      : null;
+    const contextUsage = inputTokens !== null && state.contextUsage.available
+      ? {
+        ...state.contextUsage,
+        used_tokens: Math.min(inputTokens, state.contextUsage.budget_tokens),
+        measurement: "estimate" as const,
+        source: "turn",
+      }
+      : state.contextUsage;
+    return { ...state, run: { ...(state.run ?? {}), usage: usage ?? undefined }, contextUsage };
+  }
   if (type === "behavior_mode_changed") return { ...state, run: { ...(state.run ?? {}), behavior_mode: textValue(payload.behavior_mode) } };
   if (type === "turn_completed") {
     const runId = eventRunId ?? textValue(payload.run_id);
@@ -1006,7 +1412,8 @@ export type RendererAction =
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
   | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
-  | { type: "session_new"; sessionId: string; run: unknown }
+  | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null }
+  | { type: "compaction_started"; trigger?: CompactionTrigger }
   | { type: "agent_event"; event: AgentEvent }
   | { type: "interaction_submitting"; value: boolean }
   | { type: "session_mutation_busy"; value: boolean }
@@ -1084,19 +1491,55 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const runtimeState = runtimeStateFromProjection(source.runtime);
       const currentModelRef = nonEmptyText(application?.current_model);
       const contextValue = application?.context_status;
+      const legacyContextPresent = application !== null && Object.prototype.hasOwnProperty.call(application, "context_usage");
       const compactionValue = application && Object.prototype.hasOwnProperty.call(application, "compaction_status")
         ? application.compaction_status
         : undefined;
       const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
-      return {
+      const sessionId = state.selectedSessionId;
+      const nextSessionModels = currentModelRef && sessionId
+        ? { ...state.sessionModels, [sessionId]: currentModelRef }
+        : state.sessionModels;
+      const statusSessionId = nonEmptyText(source.session_id) ?? sessionId;
+      const statusProjectKey = nonEmptyText(source.project_key) ?? state.selectedProjectKey;
+      const statusKey = statusSessionId ? sessionRuntimeKey(statusProjectKey, statusSessionId) : null;
+      const hydrated = statusSessionId
+        ? sessionRuntimeFromSource(source, state.timeline, state.sessionRuntime[statusKey as string] ?? null)
+        : null;
+      const nextSessionRuntime = statusKey && hydrated
+        ? { ...state.sessionRuntime, [statusKey]: hydrated }
+        : state.sessionRuntime;
+      const visibleHydrated = statusSessionId === sessionId && hydrated ? hydrated : null;
+      const statusState: RendererState = {
         ...state,
         ...(runtimeState ? { runtimeState } : {}),
         ...(source.active_turn === true || source.active_turn === false ? { activeTurn } : {}),
         ...(source.active_turn === false ? { terminalStatusPending: false } : {}),
         ...(currentModelRef ? { currentModelRef } : {}),
-        contextUsage: normalizeContextUsage(contextValue),
+        sessionModels: nextSessionModels,
+        // A partial status response is allowed during transport recovery. It
+        // must not erase the last complete Context measurement or Compaction
+        // state that the Application already published.
+        ...(contextValue !== undefined
+          ? { contextUsage: normalizeContextUsage(contextValue) }
+          : legacyContextPresent
+            ? { contextUsage: contextUsageAtBoundary() }
+            : {}),
         ...(compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
+        ...(visibleHydrated ? {
+          timeline: visibleHydrated.timeline,
+          todo: visibleHydrated.todo,
+          todoIteration: visibleHydrated.todoIteration,
+          run: visibleHydrated.run ?? state.run,
+          activeTurn: visibleHydrated.activeTurn,
+          terminalStatusPending: visibleHydrated.terminalStatusPending,
+          turnStatus: visibleHydrated.turnStatus,
+          pendingInteraction: visibleHydrated.pendingInteraction,
+          completionBlocked: visibleHydrated.completionBlocked,
+        } : {}),
+        sessionRuntime: nextSessionRuntime,
       };
+      return hydrated && statusSessionId ? updateSessionRuntimeStatus(statusState, statusProjectKey, statusSessionId, runtimeStatus(hydrated)) : statusState;
     }
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
@@ -1108,10 +1551,55 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return applySessionResumed(state, action.result, action.preserveRuntimeState);
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
-    case "session_new":
-      return { ...permissionUnknownAtRunBoundary(state, action.run), selectedSessionId: action.sessionId, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle", pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1, notice: "New Session", runtimeError: null };
-    case "agent_event":
-      return reduceAgentEvent(state, action.event);
+    case "session_new": {
+      const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
+      const modelRef = nonEmptyText(action.modelRef);
+      const next: RendererState = {
+        ...permissionUnknownAtRunBoundary(stateWithCache, action.run),
+        selectedSessionId: action.sessionId,
+        timeline: [],
+        todo: [],
+        todoIteration: 0,
+        activeTurn: false,
+        terminalStatusPending: false,
+        turnStatus: "idle",
+        pendingInteraction: null,
+        contextUsage: contextUsageAtBoundary(),
+        compactionStatus: { state: "idle", trigger: null, changed: null },
+        ...(modelRef ? { currentModelRef: modelRef, sessionModels: { ...stateWithCache.sessionModels, [action.sessionId]: modelRef } } : {}),
+        sessionViewRevision: stateWithCache.sessionViewRevision + 1,
+        notice: "New Session",
+        runtimeError: null,
+      };
+      const key = sessionRuntimeKey(stateWithCache.selectedProjectKey, action.sessionId);
+      const runtime = runtimeSnapshotFromState(next);
+      return updateSessionRuntimeStatus({ ...next, sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } }, stateWithCache.selectedProjectKey, action.sessionId, "idle");
+    }
+    case "compaction_started":
+      return { ...state, compactionStatus: { state: "running", trigger: action.trigger ?? "manual", changed: null }, notice: null };
+    case "agent_event": {
+      const event = action.event as Record<string, JsonValue>;
+      const eventSessionId = nonEmptyText(event.session_id);
+      const eventProjectKey = nonEmptyText(event.project_key) ?? state.selectedProjectKey;
+      const offscreen = Boolean(eventSessionId && (eventSessionId !== state.selectedSessionId || (eventProjectKey && eventProjectKey !== state.selectedProjectKey)));
+      if (!offscreen) {
+        const next = reduceAgentEvent(state, action.event);
+        return cacheVisibleRuntime(
+          updateSessionRuntimeStatus(next, state.selectedProjectKey, state.selectedSessionId ?? "", runtimeStatus(runtimeSnapshotFromState(next))),
+          state.selectedProjectKey,
+          state.selectedSessionId,
+        );
+      }
+      const key = sessionRuntimeKey(eventProjectKey, eventSessionId as string);
+      const cached = state.sessionRuntime[key];
+      const base = cached
+        ? applyRuntimeSnapshot(emptyRuntimeBoundary(state), cached)
+        : emptyRuntimeBoundary(state);
+      const next = reduceAgentEvent(base, action.event);
+      const snapshot = runtimeSnapshotFromState(next);
+      const stored = { ...state.sessionRuntime, [key]: snapshot };
+      return updateSessionRuntimeStatus({ ...state, sessionRuntime: stored }, eventProjectKey, eventSessionId as string, runtimeStatus(snapshot));
+    }
     case "interaction_submitting":
       return state.pendingInteraction ? { ...state, pendingInteraction: { ...state.pendingInteraction, submitting: action.value } } : state;
     case "session_mutation_busy":
@@ -1139,6 +1627,22 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const params = asRecord(source.params);
       const notice = action.notice ?? null;
       const actionValue = asRecord(source.ui_action);
+      if (source.code === "compact_failed" || source.code === "compact_cancelled" || source.code === "compact_no_change" || source.code === "compact_completed") {
+        const compactState: CompactionState = source.code === "compact_failed"
+          ? "failed"
+          : source.code === "compact_cancelled"
+            ? "cancelled"
+            : source.code === "compact_no_change"
+              ? "no_change"
+              : "completed";
+        return {
+          ...state,
+          compactionStatus: { state: compactState, trigger: "manual", changed: compactState === "completed" ? true : compactState === "no_change" ? false : null },
+          commandOutput: notice,
+          notice,
+          composerText: "",
+        };
+      }
       // `/status` carries the same safe projection as `status.get`.  Consume
       // that typed payload directly so the command does not depend on a
       // second status RPC (which may be unavailable or stale) before the
@@ -1165,7 +1669,9 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       if (sessionChanged && typeof actionValue.session_id === "string") {
         const replay = params?.replay;
         const run = params?.run;
-        const next = actionValue.restored === true ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run }) : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: false, terminalStatusPending: false, turnStatus: "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), sessionViewRevision: state.sessionViewRevision + 1 };
+        const next = actionValue.restored === true
+          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref })
+          : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: notice, composerText: "" };
@@ -1180,11 +1686,21 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         const run = actionValue.type === "behavior_mode_selected" && typeof actionValue.mode === "string"
           ? { ...(state.run ?? {}), behavior_mode: actionValue.mode }
           : projectedRun ?? state.run;
-        const currentModelRef = actionValue.type === "model_selected" ? nonEmptyText(actionValue.model_ref) ?? state.currentModelRef : state.currentModelRef;
+        const selectedModelRef = actionValue.type === "model_selected" ? nonEmptyText(actionValue.model_ref) : null;
+        const currentModelRef = selectedModelRef ?? state.currentModelRef;
         const contextUsage = actionValue.type === "model_selected"
           ? contextUsageAtBoundary()
           : state.contextUsage;
-        return { ...state, run, permissionMode, currentModelRef, contextUsage, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
+        const sessionModels = selectedModelRef && state.selectedSessionId
+          ? { ...state.sessionModels, [state.selectedSessionId]: selectedModelRef }
+          : state.sessionModels;
+        const projects = selectedModelRef && state.selectedSessionId
+          ? state.projects.map((project) => ({
+            ...project,
+            sessions: project.sessions.map((session) => session.session_id === state.selectedSessionId ? { ...session, model_ref: selectedModelRef } : session),
+          }))
+          : state.projects;
+        return { ...state, run, permissionMode, currentModelRef, sessionModels, projects, contextUsage, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: notice, notice, composerText: "" };
       return { ...state, commandOutput: notice, notice, composerText: "" };

@@ -6,6 +6,8 @@ TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Deskt
 
 Desktop Settings 修改已配置 Provider ID 时会提交显式 rename 映射，并同步更新引用该 Provider 的 Model Profile。未输入新 key 时，用户配置中原有的 literal 或 `env:VARIABLE_NAME` 表达会原样保留；只有输入 replacement key 时才替换该值。Provider ID 冲突或不存在的源 ID 会拒绝整次写入，失败不会改动配置文件。
 
+Desktop 的每个持久 Session 还保存自身的可选模型偏好 `model_ref`。在 Composer 中切换模型时，UthCode 会先验证 Provider/输入上限，再原子更新用户级 `default_model`、当前 Session 的模型偏好和该 Session 的运行时 Context；任一步失败都不会发布部分更新。恢复一个旧 Session 时会恢复它自己的模型，但不改写后来用于新建 Session 的用户默认模型；因此新建 Session 始终采用当前用户级 `default_model`。
+
 ## `config.toml`
 
 用户配置位于 `~/.uthcode/config.toml`，项目配置位于 `<项目目录>/.uthcode/config.toml`。

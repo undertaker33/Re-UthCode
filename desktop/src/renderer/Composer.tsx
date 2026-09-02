@@ -18,6 +18,7 @@ export function permissionSelectValue(mode: PermissionModeProjection): string {
 
 type CompletionOption = {
   value: string;
+  display?: string;
   description?: string;
 };
 
@@ -112,7 +113,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "runtimeState" | "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration">;
+  state: Pick<RendererState, "runtimeState" | "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
   onChange: (text: string) => void;
   onSubmit: (text: string) => void | Promise<void>;
   onCommand: (text: string) => void | Promise<void>;
@@ -138,7 +139,15 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
     if (pending || terminalStatusPending || runtimeRestarting || !slashMode) return [];
-    if (state.argumentCandidates.length > 0) return state.argumentCandidates.map((value) => ({ value }));
+    if (state.argumentCandidates.length > 0) {
+      const command = state.composerText.trimStart().split(/\s+/u)[0]?.toLowerCase() ?? "";
+      return state.argumentCandidates.map((value) => ({
+        value,
+        // The wire value remains the canonical model ref used by onCommand;
+        // only the visible completion label is user-facing.
+        display: command === "/model" ? modelDisplayName(state.configuration, value) : value,
+      }));
+    }
     return state.commandCandidates
       .filter((candidate) => {
         const value = candidate.value.trim().split(/\s+/u)[0] ?? "";
@@ -148,8 +157,8 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
         value: candidate.value,
         description: localizedCommandDescription(candidate.value, t),
       }));
-  }, [language, pending, runtimeRestarting, slashMode, state.argumentCandidates, state.commandCandidates, terminalStatusPending]);
-  const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
+  }, [language, pending, runtimeRestarting, slashMode, state.argumentCandidates, state.commandCandidates, state.composerText, state.configuration, terminalStatusPending]);
+  const candidateSignature = useMemo(() => candidates.map((candidate) => `${candidate.value}\u0000${candidate.display ?? ""}\u0000${candidate.description ?? ""}`).join("\u0001"), [candidates]);
 
   useEffect(() => {
     setActiveCompletion(edgeCompletionIndex(candidates, false));
@@ -240,8 +249,15 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
 
   return (
     <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined}>
+      {state.todo.length > 0 && <section className="composer-todo todo-strip" tabIndex={0} aria-label={t("tasks")} data-iteration={state.todoIteration}>
+        <header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{state.todo.length}</span></header>
+        <ul>{state.todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>
+          <span className="todo-status-icon" title={stateLabel(item.status, t)}><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span>
+          <span>{item.content}</span>
+        </li>)}</ul>
+      </section>}
       {completionOpen && candidates.length > 0 && <div className="command-menu" role="listbox" aria-label={t("commandCompletion")}>
-        {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
+        {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display ?? candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
       <div className="composer-input">
@@ -249,18 +265,25 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
         <div className="composer-actions">
           {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={inputLocked || state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
           {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()} disabled={inputLocked}><UiIcon name="stop" />{t("cancel")}</button>}
-          <button type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+          {/* Keep the historical action hook for integrations that locate the submit
+              control from the input action group. The visible control lives in the
+              bottom toolbar; this zero-area proxy preserves that DOM contract while
+              avoiding a second tab stop or accessible name. */}
+          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || !hasText} />
         </div>
       </div>
       <div className="composer-toolbar">
         <div className="composer-selectors">
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
-        <output id="composer-state" className="composer-state" role="status" aria-live="polite">{runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}</output>
+        <output id="composer-state" className={`composer-state${state.run?.behavior_mode === "plan" ? " is-plan" : ""}${compactionRunning ? " is-compacting" : ""}`} role="status" aria-live="polite">
+          {runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : compactionRunning ? `${t("compaction")} · ${t("running")}` : terminalStatusPending ? t("terminalStatusPending") : state.run?.behavior_mode === "plan" ? `${t("plan")} · ${stateLabel(state.turnStatus, t)}` : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}
+        </output>
         <div className="composer-model">
           <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />
         </div>
+        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
       </div>
     </section>
   );

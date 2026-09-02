@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type RefObject, type SyntheticEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type RefObject } from "react";
 import type { ProjectState, SessionSummary } from "./state";
 import { sessionLabel } from "./state";
 import { UiIcon, type UiIconName } from "./UiIcon";
@@ -30,8 +30,8 @@ export interface SidebarProps {
 }
 
 type MenuTarget =
-  | { kind: "project"; projectKey: string }
-  | { kind: "session"; projectKey: string; sessionId: string; variant: "project" | "recent" };
+  | { kind: "project"; projectKey: string; point?: { x: number; y: number } }
+  | { kind: "session"; projectKey: string; sessionId: string; variant: "project" | "recent"; point?: { x: number; y: number } };
 
 interface MenuAction {
   id: string;
@@ -49,29 +49,42 @@ interface FloatingMenuProps {
   actions: MenuAction[];
   anchorRef: RefObject<HTMLElement | null>;
   onClose: () => void;
+  point?: { x: number; y: number };
 }
 
 const MENU_WIDTH = 244;
 const MENU_MARGIN = 8;
 
-function menuPosition(anchor: HTMLElement, actionCount: number): CSSProperties {
+export function menuPosition(anchor: HTMLElement, actionCount: number, point?: { x: number; y: number }): CSSProperties {
   const rect = anchor.getBoundingClientRect();
   const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth);
   const viewportHeight = Math.max(document.documentElement.clientHeight, window.innerHeight);
   const estimatedHeight = Math.min(380, Math.max(48, actionCount * 40 + 12));
-  const topBelow = rect.bottom + 5;
-  const top = topBelow + estimatedHeight <= viewportHeight - MENU_MARGIN
-    ? topBelow
-    : Math.max(MENU_MARGIN, rect.top - estimatedHeight - 5);
-  const rightOfAnchor = rect.right + 5;
-  const leftOfAnchor = rect.left - MENU_WIDTH - 5;
-  const left = rightOfAnchor + MENU_WIDTH <= viewportWidth - MENU_MARGIN
-    ? rightOfAnchor
-    : Math.max(MENU_MARGIN, Math.min(leftOfAnchor, viewportWidth - MENU_WIDTH - MENU_MARGIN));
-  return { top, left };
+  if (point) {
+    const top = point.y + estimatedHeight <= viewportHeight - MENU_MARGIN
+      ? point.y
+      : point.y - estimatedHeight;
+    const left = point.x + MENU_WIDTH <= viewportWidth - MENU_MARGIN
+      ? point.x
+      : point.x - MENU_WIDTH;
+    return {
+      top: Math.max(MENU_MARGIN, Math.min(top, viewportHeight - estimatedHeight - MENU_MARGIN)),
+      left: Math.max(MENU_MARGIN, Math.min(left, viewportWidth - MENU_WIDTH - MENU_MARGIN)),
+    };
+  }
+  const top = rect.bottom + estimatedHeight <= viewportHeight - MENU_MARGIN
+    ? rect.bottom + 5
+    : rect.top - estimatedHeight - 5;
+  const left = rect.right + MENU_WIDTH <= viewportWidth - MENU_MARGIN
+    ? rect.right + 5
+    : rect.left - MENU_WIDTH - 5;
+  return {
+    top: Math.max(MENU_MARGIN, Math.min(top, viewportHeight - estimatedHeight - MENU_MARGIN)),
+    left: Math.max(MENU_MARGIN, Math.min(left, viewportWidth - MENU_WIDTH - MENU_MARGIN)),
+  };
 }
 
-function FloatingMenu({ label, actions, anchorRef, onClose }: FloatingMenuProps) {
+function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [position, setPosition] = useState<CSSProperties | null>(null);
@@ -84,7 +97,7 @@ function FloatingMenu({ label, actions, anchorRef, onClose }: FloatingMenuProps)
   useEffect(() => {
     const updatePosition = () => {
       const anchor = anchorRef.current;
-      if (anchor) setPosition(menuPosition(anchor, actions.length));
+      if (anchor) setPosition(menuPosition(anchor, actions.length, point));
     };
     updatePosition();
     window.addEventListener("resize", updatePosition);
@@ -98,7 +111,7 @@ function FloatingMenu({ label, actions, anchorRef, onClose }: FloatingMenuProps)
       window.removeEventListener("resize", updatePosition);
       document.removeEventListener("scroll", updatePosition, true);
     };
-  }, [actions.length, anchorRef, enabledIndexes]);
+  }, [actions.length, anchorRef, enabledIndexes, point]);
 
   const closeMenu = useCallback((restoreFocus = true) => {
     onClose();
@@ -236,6 +249,9 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
   const active = project.projectKey === props.selectedProjectKey;
   const [expanded, setExpanded] = useState(active);
   const [showMore, setShowMore] = useState(props.expandedProjects[project.projectKey] === true);
+  const [selectionReveal, setSelectionReveal] = useState(false);
+  const suppressSelectionReveal = useRef(false);
+  const previousSelectedSession = useRef(props.selectedSessionId);
   const [editing, setEditing] = useState(false);
   const [alias, setAlias] = useState(project.alias);
   const [confirming, setConfirming] = useState(false);
@@ -247,6 +263,13 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
     setShowMore(props.expandedProjects[project.projectKey] === true);
   }, [project.projectKey, props.expandedProjects]);
   useEffect(() => { if (!editing) setAlias(project.alias); }, [editing, project.alias]);
+  useEffect(() => {
+    if (previousSelectedSession.current !== props.selectedSessionId) {
+      previousSelectedSession.current = props.selectedSessionId;
+      suppressSelectionReveal.current = false;
+      setSelectionReveal(false);
+    }
+  }, [props.selectedSessionId]);
 
   const commitAlias = () => {
     const next = alias.trim();
@@ -293,21 +316,20 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
   // Keep the selected row visible without changing the authoritative session
   // order.  The derived flag is intentionally not persisted as a pin or a
   // catalog mutation; the user's explicit "show more" choice remains stable.
-  const visibleShowMore = showMore || (selectedInProject && !selectedVisibleInCollapsedList);
+  const visibleShowMore = showMore || selectionReveal;
   const visibleGroups = sessionGroups(project.sessions, visibleShowMore);
   const visibleExpanded = expanded || selectedInProject;
   useEffect(() => {
-    if (selectedInProject && !selectedVisibleInCollapsedList && !showMore) {
-      // Persist the stable expansion chosen by the selection itself.  This
-      // keeps a selected sixth row visible across the next catalog refresh or
-      // component remount without changing the catalog order.
-      setShowMore(true);
-      props.onProjectExpandedChange(project.projectKey, true);
+    if (selectedInProject && !selectedVisibleInCollapsedList && !showMore && !selectionReveal && !suppressSelectionReveal.current) {
+      // Reveal a newly selected row once, without mutating the user's
+      // persisted expansion choice.  The explicit Show less action may then
+      // hide that row while leaving the main chat selection intact.
+      setSelectionReveal(true);
     }
-  }, [project.projectKey, props.onProjectExpandedChange, selectedInProject, selectedVisibleInCollapsedList, showMore]);
-  const openMenu = (event?: SyntheticEvent) => {
+  }, [selectedInProject, selectedVisibleInCollapsedList, selectionReveal, showMore]);
+  const openMenu = (event?: ReactMouseEvent<HTMLElement>) => {
     event?.preventDefault();
-    onMenuTarget(menuOpen ? null : { kind: "project", projectKey: project.projectKey });
+    onMenuTarget(menuOpen ? null : { kind: "project", projectKey: project.projectKey, point: event ? { x: event.clientX, y: event.clientY } : undefined });
   };
 
   return <li className={`project-item${active ? " is-active" : ""}`}>
@@ -357,7 +379,7 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
           onClick={openMenu}
         ><UiIcon name="more" /></button>
       </div>
-      {menuOpen && <FloatingMenu label={`${project.alias} ${t("more")}`} actions={actions} anchorRef={menuAnchorRef} onClose={() => onMenuTarget(null)} />}
+      {menuOpen && <FloatingMenu label={`${project.alias} ${t("more")}`} actions={actions} anchorRef={menuAnchorRef} point={menuTarget?.kind === "project" ? menuTarget.point : undefined} onClose={() => onMenuTarget(null)} />}
     </div>
     {confirming && <div className="remove-confirm" role="alertdialog" aria-label={`${t("remove")} ${project.alias}`}>
       <p>{t("removeProjectQuestion")}</p>
@@ -378,6 +400,8 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
         onClick={() => {
           const next = !visibleShowMore;
           setShowMore(next);
+          setSelectionReveal(false);
+          suppressSelectionReveal.current = !next;
           props.onProjectExpandedChange(project.projectKey, next);
         }}
       >{visibleShowMore ? t("showLess") : `${t("showMore")} (${groups.hiddenCount})`}</button></li>}
@@ -470,11 +494,14 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
     if (next && next !== current) void props.onRenameSession(project, session, next);
     setEditing(false);
   };
-  const openMenu = (event?: SyntheticEvent) => {
+  const openMenu = (event?: ReactMouseEvent<HTMLElement>) => {
     event?.preventDefault();
-    onMenuTarget(menuOpen ? null : { kind: "session", projectKey: project.projectKey, sessionId: session.session_id, variant });
+    onMenuTarget(menuOpen ? null : { kind: "session", projectKey: project.projectKey, sessionId: session.session_id, variant, point: event ? { x: event.clientX, y: event.clientY } : undefined });
   };
   const rowClass = variant === "recent" ? "recent-line" : "session-line";
+  const liveStatus = session.runtime_status ?? "idle";
+  const statusIcon: UiIconName = liveStatus === "completed" ? "check" : liveStatus === "failed" || liveStatus === "cancelled" ? "warning" : liveStatus === "waiting" ? "pause" : liveStatus === "running" ? "status" : "todo";
+  const statusLabel = liveStatus === "waiting" ? t("waiting") : liveStatus === "running" ? t("running") : liveStatus === "completed" ? t("completed") : liveStatus === "failed" ? t("failed") : liveStatus === "cancelled" ? t("cancelled") : t("idle");
   return <li className={`session-item${variant === "recent" ? " recent-session-item" : ""}`}>
     <div
       ref={menuAnchorRef}
@@ -504,7 +531,7 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
         aria-label={sessionInfo(project, session)}
         disabled={session.corrupt === true}
         onClick={() => props.onResumeSession(project, session.session_id)}
-      ><span className="session-dot" /> <span>{sessionLabel(session)}</span>{session.corrupt && <small>{t("recovery")}</small>}{variant === "recent" && <small>{project.alias}</small>}</button>}
+      ><span className={`session-dot session-status-dot is-${liveStatus}`} title={statusLabel} aria-label={statusLabel}><UiIcon name={statusIcon} /></span> <span>{sessionLabel(session)}</span>{session.corrupt && <small>{t("recovery")}</small>}{variant === "recent" && <small>{project.alias}</small>}</button>}
       <button
         type="button"
         className="icon-button menu-trigger session-menu-trigger"
@@ -514,7 +541,7 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
         aria-expanded={menuOpen}
         onClick={openMenu}
       ><UiIcon name="more" /></button>
-      {menuOpen && <FloatingMenu label={`${sessionLabel(session)} ${t("more")}`} actions={actions} anchorRef={menuAnchorRef} onClose={() => onMenuTarget(null)} />}
+      {menuOpen && <FloatingMenu label={`${sessionLabel(session)} ${t("more")}`} actions={actions} anchorRef={menuAnchorRef} point={menuTarget?.kind === "session" ? menuTarget.point : undefined} onClose={() => onMenuTarget(null)} />}
     </div>
   </li>;
 }

@@ -9,7 +9,7 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 
 `uthcode` 启动交互界面。`uthcode exec` 执行一次任务；未提供 `PROMPT` 时从标准输入读取。`exec` 的最终回答写入 stdout，进度和错误写入 stderr。
 
-Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Configuration 公共出口；Slash 命令的名称、参数、权限和 Session 语义与本页 TUI 参考一致。
+Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Configuration 公共出口；Slash 命令的名称、参数、权限和 Session 语义与本页 TUI 参考一致。Desktop 为每个已打开的持久 Session 保留独立运行时投影：切换会话或项目不会取消另一个 Session 的 active Turn，后台状态显示在侧栏；跨进程仍只恢复已提交的 Session 内容。
 
 ## TUI 命令
 
@@ -32,6 +32,8 @@ Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Co
 常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q`、`/exit`。
 
 上表就是当前 Registry 的全部命令；未列出的 Slash 名称返回“未知命令”。`/compact` 不接受额外参数（例如 `/compact -- focus` 是用法错误）。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
+
+在 Desktop 中，Composer 的 `/model` 候选可显示模型的 `display_name`，但提交的仍是配置中的 Model Profile ID。`/plan`、`/do`、`/compact`、`/status` 与 typed interaction 都走 Bridge 的同一 Command/Turn 边界；运行中的 Turn 的 Todo 显示在 Composer 上方，Context ring 和 Runtime panel 只显示 Application 的安全状态投影。
 
 ## `exec` 退出码
 

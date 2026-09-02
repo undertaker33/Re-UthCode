@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-08-28
+snapshot_date: 2026-09-02
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -29,6 +29,7 @@ source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
 | `docs/context/A03-State/` | 状态层当前代码上下文 | Run/Turn、Event、Context、Memory、Todo/Plan、进度任务 |
 | `docs/context/A04-Orchestration/` | 编排层当前代码上下文 | Application、入口、CLI/TUI、Subagent、任务拆分、Multi-Agent 任务 |
 | `docs/context/TUI/` | 当前 TUI 的长期实现上下文；不是工作包 | 修改 TUI 交互、终端渲染、输入、滚动、暂停界面时读取 |
+| `docs/context/GUI/` | 当前 Windows Desktop GUI 的长期实现上下文；不是工作包 | 修改 Desktop Renderer、Electron/Bridge、Project/Session 导航、Composer、Todo/Plan、Settings、Context/Compact 显示时读取 |
 | `docs/work/` | 工作包根目录；直接子目录 `TXX-*` 保存活跃正式工作包，`archive/` 保存历史记录 | 收到需求文件、拆分任务包或执行用户指定 Worker Prompt 时按需读取；工作包规则见 `docs/rules/WorkPackageRules.md` |
 | `docs/work/archive/` | 用户手动归档的已完成工作包；历史证据，不代表当前代码结构 | 当前事实不足、需要追溯已确认需求或历史验收证据时按需读取；禁止默认全量扫描 |
 
@@ -45,8 +46,8 @@ path_migration:
 | --- | --- | --- | --- | --- |
 | 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、固定 PLAN 非 READ 与 unfinished-task 控制检查 | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定控制检查；AskUser 为 1—4 题，选择题始终有自由输入且不再接受旧 `allow_other`/“Other”分支；无 OS Sandbox、动态控制 registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
-| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、Transcript/Timeline、PlanContentDelta/PlanProposed/typed review、动态 Context Budget/Gate（default 256K、effective 256K 使用 Eval 选定的 balanced-208k profile、configured/provider 收紧与 provenance）、Application `context_status`/`compaction_status` 安全投影、Session v3 metadata、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；L4/L5、manual Compact、HistoryRead 与 overflow retry 已进入正式链路；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Windows Desktop Python Runtime/Bridge 适配，Bridge 暴露 Application `context_status`/`compaction_status` 与 typed interactions，真实 prompt/显式命令触发的惰性 Session、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Plan/Task、Steering |
+| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有进程内 Run/Turn、消息、事件、快照、Transcript/Timeline、PlanContentDelta/PlanProposed/typed review、动态 Context Budget/Gate（default 256K、effective 256K 使用 Eval 选定的 balanced-208k profile、configured/provider 收紧与 provenance）、Application `context_status`/`compaction_status` 安全投影、Session v3 metadata 与 Session `model_ref`、History append/reload/metadata touch 与 Instruction State 分阶段 persistence outcome、durable cursor；Desktop live delta 和 per-Session cache 只作显示投影；append 后异常先做结构化 identity reconciliation，未知 durability quarantine active Session writer，要求 close/reopen recovery 后才解除；真正 append 失败的 pending batch 保留原始 Session/Turn identity 并按 FIFO 重试；L4/L5、manual Compact、HistoryRead 与 overflow retry 已进入正式链路；无 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent 应用编排、CLI/TUI 适配、Windows Desktop Python Runtime/Bridge 适配，真实配置的 Desktop 按 Session 保存独立 Application/Run runtime，切换 Session/Project 不取消后台 Turn，Bridge 事件附 Session/Project identity；Bridge 暴露 Application `context_status`/`compaction_status` 与 typed interactions，真实 prompt/显式命令触发的惰性 Session、`/plan`、`/do`、`/new`、`/resume`、`/compact`；Compact、overflow、Timeline aging 和 HistoryRead 均复用 Application orchestrator；status/diagnostics 与 FailureReason/PauseReason 投影由 Application 提供；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Plan/Task、Steering |
 
 ## current-status
 
@@ -112,6 +113,7 @@ desktop/src/renderer/App.tsx
   -> desktop/src/preload.ts -> desktop/src/main.ts -> desktop/src/python-runtime.ts
   -> src/uthcode/interfaces/desktop/bridge.py
   -> 同一 Application/Run/Turn/Core/AgentEvent 链
+  -> Desktop background event 附 `session_id`/`project_key`，由 Renderer 作 per-Session 显示缓存
 ```
 
 配置 contract 当前事实：用户级 `config.toml` 使用 `default_model`、Provider `api_key`（literal 或 `env:VARIABLE_NAME`）、Model `remote_id`/`display_name`/可选 `reasoning_effort`；项目配置不得定义 Provider、端点或凭据等价字段。逻辑 Model Profile ID 仅用于界面和状态，AgentRun 与 direct generation 都把快照的 `remote_id` 写入 `GenerationRequest.model`；`/model` 原子写回只修改用户级 `default_model`。输入运行上限由 configured/provider/default 三类来源按收紧规则解析，未配置时 default 为 `256_000`；effective 为 `256_000` 时，正式 resolver/Turn 使用 Eval 选定的 `balanced-208k` profile，其它窗口按有界自适应派生，并在 Active Turn 内冻结。

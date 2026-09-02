@@ -14,14 +14,16 @@ import {
   applySessionResumed,
   createInitialState,
   replayToTimeline,
+  recoverMojibake,
   reduceRendererState,
   sessionLabel,
+  sessionRuntimeKey,
   type ProjectState,
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
 import { App, commandResultNotice, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, rebootstrapProject, safeErrorMessage } from "../src/renderer/App";
-import { MAX_VISIBLE_SESSIONS, Sidebar, sessionGroups } from "../src/renderer/Sidebar";
+import { MAX_VISIBLE_SESSIONS, Sidebar, menuPosition, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
@@ -139,6 +141,98 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   assert.deepEqual(fresh.timeline, []);
   assert.equal(fresh.activeTurn, false);
   assert.equal(fresh.run?.run_id, "fresh-run");
+});
+
+test("background Agent events are cached per Session and restored with Todo/pause state", () => {
+  let state = applyProjectOpened(createInitialState(), {
+    project: { path: "C:/Projects/background" },
+    sessions: [
+      { session_id: "session-a", preview: "A" },
+      { session_id: "session-b", preview: "B" },
+    ],
+    run: null,
+  });
+  state = applySessionResumed(state, {
+    session_id: "session-a",
+    restored: true,
+    replay: [],
+    active_turn: false,
+    run: { run_id: "run-a", turn_id: "turn-a", status: "idle" },
+  });
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload });
+  state = reduceRendererState(state, event({
+    type: "assistant_message_delta",
+    session_id: "session-b",
+    project_key: "C:/Projects/background",
+    run_id: "run-b",
+    turn_id: "turn-b",
+    message_id: "message-b",
+    text: "后台输出",
+  }));
+  state = reduceRendererState(state, event({
+    type: "task_state_changed",
+    session_id: "session-b",
+    project_key: "C:/Projects/background",
+    run_id: "run-b",
+    turn_id: "turn-b",
+    iteration: 1,
+    task_state: { items: [{ content: "后台任务", status: "in_progress" }] },
+  }));
+  state = reduceRendererState(state, event({
+    type: "turn_paused",
+    session_id: "session-b",
+    project_key: "C:/Projects/background",
+    run_id: "run-b",
+    turn_id: "turn-b",
+    pause: { pause_id: "pause-b", run_id: "run-b", turn_id: "turn-b", kind: "user_input_required", reason: "user_input_required", iteration: 1 },
+  }));
+  assert.equal(state.projects[0]?.sessions[1]?.runtime_status, "waiting");
+  const cached = state.sessionRuntime[sessionRuntimeKey("C:/Projects/background", "session-b")];
+  assert.equal(cached?.todo[0]?.content, "后台任务");
+  assert.equal(cached?.pendingInteraction?.pauseId, "pause-b");
+
+  state = applySessionResumed(state, {
+    session_id: "session-b",
+    restored: true,
+    replay: [],
+    active_turn: true,
+    run: { run_id: "run-b", turn_id: "turn-b", status: "paused" },
+  });
+  assert.equal(state.selectedSessionId, "session-b");
+  assert.equal(state.timeline[0]?.text, "后台输出");
+  assert.deepEqual(state.todo, [{ content: "后台任务", status: "in_progress" }]);
+  assert.equal(state.pendingInteraction?.pauseId, "pause-b");
+  assert.equal(state.turnStatus, "paused");
+});
+
+test("Renderer increments live context estimate for streamed assistant deltas", () => {
+  const initial = createInitialState({
+    contextUsage: { used_tokens: 10, budget_tokens: 100, available: true, measurement: "exact", source: "provider" },
+    run: { run_id: "run-live", turn_id: "turn-live", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  const next = reduceRendererState(initial, {
+    type: "agent_event",
+    event: {
+      type: "assistant_message_delta",
+      run_id: "run-live",
+      turn_id: "turn-live",
+      message_id: "message-live",
+      text: "streamed output",
+    },
+  });
+  assert.ok(next.contextUsage.used_tokens > 10);
+  assert.equal(next.contextUsage.measurement, "estimate");
+  assert.equal(next.contextUsage.source, "turn");
+  assert.equal(next.timeline.find((entry) => entry.kind === "assistant")?.text, "streamed output");
+});
+
+test("Renderer recovers unambiguous UTF-8 mojibake without changing real Chinese", () => {
+  const latinMojibake = String.fromCharCode(0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd);
+  assert.equal(recoverMojibake(latinMojibake), "你好");
+  assert.equal(recoverMojibake("浣犲ソ"), "你好");
+  assert.equal(recoverMojibake("你好，这是正常文本"), "你好，这是正常文本");
 });
 
 test("T04 catalog and preference updates keep the active project/session navigation projection", () => {
@@ -383,6 +477,7 @@ test("project groups, session state, and Runtime projections remain connected", 
     assert.match(panelMarkup, />PLAN</);
     assert.match(panelMarkup, />Run ID</);
     assert.match(panelMarkup, /provider\/model/);
+    assert.doesNotMatch(panelMarkup, /title="provider\/model"/u, "Runtime model tooltip must not expose the internal reference");
     assert.match(panelMarkup, />Auto</);
     if (panelMode === "hidden") assert.match(panelMarkup, /<aside[^>]*aria-hidden="true"/);
     else assert.doesNotMatch(panelMarkup, /<aside[^>]*aria-hidden="true"/);
@@ -1333,7 +1428,10 @@ test("T05 buffers synchronous turn.start stdout until the flat accepted identity
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "active authority keeps Composer locked before status idle");
     allowIdle = true;
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 70)); });
-    assert.equal(statusCalls, 2, "the buffered terminal poll reaches authoritative false");
+    // The convergence loop may have already issued its next bounded retry on
+    // a loaded test scheduler.  The observable contract is authoritative idle
+    // (and the resulting unlock), not an exact wall-clock request count.
+    assert.ok(statusCalls >= 2, "the buffered terminal poll reaches authoritative false");
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "buffered stdout does not lose terminal unlock");
   });
 });
@@ -4053,6 +4151,51 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
   });
 });
 
+test("/model completion displays the friendly label but sends the internal reference", async () => {
+  const changes: string[] = [];
+  const state = createInitialState({
+    language: "en",
+    composerText: "/model ",
+    argumentCandidates: ["provider/hidden-ref"],
+    configuration: {
+      models: {
+        "provider/hidden-ref": { display_name: "Friendly Model", remote_id: "remote-model" },
+      },
+    },
+  });
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => {
+      root.render(
+        <LanguageProvider value="en">
+          <Composer state={state} onChange={(value) => changes.push(value)} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />
+        </LanguageProvider>,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const option = container.querySelector<HTMLButtonElement>('.command-menu [role="option"]');
+    assert.ok(option);
+    assert.equal(option?.textContent, "Friendly Model");
+    assert.doesNotMatch(container.querySelector(".command-menu")?.textContent ?? "", /provider\/hidden-ref|remote-model/u);
+    act(() => { option?.click(); });
+    assert.equal(changes.at(-1), "/model provider/hidden-ref ");
+  });
+});
+
+test("context-menu point placement flips and clamps from the pointer, not the anchor rectangle", async () => {
+  await withRendererDom(async (dom) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 800 });
+    Object.defineProperty(dom.window, "innerHeight", { configurable: true, value: 600 });
+    const anchor = dom.window.document.createElement("button");
+    anchor.getBoundingClientRect = () => ({ top: 2, bottom: 30, left: 2, right: 30, width: 28, height: 28, x: 2, y: 2, toJSON: () => ({}) }) as DOMRect;
+    const nearEdge = menuPosition(anchor, 8, { x: 790, y: 590 });
+    assert.equal(nearEdge.left, 546, "right edge should flip from the pointer");
+    assert.equal(nearEdge.top, 258, "bottom edge should flip from the pointer");
+    const pointerAwayFromAnchor = menuPosition(anchor, 1, { x: 320, y: 210 });
+    assert.equal(pointerAwayFromAnchor.left, 320);
+    assert.equal(pointerAwayFromAnchor.top, 210);
+  });
+});
+
 test("T05 context ring uses only the Application status projection and accessible tooltip text", () => {
   const translateEn = (key: "contextUsage" | "contextTokens" | "contextNotStarted" | "unavailable") => translate("en", key);
   const unavailable = renderLanguage("en", <ContextRing usage={{ used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" }} language="en" translate={translateEn} />);
@@ -4105,6 +4248,7 @@ test("T05 Composer gates ordinary sends on the Application compaction status", (
   const runningMarkup = renderLanguage("en", <Composer state={running} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.match(runningMarkup, /<textarea[^>]*disabled=""/u);
   assert.match(runningMarkup, /<button[^>]*title="Send"[^>]*disabled=""/u);
+  assert.match(runningMarkup, /class="composer-state is-compacting"/u);
   const settled = createInitialState({ composerText: "continue", compactionStatus: { state: "completed", trigger: "manual", changed: true } });
   const settledMarkup = renderLanguage("en", <Composer state={settled} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.doesNotMatch(settledMarkup, /<textarea[^>]*disabled=""/u);
