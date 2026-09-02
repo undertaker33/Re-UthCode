@@ -24,16 +24,19 @@ default_permission_mode = \"default\"
 [providers.slot-1]
 kind = \"\"
 api_key = \"\"
+# display_name = \"\"
 # base_url = \"\"
 
 [providers.slot-2]
 kind = \"\"
 api_key = \"\"
+# display_name = \"\"
 # base_url = \"\"
 
 [providers.slot-3]
 kind = \"\"
 api_key = \"\"
+# display_name = \"\"
 # base_url = \"\"
 
 [models.\"slot-1\"]

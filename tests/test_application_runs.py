@@ -677,7 +677,7 @@ async def test_same_run_history_is_retained_and_different_runs_are_isolated() ->
         "assistant",
         "user",
     ]
-    assert _without_context(first_second_request.messages[0]).parts == (
+    assert first_second_conversation[0].parts == (
         TextPart("first question"),
     )
     assert _latest_user_text(isolated_request) == "isolated question"

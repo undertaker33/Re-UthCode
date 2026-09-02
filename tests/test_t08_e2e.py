@@ -237,13 +237,14 @@ def _new_tool_results_from_follow_up_requests(
     previous_messages = _without_context(provider.requests[0].messages)
     for request in provider.requests[1:]:
         current_messages = request.messages
-        assert _without_context(current_messages[: len(previous_messages)]) == previous_messages
-        for message in current_messages[len(previous_messages) :]:
+        normalized_current = _without_context(current_messages)
+        assert normalized_current[: len(previous_messages)] == previous_messages
+        for message in normalized_current[len(previous_messages) :]:
             if message.role != "tool":
                 continue
             assert all(isinstance(part, ToolResultPart) for part in message.parts)
             results.extend(message.parts)  # type: ignore[arg-type]
-        previous_messages = _without_context(current_messages)
+        previous_messages = normalized_current
     return results
 
 

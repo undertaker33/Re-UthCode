@@ -44,6 +44,7 @@ export function settingsSaveRequest(draft: ConfigurationWrite, replacementKeys: 
     providers: Object.fromEntries(Object.entries(draft.providers ?? {}).map(([id, profile]) => {
       const next = { ...profile };
       if (Object.prototype.hasOwnProperty.call(next, "base_url")) next.base_url = normalizeOptionalText(next.base_url);
+      if (Object.prototype.hasOwnProperty.call(next, "display_name")) next.display_name = normalizeOptionalText(next.display_name);
       delete next.api_key_configured;
       // A saved/revealed value is never part of the draft.  Only an explicit
       // replacement edit may add a key-bearing field to this write request.
@@ -84,6 +85,7 @@ function sourceConfig(value: ConfigurationView | null): ConfigurationWrite {
     providers[id] = {
       kind: stringValue(profile.kind, "openai_compat"),
       base_url: typeof profile.base_url === "string" && profile.base_url ? profile.base_url : null,
+      display_name: typeof profile.display_name === "string" && profile.display_name ? profile.display_name : null,
       api_key_configured: profile.api_key_configured === true,
     };
   }
@@ -152,6 +154,10 @@ function modelLabel(model: Record<string, unknown> | undefined, unnamed: string)
 function modelRemoteLabel(model: Record<string, unknown> | undefined, unnamed: string): string {
   const remoteId = stringValue(model?.remote_id).trim();
   return remoteId || unnamed;
+}
+
+function providerLabel(providerId: string, provider: Record<string, unknown> | undefined): string {
+  return stringValue(provider?.display_name).trim() || providerId;
 }
 
 export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeChange, onLanguageChange }: SettingsViewProps) {
@@ -276,7 +282,7 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
     if (normalize && providerId) setDraft((current) => {
       const profile = current.providers?.[providerId];
       if (!profile || !Object.prototype.hasOwnProperty.call(profile, "base_url")) return current;
-      return { ...current, providers: { ...current.providers, [providerId]: { ...profile, base_url: normalizeOptionalText(profile.base_url) } } };
+      return { ...current, providers: { ...current.providers, [providerId]: { ...profile, base_url: normalizeOptionalText(profile.base_url), display_name: normalizeOptionalText(profile.display_name) } } };
     });
     clearRevealCache(providerId ?? undefined);
     editorSnapshot.current = null;
@@ -436,7 +442,7 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
     while (draft.providers?.[id]) id = `protocol_${index++}`;
     setDraft((current) => ({
       ...current,
-      providers: { ...(current.providers ?? {}), [id]: { kind: "openai_compat", base_url: null, api_key_configured: false } },
+      providers: { ...(current.providers ?? {}), [id]: { kind: "openai_compat", base_url: null, display_name: null, api_key_configured: false } },
       models: current.models ?? {},
     }));
     openEditor(id);
@@ -532,8 +538,9 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
             const linked = modelsFor(id);
             const main = linked.find(([ref]) => ref === draft.default_model) ?? linked[0];
             const label = main ? modelLabel(main[1], t("unnamedModel")) : t("noModels");
-            return <button type="button" className="provider-row" title={`${t("editProvider")} ${id}`} key={id} onClick={(event) => openEditor(id, event.currentTarget)} disabled={settingsBusy}>
-              <span><strong>{id}</strong><small>{t("protocol")} · {stringValue(profile.kind, "openai_compat")}</small></span>
+            const providerName = providerLabel(id, profile);
+            return <button type="button" className="provider-row" title={`${t("editProvider")} ${providerName}`} key={id} onClick={(event) => openEditor(id, event.currentTarget)} disabled={settingsBusy}>
+              <span><strong>{providerName}</strong><small>{t("protocol")} · {stringValue(profile.kind, "openai_compat")}</small></span>
               <span><small>{t("baseUrl")}</small>{stringValue(profile.base_url, "—") || "—"}</span>
               <span><small>{t("model")}</small>{label}{linked.length > 1 ? ` +${linked.length - 1}` : ""}</span>
               <span className={`provider-key-state${profile.api_key_configured === true ? " has-api-key" : ""}`} aria-label={profile.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}><UiIcon name={profile.api_key_configured === true ? "check" : "warning"} /><small>{profile.api_key_configured === true ? t("apiKeySaved") : t("apiKeyUnavailable")}</small></span>
@@ -554,8 +561,9 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
 
       {editingProvider && edited && <div className="provider-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) cancelEditor(); }}>
         <section ref={providerModalRoot} className="provider-modal" role="dialog" aria-modal={editingModel ? undefined : "true"} aria-hidden={editingModel ? "true" : undefined} aria-disabled={settingsBusy} aria-labelledby={modalTitleId}>
-          <header><div><p className="eyebrow">{t("protocol")}</p><h2 id={modalTitleId}>{editingProvider}</h2></div><button ref={providerModalClose} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={cancelEditor} disabled={settingsBusy}>×</button></header>
+          <header><div><p className="eyebrow">{t("protocol")}</p><h2 id={modalTitleId}>{providerLabel(editingProvider, edited)}</h2></div><button ref={providerModalClose} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={cancelEditor} disabled={settingsBusy}>×</button></header>
           <div className="provider-modal__body">
+            <div className="settings-row"><label htmlFor="modal-provider-display-name">{t("providerDisplayName")}</label><input id="modal-provider-display-name" value={stringValue(edited.display_name)} placeholder={t("providerDisplayNameFallback")} onChange={(event) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, providers: updateRecord(current.providers, editingProvider, "display_name", event.target.value || null) })); }} disabled={settingsBusy} /></div>
             <div className="settings-row"><label htmlFor="modal-protocol">{t("protocol")}</label><CustomSelect id="modal-protocol" label={t("protocol")} value={stringValue(edited.kind, "openai_compat")} options={[{ value: "openai_compat", label: "OpenAI-compatible" }, { value: "openai_responses", label: "OpenAI" }, { value: "anthropic", label: "Anthropic" }, { value: "fake", label: t("localTestProvider") }]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, providers: updateRecord(current.providers, editingProvider, "kind", value) })); }} disabled={settingsBusy} /></div>
             <div className="settings-row"><label htmlFor="modal-base-url">{t("baseUrl")}</label><input id="modal-base-url" value={stringValue(edited.base_url)} onChange={(event) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, providers: updateRecord(current.providers, editingProvider, "base_url", event.target.value || null) })); }} disabled={settingsBusy} /></div>
             <div className="settings-row settings-row--secret"><label htmlFor="modal-api-key">{t("apiKey")}</label><div>

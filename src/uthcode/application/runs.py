@@ -18,7 +18,16 @@ from uthcode.core.agent import (
     RunStatus,
     TurnResult,
 )
-from uthcode.core.agent_events import AgentEvent, TurnPaused, TurnResumed
+from uthcode.core.agent_events import (
+    AgentEvent,
+    AssistantMessageCompleted,
+    AssistantMessageDelta,
+    FailureReason,
+    ReasoningDelta,
+    TerminationReason,
+    TurnPaused,
+    TurnResumed,
+)
 from uthcode.core.interaction import (
     PauseRequest,
     PauseResponse,
@@ -38,7 +47,7 @@ from uthcode.core.permission import (
     SessionGrant,
 )
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import CancellationToken, Message
+from uthcode.core.provider import CancellationToken, Message, ReasoningPart, TextPart
 
 if TYPE_CHECKING:
     from .generation import UthCodeApplication
@@ -59,6 +68,9 @@ class _PendingPersistenceBatch:
     messages: tuple[Message, ...]
     blocked: bool = False
     terminal: bool = False
+    failed_visible_message: Message | None = None
+    termination_reason: TerminationReason | None = None
+    failure_reason: FailureReason | None = None
 
 
 def _new_identifier(value: str | None, field_name: str) -> str:
@@ -283,18 +295,26 @@ class AgentRun:
         messages: Sequence[Message],
         blocked: bool = False,
         terminal: bool = False,
+        failed_visible_message: Message | None = None,
+        termination_reason: TerminationReason | None = None,
+        failure_reason: FailureReason | None = None,
     ) -> None:
         """Keep one exact FIFO retry unit without duplicating a failed append."""
 
         if session_id is None:
             return
         values = tuple(messages)
-        if not values:
+        if not values and termination_reason is None:
             return
         for index, batch in enumerate(self._pending_persistence_batches):
             if batch.session_id != session_id or batch.turn_id != turn_id:
                 continue
-            if batch.messages == values and (batch.blocked or not blocked):
+            if (
+                batch.messages == values
+                and batch.termination_reason == termination_reason
+                and batch.failed_visible_message == failed_visible_message
+                and (batch.blocked or not blocked)
+            ):
                 if terminal and not batch.terminal:
                     self._pending_persistence_batches[index] = replace(
                         batch,
@@ -310,6 +330,11 @@ class AgentRun:
                     messages=values,
                     blocked=batch.blocked or blocked,
                     terminal=batch.terminal or terminal,
+                    failed_visible_message=(
+                        failed_visible_message or batch.failed_visible_message
+                    ),
+                    termination_reason=termination_reason or batch.termination_reason,
+                    failure_reason=failure_reason or batch.failure_reason,
                 )
             return
         self._pending_persistence_batches.append(
@@ -319,6 +344,9 @@ class AgentRun:
                 messages=values,
                 blocked=blocked,
                 terminal=terminal,
+                failed_visible_message=failed_visible_message,
+                termination_reason=termination_reason,
+                failure_reason=failure_reason,
             )
         )
 
@@ -334,8 +362,18 @@ class AgentRun:
                 batch.messages,
                 session_id=batch.session_id,
                 turn_id=batch.turn_id,
+                failed_visible_message=batch.failed_visible_message,
+                termination_reason=batch.termination_reason,
+                failure_reason=batch.failure_reason,
             )
-            if outcome.persisted_message_count:
+            batch_committed = (
+                outcome.persisted_message_count == len(batch.messages)
+                and (
+                    batch.termination_reason is None
+                    or outcome.terminal_failure_appended
+                )
+            )
+            if batch_committed:
                 self._persisted_message_count += outcome.persisted_message_count
                 del self._pending_persistence_batches[0]
                 if batch.terminal:
@@ -430,6 +468,27 @@ class AgentRun:
                 turn_id=result.turn_id,
                 messages=current_messages[persisted_in_turn:],
                 terminal=True,
+                failed_visible_message=(
+                    handle._driver.failed_visible_message()
+                    if result.status is RunStatus.FAILED
+                    else None
+                ),
+                termination_reason=(
+                    result.termination_reason
+                    if result.status is RunStatus.FAILED
+                    else None
+                ),
+                failure_reason=result.failure_reason,
+            )
+        elif turn_session_id is not None and result.status is RunStatus.FAILED:
+            self._queue_pending_persistence_batch(
+                session_id=turn_session_id,
+                turn_id=result.turn_id,
+                messages=(),
+                terminal=True,
+                failed_visible_message=handle._driver.failed_visible_message(),
+                termination_reason=result.termination_reason,
+                failure_reason=result.failure_reason,
             )
         self._turn_message_start = None
         self._turn_session_id = None
@@ -484,6 +543,8 @@ class _TurnDriver:
         "_events_claimed",
         "_end_enqueued",
         "_handle",
+        "_open_visible_message_id",
+        "_failed_visible_parts",
     )
 
     def __init__(self, run: AgentRun, execution: AgentTurnExecution) -> None:
@@ -500,6 +561,8 @@ class _TurnDriver:
         self._events_claimed = False
         self._end_enqueued = False
         self._handle: TurnHandle | None = None
+        self._open_visible_message_id: str | None = None
+        self._failed_visible_parts: list[ReasoningPart | TextPart] = []
 
     def attach(self, handle: TurnHandle) -> None:
         if self._handle is not None:
@@ -602,12 +665,35 @@ class _TurnDriver:
         """Publish one Core event while preserving the single live stream."""
 
         assert self._queue is not None
+        if isinstance(event, (ReasoningDelta, AssistantMessageDelta)):
+            if self._open_visible_message_id != event.message_id:
+                self._open_visible_message_id = event.message_id
+                self._failed_visible_parts = []
+            part_type = ReasoningPart if isinstance(event, ReasoningDelta) else TextPart
+            if self._failed_visible_parts and isinstance(
+                self._failed_visible_parts[-1], part_type
+            ):
+                previous = self._failed_visible_parts[-1]
+                self._failed_visible_parts[-1] = part_type(previous.text + event.text)
+            else:
+                self._failed_visible_parts.append(part_type(event.text))
+        elif isinstance(event, AssistantMessageCompleted):
+            if self._open_visible_message_id == event.message_id:
+                self._open_visible_message_id = None
+                self._failed_visible_parts = []
         if isinstance(event, TurnPaused):
             if self._pending_pause is not None or self._response_waiter is not None:
                 raise RuntimeError("Application received more than one pending pause")
             self._pending_pause = event.pause
             self._response_waiter = asyncio.get_running_loop().create_future()
         self._queue.put_nowait(event)
+
+    def failed_visible_message(self) -> Message | None:
+        """Return only uncommitted text that was already publicly emitted."""
+
+        if not self._failed_visible_parts:
+            return None
+        return Message("assistant", tuple(self._failed_visible_parts))
 
     async def _drive(self) -> None:
         response: PauseResponse | None = None

@@ -84,7 +84,7 @@ class ProviderKind(str, Enum):
             ) from exc
 
 
-_PROVIDER_MAPPING_FIELDS = frozenset({"kind", "base_url", "api_key"})
+_PROVIDER_MAPPING_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
 _MODEL_MAPPING_FIELDS = frozenset(
     {
         "provider_profile_id",
@@ -138,6 +138,7 @@ class ProviderProfile:
     kind: ProviderKind | str
     base_url: str | None = None
     api_key: SecretValue | str | None = None
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.provider_profile_id, "provider_profile_id")
@@ -145,6 +146,8 @@ class ProviderProfile:
         object.__setattr__(self, "kind", kind)
         if self.base_url is not None:
             _require_text(self.base_url, "base_url")
+        if self.display_name is not None:
+            _require_text(self.display_name, "display_name")
         if isinstance(self.api_key, str) and not self.api_key.strip():
             object.__setattr__(self, "api_key", None)
         elif self.api_key is not None and not isinstance(self.api_key, SecretValue):
@@ -212,6 +215,7 @@ class UserProviderView:
     provider_profile_id: str
     kind: ProviderKind | str | None = None
     base_url: object | None = None
+    display_name: object | None = None
     api_key_configured: bool = False
 
     def __post_init__(self) -> None:
@@ -227,6 +231,7 @@ class UserProviderView:
             "provider_profile_id": self.provider_profile_id,
             "kind": self.kind,
             "base_url": self.base_url,
+            "display_name": self.display_name,
             "api_key_configured": self.api_key_configured,
         }
 
@@ -268,6 +273,7 @@ def _safe_user_provider(value: object, profile_id: str) -> UserProviderView:
         provider_profile_id=str(value.get("provider_profile_id", profile_id)),
         kind=value.get("kind"),
         base_url=value.get("base_url"),
+        display_name=value.get("display_name"),
         api_key_configured=value.get("api_key_configured", False) is True,
     )
 
@@ -379,6 +385,7 @@ def _freeze_user_write_section(
             profile: Mapping[str, object] = {
                 "kind": raw_profile.kind,
                 "base_url": raw_profile.base_url,
+                "display_name": raw_profile.display_name,
             }
         elif isinstance(raw_profile, UserModelView):
             profile = {
@@ -574,6 +581,7 @@ class EffectiveConfig:
                     kind=value.get("kind"),
                     base_url=value.get("base_url"),
                     api_key=value.get("api_key"),
+                    display_name=value.get("display_name"),
                 )
             else:
                 raise TypeError("providers must contain ProviderProfile values")

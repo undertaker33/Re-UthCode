@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from uthcode.application import (
+    ApplicationSessionService,
     ApplicationRuntimeContext,
     ConfigSource,
     EffectiveConfig,
@@ -22,6 +23,8 @@ from uthcode.core.provider import (
     ModelLimits,
     ProviderIdentity,
     ProviderResponse,
+    ReasoningDelta,
+    TextDelta,
     TextPart,
     Usage,
 )
@@ -60,6 +63,68 @@ def _builder(provider: ProviderProfile, model: ModelProfile) -> FakeProvider:
         events=(_completed(model.remote_id),),
         model_limits=TEST_LIMITS,
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_visible_content_and_stable_reason_survive_restart(
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "sessions"
+    service = ApplicationSessionService(
+        storage_root=storage_root,
+        project_key="project",
+        instruction_loader=None,
+    )
+    provider = FakeProvider(
+        events=(ReasoningDelta("正在分析"), TextDelta("部分回答")),
+        model_limits=TEST_LIMITS,
+    )
+    application = UthCodeApplication(provider, session_service=service)
+    session = application.create_session("failed-session")
+
+    result = await application.create_run().start_turn("触发失败").result()
+
+    assert result.status.value == "failed"
+    assert result.failure_reason is not None
+    session_id = session.session_id
+    application.close()
+
+    restarted_service = ApplicationSessionService(
+        storage_root=storage_root,
+        project_key="project",
+        instruction_loader=None,
+    )
+    recovery_provider = FakeProvider(
+        events=(_completed("unused"),), model_limits=TEST_LIMITS
+    )
+    restarted = UthCodeApplication(
+        recovery_provider,
+        session_service=restarted_service,
+    )
+    resumed = restarted.resume_session(session_id)
+
+    assert [(record.kind, record.text) for record in resumed.replay] == [
+        ("user", "触发失败"),
+        ("reasoning", "正在分析"),
+        ("assistant", "部分回答"),
+        ("failure", ""),
+    ]
+    failure = resumed.replay[-1]
+    assert failure.termination_reason == "invalid_provider_response"
+    assert failure.failure_reason == "invalid_provider_response"
+    raw_history = (
+        restarted_service.store.session_path(session_id) / "transcript.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "Provider stream ended" not in raw_history
+    await restarted.create_run().start_turn("继续").result()
+    recovered_request = recovery_provider.recorded_requests[0]
+    recovered_text = repr(
+        tuple(message.to_dict() for message in recovered_request.messages)
+    )
+    assert "触发失败" in recovered_text
+    assert "正在分析" not in recovered_text
+    assert "部分回答" not in recovered_text
+    restarted.close()
 
 
 def test_runtime_context_and_model_status_are_stable_values(tmp_path: Path) -> None:

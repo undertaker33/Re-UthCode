@@ -456,15 +456,20 @@ class OpenAICompatProvider:
                         active_content_kind = "tool"
                         raw_id = _field(raw_tool_call, "id")
                         if raw_id is not None:
-                            if not isinstance(raw_id, str) or not raw_id:
+                            if not isinstance(raw_id, str):
                                 raise InvalidProviderResponseError(
                                     "Chat tool call id is invalid"
                                 )
-                            if state.tool_call_id and state.tool_call_id != raw_id:
+                            if raw_id:
+                                if state.tool_call_id and state.tool_call_id != raw_id:
+                                    raise InvalidProviderResponseError(
+                                        "Chat tool call ids conflict"
+                                    )
+                                state.tool_call_id = raw_id
+                            elif not state.tool_call_id:
                                 raise InvalidProviderResponseError(
-                                    "Chat tool call ids conflict"
+                                    "Chat tool call id is invalid"
                                 )
-                            state.tool_call_id = raw_id
                         function = _field(raw_tool_call, "function")
                         raw_name = _field(function, "name")
                         if raw_name is not None:

@@ -57,6 +57,62 @@ def test_model_profile_keeps_provider_ref_model_ref_and_remote_id_distinct() -> 
     assert config.current_model is model
 
 
+def test_provider_display_name_round_trips_without_changing_stable_references(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "protocol/model"
+
+[providers.protocol]
+kind = "fake"
+display_name = "Local gateway"
+
+[providers.protocol_1]
+kind = "fake"
+
+[models."protocol/model"]
+provider = "protocol"
+remote_id = "served-model"
+''',
+        encoding="utf-8",
+    )
+
+    initial = read_user_configuration(home=home)
+    assert initial.providers["protocol"].display_name == "Local gateway"
+    assert initial.providers["protocol_1"].display_name is None
+
+    written = write_user_configuration(
+        UserConfigurationWriteRequest(
+            default_model="protocol/model",
+            providers={
+                "protocol": {"kind": "fake", "display_name": "Company DeepSeek"},
+                "protocol_1": {"kind": "fake", "display_name": None},
+            },
+            models={
+                "protocol/model": {
+                    "provider_profile_id": "protocol",
+                    "remote_id": "served-model",
+                }
+            },
+        ),
+        home=home,
+    )
+
+    assert written.providers["protocol"].display_name == "Company DeepSeek"
+    assert written.providers["protocol_1"].display_name is None
+    assert written.models["protocol/model"].provider_profile_id == "protocol"
+    reloaded = load_effective_config(cwd=tmp_path, home=home)
+    assert reloaded.providers["protocol"].display_name == "Company DeepSeek"
+    assert reloaded.providers["protocol_1"].display_name is None
+    assert reloaded.models["protocol/model"].provider_profile_id == "protocol"
+    rendered = user.read_text(encoding="utf-8")
+    assert 'display_name = "Company DeepSeek"' in rendered
+    assert "[providers.protocol_1]" in rendered
+
+
 @pytest.mark.parametrize(
     ("mapping", "message"),
     [

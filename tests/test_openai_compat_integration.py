@@ -162,6 +162,26 @@ def _delayed_identity_chunks() -> list[object]:
     ]
 
 
+def _empty_id_continuation_chunks() -> list[object]:
+    return [
+        _chunk(_tool_delta(0, call_id="call-1", name="search", arguments='{"q":')),
+        _chunk(
+            ChoiceDelta.model_construct(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "",
+                        "type": "function",
+                        "function": {"arguments": '"one"}'},
+                    }
+                ],
+            )
+        ),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="tool_calls"),
+    ]
+
+
 def _request(
     *messages: Message,
     system_prompt: str | None = None,
@@ -386,6 +406,31 @@ async def test_chat_delayed_tool_identity_replays_cached_deltas_with_real_ids() 
 
 
 @pytest.mark.asyncio
+async def test_chat_tool_call_continuation_empty_id_is_ignored_after_identity() -> None:
+    client = _OpenAICompatClient(_empty_id_continuation_chunks())
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
+    events = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+
+    response = next(event.response for event in events if isinstance(event, GenerationCompleted))
+    assert response.message.parts == (ToolCallPart("call-1", "search", {"q": "one"}),)
+    tool_events = [
+        event
+        for event in events
+        if isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+    ]
+    assert [type(event) for event in tool_events] == [
+        ToolCallStarted,
+        ToolCallArgumentsDelta,
+        ToolCallArgumentsDelta,
+        ToolCallCompleted,
+    ]
+    assert [event.tool_call_id for event in tool_events] == ["call-1"] * 4
+
+
+@pytest.mark.asyncio
 async def test_chat_nullable_usage_is_normalized_and_history_uses_chat_shapes() -> None:
     client = _OpenAICompatClient(
         [
@@ -529,7 +574,7 @@ async def test_chat_conflicting_index_identity_is_rejected() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("call_id", "name"),
-    [(None, "search"), ("call-1", None)],
+    [(None, "search"), ("", "search"), ("call-1", None)],
 )
 async def test_chat_tool_call_requires_id_and_name(call_id: str | None, name: str | None) -> None:
     chunks = [
@@ -540,6 +585,33 @@ async def test_chat_tool_call_requires_id_and_name(call_id: str | None, name: st
     provider = build_openai_compat_provider(
         "deepseek-test", base_url="https://mock.invalid/v1", client=client
     )
+    with pytest.raises(InvalidProviderResponseError):
+        await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+
+
+@pytest.mark.asyncio
+async def test_chat_non_string_tool_call_id_is_rejected() -> None:
+    chunks = [
+        _chunk(
+            ChoiceDelta.model_construct(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": 123,
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            )
+        ),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="tool_calls"),
+    ]
+    client = _OpenAICompatClient(chunks)
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+
     with pytest.raises(InvalidProviderResponseError):
         await _collect(provider, _request(Message("user", (TextPart("hi"),))))
 

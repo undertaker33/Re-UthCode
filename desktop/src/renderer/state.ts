@@ -599,7 +599,16 @@ function sessionRuntimeFromSource(source: Record<string, JsonValue>, replay: Tim
   const root = sessionState ?? {};
   const run = normalizeRun(root.run ?? source.run) ?? fallback?.run ?? null;
   const runStatus = textValue(run?.status).toLowerCase();
-  const pending = normalizePendingInteraction(root.pending_pause ?? source.pending_pause) ?? fallback?.pendingInteraction ?? null;
+  const pendingValue = Object.prototype.hasOwnProperty.call(root, "pending_pause")
+    ? root.pending_pause
+    : Object.prototype.hasOwnProperty.call(source, "pending_pause")
+      ? source.pending_pause
+      : undefined;
+  // An explicit null is the Application's authoritative statement that the
+  // pause was answered. Only an omitted field may retain a cached projection.
+  const pending = pendingValue === undefined
+    ? fallback?.pendingInteraction ?? null
+    : normalizePendingInteraction(pendingValue);
   const taskState = root.task_state ?? source.task_state;
   const todo = taskState !== undefined ? normalizeTodo(taskState) : fallback?.todo ?? [];
   const iterationValue = root.todo_iteration ?? source.todo_iteration;
@@ -613,8 +622,11 @@ function sessionRuntimeFromSource(source: Record<string, JsonValue>, replay: Tim
   const activeTurn = activeValue === true || (activeValue !== false && (runStatus === "running" || runStatus === "paused" || runStatus === "pausing"))
     ? true
     : activeValue === false ? false : fallback?.activeTurn ?? false;
+  const settledFallback = fallback?.turnStatus === "completed" || fallback?.turnStatus === "failed" || fallback?.turnStatus === "cancelled"
+    ? fallback.turnStatus
+    : "idle";
   const turnStatus: RendererState["turnStatus"] = activeValue === false
-    ? "idle"
+    ? settledFallback
     : pending
     ? "paused"
     : runStatus === "paused" ? "paused" : runStatus === "pausing" ? "pausing" : activeTurn ? "running" : fallback?.turnStatus ?? "idle";
@@ -777,6 +789,7 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
     .map(({ value }, index) => {
       const source = value as Record<string, JsonValue>;
       const kind = source.kind;
+      const failedTurn = kind === "failure";
       const normalizedKind: TimelineKind =
         kind === "user" || kind === "steering" || kind === "reasoning" || kind === "assistant" || kind === "tool" || kind === "plan"
           ? kind
@@ -791,14 +804,16 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
       return {
         id: `replay:${sequence}:${index}`,
         kind: normalizedKind,
-        text: textValue(source.text),
+        text: failedTurn
+          ? `Turn failed: ${textValue(source.failure_reason) || textValue(source.termination_reason) || "runtime error"}`
+          : textValue(source.text),
         runId: nonEmptyText(source.run_id) ?? undefined,
         turnId: nonEmptyText(source.turn_id) ?? undefined,
         iteration: positiveInteger(source.iteration) ?? undefined,
         toolCallId: nonEmptyText(source.tool_call_id) ?? undefined,
         toolName: nonEmptyText(source.tool_name) ?? undefined,
-        status: normalizedKind === "tool" || normalizedKind === "plan" ? terminalStatus : "completed",
-        isError: source.is_error === true,
+        status: failedTurn ? "failed" : normalizedKind === "tool" || normalizedKind === "plan" ? terminalStatus : "completed",
+        isError: failedTurn || source.is_error === true,
         planRevision: typeof source.revision === "number" ? source.revision : undefined,
         planState: normalizedKind === "plan"
           ? terminalStatus === "failed" ? "failed" : terminalStatus === "cancelled" ? "cancelled" : "final"
@@ -884,6 +899,11 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
   const key = sessionRuntimeKey(projectKey, sessionId);
   const cached = stateWithCache.sessionRuntime[key] ?? null;
   const replay = replayToTimeline(Array.isArray(source.replay) ? source.replay : []);
+  const replayEndsInFailure = [...(Array.isArray(source.replay) ? source.replay : [])]
+    .map((value) => asRecord(value))
+    .filter((value): value is Record<string, JsonValue> => value !== null)
+    .sort((left, right) => (typeof left.sequence === "number" ? left.sequence : 0) - (typeof right.sequence === "number" ? right.sequence : 0))
+    .at(-1)?.kind === "failure";
   const sourceSessionState = asRecord(source.session_state);
   const sourceRun = normalizeRun(sourceSessionState?.run ?? source.run);
   const sourceRunStatus = textValue(sourceRun?.status).toLowerCase();
@@ -891,7 +911,10 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
     || source.active_turn === true
     || sourceRunStatus === "running" || sourceRunStatus === "paused" || sourceRunStatus === "pausing";
   const runtime = sessionRuntimeFromSource(source, replay, canRestoreLiveCache ? cached : null);
-  const boundary = permissionUnknownAtRunBoundary(stateWithCache, runtime?.run ?? source.run);
+  const restoredRuntime = runtime && replayEndsInFailure && !runtime.activeTurn
+    ? { ...runtime, turnStatus: "failed" as const, terminalStatusPending: false }
+    : runtime;
+  const boundary = permissionUnknownAtRunBoundary(stateWithCache, restoredRuntime?.run ?? source.run);
   const resumedRun = boundary.run;
   const currentModel = nonEmptyText(source.model_ref);
   const catalogModel = projectKey
@@ -901,25 +924,25 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
   const next: RendererState = {
     ...boundary,
     selectedSessionId: sessionId,
-    timeline: runtime?.timeline ?? replay,
-    todo: runtime?.todo ?? [],
-    todoIteration: runtime?.todoIteration ?? 0,
-    activeTurn: runtime?.activeTurn ?? false,
-    terminalStatusPending: runtime?.terminalStatusPending ?? false,
-    turnStatus: runtime?.turnStatus ?? "idle",
-    pendingInteraction: runtime?.pendingInteraction ?? null,
-    contextUsage: runtime?.contextUsage ?? contextUsageAtBoundary(),
-    compactionStatus: runtime?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
-    completionBlocked: runtime?.completionBlocked ?? null,
+    timeline: restoredRuntime?.timeline ?? replay,
+    todo: restoredRuntime?.todo ?? [],
+    todoIteration: restoredRuntime?.todoIteration ?? 0,
+    activeTurn: restoredRuntime?.activeTurn ?? false,
+    terminalStatusPending: restoredRuntime?.terminalStatusPending ?? false,
+    turnStatus: restoredRuntime?.turnStatus ?? (replayEndsInFailure ? "failed" : "idle"),
+    pendingInteraction: restoredRuntime?.pendingInteraction ?? null,
+    contextUsage: restoredRuntime?.contextUsage ?? contextUsageAtBoundary(),
+    compactionStatus: restoredRuntime?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
+    completionBlocked: restoredRuntime?.completionBlocked ?? null,
     ...(sessionModel ? { currentModelRef: sessionModel, sessionModels: { ...stateWithCache.sessionModels, [sessionId]: sessionModel } } : {}),
     sessionViewRevision: stateWithCache.sessionViewRevision + 1,
     runtimeError: null,
     runtimeState: preserveRuntimeState ? stateWithCache.runtimeState : "ready",
     notice: "Session resumed",
-    ...(runtime ? { sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } } : {}),
+    ...(restoredRuntime ? { sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: restoredRuntime } } : {}),
     ...(projectKey ? { projects: stateWithCache.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
   };
-  return updateSessionRuntimeStatus(next, projectKey, sessionId, runtime ? runtimeStatus(runtime) : "idle");
+  return updateSessionRuntimeStatus(next, projectKey, sessionId, restoredRuntime ? runtimeStatus(restoredRuntime) : replayEndsInFailure ? "failed" : "idle");
 }
 
 /**
@@ -1086,10 +1109,11 @@ function settlePlanEntries(state: RendererState, runId: string, turnId: string, 
 
 function settleTerminalTurn(state: RendererState, runId: string, turnId: string, planStatus: "completed" | "failed" | "cancelled" = "completed"): RendererState {
   const settledPlans = settlePlanEntries(state, runId, turnId, planStatus);
+  const retainFailedAssistant = planStatus === "failed";
   return {
     ...settledPlans,
     timeline: settledPlans.timeline
-      .map((entry) => entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "reasoning" && entry.streaming
+      .map((entry) => entry.turnId === turnId && (!entry.runId || entry.runId === runId) && (entry.kind === "reasoning" || (retainFailedAssistant && entry.kind === "assistant")) && entry.streaming
         ? { ...entry, streaming: false, status: "completed" as TimelineStatus }
         : entry)
       .filter((entry) => !(entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "assistant" && entry.streaming)),
@@ -1361,18 +1385,12 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (type === "turn_resumed") return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true, terminalStatusPending: false }, "Interaction answered", "info");
   if (type === "usage_updated") {
     const usage = asRecord(payload.usage);
-    const inputTokens = usage && typeof usage.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0
-      ? usage.input_tokens
-      : null;
-    const contextUsage = inputTokens !== null && state.contextUsage.available
-      ? {
-        ...state.contextUsage,
-        used_tokens: Math.min(inputTokens, state.contextUsage.budget_tokens),
-        measurement: "estimate" as const,
-        source: "turn",
-      }
-      : state.contextUsage;
-    return { ...state, run: { ...(state.run ?? {}), usage: usage ?? undefined }, contextUsage };
+    // Core UsageUpdated is cumulative across every Provider request in the
+    // Turn. It is valid Run accounting, but it is not the size of the current
+    // request and therefore must not drive the Context ring after tool
+    // continuations. Application context_status remains that projection's
+    // authority.
+    return { ...state, run: { ...(state.run ?? {}), usage: usage ?? undefined } };
   }
   if (type === "behavior_mode_changed") return { ...state, run: { ...(state.run ?? {}), behavior_mode: textValue(payload.behavior_mode) } };
   if (type === "turn_completed") {

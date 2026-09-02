@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
 
+from uthcode.core.agent_events import FailureReason, TerminationReason
 from uthcode.core.history import (
     ActiveCheckpoint,
     EpochMacroSummary,
@@ -54,7 +55,7 @@ class SessionOperationError(RuntimeError):
 
 
 _REPLAY_KINDS = frozenset(
-    {"user", "steering", "reasoning", "assistant", "tool", "plan"}
+    {"user", "steering", "reasoning", "assistant", "tool", "plan", "failure"}
 )
 _REPLAY_TOOL_STATUSES = frozenset(
     {
@@ -86,6 +87,8 @@ class SessionReplayRecord:
     is_error: bool = False
     created_at: str | None = None
     title: str | None = None
+    termination_reason: str | None = None
+    failure_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -105,6 +108,8 @@ class SessionReplayRecord:
             (self.tool_call_id, "tool_call_id"),
             (self.status, "status"),
             (self.created_at, "created_at"),
+            (self.termination_reason, "termination_reason"),
+            (self.failure_reason, "failure_reason"),
         ):
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"replay {field_name} must be a string or None")
@@ -114,6 +119,12 @@ class SessionReplayRecord:
             raise ValueError("replay tool_call_id must be non-empty when provided")
         if self.status is not None and self.status not in _REPLAY_TOOL_STATUSES:
             raise ValueError("unsupported replay tool status")
+        if self.termination_reason is not None:
+            TerminationReason(self.termination_reason)
+        if self.failure_reason is not None:
+            FailureReason(self.failure_reason)
+        if self.kind == "failure" and self.termination_reason is None:
+            raise ValueError("failure replay requires termination_reason")
         if not isinstance(self.is_error, bool):
             raise TypeError("replay is_error must be a boolean")
         if self.title is not None:
@@ -136,6 +147,8 @@ class SessionReplayRecord:
             "status",
             "created_at",
             "title",
+            "termination_reason",
+            "failure_reason",
         ):
             field_value = getattr(self, field_name)
             if field_value is not None:
@@ -1066,6 +1079,29 @@ def _project_replay(
     legacy_message_ids: set[tuple[str, str, str]] = set()
     for unit in snapshot.transcript.semantic_units(complete_only=True):
         for entry in unit.entries:
+            if entry.kind is TranscriptKind.TURN_FAILURE:
+                termination_reason = entry.payload.get("termination_reason")
+                failure_reason = entry.payload.get("failure_reason")
+                records.append(
+                    SessionReplayRecord(
+                        session_id=snapshot.session_id,
+                        sequence=entry.sequence,
+                        turn_id=entry.turn_id,
+                        kind="failure",
+                        termination_reason=(
+                            termination_reason
+                            if isinstance(termination_reason, str)
+                            else None
+                        ),
+                        failure_reason=(
+                            failure_reason if isinstance(failure_reason, str) else None
+                        ),
+                        is_error=True,
+                        created_at=entry.created_at,
+                        title=snapshot.title,
+                    )
+                )
+                continue
             # The pre-W02 writer emitted one full ``message`` envelope for
             # each part.  Those entries share the logical message identity;
             # project that envelope once while leaving current part-local
@@ -1178,7 +1214,10 @@ def _project_replay(
                     user_seen.add(entry.turn_id)
                 elif isinstance(part, ReasoningPart):
                     kind = "reasoning"
-                elif entry.kind is TranscriptKind.ASSISTANT_MESSAGE:
+                elif entry.kind in {
+                    TranscriptKind.ASSISTANT_MESSAGE,
+                    TranscriptKind.FAILED_ASSISTANT_MESSAGE,
+                }:
                     kind = "assistant"
                 else:
                     continue
