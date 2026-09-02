@@ -15,7 +15,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from .provider import JsonPayload, Message, TextPart, ToolCallPart, ToolResultPart
+from .agent_events import FailureReason, TerminationReason
+from .provider import (
+    JsonPayload,
+    Message,
+    ReasoningPart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 
 
 TRANSCRIPT_SCHEMA_VERSION = 2
@@ -40,6 +48,8 @@ class TranscriptKind(str, Enum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     USER_STEERING = "user_steering"
+    FAILED_ASSISTANT_MESSAGE = "failed_assistant_message"
+    TURN_FAILURE = "turn_failure"
 
 
 class TranscriptBoundaryError(ValueError):
@@ -600,4 +610,68 @@ def transcript_entries_from_message(session_id: str, turn_id: str, sequence_star
             payload["native_items"] = native_items
         entries.append(TranscriptEntry(session_id, sequence, turn_id, kind, payload, semantic_unit_id=unit_id))
         sequence += 1
+    return tuple(entries)
+
+
+def transcript_entries_for_failed_turn(
+    session_id: str,
+    turn_id: str,
+    sequence_start: int,
+    *,
+    visible_message: Message | None,
+    termination_reason: TerminationReason,
+    failure_reason: FailureReason | None,
+) -> tuple[TranscriptEntry, ...]:
+    """Build safe durable facts for one failed Turn.
+
+    Only already-public UthCode text parts and stable terminal enums are
+    accepted.  Provider-native responses and exceptions never cross this
+    boundary.
+    """
+
+    if visible_message is not None and visible_message.role != "assistant":
+        raise ValueError("failed Turn visible message must have assistant role")
+    if not isinstance(termination_reason, TerminationReason):
+        termination_reason = TerminationReason(termination_reason)
+    if failure_reason is not None and not isinstance(failure_reason, FailureReason):
+        failure_reason = FailureReason(failure_reason)
+
+    entries: list[TranscriptEntry] = []
+    sequence = sequence_start
+    if visible_message is not None:
+        message_id = f"{turn_id}:failed:{sequence_start}"
+        for part_index, part in enumerate(visible_message.parts):
+            if not isinstance(part, (TextPart, ReasoningPart)):
+                raise TypeError("failed Turn visible message contains an unsupported part")
+            entries.append(
+                TranscriptEntry(
+                    session_id,
+                    sequence,
+                    turn_id,
+                    TranscriptKind.FAILED_ASSISTANT_MESSAGE,
+                    {
+                        "role": "assistant",
+                        "message_id": message_id,
+                        "message_part_index": part_index,
+                        "part": part.to_dict(),
+                    },
+                    semantic_unit_id=turn_id,
+                )
+            )
+            sequence += 1
+    entries.append(
+        TranscriptEntry(
+            session_id,
+            sequence,
+            turn_id,
+            TranscriptKind.TURN_FAILURE,
+            {
+                "termination_reason": termination_reason.value,
+                "failure_reason": (
+                    failure_reason.value if failure_reason is not None else None
+                ),
+            },
+            semantic_unit_id=turn_id,
+        )
+    )
     return tuple(entries)

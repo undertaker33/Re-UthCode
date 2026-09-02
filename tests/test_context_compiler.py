@@ -19,7 +19,7 @@ from uthcode.core.context import (
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, SemanticUnit, Timeline, Transcript, TranscriptEntry, TranscriptKind
 from uthcode.core.prompt import ContextAuthority, ContextBlock, ContextScope, ContextSourceKind, ContextStability, ProjectInstructionSource, RuntimePromptContext, ToolDefinitionSource
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import GenerationRequest, Message, NativeItem, ReasoningPart, TextPart, ToolDefinition
+from uthcode.core.provider import GenerationRequest, Message, NativeItem, ReasoningPart, TextPart, ToolCallPart, ToolDefinition, ToolResultPart
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.integrations.providers.openai_responses import _prompt_cache_key
@@ -375,6 +375,103 @@ def test_context_projection_keeps_contextual_sources_out_of_current_user_tail() 
         and any("environment: D:/project/Re-UthCode" in part.text for part in message.parts if isinstance(part, TextPart))
         for message in messages[:-1]
     )
+
+
+def test_context_composition_orders_runtime_and_history_before_current_user() -> None:
+    transcript = _transcript()
+    timeline_entry = SemanticEntry(
+        "turn-1",
+        "timeline summary",
+        (transcript.reference(1, 1),),
+        session_id="session-1",
+    )
+    timeline = Timeline("session-1").append_transaction(
+        (timeline_entry,),
+        ActiveCheckpoint("turn-1", ("turn-1",), session_id="session-1"),
+    )
+    runtime = _runtime_block("runtime fact")
+    environment = ContextBlock(
+        ContextSourceKind.ENVIRONMENT_FACT,
+        ContextAuthority.ENVIRONMENT,
+        ContextStability.DYNAMIC,
+        ContextScope.TURN,
+        "test:environment",
+        "environment fact",
+    )
+    protocol = ContextBlock(
+        ContextSourceKind.USER_MESSAGE,
+        ContextAuthority.HISTORY,
+        ContextStability.DYNAMIC,
+        ContextScope.TURN,
+        "protocol:boundary",
+        "protocol fact",
+    )
+    protected = ContextBlock(
+        ContextSourceKind.USER_MESSAGE,
+        ContextAuthority.HISTORY,
+        ContextStability.DYNAMIC,
+        ContextScope.TURN,
+        "protected:context",
+        "protected fact",
+    )
+    active_tool_call = Message(
+        "assistant",
+        (ToolCallPart("active-call", "ReadFile", {"path": "README.md"}),),
+    )
+    active_tool_result = Message(
+        "tool",
+        (ToolResultPart("active-call", "active result"),),
+    )
+    snapshot = ContextCompiler().compile(
+        ContextSourceBundle(
+            protocol_blocks=(protocol,),
+            runtime_sources=(runtime,),
+            environment_sources=(environment,),
+            timeline=timeline,
+            transcript=transcript,
+            protected_context=(protected,),
+            current_turn_deltas=(active_tool_call, active_tool_result),
+            current_turn=("current user",),
+        )
+    )
+
+    messages = messages_from_context_snapshot(snapshot)
+
+    assert [message.role for message in messages] == [
+        "user",       # protocol
+        "user",       # runtime Contextual
+        "user",       # environment Contextual
+        "user",       # Timeline
+        "assistant",  # Transcript ToolCall
+        "tool",       # Transcript ToolResult
+        "user",       # protected context
+        "assistant",  # process-local ToolCall delta
+        "tool",       # process-local ToolResult delta
+        "user",       # current user
+    ]
+    assert isinstance(messages[0].parts[0], TextPart)
+    assert messages[0].parts[0].text == "protocol fact"
+    assert isinstance(messages[1].parts[0], TextPart)
+    assert messages[1].parts[0].text.startswith("[Context]\n")
+    assert "runtime fact" in messages[1].parts[0].text
+    assert isinstance(messages[2].parts[0], TextPart)
+    assert messages[2].parts[0].text.startswith("[Context]\n")
+    assert "environment fact" in messages[2].parts[0].text
+    assert isinstance(messages[3].parts[0], TextPart)
+    assert "timeline summary" in messages[3].parts[0].text
+    assert messages[4].parts == (ToolCallPart("call-1", "ReadFile", {}),)
+    assert messages[5].parts == (ToolResultPart("call-1", "complete result ref"),)
+    assert isinstance(messages[6].parts[0], TextPart)
+    assert messages[6].parts[0].text == "protected fact"
+    assert messages[7] == active_tool_call
+    assert messages[8] == active_tool_result
+    assert messages[9] == Message("user", (TextPart("current user"),))
+    assert sum(
+        message.role == "user"
+        and isinstance(message.parts[0], TextPart)
+        and message.parts[0].text.startswith("[Context]\n")
+        for message in messages
+    ) == 2
 
 
 def test_application_request_keeps_current_user_exact_after_runtime_composition() -> None:

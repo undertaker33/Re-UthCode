@@ -283,6 +283,8 @@ _REPLAY_OUTPUT_FIELDS = (
     "is_error",
     "created_at",
     "title",
+    "termination_reason",
+    "failure_reason",
 )
 
 

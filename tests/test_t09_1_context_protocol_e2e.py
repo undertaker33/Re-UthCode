@@ -686,14 +686,19 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
     real_persist = application._persist_run_messages
     calls: list[tuple[tuple[Message, ...], str | None, str]] = []
 
-    def flaky_persist(messages, *, session_id, turn_id):  # type: ignore[no-untyped-def]
+    def flaky_persist(messages, *, session_id, turn_id, **terminal):  # type: ignore[no-untyped-def]
         calls.append((tuple(messages), session_id, turn_id))
         if len(calls) == 1:
             return SimpleNamespace(
                 persisted_message_count=0,
                 transcript_durability="not_durable",
             )
-        return real_persist(messages, session_id=session_id, turn_id=turn_id)
+        return real_persist(
+            messages,
+            session_id=session_id,
+            turn_id=turn_id,
+            **terminal,
+        )
 
     monkeypatch.setattr(application, "_persist_run_messages", flaky_persist)
     result = await application.create_run().start_turn("retry this closed fact").result()

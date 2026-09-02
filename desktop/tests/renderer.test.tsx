@@ -29,7 +29,7 @@ import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeComple
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
 import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
 import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/RuntimePanel";
-import { CustomSelect, customSelectConsumesEscape, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
+import { CustomSelect, customSelectConsumesEscape, customSelectPosition, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
@@ -143,6 +143,40 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   assert.equal(fresh.run?.run_id, "fresh-run");
 });
 
+test("durable failure replay restores retained output and the failed Turn projection", () => {
+  const initial = applyProjectOpened(createInitialState(), {
+    project: { path: "C:/Projects/failure-replay" },
+    sessions: [{ session_id: "failed-session", preview: "failed request" }],
+    run: null,
+  });
+  let resumed = applySessionResumed(initial, {
+    session_id: "failed-session",
+    restored: true,
+    replay: [
+      replayRecord(1, "user", "investigate"),
+      replayRecord(2, "reasoning", "retained reasoning"),
+      replayRecord(3, "assistant", "retained partial answer"),
+      { session_id: "failed-session", sequence: 4, turn_id: "turn-failed", kind: "failure", termination_reason: "provider_error", failure_reason: "invalid_provider_response", is_error: true },
+    ],
+    active_turn: false,
+    run: { run_id: "fresh-run", status: "idle" },
+    session_state: { active_turn: false, run: { run_id: "fresh-run", status: "idle" } },
+  });
+  assert.deepEqual(resumed.timeline.map((entry) => entry.text), ["investigate", "retained reasoning", "retained partial answer", "Turn failed: invalid_provider_response"]);
+  assert.equal(resumed.timeline.at(-1)?.kind, "status");
+  assert.equal(resumed.timeline.at(-1)?.status, "failed");
+  assert.equal(resumed.timeline.at(-1)?.isError, true);
+  assert.equal(resumed.activeTurn, false);
+  assert.equal(resumed.turnStatus, "failed");
+  assert.equal(resumed.projects[0]?.sessions[0]?.runtime_status, "failed");
+  resumed = reduceRendererState(resumed, {
+    type: "status_loaded",
+    result: { session_id: "failed-session", project_key: "C:/Projects/failure-replay", active_turn: false, session_state: { active_turn: false, run: { run_id: "fresh-run", status: "idle" } } },
+  });
+  assert.equal(resumed.turnStatus, "failed", "the authoritative idle refresh must not erase the replayed terminal failure");
+  assert.equal(resumed.projects[0]?.sessions[0]?.runtime_status, "failed");
+});
+
 test("background Agent events are cached per Session and restored with Todo/pause state", () => {
   let state = applyProjectOpened(createInitialState(), {
     project: { path: "C:/Projects/background" },
@@ -205,6 +239,87 @@ test("background Agent events are cached per Session and restored with Todo/paus
   assert.equal(state.turnStatus, "paused");
 });
 
+test("Renderer treats an explicit null pending pause as authoritative", () => {
+  let state = createInitialState({
+    selectedProjectKey: "C:/Projects/current",
+    selectedSessionId: "session-current",
+    run: { run_id: "run-current", turn_id: "turn-current", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: {
+      type: "turn_paused",
+      run_id: "run-current",
+      turn_id: "turn-current",
+      pause: {
+        kind: "permission_required",
+        pause_id: "pause-completed",
+        run_id: "run-current",
+        turn_id: "turn-current",
+        permission_request: { permission_id: "permission-completed", choices: ["once", "reject"] },
+      },
+    },
+  });
+  assert.equal(state.sessionRuntime[sessionRuntimeKey("C:/Projects/current", "session-current")]?.pendingInteraction?.pauseId, "pause-completed");
+  state = reduceRendererState(state, {
+    type: "status_loaded",
+    result: {
+      session_id: "session-current",
+      project_key: "C:/Projects/current",
+      active_turn: true,
+      session_state: {
+        run: { run_id: "run-current", turn_id: "turn-current", status: "running" },
+        active_turn: true,
+        status: "running",
+        pending_pause: null,
+      },
+    },
+  });
+  assert.equal(state.pendingInteraction, null, "an answered permission cannot be restored from cached Renderer state");
+  assert.equal(state.turnStatus, "running");
+});
+
+test("Renderer retains a cached pause only when a partial status omits the field", () => {
+  let state = createInitialState({
+    selectedProjectKey: "C:/Projects/current",
+    selectedSessionId: "session-current",
+    run: { run_id: "run-current", turn_id: "turn-current", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: {
+      type: "turn_paused",
+      run_id: "run-current",
+      turn_id: "turn-current",
+      pause: {
+        kind: "permission_required",
+        pause_id: "pause-current",
+        run_id: "run-current",
+        turn_id: "turn-current",
+        permission_request: { permission_id: "permission-current", choices: ["once", "reject"] },
+      },
+    },
+  });
+  state = reduceRendererState(state, {
+    type: "status_loaded",
+    result: {
+      session_id: "session-current",
+      project_key: "C:/Projects/current",
+      active_turn: true,
+      session_state: {
+        run: { run_id: "run-current", turn_id: "turn-current", status: "paused" },
+        active_turn: true,
+        status: "waiting",
+      },
+    },
+  });
+  assert.equal(state.pendingInteraction?.pauseId, "pause-current");
+});
+
 test("Renderer increments live context estimate for streamed assistant deltas", () => {
   const initial = createInitialState({
     contextUsage: { used_tokens: 10, budget_tokens: 100, available: true, measurement: "exact", source: "provider" },
@@ -226,6 +341,28 @@ test("Renderer increments live context estimate for streamed assistant deltas", 
   assert.equal(next.contextUsage.measurement, "estimate");
   assert.equal(next.contextUsage.source, "turn");
   assert.equal(next.timeline.find((entry) => entry.kind === "assistant")?.text, "streamed output");
+});
+
+test("Renderer keeps cumulative Turn usage out of the current-request Context projection", () => {
+  const contextUsage = { used_tokens: 40, budget_tokens: 100, available: true, measurement: "estimate" as const, source: "application" };
+  const initial = createInitialState({
+    contextUsage,
+    run: { run_id: "run-tools", turn_id: "turn-tools", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  const next = reduceRendererState(initial, {
+    type: "agent_event",
+    event: {
+      type: "usage_updated",
+      run_id: "run-tools",
+      turn_id: "turn-tools",
+      iteration: 2,
+      usage: { input_tokens: 175, output_tokens: 12 },
+    },
+  });
+  assert.deepEqual(next.contextUsage, contextUsage, "multi-request Turn totals are not current Context usage");
+  assert.deepEqual(next.run?.usage, { input_tokens: 175, output_tokens: 12 }, "cumulative usage remains visible on the Run");
 });
 
 test("Renderer recovers unambiguous UTF-8 mojibake without changing real Chinese", () => {
@@ -343,7 +480,7 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
       assert.ok(theme);
       act(() => { theme!.click(); });
       await flush();
-      const alternateTheme = container.querySelector<HTMLButtonElement>(`[role="option"][title="${language === "en" ? "Light" : "浅色"}"]`);
+      const alternateTheme = _dom.window.document.querySelector<HTMLButtonElement>(`[role="option"][title="${language === "en" ? "Light" : "浅色"}"]`);
       assert.ok(alternateTheme);
       act(() => { alternateTheme!.click(); });
       for (let index = 0; index < 4; index += 1) await flush();
@@ -1686,11 +1823,11 @@ test("T08 TaskState projection keeps the newest iteration", () => {
   assert.equal(state.todoIteration, 3);
 });
 
-test("T05 failed and cancelled turns discard incomplete assistant previews", () => {
+test("T05 failed turns retain displayed assistant content until durable replay", () => {
   let state = createInitialState();
   state = reduceRendererState(state, { type: "agent_event", event: { type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", iteration: 1, text: "unfinished" } });
   state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_failed", run_id: "run-1", turn_id: "turn-1", termination_reason: "provider_error", failure_reason: "provider_request" } });
-  assert.equal(state.timeline.some((entry) => entry.text === "unfinished"), false);
+  assert.equal(state.timeline.some((entry) => entry.text === "unfinished" && entry.kind === "assistant" && entry.streaming === false), true);
   assert.equal(state.timeline.some((entry) => entry.text.includes("provider_request")), true);
   assert.equal(state.activeTurn, true, "Core terminal event must wait for Application active_turn=false");
   assert.equal(state.terminalStatusPending, true);
@@ -2366,6 +2503,56 @@ test("T07 empty settings and model profiles use display labels without exposing 
   assert.doesNotMatch(multiMarkup, /provider\/primary|provider\/secondary/u);
 });
 
+test("Settings provider names are editable labels while provider IDs remain stable references", async () => {
+  const namedState = createInitialState({ configuration: { default_model: "protocol/model", providers: { protocol: { kind: "fake", display_name: "Local gateway", api_key_configured: false }, protocol_1: { kind: "fake", display_name: null, api_key_configured: false } }, models: { "protocol/model": { provider_profile_id: "protocol", remote_id: "served-model" } } }, settingsLoaded: true });
+  const namedMarkup = renderLanguage("en", <SettingsView state={namedState} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
+  assert.match(namedMarkup, />Local gateway</u);
+  assert.match(namedMarkup, />protocol_1</u, "a missing display name falls back to the stable provider ID");
+
+  const request = settingsSaveRequest({
+    default_model: "protocol/model",
+    providers: { protocol: { kind: "fake", display_name: "  Company DeepSeek  " } },
+    models: { "protocol/model": { provider_profile_id: "protocol", remote_id: "served-model" } },
+  }, {}, {});
+  assert.equal(request.providers?.protocol?.display_name, "Company DeepSeek");
+  assert.equal(request.models?.["protocol/model"]?.provider_profile_id, "protocol");
+
+  await withRendererDom(async (dom, container, root) => {
+    const saves: ConfigurationWrite[] = [];
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={namedState} onRevealApiKey={undefined} onBack={() => undefined} onSave={(value) => saves.push(value)} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(row);
+    act(() => { row!.click(); });
+    await tick();
+    const name = container.querySelector<HTMLInputElement>("#modal-provider-display-name");
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(name);
+    assert.ok(setter);
+    act(() => {
+      name!.focus();
+      setter!.call(name, "Renamed display only");
+      name!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "Renamed display only" }));
+      name!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      name!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      name!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await tick();
+    const apply = container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Apply"]');
+    assert.ok(apply);
+    act(() => { apply!.click(); });
+    await tick();
+    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
+    assert.ok(save);
+    act(() => { save!.click(); });
+    await tick();
+    assert.equal(saves[0]?.providers?.protocol?.display_name, "Renamed display only");
+    assert.equal(saves[0]?.models?.["protocol/model"]?.provider_profile_id, "protocol");
+    assert.equal(saves[0]?.providers?.["Renamed display only"], undefined);
+  });
+});
+
 test("T07 protocol model modal supports add, default, edit, delete, and focus-safe close", async () => {
   await withRendererDom(async (dom, container, root) => {
     const saves: ConfigurationWrite[] = [];
@@ -2381,7 +2568,7 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     const providerDialog = () => container.querySelector<HTMLElement>('.provider-modal[aria-labelledby$="protocol-title"]');
     assert.equal(container.querySelectorAll(".settings-model-row").length, 2);
     assert.ok(providerDialog());
-    assert.equal((dom.window.document.activeElement as HTMLElement)?.id, "modal-protocol");
+    assert.equal((dom.window.document.activeElement as HTMLElement)?.id, "modal-provider-display-name");
     const editSecondary = container.querySelector<HTMLButtonElement>('button[aria-label="Edit model Secondary"]');
     assert.ok(editSecondary);
     act(() => { editSecondary!.click(); });
@@ -2967,6 +3154,63 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
   });
 });
 
+test("ordinary Session navigation keeps lifecycle ownership without presenting a Runtime restart", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const project: ProjectState = {
+      path: "C:/session-navigation",
+      projectKey: "C:/session-navigation",
+      alias: "Navigation",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [{ session_id: "session-a", title: "Session A" }, { session_id: "session-b", title: "Session B" }],
+    };
+    const calls: string[] = [];
+    let resolveResume: ((value: JsonObject) => void) | null = null;
+    const pendingResume = new Promise<JsonObject>((resolve) => { resolveResume = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copySessionId: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        calls.push(method);
+        if (method === "session.resume") return await pendingResume;
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { active_turn: false, runtime: { state: "ready" } };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: project.projectKey,
+      selectedSessionId: "session-a",
+      expandedProjects: { [project.projectKey]: true },
+      run: { run_id: "run-a", status: "idle" },
+    });
+    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await tick();
+    const target = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-list .session-line")).find((button) => button.textContent?.includes("Session B"));
+    assert.ok(target);
+    act(() => { target!.click(); });
+    await tick();
+    assert.deepEqual(calls.filter((method) => method === "session.resume"), ["session.resume"]);
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
+    assert.doesNotMatch(container.textContent ?? "", /Runtime is restarting|Restarting/u);
+
+    resolveResume?.({ session_id: "session-b", replay: [], run: { run_id: "run-b", status: "idle" } });
+    for (let index = 0; index < 6; index += 1) await tick();
+    assert.ok(calls.includes("project.sessions"), "navigation still runs its serialized authoritative refresh");
+    assert.ok(calls.includes("status.get"), "navigation still completes its owned status refresh");
+    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
+  });
+});
+
 test("T07 durable Save failure releases its lifecycle owner without starting Runtime recovery", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
@@ -3535,13 +3779,13 @@ test("T05 turn_completed settles reasoning while removing only the assistant pre
   assert.equal(state.terminalStatusPending, true);
 });
 
-test("T05 failed turns settle reasoning tail while removing only assistant preview", () => {
+test("T05 failed turns settle and retain reasoning and assistant tails", () => {
   let state = createInitialState();
   state = reduceRendererState(state, { type: "agent_event", event: { type: "reasoning_delta", run_id: "run-one", turn_id: "turn-one", message_id: "reason-one", text: "failed reasoning tail" } });
   state = reduceRendererState(state, { type: "agent_event", event: { type: "assistant_message_delta", run_id: "run-one", turn_id: "turn-one", message_id: "answer-one", text: "failed preview" } });
   state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_failed", run_id: "run-one", turn_id: "turn-one", termination_reason: "provider_error", failure_reason: "provider_request" } });
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "reasoning").map((entry) => ({ text: entry.text, status: entry.status, streaming: entry.streaming })), [{ text: "failed reasoning tail", status: "completed", streaming: false }]);
-  assert.equal(state.timeline.some((entry) => entry.text === "failed preview"), false);
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "assistant").map((entry) => ({ text: entry.text, status: entry.status, streaming: entry.streaming })), [{ text: "failed preview", status: "completed", streaming: false }]);
   assert.equal(state.activeTurn, true);
   assert.equal(state.terminalStatusPending, true);
 });
@@ -4083,10 +4327,12 @@ test("T06 slash completion uses canonical values and locale-only descriptions", 
 
 test("T06 CustomSelect flips by available geometry and restores trigger focus", async () => {
   await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 300 });
     Object.defineProperty(dom.window, "innerHeight", { configurable: true, value: 240 });
-    let rect = { top: 20, bottom: 50, left: 0, right: 180 };
+    let rect = { top: 20, bottom: 50, left: 270, right: 450 };
+    const selected: string[] = [];
     act(() => {
-      root.render(<LanguageProvider value="en"><CustomSelect value="one" label="Choice" options={[{ value: "one", label: "One" }, { value: "two", label: "Two" }]} onChange={() => undefined} /></LanguageProvider>);
+      root.render(<div style={{ overflow: "hidden" }}><LanguageProvider value="en"><CustomSelect value="one" label="Choice" options={[{ value: "one", label: "One" }, { value: "two", label: "Two" }]} onChange={(value) => selected.push(value)} /></LanguageProvider></div>);
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const trigger = container.querySelector<HTMLButtonElement>(".custom-select__trigger");
@@ -4094,17 +4340,50 @@ test("T06 CustomSelect flips by available geometry and restores trigger focus", 
     trigger!.getBoundingClientRect = () => ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top, x: rect.left, y: rect.top, toJSON: () => ({}) }) as DOMRect;
     act(() => { trigger!.click(); });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    assert.ok(container.querySelector(".custom-select__list.is-below"), "menu should flip below when the lower viewport has more space");
-    rect = { top: 200, bottom: 230, left: 0, right: 180 };
+    const below = dom.window.document.querySelector<HTMLElement>(".custom-select__list.is-below");
+    assert.ok(below, "menu should flip below when the lower viewport has more space");
+    assert.equal(below!.parentElement, dom.window.document.body, "the listbox is portalled outside the clipping ancestor");
+    assert.equal(below!.style.position, "", "fixed positioning remains a shared CSS contract");
+    assert.equal(below!.style.left, "112px", "horizontal placement stays inside the viewport");
+    rect = { top: 200, bottom: 230, left: 24, right: 204 };
     act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    assert.ok(container.querySelector(".custom-select__list.is-above"), "menu should return above after the available geometry changes");
-    const option = container.querySelector<HTMLButtonElement>('.custom-select__list button[role="option"]');
+    const above = dom.window.document.querySelector<HTMLElement>(".custom-select__list.is-above");
+    assert.ok(above, "menu should return above after the available geometry changes");
+    assert.equal(above!.style.left, "24px");
+    rect = { top: 190, bottom: 220, left: 30, right: 210 };
+    act(() => { dom.window.document.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(dom.window.document.querySelector<HTMLElement>(".custom-select__list")?.style.left, "30px", "captured scroll repositions the portal");
+    const option = dom.window.document.querySelector<HTMLButtonElement>('.custom-select__list button[role="option"]');
     assert.ok(option);
     act(() => { option!.click(); });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(selected, ["one"], "pointer selection still crosses the portal boundary");
     assert.equal(dom.window.document.activeElement, trigger, "closing a select should restore focus to its trigger");
+
+    act(() => { trigger!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const focused = dom.window.document.activeElement as HTMLButtonElement;
+    assert.equal(focused.textContent, "One", "keyboard opening focuses the selected option");
+    act(() => { focused.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(dom.window.document.activeElement?.textContent, "Two");
+    act(() => { dom.window.document.activeElement?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(dom.window.document.querySelector(".custom-select__list"), null, "Escape closes the portal");
+    assert.equal(dom.window.document.activeElement, trigger, "Escape restores trigger focus");
   });
+});
+
+test("CustomSelect viewport geometry chooses a bounded above or below overlay", () => {
+  const nearTop = customSelectPosition({ top: 12, bottom: 42, left: 10, right: 170, width: 160, height: 30 } as DOMRect, 5, 320, 240);
+  assert.equal(nearTop.placement, "below");
+  assert.equal(nearTop.style.top, 47);
+  const nearBottom = customSelectPosition({ top: 198, bottom: 228, left: 10, right: 170, width: 160, height: 30 } as DOMRect, 5, 320, 240);
+  assert.equal(nearBottom.placement, "above");
+  assert.ok(Number(nearBottom.style.top) >= 8);
+  assert.ok(Number(nearBottom.style.maxHeight) <= 185);
 });
 
 test("Prompt 4 Composer keeps mode authority in slash commands while placing permission/model controls in the bottom row", async () => {
@@ -4140,11 +4419,11 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
     assert.ok(modelTrigger);
     assert.match(modelTrigger?.getAttribute("aria-label") ?? "", /Model: Local Chat/);
     act(() => { permissionTrigger?.click(); });
-    const permissionOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".composer-selectors .custom-select__list button")).find((button) => button.textContent === "Full access");
+    const permissionOption = Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>(".custom-select__list button")).find((button) => button.textContent === "Full access");
     assert.ok(permissionOption);
     act(() => { permissionOption?.click(); });
     act(() => { modelTrigger?.click(); });
-    const modelOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".composer-model .custom-select__list button")).find((button) => button.textContent === "remote-chat");
+    const modelOption = Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>(".custom-select__list button")).find((button) => button.textContent === "remote-chat");
     assert.ok(modelOption);
     act(() => { modelOption?.click(); });
     assert.deepEqual(commands, ["/permission full_access", "/model", "/model remote/fallback"]);

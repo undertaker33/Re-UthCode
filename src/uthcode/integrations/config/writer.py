@@ -23,7 +23,7 @@ _ROOT_FIELDS = frozenset(
     {"default_model", "default_permission_mode", "providers", "models"}
 )
 _PAYLOAD_FIELDS = _ROOT_FIELDS | {"provider_renames"}
-_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key"})
+_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
 _MODEL_FIELDS = frozenset(
     {
         "provider_profile_id",
@@ -289,6 +289,10 @@ def _apply_providers(document: Any, requested: Mapping[str, Any]) -> None:
             _set_or_delete(profile, "base_url", raw_profile.get("base_url"))
         elif "base_url" in profile:
             del profile["base_url"]
+        if "display_name" in raw_profile:
+            _set_or_delete(profile, "display_name", raw_profile.get("display_name"))
+        elif "display_name" in profile:
+            del profile["display_name"]
         if "api_key" in raw_profile and raw_profile.get("api_key") is not None:
             _set_or_delete(profile, "api_key", raw_profile.get("api_key"))
 

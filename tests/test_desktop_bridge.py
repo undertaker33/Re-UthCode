@@ -1090,6 +1090,51 @@ async def test_session_new_and_resume_use_fresh_runs_and_safe_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_resume_projects_stable_failure_replay_fields() -> None:
+    class FailedSessionApplication(_SessionApplication):
+        def resume_session_for_command(self, session_id: str) -> SimpleNamespace:
+            self.resume_session_calls.append(session_id)
+            self.session_id = session_id
+            replay = (
+                SessionReplayRecord(
+                    session_id,
+                    1,
+                    "turn-failed",
+                    "failure",
+                    is_error=True,
+                    termination_reason="invalid_provider_response",
+                    failure_reason="invalid_provider_response",
+                ),
+            )
+            return SimpleNamespace(session_id=session_id, replay=replay)
+
+    bridge = DesktopBridge(application=FailedSessionApplication())
+    resumed = await bridge.handle_request(
+        RequestEnvelope(
+            "session-resume-failure",
+            "session.resume",
+            {"session_id": "session-failed"},
+        )
+    )
+
+    assert resumed.ok is True
+    assert resumed.result is not None
+    assert resumed.result["replay"] == [
+        {
+            "session_id": "session-failed",
+            "sequence": 1,
+            "turn_id": "turn-failed",
+            "kind": "failure",
+            "text": "",
+            "is_error": True,
+            "termination_reason": "invalid_provider_response",
+            "failure_reason": "invalid_provider_response",
+        }
+    ]
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_session_operation_failure_keeps_application_and_run() -> None:
     from uthcode.application import SessionOperationError
 

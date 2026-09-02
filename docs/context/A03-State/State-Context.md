@@ -12,7 +12,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 
 - `[FACT]` `RunState` 是单个 Run 当前 Turn 的权威、不可变 Core 状态。
 - `[FACT]` Transcript 新写入按单个 typed Message part 保存角色、连续 identity 和 part 顺序；`ReasoningPart` 与正式 `TextPart` 可独立重建，reasoning 永不成为 final 文本。旧 v3 full-message envelope 只读兼容，不原地迁移。
-- `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放只包含 user、steering、reasoning、formal assistant 和脱敏 Tool 终态，不包含 raw ToolResult、native payload、秘密或 pending interaction。
+- `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放包含 user、steering、reasoning、formal assistant、脱敏 Tool 终态，以及失败 Turn 中已公开的 reasoning/partial assistant 与稳定 `TerminationReason`/`FailureReason`。失败内容只用于 replay，不会作为有效 assistant 响应回灌 Provider；回放不包含 raw ToolResult、SDK exception、native payload、秘密或 pending interaction。
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
@@ -52,7 +52,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 | permission mode | `AgentRun` + `UthCodeApplication` | 当前 Run；安全默认值为用户配置偏好 | Run-local `set_permission_mode`；Application 默认仅允许 `default|auto` |
 | SessionGrant | `AgentRun` | 当前进程、当前 Run | 不可变 tuple 视图 |
 | conversation messages | `RunState` | 当前 Run，跨 Turn 保留 | 不通过 `RunSnapshot` 暴露 |
-| committed Transcript | active `ApplicationSession` / `SessionWriter` | request preparation、complete tool batch 和 terminal tail 边界追加；resume 读取当前 Session | `ApplicationSession.transcript`、Context Compiler、HistoryRead |
+| committed Transcript | active `ApplicationSession` / `SessionWriter` | request preparation、complete tool batch 和 terminal tail 边界追加；失败 terminal 同批追加已公开文本与稳定失败 marker；resume 读取当前 Session | `ApplicationSession.transcript`、Context Compiler、HistoryRead、Session replay |
 | committed Timeline | active `ApplicationSession` / `SessionWriter` | L4/L5 合法 candidate 先写派生 record、最后写 checkpoint；物理记录 append-only，logical view 按最新有效 checkpoint 计算 | Context Compiler、Context diagnostics |
 | Instruction State metadata | `InstructionLoader` + Session metadata | Session create/resume/terminal close 边界 | epoch/fingerprint/reason diagnostics |
 | Session `model_ref` | active `ApplicationSession` / `SessionWriter` | create 时采用用户新建默认值；在 Session 内模型切换时更新；resume 时预检后恢复 | catalog、Session/Bridge 安全投影 |

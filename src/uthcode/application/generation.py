@@ -18,7 +18,7 @@ from uthcode.core.agent import (
     RunState,
     SessionGrantSink,
 )
-from uthcode.core.agent_events import FailureReason
+from uthcode.core.agent_events import FailureReason, TerminationReason
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION, PauseReason
 from uthcode.core.planning import (
     BehaviorMode,
@@ -45,7 +45,7 @@ from uthcode.core.provider import (
     Usage,
     validated_provider_stream,
 )
-from uthcode.core.history import TranscriptEntry
+from uthcode.core.history import TranscriptEntry, transcript_entries_for_failed_turn
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -575,6 +575,7 @@ class TranscriptPersistenceOutcome:
     transcript_reload_succeeded: bool = True
     transcript_durability: str = "durable"
     failure_stages: tuple[str, ...] = ()
+    terminal_failure_appended: bool = False
 
     @property
     def status(self) -> str:
@@ -1258,6 +1259,9 @@ class UthCodeApplication:
         *,
         session_id: str | None,
         turn_id: str,
+        failed_visible_message: Message | None = None,
+        termination_reason: TerminationReason | None = None,
+        failure_reason: FailureReason | None = None,
     ) -> TranscriptPersistenceOutcome:
         """Commit one terminal Run delta through separate durable boundaries."""
 
@@ -1322,6 +1326,17 @@ class UthCodeApplication:
                 )
                 entries.extend(converted)
                 sequence += len(converted)
+            if termination_reason is not None:
+                failed_entries = transcript_entries_for_failed_turn(
+                    active.session_id,
+                    turn_id,
+                    sequence,
+                    visible_message=failed_visible_message,
+                    termination_reason=termination_reason,
+                    failure_reason=failure_reason,
+                )
+                entries.extend(failed_entries)
+                sequence += len(failed_entries)
             if any(not entry.commit_boundary for entry in entries):
                 outcome = TranscriptPersistenceOutcome(
                     False,
@@ -1414,6 +1429,7 @@ class UthCodeApplication:
             transcript_reload_succeeded=append_outcome.reload_succeeded,
             transcript_durability=append_outcome.durability,
             failure_stages=append_failures,
+            terminal_failure_appended=termination_reason is not None,
         )
         try:
             active.persist_instruction_state()

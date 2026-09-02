@@ -50,7 +50,7 @@ class ConfigurationInitializationRequired(ConfigurationError):
 
 
 _ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode"})
-_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key"})
+_PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
 _MODEL_FIELDS = frozenset(
     {
         "provider",
@@ -376,6 +376,7 @@ def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
                 "provider_profile_id": profile_id,
                 "kind": profile.get("kind"),
                 "base_url": profile.get("base_url"),
+                "display_name": profile.get("display_name"),
                 "api_key_configured": (
                     isinstance(profile.get("api_key"), str)
                     and bool(profile.get("api_key", "").strip())
@@ -632,6 +633,7 @@ def _provider_profiles(
         )
         kind = profile.get("kind")
         base_url = profile.get("base_url")
+        display_name = profile.get("display_name")
         api_key_value = profile.get("api_key")
         if _blank(kind) and _blank(api_key_value) and _blank(base_url):
             continue
@@ -640,6 +642,10 @@ def _provider_profiles(
             or not kind.strip()
             or kind.strip().lower() not in _SUPPORTED_PROVIDER_KINDS
             or (base_url is not None and (not isinstance(base_url, str) or not base_url.strip()))
+            or (
+                display_name is not None
+                and (not isinstance(display_name, str) or not display_name.strip())
+            )
         ):
             raise ConfigurationError(
                 "invalid Provider profile",
@@ -673,6 +679,8 @@ def _provider_profiles(
                 field=f"providers.{profile_id}.base_url",
             )
         raw: dict[str, object] = {"kind": kind}
+        if "display_name" in profile:
+            raw["display_name"] = display_name
         if "base_url" in profile:
             raw["base_url"] = base_url
         if api_key is not None:

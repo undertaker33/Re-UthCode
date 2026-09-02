@@ -1845,6 +1845,14 @@ def messages_from_context_snapshot(snapshot: ContextSnapshot) -> tuple[Message, 
             except (TypeError, ValueError, json.JSONDecodeError):
                 raise ContextCompilationError("selected semantic unit block is malformed") from None
             for entry in unit.entries:
+                if entry.kind in {
+                    TranscriptKind.FAILED_ASSISTANT_MESSAGE,
+                    TranscriptKind.TURN_FAILURE,
+                }:
+                    # Failed output is durable replay evidence, not a valid
+                    # assistant response to feed back to the Provider.
+                    break_history_identity()
+                    continue
                 append_transcript_entry(entry)
             continue
         if block.provenance.startswith("message:") or block.provenance == "current:user":
@@ -2080,8 +2088,9 @@ class ContextCompiler:
 
         # Selection priority and final composition order are deliberately
         # separate.  Protected sources are selected first, while the final
-        # snapshot keeps Timeline/Transcript before runtime facts and the
-        # current user turn at the conversation tail.
+        # snapshot projects messages as protocol, runtime Contextual,
+        # environment Contextual, Timeline, Transcript, protected context,
+        # current-turn deltas, and the current user turn.
         for index, block in enumerate(prefix.blocks):
             add_selected(block, required=True, composition_key=(0, index))
         for index, raw in enumerate(sources.protocol_blocks):
@@ -2094,13 +2103,13 @@ class ContextCompiler:
             add_selected(
                 _conversation_block(raw),
                 required=True,
-                composition_key=(4, index),
+                composition_key=(6, index),
             )
         for index, raw in enumerate(sources.current_turn):
             add_selected(
                 _conversation_block(raw),
                 required=True,
-                composition_key=(7, index),
+                composition_key=(8, index),
             )
 
         if sources.transcript is not None:
@@ -2109,7 +2118,7 @@ class ContextCompiler:
                     add_selected(
                         _semantic_unit_block(unit),
                         required=True,
-                        composition_key=(3, unit.sequence_start),
+                        composition_key=(5, unit.sequence_start),
                     )
 
         if sources.timeline is not None:
@@ -2119,7 +2128,7 @@ class ContextCompiler:
                 add_selected(
                     _timeline_block(record),
                     required=True,
-                    composition_key=(2, index),
+                    composition_key=(4, index),
                 )
 
         complete_units = () if sources.transcript is None else sources.transcript.semantic_units(complete_only=True)
@@ -2138,7 +2147,7 @@ class ContextCompiler:
             if add_selected(
                 _semantic_unit_block(unit),
                 required=False,
-                composition_key=(3, unit.sequence_start),
+                composition_key=(5, unit.sequence_start),
             ):
                 continue
             # Once the newest complete unit cannot fit, older units are not
@@ -2152,17 +2161,23 @@ class ContextCompiler:
                     omission_reasons.append((identifier, "older_than_budget_boundary"))
             break
 
-        for index, raw in enumerate((*sources.current_turn_deltas, *sources.runtime_sources)):
+        for index, raw in enumerate(sources.runtime_sources):
             add_selected(
                 _conversation_block(raw),
                 required=False,
-                composition_key=(5, index),
+                composition_key=(2, index),
             )
         for index, raw in enumerate(sources.environment_sources):
             add_selected(
                 _conversation_block(raw),
                 required=False,
-                composition_key=(6, index),
+                composition_key=(3, index),
+            )
+        for index, raw in enumerate(sources.current_turn_deltas):
+            add_selected(
+                _conversation_block(raw),
+                required=False,
+                composition_key=(7, index),
             )
 
         selected.sort(key=lambda block: composition_order[context_block_id(block)])

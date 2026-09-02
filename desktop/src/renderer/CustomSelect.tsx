@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { UiIcon } from "./UiIcon";
 
 export interface SelectOption { value: string; label: string; disabled?: boolean }
@@ -14,14 +15,45 @@ export function initialEnabledOption(options: readonly SelectOption[], value: st
 }
 export function customSelectConsumesEscape(open: boolean): boolean { return open; }
 
+interface CustomSelectPosition {
+  placement: "above" | "below";
+  style: CSSProperties;
+}
+
+const MENU_GAP = 5;
+const VIEWPORT_MARGIN = 8;
+const MENU_MAX_HEIGHT = 220;
+
+export function customSelectPosition(rect: DOMRect, optionCount: number, viewportWidth: number, viewportHeight: number): CustomSelectPosition {
+  const estimatedHeight = Math.min(MENU_MAX_HEIGHT, Math.max(42, optionCount * 32 + 10));
+  const spaceAbove = Math.max(0, rect.top - VIEWPORT_MARGIN - MENU_GAP);
+  const spaceBelow = Math.max(0, viewportHeight - rect.bottom - VIEWPORT_MARGIN - MENU_GAP);
+  const placement = spaceAbove >= estimatedHeight || spaceAbove >= spaceBelow ? "above" : "below";
+  const availableHeight = placement === "above" ? spaceAbove : spaceBelow;
+  const menuHeight = Math.min(estimatedHeight, Math.max(0, availableHeight));
+  const width = Math.max(0, Math.min(rect.width, viewportWidth - VIEWPORT_MARGIN * 2));
+  const left = Math.max(VIEWPORT_MARGIN, Math.min(rect.left, viewportWidth - width - VIEWPORT_MARGIN));
+  return {
+    placement,
+    style: {
+      top: placement === "above" ? Math.max(VIEWPORT_MARGIN, rect.top - MENU_GAP - menuHeight) : rect.bottom + MENU_GAP,
+      left,
+      width,
+      maxHeight: Math.max(0, availableHeight),
+    },
+  };
+}
+
 export function CustomSelect({ value, options, onChange, label, disabled = false, id, onOpen }: CustomSelectProps) {
   const generatedId = useId();
   const listId = `${id ?? generatedId}-listbox`;
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(() => initialEnabledOption(options, value));
   const [placement, setPlacement] = useState<"above" | "below">("above");
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({ visibility: "hidden" });
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const list = useRef<HTMLDivElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const optionSignature = options.map((option) => `${option.value}\u0000${option.label}\u0000${option.disabled ? "1" : "0"}`).join("\u0001");
   useEffect(() => { if (!open) setActive(initialEnabledOption(options, value)); }, [open, optionSignature, value]);
@@ -39,16 +71,27 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
     // default (upward) until real geometry is available.
     if (rect.top === 0 && rect.bottom === 0 && rect.height === 0) {
       setPlacement("above");
+      setMenuStyle({ visibility: "hidden" });
       return;
     }
-    const estimatedHeight = Math.min(320, Math.max(44, options.length * 38 + 10));
-    const spaceAbove = Math.max(0, rect.top);
-    const spaceBelow = Math.max(0, window.innerHeight - rect.bottom);
-    setPlacement(spaceAbove >= estimatedHeight || spaceAbove >= spaceBelow ? "above" : "below");
+    const position = customSelectPosition(
+      rect,
+      options.length,
+      Math.max(document.documentElement.clientWidth, window.innerWidth),
+      Math.max(document.documentElement.clientHeight, window.innerHeight),
+    );
+    setPlacement(position.placement);
+    setMenuStyle(position.style);
   };
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return undefined;
-    const close = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) { setOpen(false); trigger.current?.focus(); } };
+    const close = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !root.current?.contains(target) && !list.current?.contains(target)) {
+        setOpen(false);
+        trigger.current?.focus();
+      }
+    };
     updatePlacement();
     document.addEventListener("pointerdown", close);
     window.addEventListener("resize", updatePlacement);
@@ -68,8 +111,12 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
     if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); if (open) choose(active); else openMenu(); }
   };
   const selected = options.find((item) => item.value === value);
-  return <div className="custom-select" ref={root} onKeyDown={keyDown} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) closeMenu(); }}>
+  const menu = open && typeof document !== "undefined" ? createPortal(<div ref={list} id={listId} className={`custom-select__list is-${placement}`} style={menuStyle} role="listbox" aria-label={label}>{options.map((option, index) => <button ref={(element) => { optionRefs.current[index] = element; }} id={`${listId}-option-${index}`} type="button" role="option" title={option.label} key={option.value} aria-selected={option.value === value} tabIndex={index === active ? 0 : -1} className={index === active ? "is-active" : ""} disabled={option.disabled} onPointerMove={() => { if (!option.disabled) setActive(index); }} onClick={() => choose(index)}>{option.label}</button>)}</div>, document.body) : null;
+  return <div className="custom-select" ref={root} onKeyDown={keyDown} onBlur={(event) => {
+    const next = event.relatedTarget as Node | null;
+    if (!root.current?.contains(next) && !list.current?.contains(next)) closeMenu();
+  }}>
     <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}><span className="custom-select__value">{selected?.label ?? value}</span><UiIcon name="chevron" /></button>
-    {open && <div id={listId} className={`custom-select__list is-${placement}`} role="listbox" aria-label={label}>{options.map((option, index) => <button ref={(element) => { optionRefs.current[index] = element; }} id={`${listId}-option-${index}`} type="button" role="option" title={option.label} key={option.value} aria-selected={option.value === value} tabIndex={index === active ? 0 : -1} className={index === active ? "is-active" : ""} disabled={option.disabled} onPointerMove={() => { if (!option.disabled) setActive(index); }} onClick={() => choose(index)}>{option.label}</button>)}</div>}
+    {menu}
   </div>;
 }

@@ -612,7 +612,13 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   ): Promise<void> => {
     const generation = runtimeGenerationRef.current + 1;
     runtimeGenerationRef.current = generation;
-    dispatch({ type: "runtime_state", state: "restarting", error: null });
+    // Navigation shares the lifecycle tail and generation ownership because
+    // it can replace the visible Application/Session projection, but it does
+    // not restart the Python Runtime. Keep that internal exclusion separate
+    // from the user-visible Runtime lifecycle state.
+    const publishesLifecycleState = kind !== "navigation";
+    const clearsSupersededLifecycleState = kind === "navigation" && stateRef.current.runtimeState === "restarting";
+    if (publishesLifecycleState) dispatch({ type: "runtime_state", state: "restarting", error: null });
     const predecessor = runtimeOperationTailRef.current;
     const owner: RuntimeOperationOwner = { generation, kind, promise: Promise.resolve() };
     const isOwned: RuntimeOwnershipCheck = () => mountedRef.current
@@ -638,7 +644,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (runtimeGenerationRef.current !== generation
         || runtimeOwnerRef.current !== owner
         || runtimeOwnerRef.current?.promise !== owner.promise) return;
-      if (!failed) dispatch({ type: "runtime_state", state: terminalState, error: null });
+      if (!failed && (publishesLifecycleState || clearsSupersededLifecycleState)) dispatch({ type: "runtime_state", state: terminalState, error: null });
       runtimeOwnerRef.current = null;
     });
     const safeOperation = operation.catch(() => {

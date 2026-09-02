@@ -20,6 +20,7 @@ default_permission_mode = "default"
 
 [providers.my-provider]
 kind = "openai_compat"
+display_name = "Company gateway"
 base_url = "https://your-provider.example/v1"
 api_key = "env:MY_PROVIDER_API_KEY"
 
@@ -51,7 +52,7 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 
 用户配置中的 `default_permission_mode` 只能是 `default` 或 `auto`；`full_access` 只能在当前运行中选择。项目配置可以选择用户已信任的 Provider、模型和非敏感模型参数，但不能定义 Provider、修改端点或密钥来源，也不能设置默认权限模式。
 
-模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
+Provider 表的键是稳定 Provider Profile ID，Model 的 `provider` 始终引用这个 ID。可选 `display_name` 只用于界面显示，修改或清空它不会改变 Model 引用；未配置时 Desktop 回退显示稳定 ID。模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
 
 ### Context Window 与 Provider 限制
 
