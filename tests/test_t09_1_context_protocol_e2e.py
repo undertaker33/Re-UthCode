@@ -17,12 +17,10 @@ from uthcode.application import (
 from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.sessions import ApplicationSessionService
-from uthcode.core.compaction import CompactionEpoch
+from uthcode.core.compaction import CompactionEpoch, CompactionResult, ContextCompactor
 from uthcode.core.agent_events import FailureReason
 from uthcode.core.context import (
-    CompactionResult,
     ContextBudget,
-    ContextCompactor,
     account_generation_request,
     pressure_estimate,
     safety_allowance_for,
@@ -61,6 +59,15 @@ def _completed(text: str) -> GenerationCompleted:
             finish_reason=FinishReason.STOP,
         )
     )
+
+
+def _required_compaction_coverage(request: GenerationRequest) -> tuple[dict[str, object], ...]:
+    marker = "Required coverage (copy only these Turn IDs):\n"
+    payload = request.messages[0].parts[0].text
+    assert marker in payload
+    decoded = json.loads(payload.rsplit(marker, 1)[1])
+    assert isinstance(decoded, list)
+    return tuple(decoded)
 
 
 class _L4Provider:
@@ -112,21 +119,18 @@ class _L4Provider:
             if self._compaction_failure is not None:
                 yield _completed("partial compaction output")
                 raise self._compaction_failure
-            turn_ids = tuple(
-                value
-                for value in request.metadata.get("context_compaction_epoch_turns", ())
-                if isinstance(value, str)
-            )
+            coverage = _required_compaction_coverage(request)
             summary = self._compaction_summary
             payload = {
                 "entries": [
                     {
-                        "turn_id": turn_id,
-                        "summary": summary or f"summary for {turn_id}",
+                        "turn_id": item["turn_id"],
+                        "summary": summary or f"summary for {item['turn_id']}",
+                        "refs": item["refs"],
                     }
-                    for turn_id in turn_ids
+                    for item in coverage
                 ],
-                "coverage": list(turn_ids),
+                "coverage": [item["turn_id"] for item in coverage],
             }
             yield _completed(json.dumps(payload, ensure_ascii=False))
             return
@@ -283,20 +287,17 @@ class _OverflowRecoveryProvider:
                     json.dumps({"entries": "not-a-list", "coverage": []})
                 )
                 return
-            turn_ids = tuple(
-                value
-                for value in request.metadata.get("context_compaction_epoch_turns", ())
-                if isinstance(value, str)
-            )
+            coverage = _required_compaction_coverage(request)
             payload = {
                 "entries": [
                     {
-                        "turn_id": turn_id,
-                        "summary": self.compaction_summary or f"summary for {turn_id}",
+                        "turn_id": item["turn_id"],
+                        "summary": self.compaction_summary or f"summary for {item['turn_id']}",
+                        "refs": item["refs"],
                     }
-                    for turn_id in turn_ids
+                    for item in coverage
                 ],
-                "coverage": list(turn_ids),
+                "coverage": [item["turn_id"] for item in coverage],
             }
             yield _completed(json.dumps(payload, ensure_ascii=False))
             return
@@ -357,17 +358,17 @@ class _PostToolOverflowProvider:
         self.observed_transcript_entries.append(tuple(active.transcript.entries))
         cancellation.raise_if_cancelled()
         if request.metadata.get("context_compaction_request") is True:
-            turn_ids = tuple(
-                value
-                for value in request.metadata.get("context_compaction_epoch_turns", ())
-                if isinstance(value, str)
-            )
+            coverage = _required_compaction_coverage(request)
             payload = {
                 "entries": [
-                    {"turn_id": turn_id, "summary": f"summary for {turn_id}"}
-                    for turn_id in turn_ids
+                    {
+                        "turn_id": item["turn_id"],
+                        "summary": f"summary for {item['turn_id']}",
+                        "refs": item["refs"],
+                    }
+                    for item in coverage
                 ],
-                "coverage": list(turn_ids),
+                "coverage": [item["turn_id"] for item in coverage],
             }
             yield _completed(json.dumps(payload, ensure_ascii=False))
             return

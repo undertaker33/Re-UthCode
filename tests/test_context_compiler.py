@@ -7,9 +7,8 @@ import pytest
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.compaction import CompactionPolicy, ContextCompactor
 from uthcode.core.context import (
-    CompactionPolicy,
-    ContextCompactor,
     ContextCompilationError,
     ContextCompiler,
     ContextSourceBundle,
@@ -168,10 +167,28 @@ def test_compact_and_conversation_growth_preserve_provider_cache_prefix() -> Non
     assert grown.prefix_changed is False
     assert cache_key(grown) == before_key
 
-    compaction = ContextCompactor(
+    compactor = ContextCompactor(
         policy=CompactionPolicy(input_budget=500, output_reserve=50, summary_hard_cap=100),
-        token_estimator=lambda text: max(1, len(text) // 20),
-    ).compact(transcript, summarize=lambda _text: "bounded summary")
+        token_estimator=lambda _text: 1,
+    )
+    epoch = compactor.plan_epoch(transcript)
+    assert epoch is not None
+    response = {
+        "entries": [
+            {
+                "turn_id": turn_id,
+                "summary": f"bounded summary for {turn_id}",
+                "refs": [ref.to_dict()],
+            }
+            for turn_id, ref in zip(epoch.turn_ids, epoch.refs, strict=True)
+        ],
+        "coverage": list(epoch.turn_ids),
+    }
+    compaction = compactor.build_epoch_candidate(
+        transcript,
+        epoch=epoch,
+        result=compactor.parse_epoch_result(response, epoch=epoch),
+    )
     assert compaction.changed is True
     assert compaction.timeline is not None
     assert compaction.timeline.active_checkpoint is not None
