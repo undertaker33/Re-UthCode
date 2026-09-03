@@ -2,12 +2,12 @@
 
 ## T01：Core Compaction 冻结与旧路径清理
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_context_compaction.py tests/test_context_compiler.py tests/test_t09_1_context_protocol_e2e.py -q`，全部用例通过。
-- [ ] multi-turn plain text、top-level summary、string entry、缺 refs、缺 coverage、数量/顺序/`turn_id` 不匹配均被拒绝；合法显式 entries 可继续。
-- [ ] oversized oldest complete Turn 能形成 bounded subpass plan，最终 candidate 只有一个 Fine、使用原 Turn identity 且 refs 覆盖完整 Turn。
-- [ ] oversized subpass 的 failure、cancel、invalid result 均不返回最终 candidate，不产生 durable ID/Timeline record。
-- [ ] 执行对 `ContextCompactor.compact`、`_compact_locked` 及旧 rolling helper 的 active source/test 引用扫描，返回 0 条；production L4/L5 single-flight 仍存在并有测试。
-- [ ] `core/context.py` 不再拥有 compaction 执行主体，`core/compaction.py` 为唯一 Core compaction 模块；公共导出无 legacy alias。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_context_compaction.py tests/test_context_compiler.py tests/test_t09_1_context_protocol_e2e.py -q`，全部用例通过。
+- [x] multi-turn plain text、top-level summary、string entry、缺 refs、缺 coverage、数量/顺序/`turn_id` 不匹配均被拒绝；合法显式 entries 可继续。
+- [x] oversized oldest complete Turn 能形成 bounded subpass plan，最终 candidate 只有一个 Fine、使用原 Turn identity 且 refs 覆盖完整 Turn。
+- [x] oversized subpass 的 failure、cancel、invalid result 均不返回最终 candidate，不产生 durable ID/Timeline record。
+- [x] 执行对 `ContextCompactor.compact`、`_compact_locked` 及旧 rolling helper 的 active source/test 引用扫描，返回 0 条；production L4/L5 single-flight 仍存在并有测试。
+- [x] `core/context.py` 不再拥有 compaction 执行主体，`core/compaction.py` 为唯一 Core compaction 模块；公共导出无 legacy alias。
 
 ## T02：Application Working Context、manual Compact 与 usage 双投影
 
