@@ -6,7 +6,8 @@ import { App } from "../src/renderer/App";
 import { CustomSelect } from "../src/renderer/CustomSelect";
 import { LanguageProvider } from "../src/renderer/i18n";
 import { SettingsView } from "../src/renderer/SettingsView";
-import { createInitialState } from "../src/renderer/state";
+import { ChatTimeline } from "../src/renderer/ChatTimeline";
+import { createInitialState, type TimelineEntry } from "../src/renderer/state";
 
 const configuration = {
   default_model: "openai/codex", default_permission_mode: "default" as const,
@@ -17,7 +18,7 @@ declare global { interface Window { fixtureEvidence: { reads: string[]; writes: 
 const preferences: DesktopPreferences = { theme: "dark", language: sessionStorage.getItem("uthcode.fixture.api.language") === "en" ? "en" : "zh-CN", windowBounds: { width: 1200, height: 800, maximized: false }, panelMode: "hidden", recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
 window.fixtureEvidence = { reads: [], writes: [], saves: [], preferences };
 const fakeApi: DesktopApi = {
-  openProject: async () => null, openProjectInExplorer: async () => undefined, copySessionId: async () => undefined, closeShell: async () => undefined,
+  openProject: async () => null, openProjectInExplorer: async () => undefined, copyText: async () => undefined, closeShell: async () => undefined,
   requestRuntime: async (method, params) => method === "settings.save" ? (window.fixtureEvidence.saves.push(params), { configuration }) : method === "settings.get" ? { configuration } : method === "settings.reveal_api_key" ? { api_key: "env:W04_FIXTURE_KEY" } : {},
   subscribeAgentEvents: () => () => undefined,
   readPreference: async <K extends PreferenceKey>(key: K) => { window.fixtureEvidence.reads.push(key); return window.fixtureEvidence.preferences[key]; },
@@ -39,7 +40,14 @@ function AppHarness() {
   const initialState = createInitialState({ runtimeState: "ready", view: "settings", configuration, settingsLoaded: true, theme: "dark", language: "zh-CN" });
   return <App api={fakeApi} initialState={initialState} />;
 }
+function ChatHarness() {
+  const [entries, setEntries] = useState<TimelineEntry[]>(() => Array.from({ length: 24 }, (_item, index) => ({ id: `fixture-entry-${index}`, kind: "assistant", text: `Entry ${index}\n${"Scrollable content line. ".repeat(12)}` })));
+  return <div className="theme-dark" style={{ position: "relative", height: "100vh" }}>
+    <button id="fixture-chat-add" type="button" style={{ position: "fixed", top: 8, left: 8, zIndex: 10 }} onClick={() => setEntries((current) => [...current, { id: `fixture-entry-${current.length}`, kind: "assistant", text: "A streamed message arrived.", streaming: true }])}>Add message</button>
+    <ChatTimeline entries={entries} todo={[]} sessionKey="fixture-chat" />
+  </div>;
+}
 const style = document.createElement("style"); style.textContent = css; document.head.append(style);
 const harness = new URLSearchParams(location.search).get("harness");
-createRoot(document.getElementById("root")!).render(harness === "select" ? <SelectHarness /> : harness === "app" ? <AppHarness /> : <Fixture />);
+createRoot(document.getElementById("root")!).render(harness === "select" ? <SelectHarness /> : harness === "app" ? <AppHarness /> : harness === "chat" ? <ChatHarness /> : <Fixture />);
 document.documentElement.dataset.fixture = "prompt-2-settings";

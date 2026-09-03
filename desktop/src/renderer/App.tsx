@@ -921,15 +921,19 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [beginSessionMutation, endSessionMutation, hasOwner, isMounted, persist, reconcileSessionMutation, refreshCatalog, runtimeGeneration, send, t, waitForRuntimeUserAccess]);
 
+  const copyText = useCallback(async (text: string) => {
+    if (!api) throw new Error("Desktop API is unavailable");
+    await api.copyText(text);
+  }, [api]);
+
   const copySessionId = useCallback(async (session: SessionSummary) => {
-    if (!api) return;
     try {
-      await api.copySessionId(session.session_id);
+      await copyText(session.session_id);
       dispatch({ type: "notice", text: t("copiedSessionId") });
     } catch (error) {
       dispatch({ type: "notice", text: safeErrorMessage(error, t("copySessionIdFailed")) });
     }
-  }, [api]);
+  }, [copyText, t]);
 
   const removeProject = useCallback(async (project: ProjectState) => {
     const current = stateRef.current;
@@ -1137,6 +1141,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         runtimeError={state.runtimeError}
         runtimeErrorVisible={runtimeVisible}
         onOpenSettings={state.runtimeError ? () => void loadSettings() : undefined}
+        onCopyText={copyText}
         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
       />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}

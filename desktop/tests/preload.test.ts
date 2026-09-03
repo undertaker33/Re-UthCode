@@ -52,7 +52,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(exposed.api, api);
   assert.deepEqual(Object.keys(api).sort(), [
     "closeShell",
-    "copySessionId",
+    "copyText",
     "openProject",
     "openProjectInExplorer",
     "readPreference",
@@ -66,7 +66,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
 
   assert.equal(await api.openProject(), "C:\\Projects\\UthCode");
   await api.openProjectInExplorer("C:\\Projects\\UthCode");
-  await api.copySessionId("session-1");
+  await api.copyText("session-1");
   await api.closeShell();
   await api.requestRuntime("status.get", {});
   await api.readPreference("theme");
@@ -76,7 +76,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
     { channel: "desktop.project.explorer", args: ["C:\\Projects\\UthCode"] },
-    { channel: "desktop.session.copy-id", args: ["session-1"] },
+    { channel: "desktop.clipboard.copy-text", args: ["session-1"] },
     { channel: "desktop.shell.close", args: [] },
     { channel: "desktop.runtime.request", args: [{ method: "status.get", params: {} }] },
     { channel: "desktop.preference.read", args: ["theme"] },
@@ -200,18 +200,18 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
 
   const pick = handlers.get(IPC_CHANNELS.pickProject);
   const explorer = handlers.get(IPC_CHANNELS.openProjectInExplorer);
-  const copySessionId = handlers.get(IPC_CHANNELS.copySessionId);
+  const copyText = handlers.get(IPC_CHANNELS.copyText);
   const closeShell = handlers.get(IPC_CHANNELS.closeShell);
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
-  assert.ok(pick && explorer && copySessionId && closeShell && runtimeRequest);
+  assert.ok(pick && explorer && copyText && closeShell && runtimeRequest);
   await assert.rejects(closeShell?.({ sender: {}, senderFrame: mainFrame }), /not trusted/);
   await assert.rejects(
     runtimeRequest?.({ sender: {}, senderFrame: mainFrame }, { method: "status.get", params: {} }),
     /not trusted/,
   );
-  await assert.rejects(copySessionId?.({ sender: {}, senderFrame: mainFrame }, "session-1"), /not trusted/);
-  await copySessionId?.(trustedEvent, "session-1");
-  await assert.rejects(copySessionId?.(trustedEvent, "  "), /Session ID is invalid/);
+  await assert.rejects(copyText?.({ sender: {}, senderFrame: mainFrame }, "session-1"), /not trusted/);
+  await copyText?.(trustedEvent, "session-1");
+  await assert.rejects(copyText?.(trustedEvent, 1), /Clipboard text is invalid/);
   await assert.rejects(explorer?.(trustedEvent, "C:\\Projects\\Other"), /selected before/);
   assert.equal(await pick?.(trustedEvent), "C:\\Projects\\UthCode");
   await explorer?.(trustedEvent, "C:\\Projects\\UthCode");

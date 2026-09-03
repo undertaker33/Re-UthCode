@@ -18,7 +18,8 @@ import {
 import { applyProjectOpened, applySessionMutation } from "../src/renderer/state-session";
 import { App, commandResultNotice, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, safeErrorMessage } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, menuPosition, sessionGroups } from "../src/renderer/Sidebar";
-import { ChatTimeline, isNearBottom, renderMarkdown, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
+import { ChatTimeline, isNearBottom, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
+import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
 import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
@@ -151,7 +152,7 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
       const api: DesktopApi = {
         openProject: async () => null,
         openProjectInExplorer: async () => undefined,
-        copySessionId: async () => undefined,
+        copyText: async () => undefined,
         closeShell: async () => undefined,
         requestRuntime: async (method) => {
           if (method === "settings.get") throw new Error(rawSettingsGet);
@@ -210,7 +211,7 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       requestRuntime: async (method) => {
         if (method === "runtime.initialize") throw new Error(rawSandboxFailure);
         return {};
@@ -250,7 +251,7 @@ test("T06 Runtime error owns one accessible DOM entity across renderer modes", a
           const error = translate(language, "runtimeStartFailed");
           const state = createInitialState({ language, theme, panelMode: scenario.panelMode, runtimeState: "configuration_required", runtimeError: error, notice: error });
           const stored: DesktopPreferences = { theme, language, windowBounds: { width: scenario.width, height: 800, maximized: false }, panelMode: scenario.panelMode, recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
-          const api: DesktopApi = { openProject: async () => null, openProjectInExplorer: async () => undefined, copySessionId: async () => undefined, closeShell: async () => undefined, requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key], writePreference: async () => stored };
+          const api: DesktopApi = { openProject: async () => null, openProjectInExplorer: async () => undefined, copyText: async () => undefined, closeShell: async () => undefined, requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key], writePreference: async () => stored };
           act(() => { root.render(<App key={`${theme}-${language}-${scenario.width}-${scenario.panelMode}-${renderIndex++}`} initialState={state} api={api} />); });
           await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
 
@@ -584,7 +585,7 @@ test("T05 App single-flights Session mutations and applies only the accepted mov
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         if (method === "session.move") {
@@ -681,7 +682,7 @@ test("T05 App keeps the original Session projection after a failed mutation", as
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         if (method === "session.move") {
@@ -744,7 +745,7 @@ test("T05 App ignores a late mutation result after navigation changes the Runtim
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         if (method === "session.move") {
@@ -834,7 +835,7 @@ test("T05 App routes direct commands and waits for terminal status authority", a
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -943,7 +944,7 @@ test("T09 App consumes typed status params through the localized RuntimePanel", 
       const api: DesktopApi = {
         openProject: async () => null,
         openProjectInExplorer: async () => undefined,
-        copySessionId: async () => undefined,
+        copyText: async () => undefined,
         closeShell: async () => undefined,
         requestRuntime: async (method) => {
           calls.push(method);
@@ -1775,7 +1776,7 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     providerRow!.focus();
     act(() => { providerRow!.click(); });
     await tick();
-    const providerDialog = () => container.querySelector<HTMLElement>('.provider-modal[aria-labelledby$="protocol-title"]');
+    const providerDialog = () => container.querySelector<HTMLElement>('.settings-editor-modal[data-settings-editor-step="provider"]');
     assert.equal(container.querySelectorAll(".settings-model-row").length, 2);
     assert.ok(providerDialog());
     assert.equal((dom.window.document.activeElement as HTMLElement)?.id, "modal-provider-display-name");
@@ -1783,22 +1784,21 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     assert.ok(editSecondary);
     act(() => { editSecondary!.click(); });
     await tick();
-    const modelDialog = container.querySelector<HTMLElement>(".model-modal");
+    const modelDialog = container.querySelector<HTMLElement>('.settings-editor-modal[data-settings-editor-step="model"]');
     assert.ok(modelDialog);
     assert.equal(modelDialog!.getAttribute("aria-modal"), "true");
-    assert.equal(providerDialog()!.getAttribute("aria-hidden"), "true", "the covered Provider modal is hidden from the accessibility tree");
-    assert.equal(providerDialog()!.getAttribute("aria-modal"), null, "only the top-level nested modal is aria-modal");
-    assert.equal((providerDialog() as HTMLElement & { inert?: boolean }).inert, true, "the covered Provider modal is inert");
+    assert.equal(container.querySelectorAll('.settings-editor-modal').length, 1, "Provider and Model share one modal root");
+    assert.equal(modelDialog!.getAttribute("aria-hidden"), null, "the active editor remains in the accessibility tree");
     assert.equal(container.querySelectorAll('[role="dialog"][aria-modal="true"]').length, 1);
     assert.doesNotMatch(modelDialog!.textContent ?? "", /provider\/secondary|__uthcode_model_/u);
     const modalFocusable = Array.from(modelDialog!.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [role="button"]:not([aria-disabled="true"])'));
     assert.ok(modalFocusable.length > 2);
     modalFocusable.at(-1)!.focus();
     act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Tab" })); });
-    assert.equal(dom.window.document.activeElement, modalFocusable[0], "Tab wraps within the nested modal");
+    assert.equal(dom.window.document.activeElement, modalFocusable[0], "Tab wraps within the single editor modal");
     modalFocusable[0]!.focus();
     act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Tab", shiftKey: true })); });
-    assert.equal(dom.window.document.activeElement, modalFocusable.at(-1), "Shift+Tab wraps within the nested modal");
+    assert.equal(dom.window.document.activeElement, modalFocusable.at(-1), "Shift+Tab wraps within the single editor modal");
     const cancelModel = modelDialog!.querySelector<HTMLButtonElement>('button[title="Cancel"]');
     assert.ok(cancelModel);
     const makeDefault = modelDialog!.querySelector<HTMLInputElement>('input[type="checkbox"]');
@@ -1808,18 +1808,20 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     assert.equal(makeDefault!.checked, true);
     act(() => { dom.window.document.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Escape" })); });
     await tick();
-    assert.equal(container.querySelector(".model-modal"), null);
-    assert.equal(dom.window.document.activeElement, editSecondary, "Escape restores focus to the model row that opened the modal");
+    assert.equal(container.querySelector('.settings-editor-modal'), null);
+    assert.equal(dom.window.document.activeElement, providerRow, "Escape cancels the transaction and restores focus to the provider row");
     const saveBeforeAdd = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
     assert.ok(saveBeforeAdd);
     act(() => { saveBeforeAdd!.click(); });
     await tick();
     assert.equal(saves.at(-1)?.default_model, "provider/primary", "Cancel restores default_model before global Save");
+    act(() => { providerRow!.click(); });
+    await tick();
     const addModel = providerDialog()!.querySelector<HTMLButtonElement>('button[title="Add model"]');
     assert.ok(addModel);
     act(() => { addModel!.click(); });
     await tick();
-    const newModelDialog = container.querySelector<HTMLElement>(".model-modal");
+    const newModelDialog = container.querySelector<HTMLElement>('.settings-editor-modal[data-settings-editor-step="model"]');
     assert.ok(newModelDialog);
     assert.match(newModelDialog!.textContent ?? "", /Unnamed model/u);
     const remoteInput = newModelDialog!.querySelector<HTMLInputElement>('input[id$="-remote"]');
@@ -1895,11 +1897,11 @@ test("T07 provider URL and model display name preserve edit-time spaces and norm
     });
     await tick();
     assert.equal(displayName!.value, " My Model ", "display name editing retains spaces and the real internal space");
-    const applyModel = container.querySelector<HTMLElement>(".model-modal button[title=\"Apply\"]") as HTMLButtonElement | null;
+    const applyModel = container.querySelector<HTMLElement>('.settings-editor-modal[data-settings-editor-step="model"] button[title="Apply"]') as HTMLButtonElement | null;
     assert.ok(applyModel);
     act(() => { applyModel!.click(); });
     await tick();
-    const applyProvider = container.querySelector<HTMLElement>(".provider-modal:not(.model-modal) footer button[title=\"Apply\"]") as HTMLButtonElement | null;
+    const applyProvider = container.querySelector<HTMLElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]') as HTMLButtonElement | null;
     assert.ok(applyProvider);
     act(() => { applyProvider!.click(); });
     await tick();
@@ -1929,7 +1931,7 @@ test("T07 durable Settings save clears transient secrets even when Runtime recov
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -1976,7 +1978,7 @@ test("T07 durable Settings save clears transient secrets even when Runtime recov
         input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
       });
       await tick();
-      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
       assert.ok(applyProvider);
       act(() => { applyProvider!.click(); });
       await tick();
@@ -1992,7 +1994,7 @@ test("T07 durable Settings save clears transient secrets even when Runtime recov
       act(() => { reopened!.click(); });
       await tick();
       assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "transient key is cleared before deferred Runtime recovery settles");
-      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
       assert.ok(applyProvider);
       act(() => { applyProvider!.click(); });
       await tick();
@@ -2013,7 +2015,7 @@ test("T07 durable Settings save clears transient secrets even when Runtime recov
       act(() => { reopened!.click(); });
       await tick();
       assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "a durable save does not repopulate the saved plaintext after recovery failure");
-      const applyProvider = container.querySelector<HTMLButtonElement>('.provider-modal:not(.model-modal) footer button[title="Apply"]');
+      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
       assert.ok(applyProvider);
       act(() => { applyProvider!.click(); });
       await tick();
@@ -2054,7 +2056,7 @@ test("T07 durable Settings Save locks the real Settings DOM and clears an A draf
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -2104,13 +2106,13 @@ test("T07 durable Settings Save locks the real Settings DOM and clears an A draf
       setInput(apiKey!, "draft-a");
     });
     await tick();
-    // Open an existing Model modal so Save also closes the nested modal and
-    // its input handlers are exercised after the lifecycle starts.
+    // Switch the same modal root to the Model step so Save closes the active
+    // transaction and its input handlers are exercised after the lifecycle starts.
     act(() => { modelEdit!.click(); });
     await tick();
-    const modelRemote = container.querySelector<HTMLInputElement>(".model-modal input[id$=\"-remote\"]");
-    const addModel = container.querySelector<HTMLButtonElement>(".provider-modal:not(.model-modal) .settings-subsection__heading > button[title=\"Add model\"]");
-    assert.ok(modelRemote && addModel);
+    const modelRemote = container.querySelector<HTMLInputElement>('.settings-editor-modal[data-settings-editor-step="model"] input[id$="-remote"]');
+    const modelBack = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="model"] footer button[title="Back to chat"]');
+    assert.ok(modelRemote && modelBack);
 
     const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
     assert.ok(save);
@@ -2121,7 +2123,7 @@ test("T07 durable Settings Save locks the real Settings DOM and clears an A draf
     assert.equal(settings?.getAttribute("aria-describedby"), "settings-busy-status");
     assert.match(container.querySelector<HTMLElement>(".settings-view__busy-status")?.textContent ?? "", /Saving settings…/u);
     assert.equal(dom.window.document.activeElement, container.querySelector("#settings-busy-status"), "busy status receives focus while the modal is closed");
-    assert.equal(container.querySelector("[role=dialog]"), null, "Save closes both provider and nested Model modal");
+    assert.equal(container.querySelector("[role=dialog]"), null, "Save closes the shared editor modal");
     assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
     assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 0, "Runtime recovery waits for durable Save");
     assert.equal(saveRequests[0]?.providers?.provider?.api_key, "draft-a");
@@ -2148,7 +2150,7 @@ test("T07 durable Settings Save locks the real Settings DOM and clears an A draf
       triggers.forEach((trigger) => trigger.click());
       back!.click();
       cancel!.click();
-      addModel!.click();
+      modelBack!.click();
       setInput(baseUrl!, " B provider ");
       setInput(apiKey!, "draft-b");
       setInput(modelRemote!, "model-b");
@@ -2204,7 +2206,7 @@ test("T07 durable Settings Save failure keeps the A draft after the modal closes
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -2300,7 +2302,7 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -2380,7 +2382,7 @@ test("ordinary Session navigation keeps lifecycle ownership without presenting a
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
@@ -2428,7 +2430,7 @@ test("T07 durable Save failure releases its lifecycle owner without starting Run
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
@@ -2463,7 +2465,7 @@ test("T07 unmount invalidates a pending durable Save without continuing its old 
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
@@ -2511,7 +2513,7 @@ test("T07 newer durable Save supersedes a blocked recovery without concurrent Ru
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
@@ -2585,7 +2587,7 @@ test("T07 completed lifecycle owner releases ordinary refreshes and runtime even
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push({ method, params });
@@ -2701,7 +2703,7 @@ test("T07 navigation supersedes blocked recovery and unmount suppresses late lif
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
         calls.push(method);
@@ -2770,7 +2772,7 @@ test("T07 duplicate Save clicks issue one durable request", async () => {
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         if (method === "settings.save") {
