@@ -24,12 +24,12 @@
 
 ## T03：Renderer state 与 App 生命周期收敛
 
-- [ ] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，新增 state/lifecycle/session 测试由正式脚本执行且全部通过。
-- [ ] `state.ts` 仍是唯一 RendererState/reducer authority；normalize/text/session helper 均为纯函数，不持 store、reducer 或持久状态。
-- [ ] `useRuntimeLifecycle` 是 runtime generation/owner/tail、AbortController、stale guard 与 terminal convergence 的唯一 owner，App 未保留重复 refs。
-- [ ] Session A/B background events、visible owner switch、stale operation、terminal event/result race 与 Settings rebootstrap 回归通过。
-- [ ] 从 `renderer.test.tsx` 迁出的高价值竞态、ARIA、Session identity/ordering 覆盖在新测试中可定位且没有被删除。
-- [ ] 执行重复 store、EventBus、RuntimeManager 和第二 reducer 的否定扫描，无 F03 新增生产命中。
+- [x] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，新增 state/lifecycle/session 测试由正式脚本执行且全部通过。
+- [x] `state.ts` 仍是唯一 RendererState/reducer authority；normalize/text/session helper 均为纯函数，不持 store、reducer 或持久状态。
+- [x] `useRuntimeLifecycle` 是 runtime generation/owner/tail、AbortController、stale guard 与 terminal convergence 的唯一 owner，App 未保留重复 refs。
+- [x] Session A/B background events、visible owner switch、stale operation、terminal event/result race 与 Settings rebootstrap 回归通过。
+- [x] 从 `renderer.test.tsx` 迁出的高价值竞态、ARIA、Session identity/ordering 覆盖在新测试中可定位且没有被删除。
+- [x] 执行重复 store、EventBus、RuntimeManager 和第二 reducer 的否定扫描，无 F03 新增生产命中。
 
 ## T04：Settings 单 Modal 与 Markdown 高频交互
 
