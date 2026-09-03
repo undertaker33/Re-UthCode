@@ -25,7 +25,11 @@ from uthcode.application import (
 )
 from uthcode.application.history import _transcript_entries_for_message
 from uthcode.application.instructions import InstructionLoader
-from uthcode.application.provider_usage import public_usage_diagnostics
+from uthcode.application.provider_usage import (
+    cumulative_usage_delta,
+    public_usage_diagnostics,
+)
+from uthcode.application.request_preparation import prepare_prospective_request_async
 from uthcode.core.history import Timeline, Transcript
 from uthcode.core.planning import BehaviorMode
 from uthcode.core.prompt import RuntimePromptContext
@@ -40,6 +44,7 @@ from uthcode.core.prompt import (
 )
 from uthcode.core.provider import (
     CancellationToken,
+    ContextCountEstimate,
     FinishReason,
     GenerationCompleted,
     GenerationRequest,
@@ -76,6 +81,134 @@ def _completed(usage: Usage) -> GenerationCompleted:
             finish_reason=FinishReason.STOP,
         )
     )
+
+
+def test_cumulative_usage_delta_clamps_regressions_and_keeps_current_details() -> None:
+    previous = Usage(
+        input_tokens=9,
+        output_tokens=4,
+        total_tokens=13,
+        cache_read_tokens=3,
+        cache_write_tokens=2,
+        details={"source": "previous"},
+    )
+    current = Usage(
+        input_tokens=7,
+        output_tokens=6,
+        total_tokens=13,
+        cache_read_tokens=1,
+        cache_write_tokens=4,
+        details={"source": "current"},
+    )
+
+    delta = cumulative_usage_delta(current, previous)
+
+    assert delta.input_tokens == 0
+    assert delta.output_tokens == 2
+    assert delta.total_tokens == 0
+    assert delta.cache_read_tokens == 0
+    assert delta.cache_write_tokens == 2
+    assert delta.details == current.details
+
+
+def test_context_projection_fingerprint_only_publishes_final_request() -> None:
+    service = ApplicationContextService()
+    full_messages = (
+        Message("user", (TextPart("older request"),)),
+        Message("assistant", (TextPart("older answer"),)),
+        Message("user", (TextPart("first request"),)),
+    )
+    reduced_messages = (Message("user", (TextPart("second request"),)),)
+
+    service.compose_generation_request(
+        full_messages,
+        run_id="projection-first",
+    )
+    first_context = service.public_diagnostics()["context"]
+    assert isinstance(first_context, Mapping)
+    first_fingerprint = first_context["conversation_projection_fingerprint"]
+    assert isinstance(first_fingerprint, str)
+    assert first_context["conversation_projection_changed"] is False
+
+    service.compose_generation_request(
+        reduced_messages,
+        run_id="projection-preview",
+        publish=False,
+    )
+    preview_context = service.public_diagnostics()["context"]
+    assert preview_context == first_context
+
+    service.compose_generation_request(
+        reduced_messages,
+        run_id="projection-final",
+    )
+    final_context = service.public_diagnostics()["context"]
+    assert isinstance(final_context, Mapping)
+    assert final_context["conversation_projection_fingerprint"] != first_fingerprint
+    assert final_context["conversation_projection_changed"] is True
+
+    service.compose_generation_request(
+        full_messages,
+        run_id="projection-restore",
+    )
+    restored_context = service.public_diagnostics()["context"]
+    assert isinstance(restored_context, Mapping)
+    assert restored_context["conversation_projection_fingerprint"] != final_context[
+        "conversation_projection_fingerprint"
+    ]
+    assert restored_context["conversation_projection_changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_prospective_request_keeps_exact_or_local_count_source() -> None:
+    base = GenerationRequest(
+        messages=(Message("user", (TextPart("prospective"),)),),
+    )
+
+    def compose(
+        provider_count: object,
+        _defer_hard_gate: bool,
+        _count_fallback: str | None,
+    ) -> GenerationRequest:
+        source = (
+            "provider.preflight_count"
+            if provider_count is not None
+            else "local.preflight_estimate"
+        )
+        return GenerationRequest(
+            messages=base.messages,
+            metadata={"context_gate": {"count_source": source}},
+        )
+
+    def finalize(
+        request: GenerationRequest,
+        _provider_count: object,
+        _defer_hard_gate: bool,
+        _count_fallback: str | None,
+    ) -> GenerationRequest:
+        return request
+
+    class ExactCounter:
+        def count_input_tokens(self, _request: GenerationRequest) -> ContextCountEstimate:
+            return ContextCountEstimate(
+                input_tokens=3,
+                source="provider.test",
+                kind="preflight_provider_count",
+            )
+
+    class FailedCounter:
+        def count_input_tokens(self, _request: GenerationRequest) -> int:
+            raise OSError("count endpoint unavailable")
+
+    _exact_request, exact_source = await prepare_prospective_request_async(
+        ExactCounter(), compose, finalize  # type: ignore[arg-type]
+    )
+    _local_request, local_source = await prepare_prospective_request_async(
+        FailedCounter(), compose, finalize  # type: ignore[arg-type]
+    )
+
+    assert exact_source == "exact"
+    assert local_source == "local"
 
 
 class _ScriptedProvider:
@@ -372,12 +505,17 @@ async def test_application_context_status_uses_budget_and_downgrades_after_mutat
 
     result = await application.create_run(run_id="context-status").start_turn("hello").result()
     assert result.status.value == "completed"
-    exact = application.status().context_status
-    assert exact.used_tokens == 10
-    assert exact.budget_tokens == 32_000
-    assert exact.available is True
-    assert exact.measurement == "exact"
-    assert exact.source == "provider_usage"
+    initial_accounting = application.provider.requests[0].metadata["request_accounting"]
+    current = application.status().context_status
+    assert current.used_tokens > 0
+    assert current.budget_tokens == 32_000
+    assert current.available is True
+    assert current.measurement == "estimate"
+    assert current.source == "context_compiler"
+    terminal_accounting = application.diagnostics()["context_request_accounting"]
+    assert isinstance(initial_accounting, Mapping)
+    assert isinstance(terminal_accounting, Mapping)
+    assert terminal_accounting["messages_tokens"] > initial_accounting["messages_tokens"]
 
     budget = application.context_service.last_budget
     assert budget is not None
@@ -961,6 +1099,11 @@ async def test_formal_agent_run_uses_cumulative_usage_for_tool_continuation_cach
         "tokens": 5,
         "provenance": "usage.details.input_tokens_details.cache_write_tokens",
     }
+    last_request_usage = application.diagnostics()["last_provider_request_usage"]
+    assert isinstance(last_request_usage, Mapping)
+    assert last_request_usage["input_tokens"] == 7
+    assert last_request_usage["output_tokens"] == 3
+    assert last_request_usage["total_tokens"] == 10
     context_status = application.status().context_status
     assert context_status.measurement == "estimate"
     assert not (

@@ -51,11 +51,11 @@ from uthcode.core.provider import (
 )
 
 
-def _completed(text: str) -> GenerationCompleted:
+def _completed(text: str, usage: Usage | None = None) -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
             message=Message("assistant", (TextPart(text),)),
-            usage=Usage(),
+            usage=usage or Usage(),
             finish_reason=FinishReason.STOP,
         )
     )
@@ -77,16 +77,20 @@ class _L4Provider:
         safe_ordinary_count: bool = False,
         compaction_failure: BaseException | None = None,
         compaction_summary: str | None = None,
+        compaction_usage: Usage | None = None,
         max_input_tokens: int = 6_000,
         pressure_extra: int = 4_000,
+        ordinary_count_override: int | None = None,
     ) -> None:
         self.identity = ProviderIdentity("fake", "l4", "provider-model")
         self.requests: list[GenerationRequest] = []
         self._safe_ordinary_count = safe_ordinary_count
         self._compaction_failure = compaction_failure
         self._compaction_summary = compaction_summary
+        self._compaction_usage = compaction_usage
         self._max_input_tokens = max_input_tokens
         self._pressure_extra = pressure_extra
+        self._ordinary_count_override = ordinary_count_override
         self.compaction_token_cancelled: list[bool] = []
 
     def resolve_model_limits(self, _model: str) -> ModelLimits:
@@ -100,6 +104,8 @@ class _L4Provider:
         estimate = account_generation_request(request).input_tokens
         if request.metadata.get("context_compaction_request") is True:
             return estimate
+        if self._ordinary_count_override is not None:
+            return self._ordinary_count_override
         if self._safe_ordinary_count:
             return 1
         if request.metadata.get("timeline_checkpoint_id") is None:
@@ -119,6 +125,18 @@ class _L4Provider:
             if self._compaction_failure is not None:
                 yield _completed("partial compaction output")
                 raise self._compaction_failure
+            if request.metadata.get("context_compaction_level") in {
+                "L4_SUBPASS",
+                "L4_FOLD",
+            }:
+                yield _completed(
+                    json.dumps(
+                        {"summary": self._compaction_summary or "bounded summary"},
+                        ensure_ascii=False,
+                    ),
+                    self._compaction_usage,
+                )
+                return
             coverage = _required_compaction_coverage(request)
             summary = self._compaction_summary
             payload = {
@@ -132,9 +150,49 @@ class _L4Provider:
                 ],
                 "coverage": [item["turn_id"] for item in coverage],
             }
-            yield _completed(json.dumps(payload, ensure_ascii=False))
+            yield _completed(
+                json.dumps(payload, ensure_ascii=False),
+                self._compaction_usage,
+            )
             return
         yield _completed("ordinary answer")
+
+
+class _ManualCountTransitionProvider(_L4Provider):
+    """Record prospective calls while injecting one controlled count outage."""
+
+    def __init__(
+        self,
+        *,
+        fail_calls: set[int],
+        exact_overrides: dict[int, int] | None = None,
+    ) -> None:
+        super().__init__(pressure_extra=0)
+        self.fail_calls = set(fail_calls)
+        self.exact_overrides = dict(exact_overrides or {})
+        self.count_calls = 0
+        self.count_log: list[tuple[int, bool, object, object]] = []
+        self.count_values: list[tuple[int, int | None]] = []
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        self.count_calls += 1
+        self.count_log.append(
+            (
+                self.count_calls,
+                request.metadata.get("context_compaction_request") is True,
+                request.metadata.get("timeline_checkpoint_id"),
+                request.metadata.get("context_reduction_levels"),
+            )
+        )
+        if self.count_calls in self.fail_calls:
+            self.count_values.append((self.count_calls, None))
+            raise OSError("count endpoint unavailable")
+        value = self.exact_overrides.get(
+            self.count_calls,
+            super().count_input_tokens(request),
+        )
+        self.count_values.append((self.count_calls, value))
+        return value
 
 
 class _HighLowProvider(_L4Provider):
@@ -169,9 +227,16 @@ class _HighLowProvider(_L4Provider):
 
 
 class _L5Provider:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        compaction_usage: Usage | None = None,
+        count_override: int | None = None,
+    ) -> None:
         self.identity = ProviderIdentity("fake", "l5", "provider-model")
         self.requests: list[GenerationRequest] = []
+        self._compaction_usage = compaction_usage
+        self._count_override = count_override
 
     def resolve_model_limits(self, _model: str) -> ModelLimits:
         return ModelLimits(max_input_tokens=6_000, max_output_tokens=2_048, source="test.l5")
@@ -179,7 +244,9 @@ class _L5Provider:
     def count_input_tokens(self, request: GenerationRequest) -> int:
         if request.metadata.get("context_compaction_request") is True:
             return account_generation_request(request).input_tokens
-        return 1
+        if self._count_override is not None:
+            return self._count_override
+        return account_generation_request(request).input_tokens
 
     async def stream(
         self,
@@ -195,7 +262,10 @@ class _L5Provider:
                 for value in request.metadata.get("context_timeline_aging_epoch_turns", ())
                 if isinstance(value, str)
             )
-            yield _completed(json.dumps({"summary": "macro summary", "coverage": list(turns)}))
+            yield _completed(
+                json.dumps({"summary": "macro summary", "coverage": list(turns)}),
+                self._compaction_usage,
+            )
             return
         yield _completed("ordinary answer")
 
@@ -250,13 +320,16 @@ class _OverflowRecoveryProvider:
         compaction_summary: str | None = None,
         max_input_tokens: int = 6_000,
         invalid_compaction_attempts: int = 0,
+        ordinary_count_override: int | None = None,
     ) -> None:
         self.identity = ProviderIdentity("fake", "overflow", "provider-model")
         self.ordinary_overflows = ordinary_overflows
         self.compaction_summary = compaction_summary
         self.max_input_tokens = max_input_tokens
         self.invalid_compaction_attempts = invalid_compaction_attempts
+        self.ordinary_count_override = ordinary_count_override
         self.requests: list[GenerationRequest] = []
+        self.counted_ordinary_inputs: list[int] = []
 
     def resolve_model_limits(self, _model: str) -> ModelLimits:
         return ModelLimits(
@@ -266,7 +339,16 @@ class _OverflowRecoveryProvider:
         )
 
     def count_input_tokens(self, request: GenerationRequest) -> int:
-        return account_generation_request(request).input_tokens
+        if (
+            request.metadata.get("context_compaction_request") is not True
+            and self.ordinary_count_override is not None
+        ):
+            value = self.ordinary_count_override
+        else:
+            value = account_generation_request(request).input_tokens
+        if request.metadata.get("context_compaction_request") is not True:
+            self.counted_ordinary_inputs.append(value)
+        return value
 
     async def stream(
         self,
@@ -448,7 +530,7 @@ async def test_w05_persists_closed_facts_before_provider_and_appends_terminal_ta
 
 @pytest.mark.asyncio
 async def test_w05_manual_compact_is_async_low_pressure_and_noop_without_candidate(tmp_path) -> None:
-    provider = _L4Provider(safe_ordinary_count=True)
+    provider = _L4Provider(pressure_extra=0)
     session_service = ApplicationSessionService(
         storage_root=tmp_path,
         project_key="w05-manual-compact",
@@ -482,6 +564,132 @@ async def test_w05_manual_compact_is_async_low_pressure_and_noop_without_candida
             if request.metadata.get("context_compaction_request") is True
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_w02_manual_compact_continues_within_epoch_limit_until_retained_target(
+    tmp_path,
+) -> None:
+    provider = _L4Provider(pressure_extra=0)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w02-manual-multi-epoch",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=6)
+
+    result = await application.compact_session()
+
+    compact_requests = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert result.changed is True
+    assert result.failure is None
+    assert 1 < len(compact_requests) <= 4
+    assert len(session.timeline.records) >= 2
+    assert application.diagnostics()["compaction"]["count"] >= 1  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_w02_manual_compact_projects_terminal_provider_usage(tmp_path) -> None:
+    provider = _L4Provider(
+        pressure_extra=0,
+        compaction_usage=Usage(
+            input_tokens=13,
+            output_tokens=5,
+            total_tokens=18,
+            details={"input_tokens": 13, "output_tokens": 5},
+        ),
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w02-manual-usage",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.compact_session()
+
+    assert result.changed is True
+    last_request_usage = application.diagnostics()["last_provider_request_usage"]
+    assert last_request_usage["input_tokens"] == 13
+    assert last_request_usage["output_tokens"] == 5
+    assert last_request_usage["total_tokens"] == 18
+    context_status = application.status().context_status
+    assert context_status.measurement == "estimate"
+    assert context_status.source == "context_compiler"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_calls", "exact_overrides"),
+    (
+        ({5}, {3: 100, 4: 100}),
+        ({3}, {4: 1_000, 5: 1_000}),
+    ),
+    ids=("exact-before-local-after", "local-before-exact-after"),
+)
+async def test_manual_candidate_recounts_both_sides_after_count_transition(
+    tmp_path,
+    fail_calls: set[int],
+    exact_overrides: dict[int, int],
+) -> None:
+    provider = _ManualCountTransitionProvider(
+        fail_calls=fail_calls,
+        exact_overrides=exact_overrides,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-count-debug",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.compact_session()
+
+    assert result.changed is True
+    assert result.failure is None
+    assert session.timeline.records
+    assert provider.fail_calls <= {
+        call for call, value in provider.count_values if value is None
+    }
+    assert all(
+        value == exact_overrides[call]
+        for call, value in provider.count_values
+        if call in exact_overrides
+    )
 
 
 @pytest.mark.asyncio
@@ -817,13 +1025,29 @@ async def test_l4_is_tool_free_bounded_and_commits_one_fine_entry_per_turn(tmp_p
 
 @pytest.mark.asyncio
 async def test_l5_ages_fine_timeline_before_ordinary_request_at_low_pressure(tmp_path) -> None:
-    provider = _L5Provider()
+    class RecordingApplication(UthCodeApplication):
+        def __init__(self, *args, **kwargs) -> None:
+            self.compaction_usages: list[Usage] = []
+            super().__init__(*args, **kwargs)
+
+        def _record_provider_request_usage(self, usage: Usage) -> None:
+            self.compaction_usages.append(usage)
+            super()._record_provider_request_usage(usage)
+
+    provider = _L5Provider(
+        compaction_usage=Usage(
+            input_tokens=13,
+            output_tokens=5,
+            total_tokens=18,
+            details={"input_tokens": 13, "output_tokens": 5},
+        )
+    )
     session_service = ApplicationSessionService(
         storage_root=tmp_path,
         project_key="test-project",
         instruction_loader=None,
     )
-    application = UthCodeApplication(
+    application = RecordingApplication(
         provider,
         configuration=EffectiveConfig.single_model(
             "configured/ref",
@@ -864,10 +1088,59 @@ async def test_l5_ages_fine_timeline_before_ordinary_request_at_low_pressure(tmp
     assert "fine-" not in aging_request.messages[0].parts[0].text
     assert "raw fact" in aging_request.messages[0].parts[0].text
     assert ordinary_request.metadata["context_compaction"]["timeline_aging"]["status"] == "completed"
+    assert application.compaction_usages == [provider._compaction_usage]
     assert session.timeline.fine_entries == ()
     assert session.timeline.physical_fine_entries == (fine,)
     assert len(session.timeline.macro_summaries) == 1
     assert isinstance(session.timeline.logical_records[-2], EpochMacroSummary)
+
+
+@pytest.mark.asyncio
+async def test_l5_equal_prospective_count_does_not_append_timeline(tmp_path) -> None:
+    provider = _L5Provider(count_override=1)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="l5-equal-count",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = application.create_session("l5-equal-session")
+    entries = _transcript_entries_for_message(
+        session.session_id,
+        "turn-1",
+        session.transcript.last_sequence + 1,
+        Message("user", (TextPart("raw fact"),)),
+    )
+    assert session.append_transcript(entries).durability == "durable"
+    fine = SemanticEntry(
+        "turn-1",
+        "fine-" + "x" * 2_000,
+        (session.transcript.reference(1, 1),),
+        session_id=session.session_id,
+    )
+    assert session.append_timeline_transaction(
+        (fine,),
+        ActiveCheckpoint("turn-1", ("turn-1",), session_id=session.session_id),
+    ).durability == "durable"
+
+    result = await application.create_run().start_turn("current fact").result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert len(provider.requests) == 2
+    aging_request, ordinary_request = provider.requests
+    assert aging_request.metadata["context_compaction_level"] == "L5"
+    assert ordinary_request.metadata["context_compaction"]["timeline_aging"]["failure"] == "no_reduction"
+    assert session.timeline.fine_entries == (fine,)
+    assert session.timeline.macro_summaries == ()
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1725,8 @@ async def test_w05_overflow_non_reduction_does_not_retry_or_commit(tmp_path) -> 
     provider = _OverflowRecoveryProvider(
         ordinary_overflows=1,
         max_input_tokens=1_000_000,
-        compaction_summary="x" * 8_000,
+        compaction_summary="compact",
+        ordinary_count_override=100,
     )
     session_service = ApplicationSessionService(
         storage_root=tmp_path,
@@ -1487,6 +1761,49 @@ async def test_w05_overflow_non_reduction_does_not_retry_or_commit(tmp_path) -> 
     assert len(ordinary) == 1
     assert len(compact) == 1
     assert session.timeline.records == ()
+    assert provider.counted_ordinary_inputs
+    assert all(value == 100 for value in provider.counted_ordinary_inputs)
+    assert any(
+        event.get("failure") == "no_reduction"
+        for event in application.diagnostics()["compaction"]["events"]  # type: ignore[index]
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_window_boundary_equal_count_does_not_append_timeline(tmp_path) -> None:
+    provider = _L4Provider(
+        max_input_tokens=6_000,
+        pressure_extra=0,
+        ordinary_count_override=6_000,
+    )
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="exact-window-boundary",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+
+    result = await application.create_run().start_turn("window boundary").result()
+
+    assert result.status is not RunStatus.COMPLETED
+    assert session.timeline.records == ()
+    compact = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is True
+    ]
+    assert len(compact) == 1
+    assert compact[0].metadata["context_gate"]["input_tokens"] < 6_000
     assert any(
         event.get("failure") == "no_reduction"
         for event in application.diagnostics()["compaction"]["events"]  # type: ignore[index]
@@ -1516,7 +1833,22 @@ async def test_hard_unsafe_ordinary_request_never_streams_to_provider(tmp_path) 
     result = await application.create_run().start_turn("current fact").result()
 
     assert result.status.value == "failed"
-    assert provider.requests == []
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert ordinary == []
+    assert provider.requests
+    assert all(
+        request.metadata.get("context_compaction_request") is True
+        for request in provider.requests
+    )
+    assert all(request.tools == () for request in provider.requests)
+    assert all(
+        request.metadata["context_gate"]["hard_safe"] is True
+        for request in provider.requests
+    )
 
 
 @pytest.mark.asyncio
@@ -1659,6 +1991,6 @@ async def test_partial_l4_commit_then_no_safe_epoch_fails_closed_when_hard_unsaf
     ]
     assert result.status is RunStatus.FAILED
     assert ordinary == []
-    assert session.timeline.active_checkpoint is not None
+    assert session.timeline.active_checkpoint is None
     diagnostics = application.diagnostics()["compaction"]
-    assert diagnostics["last"]["failure"] == "no_safe_epoch"  # type: ignore[index]
+    assert diagnostics["last"]["failure"] == "no_reduction"  # type: ignore[index]

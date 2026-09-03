@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import CancelledError
-import json
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -27,23 +26,15 @@ from uthcode.core.planning import (
 )
 from uthcode.core.provider import (
     CancellationToken,
-    ContextOverflowError,
-    DEFAULT_OUTPUT_RESERVE,
-    GenerationCompleted,
     GenerationCancelled,
     GenerationRequest,
-    InvalidProviderResponseError,
     Message,
     ModelLimits,
-    ProviderConfigurationError,
-    ProviderError,
     ProviderIdentity,
     ProviderPort,
     ReasoningOptions,
     ToolDefinition,
-    TextPart,
     Usage,
-    validated_provider_stream,
 )
 from uthcode.core.history import TranscriptEntry, transcript_entries_for_failed_turn
 from uthcode.core.prompt import (
@@ -55,20 +46,22 @@ from uthcode.core.prompt import (
     RuntimePromptContext,
 )
 from uthcode.core.context import (
-    CompactionResult,
     ContextBudget,
     ContextBudgetError,
     ContextCountEstimate,
     ContextRequestSafetyError,
     ContextUsage,
     account_generation_request,
-    evaluate_gates,
-    preflight_safety_count,
-    pressure_estimate,
     resolve_context_budget,
+)
+from uthcode.core.compaction import (
+    CompactionEpoch,
+    CompactionResult,
+    CompactionSubpass,
+    OversizedFold,
+    TimelineAgingEpoch,
     fine_timeline_usage,
 )
-from uthcode.core.compaction import CompactionEpoch, TimelineAgingEpoch
 from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
@@ -87,13 +80,24 @@ from .sessions import (
     SessionOperationError,
 )
 from .tools import ApplicationToolService
-from .provider_usage import public_usage_diagnostics
+from .provider_usage import cumulative_usage_delta, public_usage_diagnostics
+from .request_preparation import (
+    effective_output_reserve as _effective_output_reserve,
+    prepare_counted_request_async as _prepare_counted_request_async,
+    prepare_prospective_request_async as _prepare_prospective_request_async,
+    request_reduction_levels as _request_reduction_levels,
+    resolve_model_limits_async as _resolve_model_limits_async,
+    validate_model_limits as _validate_model_limits,
+    count_input_tokens_async as _count_input_tokens_async,
+)
+from .compaction import summarize_compaction_epoch_with_provider as _summarize_compaction_epoch_with_provider
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
 PermissionWriter = Callable[[PermissionMode], object]
 PermissionRulesLoader = Callable[[], RuleSet]
+_ACTIVE_TIMELINE = object()
 
 
 def failure_message(reason: FailureReason | None) -> str:
@@ -148,371 +152,6 @@ def _reasoning_options(effort: str | None) -> ReasoningOptions | None:
     return ReasoningOptions(enabled=effort != "none", effort=effort)
 
 
-def _validate_model_limits(value: object) -> ModelLimits | None:
-    if value is not None and not isinstance(value, ModelLimits):
-        raise TypeError("Provider model limits must be ModelLimits or None")
-    return value
-
-
-def _effective_output_reserve(
-    request_max_output_tokens: int | None,
-    model_max_output_tokens: int | None,
-) -> int:
-    """Resolve the one output reserve used by budget, request, and adapters."""
-
-    if request_max_output_tokens is not None:
-        return request_max_output_tokens
-    if model_max_output_tokens is not None:
-        return model_max_output_tokens
-    return DEFAULT_OUTPUT_RESERVE
-
-
-async def _resolve_model_limits_async(
-    provider: ProviderPort,
-    model: str,
-) -> ModelLimits | None:
-    resolver = getattr(provider, "resolve_model_limits", None)
-    if not callable(resolver):
-        return None
-    value = resolver(model)
-    if inspect.isawaitable(value):
-        value = await value
-    return _validate_model_limits(value)
-
-
-def _validate_provider_count(value: object) -> ContextCountEstimate | int | None:
-    if value is not None and not isinstance(value, (ContextCountEstimate, int)):
-        raise TypeError(
-            "Provider input count must be ContextCountEstimate, int, or None"
-        )
-    if isinstance(value, bool):
-        raise TypeError("Provider input count must not be boolean")
-    return value
-
-
-def _request_reduction_levels(request: GenerationRequest) -> tuple[str, ...]:
-    raw = request.metadata.get("context_reduction_levels", ())
-    if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
-        return ()
-    return tuple(value for value in raw if isinstance(value, str) and value)
-
-
-_COMPACTION_SYSTEM_PROMPT = (
-    "You are UthCode's bounded Context compactor. Return only a JSON object with "
-    "entries and coverage. Produce exactly one entry for every covered Turn, in "
-    "the supplied order. Each entry must contain turn_id and a short summary. "
-    "Do not add Turns, refs, or facts that are not present in the raw evidence."
-)
-
-_TIMELINE_AGING_SYSTEM_PROMPT = (
-    "You are UthCode's bounded Timeline aging compactor. Return only a JSON "
-    "object with summary and coverage. Produce exactly one Macro summary for "
-    "all supplied Turns in order. Use only the complete raw Transcript evidence; "
-    "never summarize a Fine or Macro summary and never invent refs or Turns."
-)
-
-
-def _compaction_input_payload(epoch: CompactionEpoch) -> str:
-    """Add an explicit output contract without exposing a second state model."""
-
-    coverage = [
-        {
-            "turn_id": unit.turn_id,
-            "refs": [ref.to_dict()],
-        }
-        for unit, ref in zip(epoch.units, epoch.refs, strict=True)
-    ]
-    return (
-        f"{epoch.input_text}\n\nRequired coverage (copy only these Turn IDs):\n"
-        + json.dumps(coverage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
-
-
-def _timeline_aging_input_payload(epoch: TimelineAgingEpoch) -> str:
-    """Add the L5 Macro contract while keeping evidence raw-only."""
-
-    coverage = [
-        {
-            "turn_id": unit.turn_id,
-            "refs": [ref.to_dict()],
-        }
-        for unit, ref in zip(epoch.units, epoch.refs, strict=True)
-    ]
-    return (
-        f"{epoch.input_text}\n\nRequired Macro coverage (copy only these Turn IDs):\n"
-        + json.dumps(coverage, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
-
-
-async def _prepare_compaction_request_async(
-    provider: ProviderPort,
-    request: GenerationRequest,
-    budget: ContextBudget,
-    *,
-    cancellation: CancellationToken,
-) -> GenerationRequest:
-    """Hard-gate an independent tool-free L4 request before sending it."""
-
-    output_reserve = budget.compaction_output_reserve
-    if budget.provider_max_output is not None:
-        output_reserve = min(output_reserve, budget.provider_max_output)
-    if output_reserve <= 0:
-        raise ContextRequestSafetyError("compact output reserve is not provider-safe")
-    compact_budget = replace(
-        budget,
-        requested_output_reserve=output_reserve,
-        safety_allowance=0,
-    )
-    current = request
-    for _ in range(8):
-        cancellation.raise_if_cancelled()
-        resolution = await _count_input_tokens_async(provider, current)
-        count = resolution.value
-        fallback_reason = resolution.fallback_reason
-        counted = preflight_safety_count(
-            current,
-            compact_budget,
-            provider_count=count,
-        )
-        accounting = account_generation_request(current)
-        pressure = pressure_estimate(current, compact_budget)
-        gate = evaluate_gates(
-            compact_budget,
-            counted,
-            accounting=accounting,
-            pressure_count=pressure,
-        )
-        if not gate.hard_safe:
-            raise ContextRequestSafetyError(
-                "compact request failed the preflight Hard Gate: " + gate.reason
-            )
-        metadata = {
-            **dict(current.metadata),
-            "context_compaction_request": True,
-            "context_gate": gate.to_dict(),
-            "context_pressure": pressure.to_dict(),
-            "context_count_source": gate.count_source,
-            "context_count_fallback": fallback_reason,
-        }
-        annotated = replace(current, metadata=metadata)
-        if annotated == current:
-            return current
-        current = annotated
-    raise ContextRequestSafetyError(
-        "compact request count did not stabilize for the final request"
-    )
-
-
-async def _run_compaction_provider(
-    provider: ProviderPort,
-    request: GenerationRequest,
-    *,
-    cancellation: CancellationToken,
-) -> str:
-    """Run one validated tool-free Provider stream and return text only."""
-
-    terminal: GenerationCompleted | None = None
-    async for event in validated_provider_stream(
-        provider,
-        request,
-        cancellation=cancellation,
-    ):
-        if isinstance(event, GenerationCompleted):
-            terminal = event
-    if terminal is None:  # pragma: no cover - validated_provider_stream guards this
-        raise InvalidProviderResponseError("compact Provider response is incomplete")
-    if terminal.response.message.role != "assistant":
-        raise InvalidProviderResponseError("compact Provider response is not assistant text")
-    text = "\n".join(
-        part.text
-        for part in terminal.response.message.parts
-        if isinstance(part, TextPart)
-    ).strip()
-    if not text:
-        raise InvalidProviderResponseError("compact Provider response has no text")
-    return text
-
-
-async def _summarize_compaction_epoch_with_provider(
-    provider: ProviderPort,
-    remote_model_id: str,
-    budget: ContextBudget,
-    epoch: CompactionEpoch | TimelineAgingEpoch,
-    *,
-    cancellation: CancellationToken,
-    aging: bool = False,
-    diagnostics: ApplicationContextService | None = None,
-) -> str:
-    """Run the one shared, tool-free, hard-gated Context model call."""
-
-    output_reserve = budget.compaction_output_reserve
-    if budget.provider_max_output is not None:
-        output_reserve = min(output_reserve, budget.provider_max_output)
-    if output_reserve <= 0:
-        raise ContextRequestSafetyError("compact output reserve is not provider-safe")
-    is_aging = aging or isinstance(epoch, TimelineAgingEpoch)
-    if is_aging:
-        payload = _timeline_aging_input_payload(epoch)  # type: ignore[arg-type]
-        system_prompt = _TIMELINE_AGING_SYSTEM_PROMPT
-        metadata = {
-            "context_compaction_request": True,
-            "context_compaction_level": "L5",
-            "context_timeline_aging_request": True,
-            "context_timeline_aging_epoch_turns": list(epoch.turn_ids),
-        }
-    else:
-        payload = _compaction_input_payload(epoch)  # type: ignore[arg-type]
-        system_prompt = _COMPACTION_SYSTEM_PROMPT
-        metadata = {
-            "context_compaction_request": True,
-            "context_compaction_epoch_turns": list(epoch.turn_ids),
-        }
-    compact_request = GenerationRequest(
-        messages=(Message("user", (TextPart(payload),)),),
-        system_prompt=system_prompt,
-        model=remote_model_id,
-        tools=(),
-        reasoning=None,
-        max_output_tokens=output_reserve,
-        temperature=0.0,
-        metadata=metadata,
-    )
-    prepared = await _prepare_compaction_request_async(
-        provider,
-        compact_request,
-        budget,
-        cancellation=cancellation,
-    )
-    if diagnostics is not None:
-        diagnostics.record_request_diagnostics(prepared, budget)
-    return await _run_compaction_provider(
-        provider,
-        prepared,
-        cancellation=cancellation,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _CountResolution:
-    value: ContextCountEstimate | int | None
-    fallback_reason: str | None = None
-
-
-def _is_controlled_count_failure(error: Exception) -> bool:
-    """Return whether a count endpoint outage may use the local estimate.
-
-    Type/value errors, provider configuration errors, malformed responses and
-    limit/overflow authority errors must remain visible to the request
-    preparer.  Only operational unavailability is eligible for a conservative
-    local fallback.
-    """
-
-    if isinstance(
-        error,
-        (
-            TypeError,
-            ValueError,
-            ContextBudgetError,
-            ProviderConfigurationError,
-            ContextOverflowError,
-            InvalidProviderResponseError,
-            GenerationCancelled,
-        ),
-    ):
-        return False
-    return isinstance(error, (ProviderError, OSError, TimeoutError))
-
-
-async def _count_input_tokens_async(
-    provider: ProviderPort,
-    request: GenerationRequest,
-) -> _CountResolution:
-    counter = getattr(provider, "count_input_tokens", None)
-    if not callable(counter):
-        return _CountResolution(None, "capability_missing")
-    try:
-        value = counter(request)
-        while inspect.isawaitable(value):
-            value = await value
-    except (GenerationCancelled, CancelledError):
-        raise
-    except Exception as exc:
-        if _is_controlled_count_failure(exc):
-            return _CountResolution(None, "provider_count_failure")
-        raise
-    validated = _validate_provider_count(value)
-    if validated is None:
-        return _CountResolution(None, "provider_count_unavailable")
-    return _CountResolution(validated)
-
-
-async def _prepare_counted_request_async(
-    provider: ProviderPort,
-    compose: Callable[[ContextCountEstimate | int | None, bool, str | None], GenerationRequest],
-    finalize: Callable[
-        [GenerationRequest, ContextCountEstimate | int | None, bool, str | None],
-        GenerationRequest,
-    ],
-    *,
-    on_counted_request: Callable[
-        [GenerationRequest, ContextCountEstimate | int | None],
-        bool | Awaitable[bool],
-    ]
-    | None = None,
-) -> GenerationRequest:
-    """Async counterpart of the exact final-request count/re-gate loop.
-
-    ``on_counted_request`` is an Application-owned catch-up hook.  It runs
-    only after an exact Provider count has been attached to a rebuilt request;
-    returning ``True`` restarts the count loop from the current sources.  The
-    hook is deliberately outside Core and cannot bypass the final Hard Gate.
-    """
-
-    counted_request = compose(None, True, None)
-    resolution = await _count_input_tokens_async(provider, counted_request)
-    if resolution.fallback_reason is not None:
-        return compose(None, False, resolution.fallback_reason)
-
-    provider_count = resolution.value
-    rebuild_from_sources = True
-    for _ in range(8):
-        if rebuild_from_sources:
-            candidate = compose(provider_count, True, None)
-            if candidate != counted_request:
-                counted_request = candidate
-                resolution = await _count_input_tokens_async(provider, counted_request)
-                if resolution.fallback_reason is not None:
-                    return compose(None, False, resolution.fallback_reason)
-                provider_count = resolution.value
-            rebuild_from_sources = False
-
-        if on_counted_request is not None:
-            retry = on_counted_request(counted_request, provider_count)
-            if inspect.isawaitable(retry):
-                retry = await retry
-            if not isinstance(retry, bool):
-                raise TypeError("on_counted_request must return a boolean")
-            if retry:
-                # The hook may have committed a fresh Timeline.  Rebuild from
-                # authoritative sources and obtain a new exact Provider count
-                # before the request is allowed to reach ``finalize``.
-                rebuild_from_sources = True
-                continue
-
-        final_request = finalize(counted_request, provider_count, False, None)
-        if final_request == counted_request:
-            return counted_request
-        counted_request = final_request
-        resolution = await _count_input_tokens_async(provider, counted_request)
-        if resolution.fallback_reason is not None:
-            return compose(None, False, resolution.fallback_reason)
-        provider_count = resolution.value
-
-    raise ContextRequestSafetyError(
-        "Provider input count did not stabilize for the final request"
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class ApplicationStatus:
     """Safe read-only runtime status for interfaces and headless callers."""
@@ -534,6 +173,7 @@ class ApplicationStatus:
     active_session_title: str | None = None
     context_status: ContextStatus = field(default_factory=ContextStatus.unavailable)
     compaction_status: CompactionStatus = field(default_factory=CompactionStatus)
+    last_provider_request_usage: Mapping[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -551,6 +191,7 @@ class ApplicationStatus:
             "context_usage": self.context_usage.to_dict(),
             "context_status": self.context_status.to_dict(),
             "compaction_status": self.compaction_status.to_dict(),
+            "last_provider_request_usage": dict(self.last_provider_request_usage),
             "timeline_checkpoint_id": self.timeline_checkpoint_id,
             "active_session_title": self.active_session_title,
             "instruction_epoch": self.instruction_epoch,
@@ -659,6 +300,7 @@ class UthCodeApplication:
         self._context_service = context_service or ApplicationContextService()
         self._session_service = session_service
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
+        self._last_provider_request_usage = public_usage_diagnostics(None)
         self._history_persistence_diagnostics: dict[str, object] = {
             "status": "not_available",
             "transcript_appended": False,
@@ -697,7 +339,6 @@ class UthCodeApplication:
             str,
             ContextBudget,
         ] | None = None
-        self._request_boundary_counts: dict[tuple[str, str], int] = {}
         self._context_service.set_context_budget(self._context_budget_for_projection())
 
     @property
@@ -1041,6 +682,149 @@ class UthCodeApplication:
             requested_output_reserve=max_output_tokens,
         )
         cancellation = CancellationToken()
+        manual_run_id = f"manual-compact:{session.session_id}"
+        manual_tool_definitions = self._tool_service.definitions() + (
+            ASK_USER_TOOL_DEFINITION,
+            TODO_WRITE_TOOL_DEFINITION,
+            PROPOSE_PLAN_TOOL_DEFINITION,
+        )
+        manual_model_profile = self.current_model
+        manual_reasoning = _reasoning_options(
+            manual_model_profile.reasoning_effort
+            if manual_model_profile is not None
+            else None
+        )
+
+        def manual_request(
+            timeline_value,
+            provider_count: ContextCountEstimate | int | None,
+            defer_hard_gate: bool,
+            count_fallback: str | None,
+            *,
+            candidate_messages: Sequence[Message] | None = None,
+            disable_reductions: bool = False,
+            reduction_levels: Sequence[str] = (),
+        ) -> GenerationRequest:
+            request, _snapshot = self._context_service.compose_generation_request(
+                (),
+                run_id=manual_run_id,
+                session_id=session.session_id,
+                transcript=session.transcript,
+                instruction_loader=self._instruction_loader,
+                timeline=timeline_value,
+                tool_definitions=manual_tool_definitions,
+                environment_sources=self._environment_sources(
+                    self._current_model_ref,
+                    provider.identity,
+                ),
+                model=remote_model_id,
+                reasoning=manual_reasoning,
+                max_output_tokens=max_output_tokens,
+                context_budget=budget,
+                provider_count=provider_count,
+                defer_hard_gate=defer_hard_gate,
+                count_fallback=count_fallback,
+                candidate_messages=candidate_messages,
+                disable_reductions=disable_reductions,
+                reduction_levels=reduction_levels,
+                publish=False,
+            )
+            return request
+
+        async def manual_prospective(
+            timeline_value,
+        ) -> tuple[GenerationRequest, str]:
+            def compose(
+                provider_count: ContextCountEstimate | int | None,
+                defer_hard_gate: bool,
+                count_fallback: str | None,
+            ) -> GenerationRequest:
+                return manual_request(
+                    timeline_value,
+                    provider_count,
+                    defer_hard_gate,
+                    count_fallback,
+                )
+
+            def finalize(
+                candidate: GenerationRequest,
+                provider_count: ContextCountEstimate | int | None,
+                defer_hard_gate: bool,
+                count_fallback: str | None,
+            ) -> GenerationRequest:
+                return manual_request(
+                    timeline_value,
+                    provider_count,
+                    defer_hard_gate,
+                    count_fallback,
+                    candidate_messages=candidate.messages,
+                    disable_reductions=True,
+                    reduction_levels=_request_reduction_levels(candidate),
+                )
+
+            return await _prepare_prospective_request_async(
+                provider,
+                compose,
+                finalize,
+            )
+
+        def manual_count(request: GenerationRequest, source: str) -> int:
+            if source == "exact":
+                gate = request.metadata.get("context_gate")
+                value = gate.get("input_tokens") if isinstance(gate, Mapping) else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+            return account_generation_request(request).input_tokens
+
+        async def validate_manual_candidate(
+            candidate: CompactionResult,
+        ) -> CompactionResult:
+            active = self._session_service.active_session
+            if active is None:
+                return replace(
+                    candidate,
+                    changed=False,
+                    failure="timeline_commit_failed",
+                )
+            previous_timeline = active.timeline
+            before_request, before_source = await manual_prospective(previous_timeline)
+            after_request, after_source = await manual_prospective(candidate.timeline)
+            if before_source == after_source == "exact":
+                before_count = manual_count(before_request, before_source)
+                after_count = manual_count(after_request, after_source)
+            else:
+                # A capability transition during one validation invocation
+                # must not compare a Provider exact count with a local
+                # estimate.  Re-account both immutable requests locally.
+                before_count = account_generation_request(before_request).input_tokens
+                after_count = account_generation_request(after_request).input_tokens
+            if (
+                after_count >= before_count
+                or candidate.output_tokens >= candidate.input_tokens
+            ):
+                return replace(
+                    candidate,
+                    timeline=previous_timeline,
+                    summary=(
+                        previous_timeline.summary
+                        if previous_timeline is not None
+                        else None
+                    ),
+                    batches=(),
+                    changed=False,
+                    failure="no_reduction",
+                )
+            return candidate
+
+        async def continue_manual(timeline_value) -> Mapping[str, object]:
+            request, source = await manual_prospective(timeline_value)
+            count = manual_count(request, source)
+            return {
+                "continue": count > budget.retained_target,
+                "retained_target": budget.retained_target,
+                "post_epoch_input_usage": count,
+                "low_water_reached": count <= budget.retained_target,
+            }
 
         async def summarize_epoch(epoch: CompactionEpoch) -> str:
             return await _summarize_compaction_epoch_with_provider(
@@ -1049,7 +833,27 @@ class UthCodeApplication:
                 budget,
                 epoch,
                 cancellation=cancellation,
-                diagnostics=self._context_service,
+                usage_sink=self._record_provider_request_usage,
+            )
+
+        async def summarize_subpass(epoch: CompactionSubpass) -> str:
+            return await _summarize_compaction_epoch_with_provider(
+                provider,
+                remote_model_id,
+                budget,
+                epoch,
+                cancellation=cancellation,
+                usage_sink=self._record_provider_request_usage,
+            )
+
+        async def summarize_fold(epoch: OversizedFold) -> str:
+            return await _summarize_compaction_epoch_with_provider(
+                provider,
+                remote_model_id,
+                budget,
+                epoch,
+                cancellation=cancellation,
+                usage_sink=self._record_provider_request_usage,
             )
 
         async def commit(candidate: CompactionResult) -> CompactionResult:
@@ -1067,9 +871,13 @@ class UthCodeApplication:
             timeline=session.timeline,
             session_id=session.session_id,
             summarize=summarize_epoch,
+            summarize_oversized_subpass=summarize_subpass,
+            summarize_oversized_fold=summarize_fold,
+            validate_candidate=validate_manual_candidate,
             commit=commit,
+            should_continue=continue_manual,
             cancellation=cancellation,
-            max_epochs=1,
+            max_epochs=4,
             input_budget=budget.compaction_input_budget,
             output_reserve=(
                 min(budget.compaction_output_reserve, budget.provider_max_output)
@@ -1083,7 +891,11 @@ class UthCodeApplication:
             ),
             trigger="manual",
         )
-        if not result.changed and result.failure in {"no_safe_epoch", "no_reduction"}:
+        if result.failure in {
+            "no_safe_epoch",
+            "no_reduction",
+            "epoch_limit_reached",
+        }:
             # A low-pressure/manual no-op is a successful no-change outcome;
             # do not fabricate a Timeline candidate or expose a retry error.
             result = replace(
@@ -1244,6 +1056,7 @@ class UthCodeApplication:
             ),
             "session": session,
             "provider_usage": dict(self._provider_usage_diagnostics),
+            "last_provider_request_usage": dict(self._last_provider_request_usage),
             "history_persistence": dict(self._history_persistence_diagnostics),
         }
 
@@ -1479,55 +1292,35 @@ class UthCodeApplication:
             self._history_persistence_diagnostics.get("committed_turns", 0)
         ) + 1
 
-    def _record_formal_run_usage(
-        self,
-        usage: Usage,
-        *,
-        exact_request_boundary: bool = False,
-    ) -> None:
+    def _record_formal_run_usage(self, usage: Usage) -> None:
         """Project one terminal AgentRun's observed cumulative Usage.
 
         ``AgentRun`` owns the terminal-result boundary, while this Application
-        method owns the diagnostics state.  A terminal Turn with no observed
-        Provider Usage does not erase the last observable projection, so
-        cancel/failure paths cannot manufacture a measurement or hide a prior
-        one merely by constructing an empty default ``Usage``.  The Core
-        ``TurnResult`` usage is cumulative across Provider iterations; it is
-        promoted to an exact Context measurement only when the caller proves
-        that this terminal result represents one completed request boundary.
+        method owns the cumulative Run diagnostics state.  A terminal Turn
+        with no observed Provider Usage does not erase the last observable
+        projection, so cancel/failure paths cannot manufacture a measurement
+        merely by constructing an empty default ``Usage``.
         """
 
-        if not isinstance(exact_request_boundary, bool):
-            raise TypeError("exact_request_boundary must be a boolean")
         projection = public_usage_diagnostics(usage)
         if projection.get("status") == "available":
             self._provider_usage_diagnostics = projection
-            input_tokens = projection.get("input_tokens")
-            if (
-                exact_request_boundary
-                and isinstance(input_tokens, int)
-                and not isinstance(input_tokens, bool)
-            ):
-                # A cumulative multi-iteration Turn is not the current
-                # request boundary.  Only AgentRun's explicit single-request
-                # proof may upgrade the Context estimate to exact.
-                self._context_service.record_exact_usage(input_tokens)
 
-    def _consume_request_boundary_count(
+    def _record_usage_updated(
         self,
-        run_id: str,
-        turn_id: str,
-    ) -> int | None:
-        """Consume the number of successfully prepared Provider requests.
+        usage: Usage,
+        *,
+        baseline: Usage | None = None,
+    ) -> None:
+        """Project one cumulative Core ``UsageUpdated`` event as last request use."""
 
-        Core ``TurnResult`` intentionally reports cumulative usage rather than
-        a request-attempt counter.  The Application request-preparation
-        boundary is therefore the narrowest fact available here: a retry of
-        the same Core iteration prepares a second request and must keep the
-        terminal projection as an estimate.
-        """
+        delta = cumulative_usage_delta(usage, baseline)
+        self._last_provider_request_usage = public_usage_diagnostics(delta)
 
-        return self._request_boundary_counts.pop((run_id, turn_id), None)
+    def _record_provider_request_usage(self, usage: Usage) -> None:
+        """Project terminal usage for one independent Compact/L5 request."""
+
+        self._last_provider_request_usage = public_usage_diagnostics(usage)
 
     def status(self) -> ApplicationStatus:
         profile = self.current_provider_profile
@@ -1598,6 +1391,7 @@ class UthCodeApplication:
             context_usage=usage,
             context_status=context_status,
             compaction_status=self._context_service.compaction_status,
+            last_provider_request_usage=dict(self._last_provider_request_usage),
             timeline_checkpoint_id=timeline_checkpoint_id,
             active_session_title=(active.title if active is not None else None),
             instruction_epoch=instruction_epoch,
@@ -1887,6 +1681,98 @@ class UthCodeApplication:
             context_budget=context_budget,
             preserve_request_diagnostics=True,
         )
+
+    def _rebuild_context_after_terminal(
+        self,
+        state: RunState,
+        *,
+        session_persisted: bool,
+    ) -> None:
+        """Rebuild Current Working Context from the terminal conversation.
+
+        Provider Usage describes the request that just ran; it is not the
+        current conversation boundary.  Once the terminal assistant message
+        is available, compose the ordinary request again so accounting and
+        Context diagnostics include that message without publishing a second
+        Provider measurement.
+        """
+
+        if not isinstance(state, RunState):
+            raise TypeError("state must be RunState")
+        active = (
+            self._session_service.active_session
+            if self._session_service is not None
+            else None
+        )
+        if active is not None and not session_persisted:
+            self._context_service.refresh_context_estimate()
+            return
+
+        model_profile = self.current_model
+        remote_model_id = (
+            model_profile.remote_id
+            if model_profile is not None
+            else self._provider.identity.model
+        )
+        context_budget = self._context_service.last_budget
+        if context_budget is None:
+            context_budget = self._context_budget_for_projection(resolve_provider=False)
+        runtime_context = RuntimePromptContext(
+            behavior_mode=state.behavior_mode,
+            task_state=state.task_state,
+            plan_state=state.plan_state,
+            one_shot_feedback=state.runtime_feedback,
+        )
+        ordinary_tools = self._tool_service.definitions() + (
+            ASK_USER_TOOL_DEFINITION,
+            TODO_WRITE_TOOL_DEFINITION,
+            PROPOSE_PLAN_TOOL_DEFINITION,
+        )
+        if active is None:
+            messages: tuple[Message, ...] = state.messages
+            transcript = None
+            timeline = None
+            session_id = None
+        else:
+            # A durable Session is authoritative after the terminal flush;
+            # passing the full Run messages as well would duplicate History.
+            messages = ()
+            transcript = active.transcript
+            timeline = active.timeline
+            session_id = active.session_id
+        try:
+            self._context_service.compose_generation_request(
+                messages,
+                run_id=state.run_id,
+                session_id=session_id,
+                transcript=transcript,
+                instruction_loader=self._instruction_loader,
+                runtime_context=runtime_context,
+                timeline=timeline,
+                tool_definitions=ordinary_tools,
+                environment_sources=self._environment_sources(
+                    self._current_model_ref,
+                    self._provider.identity,
+                ),
+                model=remote_model_id,
+                reasoning=_reasoning_options(
+                    model_profile.reasoning_effort if model_profile is not None else None
+                ),
+                max_output_tokens=_effective_output_reserve(
+                    None,
+                    model_profile.max_output_tokens
+                    if model_profile is not None
+                    else None,
+                ),
+                context_budget=context_budget,
+                defer_hard_gate=True,
+                publish=True,
+            )
+        except Exception:
+            # Terminal result delivery must not be turned into a second
+            # failure by a diagnostic-only rebuild; retain a bounded estimate
+            # from the previous authoritative Context snapshot.
+            self._context_service.refresh_context_estimate()
 
     def _model_selection_candidate(
         self,
@@ -2261,9 +2147,6 @@ class UthCodeApplication:
         # A new Turn invalidates any exact usage from the previous terminal
         # boundary before Core can emit its first event.
         self._context_service.refresh_context_estimate()
-        request_boundary_key = (state.run_id, turn_id)
-        self._request_boundary_counts[request_boundary_key] = 0
-
         provider = self._provider
         model_ref = self._current_model_ref
         model_profile = self.current_model
@@ -2303,6 +2186,11 @@ class UthCodeApplication:
             active = self._session_service.active_session
             return None if active is None else active.transcript
 
+        validate_candidate_for_compaction: Callable[
+            [CompactionResult],
+            CompactionResult | Awaitable[CompactionResult],
+        ] | None = None
+
         async def handle_provider_overflow() -> bool:
             """Perform one bounded async L4 recovery, never window discovery."""
 
@@ -2324,7 +2212,33 @@ class UthCodeApplication:
                     frozen_budget,
                     epoch,
                     cancellation=cancellation,
-                    diagnostics=self._context_service,
+                    usage_sink=self._record_provider_request_usage,
+                )
+
+            async def summarize_subpass(epoch: CompactionSubpass) -> str:
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                return await _summarize_compaction_epoch_with_provider(
+                    provider,
+                    remote_model_id,
+                    frozen_budget,
+                    epoch,
+                    cancellation=cancellation,
+                    usage_sink=self._record_provider_request_usage,
+                )
+
+            async def summarize_fold(epoch: OversizedFold) -> str:
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                return await _summarize_compaction_epoch_with_provider(
+                    provider,
+                    remote_model_id,
+                    frozen_budget,
+                    epoch,
+                    cancellation=cancellation,
+                    usage_sink=self._record_provider_request_usage,
                 )
 
             async def commit(candidate: CompactionResult) -> CompactionResult:
@@ -2345,6 +2259,9 @@ class UthCodeApplication:
                 timeline=active.timeline,
                 session_id=active.session_id,
                 summarize=summarize,
+                summarize_oversized_subpass=summarize_subpass,
+                summarize_oversized_fold=summarize_fold,
+                validate_candidate=validate_candidate_for_compaction,
                 commit=commit,
                 cancellation=cancellation,
                 max_epochs=1,
@@ -2412,6 +2329,8 @@ class UthCodeApplication:
         }
         compaction_orchestration_started = False
         timeline_aging_started = False
+        validation_before_count: int | None = None
+        continue_until_low_water = False
 
         async def prepare(
             messages: tuple[Message, ...],
@@ -2419,6 +2338,7 @@ class UthCodeApplication:
             runtime_context: RuntimePromptContext,
         ) -> GenerationRequest:
             nonlocal limits_ready, frozen_provider_limits, frozen_budget
+            nonlocal validate_candidate_for_compaction
             if not limits_ready:
                 frozen_provider_limits = await _resolve_model_limits_async(
                     provider,
@@ -2462,7 +2382,15 @@ class UthCodeApplication:
                 provider_count: ContextCountEstimate | int | None,
                 defer_hard_gate: bool,
                 count_fallback: str | None,
+                *,
+                timeline_override: object = _ACTIVE_TIMELINE,
+                publish: bool = True,
             ) -> GenerationRequest:
+                timeline_value = (
+                    active_timeline()
+                    if timeline_override is _ACTIVE_TIMELINE
+                    else timeline_override
+                )
                 request, _snapshot = self._context_service.compose_generation_request(
                     process_messages,
                     run_id=state.run_id,
@@ -2470,7 +2398,7 @@ class UthCodeApplication:
                     transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
                     runtime_context=runtime_context,
-                    timeline=active_timeline(),
+                    timeline=timeline_value,  # type: ignore[arg-type]
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
                     model=remote_model_id,
@@ -2481,6 +2409,7 @@ class UthCodeApplication:
                     defer_hard_gate=defer_hard_gate,
                     count_fallback=count_fallback,
                     current_turn_id=turn_id if active_session_id() is not None else None,
+                    publish=publish,
                 )
                 return replace(
                     request,
@@ -2495,7 +2424,15 @@ class UthCodeApplication:
                 provider_count: ContextCountEstimate | int | None,
                 defer_hard_gate: bool,
                 count_fallback: str | None,
+                *,
+                timeline_override: object = _ACTIVE_TIMELINE,
+                publish: bool = True,
             ) -> GenerationRequest:
+                timeline_value = (
+                    active_timeline()
+                    if timeline_override is _ACTIVE_TIMELINE
+                    else timeline_override
+                )
                 request, _snapshot = self._context_service.compose_generation_request(
                     process_messages,
                     run_id=state.run_id,
@@ -2503,7 +2440,7 @@ class UthCodeApplication:
                     transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
                     runtime_context=runtime_context,
-                    timeline=active_timeline(),
+                    timeline=timeline_value,  # type: ignore[arg-type]
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
                     model=remote_model_id,
@@ -2517,6 +2454,7 @@ class UthCodeApplication:
                     disable_reductions=True,
                     reduction_levels=_request_reduction_levels(candidate),
                     current_turn_id=turn_id if active_session_id() is not None else None,
+                    publish=publish,
                 )
                 return replace(
                     request,
@@ -2525,6 +2463,103 @@ class UthCodeApplication:
                         "context_compaction": dict(compaction_note),
                     },
                 )
+
+            async def validate_candidate(candidate: CompactionResult) -> CompactionResult:
+                """Compare final ordinary requests before allowing a Timeline commit."""
+
+                previous_timeline = active_timeline()
+
+                async def build(timeline_value: object) -> tuple[GenerationRequest, str]:
+                    def prospective_compose(
+                        provider_count: ContextCountEstimate | int | None,
+                        defer_hard_gate: bool,
+                        count_fallback: str | None,
+                    ) -> GenerationRequest:
+                        return compose(
+                            provider_count,
+                            defer_hard_gate,
+                            count_fallback,
+                            timeline_override=timeline_value,
+                            publish=False,
+                        )
+
+                    def prospective_finalize(
+                        counted: GenerationRequest,
+                        provider_count: ContextCountEstimate | int | None,
+                        defer_hard_gate: bool,
+                        count_fallback: str | None,
+                    ) -> GenerationRequest:
+                        return finalize(
+                            counted,
+                            provider_count,
+                            defer_hard_gate,
+                            count_fallback,
+                            timeline_override=timeline_value,
+                            publish=False,
+                        )
+
+                    return await _prepare_prospective_request_async(
+                        provider,
+                        prospective_compose,
+                        prospective_finalize,
+                    )
+
+                before_request, before_source = await build(previous_timeline)
+                after_request, after_source = await build(candidate.timeline)
+
+                def exact_count(request: GenerationRequest) -> int | None:
+                    gate = request.metadata.get("context_gate")
+                    value = gate.get("input_tokens") if isinstance(gate, Mapping) else None
+                    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+                before_count = (
+                    validation_before_count
+                    if validation_before_count is not None
+                    and before_source == "exact"
+                    else exact_count(before_request)
+                )
+                after_count = exact_count(after_request)
+                if before_source != "exact" or after_source != "exact":
+                    # Mixed capability/failure paths must use the same local
+                    # accounting model for both sides of the comparison.
+                    before_request = compose(
+                        None,
+                        False,
+                        "prospective_local",
+                        timeline_override=previous_timeline,
+                        publish=False,
+                    )
+                    after_request = compose(
+                        None,
+                        False,
+                        "prospective_local",
+                        timeline_override=candidate.timeline,
+                        publish=False,
+                    )
+                    before_count = account_generation_request(before_request).input_tokens
+                    after_count = account_generation_request(after_request).input_tokens
+                if before_count is None or after_count is None:
+                    before_count = account_generation_request(before_request).input_tokens
+                    after_count = account_generation_request(after_request).input_tokens
+                if (
+                    after_count >= before_count
+                    or candidate.output_tokens >= candidate.input_tokens
+                ):
+                    return replace(
+                        candidate,
+                        timeline=previous_timeline,
+                        summary=(
+                            previous_timeline.summary
+                            if previous_timeline is not None
+                            else None
+                        ),
+                        batches=(),
+                        changed=False,
+                        failure="no_reduction",
+                    )
+                return candidate
+
+            validate_candidate_for_compaction = validate_candidate
 
             def gate_from_request(request: GenerationRequest) -> Mapping[str, object] | None:
                 value = request.metadata.get("context_gate")
@@ -2542,7 +2577,7 @@ class UthCodeApplication:
                     frozen_budget,
                     epoch,
                     cancellation=cancellation,
-                    diagnostics=self._context_service,
+                    usage_sink=self._record_provider_request_usage,
                 )
 
             async def summarize_aging_epoch(epoch: TimelineAgingEpoch) -> str:
@@ -2561,7 +2596,37 @@ class UthCodeApplication:
                     epoch,
                     cancellation=cancellation,
                     aging=True,
-                    diagnostics=self._context_service,
+                    usage_sink=self._record_provider_request_usage,
+                )
+
+            async def summarize_subpass(epoch: CompactionSubpass) -> str:
+                if frozen_budget is None:  # pragma: no cover - limits_ready guards this
+                    raise ContextBudgetError("compact request has no frozen ContextBudget")
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                return await _summarize_compaction_epoch_with_provider(
+                    provider,
+                    remote_model_id,
+                    frozen_budget,
+                    epoch,
+                    cancellation=cancellation,
+                    usage_sink=self._record_provider_request_usage,
+                )
+
+            async def summarize_fold(epoch: OversizedFold) -> str:
+                if frozen_budget is None:  # pragma: no cover - limits_ready guards this
+                    raise ContextBudgetError("compact request has no frozen ContextBudget")
+                compaction_note["provider_attempts"] = int(
+                    compaction_note["provider_attempts"]
+                ) + 1
+                return await _summarize_compaction_epoch_with_provider(
+                    provider,
+                    remote_model_id,
+                    frozen_budget,
+                    epoch,
+                    cancellation=cancellation,
+                    usage_sink=self._record_provider_request_usage,
                 )
 
             async def commit_epoch(candidate: CompactionResult) -> CompactionResult:
@@ -2596,6 +2661,7 @@ class UthCodeApplication:
                 return self._commit_timeline_candidate(active, candidate)
 
             async def rebuild_after_epoch(timeline: object) -> Mapping[str, object]:
+                nonlocal validation_before_count
                 nonlocal authoritative_gate_after_compaction
                 nonlocal authoritative_low_water_reached
                 del timeline
@@ -2610,10 +2676,18 @@ class UthCodeApplication:
                 if gate is None:
                     return {"continue": False, "reason": "gate_unavailable"}
                 authoritative_gate_after_compaction = dict(gate)
+                usage = gate.get("preflight_input_usage")
+                gate_count_source = gate.get("count_source")
+                validation_before_count = (
+                    gate.get("input_tokens")
+                    if gate_count_source == "provider.preflight_count"
+                    and isinstance(gate.get("input_tokens"), int)
+                    and not isinstance(gate.get("input_tokens"), bool)
+                    else None
+                )
                 auto_pressure = bool(gate.get("auto_pressure", False))
                 hard_safe = bool(gate.get("hard_safe", False))
                 effective = gate.get("effective_input_limit")
-                usage = gate.get("preflight_input_usage")
                 retained_target = (
                     frozen_budget.retained_target
                     if frozen_budget is not None
@@ -2630,7 +2704,15 @@ class UthCodeApplication:
                 compaction_note["low_water_reached"] = low_water_reached
                 compaction_note["post_epoch_input_usage"] = usage
                 return {
-                    "continue": not low_water_reached,
+                    # Continue automatic catch-up only while the rebuilt
+                    # ordinary boundary still reports Pressure or remains
+                    # Hard-unsafe.  A newly safe request must not compact
+                    # older Turns merely because it has not reached the
+                    # manual retained target yet.
+                    "continue": (
+                        (continue_until_low_water or auto_pressure or not hard_safe)
+                        and not low_water_reached
+                    ),
                     "auto_pressure": auto_pressure,
                     "hard_safe": hard_safe,
                     "preflight_input_usage": usage,
@@ -2644,7 +2726,8 @@ class UthCodeApplication:
             ) -> bool:
                 """Run the single bounded L4 catch-up for this active Turn."""
 
-                nonlocal compaction_orchestration_started
+                nonlocal compaction_orchestration_started, validation_before_count
+                nonlocal continue_until_low_water
                 if trigger_gate is None:
                     return False
                 needs_compaction = bool(
@@ -2660,6 +2743,19 @@ class UthCodeApplication:
                     previous_estimate = trigger_gate.get("input_tokens")
                 if isinstance(previous_estimate, int):
                     compaction_note["previous_estimate"] = previous_estimate
+                validation_before_count = (
+                    trigger_gate.get("input_tokens")
+                    if trigger_gate.get("count_source") == "provider.preflight_count"
+                    and isinstance(trigger_gate.get("input_tokens"), int)
+                    and not isinstance(trigger_gate.get("input_tokens"), bool)
+                    else None
+                )
+                continue_until_low_water = bool(
+                    frozen_budget is not None
+                    and trigger_gate.get("count_source") == "provider.preflight_count"
+                    and trigger_gate.get("input_tokens")
+                    == frozen_budget.effective_input_limit
+                )
                 active = (
                     self._session_service.active_session
                     if self._session_service is not None
@@ -2682,6 +2778,9 @@ class UthCodeApplication:
                     timeline=active.timeline,
                     session_id=active.session_id,
                     summarize=summarize_epoch,
+                    summarize_oversized_subpass=summarize_subpass,
+                    summarize_oversized_fold=summarize_fold,
+                    validate_candidate=validate_candidate,
                     commit=commit_epoch,
                     should_continue=rebuild_after_epoch,
                     cancellation=cancellation,
@@ -2801,6 +2900,7 @@ class UthCodeApplication:
                         timeline=active.timeline,
                         session_id=active.session_id,
                         summarize=summarize_aging_epoch,
+                        validate_candidate=validate_candidate,
                         commit=commit_aging_epoch,
                         cancellation=cancellation,
                         fine_budget=fine_budget,
@@ -2862,7 +2962,6 @@ class UthCodeApplication:
                     finalize,
                     on_counted_request=on_counted_request,
                 )
-                self._request_boundary_counts[request_boundary_key] += 1
                 return prepared_request
             except GenerationCancelled:
                 # AgentLoop treats asyncio cancellation as the cooperative

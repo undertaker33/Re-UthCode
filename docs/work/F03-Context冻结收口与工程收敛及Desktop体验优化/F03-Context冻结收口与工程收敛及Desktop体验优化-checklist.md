@@ -11,16 +11,16 @@
 
 ## T02：Application Working Context、manual Compact 与 usage 双投影
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py tests/test_w05_diagnostics.py tests/test_desktop_bridge.py -q`，全部用例通过。
-- [ ] exact capability 可用时 before/after 均为 exact；缺失或受控失败时两者均为 local，不出现 source 混用。
-- [ ] 构造 summary token 变短但 prospective ordinary request 不变或变大的场景，确认 candidate 返回 `no_reduction` 等价结果且 Timeline append 为 0。
-- [ ] oversized subpass 通过同一 tool-free、Hard-gated Provider path 执行；中途失败/取消/invalid 时 durable write 为 0，成功时只提交一个完整 Turn Fine。
-- [ ] manual `/compact` 在一次调用内继续到 retained target 或既有 epoch limit；无 eligible history 为 `no_change`，已有有效 commit 后 bounded stop 仍为 completed/partial-success 且原因只在 diagnostics。
-- [ ] Compact commit 后重建 ordinary request；Current Working Context 显示新请求的 exact/local projection，不再被上一请求 usage 覆盖。
-- [ ] 同一 Turn 连续累计 `UsageUpdated` 产生正确的非负 request delta；新 Turn 从零基线开始，pause/resume 不丢边界。
-- [ ] ordinary request 与 Compact/L5 terminal usage 都能更新同一个 Last Provider Request Usage；无法证明字段存在时为 `not_available`，Bridge 不包含 raw details。
-- [ ] Conversation projection full→reduced 与 reduced→full 可观察 fingerprint/change；该值不持久化、不改变 compaction policy。
-- [ ] `request_preparation.py`、`application/compaction.py` 均有多个真实调用方且不拥有 Application/Session/Timeline state；`generation.py` 仍是唯一 `UthCodeApplication` authority。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_runs.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py tests/test_w05_diagnostics.py tests/test_desktop_bridge.py -q`，全部用例通过。
+- [x] exact capability 可用时 before/after 均为 exact；缺失或受控失败时两者均为 local，不出现 source 混用。
+- [x] 构造 summary token 变短但 prospective ordinary request 不变或变大的场景，确认 candidate 返回 `no_reduction` 等价结果且 Timeline append 为 0。
+- [x] oversized subpass 通过同一 tool-free、Hard-gated Provider path 执行；中途失败/取消/invalid 时 durable write 为 0，成功时只提交一个完整 Turn Fine。
+- [x] manual `/compact` 在一次调用内继续到 retained target 或既有 epoch limit；无 eligible history 为 `no_change`，已有有效 commit 后 bounded stop 仍为 completed/partial-success 且原因只在 diagnostics。
+- [x] Compact commit 后重建 ordinary request；Current Working Context 显示新请求的 exact/local projection，不再被上一请求 usage 覆盖。
+- [x] 同一 Turn 连续累计 `UsageUpdated` 产生正确的非负 request delta；新 Turn 从零基线开始，pause/resume 不丢边界。
+- [x] ordinary request 与 Compact/L5 terminal usage 都能更新同一个 Last Provider Request Usage；无法证明字段存在时为 `not_available`，Bridge 不包含 raw details。
+- [x] Conversation projection full→reduced 与 reduced→full 可观察 fingerprint/change；该值不持久化、不改变 compaction policy。
+- [x] `request_preparation.py`、`application/compaction.py` 均有多个真实调用方且不拥有 Application/Session/Timeline state；`generation.py` 仍是唯一 `UthCodeApplication` authority。
 
 ## T03：Renderer state 与 App 生命周期收敛
 

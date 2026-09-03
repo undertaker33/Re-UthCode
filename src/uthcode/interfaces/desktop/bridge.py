@@ -243,6 +243,7 @@ _STATUS_OUTPUT_FIELDS = (
     "context_usage",
     "context_status",
     "compaction_status",
+    "last_provider_request_usage",
     "timeline_checkpoint_id",
     "active_session_title",
     "instruction_epoch",

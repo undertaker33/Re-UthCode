@@ -27,6 +27,7 @@ from uthcode.core.agent_events import (
     TerminationReason,
     TurnPaused,
     TurnResumed,
+    UsageUpdated,
 )
 from uthcode.core.interaction import (
     PauseRequest,
@@ -47,7 +48,7 @@ from uthcode.core.permission import (
     SessionGrant,
 )
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import CancellationToken, Message, ReasoningPart, TextPart
+from uthcode.core.provider import CancellationToken, Message, ReasoningPart, TextPart, Usage
 
 if TYPE_CHECKING:
     from .generation import UthCodeApplication
@@ -504,26 +505,14 @@ class AgentRun:
         ):
             self._application._record_committed_turn()
         self._active_turn = None
-        # Application owns the public diagnostics projection.  The value is
-        # the cumulative Usage of this terminal Turn (including all Provider
-        # iterations/tool continuations), not a second Provider request.  Core
-        # does not expose a request-attempt counter, so the Application's
-        # successful request-preparation count is consumed as the only proof
-        # that this terminal result came from one request boundary.  The
-        # active-turn ownership is released first so a status read cannot see
-        # an exact terminal projection while the Run still claims the Turn.
-        request_boundary_count = self._application._consume_request_boundary_count(
-            result.run_id,
-            result.turn_id,
+        # Application owns the public Provider usage projection.  Current
+        # Working Context is rebuilt independently from the terminal ordinary
+        # conversation; terminal Usage must never overwrite that Context.
+        self._application._rebuild_context_after_terminal(
+            self._state,
+            session_persisted=(turn_session_id is None or flushed),
         )
-        self._application._record_formal_run_usage(
-            result.usage,
-            exact_request_boundary=(
-                result.status is RunStatus.COMPLETED
-                and result.tool_call_count == 0
-                and request_boundary_count == 1
-            ),
-        )
+        self._application._record_formal_run_usage(result.usage)
 
 
 class _TurnDriver:
@@ -545,6 +534,7 @@ class _TurnDriver:
         "_handle",
         "_open_visible_message_id",
         "_failed_visible_parts",
+        "_usage_baseline",
     )
 
     def __init__(self, run: AgentRun, execution: AgentTurnExecution) -> None:
@@ -563,6 +553,7 @@ class _TurnDriver:
         self._handle: TurnHandle | None = None
         self._open_visible_message_id: str | None = None
         self._failed_visible_parts: list[ReasoningPart | TextPart] = []
+        self._usage_baseline: Usage | None = None
 
     def attach(self, handle: TurnHandle) -> None:
         if self._handle is not None:
@@ -665,6 +656,16 @@ class _TurnDriver:
         """Publish one Core event while preserving the single live stream."""
 
         assert self._queue is not None
+        if isinstance(event, UsageUpdated):
+            # Core emits cumulative usage for the current Turn.  Diff against
+            # the immediately preceding cumulative event so the Application
+            # projection represents this ordinary Provider request, including
+            # tool/provider continuations and pause/resume.
+            self._run._application._record_usage_updated(
+                event.usage,
+                baseline=self._usage_baseline,
+            )
+            self._usage_baseline = event.usage
         if isinstance(event, (ReasoningDelta, AssistantMessageDelta)):
             if self._open_visible_message_id != event.message_id:
                 self._open_visible_message_id = event.message_id
