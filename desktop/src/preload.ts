@@ -57,9 +57,9 @@ export function installPreload(
       requireNonEmptyString(projectPath, "project path");
       await ipcRenderer.invoke("desktop.project.explorer", projectPath);
     },
-    async copySessionId(sessionId: string): Promise<void> {
-      requireNonEmptyString(sessionId, "session ID");
-      await ipcRenderer.invoke("desktop.session.copy-id", sessionId);
+    async copyText(text: string): Promise<void> {
+      if (typeof text !== "string" || text.length > 1_000_000) throw new TypeError("clipboard text is invalid");
+      await ipcRenderer.invoke("desktop.clipboard.copy-text", text);
     },
     async closeShell(): Promise<void> {
       await ipcRenderer.invoke("desktop.shell.close");

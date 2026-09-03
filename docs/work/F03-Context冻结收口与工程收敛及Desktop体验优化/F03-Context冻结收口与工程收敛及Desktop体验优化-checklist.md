@@ -33,14 +33,14 @@
 
 ## T04：Settings 单 Modal 与 Markdown 高频交互
 
-- [ ] 在 `desktop` 执行 `npm run typecheck`、`npm test`、`node scripts/build-settings-acceptance.mjs` 和 `node scripts/cdp-settings-acceptance.mjs`，全部成功并记录报告。
-- [ ] Provider→Model→Back 使用同一个 modal root/focus trap/return-focus owner；Cancel 回滚 transaction，Save 只走现有 Configuration write。
-- [ ] reveal/hide 不标记 Key touched；replacement 失败保留草稿、成功按既有写入收敛；关闭/取消/卸载后明文不在 reducer、preferences、日志或 snapshot 中。
-- [ ] Markdown 现有 inline/code/emphasis/link/fence/heading/table/quote/list/paragraph 子集和各 Timeline kind 覆盖保持，raw HTML 与 unsafe URL 仍被拒绝。
-- [ ] fenced code 显示正确 language label；Copy 经 `copyText` 复制逐字一致的原始代码，并有成功/失败局部反馈。
-- [ ] Session ID copy 与 Code Fence copy 共用 `copyText`；main process sender/frame/origin 校验仍生效，Renderer 无 Electron/clipboard 对象。
-- [ ] 用户离开底部后 streaming 不改变 scroll position并显示新消息入口；点击后滚到底并恢复 near-bottom follow-tail。
-- [ ] zh-CN/en、keyboard、focus、ARIA、dark/light 下 Settings、Code Fence 与新消息入口无缺文案或不可达控件。
+- [x] 在 `desktop` 执行 `npm run typecheck`、`npm test`、`node scripts/build-settings-acceptance.mjs` 和 `node scripts/cdp-settings-acceptance.mjs`，全部成功并记录报告。
+- [x] Provider→Model→Back 使用同一个 modal root/focus trap/return-focus owner；Cancel 回滚 transaction，Save 只走现有 Configuration write。
+- [x] reveal/hide 不标记 Key touched；replacement 失败保留草稿、成功按既有写入收敛；关闭/取消/卸载后明文不在 reducer、preferences、日志或 snapshot 中。
+- [x] Markdown 现有 inline/code/emphasis/link/fence/heading/table/quote/list/paragraph 子集和各 Timeline kind 覆盖保持，raw HTML 与 unsafe URL 仍被拒绝。
+- [x] fenced code 显示正确 language label；Copy 经 `copyText` 复制逐字一致的原始代码，并有成功/失败局部反馈。
+- [x] Session ID copy 与 Code Fence copy 共用 `copyText`；main process sender/frame/origin 校验仍生效，Renderer 无 Electron/clipboard 对象。
+- [x] 用户离开底部后 streaming 不改变 scroll position并显示新消息入口；点击后滚到底并恢复 near-bottom follow-tail。
+- [x] zh-CN/en、keyboard、focus、ARIA、dark/light 下 Settings、Code Fence 与新消息入口无缺文案或不可达控件。
 
 ## T05：可拖拽布局、Focus Mode 与视觉层级
 

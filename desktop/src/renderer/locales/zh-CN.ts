@@ -15,4 +15,5 @@ export const zhCN = {
   sessionResumed: "会话已恢复", idle: "空闲", auto: "自动", fullAccess: "完全访问", booting: "正在启动", restarting: "正在重启", initializing: "正在初始化", configurationRequired: "需要配置", stopped: "已停止", paused: "已暂停", cancelled: "已取消", unknown: "未知", noChange: "无变化", compaction: "上下文压缩", manual: "手动", overflow: "溢出", estimate: "估算", exact: "精确",
   completionBlockedLabel: "无法完成", unfinishedTasks: "个未完成任务",
   commandDescriptionModel: "查看或切换当前模型", commandDescriptionStatus: "显示当前 Application 状态", commandDescriptionCompact: "压缩上下文", commandDescriptionPlan: "进入规划模式", commandDescriptionNew: "创建新会话", commandDescriptionDo: "进入默认执行模式", commandCompleted: "命令已完成", commandHelp: "命令帮助", commandModelSelected: "模型已选择", commandModeSelected: "模式已切换", commandPermissionSelected: "权限已选择", commandPermissionWarning: "已选择完全访问；显式安全约束仍然生效",
+  codeBlock: "代码块", copyCode: "复制代码", copiedCode: "代码已复制", copyCodeFailed: "无法复制代码", newMessages: "新消息", jumpToLatest: "回到底部",
 } as const;

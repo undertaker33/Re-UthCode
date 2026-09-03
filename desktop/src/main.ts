@@ -44,7 +44,7 @@ const PRELOAD_ENTRY = () =>
 export const IPC_CHANNELS = Object.freeze({
   pickProject: "desktop.project.pick",
   openProjectInExplorer: "desktop.project.explorer",
-  copySessionId: "desktop.session.copy-id",
+  copyText: "desktop.clipboard.copy-text",
   closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
   runtimeEvent: "desktop.runtime.event",
@@ -211,15 +211,15 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     if (failure) throw new MainBoundaryError("explorer_open_failed", "Project Explorer action failed");
   };
 
-  const onCopySessionId = async (event: IpcMainInvokeEvent, value: unknown): Promise<void> => {
+  const onCopyText = async (event: IpcMainInvokeEvent, value: unknown): Promise<void> => {
     assertSender(event);
-    if (typeof value !== "string" || !value.trim() || value.length > 4096) {
-      throw new MainBoundaryError("invalid_session_id", "Session ID is invalid");
+    if (typeof value !== "string" || value.length > 1_000_000) {
+      throw new MainBoundaryError("invalid_copy_text", "Clipboard text is invalid");
     }
     try {
       writeClipboard(value);
     } catch {
-      throw new MainBoundaryError("clipboard_write_failed", "Session ID could not be copied");
+      throw new MainBoundaryError("clipboard_write_failed", "Clipboard text could not be copied");
     }
   };
 
@@ -313,7 +313,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
 
   ipc.handle(IPC_CHANNELS.pickProject, onPickProject);
   ipc.handle(IPC_CHANNELS.openProjectInExplorer, onOpenProjectInExplorer);
-  ipc.handle(IPC_CHANNELS.copySessionId, onCopySessionId);
+  ipc.handle(IPC_CHANNELS.copyText, onCopyText);
   ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);

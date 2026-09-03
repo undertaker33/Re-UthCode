@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron-forge start",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts tests/renderer-state.test.ts tests/renderer-state-ui.test.tsx tests/renderer-session.test.tsx tests/renderer-runtime-lifecycle.test.tsx tests/renderer.test.tsx tests/windows-packaging.test.ts tests/cdp-isolation.test.ts tests/settings-acceptance-isolation.test.ts",
+    "test": "tsx --test tests/preload.test.ts tests/runtime-process.test.ts tests/main-bundle.test.ts tests/renderer-state.test.ts tests/renderer-state-ui.test.tsx tests/renderer-session.test.tsx tests/renderer-runtime-lifecycle.test.tsx tests/renderer-settings.test.tsx tests/renderer-chat.test.tsx tests/renderer.test.tsx tests/windows-packaging.test.ts tests/cdp-isolation.test.ts tests/settings-acceptance-isolation.test.ts",
     "build:runtime": "node scripts/build-python-runtime.mjs",
     "package": "npm run build:runtime && electron-forge package",
     "make": "npm run build:runtime && electron-forge make"

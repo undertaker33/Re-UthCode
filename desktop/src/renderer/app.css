@@ -127,6 +127,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .timeline-entry--tool .tool-summary-icon + span { overflow-wrap: anywhere; }
 .timeline-entry--plan .timeline-content { border-left: 2px solid var(--accent); padding: 3px 0 3px 15px; }
 .timeline-content pre { overflow: auto; border: 1px solid var(--line); border-radius: 9px; padding: 12px; background: var(--sidebar); }
+.markdown-code-fence { margin: 12px 0; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sidebar); }
+.markdown-code-fence__toolbar { display: flex; min-height: 30px; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 0 8px 0 11px; color: var(--faint); font-size: 10px; }
+.markdown-code-fence__language { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.markdown-code-fence__copy { min-height: 24px; border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; color: var(--muted); background: transparent; font-size: 10px; }
+.markdown-code-fence__copy:hover { color: var(--text); border-color: var(--line-strong); background: var(--raised); }
+.markdown-code-fence pre { margin: 0; border: 0; border-radius: 0; }
+.markdown-code-fence pre code { display: block; min-width: max-content; padding: 0; background: transparent; }
+.timeline-new-messages { position: sticky; top: 12px; z-index: 2; display: block; min-height: 30px; margin: 0 auto 12px; border: 1px solid var(--accent); border-radius: 999px; padding: 5px 12px; color: var(--on-accent); background: var(--accent-action); box-shadow: 0 8px 20px var(--shadow); font-size: 11px; }
+.timeline-new-messages:hover { background: var(--accent); }
 .timeline-content code { border-radius: 4px; padding: 1px 4px; background: var(--raised); font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
 .timeline-content a { color: var(--accent-strong); }
 .timeline-content table { width: 100%; border-collapse: collapse; }
@@ -285,9 +294,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .settings-confirm div { display: flex; gap: 7px; }
 .settings-confirm button { min-height: 30px; border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; color: var(--text); background: var(--surface); font-size: 10px; }
 .provider-modal-backdrop { position: fixed; z-index: 1000; inset: 0; box-sizing: border-box; display: grid; place-items: center; align-items: start; overflow: auto; padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left)); background: rgb(0 0 0 / 62%); isolation: isolate; animation: settings-modal-fade 160ms ease-out; }
-.provider-modal-backdrop--nested { z-index: 1100; background: rgb(0 0 0 / 36%); }
 .provider-modal { box-sizing: border-box; display: flex; width: min(680px, 100%); max-height: min(760px, calc(100vh - 48px)); margin: auto; flex-direction: column; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 16px; background: var(--bg); box-shadow: 0 24px 70px var(--shadow); animation: settings-modal-rise 190ms cubic-bezier(.2,.8,.2,1); }
-.model-modal { width: min(610px, 100%); }
 .provider-modal > header, .provider-modal > footer { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--line); }
 .provider-modal > header h2 { margin: 0; font-size: 16px; }
 .provider-modal > header button { width: 30px; height: 30px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; }

@@ -62,7 +62,7 @@ test("T05 terminal convergence retries transient failures with backoff past one 
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         if (method !== "status.get") return {};
@@ -96,7 +96,7 @@ test("T05 terminal convergence is cancelled on unmount without a timer or stale 
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async () => { statusCalls += 1; return { active_turn: true }; },
       subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
@@ -124,7 +124,7 @@ test("T05 accepted flat Run boundaries own consecutive Turn polls and stale turn
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         if (method === "turn.start") {
@@ -206,7 +206,7 @@ test("T05 steering keeps the Bridge nested Run DTO separate from flat turn.start
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
@@ -236,7 +236,7 @@ test("T05 buffers synchronous turn.start stdout until the flat accepted identity
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: (method) => {
         if (method === "turn.start") {
@@ -294,7 +294,7 @@ test("T05 pending turn.start ownership is single-flight and discarded on unmount
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: (method) => {
         if (method === "turn.start") {
@@ -337,7 +337,7 @@ test("T03 project removal publishes terminal idle before replacement navigation 
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
-      copySessionId: async () => undefined,
+      copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method) => {
         calls.push(method);
