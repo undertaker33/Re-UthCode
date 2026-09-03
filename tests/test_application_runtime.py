@@ -295,7 +295,7 @@ def test_model_selection_metadata_failure_does_not_publish_a_split_model(
     application.close()
 
 
-def test_streaming_context_delta_is_an_estimate_until_provider_usage_corrects_it(
+def test_streaming_context_delta_remains_an_estimate_without_provider_override(
     tmp_path: Path,
 ) -> None:
     application = create_application(
@@ -313,10 +313,10 @@ def test_streaming_context_delta_is_an_estimate_until_provider_usage_corrects_it
     assert after.source == "live_delta"
     assert after.used_tokens > before.used_tokens
 
-    application.context_service.record_exact_usage(after.used_tokens + 3)
-    corrected = application.context_service.context_status
-    assert corrected.measurement == "exact"
-    assert corrected.used_tokens == after.used_tokens + 3
+    current = application.context_service.context_status
+    assert current.measurement == "estimate"
+    assert current.source == "live_delta"
+    assert current.used_tokens == after.used_tokens
     application.close()
 
 

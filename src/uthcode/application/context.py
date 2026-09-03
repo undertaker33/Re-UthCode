@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import copy
+import hashlib
+import json
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -12,10 +14,6 @@ from typing import Any
 from uthcode.core.context import (
     DEFAULT_CONTEXT_INPUT_LIMIT,
     ContextBudget,
-    CompactionEpoch,
-    CompactionInProgress,
-    CompactionResult,
-    ContextCompactor,
     ContextCompiler,
     ContextCountEstimate,
     ContextRequestSafetyError,
@@ -30,9 +28,21 @@ from uthcode.core.context import (
     preflight_safety_count,
     pressure_estimate,
     resolve_context_budget,
+)
+from uthcode.core.compaction import (
+    CompactionEpoch,
+    CompactionInProgress,
+    CompactionResult,
+    CompactionSubpass,
+    ContextCompactor,
+    OversizedCompactionPlan,
+    OversizedFold,
+    OversizedFoldPlan,
+    OversizedFoldResult,
+    OversizedSubpassResult,
+    TimelineAgingEpoch,
     fine_timeline_usage,
 )
-from uthcode.core.compaction import TimelineAgingEpoch
 from uthcode.core.history import Timeline, Transcript
 from uthcode.core.prompt import (
     ContextAuthority,
@@ -190,6 +200,8 @@ class ApplicationContextService:
         self._last_count_fallback: str | None = None
         self._context_status = ContextStatus.unavailable()
         self._compaction_status = CompactionStatus()
+        self._conversation_projection_fingerprint: str | None = None
+        self._conversation_projection_changed: bool | None = None
 
     @property
     def compiler(self) -> ContextCompiler:
@@ -232,6 +244,8 @@ class ApplicationContextService:
             "last_count_fallback": self._last_count_fallback,
             "context_status": self._context_status,
             "compaction_status": self._compaction_status,
+            "conversation_projection_fingerprint": self._conversation_projection_fingerprint,
+            "conversation_projection_changed": self._conversation_projection_changed,
         }
 
     def restore_state(self, value: Mapping[str, object]) -> None:
@@ -250,6 +264,12 @@ class ApplicationContextService:
         self._last_count_fallback = value.get("last_count_fallback")  # type: ignore[assignment]
         self._context_status = value.get("context_status", ContextStatus.unavailable())  # type: ignore[assignment]
         self._compaction_status = value.get("compaction_status", CompactionStatus())  # type: ignore[assignment]
+        fingerprint = value.get("conversation_projection_fingerprint")
+        self._conversation_projection_fingerprint = (
+            fingerprint if isinstance(fingerprint, str) else None
+        )
+        changed = value.get("conversation_projection_changed")
+        self._conversation_projection_changed = changed if isinstance(changed, bool) else None
 
     def record_live_delta(self, text: str, *, source: str = "live_delta") -> None:
         """Apply a bounded incremental estimate while a Turn is streaming."""
@@ -316,36 +336,6 @@ class ApplicationContextService:
         self._last_accounting = None
         self._last_count_fallback = None
         self._refresh_context_estimate()
-
-    def record_exact_usage(
-        self,
-        used_tokens: int,
-        *,
-        budget: ContextBudget | None = None,
-    ) -> None:
-        """Record Provider usage for the current request boundary only."""
-
-        if isinstance(used_tokens, bool) or not isinstance(used_tokens, int) or used_tokens < 0:
-            raise ValueError("used_tokens must be a non-negative integer")
-        effective_budget = budget or self._last_budget
-        if effective_budget is not None and not isinstance(effective_budget, ContextBudget):
-            raise TypeError("budget must be a ContextBudget or None")
-        if effective_budget is not None:
-            self._last_budget = effective_budget
-        if self._last_snapshot is None or effective_budget is None:
-            self._refresh_context_estimate()
-            return
-        effective = effective_budget.effective_input_limit
-        if effective is None:  # pragma: no cover - ContextBudget always resolves one
-            self._refresh_context_estimate()
-            return
-        self._context_status = ContextStatus(
-            used_tokens=used_tokens,
-            budget_tokens=effective,
-            available=True,
-            measurement="exact",
-            source="provider_usage",
-        )
 
     def begin_compaction(self, trigger: str) -> None:
         """Enter the single Application compaction lifecycle."""
@@ -420,6 +410,7 @@ class ApplicationContextService:
         previous_snapshot: ContextSnapshot | None = None,
         context_budget: ContextBudget | None = None,
         preserve_request_diagnostics: bool = False,
+        publish: bool = True,
     ) -> ContextSnapshot:
         if instruction_loader is not None and not isinstance(
             instruction_loader,
@@ -436,6 +427,8 @@ class ApplicationContextService:
             raise TypeError("tool_definitions must contain ToolDefinition values")
         if context_budget is not None and not isinstance(context_budget, ContextBudget):
             raise TypeError("context_budget must be a ContextBudget or None")
+        if not isinstance(publish, bool):
+            raise TypeError("publish must be a boolean")
 
         project_source = None
         if isinstance(instruction_loader, ProjectInstructionSource):
@@ -489,12 +482,13 @@ class ApplicationContextService:
             bundle,
             previous_snapshot=(self._last_snapshot if previous_snapshot is None else previous_snapshot),
         )
-        self._last_snapshot = snapshot
-        if context_budget is not None:
-            self._last_budget = context_budget
-        elif not preserve_request_diagnostics:
-            self._last_budget = context_budget
-        self._refresh_context_estimate()
+        if publish:
+            self._last_snapshot = snapshot
+            if context_budget is not None:
+                self._last_budget = context_budget
+            elif not preserve_request_diagnostics:
+                self._last_budget = context_budget
+            self._refresh_context_estimate()
         return snapshot
 
     def usage(self, snapshot: ContextSnapshot | None = None) -> ContextUsage:
@@ -599,6 +593,26 @@ class ApplicationContextService:
         fallback = request.metadata.get("context_count_fallback")
         self._last_count_fallback = fallback if isinstance(fallback, str) else None
 
+    def _record_conversation_projection(
+        self,
+        messages: Sequence[Message],
+    ) -> None:
+        """Record a process-local fingerprint for the final ordinary projection."""
+
+        payload = [message.to_dict() for message in messages]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fingerprint = hashlib.sha256(encoded).hexdigest()
+        self._conversation_projection_changed = (
+            self._conversation_projection_fingerprint is not None
+            and self._conversation_projection_fingerprint != fingerprint
+        )
+        self._conversation_projection_fingerprint = fingerprint
+
     @property
     def compactor(self) -> ContextCompactor:
         return self._compactor
@@ -610,6 +624,19 @@ class ApplicationContextService:
         timeline: Timeline | None = None,
         session_id: str | None = None,
         summarize: Callable[[CompactionEpoch], object | Awaitable[object]],
+        summarize_oversized_subpass: Callable[
+            [CompactionSubpass], object | Awaitable[object]
+        ]
+        | None = None,
+        summarize_oversized_fold: Callable[
+            [OversizedFold], object | Awaitable[object]
+        ]
+        | None = None,
+        validate_candidate: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ]
+        | None = None,
         commit: Callable[
             [CompactionResult],
             bool | CompactionResult | Awaitable[bool | CompactionResult],
@@ -636,6 +663,9 @@ class ApplicationContextService:
                 timeline=timeline,
                 session_id=session_id,
                 summarize=summarize,
+                summarize_oversized_subpass=summarize_oversized_subpass,
+                summarize_oversized_fold=summarize_oversized_fold,
+                validate_candidate=validate_candidate,
                 commit=commit,
                 should_continue=should_continue,
                 cancellation=cancellation,
@@ -670,6 +700,19 @@ class ApplicationContextService:
         timeline: Timeline | None = None,
         session_id: str | None = None,
         summarize: Callable[[CompactionEpoch], object | Awaitable[object]],
+        summarize_oversized_subpass: Callable[
+            [CompactionSubpass], object | Awaitable[object]
+        ]
+        | None = None,
+        summarize_oversized_fold: Callable[
+            [OversizedFold], object | Awaitable[object]
+        ]
+        | None = None,
+        validate_candidate: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ]
+        | None = None,
         commit: Callable[
             [CompactionResult],
             bool | CompactionResult | Awaitable[bool | CompactionResult],
@@ -702,6 +745,14 @@ class ApplicationContextService:
             raise ValueError("transcript and timeline must belong to the same Session")
         if not callable(summarize):
             raise TypeError("summarize must be callable")
+        if summarize_oversized_subpass is not None and not callable(
+            summarize_oversized_subpass
+        ):
+            raise TypeError("summarize_oversized_subpass must be callable or None")
+        if summarize_oversized_fold is not None and not callable(summarize_oversized_fold):
+            raise TypeError("summarize_oversized_fold must be callable or None")
+        if validate_candidate is not None and not callable(validate_candidate):
+            raise TypeError("validate_candidate must be callable or None")
         if cancellation is not None and not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
         if (
@@ -766,35 +817,110 @@ class ApplicationContextService:
                     input_budget=input_budget,
                     output_reserve=output_reserve,
                 )
+                oversized_plan: OversizedCompactionPlan | None = None
                 if epoch is None:
-                    last_failure = "no_safe_epoch"
-                    outcome(result=last_success, failure=last_failure, epoch=epoch_number)
-                    break
+                    # An ordinary epoch cannot fit when the oldest complete
+                    # Turn itself is oversized.  Core supplies the bounded
+                    # subpass/fold contract; Application only invokes the
+                    # supplied tool-free Provider callbacks.
+                    oversized_plan = self._compactor.plan_oversized_turn(
+                        transcript,
+                        timeline=current_timeline,
+                        session_id=owner,
+                        input_budget=input_budget,
+                        output_reserve=output_reserve,
+                    )
+                    if oversized_plan is None:
+                        last_failure = "no_safe_epoch"
+                        outcome(result=last_success, failure=last_failure, epoch=epoch_number)
+                        break
+                    if summarize_oversized_subpass is None:
+                        last_failure = "oversized_provider_unavailable"
+                        outcome(result=last_success, failure=last_failure, epoch=epoch_number)
+                        break
 
                 candidate_result: CompactionResult | None = None
                 failure_streak = 0
+                epoch_attempt = 0
                 for epoch_attempt in range(1, 3):
                     if cancellation is not None and cancellation.cancelled:
                         last_failure = "compaction_cancelled"
                         break
                     try:
-                        generated = summarize(epoch)
-                        if inspect.isawaitable(generated):
-                            generated = await generated
-                        if cancellation is not None and cancellation.cancelled:
-                            last_failure = "compaction_cancelled"
-                            break
-                        parsed = self._compactor.parse_epoch_result(
-                            generated,
-                            epoch=epoch,
-                            summary_hard_cap=summary_hard_cap,
-                        )
-                        candidate_result = self._compactor.build_epoch_candidate(
-                            transcript,
-                            epoch=epoch,
-                            result=parsed,
-                            timeline=current_timeline,
-                        )
+                        if epoch is not None:
+                            generated = summarize(epoch)
+                            if inspect.isawaitable(generated):
+                                generated = await generated
+                            if cancellation is not None and cancellation.cancelled:
+                                last_failure = "compaction_cancelled"
+                                break
+                            parsed = self._compactor.parse_epoch_result(
+                                generated,
+                                epoch=epoch,
+                                summary_hard_cap=summary_hard_cap,
+                            )
+                            candidate_result = self._compactor.build_epoch_candidate(
+                                transcript,
+                                epoch=epoch,
+                                result=parsed,
+                                timeline=current_timeline,
+                            )
+                        else:
+                            assert oversized_plan is not None
+                            assert summarize_oversized_subpass is not None
+                            subpass_results: list[object] = []
+                            for subpass in oversized_plan.subpasses:
+                                if cancellation is not None:
+                                    cancellation.raise_if_cancelled()
+                                generated = summarize_oversized_subpass(subpass)
+                                if inspect.isawaitable(generated):
+                                    generated = await generated
+                                parsed_subpass = self._compactor.parse_oversized_subpass_result(
+                                    generated,
+                                    subpass=subpass,
+                                    summary_hard_cap=summary_hard_cap,
+                                )
+                                subpass_results.append(parsed_subpass)
+
+                            fold_results: list[tuple[object, ...]] = []
+                            fold_values: tuple[object, ...] = tuple(subpass_results)
+                            for _fold_round in range(8):
+                                fold_plan = self._compactor.plan_oversized_fold_round(
+                                    fold_values,
+                                    input_budget=oversized_plan.input_budget,
+                                    output_reserve=oversized_plan.output_reserve,
+                                    summary_hard_cap=summary_hard_cap,
+                                )
+                                if fold_plan is None:
+                                    break
+                                if summarize_oversized_fold is None:
+                                    raise ValueError("oversized fold Provider callback is unavailable")
+                                round_results: list[object] = []
+                                for fold in fold_plan.folds:
+                                    if cancellation is not None:
+                                        cancellation.raise_if_cancelled()
+                                    generated = summarize_oversized_fold(fold)
+                                    if inspect.isawaitable(generated):
+                                        generated = await generated
+                                    parsed_fold = self._compactor.parse_oversized_fold_result(
+                                        generated,
+                                        fold=fold,
+                                        summary_hard_cap=summary_hard_cap,
+                                    )
+                                    round_results.append(parsed_fold)
+                                fold_results.append(tuple(round_results))
+                                fold_values = tuple(round_results)
+                            else:
+                                raise ValueError("oversized fold limit reached")
+                            candidate_result = self._compactor.build_oversized_candidate(
+                                transcript,
+                                plan=oversized_plan,
+                                subpass_results=tuple(subpass_results),
+                                timeline=current_timeline,
+                                fold_results=tuple(fold_results),
+                                summary_hard_cap=summary_hard_cap,
+                                cancellation=cancellation,
+                            )
                         # A parse/validation failure from the first attempt is
                         # transient once the retry produces a valid candidate.
                         # Later terminal breakers still set their own reason.
@@ -841,12 +967,44 @@ class ApplicationContextService:
                     )
                     break
 
-                non_reducing = self._non_reducing_result(
-                    candidate_result,
-                    current_timeline,
+                if validate_candidate is not None:
+                    decision = validate_candidate(candidate_result)
+                    if inspect.isawaitable(decision):
+                        decision = await decision
+                    if isinstance(decision, CompactionResult):
+                        candidate_result = decision
+                    elif isinstance(decision, bool):
+                        if not decision:
+                            candidate_result = self._non_reducing_result(
+                                candidate_result,
+                                current_timeline,
+                            ) or replace(
+                                candidate_result,
+                                timeline=current_timeline,
+                                summary=(
+                                    current_timeline.summary
+                                    if current_timeline is not None
+                                    else None
+                                ),
+                                batches=(),
+                                changed=False,
+                                failure="no_reduction",
+                            )
+                    else:
+                        raise TypeError(
+                            "validate_candidate must return bool or CompactionResult"
+                        )
+
+                non_reducing = (
+                    None
+                    if validate_candidate is not None
+                    else self._non_reducing_result(
+                        candidate_result,
+                        current_timeline,
+                    )
                 )
                 if non_reducing is not None:
-                    last_failure = "no_reduction"
+                    last_failure = non_reducing.failure or "no_reduction"
                     outcome(
                         result=non_reducing,
                         failure=last_failure,
@@ -856,7 +1014,7 @@ class ApplicationContextService:
                     break
 
                 if candidate_result.timeline is None or not candidate_result.changed:
-                    last_failure = "no_progress"
+                    last_failure = candidate_result.failure or "no_progress"
                     outcome(
                         result=candidate_result,
                         failure=last_failure,
@@ -962,6 +1120,11 @@ class ApplicationContextService:
         timeline: Timeline,
         session_id: str | None = None,
         summarize: Callable[[TimelineAgingEpoch], object | Awaitable[object]],
+        validate_candidate: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ]
+        | None = None,
         commit: Callable[
             [CompactionResult],
             bool | CompactionResult | Awaitable[bool | CompactionResult],
@@ -984,6 +1147,7 @@ class ApplicationContextService:
                 timeline=timeline,
                 session_id=session_id,
                 summarize=summarize,
+                validate_candidate=validate_candidate,
                 commit=commit,
                 cancellation=cancellation,
                 fine_budget=fine_budget,
@@ -1014,6 +1178,11 @@ class ApplicationContextService:
         timeline: Timeline,
         session_id: str | None = None,
         summarize: Callable[[TimelineAgingEpoch], object | Awaitable[object]],
+        validate_candidate: Callable[
+            [CompactionResult],
+            bool | CompactionResult | Awaitable[bool | CompactionResult],
+        ]
+        | None = None,
         commit: Callable[
             [CompactionResult],
             bool | CompactionResult | Awaitable[bool | CompactionResult],
@@ -1038,6 +1207,8 @@ class ApplicationContextService:
             raise ValueError("transcript and timeline must belong to the same Session")
         if not callable(summarize):
             raise TypeError("summarize must be callable")
+        if validate_candidate is not None and not callable(validate_candidate):
+            raise TypeError("validate_candidate must be callable or None")
         if cancellation is not None and not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
         if isinstance(fine_budget, bool) or not isinstance(fine_budget, int) or fine_budget <= 0:
@@ -1154,17 +1325,60 @@ class ApplicationContextService:
                     failure=failure,
                 )
 
-            non_reducing = self._non_reducing_result(candidate, timeline)
+            if validate_candidate is not None:
+                decision = validate_candidate(candidate)
+                if inspect.isawaitable(decision):
+                    decision = await decision
+                if isinstance(decision, CompactionResult):
+                    candidate = decision
+                elif isinstance(decision, bool):
+                    if not decision:
+                        candidate = replace(
+                            candidate,
+                            timeline=timeline,
+                            summary=timeline.summary or None,
+                            batches=(),
+                            changed=False,
+                            failure="no_reduction",
+                        )
+                else:
+                    raise TypeError(
+                        "validate_candidate must return bool or CompactionResult"
+                    )
+
+            non_reducing = (
+                None
+                if validate_candidate is not None
+                else self._non_reducing_result(candidate, timeline)
+            )
             if non_reducing is not None:
                 record(
                     status="failed",
-                    failure="no_reduction",
+                    failure=non_reducing.failure or "no_reduction",
                     changed=False,
                     usage=usage,
                     epoch=epoch,
                     attempt=failure_attempt,
                 )
                 return non_reducing
+
+            if not candidate.changed or candidate.timeline is None:
+                record(
+                    status="failed",
+                    failure=candidate.failure or "no_progress",
+                    changed=False,
+                    usage=usage,
+                    epoch=epoch,
+                    attempt=failure_attempt,
+                )
+                return replace(
+                    candidate,
+                    timeline=timeline,
+                    summary=timeline.summary or None,
+                    batches=(),
+                    changed=False,
+                    failure=candidate.failure or "no_progress",
+                )
 
             committed_result = candidate
             if commit is not None:
@@ -1264,6 +1478,8 @@ class ApplicationContextService:
                 "tool_schema_fingerprint": snapshot.tool_schema_fingerprint,
                 "tool_schema_estimated_tokens": snapshot.tool_schema_estimated_tokens,
                 "over_budget": snapshot.over_budget,
+                "conversation_projection_fingerprint": self._conversation_projection_fingerprint,
+                "conversation_projection_changed": self._conversation_projection_changed,
             }
         return {
             "schema_version": 1,
@@ -1365,6 +1581,7 @@ class ApplicationContextService:
         disable_reductions: bool = False,
         reduction_levels: Sequence[str] = (),
         current_turn_id: str | None = None,
+        publish: bool = True,
     ) -> tuple[GenerationRequest, ContextSnapshot]:
         """Compile and, when limits are supplied, preflight one final request.
 
@@ -1410,6 +1627,8 @@ class ApplicationContextService:
             raise TypeError("context_budget must be a ContextBudget or None")
         if not isinstance(defer_hard_gate, bool):
             raise TypeError("defer_hard_gate must be a boolean")
+        if not isinstance(publish, bool):
+            raise TypeError("publish must be a boolean")
         if not isinstance(disable_reductions, bool):
             raise TypeError("disable_reductions must be a boolean")
         if count_fallback is not None and (
@@ -1464,6 +1683,7 @@ class ApplicationContextService:
             tool_definitions=ordinary_tools,
             previous_snapshot=previous_snapshot,
             context_budget=context_budget,
+            publish=publish,
         )
         conversation = (
             tuple(candidate_messages)
@@ -1575,16 +1795,20 @@ class ApplicationContextService:
             metadata["context_reduction_levels"] = list(reduction_steps)
             metadata["context_count_source"] = gate.count_source
             metadata["context_count_fallback"] = count_fallback
-            self._last_budget = context_budget
-            self._last_gate = gate.to_dict()
-            self._last_pressure = pressure_count
-            self._last_count_fallback = count_fallback
-        else:
+            if publish:
+                self._last_budget = context_budget
+                self._last_gate = gate.to_dict()
+                self._last_pressure = pressure_count
+                self._last_count_fallback = count_fallback
+        elif publish:
             self._last_gate = None
             self._last_pressure = None
             self._last_count_fallback = None
-        self._last_accounting = accounting
+        if publish:
+            self._last_accounting = accounting
         request = replace(request, metadata=metadata)
+        if publish:
+            self._record_conversation_projection(request.messages)
         return request, snapshot
 
 

@@ -106,4 +106,24 @@ def public_usage_diagnostics(usage: Usage | None) -> dict[str, object]:
     }
 
 
-__all__ = ["public_usage_diagnostics"]
+def cumulative_usage_delta(current: Usage, previous: Usage | None = None) -> Usage:
+    """Return the non-negative per-request delta of cumulative Run usage."""
+
+    if not isinstance(current, Usage):
+        raise TypeError("current usage must be Usage")
+    if previous is not None and not isinstance(previous, Usage):
+        raise TypeError("previous usage must be Usage or None")
+    baseline = previous or Usage()
+    current_total = current.total_tokens if current.total_tokens is not None else 0
+    baseline_total = baseline.total_tokens if baseline.total_tokens is not None else 0
+    return Usage(
+        input_tokens=max(0, current.input_tokens - baseline.input_tokens),
+        output_tokens=max(0, current.output_tokens - baseline.output_tokens),
+        total_tokens=max(0, current_total - baseline_total),
+        cache_read_tokens=max(0, current.cache_read_tokens - baseline.cache_read_tokens),
+        cache_write_tokens=max(0, current.cache_write_tokens - baseline.cache_write_tokens),
+        details=current.details,
+    )
+
+
+__all__ = ["cumulative_usage_delta", "public_usage_diagnostics"]
