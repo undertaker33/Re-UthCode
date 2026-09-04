@@ -11,6 +11,7 @@ const desktopRoot = fileURLToPath(new URL("../", import.meta.url));
 const launcherPath = fileURLToPath(new URL("../scripts/cdp-launcher.mjs", import.meta.url));
 const driverPath = fileURLToPath(new URL("../scripts/cdp-driver.mjs", import.meta.url));
 const fixturePath = fileURLToPath(new URL("../scripts/cdp-openai-fixture.mjs", import.meta.url));
+const packagedAcceptancePath = fileURLToPath(new URL("../scripts/cdp-packaged-visual-acceptance.mjs", import.meta.url));
 const realUserProfile = "C:\\Users\\93445";
 const realUserConfig = "C:\\Users\\93445\\.uthcode\\config.toml";
 
@@ -159,6 +160,12 @@ async function waitForLine(child: ChildProcess, predicate: (line: string) => boo
     output.on("end", onEnd);
   });
 }
+
+test("packaged acceptance forwards an explicit CDP request timeout to its existing driver", async () => {
+  const source = await readFile(packagedAcceptancePath, "utf8");
+  assert.match(source, /const requestTimeoutMs = Number\(option\("request-timeout-ms", "5000"\)\)/u);
+  assert.match(source, /"--request-timeout-ms", String\(requestTimeoutMs\)/u);
+});
 
 test("CDP fixture and driver stay inside an isolated HOME without touching real config", async () => {
   const root = await mkdtemp(join(tmpdir(), "uthcode-cdp-isolation-"));

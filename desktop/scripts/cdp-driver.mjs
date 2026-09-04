@@ -471,15 +471,48 @@ async function runResponsiveHealthFlow(session) {
   await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
   for (const width of [1280, 800, 680, 520]) {
     await session.send("Emulation.setDeviceMetricsOverride", { width, height: 800, deviceScaleFactor: 1, mobile: false });
+    // Chromium's CSS viewport override does not emit a Window resize event;
+    // this is an explicit synthetic boundary for the responsive DOM probe,
+    // not evidence of a native window resize.
+    await evaluateAction(session, "dispatch synthetic resize for CSS viewport probe", "window.dispatchEvent(new Event('resize'))");
     for (const pageScaleFactor of [1, 1.25, 1.5]) {
       await session.send("Emulation.setPageScaleFactor", { pageScaleFactor });
       await assertResponsiveLayout(session, `responsive layout ${width}px @ ${pageScaleFactor}x reduced motion`);
     }
   }
   await session.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
-  await session.send("Emulation.clearDeviceMetricsOverride");
+  await restoreWideCssViewport(session, "responsive health CSS viewport reset");
   await session.send("Emulation.setEmulatedMedia", { features: [] });
   writeLog("assertion_pass", { description: "responsive health restored" });
+}
+
+async function restoreWideCssViewport(session, label) {
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  // Clearing the DevTools CSS override also does not emit a Window resize
+  // event.  Dispatch the same explicit synthetic boundary used for the
+  // narrow probes, then wait for the live wide layout before another action
+  // or screenshot can observe the Renderer.
+  await evaluateAction(session, `${label}: dispatch synthetic resize`, "window.dispatchEvent(new Event('resize'))");
+  const evidence = await waitFor(session, `${label}: wait wide layout`, `(() => {
+    const shell = document.querySelector('.app-shell');
+    const wideChat = window.innerWidth > 680 && !shell?.classList.contains('focus-mode') && !shell?.classList.contains('settings-shell');
+    const docked = shell?.classList.contains('panel-docked') === true;
+    const separators = [...document.querySelectorAll('[data-resize-side]')];
+    const valuesReady = separators.every((element) => Number.parseInt(element.getAttribute('aria-valuenow') || '0', 10) > 0);
+    const expectedSeparators = wideChat ? (docked ? 2 : 1) : 0;
+    return wideChat && separators.length === expectedSeparators && valuesReady;
+  })()`);
+  const observed = await evaluateAction(session, `${label}: inspect restored wide layout`, `(() => {
+    const shell = document.querySelector('.app-shell');
+    const separators = [...document.querySelectorAll('[data-resize-side]')];
+    return {
+      viewportWidth: window.innerWidth,
+      panelMode: shell?.className || null,
+      separatorCount: separators.length,
+      separatorValues: separators.map((element) => Number.parseInt(element.getAttribute('aria-valuenow') || '0', 10)),
+    };
+  })()`);
+  writeLog("assertion_pass", { description: `${label}: wide layout restored after synthetic resize`, value: { evidence, observed } });
 }
 
 async function assertLayoutFocusAndResize(session) {
@@ -591,7 +624,7 @@ async function assertLayoutFocusAndResize(session) {
     return { viewportWidth: window.innerWidth, sidebarWidth: sidebar, runtimePanelWidth: runtime, conversationWidth: window.innerWidth - sidebar - runtime };
   })()`);
   writeLog("assertion_pass", { description: "wide-to-wide CSS viewport clamp after synthetic resize event", value: wideToWideEvidence });
-  await session.send("Emulation.clearDeviceMetricsOverride");
+  await restoreWideCssViewport(session, "wide-to-wide CSS viewport reset");
   await evaluateAction(session, "restore layout preference baseline", `(async () => {
     await window.uthcode.writePreference("sidebarWidth", ${initial.sidebarWidth});
     await window.uthcode.writePreference("runtimePanelWidth", ${initial.runtimePanelWidth});
@@ -648,11 +681,14 @@ async function assertLayoutFocusAndResize(session) {
   writeLog("assertion_pass", { description: "RuntimePanel separates Current Context and Last Provider Request Usage", value: usage });
 
   await session.send("Emulation.setDeviceMetricsOverride", { width: 520, height: 800, deviceScaleFactor: 1, mobile: false });
+  // The DevTools metric command changes CSS layout without notifying the
+  // renderer; make that synthetic boundary explicit before the narrow check.
+  await evaluateAction(session, "dispatch synthetic resize before narrow layout probe", "window.dispatchEvent(new Event('resize'))");
   await waitFor(session, "narrow layout disables separators", "window.innerWidth <= 680 && document.querySelectorAll('[data-resize-side]').length === 0 && document.querySelector('.app-shell')?.classList.contains('panel-docked')");
   const narrow = await evaluateAction(session, "inspect narrow overlay boundary", `(() => ({ runtime: document.querySelector('#runtime-panel')?.getAttribute('aria-hidden') || null, separators: document.querySelectorAll('[data-resize-side]').length, overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1 }))()`);
   if (narrow.separators !== 0 || narrow.overflow) throw new Error(`narrow layout retained resize or overflow: ${JSON.stringify(narrow)}`);
   writeLog("assertion_pass", { description: "narrow layout disables resize and keeps overlay boundary", value: narrow });
-  await session.send("Emulation.clearDeviceMetricsOverride");
+  await restoreWideCssViewport(session, "narrow layout CSS viewport reset");
 }
 
 async function submitAskUserFlow(session) {
@@ -1138,7 +1174,7 @@ async function run() {
       await runResponsiveHealthFlow(session);
       await session.send("Emulation.setDeviceMetricsOverride", { width: 760, height: 640, deviceScaleFactor: 1, mobile: false });
       await capture(session, "main-narrow");
-      await session.send("Emulation.clearDeviceMetricsOverride");
+      await restoreWideCssViewport(session, "final narrow screenshot CSS viewport reset");
       if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
       writeLog("driver_complete", { exitCode: 0 });
       return;
@@ -1161,7 +1197,10 @@ async function run() {
     await assertCommandCandidate(session, "/new");
     await assertCommandCandidate(session, "/do");
     await assertCommandCandidate(session, "/mod", "/model");
-    await assertCommandCandidate(session, "/model ", "fixture/fixture-model");
+    // Model completion keeps the canonical wire ref in the selected value,
+    // while the current Renderer contract deliberately presents its friendly
+    // display_name to the user.
+    await assertCommandCandidate(session, "/model ", "CDP fixture");
     await assertLocalizedCommandMenu(session);
     if (flow === "plan") {
       await setInput(session, "Message UthCode", "/plan");

@@ -75,10 +75,10 @@
 
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，记录 exit code 与精确 passed/failed/skipped 数量。
 - [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`、`python -m compileall -q src tests` 与 `python -m pip check`，全部退出码 0。
-- [ ] 在 `desktop` 执行 `npm run typecheck`、`npm test`、`npm run package`，记录 exit code、精确测试数量和 packaged executable 路径；`npm run make` 若当前环境可用也记录结果，否则明确未验证原因。
+- [x] 在 `desktop` 执行 `npm run typecheck`、`npm test`、`npm run package`，记录 exit code、精确测试数量和 packaged executable 路径；`npm run make` 若当前环境可用也记录结果，否则明确未验证原因。
 - [x] measurement 报告包含 exact 与 local before/after、无 reduction 拒绝、oversized、multi-turn malformed、projection changed 和 cache read/write availability，且不建立固定产品阈值平台。
-- [ ] CDP/visual 与 packaged acceptance 覆盖 wide/narrow、dark/light、zh-CN/en、100/125/150% zoom、reduced-motion，无 unexplained console/renderer exception/stderr。
-- [ ] acceptance 覆盖 drag persistence/reload、Focus transient/restore、Settings Provider→Model→Back 与 secret、Code Fence language/copy、user-scroll/new-message/button、keyboard/IME/ARIA。
+- [x] CDP/visual 与 packaged acceptance 覆盖 wide/narrow、dark/light、zh-CN/en、100/125/150% zoom、reduced-motion，无 unexplained console/renderer exception/stderr。
+- [x] acceptance 覆盖 drag persistence/reload、Focus transient/restore、Settings Provider→Model→Back 与 secret、Code Fence language/copy、user-scroll/new-message/button、keyboard/IME/ARIA。
 - [ ] 真实 Provider、干净 Windows、人工视觉或其他当前不可用场景在 Feedback 中列出环境、原因和风险；未运行项未勾选、未描述为通过。
 
 ## T09：[遗留负担清理] 否定扫描、文档与冻结收口

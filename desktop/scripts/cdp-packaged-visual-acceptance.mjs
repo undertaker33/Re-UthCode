@@ -283,8 +283,10 @@ async function main() {
   const output = win32.isAbsolute(outputOption) ? outputOption : resolvePath(desktopRoot, outputOption);
   const port = Number(option("port", language === "en" ? "9345" : "9346"));
   const timeoutMs = Number(option("timeout-ms", "60000"));
+  const requestTimeoutMs = Number(option("request-timeout-ms", "5000"));
   if (!Number.isInteger(port) || port <= 0 || port === 7897) throw new Error(`invalid CDP port: ${port}`);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error(`invalid timeout: ${timeoutMs}`);
+  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error(`invalid CDP request timeout: ${requestTimeoutMs}`);
   assertWorkspaceOutput(output);
   const executableStat = await stat(executablePath);
   const executableBytes = await readFile(executablePath);
@@ -403,7 +405,7 @@ async function main() {
       "--report", rawReportPath,
       "--packaged-exe", executablePath,
       "--timeout-ms", String(timeoutMs),
-      "--request-timeout-ms", "5000",
+      "--request-timeout-ms", String(requestTimeoutMs),
       "--plan-chunk-delay-ms", String(planChunkDelayMs),
       ...(isProviderFlow ? ["--scenario", fixtureScenario] : []),
       ...(flow === "ask-one" ? ["--ask-question-count", "1"] : []),
