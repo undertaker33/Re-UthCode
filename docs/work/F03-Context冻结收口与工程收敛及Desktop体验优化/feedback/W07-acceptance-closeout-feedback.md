@@ -128,3 +128,29 @@ conda run --no-capture-output -n re-uthcode node scripts/cdp-packaged-visual-acc
 - `docs/user-manual/getting-started.md` 已补充 Desktop 分隔条 Pointer/键盘调整与稳定边界持久化、viewport clamp/窄屏 overlay、Focus Mode 临时恢复、`copyText` 保留代码原文、user-scroll/new-message 入口，以及 Current Context (`exact`/`estimate`/`unavailable`) 与 Last Provider Request Usage 双口径。`docs/core-design/README.md` 已补充 prospective ordinary 同源 before/after、mixed source 不直接比较、summary 变短但 ordinary 不缩小时 `no_reduction`，以及 manual retained target 多 epoch/bounded stop。
 
 返工 1 收口校验：`checklist_non_checkbox_diff=0`，F03 main/spec/tasks/prompt 的 tracked changes 为空；最终 `uth-utf8-guard` 为 `OK: 27 file(s) passed UTF-8 guard`、exit 0；文档 link checker `38` links / `BROKEN_LINKS=0`，`git diff --check` exit 0（仅 LF→CRLF 工作树提示）。
+
+## 返工 2：Desktop acceptance / CDP restore boundary
+
+本轮只调整现有 CDP 验收脚本的等待参数传递、CSS viewport 的合成 resize 边界和 fixture candidate 的显示断言；未改生产 UI、未新增 harness，也未执行 Git 写操作。
+
+### 已完成证据
+
+- 先用既有 Application/fixture 做普通输入对照：`desktop/out/f03-w07-cdp-input-round2/input-comparison.json` 记录无按键 `mouseMoved`（`buttons=0`、未先 `mousePressed`）两次均 `returned`，耗时分别 `5014ms`；拖拽序列 `mousePressed=9ms`、`mouseMoved(buttons=1)=5024ms`、`mouseReleased=13ms`，拖拽后 sidebar `aria-valuenow=310`，普通输入后仍为 `286`。两类 CDP 请求都在约 5 秒返回，原有 `request-timeout-ms=5000` 会先超时；因此新增现有 acceptance script 的 `--request-timeout-ms` 透传（默认仍为 `5000`），本次 packaged acceptance 使用 `10000`，没有放宽行为断言，也没有声称 native pointer/OS zoom 通过。对应 isolation 检查 `packaged acceptance forwards an explicit CDP request timeout to its existing driver` -> `1 passed, 0 failed`。
+- 现有 driver 在 responsive/layout probes 的 CSS viewport 进入点显式 dispatch 合成 `resize`，并在四处 `Emulation.clearDeviceMetricsOverride` restore 边界后 dispatch 同一合成事件、等待实际宽屏布局恢复再继续截图。恢复断言按真实界面核对：docked 为两个 separator，hidden/floating 为一个；en/zh 报告均记录恢复后宽度 `1264`、separator 值 `[286,260]`（docked）或 `[286]`（hidden），没有把窄屏状态带入后续宽屏截图。此处仅证明 CDP/CSS 合成边界，不证明原生窗口 resize。
+- 使用当前标准包 `desktop/out/UthCode-win32-x64/UthCode.exe`（`244440576` bytes，SHA-256 `22a71860c08f98a922d92e0203377ba7e39ec39785b7f6749437a3a6c0a2eef8`）运行现有 visual acceptance：en 报告 `[acceptance-report.json](../../../../desktop/out/f03-w07-cdp-round2-en-restore/acceptance-report.json)`，runId `3ba669ca-706e-464c-8feb-43908400f1b0`，exit 0；zh-CN 报告 `[acceptance-report.json](../../../../desktop/out/f03-w07-cdp-round2-zh-restore/acceptance-report.json)`，runId `816e8b6f-7173-4486-9e35-d556d4f290aa`，exit 0。每份报告均为 6 张截图、dark/light、docked/floating/hidden、`1264x761` 与 `760x640`，并在 `1280/800/680/520` CSS 宽度执行 `1/1.25/1.5` page scale 与 reduced-motion；`consoleErrors=0`、`consoleDiagnostics=0`、`rendererExceptions=0`、unexplained stderr=0。page scale/CSS resize 是 CDP 合成证据，native pointer、Windows 原生缩放和人工视觉仍未验证。
+- 当前标准包和标准构建已恢复成功：`conda run --no-capture-output -n re-uthcode npm --prefix desktop run package` -> exit 0；`conda run --no-capture-output -n re-uthcode npm --prefix desktop run make` -> exit 0。安装器为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`（`175683072` bytes），nupkg `175000935` bytes，`RELEASES` `78` bytes。首轮既有 `app.asar` EBUSY 事实保留为历史记录；WorkBuddy 由用户关闭后才解除锁，本轮未手动 kill 或强制删除解锁，标准构建随后正常重建当前输出。
+- Desktop 回归证据：显式 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`；`npm test` -> `181 passed, 0 failed, 0 skipped`；typecheck exit 0；现有 Settings acceptance exit 0，包含 single modal/ARIA/focus、Provider→Model、cancel rollback、secret reveal/replacement、chat scroll geometry 与 language hydrate；`renderer-chat.test.tsx` + `renderer.test.tsx` -> `92 passed, 0 failed`；离线 runtime identity 入口 -> `14 passed, 0 failed`，这不是真实 dev shell 链。
+
+### Provider fixture 与未验证边界
+
+- `/model` candidate 的可见标签断言改为真实 fixture display name `CDP fixture`，wire ref 仍由既有 status 断言固定为 `fixture/fixture-model`。修复后的 stream run `[acceptance-report.json](../../../../desktop/out/f03-w07-cdp-round2-stream-en-label/acceptance-report.json)`（runId `0a0f907d-efb2-43cd-b39e-d4abe522a4b6`）真实命中 fixture HTTP request `count=1`、`model=fixture-model`、`stream=true`，但在 global deadline 内没有出现 `fixture response`，因此 stream output 不通过，未将候选标签修复误记为端到端成功。
+- 对当前标准包的短 probe `[acceptance-report.json](../../../../desktop/out/f03-w07-stream-diagnostic-round2-probe-standard/acceptance-report.json)`（runId `65bb2716-6199-4da0-b03f-d6d768b68ff2`）只读取安全 status/DOM/fixture request：status 已从 running 收敛为 completed、`termination_reason=final_answer`，run/turn 与 `fixture/fixture-model` 一致，fixture request 为 1；DOM timeline 仍为 0 且没有 `fixture response`。该 probe 在 driver 语言 `Page.reload` 前注入 `window.__w07Events`，reload 会清除页面 listener/数组，所以 reload 后的 `events=[]` 不能证明事件通道缺失；不据此提出生产缺陷归因。真实 Provider 输出、真实 Desktop dev shell 的 Renderer→Bridge→Application→Core identity/event/terminal 完整链仍未验证，交由对应责任方后续处理。
+- 真实 Provider、干净 Windows、人工视觉、native pointer/Windows zoom 和用户实际桌面输入环境均不可在本机本轮确认；这些项保持未勾选并只记录为限制，不描述为通过。现有 packaged visual 的 console/renderer/stderr allowlist 结果为零 unexplained，但不替代上述环境证据。
+
+返工 2 收口校验：仅 Checklist checkbox 变化及本 Feedback/Context Index 文档同步；保留返工 1 历史，不覆盖旧 EBUSY/旧 stream 失败事实。`T07` 真实 dev shell、`T08` 真实 Provider/干净 Windows/人工视觉与 native 环境项继续未勾选，F03 状态继续为 `not_implemented`。
+
+### 返工 2 最终 guard
+
+- 追加本轮后执行 `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/Context-Index.md" "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/F03-Context冻结收口与工程收敛及Desktop体验优化-checklist.md" "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/feedback/W07-acceptance-closeout-feedback.md"` -> exit 0，`OK: 3 file(s) passed UTF-8 guard`；无 replacement character、常见乱码或不平衡 fenced block。
+- Context Index、F03 工作包 Markdown 的增量内部链接检查：`11 links`，`BROKEN_LINKS=0`；`git diff --check` exit 0，仅有 LF/CRLF autocrlf 提示。
+- `adfddb8` 冻结 Checklist 对比（忽略 checkbox 状态）`checklist_non_checkbox_diff=False`；F03 冻结正文、spec、tasks、prompt 的 tracked diff 为空。本轮不触碰 `.workbuddy/`、`临时目录/`，未执行 Git 写操作。
