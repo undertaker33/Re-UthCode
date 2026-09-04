@@ -154,3 +154,36 @@ conda run --no-capture-output -n re-uthcode node scripts/cdp-packaged-visual-acc
 - 追加本轮后执行 `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/Context-Index.md" "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/F03-Context冻结收口与工程收敛及Desktop体验优化-checklist.md" "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/feedback/W07-acceptance-closeout-feedback.md"` -> exit 0，`OK: 3 file(s) passed UTF-8 guard`；无 replacement character、常见乱码或不平衡 fenced block。
 - Context Index、F03 工作包 Markdown 的增量内部链接检查：`11 links`，`BROKEN_LINKS=0`；`git diff --check` exit 0，仅有 LF/CRLF autocrlf 提示。
 - `adfddb8` 冻结 Checklist 对比（忽略 checkbox 状态）`checklist_non_checkbox_diff=False`；F03 冻结正文、spec、tasks、prompt 的 tracked diff 为空。本轮不触碰 `.workbuddy/`、`临时目录/`，未执行 Git 写操作。
+
+## 返工 3：真实 Desktop dev shell identity/event/terminal 链
+
+- Reviewer 已独立复核并通过 T07 真实 dev shell 链。本轮只使用现有 Electron Forge `start` 入口与既有本地 HTTP fixture；没有改生产源码、冻结正文或新增通用 harness。独立 ignored 证据为 `[probe-report.json](../../../../desktop/out/f03-w07-dev-renderer-probe/probe-report.json)` 及同目录的 Forge/fixture stdout、stderr 日志，未覆盖 W03 packaged 证据目录。
+- 成功 probe 的实际命令为：
+
+  ```powershell
+  node out/f03-w07-dev-renderer-probe.mjs 9471
+  ```
+
+  probe 内部将 `UTHCODE_PYTHON` 精确设置为 `C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`，并以 development launch `-m uthcode.interfaces.desktop` 启动 Python runtime。Forge 命令为 `electron-forge start --enable-logging -- --remote-debugging-port=9471 --no-sandbox --disable-gpu --user-data-dir=<isolated temp>`；Renderer target 实际为 `http://localhost:3000/main_window/index.html`，因此该记录是 dev shell（`isPackaged=false`）而非 packaged executable。
+- 真实链路结果：`listenerInstalled=true`；`window.uthcode` 的 `requestRuntime`、`subscribeAgentEvents`、preference API 均可用且 API frozen。事件顺序精确为 `runtime_state → turn_started → iteration_started → assistant_message_delta → usage_updated → assistant_message_completed → turn_completed`（7 events）。除无 identity 的 `runtime_state` 外，其余 6 个事件全部匹配最终 run/session/project；selected status 的 run 为 `529f155489f84ebcab4dece4af037fc3`、session 为 `1f8e2523d0614b92995b095a28722a90`、project 为 `D:\project\Re-UthCode`，最终 turn 为 `844f05c45b9a4f13aaf25a46dbd70502`。最终 `runtime.run.status=completed`、`termination_reason=final_answer`；fixture HTTP request 为 1 次（`model=fixture-model`、`stream=true`），UI `timelineCount=2` 且 prompt/`fixture response` 均可见，Last Provider Request Usage 为 input `2`、output `3`、total `5`。
+- 进程结束必须按真实事实解释：probe 收尾时只对自己启动的 Forge/fixture 子树执行了 `taskkill /PID /T /F`，所以报告中的 Forge 与 fixture `exit=1` 是受控强制结束，不是自然 `exit=0`；不能据此写“无异常”或“stderr clean”。`forge.stderr.log` 实际包含 Electron `sandboxed_renderer.bundle.js script failed to run` 与 `TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' as it is null`，另有 React DevTools 开发提示；`fixture.stderr.log` 为空。该 stderr 事实保留为 dev probe 限制，不影响已通过的 Renderer/Bridge/Application/Core identity/event/terminal 断言。
+- T08 未验证边界继续保持未勾：packaged wrapper stream output、真实 Provider、native pointer/Windows zoom、干净 Windows、人工视觉和用户实际桌面输入环境。本轮未将 packaged stream 的 reload 前 listener 误报为事件通道缺陷，也未用 dev probe 替代这些环境证据。
+
+## 返工 3 追加：locale seed 与 packaged stream/visual 收口
+
+本轮继续只修改现有 acceptance wrapper/driver 及其 isolation test；未改生产 UI、未新增 harness、未触碰冻结正文，也未执行 Git 写操作。之前英文 packaged probe 报告中的中文界面事实保留为历史限制：旧 wrapper 在 reload 后删除 seeded `desktop-preferences.json`，后续正常写入从默认 `zh-CN` 重建偏好；原截图又使用缓存的 `observedLanguage`，因此不能作为英文当前 locale 证据。本轮移除 seed-delete workaround，保留隔离 seed 让 Desktop 走正常原子偏好写入，并让截图读取 `window.uthcode.readPreference("language")` 与当前可见 Composer textarea 的 locale ARIA（静态 `document.documentElement.lang` 不作为依据）。
+
+- wrapper 用既有 `resolvePath` 规范化 `workspaceRoot`，去除末尾反斜杠；现有 `--request-timeout-ms` 透传保留默认 `5000`，本轮标准包验收显式使用 `10000`，全局 deadline 仍为 `120000`。
+- `submitStatusCommand` 在选择候选后等待 textarea 为 `/status` 且真实 `.composer-send` 可用，再点击既有 Send；UI Model 保持显示名 `CDP fixture`，另用本次 `/status` 的安全 `requestRuntime("status.get", {})` 断言 wire `provider_profile=fixture`、`current_model=fixture/fixture-model`。forbidden marker 仅扫描本次 timeline notice 与 `.runtime-facts` label/value，不扫描整页历史正文。
+- 当前标准包 `desktop/out/UthCode-win32-x64/UthCode.exe` 的既有入口、显式 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe` 和 `--request-timeout-ms 10000` 运行结果如下：
+
+| flow/language | report | runId | result | locale evidence |
+| --- | --- | --- | --- | --- |
+| stream/en | [`acceptance-report.json`](../../../../desktop/out/f03-w07-cdp-round3-en-stream-locale-dom/acceptance-report.json) | `730b8b96-3485-4e43-84d0-fec6476f79eb` | exit 0；fixture request `1`；driver/electron `0` | requested `en`、preference `en`、main UI `en`；`Runtime information` / `CDP fixture` / `fixture/fixture-model` |
+| stream/zh | [`acceptance-report.json`](../../../../desktop/out/f03-w07-cdp-round3-zh-stream-locale-dom/acceptance-report.json) | `563cd2aa-1c72-4827-a98c-308e3048efc7` | exit 0；fixture request `1`；driver/electron `0` | requested `zh`、preference `zh-CN`、main UI `zh-CN`；`运行时信息` / `CDP fixture` / `fixture/fixture-model` |
+| visual/en | [`acceptance-report.json`](../../../../desktop/out/f03-w07-cdp-round3-en-visual-locale-dom/acceptance-report.json) | `c19c9300-51f4-4149-b951-f3867914bdbf` | exit 0；6 screenshots；console/renderer errors `0` | all 6 screenshots preference/current UI `en` |
+| visual/zh | [`acceptance-report.json`](../../../../desktop/out/f03-w07-cdp-round3-zh-visual-locale-dom/acceptance-report.json) | `876c7e4b-d771-490c-a3e6-2aa001e10e3c` | exit 0；6 screenshots；console/renderer errors `0` | all 6 screenshots preference/current UI `zh-CN` |
+
+Stream 的 `/status` 日志还记录了当前 facts：en `Turn Idle`、`Current Context 5,751 / 128,000 · estimate`、`Last Provider Request Usage Total: 5 · Input: 2 · Output: 3`；zh 为对应本地化字段，数值相同。旧 stream 失败报告未删除或改写；本轮只把当前标准包的 locale-correct、display/wire-separated 结果作为新的验收证据。`npm test` 使用同一显式 Python 环境最终为 `183 passed, 0 failed, 0 skipped`，exit 0；前述标准 `npm run package`/`npm run make` 的 exit 0 结果沿用主控已记录证据。
+
+本轮仍不宣称真实 Provider、native pointer/Windows 原生缩放、干净 Windows、人工视觉或用户实际桌面输入通过；这些 Checklist 项保持未勾。此前 dev probe 的受控 `taskkill`/sandboxed-renderer stderr 与 packaged reload 前 listener 限制均保留在历史段落中，不被本轮 packaged stream/visual 结果覆盖。

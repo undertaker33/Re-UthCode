@@ -102,14 +102,21 @@ async function recordScreenshot(session, name, result) {
   const screenshot = Buffer.from(result.data, "base64");
   const path = resolve(screenshotDir, `${name}.png`);
   await writeFile(path, screenshot);
-  const state = await session.evaluate(`(() => {
+  const state = await session.evaluate(`(async () => {
     const shell = document.querySelector('.app-shell');
     const classes = shell ? [...shell.classList] : [];
     const layout = classes.includes('panel-floating') ? 'floating' : classes.includes('panel-hidden') ? 'hidden' : classes.includes('panel-docked') ? 'docked' : null;
     const theme = classes.includes('theme-dark') ? 'dark' : classes.includes('theme-light') ? 'light' : null;
-    return { language: document.documentElement?.getAttribute('lang') || document.body?.dataset?.language || null, theme, runtimePanelLayout: layout, viewport: { width: window.innerWidth, height: window.innerHeight, deviceScaleFactor: window.devicePixelRatio } };
+    const preferenceLanguage = typeof window.uthcode?.readPreference === 'function' ? await window.uthcode.readPreference('language') : null;
+    const messageLabel = document.querySelector('.composer textarea')?.getAttribute('aria-label') || null;
+    const uiLanguage = messageLabel === 'Message UthCode' ? 'en' : messageLabel === '发送给 UthCode' ? 'zh-CN' : null;
+    const documentLanguage = document.documentElement?.getAttribute('lang') || document.body?.dataset?.language || null;
+    return { language: preferenceLanguage || uiLanguage || documentLanguage, preferenceLanguage, uiLanguage, documentLanguage, theme, runtimePanelLayout: layout, viewport: { width: window.innerWidth, height: window.innerHeight, deviceScaleFactor: window.devicePixelRatio } };
   })()`);
-  const evidence = { name, path, bytes: screenshot.byteLength, sha256: createHash("sha256").update(screenshot).digest("hex"), ...state, language: observedLanguage ?? state.language };
+  if (requestedLanguage && ((state.preferenceLanguage && state.preferenceLanguage !== requestedLanguage) || (state.uiLanguage && state.uiLanguage !== requestedLanguage))) {
+    throw new Error(`screenshot language does not match requested language: ${JSON.stringify({ requestedLanguage, preferenceLanguage: state.preferenceLanguage, uiLanguage: state.uiLanguage, documentLanguage: state.documentLanguage })}`);
+  }
+  const evidence = { name, path, bytes: screenshot.byteLength, sha256: createHash("sha256").update(screenshot).digest("hex"), ...state };
   screenshots.push(evidence);
   writeLog("screenshot_saved", { ...evidence, screenshotDir });
 }
@@ -988,34 +995,60 @@ async function submitStatusCommand(session) {
   })()`);
   if (!selected) throw new Error("/status completion was not available");
   await waitFor(session, "status command selected", "document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]')?.value.trim() === '/status' && !document.querySelector('.command-menu')");
-  await evaluateAction(session, "execute status command", `(() => {
-    const element = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
-    if (!element) return false;
-    element.focus();
-    element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
-    return true;
+  await waitFor(session, "status command ready for Send", `(() => {
+    const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    const button = document.querySelector('.composer-send');
+    return input?.value.trim() === '/status' && Boolean(button && !button.disabled);
   })()`);
+  const submitted = await evaluateAction(session, "execute status command with Send", `(() => {
+    const button = document.querySelector('.composer-send');
+    if (!button || button.disabled) return false;
+    const menuOpen = Boolean(document.querySelector('.command-menu'));
+    button.click();
+    return { submitted: true, menuOpen };
+  })()`);
+  if (!submitted?.submitted) throw new Error("/status Send control was not available");
   const expectedNotice = requestedLanguage === "zh-CN" ? "运行时信息" : "Runtime information";
   await waitFor(session, "localized status command output", `Boolean(document.querySelector('.timeline-notice')?.textContent?.includes(${JSON.stringify(expectedNotice)}))`);
   const statusView = await evaluateAction(session, "read typed status projection", `(() => {
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
     const facts = [...document.querySelectorAll('.runtime-facts > div')].map((row) => ({
       label: row.querySelector('dt')?.textContent?.trim() || '',
       value: row.querySelector('dd')?.textContent?.trim() || '',
     }));
+    const projectionText = [...document.querySelectorAll('.timeline-notice, .runtime-facts dt, .runtime-facts dd')]
+      .filter(visible)
+      .map((element) => (element.textContent || '').trim())
+      .filter(Boolean)
+      .join(' ');
     return {
       notice: document.querySelector('.timeline-notice')?.textContent?.trim() || '',
       noticeCount: document.querySelectorAll('.timeline-notice').length,
       facts,
-      body: document.body?.innerText || '',
+      projectionText,
+    };
+  })()`);
+  const statusWire = await evaluateAction(session, "read typed status wire identity", `(async () => {
+    const value = await window.uthcode.requestRuntime("status.get", {});
+    const application = value && typeof value === "object" && value.application && typeof value.application === "object" ? value.application : {};
+    return {
+      providerProfile: typeof application.provider_profile === "string" ? application.provider_profile : null,
+      currentModel: typeof application.current_model === "string" ? application.current_model : null,
     };
   })()`);
   const modelLabel = requestedLanguage === "zh-CN" ? "模型" : "Model";
   const model = statusView.facts.find((item) => item.label === modelLabel)?.value;
   if (statusView.noticeCount !== 1 || statusView.notice !== expectedNotice) throw new Error(`typed /status notice is not a single localized message: ${JSON.stringify(statusView.notice)}`);
-  if (model !== "fixture/fixture-model") throw new Error(`typed /status safe model param was not projected: ${JSON.stringify(model)}`);
+  if (model !== "CDP fixture") throw new Error(`typed /status display model was not projected: ${JSON.stringify(model)}`);
+  if (statusWire?.providerProfile !== "fixture" || statusWire?.currentModel !== "fixture/fixture-model") throw new Error(`typed /status wire identity was not projected: ${JSON.stringify(statusWire)}`);
   const forbidden = /RuntimeRequestError|EPERM|native|diagnostic|configuration[_ ]?(?:source|path)|file:\/\/|[A-Za-z]:[\\/]/iu;
-  if (forbidden.test(statusView.body)) throw new Error(`typed /status exposed a native/free-form/path/diagnostic value: ${statusView.body}`);
-  writeLog("assertion_pass", { description: `typed /status shows safe params only (${requestedLanguage})`, value: { notice: statusView.notice, model, facts: statusView.facts } });
+  if (forbidden.test(statusView.projectionText)) throw new Error(`typed /status exposed a native/free-form/path/diagnostic value: ${statusView.projectionText}`);
+  writeLog("assertion_pass", { description: `typed /status shows localized display and safe wire identity (${requestedLanguage})`, value: { notice: statusView.notice, displayModel: model, wire: statusWire, facts: statusView.facts } });
 }
 
 async function setInput(session, label, value) {
@@ -1116,9 +1149,7 @@ async function run() {
         writeLog("assertion_pass", { description: "requested language already initialized by fixture preferences", value: currentLanguage });
       }
       // Reload even when the requested language is already present.  This
-      // keeps the packaged acceptance boundary identical for en/zh and lets
-      // the runner remove its bootstrap seed only after the fresh document
-      // has consumed it.
+      // keeps the packaged acceptance boundary identical for en/zh.
       const previousDocumentOrigin = await evaluateAction(session, "read document origin before language reload", "performance.timeOrigin");
       await session.send("Page.reload", { ignoreCache: true });
       await waitFor(session, "UthCode shell after language reload", `performance.timeOrigin !== ${JSON.stringify(previousDocumentOrigin)} && document.readyState === 'complete' && Boolean(document.querySelector('.sidebar'))`);
@@ -1132,9 +1163,6 @@ async function run() {
         await waitFor(session, "restored Project", "Boolean(document.querySelector('button.project-select'))");
         await waitFor(session, "new Session action", "Boolean(document.querySelector('button.new-session-line'))");
       }
-      // Give the packaged runner time to remove its bootstrap-only preference
-      // seed after the language boundary, before the first durable UI mutation.
-      await sleep(250);
     }
 
     if (flow === "visual-fixture") {

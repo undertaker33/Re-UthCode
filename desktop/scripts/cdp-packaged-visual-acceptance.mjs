@@ -19,7 +19,7 @@ import { join, resolve as resolvePath, win32 } from "node:path";
 import { createIsolatedCdpContext } from "./cdp-launcher.mjs";
 
 const desktopRoot = fileURLToPath(new URL("../", import.meta.url));
-const workspaceRoot = fileURLToPath(new URL("../../", import.meta.url));
+const workspaceRoot = resolvePath(fileURLToPath(new URL("../../", import.meta.url)));
 const driverPath = fileURLToPath(new URL("./cdp-driver.mjs", import.meta.url));
 const fixturePath = fileURLToPath(new URL("./cdp-openai-fixture.mjs", import.meta.url));
 const providerFlows = new Set(["stream", "tool", "todo", "ask", "ask-one", "permission", "plan", "failure", "delay", "sessions"]);
@@ -319,8 +319,6 @@ async function main() {
   let failure;
   let rawDriverReport;
   let seededPreferencePath;
-  let seededPreferenceRemoved = false;
-  let preferenceRemovalPromise = Promise.resolve();
   const managedEnvNames = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"];
   const previousEnv = Object.fromEntries(managedEnvNames.map((name) => [name, process.env[name]]));
 
@@ -340,8 +338,8 @@ async function main() {
       selectedSessionId: null,
     });
     // Electron resolves app.getPath("userData") to the exact launcher-owned
-    // --user-data-dir. Seed only that path; the driver removes it after the
-    // language reload so durable writes do not replace a bootstrap file.
+    // --user-data-dir. Seed only that path and retain it while the Renderer
+    // performs its normal atomic preference writes.
     seededPreferencePath = join(electronContext.userDataDir, "desktop-preferences.json");
     await mkdir(resolvePath(seededPreferencePath, ".."), { recursive: true });
     await writeFile(seededPreferencePath, desktopPreferences, "utf8");
@@ -412,23 +410,8 @@ async function main() {
       ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
       ...(flow === "delay" ? ["--delay-action", delayAction] : []),
     ], { cwd: desktopRoot, env: driverContext.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    driverOutput = collectOutput(driverChild, {
-      onStdout: (text) => {
-        // The fresh-document language read establishes the bootstrap
-        // boundary.  Remove the seed only then so reload consumes it before
-        // the first later durable preference write.
-        const languageBoundaryReached = text.includes('"description":"read requested language"');
-        if (seededPreferenceRemoved || !languageBoundaryReached) return;
-        seededPreferenceRemoved = true;
-        // The seed must survive the language reload so the initial project is
-        // restored. Remove it only after that assertion; subsequent preference
-        // writes then create a fresh destination rather than replacing the
-        // bootstrap fixture on Windows.
-        preferenceRemovalPromise = rm(seededPreferencePath, { force: true });
-      },
-    });
+    driverOutput = collectOutput(driverChild);
     driverExit = await waitForChild(driverChild, timeoutMs + 15_000);
-    await preferenceRemovalPromise;
     rawDriverReport = await readJsonIfPresent(rawReportPath);
     if (driverExit.code !== 0 || rawDriverReport?.status !== "passed") {
       throw new Error(`packaged CDP driver failed: code=${driverExit.code} status=${rawDriverReport?.status ?? "missing"}`);
@@ -550,7 +533,6 @@ async function main() {
     logs: reportLogs,
     cleanup: {
       seededPreferencePath,
-      seededPreferenceRemoved,
       electronRoot: electronContext?.root ?? null,
       driverRoot: driverContext?.root ?? null,
       fixtureRoot: fixtureContext?.root ?? null,

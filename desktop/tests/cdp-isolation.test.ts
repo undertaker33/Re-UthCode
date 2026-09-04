@@ -167,6 +167,23 @@ test("packaged acceptance forwards an explicit CDP request timeout to its existi
   assert.match(source, /"--request-timeout-ms", String\(requestTimeoutMs\)/u);
 });
 
+test("packaged acceptance normalizes the workspace root before seeding project identity", async () => {
+  const source = await readFile(packagedAcceptancePath, "utf8");
+  assert.match(source, /const workspaceRoot = resolvePath\(fileURLToPath\(new URL\("\.\.\/\.\.\/", import\.meta\.url\)\)\);/u);
+  assert.doesNotMatch(source, /seededPreferenceRemoved|preferenceRemovalPromise/u);
+});
+
+test("packaged stream status keeps Renderer display and wire model identities separate", async () => {
+  const source = await readFile(driverPath, "utf8");
+  assert.match(source, /document\.querySelector\('\.composer-send'\)/u);
+  assert.match(source, /typed \/status display model was not projected/u);
+  assert.match(source, /window\.uthcode\.requestRuntime\("status\.get", \{\}\)/u);
+  assert.match(source, /currentModel !== "fixture\/fixture-model"/u);
+  assert.match(source, /preferenceLanguage/gu);
+  assert.match(source, /const messageLabel = document\.querySelector\('\.composer textarea'\)/u);
+  assert.doesNotMatch(source, /language: observedLanguage \?\? state\.language/u);
+});
+
 test("CDP fixture and driver stay inside an isolated HOME without touching real config", async () => {
   const root = await mkdtemp(join(tmpdir(), "uthcode-cdp-isolation-"));
   const sentinelPath = join(root, "temporary-sentinel.txt");
