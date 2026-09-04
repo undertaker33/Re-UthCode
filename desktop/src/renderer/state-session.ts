@@ -13,6 +13,7 @@ import { nonEmptyText, textValue } from "./text-normalization";
 import type {
   PermissionModeProjection,
   ProjectState,
+  ProviderRequestUsageProjection,
   RendererState,
   RunProjection,
   SessionRuntimeSnapshot,
@@ -20,6 +21,25 @@ import type {
   TimelineEntry,
 } from "./state";
 import { permissionModeOf } from "./state-normalization";
+
+function providerRequestUsageAtBoundary(): ProviderRequestUsageProjection {
+  return {
+    status: "not_available",
+    input_tokens: null,
+    output_tokens: null,
+    total_tokens: null,
+    cache_read: { status: "not_available", tokens: null, provenance: null },
+    cache_write: { status: "not_available", tokens: null, provenance: null },
+  };
+}
+
+function cloneProviderRequestUsage(value: ProviderRequestUsageProjection): ProviderRequestUsageProjection {
+  return {
+    ...value,
+    cache_read: { ...value.cache_read },
+    cache_write: { ...value.cache_write },
+  };
+}
 
 export function sessionRuntimeKey(projectKey: string | null | undefined, sessionId: string): string {
   return `${projectKey ?? ""}\u0000${sessionId}`;
@@ -32,6 +52,7 @@ export function cloneSessionRuntime(snapshot: SessionRuntimeSnapshot): SessionRu
     todo: snapshot.todo.map((item) => ({ ...item })),
     run: snapshot.run ? { ...snapshot.run, usage: snapshot.run.usage ? { ...snapshot.run.usage } : undefined } : null,
     contextUsage: { ...snapshot.contextUsage },
+    ...(snapshot.lastProviderRequestUsage ? { lastProviderRequestUsage: cloneProviderRequestUsage(snapshot.lastProviderRequestUsage) } : {}),
     compactionStatus: { ...snapshot.compactionStatus },
     pendingInteraction: snapshot.pendingInteraction
       ? { ...snapshot.pendingInteraction, request: snapshot.pendingInteraction.request ? { ...snapshot.pendingInteraction.request } : undefined }
@@ -46,6 +67,7 @@ export function runtimeSnapshotFromState(state: RendererState): SessionRuntimeSn
     todoIteration: state.todoIteration,
     run: state.run,
     contextUsage: state.contextUsage,
+    lastProviderRequestUsage: state.lastProviderRequestUsage,
     compactionStatus: state.compactionStatus,
     permissionMode: state.permissionMode,
     activeTurn: state.activeTurn,
@@ -64,6 +86,9 @@ export function applyRuntimeSnapshot(state: RendererState, snapshot: SessionRunt
     todoIteration: snapshot.todoIteration,
     run: snapshot.run ? { ...snapshot.run, usage: snapshot.run.usage ? { ...snapshot.run.usage } : undefined } : null,
     contextUsage: { ...snapshot.contextUsage },
+    lastProviderRequestUsage: snapshot.lastProviderRequestUsage
+      ? cloneProviderRequestUsage(snapshot.lastProviderRequestUsage)
+      : providerRequestUsageAtBoundary(),
     compactionStatus: { ...snapshot.compactionStatus },
     permissionMode: snapshot.permissionMode,
     activeTurn: snapshot.activeTurn,
@@ -84,6 +109,7 @@ export function emptyRuntimeBoundary(state: RendererState): RendererState {
     todoIteration: 0,
     run: null,
     contextUsage: contextUsageAtBoundary(),
+    lastProviderRequestUsage: providerRequestUsageAtBoundary(),
     compactionStatus: { state: "idle", trigger: null, changed: null },
     permissionMode: "unknown",
     activeTurn: false,
@@ -264,6 +290,7 @@ export function applyProjectOpened(state: RendererState, result: unknown, preser
     turnStatus: "idle",
     pendingInteraction: null,
     contextUsage: contextUsageAtBoundary(),
+    lastProviderRequestUsage: providerRequestUsageAtBoundary(),
     sessionModels: mergeSessionModels(stateWithCache.sessionModels, sessions),
     sessionViewRevision: stateWithCache.sessionViewRevision + 1,
     runtimeState: preserveRuntimeState ? stateWithCache.runtimeState : "ready",
@@ -284,7 +311,12 @@ export function applyCatalogRefreshed(state: RendererState, projectKey: string, 
   };
 }
 
-export function applySessionResumed(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
+export function applySessionResumed(
+  state: RendererState,
+  result: unknown,
+  preserveRuntimeState = false,
+  providerRequestUsage?: ProviderRequestUsageProjection,
+): RendererState {
   const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
   const source = resultRecord(result);
   const sessionId = nonEmptyText(source.session_id);
@@ -305,7 +337,7 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
   const canRestoreLiveCache = sourceSessionState !== null
     || source.active_turn === true
     || sourceRunStatus === "running" || sourceRunStatus === "paused" || sourceRunStatus === "pausing";
-  const runtime = sessionRuntimeFromSource(source, replay, canRestoreLiveCache ? cached : null);
+  const runtime = sessionRuntimeFromSource(source, replay, canRestoreLiveCache ? cached : null, providerRequestUsage);
   const restoredRuntime = runtime && replayEndsInFailure && !runtime.activeTurn
     ? { ...runtime, turnStatus: "failed" as const, terminalStatusPending: false }
     : runtime;
@@ -326,6 +358,9 @@ export function applySessionResumed(state: RendererState, result: unknown, prese
     turnStatus: restoredRuntime?.turnStatus ?? (replayEndsInFailure ? "failed" : "idle"),
     pendingInteraction: restoredRuntime?.pendingInteraction ?? null,
     contextUsage: restoredRuntime?.contextUsage ?? contextUsageAtBoundary(),
+    lastProviderRequestUsage: restoredRuntime?.lastProviderRequestUsage
+      ? cloneProviderRequestUsage(restoredRuntime.lastProviderRequestUsage)
+      : providerRequestUsageAtBoundary(),
     compactionStatus: restoredRuntime?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
     completionBlocked: restoredRuntime?.completionBlocked ?? null,
     ...(sessionModel ? { currentModelRef: sessionModel, sessionModels: { ...stateWithCache.sessionModels, [sessionId]: sessionModel } } : {}),
@@ -407,6 +442,7 @@ export function applySessionMutation(
          turnStatus: "idle" as const,
          pendingInteraction: null,
          contextUsage: contextUsageAtBoundary(),
+         lastProviderRequestUsage: providerRequestUsageAtBoundary(),
          sessionViewRevision: state.sessionViewRevision + 1,
        }
       : {}),

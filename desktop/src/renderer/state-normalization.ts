@@ -8,6 +8,7 @@ import type {
   InteractionKind,
   PendingInteraction,
   PermissionModeProjection,
+  ProviderRequestUsageProjection,
   RendererState,
   RunProjection,
   SessionRuntimeSnapshot,
@@ -122,7 +123,12 @@ export function normalizePendingInteraction(value: unknown): PendingInteraction 
 }
 
 /** Hydrate one Session runtime projection from an Application status DTO. */
-export function sessionRuntimeFromSource(source: Record<string, JsonValue>, replay: TimelineEntry[], fallback: SessionRuntimeSnapshot | null): SessionRuntimeSnapshot | null {
+export function sessionRuntimeFromSource(
+  source: Record<string, JsonValue>,
+  replay: TimelineEntry[],
+  fallback: SessionRuntimeSnapshot | null,
+  providerRequestUsage?: ProviderRequestUsageProjection,
+): SessionRuntimeSnapshot | null {
   const sessionState = asRecord(source.session_state);
   if (!sessionState && !fallback) return null;
   const root = sessionState ?? {};
@@ -165,6 +171,11 @@ export function sessionRuntimeFromSource(source: Record<string, JsonValue>, repl
     todoIteration,
     run,
     contextUsage: contextValue !== undefined ? normalizeContextUsage(contextValue) : fallback?.contextUsage ?? contextUsageAtBoundary(),
+    ...(providerRequestUsage
+      ? { lastProviderRequestUsage: providerRequestUsage }
+      : fallback?.lastProviderRequestUsage
+        ? { lastProviderRequestUsage: fallback.lastProviderRequestUsage }
+        : {}),
     compactionStatus: compactionValue !== undefined ? normalizeCompactionStatus(compactionValue) : fallback?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
     permissionMode: permissionModeOf(run),
     activeTurn,

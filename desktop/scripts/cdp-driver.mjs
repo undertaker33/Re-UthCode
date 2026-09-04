@@ -359,6 +359,11 @@ async function waitForInteraction(session, label, selector) {
 }
 
 async function assertResponsiveLayout(session, label) {
+  // Device-metric changes and CSS track clamps repaint on separate renderer
+  // turns. Wait for the document geometry to settle before evaluating the
+  // strict overflow assertion; a persistent overflow still exhausts the same
+  // fixed flow deadline and remains a failure.
+  await waitFor(session, `${label} geometry stable`, "(() => Boolean(document.querySelector('.app-shell') && document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1 && document.body.scrollWidth <= document.body.clientWidth + 1))()");
   const evidence = await evaluateAction(session, label, `(() => {
     const visible = (element) => {
       if (!element) return false;
@@ -464,7 +469,7 @@ async function assertLocalizedCommandMenu(session) {
 
 async function runResponsiveHealthFlow(session) {
   await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
-  for (const width of [680, 520]) {
+  for (const width of [1280, 800, 680, 520]) {
     await session.send("Emulation.setDeviceMetricsOverride", { width, height: 800, deviceScaleFactor: 1, mobile: false });
     for (const pageScaleFactor of [1, 1.25, 1.5]) {
       await session.send("Emulation.setPageScaleFactor", { pageScaleFactor });
@@ -475,6 +480,179 @@ async function runResponsiveHealthFlow(session) {
   await session.send("Emulation.clearDeviceMetricsOverride");
   await session.send("Emulation.setEmulatedMedia", { features: [] });
   writeLog("assertion_pass", { description: "responsive health restored" });
+}
+
+async function assertLayoutFocusAndResize(session) {
+  const initial = await evaluateAction(session, "read layout preference baseline", `(async () => ({
+    panelMode: window.uthcode?.readPreference ? await window.uthcode.readPreference("panelMode") : null,
+    sidebarWidth: window.uthcode?.readPreference ? await window.uthcode.readPreference("sidebarWidth") : null,
+    runtimePanelWidth: window.uthcode?.readPreference ? await window.uthcode.readPreference("runtimePanelWidth") : null,
+  }))()`);
+  if (!initial || initial.panelMode !== "docked" || !Number.isInteger(initial.sidebarWidth) || !Number.isInteger(initial.runtimePanelWidth)) {
+    throw new Error(`layout preference API did not expose the docked baseline: ${JSON.stringify(initial)}`);
+  }
+
+  // Keep the real pointer path before any Emulation metrics changes.  The
+  // packaged Electron renderer has one stable native input surface for this
+  // assertion; responsive metric checks below are a separate presentation
+  // probe and must not leave pointer capture in a different renderer state.
+  const separatorEvidence = await evaluateAction(session, "inspect layout separators", `(() => {
+    const separators = [...document.querySelectorAll('[data-resize-side]')];
+    return separators.map((element) => ({
+      side: element.getAttribute('data-resize-side'),
+      role: element.getAttribute('role'),
+      orientation: element.getAttribute('aria-orientation'),
+      min: element.getAttribute('aria-valuemin'),
+      max: element.getAttribute('aria-valuemax'),
+      now: element.getAttribute('aria-valuenow'),
+      label: element.getAttribute('aria-label'),
+      controls: element.getAttribute('aria-controls'),
+    }));
+  })()`);
+  const sidebarSeparator = separatorEvidence?.find((item) => item.side === "sidebar");
+  const runtimeSeparator = separatorEvidence?.find((item) => item.side === "runtime");
+  if (!sidebarSeparator || !runtimeSeparator || sidebarSeparator.role !== "separator" || runtimeSeparator.role !== "separator" || sidebarSeparator.orientation !== "vertical" || runtimeSeparator.orientation !== "vertical" || sidebarSeparator.controls !== "workspace-main" || runtimeSeparator.controls !== "workspace-main") {
+    throw new Error(`wide separators did not expose the ARIA contract: ${JSON.stringify(separatorEvidence)}`);
+  }
+  writeLog("assertion_pass", { description: "wide separators expose Pointer/keyboard ARIA contract", value: separatorEvidence });
+
+  const pointerGeometry = await evaluateAction(session, "read sidebar resize geometry", `(() => {
+    const element = document.querySelector('[data-resize-side="sidebar"]');
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`);
+  if (!pointerGeometry || !Number.isFinite(pointerGeometry.x) || !Number.isFinite(pointerGeometry.y)) throw new Error(`sidebar separator did not expose pointer geometry: ${JSON.stringify(pointerGeometry)}`);
+  await session.send("Page.bringToFront");
+  await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x: pointerGeometry.x, y: pointerGeometry.y, button: "left", buttons: 1, clickCount: 1 });
+  await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pointerGeometry.x + 24, y: pointerGeometry.y, button: "left", buttons: 1 });
+  const pointerResult = await evaluateAction(session, "read sidebar resize preview", `(() => {
+    const element = document.querySelector('[data-resize-side="sidebar"]');
+    if (!element) return null;
+    return { value: Number.parseInt(element.getAttribute('aria-valuenow') || '0', 10), style: getComputedStyle(document.querySelector('.app-shell')).getPropertyValue('--sidebar-width').trim() };
+  })()`);
+  if (!pointerResult || pointerResult.value <= initial.sidebarWidth) throw new Error(`sidebar separator did not accept pointer preview: ${JSON.stringify(pointerResult)}`);
+  await sleep(100);
+  const duringPointer = await evaluateAction(session, "read sidebar preference during pointer preview", "window.uthcode.readPreference('sidebarWidth')");
+  if (duringPointer !== initial.sidebarWidth) throw new Error(`pointer preview wrote a preference before release: ${duringPointer}`);
+  const committedWidth = Math.round(Math.min(Number.parseInt(sidebarSeparator.max, 10), initial.sidebarWidth + 24));
+  await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pointerGeometry.x + 24, y: pointerGeometry.y, button: "left", buttons: 0, clickCount: 1 });
+  await waitFor(session, "sidebar pointer preference commit", `(async () => (await window.uthcode.readPreference('sidebarWidth')) === ${committedWidth})()`);
+  writeLog("assertion_pass", { description: "pointer move stays visual and release commits one sidebar width", value: { before: initial.sidebarWidth, after: committedWidth, duringPointer } });
+
+  const pointerReloadOrigin = await evaluateAction(session, "read document origin before pointer width reload", "performance.timeOrigin");
+  await session.send("Page.reload", { ignoreCache: true });
+  await waitFor(session, "layout shell after pointer width reload", `performance.timeOrigin !== ${JSON.stringify(pointerReloadOrigin)} && document.readyState === 'complete' && Boolean(document.querySelector('.app-shell')) && Boolean(document.querySelector('.composer textarea'))`);
+  await waitFor(session, "sidebar width rehydrated", `(async () => (await window.uthcode.readPreference('sidebarWidth')) === ${committedWidth} && document.querySelector('[data-resize-side="sidebar"]')?.getAttribute('aria-valuenow') === ${JSON.stringify(String(committedWidth))})()`);
+  writeLog("assertion_pass", { description: "sidebar width survives a fresh Renderer reload", value: { sidebarWidth: committedWidth, documentReloaded: true } });
+
+  const seededWideWidths = await evaluateAction(session, "seed wide-to-wide clamp widths", `(async () => {
+    if (typeof window.uthcode?.writePreference !== "function") return false;
+    await window.uthcode.writePreference("sidebarWidth", 420);
+    await window.uthcode.writePreference("runtimePanelWidth", 520);
+    return true;
+  })()`);
+  if (!seededWideWidths) throw new Error("layout preference API did not expose width writes for the wide-to-wide clamp assertion");
+  await waitFor(session, "wide-to-wide seed persisted", `(async () => (await window.uthcode.readPreference("sidebarWidth")) === 420 && (await window.uthcode.readPreference("runtimePanelWidth")) === 520)()`);
+  const seedDocumentOrigin = await evaluateAction(session, "read document origin before wide-to-wide reload", "performance.timeOrigin");
+  await session.send("Page.reload", { ignoreCache: true });
+  await waitFor(session, "wide-to-wide seed rehydrated", `performance.timeOrigin !== ${JSON.stringify(seedDocumentOrigin)} && document.readyState === 'complete' && Boolean(document.querySelector('.app-shell')) && Boolean(document.querySelector('.composer textarea'))`);
+  await waitFor(session, "wide-to-wide DOM seed rehydrated", `(async () => (await window.uthcode.readPreference("sidebarWidth")) === 420 && (await window.uthcode.readPreference("runtimePanelWidth")) === 520 && document.querySelector('[data-resize-side="sidebar"]')?.getAttribute('aria-valuenow') === "420" && document.querySelector('[data-resize-side="runtime"]')?.getAttribute('aria-valuenow') === "520")()`);
+  await session.send("Emulation.setDeviceMetricsOverride", { width: 800, height: 800, deviceScaleFactor: 1, mobile: false });
+  await evaluateAction(session, "dispatch synthetic resize after CSS viewport override", "window.dispatchEvent(new Event('resize'))");
+  await sleep(250);
+  const wideToWideObserved = await evaluateAction(session, "inspect wide-to-wide clamp state", `(async () => {
+    const shell = document.querySelector('.app-shell');
+    const sidebar = document.querySelector('[data-resize-side="sidebar"]');
+    const runtime = document.querySelector('[data-resize-side="runtime"]');
+    return {
+      viewportWidth: window.innerWidth,
+      devicePixelRatio: window.devicePixelRatio,
+      sidebarWidth: Number.parseInt(sidebar?.getAttribute('aria-valuenow') || '0', 10),
+      runtimePanelWidth: Number.parseInt(runtime?.getAttribute('aria-valuenow') || '0', 10),
+      sidebarStyle: shell ? getComputedStyle(shell).getPropertyValue('--sidebar-width').trim() : null,
+      runtimeStyle: shell ? getComputedStyle(shell).getPropertyValue('--runtime-width').trim() : null,
+      documentWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+      panelMode: shell?.className || null,
+      sidebarPresent: Boolean(sidebar),
+      runtimePresent: Boolean(runtime),
+    };
+  })()`);
+  writeLog("assertion_info", { description: "wide-to-wide clamp state after synthetic resize", value: wideToWideObserved });
+  await waitFor(session, "wide-to-wide viewport clamp", `(() => {
+    const sidebar = Number.parseInt(document.querySelector('[data-resize-side="sidebar"]')?.getAttribute('aria-valuenow') || '0', 10);
+    const runtime = Number.parseInt(document.querySelector('[data-resize-side="runtime"]')?.getAttribute('aria-valuenow') || '0', 10);
+    return window.innerWidth === 800 && sidebar === 180 && runtime === 380 && sidebar + runtime + 240 <= window.innerWidth;
+  })()`);
+  const wideToWideEvidence = await evaluateAction(session, "read wide-to-wide viewport clamp", `(() => {
+    const sidebar = Number.parseInt(document.querySelector('[data-resize-side="sidebar"]')?.getAttribute('aria-valuenow') || '0', 10);
+    const runtime = Number.parseInt(document.querySelector('[data-resize-side="runtime"]')?.getAttribute('aria-valuenow') || '0', 10);
+    return { viewportWidth: window.innerWidth, sidebarWidth: sidebar, runtimePanelWidth: runtime, conversationWidth: window.innerWidth - sidebar - runtime };
+  })()`);
+  writeLog("assertion_pass", { description: "wide-to-wide CSS viewport clamp after synthetic resize event", value: wideToWideEvidence });
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  await evaluateAction(session, "restore layout preference baseline", `(async () => {
+    await window.uthcode.writePreference("sidebarWidth", ${initial.sidebarWidth});
+    await window.uthcode.writePreference("runtimePanelWidth", ${initial.runtimePanelWidth});
+    return true;
+  })()`);
+  const restoredDocumentOrigin = await evaluateAction(session, "read document origin before baseline reload", "performance.timeOrigin");
+  await session.send("Page.reload", { ignoreCache: true });
+  await waitFor(session, "layout baseline after wide-to-wide assertion", `performance.timeOrigin !== ${JSON.stringify(restoredDocumentOrigin)} && document.readyState === 'complete' && Boolean(document.querySelector('.app-shell')) && Boolean(document.querySelector('.composer textarea'))`);
+  await waitFor(session, "layout preference baseline restored", `(async () => (await window.uthcode.readPreference("sidebarWidth")) === ${initial.sidebarWidth} && (await window.uthcode.readPreference("runtimePanelWidth")) === ${initial.runtimePanelWidth} && document.querySelector('[data-resize-side="sidebar"]')?.getAttribute('aria-valuenow') === ${JSON.stringify(String(initial.sidebarWidth))} && document.querySelector('[data-resize-side="runtime"]')?.getAttribute('aria-valuenow') === ${JSON.stringify(String(initial.runtimePanelWidth))})()`);
+
+  await evaluateAction(session, "keyboard resize Runtime panel", `(() => {
+    const element = document.querySelector('[data-resize-side="runtime"]');
+    if (!element) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', code: 'Home', bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await waitFor(session, "Runtime keyboard preference commit", "(async () => (await window.uthcode.readPreference('runtimePanelWidth')) === 260)()");
+  writeLog("assertion_pass", { description: "keyboard Runtime resize commits at the stable key boundary", value: { runtimePanelWidth: 260 } });
+
+  const focusBaseline = await evaluateAction(session, "read Focus Mode baseline", `(async () => ({
+    panelMode: await window.uthcode.readPreference("panelMode"),
+    sidebarWidth: await window.uthcode.readPreference("sidebarWidth"),
+    runtimePanelWidth: await window.uthcode.readPreference("runtimePanelWidth"),
+  }))()`);
+  await clickSelector(session, ".focus-mode-toggle");
+  await waitFor(session, "Focus Mode active", "document.querySelector('.app-shell')?.classList.contains('focus-mode') && !document.querySelector('.sidebar') && !document.querySelector('#runtime-panel')");
+  const focusPreferences = await evaluateAction(session, "read Focus Mode preferences", `(async () => ({
+    panelMode: await window.uthcode.readPreference("panelMode"),
+    sidebarWidth: await window.uthcode.readPreference("sidebarWidth"),
+    runtimePanelWidth: await window.uthcode.readPreference("runtimePanelWidth"),
+  }))()`);
+  if (JSON.stringify(focusPreferences) !== JSON.stringify(focusBaseline)) throw new Error(`Focus Mode changed durable preferences: ${JSON.stringify({ focusBaseline, focusPreferences })}`);
+  await capture(session, "main-focus-mode");
+  const escaped = await evaluateAction(session, "exit Focus Mode with Escape", `(() => { const event = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }); document.dispatchEvent(event); return event.defaultPrevented; })()`);
+  if (!escaped) throw new Error("Focus Mode Escape was not consumed");
+  await waitFor(session, "Focus Mode restored", "!document.querySelector('.app-shell')?.classList.contains('focus-mode') && Boolean(document.querySelector('.sidebar')) && Boolean(document.querySelector('#runtime-panel'))");
+  const restoredPreferences = await evaluateAction(session, "read restored Focus Mode preferences", `(async () => ({
+    panelMode: await window.uthcode.readPreference("panelMode"),
+    sidebarWidth: await window.uthcode.readPreference("sidebarWidth"),
+    runtimePanelWidth: await window.uthcode.readPreference("runtimePanelWidth"),
+  }))()`);
+  if (JSON.stringify(restoredPreferences) !== JSON.stringify(focusBaseline)) throw new Error(`Focus Mode restore changed durable preferences: ${JSON.stringify({ focusBaseline, restoredPreferences })}`);
+  writeLog("assertion_pass", { description: "Focus Mode is transient and restores panel mode and widths", value: restoredPreferences });
+
+  const usage = await evaluateAction(session, "inspect split Runtime usage projection", `(() => {
+    const current = document.querySelector('[data-runtime-usage="current-context"]');
+    const last = document.querySelector('[data-runtime-usage="last-provider-request"]');
+    return { current: current?.textContent?.trim() || null, currentStatus: current?.getAttribute('data-usage-status') || null, last: last?.textContent?.trim() || null, lastStatus: last?.getAttribute('data-usage-status') || null };
+  })()`);
+  if (!usage?.current || !usage?.last || !["available", "unavailable"].includes(usage.currentStatus) || usage.lastStatus !== "available" && usage.lastStatus !== "not_available") {
+    throw new Error(`Runtime usage projections were not separated: ${JSON.stringify(usage)}`);
+  }
+  writeLog("assertion_pass", { description: "RuntimePanel separates Current Context and Last Provider Request Usage", value: usage });
+
+  await session.send("Emulation.setDeviceMetricsOverride", { width: 520, height: 800, deviceScaleFactor: 1, mobile: false });
+  await waitFor(session, "narrow layout disables separators", "window.innerWidth <= 680 && document.querySelectorAll('[data-resize-side]').length === 0 && document.querySelector('.app-shell')?.classList.contains('panel-docked')");
+  const narrow = await evaluateAction(session, "inspect narrow overlay boundary", `(() => ({ runtime: document.querySelector('#runtime-panel')?.getAttribute('aria-hidden') || null, separators: document.querySelectorAll('[data-resize-side]').length, overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1 }))()`);
+  if (narrow.separators !== 0 || narrow.overflow) throw new Error(`narrow layout retained resize or overflow: ${JSON.stringify(narrow)}`);
+  writeLog("assertion_pass", { description: "narrow layout disables resize and keeps overlay boundary", value: narrow });
+  await session.send("Emulation.clearDeviceMetricsOverride");
 }
 
 async function submitAskUserFlow(session) {
@@ -945,6 +1123,7 @@ async function run() {
       await setSelect(session, "theme", "dark");
       await clickText(session, "Back to chat");
       await capture(session, "main-dark-docked");
+      await assertLayoutFocusAndResize(session);
       await assertResponsiveLayout(session, "dark wide layout");
       await runResponsiveHealthFlow(session);
       await setSelect(session, "Runtime panel layout", "floating");
@@ -1035,6 +1214,7 @@ async function run() {
 
     // Settings, theme, and runtime panel are exercised through actual DOM
     // controls; no renderer state or IPC protocol is injected by the driver.
+    await assertLayoutFocusAndResize(session);
     await clickText(session, "Settings");
     await waitFor(session, "Settings view", "Boolean(document.querySelector('.settings-view'))");
     if (flow !== "visual" && flow !== "shell") await submitSettingsRevealFlow(session);

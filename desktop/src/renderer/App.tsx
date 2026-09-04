@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { isDesktopCommandResult } from "../desktop-api";
+import {
+  DEFAULT_RUNTIME_PANEL_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
+  RUNTIME_PANEL_WIDTH_MAX,
+  RUNTIME_PANEL_WIDTH_MIN,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+} from "../desktop-api";
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
@@ -31,6 +39,128 @@ export interface AppProps {
 }
 
 const RUNTIME_PANEL_ID = "runtime-panel";
+export const CONVERSATION_MIN_WIDTH = 240;
+
+export interface LayoutWidthBounds {
+  sidebar: { min: number; max: number };
+  runtime: { min: number; max: number };
+}
+
+export function clampLayoutWidth(value: number, bounds: { min: number; max: number }): number {
+  if (!Number.isFinite(value)) return bounds.min;
+  return Math.round(Math.min(bounds.max, Math.max(bounds.min, value)));
+}
+
+/** Calculate CSS-pixel limits while leaving a readable Conversation column. */
+export function layoutWidthBounds(
+  viewportWidth: number,
+  panelMode: PanelModePreference,
+  sidebarWidth = DEFAULT_SIDEBAR_WIDTH,
+  runtimePanelWidth = DEFAULT_RUNTIME_PANEL_WIDTH,
+): LayoutWidthBounds {
+  const viewport = Number.isFinite(viewportWidth) ? Math.max(0, viewportWidth) : 1280;
+  const runtimeBudget = panelMode === "docked"
+    ? viewport - SIDEBAR_WIDTH_MIN - CONVERSATION_MIN_WIDTH
+    : viewport - 16;
+  const runtimeMax = Math.min(RUNTIME_PANEL_WIDTH_MAX, Math.max(RUNTIME_PANEL_WIDTH_MIN, runtimeBudget));
+  const runtime = clampLayoutWidth(runtimePanelWidth, { min: RUNTIME_PANEL_WIDTH_MIN, max: runtimeMax });
+  const sidebarBudget = viewport - CONVERSATION_MIN_WIDTH - (panelMode === "docked" ? runtime : 0);
+  const sidebarMax = Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, sidebarBudget));
+  const sidebar = clampLayoutWidth(sidebarWidth, { min: SIDEBAR_WIDTH_MIN, max: sidebarMax });
+  // A very narrow wide-mode viewport may leave no room for both minimums. In
+  // that case the explicit narrow media query takes over at 680 CSS pixels;
+  // keeping the bounded values here prevents a negative grid track.
+  const finalRuntimeBudget = panelMode === "docked"
+    ? viewport - sidebar - CONVERSATION_MIN_WIDTH
+    : viewport - 16;
+  const finalRuntimeMax = Math.min(RUNTIME_PANEL_WIDTH_MAX, Math.max(RUNTIME_PANEL_WIDTH_MIN, finalRuntimeBudget));
+  return {
+    sidebar: { min: SIDEBAR_WIDTH_MIN, max: sidebarMax },
+    runtime: { min: RUNTIME_PANEL_WIDTH_MIN, max: finalRuntimeMax },
+  };
+}
+
+export function clampedLayoutWidths(
+  viewportWidth: number,
+  panelMode: PanelModePreference,
+  sidebarWidth: number,
+  runtimePanelWidth: number,
+): { sidebarWidth: number; runtimePanelWidth: number } {
+  const bounds = layoutWidthBounds(viewportWidth, panelMode, sidebarWidth, runtimePanelWidth);
+  const nextSidebar = clampLayoutWidth(sidebarWidth, bounds.sidebar);
+  const nextRuntime = clampLayoutWidth(runtimePanelWidth, bounds.runtime);
+  return { sidebarWidth: nextSidebar, runtimePanelWidth: nextRuntime };
+}
+
+interface ResizeSeparatorProps {
+  side: "sidebar" | "runtime";
+  value: number;
+  bounds: { min: number; max: number };
+  label: string;
+  disabled?: boolean;
+  onPreview: (value: number) => void;
+  onCommit: (value: number) => void;
+}
+
+function ResizeSeparator({ side, value, bounds, label, disabled = false, onPreview, onCommit }: ResizeSeparatorProps) {
+  const drag = useRef<{ pointerId: number; origin: number; originValue: number; lastValue: number } | null>(null);
+  const valueForPointer = (clientX: number) => clampLayoutWidth(side === "sidebar"
+    ? (drag.current?.originValue ?? value) + (clientX - (drag.current?.origin ?? clientX))
+    : (drag.current?.originValue ?? value) - (clientX - (drag.current?.origin ?? clientX)), bounds);
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (disabled || event.button !== 0) return;
+    event.preventDefault();
+    drag.current = { pointerId: event.pointerId, origin: event.clientX, originValue: value, lastValue: value };
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* jsdom and older WebViews may not implement capture */ }
+  };
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag.current || drag.current.pointerId !== event.pointerId) return;
+    const next = valueForPointer(event.clientX);
+    drag.current.lastValue = next;
+    onPreview(next);
+  };
+  const finishPointer = (event: ReactPointerEvent<HTMLDivElement>, commit: boolean) => {
+    if (!drag.current || drag.current.pointerId !== event.pointerId) return;
+    const current = drag.current;
+    drag.current = null;
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* capture is optional */ }
+    if (commit) onCommit(current.lastValue);
+  };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const step = event.shiftKey ? 48 : 16;
+    let next: number | null = null;
+    if (event.key === "Home") next = bounds.min;
+    else if (event.key === "End") next = bounds.max;
+    else if (side === "sidebar" && event.key === "ArrowLeft") next = value - step;
+    else if (side === "sidebar" && event.key === "ArrowRight") next = value + step;
+    else if (side === "runtime" && event.key === "ArrowLeft") next = value + step;
+    else if (side === "runtime" && event.key === "ArrowRight") next = value - step;
+    if (next === null) return;
+    event.preventDefault();
+    const clamped = clampLayoutWidth(next, bounds);
+    onPreview(clamped);
+    onCommit(clamped);
+  };
+  return <div
+    className={`layout-separator layout-separator--${side}`}
+    role="separator"
+    aria-orientation="vertical"
+    aria-label={label}
+    aria-valuemin={bounds.min}
+    aria-valuemax={bounds.max}
+    aria-valuenow={value}
+    aria-controls="workspace-main"
+    aria-disabled={disabled || undefined}
+    data-resize-side={side}
+    tabIndex={disabled ? -1 : 0}
+    onPointerDown={onPointerDown}
+    onPointerMove={onPointerMove}
+    onPointerUp={(event) => finishPointer(event, true)}
+    onPointerCancel={(event) => finishPointer(event, false)}
+    onKeyDown={onKeyDown}
+  />;
+}
 
 function runtimeApi(explicit?: DesktopApi): DesktopApi | undefined {
   if (explicit) return explicit;
@@ -167,8 +297,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   stateRef.current = state;
   const api = runtimeApi(explicitApi);
   const [narrowViewport, setNarrowViewport] = useState(() => typeof window !== "undefined" && window.innerWidth <= 680);
+  const [viewportWidth, setViewportWidth] = useState(() => typeof window !== "undefined" ? window.innerWidth : 1280);
   const narrowViewportRef = useRef(narrowViewport);
   const runtimeToggleRef = useRef<HTMLButtonElement>(null);
+  const focusModeToggleRef = useRef<HTMLButtonElement>(null);
   const runtimeFocusHandoffRef = useRef(false);
   const settingsSaveInFlightRef = useRef(false);
   const sessionMutationGenerationRef = useRef(0);
@@ -217,6 +349,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         runtimeFocusHandoffRef.current = true;
       }
       narrowViewportRef.current = nextNarrow;
+      setViewportWidth(window.innerWidth);
       setNarrowViewport(nextNarrow);
     };
     updateViewport();
@@ -224,7 +357,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     return () => window.removeEventListener("resize", updateViewport);
   }, []);
 
-  const persist = useCallback(async (key: "theme" | "language" | "panelMode" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "expandedProjects" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
+  // Keep the rendered tracks inside the current CSS-pixel viewport. This is
+  // a presentation clamp only: the stable user-selected width is persisted
+  // by the separator's commit callback, never by resize/zoom churn.
+  useEffect(() => {
+    if (typeof window === "undefined" || narrowViewport) return;
+    const next = clampedLayoutWidths(viewportWidth, state.panelMode, state.sidebarWidth, state.runtimePanelWidth);
+    if (next.sidebarWidth !== state.sidebarWidth) dispatch({ type: "set_sidebar_width", width: next.sidebarWidth });
+    if (next.runtimePanelWidth !== state.runtimePanelWidth) dispatch({ type: "set_runtime_panel_width", width: next.runtimePanelWidth });
+  }, [narrowViewport, viewportWidth, state.panelMode, state.runtimePanelWidth, state.sidebarWidth]);
+
+  const persist = useCallback(async (key: "theme" | "language" | "panelMode" | "sidebarWidth" | "runtimePanelWidth" | "recentProjects" | "projectAliases" | "pinnedProjectKeys" | "pinnedSessions" | "expandedProjects" | "selectedProjectKey" | "selectedSessionId", value: unknown) => {
     if (!api) return;
     try {
       await api.writePreference(key as never, value as never);
@@ -458,6 +601,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("theme"),
       api.readPreference("language"),
       api.readPreference("panelMode"),
+      api.readPreference("sidebarWidth"),
+      api.readPreference("runtimePanelWidth"),
       api.readPreference("recentProjects"),
       api.readPreference("projectAliases"),
       api.readPreference("pinnedProjectKeys"),
@@ -465,12 +610,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("expandedProjects"),
       api.readPreference("selectedProjectKey"),
       api.readPreference("selectedSessionId"),
-    ]).then(([theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId]) => {
+    ]).then(([theme, language, panelMode, sidebarWidth, runtimePanelWidth, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId]) => {
       // A user save/navigation may have become the current lifecycle owner
       // while Desktop preferences were still loading. Do not let this late
       // bootstrap callback supersede that newer generation.
       if (cancelled || hasOwner()) return;
-      dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId } });
+      dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, sidebarWidth, runtimePanelWidth, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId } });
       const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
       if (selected) {
         void enqueueRuntimeOperation("startup", async (isOwned) => {
@@ -784,8 +929,33 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const setPanelMode = useCallback((panelMode: PanelModePreference) => {
     dispatch({ type: "set_panel_mode", panelMode });
-    void persist("panelMode", panelMode);
+    // Focus Mode is transient. Any defensive presentation callback that
+    // arrives while it is active must not turn that transient state into a
+    // durable panel preference.
+    if (!stateRef.current.focusMode) void persist("panelMode", panelMode);
   }, [persist]);
+
+  const setSidebarWidth = useCallback((width: number, commit = false) => {
+    const bounds = typeof window === "undefined"
+      ? { min: SIDEBAR_WIDTH_MIN, max: SIDEBAR_WIDTH_MAX }
+      : layoutWidthBounds(window.innerWidth, stateRef.current.panelMode, stateRef.current.sidebarWidth, stateRef.current.runtimePanelWidth).sidebar;
+    const next = clampLayoutWidth(width, bounds);
+    dispatch({ type: "set_sidebar_width", width: next });
+    if (commit && !stateRef.current.focusMode) void persist("sidebarWidth", next);
+  }, [persist]);
+
+  const setRuntimePanelWidth = useCallback((width: number, commit = false) => {
+    const bounds = typeof window === "undefined"
+      ? { min: RUNTIME_PANEL_WIDTH_MIN, max: RUNTIME_PANEL_WIDTH_MAX }
+      : layoutWidthBounds(window.innerWidth, stateRef.current.panelMode, stateRef.current.sidebarWidth, stateRef.current.runtimePanelWidth).runtime;
+    const next = clampLayoutWidth(width, bounds);
+    dispatch({ type: "set_runtime_panel_width", width: next });
+    if (commit && !stateRef.current.focusMode) void persist("runtimePanelWidth", next);
+  }, [persist]);
+
+  const setFocusMode = useCallback((value: boolean) => {
+    dispatch({ type: "set_focus_mode", value });
+  }, []);
 
   const restoreRuntimeToggleFocus = useCallback(() => {
     runtimeToggleRef.current?.focus();
@@ -806,6 +976,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [persist]);
 
   const toggleRuntime = useCallback(() => {
+    if (stateRef.current.focusMode) return;
     const current = stateRef.current.panelMode;
     setPanelMode(current === "hidden" || (current === "docked" && narrowViewport) ? "floating" : "hidden");
   }, [narrowViewport, setPanelMode]);
@@ -996,6 +1167,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       return;
     }
     if (!(await waitForRuntimeLifecycleIdle()) || hasOwner()) return;
+    dispatch({ type: "set_focus_mode", value: false });
     dispatch({ type: "set_view", view: "settings" });
     try {
       const result = asObject(await send("settings.get", {}));
@@ -1112,7 +1284,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     dispatch({ type: "set_view", view: "chat" });
   }, []);
 
-  const runtimeVisible = state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
+  useEffect(() => {
+    if (!state.focusMode || typeof document === "undefined") return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setFocusMode(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [setFocusMode, state.focusMode]);
+  useLayoutEffect(() => {
+    if (state.focusMode || typeof document === "undefined") return;
+    if (document.activeElement === document.body) focusModeToggleRef.current?.focus();
+  }, [state.focusMode]);
+
+  const runtimeVisible = !state.focusMode && state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
   useLayoutEffect(() => {
     if (!runtimeVisible || !runtimeFocusHandoffRef.current) return;
     runtimeFocusHandoffRef.current = false;
@@ -1129,7 +1316,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <h1>{state.selectedSessionId ? `${t("session")} ${state.selectedSessionId.slice(0, 8)}` : t("newConversation")}</h1>
         </div>
         <div className="conversation-actions">
-          <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>
+          {!state.focusMode && <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>}
+          <button ref={focusModeToggleRef} type="button" className="icon-button focus-mode-toggle" title={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-label={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-pressed={state.focusMode} onClick={() => setFocusMode(!state.focusMode)}><UiIcon name="panel" /><span className="sr-only">{state.focusMode ? t("exitFocusMode") : t("enterFocusMode")}</span></button>
         </div>
       </header>
       <ChatTimeline
@@ -1150,11 +1338,24 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   );
 
   const themeClass = `theme-${state.theme}`;
+  const wideLayout = !narrowViewport && state.view === "chat" && !state.focusMode;
+  const widthBounds = layoutWidthBounds(
+    typeof window === "undefined" ? 1280 : window.innerWidth,
+    state.panelMode,
+    state.sidebarWidth,
+    state.runtimePanelWidth,
+  );
+  const shellStyle = {
+    "--sidebar-width": narrowViewport ? "clamp(112px, 30vw, 154px)" : `${state.sidebarWidth}px`,
+    "--runtime-width": narrowViewport ? "0px" : `${state.runtimePanelWidth}px`,
+  } as CSSProperties;
   return <LanguageProvider value={state.language}>
-    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.view === "settings" ? " settings-shell" : ""}`}>
-      {state.view === "chat" && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
-      <main aria-label={t("workspace")}>{content}</main>
-      {state.view === "chat" && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
+    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}`} style={shellStyle}>
+      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
+      {state.view === "chat" && !state.focusMode && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
+      {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}
+      {wideLayout && state.panelMode === "docked" && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
     </div>
   </LanguageProvider>;
 }

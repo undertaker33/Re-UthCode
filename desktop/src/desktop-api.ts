@@ -24,6 +24,14 @@ export type ThemePreference = "system" | "dark" | "light";
 export type LanguagePreference = "zh-CN" | "en";
 export type PanelModePreference = "hidden" | "docked" | "floating";
 
+/** Durable wide-layout defaults and bounds, expressed in CSS pixels. */
+export const DEFAULT_SIDEBAR_WIDTH = 286;
+export const DEFAULT_RUNTIME_PANEL_WIDTH = 318;
+export const SIDEBAR_WIDTH_MIN = 180;
+export const SIDEBAR_WIDTH_MAX = 420;
+export const RUNTIME_PANEL_WIDTH_MIN = 260;
+export const RUNTIME_PANEL_WIDTH_MAX = 520;
+
 export interface WindowBoundsPreference {
   x?: number;
   y?: number;
@@ -45,6 +53,8 @@ export interface DesktopPreferences {
   language: LanguagePreference;
   windowBounds: WindowBoundsPreference;
   panelMode: PanelModePreference;
+  sidebarWidth: number;
+  runtimePanelWidth: number;
   recentProjects: RecentProjectPreference[];
   projectAliases: Record<string, string>;
   pinnedProjectKeys: string[];
@@ -60,6 +70,8 @@ export const PREFERENCE_KEYS = [
   "language",
   "windowBounds",
   "panelMode",
+  "sidebarWidth",
+  "runtimePanelWidth",
   "recentProjects",
   "projectAliases",
   "pinnedProjectKeys",
