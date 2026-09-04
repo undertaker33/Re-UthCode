@@ -66,7 +66,7 @@
 
 - [x] 从 ordinary、manual、auto、overflow 与 L5 真实入口验证只有一条 Application/Core compaction 链，Provider request 均 tool-free 且先 Hard Gate。
 - [x] no-reduction、malformed、oversized failure/cancel 都在 durable append 前收口；有效 commit 后 Timeline、Current Context 与 Last Provider Request Usage 按各自权威更新。
-- [ ] 从真实 Desktop dev shell 验证 `Renderer → DesktopApi → Main/Preload → DesktopBridge → Application → Core` identity、事件顺序与 terminal convergence 一致。
+- [x] 从真实 Desktop dev shell 验证 `Renderer → DesktopApi → Main/Preload → DesktopBridge → Application → Core` identity、事件顺序与 terminal convergence 一致。
 - [x] Session background runtime、Settings rebootstrap、clipboard、layout preference、Focus、scroll 与 status 均使用唯一 owner，无第二 Run/Application/store/modal。
 - [x] Headless、CLI、TUI、Desktop、Permission、Session persistence/recovery、Context Gate 与配置安全回归通过。
 - [x] 执行架构和 import 扫描，确认无循环依赖、Interface→Core/Integration 越权或 Provider SDK 类型穿透。
