@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from uthcode.application import ApplicationContextService, CommandDispatcher, ContextUsage, EffectiveConfig, OpenSessionPicker, OutcomeStatus, SessionChanged, SessionOperationError, SessionReplayRecord, create_application, create_builtin_registry
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.application.instructions import InstructionLoader
 from uthcode.application.runtime_context import ApplicationRuntimeContext
 from uthcode.core.history import ActiveCheckpoint, SemanticEntry, Transcript, TranscriptEntry, TranscriptKind
@@ -44,16 +44,21 @@ def _message_transcript(session_id: str, messages: tuple[Message, ...]) -> Trans
     transcript = Transcript(session_id)
     sequence = 1
     for index, message in enumerate(messages, start=1):
-        entries = _transcript_entries_for_message(session_id, f"turn-{index}", sequence, message)
+        entries = transcript_entries_from_message(session_id, f"turn-{index}", sequence, message)
         for entry in entries:
             transcript = transcript.append(entry)
         sequence += len(entries)
     return transcript
 
 
-def _seed(application, session_id: str = "session-1") -> Transcript:
+def _seed(
+    application,
+    session_id: str = "session-1",
+    *,
+    prompt: str = "first prompt",
+) -> Transcript:
     session = application.create_session(session_id)
-    transcript = _message_transcript(session_id, (Message("user", (TextPart("first prompt"),)),))
+    transcript = _message_transcript(session_id, (Message("user", (TextPart(prompt),)),))
     session.append_transcript(transcript.entries)
     session.close()
     return transcript
@@ -77,7 +82,7 @@ def _replay_transcript(session_id: str) -> Transcript:
     ) -> None:
         nonlocal sequence
         if kind is None:
-            values = _transcript_entries_for_message(
+            values = transcript_entries_from_message(
                 session_id, turn_id, sequence, message
             )
         else:
@@ -553,7 +558,19 @@ async def test_compact_command_surfaces_success_and_noop(tmp_path: Path) -> None
             _completed(
                 json.dumps(
                     {
-                        "entries": [{"turn_id": "turn-1", "summary": "bounded summary"}],
+                        "entries": [
+                            {
+                                "turn_id": "turn-1",
+                                "summary": "bounded summary",
+                                "refs": [
+                                    {
+                                        "session_id": "compact",
+                                        "sequence_start": 1,
+                                        "sequence_end": 1,
+                                    }
+                                ],
+                            }
+                        ],
                         "coverage": ["turn-1"],
                     }
                 )
@@ -563,7 +580,7 @@ async def test_compact_command_surfaces_success_and_noop(tmp_path: Path) -> None
     )
     application = _application(tmp_path, store, provider=provider)
     try:
-        _seed(application, "compact")
+        _seed(application, "compact", prompt="compact history " + "x" * 4_000)
         application.resume_session("compact")
         dispatcher = CommandDispatcher(create_builtin_registry(), application)
         first = await dispatcher.dispatch_text_async("/compact")
@@ -580,8 +597,12 @@ async def test_compact_command_surfaces_success_and_noop(tmp_path: Path) -> None
         assert "source=configured" in status.output
         assert "observed=['configured', 'provider']" in status.output
         assert "tightened=[]" in status.output
-        assert "context gate:" in status.output and "hard_safe=True" in status.output
+        assert "context gate: hard_safe=?" in status.output
         assert "context outcome:" in status.output
+        application_status = application.status()
+        assert application_status.context_status.available is True
+        assert application_status.context_status.measurement == "estimate"
+        assert application_status.last_provider_request_usage["status"] == "not_available"
         assert application.session_service.active_session.timeline.active_checkpoint is not None  # type: ignore[union-attr]
     finally:
         application.close()

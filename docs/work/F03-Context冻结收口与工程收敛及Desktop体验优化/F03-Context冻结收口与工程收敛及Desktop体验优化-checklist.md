@@ -55,21 +55,21 @@
 
 ## T06：非 Desktop/TUI 高置信瘦身与测试收口
 
-- [ ] 执行 `rg -n "uthcode\.application\.history|application/history|ContextCompactor\.compact|_compact_locked" src tests eval desktop/src desktop/tests`，active 旧入口命中为 0 或逐条证明是合法否定测试。
-- [ ] `src/uthcode/application/history.py` 已删除，所有真实调用方直接使用 Core 现有转换函数，且无 re-export/alias。
-- [ ] 迁移后无调用方 helper/import/fixture 已删除；没有仅为历史测试保留 production facade。
-- [ ] `core/agent.py`、`application/sessions.py`、`integrations/session_files.py`、Provider factory/fake、legacy durable reader 未被无关拆分或删除。
-- [ ] Permission、Secret、Hard Gate、Session authority/durability、Provider protocol、pause/resume/cancel 与 TUI/CLI 定向回归通过。
-- [ ] 合并的重复测试均有等价 contract 覆盖和清晰故障定位证据；高价值安全/持久化回归数量未下降。
+- [x] 执行 `rg -n "uthcode\.application\.history|application/history|ContextCompactor\.compact|_compact_locked" src tests eval desktop/src desktop/tests`，active 旧入口命中为 0 或逐条证明是合法否定测试。
+- [x] `src/uthcode/application/history.py` 已删除，所有真实调用方直接使用 Core 现有转换函数，且无 re-export/alias。
+- [x] 迁移后无调用方 helper/import/fixture 已删除；没有仅为历史测试保留 production facade。
+- [x] `core/agent.py`、`application/sessions.py`、`integrations/session_files.py`、Provider factory/fake、legacy durable reader 未被无关拆分或删除。
+- [x] Permission、Secret、Hard Gate、Session authority/durability、Provider protocol、pause/resume/cancel 与 TUI/CLI 定向回归通过。
+- [x] 合并的重复测试均有等价 contract 覆盖和清晰故障定位证据；高价值安全/持久化回归数量未下降。
 
 ## T07：[接入主流程] Context 与 Desktop 生产链集成
 
-- [ ] 从 ordinary、manual、auto、overflow 与 L5 真实入口验证只有一条 Application/Core compaction 链，Provider request 均 tool-free 且先 Hard Gate。
-- [ ] no-reduction、malformed、oversized failure/cancel 都在 durable append 前收口；有效 commit 后 Timeline、Current Context 与 Last Provider Request Usage 按各自权威更新。
+- [x] 从 ordinary、manual、auto、overflow 与 L5 真实入口验证只有一条 Application/Core compaction 链，Provider request 均 tool-free 且先 Hard Gate。
+- [x] no-reduction、malformed、oversized failure/cancel 都在 durable append 前收口；有效 commit 后 Timeline、Current Context 与 Last Provider Request Usage 按各自权威更新。
 - [ ] 从真实 Desktop dev shell 验证 `Renderer → DesktopApi → Main/Preload → DesktopBridge → Application → Core` identity、事件顺序与 terminal convergence 一致。
-- [ ] Session background runtime、Settings rebootstrap、clipboard、layout preference、Focus、scroll 与 status 均使用唯一 owner，无第二 Run/Application/store/modal。
-- [ ] Headless、CLI、TUI、Desktop、Permission、Session persistence/recovery、Context Gate 与配置安全回归通过。
-- [ ] 执行架构和 import 扫描，确认无循环依赖、Interface→Core/Integration 越权或 Provider SDK 类型穿透。
+- [x] Session background runtime、Settings rebootstrap、clipboard、layout preference、Focus、scroll 与 status 均使用唯一 owner，无第二 Run/Application/store/modal。
+- [x] Headless、CLI、TUI、Desktop、Permission、Session persistence/recovery、Context Gate 与配置安全回归通过。
+- [x] 执行架构和 import 扫描，确认无循环依赖、Interface→Core/Integration 越权或 Provider SDK 类型穿透。
 
 ## T08：[端到端验证] 全量回归、measurement 与 Desktop 验收
 

@@ -6,7 +6,7 @@ import pytest
 
 from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, InstructionLoader, create_application
 from uthcode.application.context import ApplicationContextService
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.core.compaction import CompactionPolicy, ContextCompactor
 from uthcode.core.context import (
     ContextCompilationError,
@@ -271,7 +271,7 @@ def test_context_rebuilds_reasoning_and_formal_parts_with_native_items() -> None
         kind="text",
         payload={"type": "text", "text": "answer"},
     )
-    entries = _transcript_entries_for_message(
+    entries = transcript_entries_from_message(
         "session-1",
         "turn-reasoning",
         1,
