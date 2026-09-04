@@ -158,6 +158,29 @@ class _L4Provider:
         yield _completed("ordinary answer")
 
 
+class _ProspectiveWorkingSetProvider(_L4Provider):
+    """Return a large summary while exposing a smaller ordinary after-count."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            max_input_tokens=10_000,
+            pressure_extra=0,
+            compaction_summary="x" * 604,
+        )
+        self.ordinary_counts: list[int] = []
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        if request.metadata.get("context_compaction_request") is True:
+            return account_generation_request(request).input_tokens
+        value = (
+            10_000
+            if request.metadata.get("timeline_checkpoint_id") is None
+            else 8_000
+        )
+        self.ordinary_counts.append(value)
+        return value
+
+
 class _ManualCountTransitionProvider(_L4Provider):
     """Record prospective calls while injecting one controlled count outage."""
 
@@ -491,6 +514,18 @@ def _seed_session(application: UthCodeApplication, *, count: int = 70):
     return session
 
 
+def _seed_short_session(application: UthCodeApplication):
+    session = application.create_session("short-session")
+    entries = transcript_entries_from_message(
+        session.session_id,
+        "turn-1",
+        session.transcript.last_sequence + 1,
+        Message("user", (TextPart("fact " + "x" * 160),)),
+    )
+    assert session.append_transcript(entries).durability == "durable"
+    return session
+
+
 def _assert_timeline_refs_are_complete(session) -> None:
     for record in session.timeline.records:
         for ref in getattr(record, "refs", ()):
@@ -640,6 +675,89 @@ async def test_w02_manual_compact_projects_terminal_provider_usage(tmp_path) -> 
     context_status = application.status().context_status
     assert context_status.measurement == "estimate"
     assert context_status.source == "context_compiler"
+
+
+@pytest.mark.asyncio
+async def test_manual_accepts_large_summary_when_ordinary_working_set_shrinks(
+    tmp_path,
+) -> None:
+    provider = _ProspectiveWorkingSetProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-large-summary",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=10_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_short_session(application)
+
+    result = await application.compact_session()
+
+    assert result.changed is True
+    assert result.failure is None
+    assert session.timeline.records
+    events = application.diagnostics()["compaction"]["events"]
+    assert any(
+        event["output_tokens"] >= event["input_tokens"]
+        for event in events
+        if isinstance(event.get("input_tokens"), int)
+        and isinstance(event.get("output_tokens"), int)
+        and event.get("coverage_count", 0) > 0
+    )
+    assert provider.ordinary_counts[0] == 10_000
+    assert provider.ordinary_counts[-1] == 8_000
+
+
+@pytest.mark.asyncio
+async def test_auto_accepts_large_summary_when_ordinary_working_set_shrinks(
+    tmp_path,
+) -> None:
+    provider = _ProspectiveWorkingSetProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="auto-large-summary",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=10_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_short_session(application)
+
+    result = await application.create_run().start_turn("current fact").result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert session.timeline.records
+    ordinary = [
+        request
+        for request in provider.requests
+        if request.metadata.get("context_compaction_request") is not True
+    ]
+    assert len(ordinary) == 1
+    assert provider.ordinary_counts[0] == 10_000
+    assert provider.ordinary_counts[-1] == 8_000
+    events = application.diagnostics()["compaction"]["events"]
+    assert any(
+        event["output_tokens"] >= event["input_tokens"]
+        for event in events
+        if isinstance(event.get("input_tokens"), int)
+        and isinstance(event.get("output_tokens"), int)
+        and event.get("coverage_count", 0) > 0
+    )
 
 
 @pytest.mark.asyncio
@@ -1685,6 +1803,7 @@ async def test_w05_auto_non_reduction_is_not_recovered_or_committed(tmp_path) ->
     provider = _L4Provider(
         max_input_tokens=1_000_000,
         pressure_extra=1_000_000,
+        ordinary_count_override=1_000_000,
         compaction_summary="x" * 8_000,
     )
     session_service = ApplicationSessionService(

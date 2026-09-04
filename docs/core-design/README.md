@@ -211,7 +211,7 @@ Compact
 
 Context 的计量也属于这条状态边界：Provider 能提供可靠 preflight count 时记录 `exact`，只能本地保守估计时记录 `estimate`，尚未形成可编译请求时保持 `unavailable`。Compact 的 L4/L5、manual `/compact` 与 overflow recovery 共用同一 Application 编排和 tool-free Hard Gate；严格 multi-Turn `turn_id`/原始 `refs` coverage、无 reduction、oversized bounded subpass 的失败/取消都在 durable Timeline append 前收口，成功 oversized 仍只提交一个完整 Turn Fine。terminal Provider usage 进入独立的 Last Provider Request Usage，不覆盖 Working Context projection。
 
-Application 在决定是否提交 Compact candidate 时，会用同一个 request compiler 重新装配 compact 前后的 prospective ordinary request，并只比较同一 measurement 来源：可靠 Provider count 得到 `exact/exact`，count endpoint 受控失败则两侧都用标明原因的 `local/local` 估计；混合来源不会直接比较。即使 summary 文本变短，只要 ordinary request 没有缩小，就以 `no_reduction` 在 durable append 前拒绝。manual `/compact` 在同一入口内逐 epoch 提交成功 candidate、重建 ordinary projection，并继续到 retained target 或既有 bounded epoch limit；无 eligible history 是 no-change，不伪造 Timeline。
+Application 在决定是否提交 Compact candidate 时，会用同一个 request compiler 重新装配 compact 前后的 prospective ordinary request，并只比较同一 measurement 来源：可靠 Provider count 得到 `exact/exact`，count endpoint 受控失败则两侧都用标明原因的 `local/local` 估计；混合来源不会直接比较。即使 summary 文本变短，只要 ordinary request 没有缩小，就以 `no_reduction` 在 durable append 前拒绝；summary/epoch input-output token 只作 diagnostics，ordinary request 缩小时即使 summary output 不小于 epoch input 也允许提交。manual `/compact` 在同一入口内逐 epoch 提交成功 candidate、重建 ordinary projection，并继续到 retained target 或既有 bounded epoch limit；无 eligible history 是 no-change，不伪造 Timeline。
 
 以后 Memory 出现时，它也不会取代这些运行状态，而是继续扩展 Agent 能够跨更长时间保留和重新获取的信息。
 
