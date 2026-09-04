@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.core.history import (
     Transcript,
     TranscriptBoundaryError,
@@ -75,7 +75,7 @@ def test_application_message_conversion_preserves_complete_message_identity() ->
             ToolResultPart("call-1", "done"),
         ),
     )
-    entries = _transcript_entries_for_message("session-1", "turn-1", 1, message)
+    entries = transcript_entries_from_message("session-1", "turn-1", 1, message)
     assert len(entries) == 2
     assert {entry.semantic_unit_id for entry in entries} == {"turn-1"}
     assert [entry.payload["message_id"] for entry in entries] == ["turn-1:1", "turn-1:1"]
@@ -111,7 +111,7 @@ def test_application_message_conversion_keeps_each_reasoning_carrier_local() -> 
         native_items=(reasoning_native, text_native),
     )
 
-    entries = _transcript_entries_for_message("session-1", "turn-2", 4, message)
+    entries = transcript_entries_from_message("session-1", "turn-2", 4, message)
 
     assert [entry.payload["part"] for entry in entries] == [
         {"type": "reasoning", "text": "plan"},

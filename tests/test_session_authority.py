@@ -18,7 +18,7 @@ from uthcode.application import (
     ToolResultPart,
     UthCodeApplication,
 )
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.integrations import session_files
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import (
@@ -61,7 +61,7 @@ def _real_application(
 
 
 def _user_transcript(session_id: str, text: str):
-    return _transcript_entries_for_message(
+    return transcript_entries_from_message(
         session_id,
         "turn-title",
         1,
@@ -335,7 +335,7 @@ def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
     entries = []
     entries.extend(_user_transcript("plan-replay", "开始"))
     entries.extend(
-        _transcript_entries_for_message(
+        transcript_entries_from_message(
             "plan-replay",
             "turn-plan",
             2,
@@ -343,7 +343,7 @@ def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
         )
     )
     entries.extend(
-        _transcript_entries_for_message(
+        transcript_entries_from_message(
             "plan-replay",
             "turn-plan",
             3,
@@ -351,7 +351,7 @@ def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
         )
     )
     entries.extend(
-        _transcript_entries_for_message(
+        transcript_entries_from_message(
             "plan-replay",
             "turn-malformed",
             4,
@@ -359,7 +359,7 @@ def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
         )
     )
     entries.extend(
-        _transcript_entries_for_message(
+        transcript_entries_from_message(
             "plan-replay",
             "turn-malformed",
             5,
@@ -367,7 +367,7 @@ def test_replay_projects_only_complete_successful_plans_without_raw_tool_body(
         )
     )
     entries.extend(
-        _transcript_entries_for_message(
+        transcript_entries_from_message(
             "plan-replay",
             "turn-pending",
             6,

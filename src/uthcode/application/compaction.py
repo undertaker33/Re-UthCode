@@ -45,8 +45,9 @@ from .request_preparation import count_input_tokens_async
 _COMPACTION_SYSTEM_PROMPT = (
     "You are UthCode's bounded Context compactor. Return only a JSON object with "
     "entries and coverage. Produce exactly one entry for every covered Turn, in "
-    "the supplied order. Each entry must contain turn_id and a short summary. "
-    "Do not add Turns, refs, or facts that are not present in the raw evidence."
+    "the supplied order. Each entry must contain turn_id, the exact refs copied "
+    "from Required coverage, and a short summary. Do not add Turns or facts that "
+    "are not present in the raw evidence."
 )
 
 _TIMELINE_AGING_SYSTEM_PROMPT = (

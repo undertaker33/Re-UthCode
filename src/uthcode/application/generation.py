@@ -36,7 +36,11 @@ from uthcode.core.provider import (
     ToolDefinition,
     Usage,
 )
-from uthcode.core.history import TranscriptEntry, transcript_entries_for_failed_turn
+from uthcode.core.history import (
+    TranscriptEntry,
+    transcript_entries_for_failed_turn,
+    transcript_entries_from_message,
+)
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -67,7 +71,6 @@ from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
 from .instructions import InstructionLoader
-from .history import _transcript_entries_for_message
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
     ApplicationSession,
@@ -1131,7 +1134,7 @@ class UthCodeApplication:
         try:
             sequence = active.transcript.last_sequence + 1
             for message in messages:
-                converted = _transcript_entries_for_message(
+                converted = transcript_entries_from_message(
                     active.session_id,
                     turn_id,
                     sequence,

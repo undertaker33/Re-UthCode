@@ -23,7 +23,7 @@ from uthcode.application import (
     UthCodeApplication,
     create_builtin_registry,
 )
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.application.instructions import InstructionLoader
 from uthcode.application.provider_usage import (
     cumulative_usage_delta,
@@ -547,7 +547,7 @@ def test_cold_session_resume_rebuilds_estimate_with_provider_ceiling(tmp_path: P
     store.create_session("cold-status", project_key=project_key)
     with store.open_writer("cold-status", expected_project_key=project_key) as writer:
         writer.append_transcript(
-            _transcript_entries_for_message(
+            transcript_entries_from_message(
                 "cold-status",
                 "turn-cold",
                 1,
@@ -587,7 +587,7 @@ async def test_cold_session_resume_resolves_async_provider_ceiling_inside_event_
         expected_project_key=project_key,
     ) as writer:
         writer.append_transcript(
-            _transcript_entries_for_message(
+            transcript_entries_from_message(
                 "cold-async-status",
                 "turn-cold-async",
                 1,
@@ -643,7 +643,7 @@ def test_sync_session_resume_resolves_async_provider_ceiling_without_running_loo
         expected_project_key=project_key,
     ) as writer:
         writer.append_transcript(
-            _transcript_entries_for_message(
+            transcript_entries_from_message(
                 "cold-sync-async-status",
                 "turn-cold-sync-async",
                 1,

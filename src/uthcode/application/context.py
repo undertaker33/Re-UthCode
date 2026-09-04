@@ -43,7 +43,7 @@ from uthcode.core.compaction import (
     TimelineAgingEpoch,
     fine_timeline_usage,
 )
-from uthcode.core.history import Timeline, Transcript
+from uthcode.core.history import Timeline, Transcript, transcript_entries_from_message
 from uthcode.core.prompt import (
     ContextAuthority,
     ContextBlock,
@@ -71,7 +71,6 @@ from uthcode.core.provider import (
 )
 
 from .instructions import InstructionLoader
-from .history import _transcript_entries_for_message
 
 
 _CONTEXT_MEASUREMENTS = frozenset({"estimate", "exact", "unavailable"})
@@ -1925,7 +1924,7 @@ def _transcript_for_messages(session_id: str, messages: Sequence[Message]) -> Tr
     sequence = 1
     for index, message in enumerate(messages):
         turn_id = f"runtime-{index + 1}"
-        entries = _transcript_entries_for_message(session_id, turn_id, sequence, message)
+        entries = transcript_entries_from_message(session_id, turn_id, sequence, message)
         for entry in entries:
             # These entries are a deterministic, process-local projection of
             # the messages supplied to request preparation.  Wall-clock

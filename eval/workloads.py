@@ -20,9 +20,9 @@ from uthcode.application import (
 )
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.instructions import InstructionLoader
-from uthcode.application.history import _transcript_entries_for_message
 from uthcode.core.provider import ModelLimits
 from uthcode.core.context import account_generation_request
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.integrations.instruction_files import InstructionFileReader
 
 
@@ -93,7 +93,7 @@ def seed_profile_history(application: object) -> int:
             "user",
             (TextPart(f"offline stable context fact {index} " + "x" * PROFILE_SEED_FACT_WIDTH),),
         )
-        entries = _transcript_entries_for_message(
+        entries = transcript_entries_from_message(
             session.session_id,
             f"eval-seed-turn-{index}",
             session.transcript.last_sequence + 1,

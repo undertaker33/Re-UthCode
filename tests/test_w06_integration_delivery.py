@@ -27,7 +27,7 @@ from uthcode.application import (
     create_builtin_registry,
     create_application,
 )
-from uthcode.application.history import _transcript_entries_for_message
+from uthcode.core.history import transcript_entries_from_message
 from uthcode.application.instructions import InstructionLoader, InstructionSourceNotFoundError
 from uthcode.application.runtime_context import ApplicationRuntimeContext
 from uthcode.core.history import Transcript, TranscriptKind
@@ -271,7 +271,7 @@ async def test_resume_uses_transcript_and_starts_a_fresh_run(tmp_path: Path) -> 
     application = _build_application(project, sessions, provider)
     try:
         session = application.create_session("resume")
-        entries = _transcript_entries_for_message("resume", "seed", 1, Message("user", (TextPart("DURABLE_MARKER"),)))
+        entries = transcript_entries_from_message("resume", "seed", 1, Message("user", (TextPart("DURABLE_MARKER"),)))
         session.append_transcript(entries)
         session.close()
         resumed = application.resume_session_for_command("resume")
@@ -350,7 +350,7 @@ async def test_process_boundary_resume_replays_mixed_turn_once_and_new_is_empty(
         entries: list[object] = []
         sequence = 1
         for message in messages:
-            values = _transcript_entries_for_message(
+            values = transcript_entries_from_message(
                 session_id,
                 "formal-turn",
                 sequence,
@@ -477,7 +477,7 @@ def test_transcript_message_groups_keep_tool_call_and_result_together(tmp_path: 
     application = _build_application(project, sessions, _Provider())
     try:
         session = application.create_session("tool-group")
-        entries = _transcript_entries_for_message("tool-group", "turn", 1, Message("assistant", (TextPart("before"),)))
+        entries = transcript_entries_from_message("tool-group", "turn", 1, Message("assistant", (TextPart("before"),)))
         session.append_transcript(entries)
         assert [entry.kind for entry in session.transcript.entries] == [TranscriptKind.ASSISTANT_MESSAGE]
     finally:
