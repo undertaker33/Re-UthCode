@@ -1,5 +1,13 @@
 import type { AgentEvent, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import {
+  DEFAULT_RUNTIME_PANEL_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
+  RUNTIME_PANEL_WIDTH_MAX,
+  RUNTIME_PANEL_WIDTH_MIN,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+} from "../desktop-api";
+import {
   asRecord,
   contextUsageAtBoundary,
   messageReasoning,
@@ -49,6 +57,87 @@ export interface ContextUsageProjection {
   available: boolean;
   measurement: ContextMeasurement;
   source: string;
+}
+
+export type ProviderUsageStatus = "available" | "not_available";
+
+export interface ProviderCacheUsageProjection {
+  status: ProviderUsageStatus;
+  tokens: number | null;
+  provenance: string | null;
+}
+
+/** Safe terminal usage projection for the most recent Provider request. */
+export interface ProviderRequestUsageProjection {
+  status: ProviderUsageStatus;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  cache_read: ProviderCacheUsageProjection;
+  cache_write: ProviderCacheUsageProjection;
+}
+
+function nonNegativeToken(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeProviderCacheUsage(value: unknown): ProviderCacheUsageProjection | null {
+  const source = asRecord(value);
+  if (!source || (source.status !== "available" && source.status !== "not_available")) return null;
+  const tokens = source.tokens === null ? null : nonNegativeToken(source.tokens);
+  const provenance = source.provenance === null ? null : nonEmptyText(source.provenance);
+  if (source.status === "available" && (tokens === null || provenance === null)) return null;
+  if (source.status === "not_available" && (tokens !== null || provenance !== null)) return null;
+  return { status: source.status, tokens, provenance };
+}
+
+export function providerRequestUsageAtBoundary(): ProviderRequestUsageProjection {
+  return {
+    status: "not_available",
+    input_tokens: null,
+    output_tokens: null,
+    total_tokens: null,
+    cache_read: { status: "not_available", tokens: null, provenance: null },
+    cache_write: { status: "not_available", tokens: null, provenance: null },
+  };
+}
+
+function cloneProviderRequestUsage(value: ProviderRequestUsageProjection): ProviderRequestUsageProjection {
+  return {
+    ...value,
+    cache_read: { ...value.cache_read },
+    cache_write: { ...value.cache_write },
+  };
+}
+
+/** Normalize only the safe usage fields exposed by Application.status(). */
+export function normalizeProviderRequestUsage(value: unknown): ProviderRequestUsageProjection {
+  const source = asRecord(value);
+  if (!source || (source.status !== "available" && source.status !== "not_available")) return providerRequestUsageAtBoundary();
+  const fields = ["input_tokens", "output_tokens", "total_tokens"] as const;
+  const values = fields.map((field) => source[field] === null ? null : nonNegativeToken(source[field]));
+  if (values.some((value, index) => value === null && source[fields[index]] !== null)) return providerRequestUsageAtBoundary();
+  const cacheRead = normalizeProviderCacheUsage(source.cache_read);
+  const cacheWrite = normalizeProviderCacheUsage(source.cache_write);
+  if (!cacheRead || !cacheWrite) return providerRequestUsageAtBoundary();
+  const available = source.status === "available";
+  if (available && values.every((value) => value === null) && cacheRead.status === "not_available" && cacheWrite.status === "not_available") return providerRequestUsageAtBoundary();
+  if (!available && (values.some((value) => value !== null) || cacheRead.status === "available" || cacheWrite.status === "available")) return providerRequestUsageAtBoundary();
+  return {
+    status: source.status,
+    input_tokens: values[0],
+    output_tokens: values[1],
+    total_tokens: values[2],
+    cache_read: cacheRead,
+    cache_write: cacheWrite,
+  };
+}
+
+function providerRequestUsageFromResult(value: unknown): ProviderRequestUsageProjection | undefined {
+  const source = resultRecord(value);
+  const application = asRecord(source.application);
+  if (!application || !Object.prototype.hasOwnProperty.call(application, "last_provider_request_usage")) return undefined;
+  return normalizeProviderRequestUsage(application.last_provider_request_usage);
 }
 
 export interface CompactionStatusProjection {
@@ -169,6 +258,7 @@ export interface RendererState {
   todoIteration: number;
   run: RunProjection | null;
   contextUsage: ContextUsageProjection;
+  lastProviderRequestUsage: ProviderRequestUsageProjection;
   compactionStatus: CompactionStatusProjection;
   permissionMode: PermissionModeProjection;
   pinnedSessions: DesktopPreferences["pinnedSessions"];
@@ -197,6 +287,10 @@ export interface RendererState {
   diagnostics: string[];
   composerText: string;
   panelMode: PanelModePreference;
+  sidebarWidth: number;
+  runtimePanelWidth: number;
+  /** Renderer-only presentation state; never loaded from or written to preferences. */
+  focusMode: boolean;
   theme: ThemePreference;
   language: LanguagePreference;
   view: "chat" | "settings";
@@ -216,6 +310,8 @@ export interface SessionRuntimeSnapshot {
   todoIteration: number;
   run: RunProjection | null;
   contextUsage: ContextUsageProjection;
+  /** The latest Provider usage belongs to this Session projection. */
+  lastProviderRequestUsage?: ProviderRequestUsageProjection;
   compactionStatus: CompactionStatusProjection;
   permissionMode: PermissionModeProjection;
   activeTurn: boolean;
@@ -236,6 +332,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   todoIteration: 0,
   run: null,
   contextUsage: { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" },
+  lastProviderRequestUsage: providerRequestUsageAtBoundary(),
   compactionStatus: { state: "idle", trigger: null, changed: null },
   permissionMode: "unknown",
   pinnedSessions: [],
@@ -260,6 +357,9 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   diagnostics: [],
   composerText: "",
   panelMode: "docked",
+  sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+  runtimePanelWidth: DEFAULT_RUNTIME_PANEL_WIDTH,
+  focusMode: false,
   theme: "system",
   language: "zh-CN",
   view: "chat",
@@ -276,6 +376,7 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
   return {
     ...DEFAULT_RENDERER_STATE,
     ...overrides,
+    lastProviderRequestUsage: cloneProviderRequestUsage(overrides.lastProviderRequestUsage ?? DEFAULT_RENDERER_STATE.lastProviderRequestUsage),
     projects: overrides.projects?.map((project) => ({ ...project, sessions: [...project.sessions] })) ?? [],
     expandedProjects: overrides.expandedProjects ? { ...overrides.expandedProjects } : {},
     timeline: overrides.timeline?.map((entry) => ({ ...entry })) ?? [],
@@ -683,6 +784,9 @@ export type RendererAction =
   | { type: "notice"; text: string | null }
   | { type: "set_theme"; theme: ThemePreference }
   | { type: "set_panel_mode"; panelMode: PanelModePreference }
+  | { type: "set_sidebar_width"; width: number }
+  | { type: "set_runtime_panel_width"; width: number }
+  | { type: "set_focus_mode"; value: boolean }
   | { type: "set_view"; view: "chat" | "settings" }
   | { type: "settings_loaded"; configuration: ConfigurationView }
   | { type: "settings_error"; message: string | null }
@@ -727,6 +831,12 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         theme: preferences.theme !== undefined ? (preferences.theme === "dark" || preferences.theme === "light" ? preferences.theme : "system") : state.theme,
         language: preferences.language !== undefined ? (preferences.language === "en" ? "en" : "zh-CN") : state.language,
         panelMode: preferences.panelMode !== undefined ? (preferences.panelMode === "hidden" || preferences.panelMode === "floating" ? preferences.panelMode : "docked") : state.panelMode,
+        sidebarWidth: preferences.sidebarWidth !== undefined && Number.isSafeInteger(preferences.sidebarWidth)
+          ? Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, preferences.sidebarWidth))
+          : state.sidebarWidth,
+        runtimePanelWidth: preferences.runtimePanelWidth !== undefined && Number.isSafeInteger(preferences.runtimePanelWidth)
+          ? Math.min(RUNTIME_PANEL_WIDTH_MAX, Math.max(RUNTIME_PANEL_WIDTH_MIN, preferences.runtimePanelWidth))
+          : state.runtimePanelWidth,
       };
     }
     case "runtime_state":
@@ -751,21 +861,32 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const compactionValue = application && Object.prototype.hasOwnProperty.call(application, "compaction_status")
         ? application.compaction_status
         : undefined;
+      const providerUsageValue = application && Object.prototype.hasOwnProperty.call(application, "last_provider_request_usage")
+        ? application.last_provider_request_usage
+        : undefined;
+      const normalizedProviderUsage = providerUsageValue !== undefined
+        ? normalizeProviderRequestUsage(providerUsageValue)
+        : undefined;
       const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
       const sessionId = state.selectedSessionId;
       const nextSessionModels = currentModelRef && sessionId
         ? { ...state.sessionModels, [sessionId]: currentModelRef }
         : state.sessionModels;
-      const statusSessionId = nonEmptyText(source.session_id) ?? sessionId;
+      const rawStatusSessionId = nonEmptyText(source.session_id);
+      const statusSessionId = rawStatusSessionId ?? sessionId;
       const statusProjectKey = nonEmptyText(source.project_key) ?? state.selectedProjectKey;
       const statusKey = statusSessionId ? sessionRuntimeKey(statusProjectKey, statusSessionId) : null;
       const hydrated = statusSessionId
-        ? sessionRuntimeFromSource(source, state.timeline, state.sessionRuntime[statusKey as string] ?? null)
+        ? sessionRuntimeFromSource(source, state.timeline, state.sessionRuntime[statusKey as string] ?? null, normalizedProviderUsage)
         : null;
       const nextSessionRuntime = statusKey && hydrated
         ? { ...state.sessionRuntime, [statusKey]: hydrated }
         : state.sessionRuntime;
       const visibleHydrated = statusSessionId === sessionId && hydrated ? hydrated : null;
+      const statusTargetsVisibleSession = rawStatusSessionId === null || rawStatusSessionId === sessionId;
+      const visibleProviderUsage = statusTargetsVisibleSession
+        ? hydrated?.lastProviderRequestUsage ?? normalizedProviderUsage
+        : undefined;
       const statusState: RendererState = {
         ...state,
         ...(runtimeState ? { runtimeState } : {}),
@@ -782,6 +903,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
             ? { contextUsage: contextUsageAtBoundary() }
             : {}),
         ...(compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
+        ...(visibleProviderUsage ? { lastProviderRequestUsage: cloneProviderRequestUsage(visibleProviderUsage) } : {}),
         ...(visibleHydrated ? {
           timeline: visibleHydrated.timeline,
           todo: visibleHydrated.todo,
@@ -804,7 +926,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "catalog_refreshed":
       return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
     case "session_resumed":
-      return applySessionResumed(state, action.result, action.preserveRuntimeState);
+      return applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result));
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new": {
@@ -821,6 +943,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         turnStatus: "idle",
         pendingInteraction: null,
         contextUsage: contextUsageAtBoundary(),
+        lastProviderRequestUsage: providerRequestUsageAtBoundary(),
         compactionStatus: { state: "idle", trigger: null, changed: null },
         ...(modelRef ? { currentModelRef: modelRef, sessionModels: { ...stateWithCache.sessionModels, [action.sessionId]: modelRef } } : {}),
         sessionViewRevision: stateWithCache.sessionViewRevision + 1,
@@ -926,8 +1049,8 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         const replay = params?.replay;
         const run = params?.run;
         const next = actionValue.restored === true
-          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref })
-          : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
+          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params))
+          : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: notice, composerText: "" };
@@ -975,6 +1098,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         todoIteration: 0,
         run: null,
         contextUsage: contextUsageAtBoundary(),
+        lastProviderRequestUsage: providerRequestUsageAtBoundary(),
         permissionMode: "unknown",
         currentModelRef: null,
         activeTurn: false,
@@ -1004,6 +1128,22 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return { ...state, theme: action.theme };
     case "set_panel_mode":
       return { ...state, panelMode: action.panelMode };
+    case "set_sidebar_width":
+      return {
+        ...state,
+        sidebarWidth: Number.isSafeInteger(action.width)
+          ? Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, action.width))
+          : state.sidebarWidth,
+      };
+    case "set_runtime_panel_width":
+      return {
+        ...state,
+        runtimePanelWidth: Number.isSafeInteger(action.width)
+          ? Math.min(RUNTIME_PANEL_WIDTH_MAX, Math.max(RUNTIME_PANEL_WIDTH_MIN, action.width))
+          : state.runtimePanelWidth,
+      };
+    case "set_focus_mode":
+      return { ...state, focusMode: action.value };
     case "set_view":
       return { ...state, view: action.view };
     case "settings_loaded":

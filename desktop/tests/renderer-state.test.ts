@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { AgentEvent } from "../src/desktop-api";
 import {
   createInitialState,
+  normalizeProviderRequestUsage,
   reduceRendererState,
   type RendererState,
 } from "../src/renderer/state";
@@ -66,6 +67,81 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   assert.deepEqual(fresh.timeline, []);
   assert.equal(fresh.activeTurn, false);
   assert.equal(fresh.run?.run_id, "fresh-run");
+});
+
+test("T05 Provider usage follows Session boundaries, snapshots, and delayed status", () => {
+  const projectKey = "C:/Projects/provider-usage-boundary";
+  const usage = (input: number, output: number) => normalizeProviderRequestUsage({
+    status: "available",
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    cache_read: { status: "not_available", tokens: null, provenance: null },
+    cache_write: { status: "not_available", tokens: null, provenance: null },
+  });
+  const usageA = usage(111, 22);
+  const usageB = usage(17, 9);
+  const opened = applyProjectOpened(createInitialState(), {
+    project: { path: projectKey },
+    sessions: [{ session_id: "session-a" }, { session_id: "session-b" }],
+    run: null,
+  });
+  const stateA = createInitialState({
+    ...opened,
+    selectedSessionId: "session-a",
+    lastProviderRequestUsage: usageA,
+    run: { run_id: "run-a", status: "completed" },
+  });
+
+  const newSession = reduceRendererState(stateA, {
+    type: "session_new",
+    sessionId: "session-b",
+    run: { run_id: "run-b", status: "idle" },
+  });
+  assert.equal(newSession.lastProviderRequestUsage.status, "not_available", "new Session starts without the prior request usage");
+  assert.equal(newSession.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]?.lastProviderRequestUsage?.total_tokens, 133, "the prior usage remains with Session A");
+  assert.equal(newSession.sessionRuntime[sessionRuntimeKey(projectKey, "session-b")]?.lastProviderRequestUsage?.status, "not_available");
+
+  const projectOpened = applyProjectOpened(stateA, {
+    project: { path: "C:/Projects/provider-usage-other" },
+    sessions: [],
+    run: null,
+  });
+  assert.equal(projectOpened.lastProviderRequestUsage.status, "not_available", "project_opened clears the visible usage boundary");
+  assert.equal(projectOpened.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]?.lastProviderRequestUsage?.total_tokens, 133);
+
+  const cachedB = runtimeSnapshotFromState(createInitialState({
+    ...stateA,
+    selectedSessionId: "session-b",
+    lastProviderRequestUsage: usageB,
+    run: { run_id: "run-b", status: "completed" },
+  }));
+  const resumedB = applySessionResumed(
+    createInitialState({
+      ...stateA,
+      sessionRuntime: { [sessionRuntimeKey(projectKey, "session-b")]: cachedB },
+    }),
+    {
+      session_id: "session-b",
+      session_state: { active_turn: false, run: { run_id: "run-b", status: "completed" } },
+      replay: [],
+    },
+  );
+  assert.equal(resumedB.lastProviderRequestUsage.total_tokens, 26, "session_resumed restores usage from the existing Session snapshot");
+
+  const delayedFailure = reduceRendererState(newSession, {
+    type: "status_loaded",
+    result: {
+      session_id: "session-a",
+      project_key: projectKey,
+      active_turn: false,
+      application: { last_provider_request_usage: usageA },
+      session_state: { active_turn: false, run: { run_id: "run-a", status: "failed" } },
+    },
+  });
+  assert.equal(delayedFailure.selectedSessionId, "session-b");
+  assert.equal(delayedFailure.lastProviderRequestUsage.status, "not_available", "a delayed failure for Session A cannot overwrite Session B usage");
+  assert.equal(delayedFailure.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]?.lastProviderRequestUsage?.total_tokens, 133, "the delayed status is retained on Session A");
 });
 
 test("durable failure replay restores retained output and the failed Turn projection", () => {

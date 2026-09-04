@@ -598,8 +598,20 @@ test("desktop preferences persist only allowlisted UI metadata", async () => {
     await writeFile(file, JSON.stringify({ theme: "dark" }), "utf8");
     assert.equal((await preferences.read()).language, "zh-CN");
     assert.deepEqual((await preferences.read()).expandedProjects, {});
+    assert.equal((await preferences.read()).sidebarWidth, 286, "legacy documents migrate the new sidebar width to its default");
+    assert.equal((await preferences.read()).runtimePanelWidth, 318, "legacy documents migrate the new Runtime width to its default");
     await preferences.write("theme", "dark");
     await preferences.write("language", "en");
+    await preferences.write("sidebarWidth", 376);
+    await preferences.write("runtimePanelWidth", 412);
+    const reloaded = new DesktopPreferences(file);
+    assert.equal((await reloaded.read()).sidebarWidth, 376);
+    assert.equal((await reloaded.read()).runtimePanelWidth, 412);
+    await reloaded.write("sidebarWidth", 999);
+    await reloaded.write("runtimePanelWidth", 1);
+    assert.equal((await reloaded.read()).sidebarWidth, 420, "oversized sidebar width clamps to the durable maximum");
+    assert.equal((await reloaded.read()).runtimePanelWidth, 260, "undersized Runtime width clamps to the durable minimum");
+    await assert.rejects(reloaded.write("sidebarWidth", 12.5 as never), /finite integer/);
     await preferences.write("selectedProjectKey", "C:\\Projects\\UthCode");
     await preferences.write("recentProjects", [
       { path: "C:\\Projects\\UthCode", alias: "Work", pinned: true },

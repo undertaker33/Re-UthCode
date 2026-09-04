@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import {
+  DEFAULT_RUNTIME_PANEL_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
+  RUNTIME_PANEL_WIDTH_MAX,
+  RUNTIME_PANEL_WIDTH_MIN,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+} from "./desktop-api";
 import type {
   DesktopPreferences as ApiDesktopPreferences,
   PanelModePreference,
@@ -21,6 +29,8 @@ export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = {
   language: "zh-CN",
   windowBounds: { width: 1280, height: 800, maximized: false },
   panelMode: "docked",
+  sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+  runtimePanelWidth: DEFAULT_RUNTIME_PANEL_WIDTH,
   recentProjects: [],
   projectAliases: {},
   pinnedProjectKeys: [],
@@ -50,6 +60,8 @@ function clonePreferences(value: DesktopPreferences): DesktopPreferences {
     language: value.language,
     windowBounds: { ...value.windowBounds },
     panelMode: value.panelMode,
+    sidebarWidth: value.sidebarWidth,
+    runtimePanelWidth: value.runtimePanelWidth,
     recentProjects: value.recentProjects.map((item) => ({ ...item })),
     projectAliases: { ...value.projectAliases },
     pinnedProjectKeys: [...value.pinnedProjectKeys],
@@ -89,6 +101,14 @@ function validatePanelMode(value: unknown): PanelModePreference {
     throw new PreferenceValidationError("panelMode is invalid");
   }
   return value;
+}
+
+/** Normalize a persisted layout width without letting old metadata break the shell. */
+function validateLayoutWidth(value: unknown, field: string, minimum: number, maximum: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new PreferenceValidationError(`${field} must be a finite integer`);
+  }
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function validateWindowBounds(value: unknown, current?: WindowBoundsPreference): WindowBoundsPreference {
@@ -229,6 +249,8 @@ function validateDocument(value: unknown): DesktopPreferences {
   if (source.language !== undefined) result.language = validateLanguage(source.language);
   if (source.windowBounds !== undefined) result.windowBounds = validateWindowBounds(source.windowBounds);
   if (source.panelMode !== undefined) result.panelMode = validatePanelMode(source.panelMode);
+  if (source.sidebarWidth !== undefined) result.sidebarWidth = validateLayoutWidth(source.sidebarWidth, "sidebarWidth", SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+  if (source.runtimePanelWidth !== undefined) result.runtimePanelWidth = validateLayoutWidth(source.runtimePanelWidth, "runtimePanelWidth", RUNTIME_PANEL_WIDTH_MIN, RUNTIME_PANEL_WIDTH_MAX);
   if (source.recentProjects !== undefined) result.recentProjects = validateRecentProjects(source.recentProjects);
   if (source.projectAliases !== undefined) result.projectAliases = validateStringMap(source.projectAliases, "projectAliases");
   if (source.pinnedProjectKeys !== undefined) result.pinnedProjectKeys = validateStringList(source.pinnedProjectKeys, "pinnedProjectKeys");
@@ -274,6 +296,8 @@ export class DesktopPreferencesStore {
       case "language": normalized = validateLanguage(value); break;
       case "windowBounds": normalized = validateWindowBounds(value, current.windowBounds); break;
       case "panelMode": normalized = validatePanelMode(value); break;
+      case "sidebarWidth": normalized = validateLayoutWidth(value, key, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX); break;
+      case "runtimePanelWidth": normalized = validateLayoutWidth(value, key, RUNTIME_PANEL_WIDTH_MIN, RUNTIME_PANEL_WIDTH_MAX); break;
       case "recentProjects": normalized = validateRecentProjects(value); break;
       case "projectAliases": normalized = validateStringMap(value, key); break;
       case "pinnedProjectKeys": normalized = validateStringList(value, key); break;

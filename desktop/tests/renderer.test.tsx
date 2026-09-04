@@ -10,20 +10,21 @@ import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject } from "../
 
 import {
   createInitialState,
+  normalizeProviderRequestUsage,
   reduceRendererState,
   type ProjectState,
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
 import { applyProjectOpened, applySessionMutation } from "../src/renderer/state-session";
-import { App, commandResultNotice, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, safeErrorMessage } from "../src/renderer/App";
+import { App, clampLayoutWidth, clampedLayoutWidths, commandResultNotice, layoutWidthBounds, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, safeErrorMessage } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, menuPosition, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
 import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
 import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
-import { RuntimeLayoutSelect, RuntimePanel, stateLabel } from "../src/renderer/RuntimePanel";
+import { RuntimeLayoutSelect, RuntimePanel, providerUsageLabel, stateLabel } from "../src/renderer/RuntimePanel";
 import { CustomSelect, customSelectConsumesEscape, customSelectPosition, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
 
@@ -133,6 +134,8 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
     language,
     windowBounds: { width: 1100, height: 760, maximized: false },
     panelMode: "docked",
+    sidebarWidth: 286,
+    runtimePanelWidth: 318,
     recentProjects: selectedProjectKey ? [{ path: selectedProjectKey }] : [],
     projectAliases: {},
     pinnedProjectKeys: [],
@@ -250,7 +253,7 @@ test("T06 Runtime error owns one accessible DOM entity across renderer modes", a
           Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: scenario.width });
           const error = translate(language, "runtimeStartFailed");
           const state = createInitialState({ language, theme, panelMode: scenario.panelMode, runtimeState: "configuration_required", runtimeError: error, notice: error });
-          const stored: DesktopPreferences = { theme, language, windowBounds: { width: scenario.width, height: 800, maximized: false }, panelMode: scenario.panelMode, recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
+          const stored: DesktopPreferences = { theme, language, windowBounds: { width: scenario.width, height: 800, maximized: false }, panelMode: scenario.panelMode, sidebarWidth: 286, runtimePanelWidth: 318, recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
           const api: DesktopApi = { openProject: async () => null, openProjectInExplorer: async () => undefined, copyText: async () => undefined, closeShell: async () => undefined, requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key], writePreference: async () => stored };
           act(() => { root.render(<App key={`${theme}-${language}-${scenario.width}-${scenario.panelMode}-${renderIndex++}`} initialState={state} api={api} />); });
           await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
@@ -820,6 +823,8 @@ test("T05 App routes direct commands and waits for terminal status authority", a
       language: "en",
       windowBounds: { width: 1100, height: 760, maximized: false },
       panelMode: "docked",
+      sidebarWidth: 286,
+      runtimePanelWidth: 318,
       recentProjects: [],
       projectAliases: {},
       pinnedProjectKeys: [],
@@ -932,6 +937,8 @@ test("T09 App consumes typed status params through the localized RuntimePanel", 
         language,
         windowBounds: { width: 1100, height: 760, maximized: false },
         panelMode: "hidden",
+        sidebarWidth: 286,
+        runtimePanelWidth: 318,
         recentProjects: [],
         projectAliases: {},
         pinnedProjectKeys: [],
@@ -1097,6 +1104,165 @@ test("T05 wide floating Runtime keeps its three-state layout without drawer dism
     assert.equal(toggle?.getAttribute("aria-expanded"), "true");
     assert.equal(runtime?.getAttribute("aria-hidden"), null);
   });
+});
+
+test("T05 layout width helpers clamp docked tracks to a usable Conversation", () => {
+  const wide = layoutWidthBounds(1100, "docked", 286, 318);
+  assert.equal(wide.sidebar.min, 180);
+  assert.equal(wide.sidebar.max, 420);
+  assert.equal(wide.runtime.min, 260);
+  assert.equal(wide.runtime.max, 520);
+  assert.equal(clampLayoutWidth(999, wide.sidebar), 420);
+  const zoomed = clampedLayoutWidths(700, "docked", 420, 520);
+  assert.deepEqual(zoomed, { sidebarWidth: 180, runtimePanelWidth: 280 });
+  assert.equal(zoomed.sidebarWidth + zoomed.runtimePanelWidth + 240, 700, "docked clamps leave the minimum Conversation track");
+  const floating = clampedLayoutWidths(760, "floating", 999, 999);
+  assert.deepEqual(floating, { sidebarWidth: 420, runtimePanelWidth: 520 }, "floating Runtime does not consume a grid track");
+});
+
+test("T05 wide-to-wide resize clamps docked tracks to the current CSS viewport", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1280 });
+    act(() => {
+      root.render(<App initialState={createInitialState({ language: "en", panelMode: "docked", sidebarWidth: 420, runtimePanelWidth: 520 })} api={undefined} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const shell = container.querySelector<HTMLElement>(".app-shell");
+    assert.ok(shell);
+    assert.equal(shell.style.getPropertyValue("--sidebar-width"), "420px");
+    assert.equal(shell.style.getPropertyValue("--runtime-width"), "520px");
+
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 800 });
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
+    await act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    const expected = clampedLayoutWidths(800, "docked", 420, 520);
+    assert.deepEqual(expected, { sidebarWidth: 180, runtimePanelWidth: 380 });
+    assert.equal(shell.style.getPropertyValue("--sidebar-width"), `${expected.sidebarWidth}px`);
+    assert.equal(shell.style.getPropertyValue("--runtime-width"), `${expected.runtimePanelWidth}px`);
+    assert.ok(expected.sidebarWidth + expected.runtimePanelWidth + 240 <= 800, "the Conversation track remains usable after a wide-to-wide shrink");
+  });
+});
+
+test("T05 separators use pointer/keyboard previews and one stable preference commit", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1100 });
+    const stored: DesktopPreferences = {
+      theme: "dark", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+      recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null,
+    };
+    const writes: Array<[string, unknown]> = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async () => ({}),
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => stored[key],
+      writePreference: async (key, value) => { writes.push([key, value]); return stored; },
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", theme: "dark", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318 })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const shell = container.querySelector<HTMLElement>(".app-shell");
+    const sidebar = container.querySelector<HTMLElement>('[data-resize-side="sidebar"]');
+    const runtime = container.querySelector<HTMLElement>('[data-resize-side="runtime"]');
+    assert.ok(shell && sidebar && runtime);
+    assert.equal(sidebar.getAttribute("role"), "separator");
+    assert.equal(sidebar.getAttribute("aria-orientation"), "vertical");
+    assert.equal(sidebar.getAttribute("aria-valuemin"), "180");
+    assert.equal(sidebar.getAttribute("aria-valuemax"), "420");
+    assert.equal(sidebar.getAttribute("aria-label"), "Resize sidebar");
+    assert.equal(runtime.getAttribute("aria-label"), "Resize Runtime panel");
+    assert.equal(runtime.getAttribute("aria-controls"), "workspace-main");
+
+    const pointerEvent = (type: string, clientX: number) => {
+      const event = new dom.window.MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX });
+      Object.defineProperty(event, "pointerId", { configurable: true, value: 7 });
+      return event;
+    };
+    act(() => { sidebar.dispatchEvent(pointerEvent("pointerdown", 286)); });
+    act(() => { sidebar.dispatchEvent(pointerEvent("pointermove", 326)); });
+    assert.equal(shell.style.getPropertyValue("--sidebar-width"), "326px");
+    assert.deepEqual(writes, [], "pointer preview stays local and does not write IPC");
+    await act(async () => {
+      sidebar.dispatchEvent(pointerEvent("pointerup", 326));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    assert.deepEqual(writes, [["sidebarWidth", 326]], "pointer release commits one durable width");
+
+    act(() => { sidebar.focus(); sidebar.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(shell.style.getPropertyValue("--sidebar-width"), "342px");
+    assert.deepEqual(writes, [["sidebarWidth", 326], ["sidebarWidth", 342]], "keyboard resize commits at the stable key boundary");
+
+    act(() => { runtime.focus(); runtime.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(shell.style.getPropertyValue("--runtime-width"), "260px");
+    assert.deepEqual(writes, [["sidebarWidth", 326], ["sidebarWidth", 342], ["runtimePanelWidth", 260]]);
+  });
+});
+
+test("T05 Focus Mode is transient and restores panel layout without preference writes", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1100 });
+    const stored: DesktopPreferences = {
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 304, runtimePanelWidth: 366,
+      recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null,
+    };
+    const writes: Array<[string, unknown]> = [];
+    const api: DesktopApi = {
+      openProject: async () => null, openProjectInExplorer: async () => undefined, copyText: async () => undefined, closeShell: async () => undefined,
+      requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key],
+      writePreference: async (key, value) => { writes.push([key, value]); return stored; },
+    };
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", panelMode: "docked", sidebarWidth: 304, runtimePanelWidth: 366 })} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const shell = container.querySelector<HTMLElement>(".app-shell");
+    const focus = container.querySelector<HTMLButtonElement>(".focus-mode-toggle");
+    assert.ok(shell && focus);
+    assert.equal(focus.getAttribute("aria-pressed"), "false");
+    act(() => { focus.click(); });
+    assert.ok(shell.classList.contains("focus-mode"));
+    assert.equal(container.querySelector(".sidebar"), null);
+    assert.equal(container.querySelector("#runtime-panel"), null);
+    assert.equal(focus.getAttribute("aria-pressed"), "true");
+    assert.deepEqual(writes, [], "entering Focus Mode is renderer-only");
+    const escape = new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => { dom.window.document.dispatchEvent(escape); });
+    assert.equal(escape.defaultPrevented, true);
+    assert.equal(shell.classList.contains("focus-mode"), false);
+    assert.ok(container.querySelector(".sidebar"));
+    assert.ok(container.querySelector("#runtime-panel"));
+    assert.equal(shell.style.getPropertyValue("--sidebar-width"), "304px");
+    assert.equal(shell.style.getPropertyValue("--runtime-width"), "366px");
+    assert.deepEqual(writes, [], "Focus exit restores the prior panel and widths without persistence");
+  });
+});
+
+test("T05 RuntimePanel separates Current Context from Last Provider Request Usage", () => {
+  const state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    contextUsage: { used_tokens: 512, budget_tokens: 2048, available: true, measurement: "exact", source: "status" },
+    lastProviderRequestUsage: normalizeProviderRequestUsage({
+      status: "available", input_tokens: 128, output_tokens: 64, total_tokens: 192,
+      cache_read: { status: "available", tokens: 32, provenance: "usage.details.cache_read_tokens" },
+      cache_write: { status: "not_available", tokens: null, provenance: null },
+    }),
+  });
+  const markup = renderLanguage("en", <RuntimePanel state={state} onPanelModeChange={() => undefined} />);
+  assert.match(markup, />Runtime status</);
+  assert.match(markup, />Environment</);
+  assert.match(markup, />Identity</);
+  assert.match(markup, /data-runtime-usage="current-context"[^>]*>512 \/ 2,048 · exact/);
+  assert.match(markup, /data-runtime-usage="last-provider-request"[^>]*>Total: 192 · Input: 128 · Output: 64 · Cache read: 32/);
+  const unavailable = renderLanguage("en", <RuntimePanel state={createInitialState({ language: "en" })} onPanelModeChange={() => undefined} />);
+  assert.match(unavailable, /data-runtime-usage="current-context"[^>]*data-usage-status="unavailable"[^>]*>Unavailable/);
+  assert.match(unavailable, /data-runtime-usage="last-provider-request"[^>]*data-usage-status="not_available"[^>]*>Unavailable/);
+  assert.equal(providerUsageLabel(state.lastProviderRequestUsage, (key) => translate("zh-CN", key)), "总计: 192 · 输入: 128 · 输出: 64 · 缓存读取: 32");
 });
 
 test("project pinning absorbs independent Session pins into the project tree", () => {
@@ -1919,7 +2085,7 @@ test("T07 durable Settings save clears transient secrets even when Runtime recov
   const config = { default_model: "provider/model", default_permission_mode: "default" as const, providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
   const project: ProjectState = { path: "C:/settings-project", projectKey: "C:/settings-project", alias: "Settings project", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
   const preferences: DesktopPreferences = {
-    theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+    theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
     recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
   };
   const runScenario = async (failure: RecoveryFailure, replacement = false, deferFailure = false) => withRendererDom(async (dom, container, root) => {
@@ -2044,7 +2210,7 @@ test("T07 durable Settings Save locks the real Settings DOM and clears an A draf
     };
     const project: ProjectState = { path: "C:/settings-dom-success", projectKey: "C:/settings-dom-success", alias: "Settings DOM success", pinned: false, sessions: [], catalogFresh: true };
     const preferences: DesktopPreferences = {
-      theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
       recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: null,
     };
     const calls: Array<{ method: string; params: JsonObject }> = [];
@@ -2291,7 +2457,7 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
     const first: ProjectState = { path: "C:/pending-save-a", projectKey: "C:/pending-save-a", alias: "Pending A", pinned: false, sessions: [{ session_id: "session-a" }], catalogFresh: true };
     const second: ProjectState = { path: "C:/pending-save-b", projectKey: "C:/pending-save-b", alias: "Pending B", pinned: false, sessions: [], catalogFresh: true };
     const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
       recentProjects: [{ path: first.path, alias: first.alias }, { path: second.path, alias: second.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: first.projectKey, selectedSessionId: "session-a",
     };
     const calls: Array<{ method: string; params: JsonObject }> = [];
@@ -2501,7 +2667,7 @@ test("T07 newer durable Save supersedes a blocked recovery without concurrent Ru
     };
     const project: ProjectState = { path: "C:/save-ownership", projectKey: "C:/save-ownership", alias: "Save ownership", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
     const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
       recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
     };
     const calls: string[] = [];
@@ -2577,7 +2743,7 @@ test("T07 completed lifecycle owner releases ordinary refreshes and runtime even
     };
     const project: ProjectState = { path: "C:/lifecycle-terminal", projectKey: "C:/lifecycle-terminal", alias: "Lifecycle terminal", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
     const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked",
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
       recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
     };
     const calls: Array<{ method: string; params: JsonObject }> = [];

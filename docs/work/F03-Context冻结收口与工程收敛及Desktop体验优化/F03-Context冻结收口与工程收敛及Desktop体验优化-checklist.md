@@ -44,14 +44,14 @@
 
 ## T05：可拖拽布局、Focus Mode 与视觉层级
 
-- [ ] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，preference migration、layout reducer、Pointer/keyboard resize、Focus 与 RuntimePanel tests 全部通过。
-- [ ] 旧 preference 文档无 width 字段时加载默认值；合法宽度可写回/重载，非法或越界值按明确规则恢复或 clamp。
-- [ ] wide mode 左右 separator 支持 Pointer 与 keyboard，具有正确 role/value/label；拖动期间不高频写 preference，只在稳定边界写一次。
-- [ ] resize、窗口变化及 100%/125%/150% zoom 后宽度按 viewport 重新 clamp，Conversation 保持最小可用宽度；narrow mode 禁用 resize 且 Runtime overlay 回归通过。
-- [ ] Focus Mode 隐藏 Sidebar/Runtime；退出后恢复进入前的 `panelMode` 与宽度，整个过程没有 preference write。
-- [ ] RuntimePanel 分组展示运行状态、环境、标识，Current Context 与 Last Provider Request Usage 数值和 unavailable 状态分离。
-- [ ] Sidebar show-more、catalog order、overlay Escape/outside-click/focus restore、IME、focus-visible、ARIA/live region 回归通过。
-- [ ] dark/light/system、zh-CN/en 与 reduced-motion 下新增视觉/transition 无横向裁切、乱码、缺文案或非必要动画。
+- [x] 在 `desktop` 执行 `npm run typecheck` 与 `npm test`，preference migration、layout reducer、Pointer/keyboard resize、Focus 与 RuntimePanel tests 全部通过。
+- [x] 旧 preference 文档无 width 字段时加载默认值；合法宽度可写回/重载，非法或越界值按明确规则恢复或 clamp。
+- [x] wide mode 左右 separator 支持 Pointer 与 keyboard，具有正确 role/value/label；拖动期间不高频写 preference，只在稳定边界写一次。
+- [x] resize、窗口变化及 100%/125%/150% zoom 后宽度按 viewport 重新 clamp，Conversation 保持最小可用宽度；narrow mode 禁用 resize 且 Runtime overlay 回归通过。
+- [x] Focus Mode 隐藏 Sidebar/Runtime；退出后恢复进入前的 `panelMode` 与宽度，整个过程没有 preference write。
+- [x] RuntimePanel 分组展示运行状态、环境、标识，Current Context 与 Last Provider Request Usage 数值和 unavailable 状态分离。
+- [x] Sidebar show-more、catalog order、overlay Escape/outside-click/focus restore、IME、focus-visible、ARIA/live region 回归通过。
+- [x] dark/light/system、zh-CN/en 与 reduced-motion 下新增视觉/transition 无横向裁切、乱码、缺文案或非必要动画。
 
 ## T06：非 Desktop/TUI 高置信瘦身与测试收口
 
