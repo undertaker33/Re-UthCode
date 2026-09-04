@@ -215,3 +215,17 @@ W02 已在 `src/uthcode/application/generation.py` 删除 manual `compact_sessio
 `docs/Context-Index.md` 已将 F03 从 `not_implemented` 移至 `implemented_unarchived`：当前源码有 W02 hotfix、Checklist 全部现有记录项完成且 W01～W07 Feedback 齐全，F03 目录仍位于 `docs/work/`，未执行归档。Index 同时注明本轮不重打包，旧 package/make/visual/Installer 不是 hotfix 产物。用户最终 F03 复验仍待进行；本机未验证的真实 Provider、native pointer/Windows 原生 DPI/zoom、干净 Windows、人工视觉和实际用户输入继续是明确限制，不作为 F03 通过这些外部场景的声明。
 
 本轮未修改 W07 之外的 Feedback，未删除或覆盖历史事实，未执行 Git 写操作，也未触碰 `.workbuddy/`、`临时目录/`。
+
+## 返工第 5 轮：手动压缩超时后 Runtime 失效
+
+用户报告手动压缩等待后显示失败，随后不能切换会话或发送消息。现场显示 Turn 空闲、Composer 就绪，但导航报错。离线读取受影响会话确认 523 条 Transcript、9 个完整 Turn、合法 Timeline 引用，无损坏或未知 durability；首个待压缩 oversized Turn 需要 4 个 bounded subpass。离线 fixture 可以完成这些 subpass，最终是否提交仍由 ordinary before/after 判断；这不代表真实 Provider 的压缩结果已经通过验收。原始会话数据未修改。
+
+根因是 Desktop 普通 RPC 的 30 秒等待超时删除了 pending 请求，Bridge 随后发出的合法迟到响应被误判为未知 ID，触发 `malformed_response`。Runtime 保持存活却被标为 failed，后续请求无法恢复。修复位于 `desktop/src/python-runtime.ts`：超时 ID 保留至合法响应或进程边界结束；先校验响应形状，再丢弃迟到结果，未知 ID 与损坏帧继续报错。审核指出初稿 256 条上限会在持续状态轮询时淘汰仍可能响应的请求，已删除该上限并增加 257 条超时回归。
+
+无参数 `/compact` 现在等待真实 Bridge 结果，不套用普通 RPC 的 30 秒客户端 timer；普通 RPC 和无效的带参数 compact 请求保留原 timeout。压缩仍受原有 epoch/Provider/进程关闭边界约束，shutdown 会回收未完成请求。Bridge 保持串行，压缩期间导航请求仍可能等待；本轮修复的是伪报失败与迟到响应造成的永久失效，没有增加后台 Compact 调度机制。
+
+验证：原迟到响应回归在修复前观察到 `runtime.state=failed`（预期 ready）；修复后定向 Runtime 测试 `20/20 passed`，覆盖迟到成功/失败、后续 RPC、257 条超时、未知 ID、长 compact 的成功/失败及 shutdown。主控执行 `conda run --no-capture-output -n re-uthcode npm --prefix desktop test`：`189 passed, 0 failed, 0 skipped`，exit 0，`59451.2512ms`；`npm --prefix desktop run typecheck` 在同一 Conda 环境 exit 0。本轮未修改 Python 源码，未重复全量 Python 回归；Desktop 测试包含真实离线 Bridge/Application/Core 路径。
+
+原 reviewer 按用户最新要求使用 luna/max 完成复审，结论 PASS、无剩余 finding。主控在 `re-uthcode` 环境执行 `npm --prefix desktop run package`，exit 0；包含 Runtime ready/status/shutdown 与 prompt 资源 smoke。旧故障实例正常关闭后完成标准打包，新包 `desktop/out/UthCode-win32-x64/UthCode.exe` 已启动；实际通过侧栏从原会话切到另一已有会话，再切回原会话，未出现导航错误。原草稿“你好”已恢复，发送按钮可用，但未点击发送、未调用真实 Provider。原会话 Transcript 与 Timeline 的长度及修改时间在关闭旧实例后核对未变；正常导航可能更新会话使用元数据。
+
+本轮没有执行 `npm run make`，没有更新安装器；真实 Provider 的手动压缩和消息发送仍待用户复验，不以离线 fixture 或按钮可用代替端到端验收。当前 package 包含此前 Python Compact 1A hotfix 与本轮 Desktop transport 修复，取代第 4 轮所述未重打包状态；历史安装器边界保持不变。未执行工作包归档，未修改冻结正文或无关用户目录。

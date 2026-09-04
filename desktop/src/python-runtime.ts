@@ -65,6 +65,15 @@ interface ReadableLike {
   on(event: "data", listener: (chunk: unknown) => void): this;
 }
 
+function isCanonicalCompactRequest(method: string, params: JsonObject): boolean {
+  // CommandParser remains the authority for command validity.  The transport
+  // only recognizes the exact no-argument canonical spelling when selecting
+  // its client deadline; it never parses aliases or command arguments.
+  return method === "command.execute"
+    && typeof params.text === "string"
+    && params.text.trim().toLowerCase() === "/compact";
+}
+
 export interface ChildProcessLike {
   readonly pid?: number;
   readonly stdin?: WritableLike | null;
@@ -83,7 +92,7 @@ export type SpawnLike = (
 type PendingRequest = {
   resolve: (value: JsonValue) => void;
   reject: (reason?: unknown) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
 };
 
 export class RuntimeBoundaryError extends Error {
@@ -132,6 +141,10 @@ export class PythonRuntime {
 
   private readonly spawnProcess: SpawnLike;
   private readonly pending = new Map<string, PendingRequest>();
+  // A request timeout only releases the Renderer-side waiter.  The JSONL
+  // Bridge may still finish that request and emit its response later, so
+  // retain its id until that response arrives or the child boundary is closed.
+  private readonly timedOutRequestIds = new Set<string>();
   private readonly onAgentEvent?: (event: AgentEvent) => void;
   private readonly onRuntimeState?: (state: string) => void;
   private readonly onDiagnostic?: (line: string) => void;
@@ -176,6 +189,7 @@ export class PythonRuntime {
     }
     this._state = "starting";
     this.resetTransportBuffers();
+    this.timedOutRequestIds.clear();
     try {
       const child = this.spawnProcess(this.launch.command, this.launch.args, {
         shell: false,
@@ -203,14 +217,19 @@ export class PythonRuntime {
   }
 
   async request(method: string, params: JsonObject): Promise<JsonValue> {
-    return this.requestInternal(method, params, false);
+    return this.requestInternal(
+      method,
+      params,
+      false,
+      isCanonicalCompactRequest(method, params) ? undefined : this.requestTimeoutMs,
+    );
   }
 
   private async requestInternal(
     method: string,
     params: JsonObject,
     allowStopping: boolean,
-    timeoutMs = this.requestTimeoutMs,
+    timeoutMs: number | undefined,
   ): Promise<JsonValue> {
     if (
       this._state !== "ready" &&
@@ -227,11 +246,15 @@ export class PythonRuntime {
     const id = randomUUID();
     const envelope = JSON.stringify({ type: "request", id, method, params });
     return new Promise<JsonValue>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new RuntimeBoundaryError("request_timeout", "Python Runtime request timed out"));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      const pending: PendingRequest = { resolve, reject };
+      if (timeoutMs !== undefined) {
+        pending.timer = setTimeout(() => {
+          this.pending.delete(id);
+          this.timedOutRequestIds.add(id);
+          reject(new RuntimeBoundaryError("request_timeout", "Python Runtime request timed out"));
+        }, timeoutMs);
+      }
+      this.pending.set(id, pending);
       try {
         child.stdin?.write(`${envelope}\n`, (error) => {
           if (error) this.rejectPending(id, new RuntimeBoundaryError("process_error", "Python Runtime input failed"));
@@ -418,7 +441,8 @@ export class PythonRuntime {
       this.failMalformedOutput();
       return;
     }
-    if (value.id === null || !this.pending.has(value.id)) {
+    const timedOut = typeof value.id === "string" && this.timedOutRequestIds.has(value.id);
+    if (value.id === null || (!this.pending.has(value.id) && !timedOut)) {
       this.failMalformedOutput();
       return;
     }
@@ -431,6 +455,10 @@ export class PythonRuntime {
         this.failMalformedOutput();
         return;
       }
+      if (timedOut) {
+        this.timedOutRequestIds.delete(value.id as string);
+        return;
+      }
       this.resolvePending(value.id, value.result);
     } else {
       if (
@@ -440,6 +468,10 @@ export class PythonRuntime {
         typeof value.error.message !== "string"
       ) {
         this.failMalformedOutput();
+        return;
+      }
+      if (timedOut) {
+        this.timedOutRequestIds.delete(value.id as string);
         return;
       }
       this.rejectPending(value.id, new RuntimeRequestError(value.error.kind, value.error.message));
@@ -542,5 +574,6 @@ export class PythonRuntime {
       pending.reject(reason);
       this.pending.delete(id);
     }
+    this.timedOutRequestIds.clear();
   }
 }

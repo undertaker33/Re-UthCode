@@ -96,6 +96,10 @@ function response(id: string, result: unknown): string {
   return `${JSON.stringify({ id, ok: true, result, type: "response" })}\n`;
 }
 
+function errorResponse(id: string, kind: string, message: string): string {
+  return `${JSON.stringify({ id, ok: false, error: { kind, message }, type: "response" })}\n`;
+}
+
 function requestId(child: FakeChild): string {
   const envelope = JSON.parse(child.writes.at(-1) ?? "{}");
   return envelope.id;
@@ -233,6 +237,170 @@ test("timeout, malformed output, and unexpected exit reject pending requests as 
   await assert.rejects(exited, (error: unknown) => {
     return error instanceof RuntimeBoundaryError && error.kind === "process_exit";
   });
+});
+
+test("late response for a timed-out request does not poison a live Runtime", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    requestTimeoutMs: 15,
+  });
+  await runtime.start();
+
+  const pending = runtime.request("command.execute", { text: "/status" });
+  const timedOutId = requestId(child);
+  await assert.rejects(pending, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  });
+  assert.equal(runtime.state, "ready");
+
+  // The serial Bridge may finish the command after the renderer-side timeout
+  // and still emit the original response id.  That stale response is not a
+  // malformed protocol frame and must not destroy the live child boundary.
+  child.stdout.emit("data", response(timedOutId, { state: "ready" }));
+  assert.equal(runtime.state, "ready");
+
+  const failed = runtime.request("status.get", {});
+  const failedId = requestId(child);
+  await assert.rejects(failed, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  });
+  child.stdout.emit("data", errorResponse(failedId, "provider_error", "late failure"));
+  assert.equal(runtime.state, "ready");
+
+  const status = runtime.request("status.get", {});
+  const statusId = requestId(child);
+  child.stdout.emit("data", response(statusId, { state: "ready", active_turn: false }));
+  assert.deepEqual(await status, { state: "ready", active_turn: false });
+  await runtime.shutdown();
+});
+
+test("canonical /compact waits beyond the client deadline while status keeps its timeout", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    requestTimeoutMs: 15,
+  });
+  await runtime.start();
+
+  let compactSettled = false;
+  const compact = runtime
+    .request("command.execute", { text: " \t/CoMpAcT \n" })
+    .finally(() => { compactSettled = true; });
+  const compactId = requestId(child);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(compactSettled, false);
+
+  const withArgument = runtime.request("command.execute", { text: "/compact extra" });
+  await assert.rejects(withArgument, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  });
+  assert.equal(compactSettled, false);
+
+  const status = runtime.request("status.get", {});
+  await assert.rejects(status, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  });
+  assert.equal(compactSettled, false);
+
+  child.stdout.emit("data", response(compactId, { command: "compact", status: "success" }));
+  assert.deepEqual(await compact, { command: "compact", status: "success" });
+  assert.equal(runtime.state, "ready");
+  await runtime.shutdown();
+});
+
+test("canonical /compact failure settles only when the Bridge reports failure", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    requestTimeoutMs: 15,
+  });
+  await runtime.start();
+
+  let compactSettled = false;
+  const compact = runtime
+    .request("command.execute", { text: "/compact" })
+    .finally(() => { compactSettled = true; });
+  const compactId = requestId(child);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(compactSettled, false);
+
+  child.stdout.emit("data", errorResponse(compactId, "execution_error", "compact failed"));
+  await assert.rejects(compact, (error: unknown) => {
+    return error instanceof RuntimeRequestError
+      && error.kind === "execution_error"
+      && error.message === "compact failed";
+  });
+  assert.equal(runtime.state, "ready");
+  await runtime.shutdown();
+});
+
+test("bounded shutdown reaps a child with an unfinished canonical /compact request", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    requestTimeoutMs: 15,
+    shutdownTimeoutMs: 20,
+  });
+  await runtime.start();
+
+  const compact = runtime.request("command.execute", { text: "/compact" });
+  const compactId = requestId(child);
+  assert.equal(typeof compactId, "string");
+
+  const shutdown = runtime.shutdown();
+  assert.equal(JSON.parse(child.writes.at(-1) ?? "{}").method, "runtime.shutdown");
+  await shutdown;
+  await assert.rejects(compact, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "shutdown_timeout";
+  });
+  assert.equal(runtime.state, "stopped");
+});
+
+test("late responses remain correlated after more than 256 requests time out", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+    requestTimeoutMs: 2,
+  });
+  await runtime.start();
+
+  const requests = Array.from({ length: 257 }, () => runtime.request("status.get", {}));
+  const ids = child.writes.map((line) => (JSON.parse(line) as { id: string }).id);
+  assert.equal(ids.length, 257);
+  await Promise.all(requests.map((request) => assert.rejects(request, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  })));
+
+  child.stdout.emit("data", response(ids[0]!, { state: "ready" }));
+  assert.equal(runtime.state, "ready");
+  const status = runtime.request("status.get", {});
+  const statusId = requestId(child);
+  child.stdout.emit("data", response(statusId, { state: "ready", active_turn: false }));
+  assert.deepEqual(await status, { state: "ready", active_turn: false });
+  await runtime.shutdown();
+});
+
+test("an actually unknown response id still fails the Runtime boundary", async () => {
+  const child = new FakeChild();
+  const runtime = new PythonRuntime({
+    launch: { command: "python.exe", args: [] },
+    spawn: (() => child) as never,
+  });
+  await runtime.start();
+
+  const pending = runtime.request("status.get", {});
+  child.stdout.emit("data", response("unknown-response-id", { state: "ready" }));
+  assert.equal(runtime.state, "failed");
+  await assert.rejects(pending, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "malformed_response";
+  });
+  child.emit("close", 1, null);
 });
 
 test("malformed output and process error cannot replace a still-live child", async () => {
