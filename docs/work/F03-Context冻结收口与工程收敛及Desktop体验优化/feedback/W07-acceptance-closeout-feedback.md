@@ -187,3 +187,31 @@ conda run --no-capture-output -n re-uthcode node scripts/cdp-packaged-visual-acc
 Stream 的 `/status` 日志还记录了当前 facts：en `Turn Idle`、`Current Context 5,751 / 128,000 · estimate`、`Last Provider Request Usage Total: 5 · Input: 2 · Output: 3`；zh 为对应本地化字段，数值相同。旧 stream 失败报告未删除或改写；本轮只把当前标准包的 locale-correct、display/wire-separated 结果作为新的验收证据。`npm test` 使用同一显式 Python 环境最终为 `183 passed, 0 failed, 0 skipped`，exit 0；前述标准 `npm run package`/`npm run make` 的 exit 0 结果沿用主控已记录证据。
 
 本轮仍不宣称真实 Provider、native pointer/Windows 原生缩放、干净 Windows、人工视觉或用户实际桌面输入通过；这些 Checklist 项保持未勾。此前 dev probe 的受控 `taskkill`/sandboxed-renderer stderr 与 packaged reload 前 listener 限制均保留在历史段落中，不被本轮 packaged stream/visual 结果覆盖。
+
+## 返工第 4 轮：Compact 1A correctness hotfix 与最终文档收口
+
+### 用户决定与范围
+
+用户验收附件确认：F03 主体已收敛，不再进行整体 Context、工程或 Desktop 重构；Compact 1A 的旧 summary-length gate 是唯一必须修复的 correctness 缺口。用户同时确认，最后一项 Checklist 的职责是记录真实 Provider、干净 Windows、人工视觉等本机不可用场景的环境、原因与风险，不阻塞进入后续 Agent Core 能力阶段；这些环境未运行项仍不得写成通过。该决定只影响本次收口记录，不改变外部环境限制，也不授权归档。
+
+### W02 hotfix 与验证引用
+
+W02 已在 `src/uthcode/application/generation.py` 删除 manual `compact_session` 与 ordinary/overflow/L5 共用 validator 中的两处 `candidate.output_tokens >= candidate.input_tokens` 裁决条件；保留 prospective ordinary Working Context 的同源 `after_count >= before_count` no-reduction 判断，summary/epoch input-output token 仅作 diagnostics。W02 新增 manual/auto 反向 regression：ordinary `before=10000`、`after=8000` 时，即使 candidate `input_tokens=151`、`output_tokens=151`，仍实际 durable commit；ordinary before/after 相等时仍不提交。实现与验证记录见 [`W02 Feedback`](W02-application-context-usage-feedback.md)；本轮原 reviewer 已对该 hotfix 最终 PASS、无 finding。
+
+- 旧代码反向红测：`2 failed, 35 deselected`；删除 gate 后同一选择集：`2 passed, 35 deselected in 0.79s`。
+- W02 定向集：`188 passed`、`0 failed`、exit 0、`18.58s`；架构：`23 passed`、`0 failed`、exit 0、`6.13s`。
+- 全量 Python：`conda run --no-capture-output -n re-uthcode python -m pytest -q` -> `1481 passed, 3 skipped`、`0 failed`、exit 0、`169.32s`；`python -m compileall -q src tests` 与 `python -m pip check` 均 exit 0，后者为 `No broken requirements found.`。
+
+### Desktop 当前回归与构建边界
+
+主控在同一 `re-uthcode` 环境显式使用 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe` 完成本轮未改 Desktop 代码的回归：`conda run --no-capture-output -n re-uthcode npm --prefix desktop test` -> `183 passed, 0 failed, 0 skipped`、exit 0、`duration_ms=56519.153`；`npm --prefix desktop run typecheck` -> exit 0。
+
+本轮没有重跑 `npm run package`、`npm run make` 或 packaged visual。此前记录的 package/make、en/zh packaged stream/visual 与 Installer 均来自 W02 hotfix 前的 `7f858896f92d7f0bc16278cd82ab7f27ce2b74df` 基线；旧安装器和旧 packaged executable 不宣称包含本次 `generation.py` 修复，也不以它们替代本轮 Python 源码回归。该边界是验收记录的时间/产物事实，不是新的失败或能力欠账。
+
+### Checklist、Index 与用户复验状态
+
+本轮将最后一项既有 Checklist checkbox 从 `[ ]` 改为 `[x]`，因为 Feedback 已记录真实 Provider、native pointer/Windows 原生 DPI/zoom、干净 Windows、人工视觉及实际用户桌面输入的环境限制、未运行原因和风险；这些项目本身仍未运行且未描述为通过。其余文字与顺序未改，冻结正文、Spec、Tasks、Prompt 未改。
+
+`docs/Context-Index.md` 已将 F03 从 `not_implemented` 移至 `implemented_unarchived`：当前源码有 W02 hotfix、Checklist 全部现有记录项完成且 W01～W07 Feedback 齐全，F03 目录仍位于 `docs/work/`，未执行归档。Index 同时注明本轮不重打包，旧 package/make/visual/Installer 不是 hotfix 产物。用户最终 F03 复验仍待进行；本机未验证的真实 Provider、native pointer/Windows 原生 DPI/zoom、干净 Windows、人工视觉和实际用户输入继续是明确限制，不作为 F03 通过这些外部场景的声明。
+
+本轮未修改 W07 之外的 Feedback，未删除或覆盖历史事实，未执行 Git 写操作，也未触碰 `.workbuddy/`、`临时目录/`。

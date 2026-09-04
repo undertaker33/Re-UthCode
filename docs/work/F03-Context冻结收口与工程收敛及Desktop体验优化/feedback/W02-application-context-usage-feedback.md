@@ -76,3 +76,22 @@ T02 项已按本轮实际测试与 source scan 勾选；T03～T09 未勾选，�
 - `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：exit code `0`。
 - `conda run --no-capture-output -n re-uthcode python C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/feedback/W02-application-context-usage-feedback.md" "docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/F03-Context冻结收口与工程收敛及Desktop体验优化-checklist.md"`：`OK: 2 file(s) passed UTF-8 guard`，exit code `0`。
 - 追加文档后再次执行 `git diff --check`：exit code `0`；仅有 LF→CRLF warning，无 whitespace error。全量 pytest、pip check、真实 Provider、干净 Windows 与 Desktop npm 验收仍未执行。
+
+## 返工第 3 轮（用户验收 Compact 1A correctness hotfix）
+
+### Finding 与修复
+
+- `generation.py` 的 manual `compact_session` 与 ordinary/overflow/L5 共用 candidate validator 原先同时以 prospective ordinary `after_count >= before_count` 和 `candidate.output_tokens >= candidate.input_tokens` 拒绝候选；后者会把 summary/epoch token 比较误当作 durable no-reduction 裁决。已删除两处旧 summary-length gate，保留同源 prospective ordinary after-before 比较与既有 diagnostics。
+- 新增正式 Application 入口回归：`test_manual_accepts_large_summary_when_ordinary_working_set_shrinks` 与 `test_auto_accepts_large_summary_when_ordinary_working_set_shrinks`。注入 Provider 观测 `ordinary before=10000`、`ordinary after=8000`，候选 diagnostics 明确 `input_tokens=151`、`output_tokens=151`，并断言真实 Timeline durable record；`test_w05_auto_non_reduction_is_not_recovered_or_committed` 改为显式 ordinary before/after 同源相等，继续覆盖 no-reduction 不提交。无 validator 的低层 `test_l4_equal_or_larger_output_is_a_non_committing_no_reduction` 保持不变，仍验证 Core fallback 合同而非 Application 1A 裁决。
+- `docs/core-design/README.md` 补充：summary/epoch input-output token 仅用于 diagnostics；ordinary request 缩小时，即使 summary output 不小于 epoch input 也允许提交。
+
+### 返工验证
+
+- 旧代码反向红测：`conda run --no-capture-output -n re-uthcode python -m pytest tests/test_t09_1_context_protocol_e2e.py -q -k accepts_large_summary_when_ordinary_working_set_shrinks`：`2 failed, 35 deselected`；manual event 观测为 `(input=151, output=151, failure=None, changed=False, coverage=0)`，证明旧 summary gate 在正式候选上拒绝。
+- 删除两处 gate 后同一命令：`2 passed, 35 deselected in 0.79s`，exit code `0`。
+- T02 定向集 `tests/test_application_runs.py tests/test_application_runtime.py tests/test_t09_1_context_protocol_e2e.py tests/test_w05_diagnostics.py tests/test_desktop_bridge.py`：`188 passed`，`0 failed`，exit code `0`，`18.58s`。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`：`23 passed`，`0 failed`，exit code `0`，`6.13s`。
+- 仓库全量 `conda run --no-capture-output -n re-uthcode python -m pytest -q`：`1481 passed, 3 skipped`，`0 failed`，exit code `0`，`169.32s`。
+- `conda run --no-capture-output -n re-uthcode python -m compileall -q src tests`：exit code `0`。
+- `conda run --no-capture-output -n re-uthcode python -m pip check`：`No broken requirements found.`，exit code `0`。
+- 本轮未执行 Desktop npm、真实 Provider、干净 Windows 安装验收；未执行任何 Git 写操作，未触碰 `.workbuddy/`、`临时目录/`，未修改冻结 Spec/Tasks/Prompt/Checklist、Context-Index 或 W07 Feedback。

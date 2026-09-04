@@ -79,7 +79,7 @@
 - [x] measurement 报告包含 exact 与 local before/after、无 reduction 拒绝、oversized、multi-turn malformed、projection changed 和 cache read/write availability，且不建立固定产品阈值平台。
 - [x] CDP/visual 与 packaged acceptance 覆盖 wide/narrow、dark/light、zh-CN/en、100/125/150% zoom、reduced-motion，无 unexplained console/renderer exception/stderr。
 - [x] acceptance 覆盖 drag persistence/reload、Focus transient/restore、Settings Provider→Model→Back 与 secret、Code Fence language/copy、user-scroll/new-message/button、keyboard/IME/ARIA。
-- [ ] 真实 Provider、干净 Windows、人工视觉或其他当前不可用场景在 Feedback 中列出环境、原因和风险；未运行项未勾选、未描述为通过。
+- [x] 真实 Provider、干净 Windows、人工视觉或其他当前不可用场景在 Feedback 中列出环境、原因和风险；未运行项未勾选、未描述为通过。
 
 ## T09：[遗留负担清理] 否定扫描、文档与冻结收口
 

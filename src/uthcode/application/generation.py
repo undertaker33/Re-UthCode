@@ -801,10 +801,7 @@ class UthCodeApplication:
                 # estimate.  Re-account both immutable requests locally.
                 before_count = account_generation_request(before_request).input_tokens
                 after_count = account_generation_request(after_request).input_tokens
-            if (
-                after_count >= before_count
-                or candidate.output_tokens >= candidate.input_tokens
-            ):
+            if after_count >= before_count:
                 return replace(
                     candidate,
                     timeline=previous_timeline,
@@ -2544,10 +2541,7 @@ class UthCodeApplication:
                 if before_count is None or after_count is None:
                     before_count = account_generation_request(before_request).input_tokens
                     after_count = account_generation_request(after_request).input_tokens
-                if (
-                    after_count >= before_count
-                    or candidate.output_tokens >= candidate.input_tokens
-                ):
+                if after_count >= before_count:
                     return replace(
                         candidate,
                         timeline=previous_timeline,
