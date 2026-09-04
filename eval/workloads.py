@@ -124,6 +124,31 @@ def _json_mapping(text: str) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
 
 
+def _compaction_coverage(request: Any, turns: Sequence[str]) -> tuple[Mapping[str, object], ...]:
+    """Copy the exact refs required by the real Application compaction request."""
+
+    marker = "Required coverage (copy only these Turn IDs):\n"
+    messages = getattr(request, "messages", ())
+    if not messages:
+        raise RuntimeError("compaction request is missing its coverage payload")
+    parts = getattr(messages[0], "parts", ())
+    payload = getattr(parts[0], "text", None) if parts else None
+    if not isinstance(payload, str) or marker not in payload:
+        raise RuntimeError("compaction request is missing its required coverage marker")
+    decoded = json.loads(payload.rsplit(marker, 1)[1])
+    if not isinstance(decoded, list) or len(decoded) != len(turns):
+        raise RuntimeError("compaction request coverage does not match request metadata")
+    coverage: list[Mapping[str, object]] = []
+    for expected_turn_id, item in zip(turns, decoded, strict=True):
+        if not isinstance(item, Mapping) or item.get("turn_id") != expected_turn_id:
+            raise RuntimeError("compaction request coverage turn IDs do not match metadata")
+        refs = item.get("refs")
+        if not isinstance(refs, list) or not refs:
+            raise RuntimeError("compaction request coverage is missing exact refs")
+        coverage.append(item)
+    return tuple(coverage)
+
+
 def _stable_route_rank(seed: int, path: str) -> tuple[int, str]:
     digest = hashlib.sha256(f"{seed}:{path}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big"), path
@@ -287,12 +312,17 @@ class ProfileWorkloadProvider:
                     )
                     if isinstance(value, str)
                 ]
+                coverage = _compaction_coverage(request, turns)
                 yield _completed(
                     json.dumps(
                         {
                             "entries": [
-                                {"turn_id": turn_id, "summary": "offline bounded summary"}
-                                for turn_id in turns
+                                {
+                                    "turn_id": item["turn_id"],
+                                    "summary": "offline bounded summary",
+                                    "refs": item["refs"],
+                                }
+                                for item in coverage
                             ],
                             "coverage": turns,
                         },

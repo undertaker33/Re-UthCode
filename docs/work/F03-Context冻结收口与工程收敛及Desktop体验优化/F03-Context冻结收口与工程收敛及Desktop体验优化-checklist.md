@@ -73,22 +73,22 @@
 
 ## T08：[端到端验证] 全量回归、measurement 与 Desktop 验收
 
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，记录 exit code 与精确 passed/failed/skipped 数量。
-- [ ] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`、`python -m compileall -q src tests` 与 `python -m pip check`，全部退出码 0。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest -q`，记录 exit code 与精确 passed/failed/skipped 数量。
+- [x] 执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architecture_boundaries.py -q`、`python -m compileall -q src tests` 与 `python -m pip check`，全部退出码 0。
 - [ ] 在 `desktop` 执行 `npm run typecheck`、`npm test`、`npm run package`，记录 exit code、精确测试数量和 packaged executable 路径；`npm run make` 若当前环境可用也记录结果，否则明确未验证原因。
-- [ ] measurement 报告包含 exact 与 local before/after、无 reduction 拒绝、oversized、multi-turn malformed、projection changed 和 cache read/write availability，且不建立固定产品阈值平台。
+- [x] measurement 报告包含 exact 与 local before/after、无 reduction 拒绝、oversized、multi-turn malformed、projection changed 和 cache read/write availability，且不建立固定产品阈值平台。
 - [ ] CDP/visual 与 packaged acceptance 覆盖 wide/narrow、dark/light、zh-CN/en、100/125/150% zoom、reduced-motion，无 unexplained console/renderer exception/stderr。
 - [ ] acceptance 覆盖 drag persistence/reload、Focus transient/restore、Settings Provider→Model→Back 与 secret、Code Fence language/copy、user-scroll/new-message/button、keyboard/IME/ARIA。
 - [ ] 真实 Provider、干净 Windows、人工视觉或其他当前不可用场景在 Feedback 中列出环境、原因和风险；未运行项未勾选、未描述为通过。
 
 ## T09：[遗留负担清理] 否定扫描、文档与冻结收口
 
-- [ ] 执行旧 compaction/history、重复 authority、Manager/EventBus/Registry、无调用方 public surface、SDK import 与未来占位扫描，所有命中为 0 或逐条解释。
-- [ ] 按 `docs/README.md` 维护映射同步所有受影响用户手册、核心设计、Tools 与 A03/A04/GUI 当前事实文档，内容与最终代码一致。
-- [ ] 全量盘点 `docs/work/` 与 `docs/work/archive/` 后更新 `docs/Context-Index.md`；只有 Checklist 全部完成且 Feedback 齐全时才将 F03 标为 `implemented_unarchived`。
-- [ ] 核对 `docs/OutstandingDebtList.md`；F03 仍无新增、变更或回补欠账时保持其内容不变。
-- [ ] 对 F03 工作包和所有实际修改 Markdown 运行 UTF-8 guard，确认可解码、无 replacement/常见乱码且 fenced code block 成对。
-- [ ] 执行文档内部链接、秘密示例、`git diff --check` 与 diff scope 检查；其他冻结工作包无修改。
-- [ ] W01～W07 Feedback 齐全并记录改动、机制、文件、精确测试、Checklist、偏差、未完成项、风险与清理结果；返工只在原文件末尾追加。
-- [ ] 记录结构收敛前后主要职责/file size 变化，不设置或声称 LOC KPI。
-- [ ] 未自动归档 F03/F02/T10，未执行未经用户明确要求的 commit、push、merge、rebase、tag 或 release。
+- [x] 执行旧 compaction/history、重复 authority、Manager/EventBus/Registry、无调用方 public surface、SDK import 与未来占位扫描，所有命中为 0 或逐条解释。
+- [x] 按 `docs/README.md` 维护映射同步所有受影响用户手册、核心设计、Tools 与 A03/A04/GUI 当前事实文档，内容与最终代码一致。
+- [x] 全量盘点 `docs/work/` 与 `docs/work/archive/` 后更新 `docs/Context-Index.md`；只有 Checklist 全部完成且 Feedback 齐全时才将 F03 标为 `implemented_unarchived`。
+- [x] 核对 `docs/OutstandingDebtList.md`；F03 仍无新增、变更或回补欠账时保持其内容不变。
+- [x] 对 F03 工作包和所有实际修改 Markdown 运行 UTF-8 guard，确认可解码、无 replacement/常见乱码且 fenced code block 成对。
+- [x] 执行文档内部链接、秘密示例、`git diff --check` 与 diff scope 检查；其他冻结工作包无修改。
+- [x] W01～W07 Feedback 齐全并记录改动、机制、文件、精确测试、Checklist、偏差、未完成项、风险与清理结果；返工只在原文件末尾追加。
+- [x] 记录结构收敛前后主要职责/file size 变化，不设置或声称 LOC KPI。
+- [x] 未自动归档 F03/F02/T10，未执行未经用户明确要求的 commit、push、merge、rebase、tag 或 release。
