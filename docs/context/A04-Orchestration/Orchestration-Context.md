@@ -27,6 +27,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 ## 私有 Eval 手动链路
 
 - `[FACT]` `eval/runner.py` 是仓库级手动入口；它读取版本化任务，创建仓库外的专用 attempt 根，再通过 `uthcode.application` 公共导出交给 `eval/execution.py` 完成一个 Application/Run/Turn 和一条事件流。
+- `[FACT]` 离线 profile workload 只从真实 Application compaction request 的 Required coverage payload 复制 Turn identity 与 exact refs，再交给严格 multi-turn parser；它不内置标准答案、不伪造 refs，也不改变生产 Context authority。报告对 Provider cache、HistoryRead 等不存在的来源保留 `not_available` 与原因。
 - `[FACT]` verifier 作为独立离线子进程读取 attempt workspace；`eval/metrics.py` 与 `eval/reporting.py` 只消费公开事件、终态、verifier 和受控 diagnostics，报告并列保留六个维度，不生成总分。
 - `[FACT]` 真实 Eval 运行必须显式提供 `--model` 远端模型标识；该标识进入 attempt 和聚合报告的 `model_id` 指纹。报告同时保存 `task_sample_counts`；Compare 先校验每份报告的映射非空、键集合等于 `task_ids` 且计数总和等于 `sample_count`，再要求两边逐任务样本计数映射完全一致。
 - `[BOUNDARY]` Eval 不注册正式 `uthcode` CLI，不接入 CI，不修改 `src/uthcode/**`；workspace、home、artifact、cache 和 report 都必须位于物理校验过的仓库外专用根。

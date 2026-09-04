@@ -60,6 +60,8 @@ Provider 表的键是稳定 Provider Profile ID，Model 的 `provider` 始终引
 
 如果用户没有配置 `context_window`，UthCode 使用 `256_000` 的默认输入 Operating Window；Provider 若报告更小的可靠 `max_input_tokens`，则进一步收紧，且最终值和来源会显示在 `/status` 与 diagnostics 中。每个 Active Turn 在首次请求准备时冻结这一预算；普通请求、工具续环、手动 Compact、L4/L5 和 overflow retry 都沿用同一 Application Context/Hard Gate 链路。UthCode 不使用型号名称推断或官方随包窗口表作为上限权威。
 
+`/status` 和 Desktop Runtime panel 会把 Context measurement 标为 `exact`、`estimate` 或 `unavailable`。`exact` 仅来自可靠 Provider preflight count；计数服务不可用时，local estimate 会保留明确来源。Provider cache read/write 也只有在 usage 明确提供对应字段时才显示 `available`，默认零值不代表已测得缓存读写。
+
 ## `permissions.toml`
 
 用户规则位于 `~/.uthcode/permissions.toml`，项目规则位于 `<项目目录>/.uthcode/permissions.toml`。规则在新建一次运行时载入，运行中修改不会立即生效。
