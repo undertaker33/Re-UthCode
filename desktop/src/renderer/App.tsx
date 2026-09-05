@@ -29,7 +29,7 @@ import {
   useRuntimeLifecycle,
   type RuntimeOwnershipCheck,
 } from "./useRuntimeLifecycle";
-import type { SessionOrderReason } from "./state-session";
+import { sessionRuntimeKey, type SessionOrderReason } from "./state-session";
 import { UiIcon } from "./UiIcon";
 import { LanguageProvider, translate } from "./i18n";
 
@@ -310,6 +310,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
   const runtimeStatusPollRef = useRef<Promise<boolean> | null>(null);
+  const historyRequestsRef = useRef<Map<string, { token: symbol; promise: Promise<void> }>>(new Map());
+  const preparationPollSequenceRef = useRef(0);
+  const preparationPollRef = useRef<Map<string, number>>(new Map());
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
@@ -449,6 +452,129 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [hasOwner, send, waitForRuntimeLifecycleIdle]);
 
+  const loadHistoryPage = useCallback((projectKey: string, sessionId: string, cursor: string | null, replace: boolean): Promise<void> => {
+    const key = sessionRuntimeKey(projectKey, sessionId);
+    const existing = historyRequestsRef.current.get(key);
+    if (existing) return existing.promise;
+    dispatch({ type: "history_page_loading", projectKey, sessionId });
+    const token = Symbol("history-page");
+    const request = (async () => {
+      try {
+        const params: JsonObject = { session_id: sessionId, page_size: 30 };
+        if (cursor !== null) params.cursor = cursor;
+        const result = await send("history.page", params);
+        if (historyRequestsRef.current.get(key)?.token !== token) return;
+        dispatch({ type: "history_page_loaded", projectKey, sessionId, result, replace });
+      } catch (error) {
+        if (historyRequestsRef.current.get(key)?.token !== token) return;
+        dispatch({ type: "history_page_error", projectKey, sessionId, message: safeErrorMessage(error, t("sessionCatalogUnavailable")) });
+      } finally {
+        if (historyRequestsRef.current.get(key)?.token === token) historyRequestsRef.current.delete(key);
+      }
+    })();
+    historyRequestsRef.current.set(key, { token, promise: request });
+    return request;
+  }, [send, t]);
+
+  const beginSessionPresentation = useCallback((projectKey: string, sessionId: string) => {
+    const previousProjectKey = stateRef.current.selectedProjectKey;
+    const previousSessionId = stateRef.current.selectedSessionId;
+    if (previousSessionId && (previousProjectKey !== projectKey || previousSessionId !== sessionId)) {
+      preparationPollRef.current.delete(sessionRuntimeKey(previousProjectKey, previousSessionId));
+    }
+    dispatch({ type: "history_page_started", projectKey, sessionId });
+    const key = sessionRuntimeKey(projectKey, sessionId);
+    const history = stateRef.current.sessionHistory[key];
+    // A cached first page is already sufficient for immediate display.  An
+    // error starts a local retry, while a missing key starts the first page
+    // without waiting for the cold runtime preparation below.
+    if (!history || history.error) void loadHistoryPage(projectKey, sessionId, null, true);
+  }, [loadHistoryPage]);
+
+  const pollSessionPreparation = useCallback((projectKey: string, sessionId: string) => {
+    const key = sessionRuntimeKey(projectKey, sessionId);
+    const token = preparationPollSequenceRef.current + 1;
+    preparationPollSequenceRef.current = token;
+    preparationPollRef.current.set(key, token);
+    let initialPresentationCheck = true;
+    const schedule = () => {
+      if (typeof window === "undefined") return;
+      window.setTimeout(() => { void poll(); }, 100);
+    };
+    const poll = async (): Promise<void> => {
+      const current = stateRef.current;
+      if (!isMounted() || preparationPollRef.current.get(key) !== token) return;
+      // The selected Session dispatch and this observer are started in the
+      // same React turn. A synchronous bridge response can reach here before
+      // stateRef observes that commit; keep the keyed observer alive for the
+      // next presentation tick. A later navigation removes the old key, so a
+      // stale observer cannot poll forever.
+      if (current.selectedProjectKey !== projectKey || current.selectedSessionId !== sessionId) {
+        // The first poll is deferred until the navigation dispatch commits,
+        // but React may still be between the dispatch and its state commit.
+        // Allow exactly one bounded retry for that presentation race; any
+        // later mismatch is a real stale observer (for example a project-only
+        // open) and must terminate rather than retry forever.
+        if (initialPresentationCheck) {
+          initialPresentationCheck = false;
+          schedule();
+        } else if (preparationPollRef.current.get(key) === token) {
+          preparationPollRef.current.delete(key);
+        }
+        return;
+      }
+      initialPresentationCheck = false;
+      if (hasOwner() || current.runtimeState === "restarting") {
+        schedule();
+        return;
+      }
+      const generation = runtimeGeneration();
+      try {
+        const result = asObject(await send("session.resume", { session_id: sessionId }));
+        const after = stateRef.current;
+        if (preparationPollRef.current.get(key) !== token) return;
+        if (!isMounted() || runtimeGeneration() !== generation || hasOwner()
+          || after.selectedProjectKey !== projectKey || after.selectedSessionId !== sessionId) {
+          // Keep polling only when this is still the selected target. A new
+          // navigation removes its token; an unrelated lifecycle owner merely
+          // asks us to try again after that owner releases the Runtime.
+          if (preparationPollRef.current.get(key) === token
+            && after.selectedProjectKey === projectKey && after.selectedSessionId === sessionId) schedule();
+          return;
+        }
+        if (result.preparing === true || asObject(result.session_state).status === "preparing") {
+          schedule();
+          return;
+        }
+        preparationPollRef.current.delete(key);
+        if (result.preparation_failed === true || result.session_id !== sessionId) {
+          dispatch({ type: "session_preparation", projectKey, sessionId, status: "failed" });
+          return;
+        }
+        dispatch({ type: "session_resumed", result, preserveRuntimeState: true, preserveSessionRuntime: true, preserveTimeline: true });
+        await refreshRuntimeStatus();
+      } catch (error) {
+        const after = stateRef.current;
+        if (preparationPollRef.current.get(key) !== token) return;
+        if (!isMounted() || runtimeGeneration() !== generation || hasOwner()
+          || after.selectedProjectKey !== projectKey || after.selectedSessionId !== sessionId) {
+          if (preparationPollRef.current.get(key) === token
+            && after.selectedProjectKey === projectKey && after.selectedSessionId === sessionId) schedule();
+          return;
+        }
+        preparationPollRef.current.delete(key);
+        dispatch({ type: "session_preparation", projectKey, sessionId, status: "failed" });
+        dispatch({ type: "notice", text: safeErrorMessage(error, t("sessionResumeFailed")) });
+      }
+    };
+    // Navigation dispatches the selected Session and preparation marker in
+    // the same React turn that starts this observer.  Defer the first check
+    // until that presentation commit is visible through stateRef; otherwise
+    // the observer would mistake the previous Session for a stale target and
+    // exit before the background preparation can be polled.
+    if (typeof window !== "undefined") window.setTimeout(() => { void poll(); }, 0);
+  }, [hasOwner, isMounted, refreshRuntimeStatus, runtimeGeneration, send, t]);
+
   const publishTerminalStatus = useCallback((result: JsonValue) => {
     dispatch({ type: "status_loaded", result });
   }, []);
@@ -564,6 +690,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const openProjectPath = useCallback(async (path: string) => {
     if (!api) return;
+    // Project-only navigation clears the selected Session, so every pending
+    // preparation observer belongs to an obsolete visible target.  Remove
+    // their tokens before the asynchronous project.open boundary can return.
+    preparationPollRef.current.clear();
     await enqueueRuntimeOperation("navigation", async (isOwned) => {
       const result = await send("project.open", { path });
       if (!isOwned()) throw new StaleRuntimeOperation();
@@ -641,10 +771,20 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           await refreshRuntimeStatus(isOwned);
           await refreshCatalog(selected.path, "catalog_refresh", undefined, true, isOwned);
           if (selectedSessionId) {
+            beginSessionPresentation(selected.path, selectedSessionId);
             const resumed = await send("session.resume", { session_id: selectedSessionId });
             if (cancelled || !isOwned()) throw new StaleRuntimeOperation();
-            dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true });
-            await refreshRuntimeStatus(isOwned);
+            const source = asObject(resumed);
+            const preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
+            if (preparing) {
+              dispatch({ type: "session_preparation", projectKey: selected.path, sessionId: selectedSessionId, status: "preparing" });
+              pollSessionPreparation(selected.path, selectedSessionId);
+            } else if (source.preparation_failed === true) {
+              dispatch({ type: "session_preparation", projectKey: selected.path, sessionId: selectedSessionId, status: "failed" });
+            } else {
+              dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true, preserveSessionRuntime: true, preserveTimeline: true });
+              await refreshRuntimeStatus(isOwned);
+            }
           }
         }, (error, isOwned) => {
           if (!cancelled && isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("runtimeStartFailed")), state: "configuration_required" });
@@ -661,7 +801,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       cancelTerminalStatusPoll();
       unsubscribe();
     };
-  }, [api, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, processAgentEvent, refreshCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
+  }, [api, beginSessionPresentation, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, pollSessionPreparation, processAgentEvent, refreshCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
 
   const openProject = useCallback(async () => {
     if (!api) return;
@@ -721,7 +861,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     // active Turn to become idle.
     if (sessionId
       && stateRef.current.selectedProjectKey === project.projectKey
-      && stateRef.current.selectedSessionId === sessionId) return;
+      && stateRef.current.selectedSessionId === sessionId
+      && stateRef.current.sessionPreparation[sessionRuntimeKey(project.projectKey, sessionId)] !== "failed") return;
     await enqueueRuntimeOperation("navigation", async (isOwned) => {
       // The bridge keeps an independent runtime per durable Session. Project
       // navigation also preserves the old runtime, so switching rows/projects
@@ -733,12 +874,23 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         dispatch({ type: "project_opened", result: opened, preserveRuntimeState: true, preserveSessionRuntime: true });
         await persist("selectedProjectKey", project.projectKey);
       }
+      let preparing = false;
       if (sessionId) {
+        beginSessionPresentation(project.projectKey, sessionId);
         const result = await send("session.resume", { session_id: sessionId });
         if (!isOwned()) throw new StaleRuntimeOperation();
-        setLatestTurnIdentity(identityFromRun(asObject(result).run));
-        cancelTerminalStatusPoll();
-        dispatch({ type: "session_resumed", result, preserveRuntimeState: true, preserveSessionRuntime: true });
+        const source = asObject(result);
+        preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
+        if (source.preparation_failed === true) {
+          dispatch({ type: "session_preparation", projectKey: project.projectKey, sessionId, status: "failed" });
+        } else if (preparing) {
+          dispatch({ type: "session_preparation", projectKey: project.projectKey, sessionId, status: "preparing" });
+          pollSessionPreparation(project.projectKey, sessionId);
+        } else {
+          setLatestTurnIdentity(identityFromRun(source.run));
+          cancelTerminalStatusPoll();
+          dispatch({ type: "session_resumed", result, preserveRuntimeState: true, preserveSessionRuntime: true, preserveTimeline: true });
+        }
         await persist("selectedSessionId", sessionId);
       } else {
         const result = await send("session.new", {});
@@ -754,16 +906,39 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
       if (!isOwned()) throw new StaleRuntimeOperation();
       await refreshCatalog(project.projectKey, sessionId ? "session_resume" : "session_new", sessionId || undefined, true, isOwned);
-      await refreshRuntimeStatus(isOwned);
+      if (!sessionId || !preparing) {
+        await refreshRuntimeStatus(isOwned);
+      }
     }, (error, isOwned) => {
       if (isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("sessionOpenFailed")), state: "ready" });
     });
-  }, [api, cancelTerminalStatusPoll, enqueueRuntimeOperation, persist, refreshCatalog, refreshRuntimeStatus, send, setLatestTurnIdentity, t]);
+  }, [api, beginSessionPresentation, cancelTerminalStatusPoll, enqueueRuntimeOperation, persist, pollSessionPreparation, refreshCatalog, refreshRuntimeStatus, send, setLatestTurnIdentity, t]);
 
   const newSession = useCallback(async () => {
     const project = stateRef.current.projects.find((item) => item.projectKey === stateRef.current.selectedProjectKey);
     if (project) await resumeSession(project, "");
   }, [resumeSession]);
+
+  const loadOlderHistory = useCallback(() => {
+    const current = stateRef.current;
+    if (!current.selectedProjectKey || !current.selectedSessionId) return;
+    const key = sessionRuntimeKey(current.selectedProjectKey, current.selectedSessionId);
+    const history = current.sessionHistory[key];
+    if (!history || history.loading || !history.hasMore || !history.nextCursor) return;
+    void loadHistoryPage(current.selectedProjectKey, current.selectedSessionId, history.nextCursor, false);
+  }, [loadHistoryPage]);
+
+  const retryHistory = useCallback(() => {
+    const current = stateRef.current;
+    if (!current.selectedProjectKey || !current.selectedSessionId) return;
+    const key = sessionRuntimeKey(current.selectedProjectKey, current.selectedSessionId);
+    const history = current.sessionHistory[key];
+    if (!history || history.loading || !history.error) return;
+    const replace = history.records.length === 0;
+    const cursor = replace ? null : history.nextCursor;
+    if (!replace && !cursor) return;
+    void loadHistoryPage(current.selectedProjectKey, current.selectedSessionId, cursor, replace);
+  }, [loadHistoryPage]);
 
   const executeCommand = useCallback(async (text: string) => {
     if (!text.trim() || !api || commandInFlightRef.current) return;
@@ -833,6 +1008,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const submitComposer = useCallback(async (text: string) => {
     const isCompactionRunning = () => (stateRef.current.compactionStatus.state as string) === "running";
     if (!api || !isMounted() || !text.trim() || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
+    const selectedProjectKey = stateRef.current.selectedProjectKey;
+    const selectedSessionId = stateRef.current.selectedSessionId;
+    const preparation = selectedProjectKey && selectedSessionId
+      ? stateRef.current.sessionPreparation[sessionRuntimeKey(selectedProjectKey, selectedSessionId)]
+      : undefined;
+    // Slash commands remain available for status/recovery while a cold
+    // Session is preparing. Ordinary Turns must wait for its Application/Run
+    // owner to finish recovery so they cannot race a second writer.
+    if (!text.trimStart().startsWith("/") && preparation !== undefined && preparation !== "ready") return;
     if ((hasOwner() || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return;
     if (!isMounted() || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
@@ -1321,6 +1505,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     runtimeToggleRef.current?.focus();
   }, [runtimeVisible]);
   const runtimeToggleLabel = runtimeVisible ? t("closeRuntime") : t("openRuntime");
+  const visibleHistory = state.selectedProjectKey && state.selectedSessionId
+    ? state.sessionHistory[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)]
+    : undefined;
+  const visiblePreparation = state.selectedProjectKey && state.selectedSessionId
+    ? state.sessionPreparation[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)]
+    : undefined;
   const content = state.view === "settings" ? (
     <SettingsView state={state} onRevealApiKey={revealSettingsApiKey} onBack={backFromSettings} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
   ) : (
@@ -1345,10 +1535,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         runtimeErrorVisible={runtimeVisible}
         onOpenSettings={state.runtimeError ? () => void loadSettings() : undefined}
         onCopyText={copyText}
+        onLoadOlder={loadOlderHistory}
+        onRetryOlder={retryHistory}
+        historyHasMore={visibleHistory?.hasMore ?? false}
+        historyLoading={visibleHistory?.loading ?? false}
+        historyError={visibleHistory?.error ?? null}
+        historyRevision={visibleHistory?.revision ?? 0}
+        preparationStatus={visiblePreparation}
         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
       />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
-      <Composer state={state} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
+      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
     </>
   );
 

@@ -114,6 +114,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 
 export interface ComposerProps {
   state: Pick<RendererState, "runtimeState" | "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
+  sessionPreparationStatus?: "preparing" | "ready" | "failed";
   onChange: (text: string) => void;
   onSubmit: (text: string) => void | Promise<void>;
   onCommand: (text: string) => void | Promise<void>;
@@ -122,7 +123,7 @@ export interface ComposerProps {
   onDismissCompletion?: () => void;
 }
 
-export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCancel, onDismissCompletion }: ComposerProps) {
+export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onDismissCompletion }: ComposerProps) {
   const { language, t } = useTranslation();
   const composerRef = useRef<HTMLElement>(null);
   const composing = useRef(false);
@@ -135,7 +136,8 @@ export function Composer({ state, onChange, onSubmit, onCommand, onPause, onCanc
   const terminalStatusPending = state.terminalStatusPending;
   const compactionRunning = state.compactionStatus.state === "running";
   const runtimeRestarting = state.runtimeState === "restarting";
-  const inputLocked = pending || terminalStatusPending || compactionRunning || runtimeRestarting;
+  const inputLocked = pending || terminalStatusPending || compactionRunning || runtimeRestarting
+    || (sessionPreparationStatus !== undefined && sessionPreparationStatus !== "ready");
   const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
     if (pending || terminalStatusPending || runtimeRestarting || !slashMode) return [];

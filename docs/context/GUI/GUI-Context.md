@@ -13,7 +13,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` 调用链固定为 `renderer/App.tsx -> preload.ts -> main.ts -> python-runtime.ts -> interfaces/desktop/bridge.py -> UthCodeApplication -> AgentRun -> TurnHandle -> AgentEvent`。Python child 只处理受控 stdio/请求与关闭回收；Bridge 处理 Application、Run、Session 和安全投影。
 - `[FACT]` 每个已打开的真实配置 Desktop Session 对应独立的 Application/Run 运行时投影。切换 Session、新建 Session 或打开另一项目时，旧 Session 的 active Turn 被停放为 background runtime，不因界面导航而取消；再次选择该 Session 会重新激活其已有 runtime，或以共享持久 Session store 的新 Application 恢复它。
 - `[FACT]` background AgentEvent 附带 `session_id` 与 `project_key`。Renderer 以二者为键缓存每个 Session 的 timeline、Todo、Run、typed interaction、Context/Compact 和终态投影；侧栏按该投影显示 running、waiting、completed、failed、cancelled 或 idle。这个缓存是 Interface 投影，不是持久状态或第二份业务权威。
-- `[FACT]` Desktop 的 `session.new`、`session.resume`、`project.open` 在候选 Application/Run/必要 DTO 成功准备后才切换可见 owner。当前已显示 Session 被再次选择时是视图 no-op。闲置且完成的 background runtime 会关闭回收；Desktop 关闭时会取消并等待所有仍活动的 handle，再关闭每个 Application。
+- `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会同时原子写回用户级 `default_model` 和该 Session 的 `model_ref`，并刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；失败时不发布拆分的模型/Context/metadata 状态。
 - `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
 - `[FACT]` `/model` 参数补全向用户显示 Model 的 `display_name`，但执行值仍为规范的 logical Model Profile ID。Settings 中 Provider 的可选 `display_name` 也只用于列表和弹窗标题，缺失时回退稳定 Provider Profile ID；修改显示名不会改变 Model 引用。Composer 的模型、权限选择器在 active Turn、pending interaction、Compact 或 runtime restart 时禁用，避免绕过 Application 边界。
@@ -44,7 +44,8 @@ visible Session A 有 active Turn
 
 - 同一 Session 同时最多一个 active Turn，仍遵守 `AgentRun` 的独占约束；在该 Session 可见时，普通输入是 Steering，暂停/恢复/取消仍指向同一 Turn。
 - 普通侧栏与 Slash 导航保留 Session-owned Run 的事件接收，不把停放的 Run 当作已失效 Run；真正清空工作区时清除显示缓存并拒绝已知旧 Run 的迟到事件。目录刷新省略运行状态时保留已有 running/waiting 等投影；带身份的 status 只更新匹配 Project/Session 的投影，不覆盖另一可见会话。
-- 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。恢复已持有 runtime 的 Session 优先使用其匹配的已加载 snapshot 生成 replay，避免重复读盘；首次恢复与目录刷新仍保留既有持久读取语义，不保证长历史会话瞬时切换。
+- 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。Desktop catalog 读取元数据，不为每个目录项重建完整历史；聊天默认显示最近 30 个完整交互单元，向上接近顶部再读取更早页，不自动补载全部历史。
+- 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录使用稳定身份并与当前实时投影合并；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。
 - Session rename/move 是 Application 的持久元数据操作。Bridge 在任一已保存 runtime 仍有 active Turn 时拒绝这些变更，避免修改与运行中的 Session 边界竞争。
 - 进程内的 per-Session runtime 是导航连续性机制，不是 Session v3 持久格式的一部分。Runtime crash/protocol error 仍与 Provider/Turn 的正式失败投影分离。
 
@@ -53,7 +54,7 @@ visible Session A 有 active Turn
 | 区域 | 当前行为 | 权威来源 |
 | --- | --- | --- |
 | Sidebar | Project/Session 目录、title/preview、pin、rename/move 和 per-Session 运行状态；选择一行不取消其他 Session 的后台 Turn | Session catalog + Renderer 的事件缓存；rename/move 由 Application 提交 |
-| Chat timeline | 已提交 replay 与当前 Session 的安全 AgentEvent 流；切换后使用该 Session 的缓存或 replay | Bridge 安全 DTO / Application Session |
+| Chat timeline | 最近历史优先显示，上翻按页加载；与当前 Session 的安全 AgentEvent 流合并 | Bridge 安全 DTO / Application Session |
 | Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring；Todo 条置于输入区上方 | Command/Turn/Context Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |

@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-09-04
+snapshot_date: 2026-09-05
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全。Compact 1A correctness hotfix 已删除旧 summary-length gate；历史全量 Python `1481 passed, 3 skipped`。W07 第 5 轮修复迟到 RPC 响应造成 Runtime 失效，标准 package 已更新，PR #99 合并；第 6 轮修复运行中会话导航丢事件、目录覆盖运行图标、status 串会话及轮询积压，并复用已加载 Session snapshot。当前 Desktop `195 passed`、Python Bridge/Application/Session/架构定向 `125 passed`，typecheck 通过。第 6 轮未更新运行中的 packaged app，待关闭应用后重打包；既有安装器不宣称包含这些返工。详细审核、构建与复验边界见 W07 Feedback。用户最终复验仍待进行，真实 Provider、干净 Windows、原生 DPI 等未验证项不宣称通过；未归档。 |
+| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全，Compact 1A hotfix 与第 5/6 轮 Runtime/导航修复保留。第 7 轮增补最近 30 个完整单元的尾部块分页、上翻按需加载、冷准备解耦与取消 writer 收尾；Desktop `204 passed`、Python 相关含架构 `171 passed`、typecheck 通过，terra/high 独立复审 PASS。100/1000/5000 单元 fixture 首屏实读均为 49153 bytes。压缩失败/中断协议增补尚待实施；未修改任务书。第 6/7 轮尚未更新标准包，既有安装器不宣称包含这些返工；用户已授权两项验证后正常关闭应用再打包。详细结果与外部未验证边界见 W07 Feedback；用户最终复验待进行，未归档。 |
 
 ### `not_implemented`
 

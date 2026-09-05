@@ -241,3 +241,31 @@ W02 已在 `src/uthcode/application/generation.py` 删除 manual `compact_sessio
 worker 定向 7/7、相关 Renderer 集合 140/140、Bridge 67 passed；主控执行 `conda run --no-capture-output -n re-uthcode npm --prefix desktop test`，设置项目 Python 路径后为 `195 passed, 0 failed, 0 skipped`、exit 0、`57119.2373ms`；同环境 `npm --prefix desktop run typecheck` exit 0。主控执行 `python -m pytest tests/test_desktop_bridge.py tests/test_application_runtime.py tests/test_session_files.py tests/test_architecture_boundaries.py -q`，`125 passed in 9.97s`、exit 0。未重复全仓 Python 测试，未调用真实 Provider 或操作用户运行中的应用/会话。
 
 独立 luna/max reviewer 最终 PASS，无证据充分的剩余 finding；审核中对 Slash `/new` 缓存与跨 Project Runtime 状态的疑点，经核对真实调用边界后撤回，未据此扩码。GUI 当前事实与 Context Index 已同步，3 份文档 UTF-8 guard 通过，无编码问题需修复。当前用户应用仍运行，尚未取得关闭确认，因此本轮未执行标准 package/make 或更新安装器；第 5 轮已启动的包不包含第 6 轮代码。真实 Provider、真实用户环境长会话切换延迟与新 packaged app 仍待复验，F03 未归档。
+
+## 返工第 7 轮：历史按需加载与冷 Session 准备解耦
+
+用户明确将历史分页与压缩中断协议作为 F03 分支增补，不新建或修改任务书；本轮只完成前一项，压缩协议另行实施。默认通过 Application → `history.page` 读取最近 30 个完整 semantic unit，向上滚动再加载更早页。存储从 JSONL 尾部以 16 KiB 块逆读，不全量解析后截取，不创建持久索引或缓存数据库；工具调用/结果保持同页，沿用安全摘要和外部结果引用。模型 Context 与完整运行时恢复语义不变。
+
+Desktop `session.resume` 不再返回完整 replay；最近页独立显示，冷准备标明 preparing/failed，普通发送等待 ready。同步磁盘恢复放入线程，Provider 异步调用仍在原事件循环；目录只读取 metadata。已有运行 Session 的事件继续按 Session/Project 接收。分页 single-flight、迟到请求身份检查、局部重试和前插锚点已接入，准备任务捕获创建时的项目归属。
+
+实施 worker 使用 luna/max，独立性能/生命周期测试亦由 luna/max 完成。审核发现并修复了读取范围序号校验、旧 full-message 多 part ID 冲突、同 Turn 实时/持久记录误合并、迟到准备响应覆盖新选择、无 sequence 实时尾部排序、跨项目 owner 漂移、旧轮询计时器及取消冷准备遗留 writer。取消回归先得到 `1 failed`：真实 writer 持锁、active 尚未提交时取消，线程继续后遗留 Session；修复后等待已启动操作收尾再 close，`1 passed`，并实际重新取得 writer lock 和 resume。底层真正阻塞时仍由现有 PythonRuntime 外层进程回收时限处理，不另建后台 cleanup 调度器。
+
+### 可重复性能证据
+
+`tests/test_history_paging_performance.py` 独立累计真实文件句柄的读取量/调用数，禁止全文件读取和访问外部 raw result；不依赖生产自报计数，也不设置脆弱的绝对耗时门槛。主控一次完整实测如下，耗时只代表本机 fixture 的 Application 最近页读取，不代表真实 Electron 切换耗时：
+
+| 完整单元数 | JSONL 总字节 | 首屏实际读取字节 / 次数 | 首屏耗时 |
+| --- | --- | --- | --- |
+| 100 | 118784 | 49153 / 4 | 4.444ms |
+| 1000 | 1193786 | 49153 / 4 | 3.812ms |
+| 5000 | 5977788 | 49153 / 4 | 4.220ms |
+
+外部结果 fixture 原文为 120053 bytes，Transcript 为 139778 bytes；首屏只读取 65537 bytes / 5 次，跨块 ToolCall/ToolResult 单元完整，原文文件不被打开。
+
+### 最终验证与边界
+
+- 主控：设置 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`，执行 `conda run --no-capture-output -n re-uthcode npm --prefix desktop test`：`204 passed, 0 failed, 0 skipped`，exit 0，`37073.4809ms`；同环境 `npm --prefix desktop run typecheck` exit 0。
+- 主控：`conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_paging.py tests/test_history_paging_performance.py tests/test_history_bridge.py tests/test_history_prepare_lifecycle.py tests/test_desktop_bridge.py tests/test_application_runtime.py tests/test_session_files.py tests/test_session_authority.py tests/test_w04_session_commands.py tests/test_architecture_boundaries.py -q`：`171 passed in 19.53s`，exit 0。未将此前 169 项或修复前的 203 项结果作为最终候选证据。
+- 按用户更新后的 reviewer 配置，独立 terra/high 完整复审 PASS；其 Python 历史/Bridge/生命周期定向为 `79 passed in 10.88s`，带显式 deferred gate 的 project-only 轮询测试连续 5 次通过。早期该测试固定墙钟次数不稳定，已替换为可控制的响应顺序。
+- 当前事实文档、快速上手和索引同步；冻结正文、Spec、Tasks、Prompt、Checklist 均未改，未归档。没有新增能力欠账。
+- 本轮尚未 package/make、关闭应用或调用真实 Provider。用户已授权两项复审与回归通过后正常关闭、更新标准包并重启；该授权尚未执行。旧安装器不包含本轮增补，原生窗口/真实 Provider 验证不宣称通过。

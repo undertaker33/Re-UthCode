@@ -10,7 +10,7 @@ Application public exports or the strict protocol envelopes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from enum import Enum
 import inspect
 import json
@@ -52,6 +52,7 @@ from uthcode.application import (
     ResumeTurnResponse,
     SessionChanged,
     SessionCatalogEntry,
+    SessionHistoryPage,
     SessionMutation,
     SessionOperationError,
     SessionReplayRecord,
@@ -99,6 +100,7 @@ _METHODS = frozenset(
         "runtime.shutdown",
         "project.open",
         "project.sessions",
+        "history.page",
         "session.new",
         "session.resume",
         "session.rename",
@@ -286,6 +288,7 @@ _REPLAY_OUTPUT_FIELDS = (
     "title",
     "termination_reason",
     "failure_reason",
+    "message_id",
 )
 
 
@@ -470,6 +473,23 @@ def _replay_values(values: object) -> list[object]:
         if projected is not None:
             result.append(projected)
     return result
+
+
+def _history_page_value(value: object) -> dict[str, object]:
+    projected = _dto_fields(
+        value,
+        SessionHistoryPage,
+        ("session_id", "records", "next_cursor", "has_more", "unit_count"),
+    )
+    if projected is None:
+        raise BridgeError("session_error", "Session history page unavailable")
+    records = projected.get("records")
+    if not isinstance(records, list):
+        raise BridgeError("session_error", "Session history page unavailable")
+    for record in records:
+        if not isinstance(record, Mapping) or not isinstance(record.get("record_id"), str):
+            raise BridgeError("session_error", "Session history page unavailable")
+    return projected
 
 
 def _application_status(value: object) -> dict[str, object] | None:
@@ -788,27 +808,38 @@ class DesktopBridge:
             self._dispatcher = dispatcher
         if completion is not None:
             self._completion = completion
+        if isinstance(runtime, dict):
+            # A runtime created by deferred Session preparation is retained
+            # until its first explicit activation.  Once selected, ordinary
+            # inactive-runtime reclamation may apply again.
+            runtime["retain"] = False
 
     def _store_active_runtime(self) -> None:
         self._remember_current_runtime()
 
-    def _clone_application_for_session(self) -> object:
+    def _clone_application_for_session(
+        self,
+        *,
+        owner: object | None = None,
+        workdir: Path | None = None,
+    ) -> object:
         """Build an independent Application sharing the durable Session store."""
 
-        current = self._application
+        current = self._application if owner is None else owner
         if current is None:
             raise BridgeError("application_required", "Application is not initialized")
+        target_workdir = self._workdir if workdir is None else workdir
         if self._application_factory is not None:
             try:
-                return self._application_factory(self._workdir)
+                return self._application_factory(target_workdir)
             except Exception:
                 raise BridgeError("session_error", "Session runtime could not be prepared") from None
         config = None
         try:
             if self._config_loader is not None:
-                config = self._config_loader(self._workdir)
+                config = self._config_loader(target_workdir)
             else:
-                config = load_effective_config(cwd=self._workdir, home=self._home)
+                config = load_effective_config(cwd=target_workdir, home=self._home)
         except Exception:
             config = getattr(current, "configuration", None)
         if not isinstance(config, EffectiveConfig):
@@ -823,7 +854,7 @@ class DesktopBridge:
                 config,
                 provider_builder=builder if callable(builder) else None,
                 model_writer=writer if callable(writer) else None,
-                runtime_context=context if isinstance(context, ApplicationRuntimeContext) else ApplicationRuntimeContext.from_system(workdir=self._workdir),
+                runtime_context=context if isinstance(context, ApplicationRuntimeContext) else ApplicationRuntimeContext.from_system(workdir=target_workdir),
                 session_store=store,
             )
         except Exception:
@@ -875,6 +906,8 @@ class DesktopBridge:
         for key, runtime in list(self._background_runtimes.items()):
             if runtime.get("application") is current_application:
                 continue
+            if runtime.get("retain") is True:
+                continue
             if runtime.get("handle") is not None:
                 continue
             task = runtime.get("task")
@@ -923,6 +956,23 @@ class DesktopBridge:
                 pass
         return getattr(active, "replay", ()) if active is not None and active_id == session_id else ()
 
+    @staticmethod
+    def _session_history_page_for_application(
+        application: object | None,
+        session_id: str,
+        *,
+        cursor: str | None,
+        page_size: int,
+    ) -> object:
+        service = getattr(application, "session_service", None)
+        runtime = getattr(application, "session_history_page", None)
+        if callable(runtime):
+            return runtime(session_id, cursor=cursor, page_size=page_size)
+        page = getattr(service, "read_history_page", None)
+        if callable(page):
+            return page(session_id, cursor=cursor, page_size=page_size)
+        raise BridgeError("session_error", "Application does not support history pages")
+
     def _runtime_result(self) -> dict[str, object]:
         application = self._application
         state = self._state if isinstance(self._state, str) else "failed"
@@ -964,7 +1014,14 @@ class DesktopBridge:
 
     @staticmethod
     def _application_sessions_for(application: object | None) -> tuple[object, ...]:
-        catalog = getattr(application, "session_catalog", None)
+        # Project navigation needs identities/order only.  Prefer the
+        # Application's metadata projection so opening a project does not
+        # replay every Session before the selected history page is visible;
+        # lightweight test/embedding Applications may expose only the older
+        # catalog seam and remain usable through that real fallback.
+        catalog = getattr(application, "session_catalog_metadata", None)
+        if not callable(catalog):
+            catalog = getattr(application, "session_catalog", None)
         if not callable(catalog):
             return ()
         try:
@@ -1035,6 +1092,8 @@ class DesktopBridge:
         if method == "project.sessions":
             _require_params(params, set(), method=method)
             return {"sessions": _catalog_entries(self._application_sessions())}
+        if method == "history.page":
+            return self._history_page(params)
         if method == "session.new":
             return await self._session_new(params)
         if method == "session.resume":
@@ -1442,7 +1501,7 @@ class DesktopBridge:
             except Exception:
                 raise BridgeError("session_error", "Session context could not be prepared") from None
         await self._close_active_for_boundary()
-        candidate_run = self._fresh_session_run(application)
+        candidate_run = await asyncio.to_thread(self._fresh_session_run, application)
         resume = getattr(application, "resume_session_for_command_async", None)
         if not callable(resume):
             resume = getattr(application, "resume_session_for_command", None)
@@ -1450,11 +1509,13 @@ class DesktopBridge:
             raise BridgeError("session_error", "Application does not support Sessions")
         try:
             if context_budget is None:
-                session = resume(session_id)
+                session = await self._call_session_operation(resume, session_id)
             else:
-                session = resume(session_id, context_budget=context_budget)
-            if inspect.isawaitable(session):
-                session = await session
+                session = await self._call_session_operation(
+                    resume,
+                    session_id,
+                    context_budget=context_budget,
+                )
         except Exception as exc:
             kind = getattr(exc, "kind", None)
             raise BridgeError(
@@ -1465,113 +1526,401 @@ class DesktopBridge:
                 "Session could not be resumed",
             ) from None
         restored_id = _session_identity(getattr(session, "session_id", None), session_id)
-        replay = getattr(session, "replay", ())
         self._run = candidate_run
         return {
             "session_id": restored_id,
             "restored": True,
-            "replay": _replay_values(replay),
+            # History is loaded through ``history.page``.  Keeping this
+            # response replay-free makes Session navigation independent from
+            # a cold transcript read and avoids a second full-history path.
+            "replay": [],
             "model_ref": getattr(session, "model_ref", None),
             "active_turn": self._active_handle is not None,
             "run": self._snapshot(),
             "session_state": self._session_state_projection(),
+            "preparing": False,
         }
 
-    async def _session_resume_background(self, session_id: str) -> dict[str, object]:
-        """Switch runtime ownership without cancelling a background Turn."""
+    def _history_page(self, params: Mapping[str, object]) -> dict[str, object]:
+        """Return one bounded page without switching or opening a runtime."""
 
-        current_id = self._session_id_for_application(self._application)
-        if current_id == session_id:
-            # Resuming the already-visible Session is not a navigation
-            # boundary. Let its current Turn flush its durable transcript,
-            # but never cancel the handle as the old bridge did.
-            replay = self._session_replay_for_application(self._application, session_id)
-            self._reclaim_background_runtimes()
-            runtime = self._runtime_for_session(session_id)
-            return {
-                "session_id": session_id,
-                "restored": True,
-                "replay": _replay_values(replay),
-                "model_ref": getattr(getattr(getattr(self._application, "session_service", None), "active_session", None), "model_ref", None),
-                "active_turn": self._active_handle is not None,
-                "run": self._snapshot(),
-                "session_state": self._session_state_projection(runtime),
-            }
-        existing = self._runtime_for_session(session_id)
-        if existing is not None:
-            self._remember_current_runtime()
-            self._activate_runtime(existing)
-            replay = self._session_replay_for_application(self._application, session_id)
-            self._reclaim_background_runtimes()
-            return {
-                "session_id": session_id,
-                "restored": True,
-                "replay": _replay_values(replay),
-                "model_ref": getattr(getattr(getattr(self._application, "session_service", None), "active_session", None), "model_ref", None),
-                "active_turn": self._active_handle is not None,
-                "run": self._snapshot(),
-                "session_state": self._session_state_projection(existing),
-            }
+        if "session_id" not in params:
+            raise BridgeError(
+                "invalid_request",
+                "history.page is missing fields: ['session_id']",
+            )
+        unknown = set(params).difference({"session_id", "cursor", "page_size"})
+        if unknown:
+            raise BridgeError(
+                "invalid_request",
+                f"history.page has unknown fields: {sorted(unknown)!r}",
+            )
+        session_id = _text_param(params, "session_id")
+        cursor = params.get("cursor")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise BridgeError("invalid_request", "cursor must be a non-empty string or null")
+        page_size_value = params.get("page_size", 30)
+        if isinstance(page_size_value, bool) or not isinstance(page_size_value, int):
+            raise BridgeError("invalid_request", "page_size must be an integer")
+        if page_size_value < 1 or page_size_value > 100:
+            raise BridgeError("invalid_request", "page_size must be between 1 and 100")
+        if self._application is None:
+            raise BridgeError("application_required", "Application is not initialized")
+        runtime = self._runtime_for_session(session_id)
+        application = (
+            runtime.get("application") or self._application
+            if runtime is not None
+            else self._application
+        )
+        page = self._session_history_page_for_application(
+            application,
+            session_id,
+            cursor=cursor,
+            page_size=page_size_value,
+        )
+        return _history_page_value(page)
 
-        candidate = self._clone_application_for_session()
+    async def _prepare_background_runtime(
+        self,
+        session_id: str,
+        runtime: dict[str, object],
+        *,
+        owner: object | None,
+        workdir: Path,
+    ) -> None:
+        """Prepare one cold Session independently of Bridge request handling."""
+
+        candidate: object | None = None
+
+        async def await_preparation_operation(
+            operation: Awaitable[object],
+            *,
+            result_is_candidate: bool = False,
+        ) -> object:
+            """Keep an offloaded operation alive when its owner is cancelled.
+
+            Cancelling an ``asyncio.to_thread`` await cancels only the
+            asyncio wrapper; the worker thread continues.  A cold Session
+            resume can therefore commit its writer after this preparation
+            task has been cancelled.  Keep each operation behind a shield and
+            leave it attached to the placeholder until it finishes, so the
+            cancellation path can close the candidate at the real operation
+            boundary instead of racing the worker.
+            """
+
+            operation_task = asyncio.ensure_future(operation)
+            runtime["preparation_operation"] = operation_task
+            runtime["preparation_result_is_candidate"] = result_is_candidate
+            cancelled = False
+            try:
+                return await asyncio.shield(operation_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                # A cancellation leaves the unfinished operation attached for
+                # ``defer_candidate_close`` below.  Completed operations no
+                # longer need a lifecycle reference.
+                if not cancelled and operation_task.done() and runtime.get("preparation_operation") is operation_task:
+                    runtime.pop("preparation_operation", None)
+                    runtime.pop("preparation_result_is_candidate", None)
+
+        async def close_object(value: object | None) -> None:
+            if value is None:
+                return
+            close = getattr(value, "close", None)
+            if not callable(close):
+                return
+            try:
+                await asyncio.to_thread(close)
+            except Exception:
+                pass
+
+        async def close_candidate() -> None:
+            await close_object(candidate)
+
         try:
-            candidate_run = self._fresh_session_run(candidate)
+            # Building an Application can load configuration and Session
+            # metadata.  Creating its Run can load permission rules.  Both are
+            # synchronous seams in the existing Application API, so isolate
+            # them rather than running them in the request/event loop.
+            candidate = await await_preparation_operation(
+                asyncio.to_thread(
+                    self._clone_application_for_session,
+                    owner=owner,
+                    workdir=workdir,
+                ),
+                result_is_candidate=True,
+            )
+            candidate_run = await await_preparation_operation(
+                asyncio.to_thread(self._fresh_session_run, candidate),
+            )
             resume = getattr(candidate, "resume_session_for_command_async", None)
             if not callable(resume):
                 resume = getattr(candidate, "resume_session_for_command", None)
             if not callable(resume):
                 raise BridgeError("session_error", "Application does not support Sessions")
-            session = resume(session_id)
-            if inspect.isawaitable(session):
-                session = await session
+            session = await await_preparation_operation(
+                self._call_session_operation(resume, session_id),
+            )
             restored_id = _session_identity(getattr(session, "session_id", None), session_id)
-            replay = getattr(session, "replay", ())
+            if restored_id != session_id:
+                raise BridgeError("session_error", "Session returned an unexpected identity")
             dispatcher = CommandDispatcher(self._registry, candidate)
             completion = CompletionEngine(self._registry, candidate)
-            self._remember_current_runtime()
-            runtime = {
+        except asyncio.CancelledError:
+            # The operation may be an async Application method whose inner
+            # storage call is still running in a worker thread.  Do not close
+            # the candidate until that method has returned and its writer
+            # ownership has settled.  The Bridge's outer process shutdown
+            # owns the final hard deadline; this soft boundary must wait for
+            # an already-started synchronous recovery rather than detaching a
+            # writer-owning operation from its candidate.
+            operation = runtime.get("preparation_operation")
+            operation_result: object | None = None
+            if isinstance(operation, asyncio.Future):
+                try:
+                    operation_result = await asyncio.shield(operation)
+                except BaseException:
+                    pass
+                runtime.pop("preparation_operation", None)
+                result_is_candidate = runtime.pop("preparation_result_is_candidate", False) is True
+                if result_is_candidate and candidate is None:
+                    await close_object(operation_result)
+            await close_candidate()
+            if self._background_runtimes.get(session_id) is runtime:
+                runtime["status"] = "cancelled"
+                runtime["preparing"] = False
+                runtime["task"] = None
+            return
+        except BridgeError as exc:
+            await close_candidate()
+            if self._background_runtimes.get(session_id) is runtime:
+                runtime["status"] = "failed"
+                runtime["preparing"] = False
+                runtime["task"] = None
+                runtime["error_kind"] = exc.kind
+            return
+        except Exception as exc:
+            await close_candidate()
+            if self._background_runtimes.get(session_id) is runtime:
+                runtime["status"] = "failed"
+                runtime["preparing"] = False
+                runtime["task"] = None
+                kind = getattr(exc, "kind", None)
+                runtime["error_kind"] = kind if isinstance(kind, str) else "session_error"
+            return
+
+        # A stale completion must not install a runtime after a retry,
+        # shutdown, or another Session has replaced this placeholder.
+        if self._background_runtimes.get(session_id) is not runtime or runtime.get("closed") is True:
+            await close_candidate()
+            return
+        runtime.update(
+            {
                 "application": candidate,
                 "run": candidate_run,
                 "handle": None,
                 "task": None,
                 "dispatcher": dispatcher,
                 "completion": completion,
-                "closed": False,
                 "status": "idle",
-                "project_key": str(self._workdir),
+                "preparing": False,
+                # Keep a prepared but not-yet-selected runtime alive while
+                # another Session is displayed.  Activation clears this bit.
+                "retain": True,
             }
-            self._background_runtimes[restored_id] = runtime
-            self._activate_runtime(runtime)
+        )
+
+    @staticmethod
+    def _background_resume_result(
+        session_id: str,
+        *,
+        runtime: Mapping[str, object] | None,
+        application: object | None,
+        run: object | None,
+        active_handle: object | None,
+        preparing: bool,
+        preparation_failed: bool = False,
+    ) -> dict[str, object]:
+        service = getattr(application, "session_service", None)
+        active = getattr(service, "active_session", None) if service is not None else None
+        model_ref = getattr(active, "model_ref", None)
+        result = {
+            "session_id": session_id,
+            "restored": True,
+            # Durable history is always supplied by history.page.  A resume
+            # response only establishes runtime ownership/preparation state.
+            "replay": [],
+            "model_ref": model_ref,
+            "active_turn": active_handle is not None,
+            "run": DesktopBridge._snapshot_for(run),
+            "session_state": DesktopBridge._session_state_projection_for(
+                runtime,
+                application=application,
+                run=run,
+                active_handle=active_handle,
+            ),
+            "preparing": preparing,
+        }
+        if preparation_failed:
+            result["preparation_failed"] = True
+        return result
+
+    @staticmethod
+    def _session_state_projection_for(
+        runtime: Mapping[str, object] | None,
+        *,
+        application: object | None,
+        run: object | None,
+        active_handle: object | None,
+    ) -> dict[str, object]:
+        """Project a runtime that may not yet be installed as Bridge owner."""
+
+        if runtime is not None:
+            handle = runtime.get("handle")
+            if handle is not None or runtime.get("status") == "preparing":
+                # Reuse the instance method only when it can inspect the
+                # runtime's own Application/Run.  Placeholder runtimes have
+                # neither, so the small explicit projection below is needed.
+                if runtime.get("application") is not None or runtime.get("run") is not None:
+                    return DesktopBridge._project_runtime_mapping(runtime)
+            status = runtime.get("status")
+            if isinstance(status, str):
+                return {
+                    "run": DesktopBridge._snapshot_for(run),
+                    "active_turn": active_handle is not None,
+                    "status": status,
+                    "pending_pause": None,
+                    "task_state": None,
+                    "application": None,
+                }
+        return {
+            "run": DesktopBridge._snapshot_for(run),
+            "active_turn": active_handle is not None,
+            "status": "running" if active_handle is not None else "idle",
+            "pending_pause": None,
+            "task_state": None,
+            "application": None,
+        }
+
+    @staticmethod
+    def _project_runtime_mapping(runtime: Mapping[str, object]) -> dict[str, object]:
+        """Project a prepared runtime without changing Bridge ownership."""
+
+        run = runtime.get("run")
+        handle = runtime.get("handle")
+        application = runtime.get("application")
+        status = runtime.get("status")
+        return {
+            "run": DesktopBridge._snapshot_for(run),
+            "active_turn": handle is not None,
+            "status": status if isinstance(status, str) else "idle",
+            "pending_pause": runtime.get("pending_pause"),
+            "task_state": runtime.get("task_state"),
+            "application": _application_status(application) if application is not None and callable(getattr(application, "status", None)) else None,
+        }
+
+    async def _session_resume_background(self, session_id: str) -> dict[str, object]:
+        """Switch ownership or start a non-blocking cold Session preparation."""
+
+        current_id = self._session_id_for_application(self._application)
+        if current_id == session_id:
+            # Resuming the already-visible Session is a presentation no-op.
+            # History is loaded by history.page and is never replayed here.
             self._reclaim_background_runtimes()
-            return {
-                "session_id": restored_id,
-                "restored": True,
-                "replay": _replay_values(replay),
-                "model_ref": getattr(session, "model_ref", None),
-                "active_turn": self._active_handle is not None,
-                "run": self._snapshot(),
-                "session_state": self._session_state_projection(runtime),
-            }
-        except BridgeError:
-            close = getattr(candidate, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-            raise
-        except Exception as exc:
-            close = getattr(candidate, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-            kind = getattr(exc, "kind", None)
-            raise BridgeError(
-                {"busy": "session_busy", "corrupt": "session_corrupt", "unknown": "session_unknown"}.get(kind, "session_error"),
-                "Session could not be resumed",
-            ) from None
+            runtime = self._runtime_for_session(session_id)
+            return self._background_resume_result(
+                session_id,
+                runtime=runtime,
+                application=self._application,
+                run=self._run,
+                active_handle=self._active_handle,
+                preparing=False,
+            )
+
+        existing = self._runtime_for_session(session_id)
+        if existing is not None:
+            status = existing.get("status")
+            if status == "preparing":
+                # The original preparation owns the only in-flight cold
+                # operation for this Session.  Never start a second one.
+                return self._background_resume_result(
+                    session_id,
+                    runtime=existing,
+                    application=existing.get("application"),
+                    run=existing.get("run"),
+                    active_handle=existing.get("handle"),
+                    preparing=True,
+                )
+            if status in {"failed", "cancelled"}:
+                # Let the renderer observe one safe terminal preparation
+                # result.  A later explicit selection consumes that marker
+                # and starts a fresh preparation; polling must not turn a
+                # persistent corrupt/read failure into an endless retry loop.
+                if existing.get("failure_reported") is not True:
+                    existing["failure_reported"] = True
+                    return self._background_resume_result(
+                        session_id,
+                        runtime=existing,
+                        application=None,
+                        run=None,
+                        active_handle=None,
+                        preparing=False,
+                        preparation_failed=True,
+                    )
+                self._background_runtimes.pop(session_id, None)
+                existing = None
+        if existing is not None:
+            self._remember_current_runtime()
+            self._activate_runtime(existing)
+            self._reclaim_background_runtimes()
+            return self._background_resume_result(
+                session_id,
+                runtime=existing,
+                application=self._application,
+                run=self._run,
+                active_handle=self._active_handle,
+                preparing=False,
+            )
+
+        # Park the currently visible runtime before creating a placeholder.
+        # The placeholder has no Application/Run ownership, so history and
+        # other Sessions remain usable while its cold read is in progress.
+        self._remember_current_runtime()
+        owner = self._application
+        workdir = self._workdir
+        runtime: dict[str, object] = {
+            "application": None,
+            "run": None,
+            "handle": None,
+            "task": None,
+            "dispatcher": None,
+            "completion": None,
+            "closed": False,
+            "status": "preparing",
+            "preparing": True,
+            "retain": True,
+            "project_key": str(workdir),
+        }
+        self._background_runtimes[session_id] = runtime
+        task = asyncio.create_task(
+            self._prepare_background_runtime(
+                session_id,
+                runtime,
+                owner=owner,
+                workdir=workdir,
+            )
+        )
+        runtime["task"] = task
+        return self._background_resume_result(
+            session_id,
+            runtime=runtime,
+            application=None,
+            run=None,
+            active_handle=None,
+            preparing=True,
+        )
 
     async def _session_rename(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"session_id", "title"}, method="session.rename")
@@ -1651,6 +2000,29 @@ class DesktopBridge:
             return DesktopBridge._create_run(application)
         except BridgeError:
             raise BridgeError("session_error", "Session Run could not be prepared") from None
+
+    @staticmethod
+    async def _call_session_operation(
+        operation: Callable[..., object],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Invoke a Session operation without blocking the bridge loop.
+
+        The Application exposes both synchronous and ``*_async`` Session
+        entry points.  A synchronous implementation may perform a cold
+        JSONL read while opening its writer, so running the call directly from
+        an async Bridge handler would stall unrelated requests.  Async
+        implementations remain on the event loop; synchronous ones are
+        isolated to the existing default worker pool.
+        """
+
+        if inspect.iscoroutinefunction(operation):
+            return await operation(*args, **kwargs)
+        value = await asyncio.to_thread(operation, *args, **kwargs)
+        if inspect.isawaitable(value):
+            return await value
+        return value
 
     def _ensure_no_active(self, *, method: str) -> None:
         if self._active_handle is not None or any(

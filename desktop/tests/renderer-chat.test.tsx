@@ -116,3 +116,72 @@ test("ChatTimeline preserves a reader's position and offers an explicit new-mess
     assert.equal(scrollTop, 400, "the explicit jump re-arms follow-tail");
   });
 });
+
+test("ChatTimeline requests one older page, preserves its anchor, and offers a local retry", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let scrollTop = 0;
+    let scrollHeight = 500;
+    let loadCalls = 0;
+    let retryCalls = 0;
+    const entries = (prefix: string): TimelineEntry[] => [
+      { id: `${prefix}-user`, kind: "user", text: `${prefix} prompt`, sequence: prefix === "old" ? 1 : 2, turnId: prefix },
+      { id: `${prefix}-assistant`, kind: "assistant", text: `${prefix} answer`, sequence: prefix === "old" ? 2 : 3, turnId: prefix },
+    ];
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline
+        entries={entries("recent")}
+        todo={[]}
+        sessionKey="history"
+        historyHasMore
+        onLoadOlder={() => { loadCalls += 1; }}
+        onRetryOlder={() => { retryCalls += 1; }}
+      /></LanguageProvider>);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const timeline = container.querySelector<HTMLElement>(".timeline");
+    assert.ok(timeline);
+    Object.defineProperty(timeline, "scrollHeight", { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(timeline, "clientHeight", { configurable: true, get: () => 100 });
+    Object.defineProperty(timeline, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = value; } });
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
+    assert.equal(scrollTop, 400);
+    scrollTop = 32;
+    act(() => { timeline!.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+    assert.equal(loadCalls, 1);
+
+    scrollHeight = 800;
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline
+        entries={[...entries("old"), ...entries("recent")]}
+        todo={[]}
+        sessionKey="history"
+        historyHasMore
+        historyLoading
+        historyRevision={1}
+        onLoadOlder={() => { loadCalls += 1; }}
+        onRetryOlder={() => { retryCalls += 1; }}
+      /></LanguageProvider>);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(scrollTop, 332, "older rows are inserted above the same visible pixel");
+    act(() => { timeline!.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+    assert.equal(loadCalls, 1, "loading suppresses a duplicate top request");
+
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline
+        entries={[...entries("old"), ...entries("recent")]}
+        todo={[]}
+        sessionKey="history"
+        historyHasMore
+        historyError="history unavailable"
+        onLoadOlder={() => { loadCalls += 1; }}
+        onRetryOlder={() => { retryCalls += 1; }}
+      /></LanguageProvider>);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const retry = container.querySelector<HTMLButtonElement>(".timeline-history-error button");
+    assert.ok(retry);
+    act(() => { retry!.click(); });
+    assert.equal(retryCalls, 1);
+  });
+});

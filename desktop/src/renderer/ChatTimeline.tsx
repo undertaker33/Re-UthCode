@@ -30,6 +30,17 @@ export interface ChatTimelineProps {
   onCopyText?: (text: string) => Promise<void>;
   /** Changes only when a Session/Project view is replaced, not on streaming. */
   sessionKey?: string;
+  /** Request an older durable page when the reader reaches the top. */
+  onLoadOlder?: () => void;
+  /** Retry only the failed older-page request. */
+  onRetryOlder?: () => void;
+  historyHasMore?: boolean;
+  historyLoading?: boolean;
+  historyError?: string | null;
+  /** Changes after a successful durable page prepend. */
+  historyRevision?: number;
+  /** Cold runtime preparation is independent from the visible history page. */
+  preparationStatus?: "preparing" | "ready" | "failed";
 }
 
 function entryLabel(entry: TimelineEntry, t: (key: TranslationKey) => string): string {
@@ -83,7 +94,7 @@ function timelineContentFingerprint(entries: TimelineEntry[], notice: string | n
   });
 }
 
-export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default" }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
@@ -91,6 +102,8 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
   const followTail = useRef(true);
   const previousSessionKey = useRef<string | null>(null);
   const previousContentFingerprint = useRef<string | null>(null);
+  const previousHistoryRevision = useRef(historyRevision);
+  const prependAnchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const contentFingerprint = timelineContentFingerprint(entries, notice, runtimeError, runtimeErrorVisible);
 
   useLayoutEffect(() => {
@@ -98,12 +111,21 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
     if (!element) return;
     const sessionChanged = previousSessionKey.current !== sessionKey;
     const contentChanged = previousContentFingerprint.current !== contentFingerprint;
+    const historyChanged = previousHistoryRevision.current !== historyRevision;
     previousSessionKey.current = sessionKey;
     previousContentFingerprint.current = contentFingerprint;
+    previousHistoryRevision.current = historyRevision;
     if (sessionChanged) {
       followTail.current = true;
       setShowNewMessages(false);
       scrollTimelineToBottom(element);
+    } else if (historyChanged && prependAnchor.current) {
+      const anchor = prependAnchor.current;
+      prependAnchor.current = null;
+      // Inserting older records increases scrollHeight above the existing
+      // viewport. Restore the same first visible pixel instead of jumping.
+      element.scrollTop = Math.max(0, anchor.scrollTop + (element.scrollHeight - anchor.scrollHeight));
+      setShowNewMessages(false);
     } else if (contentChanged && followTail.current) {
       setShowNewMessages(false);
       scrollTimelineToBottom(element);
@@ -115,7 +137,7 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
     } else if (followTail.current) {
       scrollTimelineToBottom(element);
     }
-  }, [contentFingerprint, sessionKey]);
+  }, [contentFingerprint, historyRevision, sessionKey]);
 
   useEffect(() => {
     const element = timelineRef.current;
@@ -138,6 +160,22 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
     const nearBottom = isNearBottom(event.currentTarget);
     followTail.current = nearBottom;
     if (nearBottom) setShowNewMessages(false);
+    if (event.currentTarget.scrollTop <= TIMELINE_NEAR_BOTTOM_THRESHOLD
+      && historyHasMore
+      && !historyLoading
+      && onLoadOlder) {
+      prependAnchor.current = {
+        scrollHeight: event.currentTarget.scrollHeight,
+        scrollTop: event.currentTarget.scrollTop,
+      };
+      onLoadOlder();
+    }
+  };
+
+  const retryOlder = () => {
+    const element = timelineRef.current;
+    if (element) prependAnchor.current = { scrollHeight: element.scrollHeight, scrollTop: element.scrollTop };
+    onRetryOlder?.();
   };
 
   const jumpToLatest = () => {
@@ -165,6 +203,11 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
         <span>{runtimeError}</span>
         {onOpenSettings && <button type="button" onClick={onOpenSettings}>{t("openSettings")}</button>}
       </div>}
+      {preparationStatus === "preparing" && <p className="timeline-preparation" role="status">{t("sessionPreparing")}</p>}
+      {preparationStatus === "failed" && <p className="timeline-preparation timeline-preparation--failed" role="alert">{t("sessionPreparationFailed")}</p>}
+      {historyError && <div className="timeline-history-error" role="alert"><span>{historyError}</span>{onRetryOlder && <button type="button" onClick={retryOlder}>{t("retry")}</button>}</div>}
+      {historyLoading && <p className="timeline-history-loading" role="status">{t("loadOlder")}…</p>}
+      {historyHasMore && !historyLoading && onLoadOlder && entries.length > 0 && <button type="button" className="timeline-load-older" onClick={() => { const element = timelineRef.current; if (element) prependAnchor.current = { scrollHeight: element.scrollHeight, scrollTop: element.scrollTop }; onLoadOlder(); }}>{t("loadOlder")}</button>}
       {visibleNotice && <p className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
       {showNewMessages && <button type="button" className="timeline-new-messages" data-new-messages="true" aria-label={t("jumpToLatest")} title={t("jumpToLatest")} onClick={jumpToLatest}>{t("newMessages")}</button>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}

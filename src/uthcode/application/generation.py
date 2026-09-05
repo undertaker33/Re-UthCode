@@ -78,6 +78,7 @@ from .sessions import (
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
     SessionCatalogEntry,
+    SessionHistoryPage,
     SessionMutation,
     SessionReplayRecord,
     SessionOperationError,
@@ -510,6 +511,13 @@ class UthCodeApplication:
             return ()
         return self._session_service.list_catalog()
 
+    def session_catalog_metadata(self) -> tuple[SessionCatalogEntry, ...]:
+        """Return Session Picker rows without loading every transcript."""
+
+        if self._session_service is None:
+            return ()
+        return self._session_service.list_catalog_metadata()
+
     def new_session_for_command(self) -> ApplicationSession:
         """Create and commit a fresh Session only after staging succeeds."""
 
@@ -607,7 +615,13 @@ class UthCodeApplication:
         elif not isinstance(context_budget, ContextBudget):
             raise TypeError("context_budget must be a ContextBudget or None")
         await self._preflight_session_model_async(session_id)
-        session = self._session_service.resume_session_for_command(
+        # Opening the writer, loading/reconciling the JSONL snapshot and
+        # rebuilding the Session instruction state are synchronous storage
+        # boundaries. Keep this bounded recovery operation off an interface
+        # event loop; Provider limit resolution below remains on the caller's
+        # loop instead of moving an async Provider client to a worker thread.
+        session = await asyncio.to_thread(
+            self._session_service.resume_session_for_command,
             session_id,
             replay_builder=self._build_session_replay,
         )
@@ -637,6 +651,24 @@ class UthCodeApplication:
             return active.replay
         snapshot = self._session_service.read_session(session_id)
         return self._build_session_replay(snapshot)
+
+    def session_history_page(
+        self,
+        session_id: str,
+        *,
+        cursor: str | None = None,
+        page_size: int = 30,
+    ) -> SessionHistoryPage:
+        """Read one bounded history page through the Application boundary."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.read_history_page(
+            session_id,
+            cursor=cursor,
+            page_size=page_size,
+            tool_summary=self._tool_service.describe_tool_call,
+        )
 
     def _build_session_replay(self, snapshot) -> tuple[SessionReplayRecord, ...]:
         """Build the interface-neutral replay through Application redaction."""
@@ -2035,7 +2067,13 @@ class UthCodeApplication:
 
         if self._session_service is None:
             return
-        snapshot = self._session_service.read_session_for_command(session_id)
+        # SessionFileStore recovery is synchronous filesystem work. Keep it
+        # off an interface event loop; Provider limit resolution below is
+        # intentionally awaited on the caller's loop.
+        snapshot = await asyncio.to_thread(
+            self._session_service.read_session_for_command,
+            session_id,
+        )
         model_ref = snapshot.metadata.model_ref
         if not model_ref or model_ref == self._current_model_ref:
             return

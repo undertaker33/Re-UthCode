@@ -69,6 +69,156 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   assert.equal(fresh.run?.run_id, "fresh-run");
 });
 
+test("history pages merge with live output, dedupe stable identities, and ignore stale Sessions", () => {
+  const projectKey = "C:/Projects/history-renderer";
+  const key = sessionRuntimeKey(projectKey, "session-a");
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    timeline: [{ id: "live-assistant", kind: "assistant", text: "live tail", turnId: "turn-1", messageId: "message-1", streaming: true }],
+    projects: [{
+      path: projectKey,
+      projectKey,
+      alias: "History",
+      pinned: false,
+      sessions: [{ session_id: "session-a" }, { session_id: "session-b" }],
+      catalogFresh: true,
+    }],
+  });
+  state = reduceRendererState(state, { type: "history_page_started", projectKey, sessionId: "session-a" });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-a",
+    replace: true,
+    result: {
+      session_id: "session-a",
+      records: [
+        { record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "user", text: "prompt", is_error: false },
+        { record_id: "session-a:2:assistant:0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", message_id: "message-1", text: "durable final", is_error: false },
+      ],
+      next_cursor: "older",
+      has_more: true,
+      unit_count: 1,
+    },
+  });
+  assert.deepEqual(state.timeline.map((entry) => entry.text), ["prompt", "durable final"]);
+  assert.equal(state.sessionHistory[key]?.records.length, 2);
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-a",
+    result: {
+      session_id: "session-a",
+      records: [
+        { record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "user", text: "prompt", is_error: false },
+        { record_id: "session-a:2:assistant:0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", text: "durable final", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.equal(state.sessionHistory[key]?.records.length, 2, "repeated page identities are collapsed");
+  assert.equal(state.timeline.filter((entry) => entry.kind === "assistant").length, 1, "live and durable assistant are one visible record");
+
+  let liveTail = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    timeline: [{ id: "live-new", kind: "assistant", text: "live:new", turnId: "turn-2", streaming: true }],
+  });
+  liveTail = reduceRendererState(liveTail, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-a",
+    replace: true,
+    result: {
+      session_id: "session-a",
+      records: [
+        { record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "user", text: "oldprompt", is_error: false },
+        { record_id: "session-a:2:assistant:0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", text: "oldanswer", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.deepEqual(liveTail.timeline.map((entry) => entry.text), ["oldprompt", "oldanswer", "live:new"], "live records remain at the tail after older history is inserted");
+
+  const beforeStale = state;
+  const stale = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-b",
+    result: { session_id: "session-a", records: [], next_cursor: null, has_more: false, unit_count: 0 },
+  });
+  assert.deepEqual(stale, beforeStale, "a response for another Session cannot replace the current view");
+});
+
+test("history merge preserves distinct same-turn assistant parts and messages", () => {
+  const projectKey = "C:/Projects/history-identities";
+  const base = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    timeline: [{ id: "live-assistant", kind: "assistant", text: "streaming prefix", turnId: "turn-1", messageId: "message-1", streaming: true }],
+  });
+  const result = reduceRendererState(base, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-a",
+    replace: true,
+    result: {
+      session_id: "session-a",
+      records: [
+        { record_id: "session-a:1:assistant::0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: "message-1", text: "part one", is_error: false },
+        { record_id: "session-a:1:assistant::1", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: "message-1", text: "part two", is_error: false },
+        { record_id: "session-a:2:assistant::0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", message_id: "message-2", text: "independent message", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.equal(result.timeline.filter((entry) => entry.kind === "assistant").length, 3);
+  assert.deepEqual(result.timeline.map((entry) => entry.text), ["part one", "part two", "independent message"]);
+  assert.equal(result.sessionHistory[sessionRuntimeKey(projectKey, "session-a")]?.records.length, 3);
+});
+
+test("preparing Session resume keeps its history timeline and marks ready only after the boundary", () => {
+  const projectKey = "C:/Projects/history-preparing";
+  let state = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: "session-a" });
+  state = reduceRendererState(state, { type: "history_page_started", projectKey, sessionId: "session-a" });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-a",
+    replace: true,
+    result: {
+      session_id: "session-a",
+      records: [{ record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "user", text: "history", is_error: false }],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.equal(state.sessionPreparation[sessionRuntimeKey(projectKey, "session-a")], "preparing");
+  const resumed = reduceRendererState(state, {
+    type: "session_resumed",
+    preserveRuntimeState: true,
+    preserveSessionRuntime: true,
+    preserveTimeline: true,
+    result: {
+      session_id: "session-a",
+      replay: [],
+      run: null,
+      session_state: { active_turn: false, run: null },
+    },
+  });
+  assert.deepEqual(resumed.timeline.map((entry) => entry.text), ["history"]);
+  assert.equal(resumed.sessionPreparation[sessionRuntimeKey(projectKey, "session-a")], "ready");
+  assert.deepEqual(resumed.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]?.timeline.map((entry) => entry.text), ["history"]);
+});
+
 test("T05 Provider usage follows Session boundaries, snapshots, and delayed status", () => {
   const projectKey = "C:/Projects/provider-usage-boundary";
   const usage = (input: number, output: number) => normalizeProviderRequestUsage({
