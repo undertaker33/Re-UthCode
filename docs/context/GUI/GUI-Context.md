@@ -43,6 +43,8 @@ visible Session A 有 active Turn
 ```
 
 - 同一 Session 同时最多一个 active Turn，仍遵守 `AgentRun` 的独占约束；在该 Session 可见时，普通输入是 Steering，暂停/恢复/取消仍指向同一 Turn。
+- 普通侧栏与 Slash 导航保留 Session-owned Run 的事件接收，不把停放的 Run 当作已失效 Run；真正清空工作区时清除显示缓存并拒绝已知旧 Run 的迟到事件。目录刷新省略运行状态时保留已有 running/waiting 等投影；带身份的 status 只更新匹配 Project/Session 的投影，不覆盖另一可见会话。
+- 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。恢复已持有 runtime 的 Session 优先使用其匹配的已加载 snapshot 生成 replay，避免重复读盘；首次恢复与目录刷新仍保留既有持久读取语义，不保证长历史会话瞬时切换。
 - Session rename/move 是 Application 的持久元数据操作。Bridge 在任一已保存 runtime 仍有 active Turn 时拒绝这些变更，避免修改与运行中的 Session 边界竞争。
 - 进程内的 per-Session runtime 是导航连续性机制，不是 Session v3 持久格式的一部分。Runtime crash/protocol error 仍与 Provider/Turn 的正式失败投影分离。
 

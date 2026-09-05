@@ -765,11 +765,11 @@ export type RendererAction =
   | { type: "runtime_initialized"; result: unknown; preserveRuntimeState?: boolean }
   | { type: "status_loaded"; result: unknown }
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
-  | { type: "project_opened"; result: unknown; preserveRuntimeState?: boolean }
+  | { type: "project_opened"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
-  | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean }
+  | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
-  | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null }
+  | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
   | { type: "compaction_started"; trigger?: CompactionTrigger }
   | { type: "agent_event"; event: AgentEvent }
   | { type: "interaction_submitting"; value: boolean }
@@ -867,42 +867,49 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const normalizedProviderUsage = providerUsageValue !== undefined
         ? normalizeProviderRequestUsage(providerUsageValue)
         : undefined;
-      const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
       const sessionId = state.selectedSessionId;
-      const nextSessionModels = currentModelRef && sessionId
+      const rawStatusSessionId = nonEmptyText(source.session_id);
+      const rawStatusProjectKey = nonEmptyText(source.project_key);
+      const statusProjectKey = rawStatusProjectKey ?? state.selectedProjectKey;
+      const statusTargetsVisibleProject = rawStatusProjectKey === null || rawStatusProjectKey === state.selectedProjectKey;
+      const statusTargetsVisibleSession = statusTargetsVisibleProject && (rawStatusSessionId === null || rawStatusSessionId === sessionId);
+      const statusSessionId = rawStatusSessionId ?? (statusTargetsVisibleProject ? sessionId : null);
+      const activeTurn = source.active_turn === true ? true : source.active_turn === false ? false : state.activeTurn;
+      const nextSessionModels = statusTargetsVisibleSession && currentModelRef && sessionId
         ? { ...state.sessionModels, [sessionId]: currentModelRef }
         : state.sessionModels;
-      const rawStatusSessionId = nonEmptyText(source.session_id);
-      const statusSessionId = rawStatusSessionId ?? sessionId;
-      const statusProjectKey = nonEmptyText(source.project_key) ?? state.selectedProjectKey;
       const statusKey = statusSessionId ? sessionRuntimeKey(statusProjectKey, statusSessionId) : null;
       const hydrated = statusSessionId
-        ? sessionRuntimeFromSource(source, state.timeline, state.sessionRuntime[statusKey as string] ?? null, normalizedProviderUsage)
+        ? sessionRuntimeFromSource(
+          source,
+          statusTargetsVisibleSession && statusSessionId === sessionId ? state.timeline : [],
+          state.sessionRuntime[statusKey as string] ?? null,
+          normalizedProviderUsage,
+        )
         : null;
       const nextSessionRuntime = statusKey && hydrated
         ? { ...state.sessionRuntime, [statusKey]: hydrated }
         : state.sessionRuntime;
-      const visibleHydrated = statusSessionId === sessionId && hydrated ? hydrated : null;
-      const statusTargetsVisibleSession = rawStatusSessionId === null || rawStatusSessionId === sessionId;
+      const visibleHydrated = statusTargetsVisibleSession && statusSessionId === sessionId && hydrated ? hydrated : null;
       const visibleProviderUsage = statusTargetsVisibleSession
         ? hydrated?.lastProviderRequestUsage ?? normalizedProviderUsage
         : undefined;
       const statusState: RendererState = {
         ...state,
         ...(runtimeState ? { runtimeState } : {}),
-        ...(source.active_turn === true || source.active_turn === false ? { activeTurn } : {}),
-        ...(source.active_turn === false ? { terminalStatusPending: false } : {}),
-        ...(currentModelRef ? { currentModelRef } : {}),
+        ...(statusTargetsVisibleSession && (source.active_turn === true || source.active_turn === false) ? { activeTurn } : {}),
+        ...(statusTargetsVisibleSession && source.active_turn === false ? { terminalStatusPending: false } : {}),
+        ...(statusTargetsVisibleSession && currentModelRef ? { currentModelRef } : {}),
         sessionModels: nextSessionModels,
         // A partial status response is allowed during transport recovery. It
         // must not erase the last complete Context measurement or Compaction
         // state that the Application already published.
-        ...(contextValue !== undefined
+        ...(statusTargetsVisibleSession && contextValue !== undefined
           ? { contextUsage: normalizeContextUsage(contextValue) }
-          : legacyContextPresent
+          : statusTargetsVisibleSession && legacyContextPresent
             ? { contextUsage: contextUsageAtBoundary() }
             : {}),
-        ...(compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
+        ...(statusTargetsVisibleSession && compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
         ...(visibleProviderUsage ? { lastProviderRequestUsage: cloneProviderRequestUsage(visibleProviderUsage) } : {}),
         ...(visibleHydrated ? {
           timeline: visibleHydrated.timeline,
@@ -922,18 +929,18 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
     case "project_opened":
-      return applyProjectOpened(state, action.result, action.preserveRuntimeState);
+      return applyProjectOpened(state, action.result, action.preserveRuntimeState, action.preserveSessionRuntime);
     case "catalog_refreshed":
       return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
     case "session_resumed":
-      return applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result));
+      return applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime);
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new": {
       const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
       const modelRef = nonEmptyText(action.modelRef);
       const next: RendererState = {
-        ...permissionUnknownAtRunBoundary(stateWithCache, action.run),
+        ...permissionUnknownAtRunBoundary(stateWithCache, action.run, action.preserveSessionRuntime !== true),
         selectedSessionId: action.sessionId,
         timeline: [],
         todo: [],
@@ -975,6 +982,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         ? applyRuntimeSnapshot(emptyRuntimeBoundary(state), cached)
         : emptyRuntimeBoundary(state);
       const next = reduceAgentEvent(base, action.event);
+      if (next === base) return state;
       const snapshot = runtimeSnapshotFromState(next);
       const stored = { ...state.sessionRuntime, [key]: snapshot };
       return updateSessionRuntimeStatus({ ...state, sessionRuntime: stored }, eventProjectKey, eventSessionId as string, runtimeStatus(snapshot));
@@ -1049,8 +1057,8 @@ export function reduceRendererState(state: RendererState, action: RendererAction
         const replay = params?.replay;
         const run = params?.run;
         const next = actionValue.restored === true
-          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params))
-          : { ...permissionUnknownAtRunBoundary(state, run), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
+          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params), true)
+          : { ...permissionUnknownAtRunBoundary(state, run, false), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
         return { ...next, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: notice, composerText: "" };
@@ -1089,39 +1097,45 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "clear_timeline":
       return { ...state, timeline: [] };
     case "workspace_cleared":
-      return {
-        ...state,
-        selectedProjectKey: null,
-        selectedSessionId: null,
-        timeline: [],
-        todo: [],
-        todoIteration: 0,
-        run: null,
-        contextUsage: contextUsageAtBoundary(),
-        lastProviderRequestUsage: providerRequestUsageAtBoundary(),
-        permissionMode: "unknown",
-        currentModelRef: null,
-        activeTurn: false,
-        terminalStatusPending: false,
-        turnStatus: "idle",
-        pendingInteraction: null,
-        completionBlocked: null,
-        commandCandidates: [],
-        argumentCandidates: [],
-        commandUsage: null,
-        commandArgumentPrompt: null,
-        commandOutput: null,
-        composerText: "",
-        modelCandidates: [],
-        modelPickerOpen: false,
-        notice: null,
-        runtimeError: null,
-        runtimeState: "stopped",
-        ignoredRunIds: state.run?.run_id
-          ? [...state.ignoredRunIds, state.run.run_id].slice(-20)
-          : state.ignoredRunIds,
-        sessionViewRevision: state.sessionViewRevision + 1,
-      };
+      {
+        const invalidatedRunIds = [
+          ...state.ignoredRunIds,
+          ...Object.values(state.sessionRuntime).map((snapshot) => snapshot.run?.run_id),
+          state.run?.run_id,
+        ].filter((runId): runId is string => typeof runId === "string" && runId.length > 0);
+        return {
+          ...state,
+          selectedProjectKey: null,
+          selectedSessionId: null,
+          timeline: [],
+          todo: [],
+          todoIteration: 0,
+          run: null,
+          contextUsage: contextUsageAtBoundary(),
+          lastProviderRequestUsage: providerRequestUsageAtBoundary(),
+          permissionMode: "unknown",
+          currentModelRef: null,
+          activeTurn: false,
+          terminalStatusPending: false,
+          turnStatus: "idle",
+          pendingInteraction: null,
+          completionBlocked: null,
+          commandCandidates: [],
+          argumentCandidates: [],
+          commandUsage: null,
+          commandArgumentPrompt: null,
+          commandOutput: null,
+          composerText: "",
+          modelCandidates: [],
+          modelPickerOpen: false,
+          notice: null,
+          runtimeError: null,
+          runtimeState: "stopped",
+          sessionRuntime: {},
+          ignoredRunIds: [...new Set(invalidatedRunIds)].slice(-20),
+          sessionViewRevision: state.sessionViewRevision + 1,
+        };
+      }
     case "notice":
       return { ...state, notice: action.text };
     case "set_theme":

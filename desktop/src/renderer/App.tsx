@@ -309,6 +309,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const commandInFlightRef = useRef(false);
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
+  const runtimeStatusPollRef = useRef<Promise<boolean> | null>(null);
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
@@ -427,10 +428,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     await refreshCatalog(projectKey, "catalog_refresh", undefined, false);
   }, [isMounted, refreshCatalog]);
 
-  const refreshRuntimeStatus = useCallback(async (isOwned?: RuntimeOwnershipCheck): Promise<boolean> => {
+  const refreshRuntimeStatus = useCallback(async (isOwned?: RuntimeOwnershipCheck, skipIfOwned = false): Promise<boolean> => {
     if (isOwned) {
       if (!isOwned()) return false;
-    } else if (!(await waitForRuntimeLifecycleIdle()) || hasOwner() || stateRef.current.runtimeState === "restarting") return false;
+    } else {
+      if (skipIfOwned && (hasOwner() || stateRef.current.runtimeState === "restarting")) return false;
+      if (!(await waitForRuntimeLifecycleIdle())) return false;
+      if (hasOwner() || stateRef.current.runtimeState === "restarting") return false;
+    }
     try {
       const result = await send("status.get", {});
       if (isOwned && !isOwned()) return false;
@@ -459,7 +464,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     if (!api || (!state.activeTurn && state.compactionStatus.state !== "running")) return undefined;
     let cancelled = false;
     const refresh = () => {
-      if (!cancelled) void refreshRuntimeStatus();
+      if (cancelled || runtimeStatusPollRef.current) return;
+      const pending = refreshRuntimeStatus(undefined, true);
+      runtimeStatusPollRef.current = pending;
+      void pending.then(
+        () => {
+          if (runtimeStatusPollRef.current === pending) runtimeStatusPollRef.current = null;
+        },
+        () => {
+          if (runtimeStatusPollRef.current === pending) runtimeStatusPollRef.current = null;
+        },
+      );
     };
     const timer = window.setInterval(refresh, 1000);
     return () => {
@@ -552,7 +567,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     await enqueueRuntimeOperation("navigation", async (isOwned) => {
       const result = await send("project.open", { path });
       if (!isOwned()) throw new StaleRuntimeOperation();
-      dispatch({ type: "project_opened", result, preserveRuntimeState: true });
+      dispatch({ type: "project_opened", result, preserveRuntimeState: true, preserveSessionRuntime: true });
       const next = stateRef.current.projects.some((project) => project.projectKey === path)
         ? stateRef.current.projects
         : [...stateRef.current.projects, { path, projectKey: path, alias: path.split(/[\\/]/u).filter(Boolean).pop() || path, pinned: false, sessions: [], catalogFresh: true }];
@@ -715,7 +730,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (stateRef.current.selectedProjectKey !== project.projectKey) {
         const opened = await send("project.open", { path: project.path });
         if (!isOwned()) throw new StaleRuntimeOperation();
-        dispatch({ type: "project_opened", result: opened, preserveRuntimeState: true });
+        dispatch({ type: "project_opened", result: opened, preserveRuntimeState: true, preserveSessionRuntime: true });
         await persist("selectedProjectKey", project.projectKey);
       }
       if (sessionId) {
@@ -723,7 +738,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         if (!isOwned()) throw new StaleRuntimeOperation();
         setLatestTurnIdentity(identityFromRun(asObject(result).run));
         cancelTerminalStatusPoll();
-        dispatch({ type: "session_resumed", result, preserveRuntimeState: true });
+        dispatch({ type: "session_resumed", result, preserveRuntimeState: true, preserveSessionRuntime: true });
         await persist("selectedSessionId", sessionId);
       } else {
         const result = await send("session.new", {});
@@ -733,7 +748,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         if (nextId) {
           setLatestTurnIdentity(identityFromRun(source.run));
           cancelTerminalStatusPoll();
-          dispatch({ type: "session_new", sessionId: nextId, run: source.run, modelRef: typeof source.model_ref === "string" ? source.model_ref : null });
+          dispatch({ type: "session_new", sessionId: nextId, run: source.run, modelRef: typeof source.model_ref === "string" ? source.model_ref : null, preserveSessionRuntime: true });
           await persist("selectedSessionId", nextId);
         }
       }

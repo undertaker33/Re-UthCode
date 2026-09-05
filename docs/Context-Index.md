@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 已齐全；W02 Compact 1A correctness hotfix 已删除 `generation.py` manual 与 ordinary/overflow/L5 validator 的旧 summary-length gate，只以 prospective ordinary Working Context `after < before` 裁决，并有反向 regression。全量 Python `1481 passed, 3 skipped`、架构 `23 passed`、`compileall`/`pip check` exit 0；Desktop 本轮 `npm test` 为 `183 passed, 0 failed, 0 skipped`，`typecheck` exit 0。package/make 与 en/zh packaged stream/visual 报告均为 hotfix 前 `7f858896f92d7f0bc16278cd82ab7f27ce2b74df` 基线证据，本轮按范围未重打包或重建 Installer，不宣称旧安装器包含该 hotfix。Checklist 已记录全部当前可验证项及不可用外部场景；用户最终 F03 复验仍待进行。真实 Provider、native pointer/Windows 原生 DPI/zoom、干净 Windows、人工视觉与实际用户桌面输入未独立验证，未描述为通过；F03 目录仍在 `docs/work/`，未归档。 |
+| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全。Compact 1A correctness hotfix 已删除旧 summary-length gate；历史全量 Python `1481 passed, 3 skipped`。W07 第 5 轮修复迟到 RPC 响应造成 Runtime 失效，标准 package 已更新，PR #99 合并；第 6 轮修复运行中会话导航丢事件、目录覆盖运行图标、status 串会话及轮询积压，并复用已加载 Session snapshot。当前 Desktop `195 passed`、Python Bridge/Application/Session/架构定向 `125 passed`，typecheck 通过。第 6 轮未更新运行中的 packaged app，待关闭应用后重打包；既有安装器不宣称包含这些返工。详细审核、构建与复验边界见 W07 Feedback。用户最终复验仍待进行，真实 Provider、干净 Windows、原生 DPI 等未验证项不宣称通过；未归档。 |
 
 ### `not_implemented`
 

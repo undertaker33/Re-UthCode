@@ -896,14 +896,32 @@ class DesktopBridge:
     @staticmethod
     def _session_replay_for_application(application: object | None, session_id: str) -> object:
         service = getattr(application, "session_service", None)
+        active = getattr(service, "active_session", None) if service is not None else None
+        active_id = getattr(active, "session_id", None)
+        if active is not None and active_id == session_id:
+            # A selected Session already owns a loaded writer snapshot. Project
+            # the snapshot in memory instead of reopening the same durable
+            # file on every navigation round trip.
+            project_replay_snapshot = getattr(service, "project_replay_snapshot", None)
+            try:
+                snapshot = getattr(active, "snapshot", None)
+            except Exception:
+                snapshot = None
+            if callable(project_replay_snapshot) and snapshot is not None:
+                try:
+                    return project_replay_snapshot(snapshot)
+                except Exception:
+                    pass
+            replay = getattr(active, "replay", None)
+            if replay is not None:
+                return replay
         project_replay = getattr(service, "project_replay", None)
         if callable(project_replay):
             try:
                 return project_replay(session_id)
             except Exception:
                 pass
-        active = getattr(service, "active_session", None) if service is not None else None
-        return getattr(active, "replay", ())
+        return getattr(active, "replay", ()) if active is not None and active_id == session_id else ()
 
     def _runtime_result(self) -> dict[str, object]:
         application = self._application

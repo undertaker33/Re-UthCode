@@ -229,3 +229,15 @@ W02 已在 `src/uthcode/application/generation.py` 删除 manual `compact_sessio
 原 reviewer 按用户最新要求使用 luna/max 完成复审，结论 PASS、无剩余 finding。主控在 `re-uthcode` 环境执行 `npm --prefix desktop run package`，exit 0；包含 Runtime ready/status/shutdown 与 prompt 资源 smoke。旧故障实例正常关闭后完成标准打包，新包 `desktop/out/UthCode-win32-x64/UthCode.exe` 已启动；实际通过侧栏从原会话切到另一已有会话，再切回原会话，未出现导航错误。原草稿“你好”已恢复，发送按钮可用，但未点击发送、未调用真实 Provider。原会话 Transcript 与 Timeline 的长度及修改时间在关闭旧实例后核对未变；正常导航可能更新会话使用元数据。
 
 本轮没有执行 `npm run make`，没有更新安装器；真实 Provider 的手动压缩和消息发送仍待用户复验，不以离线 fixture 或按钮可用代替端到端验收。当前 package 包含此前 Python Compact 1A hotfix 与本轮 Desktop transport 修复，取代第 4 轮所述未重打包状态；历史安装器边界保持不变。未执行工作包归档，未修改冻结正文或无关用户目录。
+
+## 返工第 6 轮：运行中 Session 导航丢事件、图标与延迟
+
+用户复验报告：运行中切换会话后侧栏运行标记不稳定，导航明显等待，切回原会话时 Context 增长但聊天没有新增，重启后才恢复。代码证据确认普通导航将旧 Run 写入全局 ignoredRunIds，后台和切回后的事件均被拒绝；目录 metadata 省略 runtime_status 时被规范化为 idle，覆盖实时图标。主控独立运行新增 A→B→A 回归，旧代码只保留 `before navigation`，缺少后台 `after navigation`，结果 1 failed，构成修复前证据。
+
+本轮 worker 使用 luna/max：普通侧栏及 Slash 导航显式保留 Session runtime 的事件归属，真正替换/清空仍保留 stale 拒绝；清空时清理 per-Session 显示缓存并失效已知 Run，被拒绝的后台事件不再重建空缓存。目录缺少状态字段时保留当前实时状态，显式状态仍可更新；迟到 status 按 Project/Session 隔离，不能把另一会话的 Context、模型或 Timeline 写入可见会话。未新增业务状态或持久缓存。
+
+延迟处理仅移除当前可证明的多余工作：补充 status 轮询 single-flight，导航/重启 owner 占用期间跳过，不在串行 Bridge 前积压；已有 active Session 的 replay 优先从匹配的已加载 snapshot 投影，保留既有 fallback。首次恢复与 project.sessions 的持久读取未改，长历史目录仍有读取成本，不宣称所有切换瞬时完成。只读 worker 的临时 fake Provider 探针曾观察到 5 个各 2000-entry 会话目录读取约 1.3 秒、单会话 snapshot 投影约 26–28ms 对比重读约 285–299ms；探针未留存为可重复脚本，这些数值仅作诊断线索，不作为固定性能承诺或正式性能验收。
+
+worker 定向 7/7、相关 Renderer 集合 140/140、Bridge 67 passed；主控执行 `conda run --no-capture-output -n re-uthcode npm --prefix desktop test`，设置项目 Python 路径后为 `195 passed, 0 failed, 0 skipped`、exit 0、`57119.2373ms`；同环境 `npm --prefix desktop run typecheck` exit 0。主控执行 `python -m pytest tests/test_desktop_bridge.py tests/test_application_runtime.py tests/test_session_files.py tests/test_architecture_boundaries.py -q`，`125 passed in 9.97s`、exit 0。未重复全仓 Python 测试，未调用真实 Provider 或操作用户运行中的应用/会话。
+
+独立 luna/max reviewer 最终 PASS，无证据充分的剩余 finding；审核中对 Slash `/new` 缓存与跨 Project Runtime 状态的疑点，经核对真实调用边界后撤回，未据此扩码。GUI 当前事实与 Context Index 已同步，3 份文档 UTF-8 guard 通过，无编码问题需修复。当前用户应用仍运行，尚未取得关闭确认，因此本轮未执行标准 package/make 或更新安装器；第 5 轮已启动的包不包含第 6 轮代码。真实 Provider、真实用户环境长会话切换延迟与新 packaged app 仍待复验，F03 未归档。
