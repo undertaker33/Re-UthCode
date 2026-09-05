@@ -564,6 +564,27 @@ async def test_resuming_current_running_session_returns_without_waiting_for_turn
     await bridge.shutdown()
 
 
+def test_session_replay_projects_matching_active_snapshot_before_storage() -> None:
+    expected = ("from-snapshot",)
+    calls: list[object] = []
+
+    class SnapshotService:
+        active_session = SimpleNamespace(session_id="session-target", snapshot=object(), replay=("active-replay",))
+
+        def project_replay_snapshot(self, snapshot: object) -> tuple[str, ...]:
+            calls.append(snapshot)
+            return expected
+
+        def project_replay(self, _session_id: str) -> tuple[str, ...]:
+            raise AssertionError("matching active Session should not reopen durable storage")
+
+    application = SimpleNamespace(session_service=SnapshotService())
+    replay = DesktopBridge._session_replay_for_application(application, "session-target")
+
+    assert replay == expected
+    assert calls == [SnapshotService.active_session.snapshot]
+
+
 def test_background_runtime_reclaims_only_completed_inactive_pairs() -> None:
     current = _FakeApplication()
     completed = _FakeApplication()

@@ -1106,6 +1106,152 @@ test("T05 wide floating Runtime keeps its three-state layout without drawer dism
   });
 });
 
+test("T05 App keeps a background Session stream visible after switching away and back", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectPath = "C:/navigation-live";
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Live",
+      pinned: false,
+      sessions: [
+        { session_id: "session-a", title: "Session A", project_key: projectPath },
+        { session_id: "session-b", title: "Session B", project_key: projectPath },
+      ],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    const runFor = (id: "a" | "b") => ({ run_id: `run-${id}`, turn_id: `turn-${id}`, status: "running" });
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let visibleSessionId = "session-a";
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "session.resume") {
+          visibleSessionId = typeof params.session_id === "string" ? params.session_id : "session-a";
+          const id = visibleSessionId === "session-b" ? "b" : "a";
+          return {
+            session_id: visibleSessionId,
+            restored: true,
+            replay: [],
+            active_turn: true,
+            run: runFor(id),
+            session_state: { active_turn: true, run: runFor(id) },
+          };
+        }
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") {
+          const id = visibleSessionId === "session-b" ? "b" : "a";
+          return { session_id: `session-${id}`, project_key: projectPath, active_turn: true, session_state: { active_turn: true, run: runFor(id) } };
+        }
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined as never,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: projectPath,
+      selectedSessionId: "session-a",
+      run: runFor("a"),
+      activeTurn: true,
+      turnStatus: "running",
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const emit = (sessionId: string, runId: string, turnId: string, text: string) => {
+      act(() => { eventListener?.({ type: "assistant_message_delta", session_id: sessionId, project_key: projectPath, run_id: runId, turn_id: turnId, message_id: `message-${sessionId}`, text }); });
+    };
+
+    await flush();
+    emit("session-a", "run-a", "turn-a", "before navigation");
+    await flush();
+    const sessionRows = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)"));
+    const row = (title: string) => sessionRows().find((button) => button.textContent?.includes(title));
+    assert.ok(row("Session B"));
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    emit("session-b", "run-b", "turn-b", "background B");
+    emit("session-a", "run-a", "turn-a", "after navigation");
+    await flush();
+    assert.match(container.querySelector<HTMLElement>(".session-line.is-selected")?.textContent ?? "", /Session B/u);
+    const sessionBStatus = row("Session B")?.querySelector<HTMLElement>(".session-status-dot");
+    assert.equal(sessionBStatus?.getAttribute("title"), "running", "catalog refresh must not clear a live background icon");
+
+    assert.ok(row("Session A"));
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    emit("session-a", "run-a", "turn-a", "after return");
+    await flush();
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /before navigationafter navigationafter return/u);
+  });
+});
+
+test("T05 supplementary Runtime status polling is single-flight", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const timers: Array<() => void> = [];
+    Object.defineProperty(dom.window, "setInterval", {
+      configurable: true,
+      value: (callback: () => void) => {
+        timers.push(callback);
+        return timers.length;
+      },
+    });
+    Object.defineProperty(dom.window, "clearInterval", { configurable: true, value: () => undefined });
+    let statusCalls = 0;
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+    let resolveStatus: ((value: JsonObject) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method !== "status.get") return {};
+        statusCalls += 1;
+        activeRequests += 1;
+        maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+        return await new Promise<JsonObject>((resolve) => {
+          resolveStatus = (value) => {
+            activeRequests -= 1;
+            resolve(value);
+          };
+        });
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      activeTurn: true,
+      turnStatus: "running",
+      run: { run_id: "run-poll", turn_id: "turn-poll", status: "running" },
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await act(async () => { await tick(); await tick(); });
+    assert.ok(timers.length > 0);
+    for (const callback of timers) {
+      callback();
+      callback();
+    }
+    await act(async () => { await tick(); await tick(); });
+    assert.equal(statusCalls, 1, "a pending supplementary status request suppresses duplicate interval ticks");
+    assert.equal(maxActiveRequests, 1);
+    resolveStatus?.({ active_turn: true });
+    await act(async () => { await tick(); await tick(); });
+  });
+});
+
 test("T05 layout width helpers clamp docked tracks to a usable Conversation", () => {
   const wide = layoutWidthBounds(1100, "docked", 286, 318);
   assert.equal(wide.sidebar.min, 180);

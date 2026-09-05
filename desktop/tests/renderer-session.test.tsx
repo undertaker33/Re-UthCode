@@ -61,6 +61,44 @@ test("catalog refresh updates session rows in place instead of sorting a resumed
   assert.equal(refreshed.projects[0]?.sessions[0]?.preview, "one updated");
 });
 
+test("catalog refresh preserves live Session status when metadata omits it", () => {
+  const projectKey = "C:/one";
+  const initial = createInitialState({
+    projects: [{
+      path: projectKey,
+      projectKey,
+      alias: "One",
+      pinned: false,
+      sessions: [
+        { session_id: "running", preview: "running", runtime_status: "running" },
+        { session_id: "waiting", preview: "waiting", runtime_status: "waiting" },
+      ],
+      catalogFresh: true,
+    }],
+  });
+  const refreshed = reduceRendererState(initial, {
+    type: "catalog_refreshed",
+    projectKey,
+    sessions: [
+      { session_id: "running", preview: "running updated" },
+      { session_id: "waiting", preview: "waiting updated" },
+    ],
+  });
+  assert.equal(refreshed.projects[0]?.sessions[0]?.runtime_status, "running");
+  assert.equal(refreshed.projects[0]?.sessions[1]?.runtime_status, "waiting");
+
+  const terminal = reduceRendererState(refreshed, {
+    type: "catalog_refreshed",
+    projectKey,
+    sessions: [
+      { session_id: "running", preview: "done", runtime_status: "completed" },
+      { session_id: "waiting", preview: "waiting updated" },
+    ],
+  });
+  assert.equal(terminal.projects[0]?.sessions[0]?.runtime_status, "completed", "an explicit terminal status remains authoritative");
+  assert.equal(terminal.projects[0]?.sessions[1]?.runtime_status, "waiting");
+});
+
 test("session mutation moves one catalog row to the target without changing its identity or history projection", () => {
   const initial = createInitialState({
     projects: [

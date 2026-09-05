@@ -144,6 +144,42 @@ test("T05 Provider usage follows Session boundaries, snapshots, and delayed stat
   assert.equal(delayedFailure.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]?.lastProviderRequestUsage?.total_tokens, 133, "the delayed status is retained on Session A");
 });
 
+test("delayed status from another project cannot overwrite the visible Session projection", () => {
+  const visibleProject = "C:/Projects/status-visible";
+  const delayedProject = "C:/Projects/status-delayed";
+  const visible = createInitialState({
+    selectedProjectKey: visibleProject,
+    selectedSessionId: "shared-session",
+    timeline: [{ id: "visible", kind: "assistant", text: "visible output", runId: "visible-run", turnId: "visible-turn" }],
+    run: { run_id: "visible-run", turn_id: "visible-turn", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+    contextUsage: { used_tokens: 12, budget_tokens: 100, available: true, measurement: "exact", source: "visible" },
+    projects: [{
+      path: visibleProject,
+      projectKey: visibleProject,
+      alias: "Visible",
+      pinned: false,
+      sessions: [{ session_id: "shared-session", runtime_status: "running" }],
+      catalogFresh: true,
+    }],
+  });
+  const delayed = reduceRendererState(visible, {
+    type: "status_loaded",
+    result: {
+      session_id: "shared-session",
+      project_key: delayedProject,
+      active_turn: false,
+      application: { context_status: { used_tokens: 999, budget_tokens: 1000, available: true, measurement: "exact", source: "delayed" } },
+      session_state: { active_turn: false, run: { run_id: "delayed-run", status: "completed" } },
+    },
+  });
+  assert.equal(delayed.timeline[0]?.text, "visible output");
+  assert.equal(delayed.run?.run_id, "visible-run");
+  assert.equal(delayed.contextUsage.used_tokens, 12);
+  assert.equal(delayed.sessionRuntime[sessionRuntimeKey(delayedProject, "shared-session")]?.timeline.length, 0, "the offscreen project must not seed its cache from visible timeline");
+});
+
 test("durable failure replay restores retained output and the failed Turn projection", () => {
   const initial = applyProjectOpened(createInitialState(), {
     project: { path: "C:/Projects/failure-replay" },
@@ -238,6 +274,132 @@ test("background Agent events are cached per Session and restored with Todo/paus
   assert.deepEqual(state.todo, [{ content: "后台任务", status: "in_progress" }]);
   assert.equal(state.pendingInteraction?.pauseId, "pause-b");
   assert.equal(state.turnStatus, "paused");
+});
+
+test("a running Session keeps later deltas and status when navigating away and back", () => {
+  const projectKey = "C:/Projects/navigation-live";
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload as AgentEvent });
+  let state = applyProjectOpened(createInitialState(), {
+    project: { path: projectKey },
+    sessions: [{ session_id: "session-a" }, { session_id: "session-b" }],
+    run: null,
+  });
+  state = applySessionResumed(state, {
+    session_id: "session-a",
+    restored: true,
+    replay: [],
+    active_turn: true,
+    run: { run_id: "run-a", turn_id: "turn-a", status: "running" },
+    session_state: { active_turn: true, run: { run_id: "run-a", turn_id: "turn-a", status: "running" } },
+  });
+  state = reduceRendererState(state, event({
+    type: "assistant_message_delta",
+    session_id: "session-a",
+    project_key: projectKey,
+    run_id: "run-a",
+    turn_id: "turn-a",
+    message_id: "message-a",
+    text: "before navigation",
+  }));
+  state = applySessionResumed(state, {
+    session_id: "session-b",
+    restored: true,
+    replay: [],
+    active_turn: true,
+    run: { run_id: "run-b", turn_id: "turn-b", status: "running" },
+    session_state: { active_turn: true, run: { run_id: "run-b", turn_id: "turn-b", status: "running" } },
+  }, true, undefined, true);
+  state = reduceRendererState(state, event({
+    type: "assistant_message_delta",
+    session_id: "session-a",
+    project_key: projectKey,
+    run_id: "run-a",
+    turn_id: "turn-a",
+    message_id: "message-a",
+    text: "after navigation",
+  }));
+  const cachedA = state.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")];
+  assert.equal(cachedA?.timeline.find((entry) => entry.messageId === "message-a")?.text, "before navigationafter navigation");
+  assert.equal(state.projects[0]?.sessions[0]?.runtime_status, "running");
+
+  state = reduceRendererState(state, {
+    type: "catalog_refreshed",
+    projectKey,
+    sessions: [{ session_id: "session-a" }, { session_id: "session-b" }],
+  });
+  assert.equal(state.projects[0]?.sessions[0]?.runtime_status, "running", "catalog refresh without a live field must not clear the running icon");
+
+  state = applySessionResumed(state, {
+    session_id: "session-a",
+    restored: true,
+    replay: [],
+    active_turn: true,
+    run: { run_id: "run-a", turn_id: "turn-a", status: "running" },
+    session_state: { active_turn: true, run: { run_id: "run-a", turn_id: "turn-a", status: "running" } },
+  }, true, undefined, true);
+  state = reduceRendererState(state, event({
+    type: "assistant_message_delta",
+    session_id: "session-a",
+    project_key: projectKey,
+    run_id: "run-a",
+    turn_id: "turn-a",
+    message_id: "message-a",
+    text: "after return",
+  }));
+  assert.equal(state.timeline.find((entry) => entry.messageId === "message-a")?.text, "before navigationafter navigationafter return");
+});
+
+test("workspace clear invalidates visible and parked Session runs before late events can rebuild cache", () => {
+  const projectKey = "C:/Projects/clear-runtime";
+  const event = (sessionId: string, runId: string, turnId: string) => ({
+    type: "agent_event" as const,
+    event: {
+      type: "assistant_message_delta",
+      session_id: sessionId,
+      project_key: projectKey,
+      run_id: runId,
+      turn_id: turnId,
+      message_id: `message-${sessionId}`,
+      text: "late",
+    } as AgentEvent,
+  });
+  let state = applyProjectOpened(createInitialState(), {
+    project: { path: projectKey },
+    sessions: [{ session_id: "session-a" }, { session_id: "session-b" }],
+    run: null,
+  });
+  state = applySessionResumed(state, {
+    session_id: "session-a",
+    restored: true,
+    replay: [],
+    active_turn: true,
+    run: { run_id: "run-a", turn_id: "turn-a", status: "running" },
+    session_state: { active_turn: true, run: { run_id: "run-a", turn_id: "turn-a", status: "running" } },
+  });
+  state = reduceRendererState(state, event("session-a", "run-a", "turn-a"));
+  state = reduceRendererState(state, {
+    type: "session_resumed",
+    preserveRuntimeState: true,
+    preserveSessionRuntime: true,
+    result: {
+      session_id: "session-b",
+      restored: true,
+      replay: [],
+      active_turn: true,
+      run: { run_id: "run-b", turn_id: "turn-b", status: "running" },
+      session_state: { active_turn: true, run: { run_id: "run-b", turn_id: "turn-b", status: "running" } },
+    },
+  });
+  state = reduceRendererState(state, event("session-b", "run-b", "turn-b"));
+  assert.ok(state.sessionRuntime[sessionRuntimeKey(projectKey, "session-a")]);
+  assert.ok(state.sessionRuntime[sessionRuntimeKey(projectKey, "session-b")]);
+
+  state = reduceRendererState(state, { type: "workspace_cleared" });
+  assert.deepEqual(state.sessionRuntime, {});
+  state = reduceRendererState(state, event("session-a", "run-a", "turn-a"));
+  state = reduceRendererState(state, event("session-b", "run-b", "turn-b"));
+  assert.deepEqual(state.sessionRuntime, {}, "late events from every invalidated Session remain stale after clear");
+  assert.deepEqual(state.timeline, []);
 });
 
 test("Renderer treats an explicit null pending pause as authoritative", () => {

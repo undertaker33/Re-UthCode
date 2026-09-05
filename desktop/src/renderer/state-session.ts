@@ -168,6 +168,9 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
   const source = asRecord(value);
   const sessionId = nonEmptyText(source?.session_id);
   if (!sessionId) return null;
+  const runtimeStatus = source?.runtime_status === "idle" || source?.runtime_status === "running" || source?.runtime_status === "waiting" || source?.runtime_status === "completed" || source?.runtime_status === "failed" || source?.runtime_status === "cancelled"
+    ? source.runtime_status
+    : undefined;
   return {
     session_id: sessionId,
     project_key: nonEmptyText(source?.project_key) ?? fallbackProjectKey,
@@ -178,10 +181,17 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
     transcript_entries: typeof source?.transcript_entries === "number" ? source.transcript_entries : 0,
     corrupt: source?.corrupt === true,
     model_ref: source?.model_ref === null ? null : nonEmptyText(source?.model_ref),
-    runtime_status: source?.runtime_status === "running" || source?.runtime_status === "waiting" || source?.runtime_status === "completed" || source?.runtime_status === "failed" || source?.runtime_status === "cancelled"
-      ? source.runtime_status
-      : "idle",
+    ...(runtimeStatus ? { runtime_status: runtimeStatus } : {}),
   };
+}
+
+function preserveRuntimeStatuses(previous: readonly SessionSummary[], incoming: readonly SessionSummary[]): SessionSummary[] {
+  const previousById = new Map(previous.map((session) => [session.session_id, session]));
+  return incoming.map((session) => {
+    if (session.runtime_status !== undefined) return session;
+    const status = previousById.get(session.session_id)?.runtime_status;
+    return status === undefined ? session : { ...session, runtime_status: status };
+  });
 }
 
 export function applySessionPins(sessions: SessionSummary[], projectKey: string, pinnedSessions: DesktopPreferences["pinnedSessions"]): SessionSummary[] {
@@ -256,17 +266,22 @@ function rememberRunBoundary(state: RendererState, nextRun: unknown): string[] {
   return [...state.ignoredRunIds, previous].slice(-20);
 }
 
-export function permissionUnknownAtRunBoundary(state: RendererState, run: unknown): RendererState {
+export function permissionUnknownAtRunBoundary(state: RendererState, run: unknown, ignorePreviousRun = true): RendererState {
   const normalized = normalizeRun(run);
   return {
     ...state,
     run: normalized,
     permissionMode: permissionModeOf(normalized),
-    ignoredRunIds: rememberRunBoundary(state, run),
+    ignoredRunIds: ignorePreviousRun ? rememberRunBoundary(state, run) : state.ignoredRunIds,
   };
 }
 
-export function applyProjectOpened(state: RendererState, result: unknown, preserveRuntimeState = false): RendererState {
+export function applyProjectOpened(
+  state: RendererState,
+  result: unknown,
+  preserveRuntimeState = false,
+  preserveSessionRuntime = false,
+): RendererState {
   const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
   const source = resultRecord(result);
   const project = resultRecord(source.project);
@@ -276,10 +291,14 @@ export function applyProjectOpened(state: RendererState, result: unknown, preser
   const incomingSessions = Array.isArray(source.sessions)
     ? source.sessions.map((item) => normalizeSession(item, path)).filter((item): item is SessionSummary => item !== null)
     : [];
-  const sessions = preserveSessionOrder(existing?.sessions ?? [], incomingSessions, "project_open");
+  const sessions = preserveSessionOrder(existing?.sessions ?? [], preserveRuntimeStatuses(existing?.sessions ?? [], incomingSessions), "project_open");
   const nextRun = normalizeRun(source.run);
   return {
-    ...permissionUnknownAtRunBoundary(replaceProject(stateWithCache, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, stateWithCache.pinnedSessions), catalogFresh: true }), nextRun),
+    ...permissionUnknownAtRunBoundary(
+      replaceProject(stateWithCache, { ...projectFromPath(path, existing), sessions: applySessionPins(sessions, path, stateWithCache.pinnedSessions), catalogFresh: true }),
+      nextRun,
+      !preserveSessionRuntime,
+    ),
     selectedProjectKey: path,
     selectedSessionId: null,
     timeline: [],
@@ -302,7 +321,7 @@ export function applyProjectOpened(state: RendererState, result: unknown, preser
 export function applyCatalogRefreshed(state: RendererState, projectKey: string, values: readonly unknown[], reason: SessionOrderReason = "catalog_refresh", focusSessionId?: string): RendererState {
   const previous = state.projects.find((item) => item.projectKey === projectKey)?.sessions ?? [];
   const incoming = values.map((item) => normalizeSession(item, projectKey)).filter((item): item is SessionSummary => item !== null);
-  const sessions = applySessionPins(preserveSessionOrder(previous, incoming, reason, focusSessionId), projectKey, state.pinnedSessions);
+  const sessions = applySessionPins(preserveSessionOrder(previous, preserveRuntimeStatuses(previous, incoming), reason, focusSessionId), projectKey, state.pinnedSessions);
   const replaced = replaceProject(state, projectFromPath(projectKey, state.projects.find((item) => item.projectKey === projectKey)));
   return {
     ...replaced,
@@ -316,6 +335,7 @@ export function applySessionResumed(
   result: unknown,
   preserveRuntimeState = false,
   providerRequestUsage?: ProviderRequestUsageProjection,
+  preserveSessionRuntime = false,
 ): RendererState {
   const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
   const source = resultRecord(result);
@@ -341,7 +361,11 @@ export function applySessionResumed(
   const restoredRuntime = runtime && replayEndsInFailure && !runtime.activeTurn
     ? { ...runtime, turnStatus: "failed" as const, terminalStatusPending: false }
     : runtime;
-  const boundary = permissionUnknownAtRunBoundary(stateWithCache, restoredRuntime?.run ?? source.run);
+  const boundary = permissionUnknownAtRunBoundary(
+    stateWithCache,
+    restoredRuntime?.run ?? source.run,
+    !preserveSessionRuntime,
+  );
   const currentModel = nonEmptyText(source.model_ref);
   const catalogModel = projectKey
     ? stateWithCache.projects.find((project) => project.projectKey === projectKey)?.sessions.find((session) => session.session_id === sessionId)?.model_ref
