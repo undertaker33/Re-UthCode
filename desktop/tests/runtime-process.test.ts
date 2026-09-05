@@ -654,7 +654,7 @@ async function waitForAgentEvent(
   throw new Error(`Timed out waiting for Desktop AgentEvent ${type}`);
 }
 
-test("offline Desktop Runtime traverses Bridge, Application, Core, events, and replay", async () => {
+test("offline Desktop Runtime traverses Bridge, Application, Core, events, and paged history", async () => {
   const home = await mkdtemp(join(tmpdir(), "uthcode-desktop-e2e-home-"));
   const project = await mkdtemp(join(tmpdir(), "uthcode-desktop-e2e-project-"));
   const configDirectory = join(home, ".uthcode");
@@ -742,11 +742,15 @@ test("offline Desktop Runtime traverses Bridge, Application, Core, events, and r
     const resumed = await runtime.request("session.resume", { session_id: sessionId as string });
     const replay = (resumed as Record<string, unknown>).replay;
     assert.equal((resumed as Record<string, unknown>).restored, true);
-    assert.ok(Array.isArray(replay));
-    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "user"));
-    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "assistant"));
-    assert.ok((replay as Array<Record<string, unknown>>).some((entry) => entry.kind === "user" && entry.text === chinesePrompt));
-    assert.doesNotMatch(JSON.stringify({ events, replay }), /�|浣犲ソ|璇蜂繚鐣/u);
+    assert.deepEqual(replay, [], "resume establishes runtime ownership; history.page owns durable replay");
+    assert.equal((resumed as Record<string, unknown>).preparing, false);
+    const history = await runtime.request("history.page", { session_id: sessionId as string });
+    const records = (history as Record<string, unknown>).records;
+    assert.ok(Array.isArray(records));
+    assert.ok((records as Array<Record<string, unknown>>).some((entry) => entry.kind === "user"));
+    assert.ok((records as Array<Record<string, unknown>>).some((entry) => entry.kind === "assistant"));
+    assert.ok((records as Array<Record<string, unknown>>).some((entry) => entry.kind === "user" && entry.text === chinesePrompt));
+    assert.doesNotMatch(JSON.stringify({ events, history }), /�|浣犲ソ|璇蜂繚鐣/u);
     assert.deepEqual(diagnostics, []);
   } finally {
     await runtime.shutdown();

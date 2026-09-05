@@ -204,6 +204,19 @@ export interface TimelineEntry {
   planState?: "draft" | "final" | "failed" | "cancelled";
 }
 
+export interface SessionHistoryState {
+  /** Durable pages only; live events remain in the per-session runtime cache. */
+  records: TimelineEntry[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  loading: boolean;
+  error: string | null;
+  /** Changes only after a successful page prepend/replace. */
+  revision: number;
+}
+
+export type SessionPreparationState = "preparing" | "ready" | "failed";
+
 export interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
@@ -268,6 +281,10 @@ export interface RendererState {
   sessionModels: Record<string, string>;
   /** Per-session live projection.  Events are authoritative even off-screen. */
   sessionRuntime: Record<string, SessionRuntimeSnapshot>;
+  /** Bounded durable history pages keyed by project/session identity. */
+  sessionHistory: Record<string, SessionHistoryState>;
+  /** Runtime preparation is independent from the already-visible history page. */
+  sessionPreparation: Record<string, SessionPreparationState>;
   modelCandidates: string[];
   modelPickerOpen: boolean;
   activeTurn: boolean;
@@ -340,6 +357,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   currentModelRef: null,
   sessionModels: {},
   sessionRuntime: {},
+  sessionHistory: {},
+  sessionPreparation: {},
   modelCandidates: [],
   modelPickerOpen: false,
   activeTurn: false,
@@ -387,6 +406,13 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
     sessionRuntime: overrides.sessionRuntime
       ? Object.fromEntries(Object.entries(overrides.sessionRuntime).map(([key, snapshot]) => [key, cloneSessionRuntime(snapshot)]))
       : {},
+    sessionHistory: overrides.sessionHistory
+      ? Object.fromEntries(Object.entries(overrides.sessionHistory).map(([key, history]) => [key, {
+        ...history,
+        records: history.records.map((entry) => ({ ...entry })),
+      }]))
+      : {},
+    sessionPreparation: overrides.sessionPreparation ? { ...overrides.sessionPreparation } : {},
   };
 }
 
@@ -397,6 +423,67 @@ function appendStatus(state: RendererState, text: string, status: TimelineStatus
     timeline: [...state.timeline, { id, kind: "status", text, status }],
     nextStatusId: state.nextStatusId + 1,
   };
+}
+
+function emptySessionHistory(): SessionHistoryState {
+  return {
+    records: [],
+    nextCursor: null,
+    hasMore: false,
+    loading: false,
+    error: null,
+    revision: 0,
+  };
+}
+
+function sameTimelineIdentity(left: TimelineEntry, right: TimelineEntry): boolean {
+  if (left.id === right.id) return true;
+  if (left.kind !== right.kind || !left.turnId || !right.turnId || left.turnId !== right.turnId) return false;
+  if ((left.kind === "tool" || left.kind === "plan") && left.toolCallId && right.toolCallId) {
+    return left.toolCallId === right.toolCallId;
+  }
+  if (left.messageId && right.messageId) return left.messageId === right.messageId;
+  // A Turn is not a Message identity: it can contain multiple assistant,
+  // steering, reasoning, or tool records. When the durable projection and a
+  // live event do not carry the same stable id, preserve both rather than
+  // guessing from kind/text/Turn and dropping a real record.
+  return false;
+}
+
+function mergeTimelineEntries(
+  base: readonly TimelineEntry[],
+  incoming: readonly TimelineEntry[],
+  preferIncoming = false,
+): TimelineEntry[] {
+  const result = base.map((entry) => ({ ...entry }));
+  const matched = new Set<number>();
+  incoming.forEach((candidate) => {
+    // Stable record ids are safe to match repeatedly: a retried page may
+    // contain the same record more than once and must remain idempotent.
+    const exactIndex = result.findIndex((entry) => entry.id === candidate.id);
+    const index = exactIndex >= 0
+      ? exactIndex
+      : result.findIndex((entry, entryIndex) => !matched.has(entryIndex) && sameTimelineIdentity(entry, candidate));
+    if (index < 0) {
+      result.push({ ...candidate });
+      // Do not allow two distinct incoming records with the same stable
+      // message identity to match the row inserted by the previous record in
+      // this batch. Their record ids remain the authoritative disambiguator.
+      matched.add(result.length - 1);
+      return;
+    }
+    matched.add(index);
+    const existing = result[index]!;
+    const incomingIsLive = candidate.streaming === true || candidate.sequence === undefined;
+    const existingIsLive = existing.streaming === true || existing.sequence === undefined;
+    const replace = preferIncoming || (incomingIsLive && !existingIsLive) || (existing.streaming && !candidate.streaming);
+    result[index] = replace ? { ...existing, ...candidate } : { ...candidate, ...existing };
+  });
+  return result.sort((left, right) => {
+    if (left.sequence === undefined) return right.sequence === undefined ? 0 : 1;
+    if (right.sequence === undefined) return -1;
+    return left.sequence - right.sequence;
+  });
 }
 
 /**
@@ -767,7 +854,12 @@ export type RendererAction =
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
   | { type: "project_opened"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
-  | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean }
+  | { type: "history_page_started"; projectKey: string; sessionId: string }
+  | { type: "history_page_loading"; projectKey: string; sessionId: string }
+  | { type: "history_page_loaded"; projectKey: string; sessionId: string; result: unknown; replace?: boolean }
+  | { type: "history_page_error"; projectKey: string; sessionId: string; message: string }
+  | { type: "session_preparation"; projectKey: string; sessionId: string; status: SessionPreparationState }
+  | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean; preserveTimeline?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
   | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
   | { type: "compaction_started"; trigger?: CompactionTrigger }
@@ -932,8 +1024,108 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       return applyProjectOpened(state, action.result, action.preserveRuntimeState, action.preserveSessionRuntime);
     case "catalog_refreshed":
       return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
+    case "history_page_started": {
+      const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
+      const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+      const history = stateWithCache.sessionHistory[key];
+      const cached = stateWithCache.sessionRuntime[key];
+      const target = cached ? applyRuntimeSnapshot(emptyRuntimeBoundary(stateWithCache), cached) : emptyRuntimeBoundary(stateWithCache);
+      return {
+        ...target,
+        selectedProjectKey: action.projectKey,
+        selectedSessionId: action.sessionId,
+        // Durable history is the initial presentation, while a parked
+        // runtime may already have live/uncommitted output for this Session.
+        // Keep both projections and let the stable identity merge collapse a
+        // durable record with its live counterpart.
+        timeline: history
+          ? mergeTimelineEntries(history.records, target.timeline)
+          : target.timeline,
+        sessionPreparation: { ...stateWithCache.sessionPreparation, [key]: "preparing" },
+        sessionViewRevision: stateWithCache.sessionViewRevision + 1,
+        runtimeError: null,
+        notice: null,
+      };
+    }
+    case "history_page_loading": {
+      const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+      const current = state.sessionHistory[key] ?? emptySessionHistory();
+      return {
+        ...state,
+        sessionHistory: {
+          ...state.sessionHistory,
+          [key]: { ...current, loading: true, error: null },
+        },
+      };
+    }
+    case "history_page_loaded": {
+      const source = resultRecord(action.result);
+      if (nonEmptyText(source.session_id) !== action.sessionId) return state;
+      const incoming = replayToTimeline(Array.isArray(source.records) ? source.records : []);
+      const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+      const current = state.sessionHistory[key] ?? emptySessionHistory();
+      const replace = action.replace === true || !Object.prototype.hasOwnProperty.call(state.sessionHistory, key);
+      const records = replace ? incoming : mergeTimelineEntries(current.records, incoming, true);
+      const nextHistory: SessionHistoryState = {
+        records,
+        nextCursor: typeof source.next_cursor === "string" ? source.next_cursor : null,
+        hasMore: source.has_more === true,
+        loading: false,
+        error: null,
+        revision: current.revision + 1,
+      };
+      const targetVisible = state.selectedProjectKey === action.projectKey && state.selectedSessionId === action.sessionId;
+      const cachedRuntime = state.sessionRuntime[key];
+      const visibleBase = targetVisible ? state.timeline : cachedRuntime?.timeline ?? [];
+      return {
+        ...state,
+        sessionHistory: { ...state.sessionHistory, [key]: nextHistory },
+        ...(targetVisible ? { timeline: mergeTimelineEntries(visibleBase, incoming, true) } : {}),
+      };
+    }
+    case "history_page_error": {
+      const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+      const current = state.sessionHistory[key] ?? emptySessionHistory();
+      return {
+        ...state,
+        sessionHistory: {
+          ...state.sessionHistory,
+          [key]: { ...current, loading: false, error: action.message },
+        },
+      };
+    }
+    case "session_preparation": {
+      const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+      return {
+        ...state,
+        sessionPreparation: { ...state.sessionPreparation, [key]: action.status },
+      };
+    }
     case "session_resumed":
-      return applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime);
+      {
+        const next = applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime);
+        if (!action.preserveTimeline) return next;
+        const sessionId = nonEmptyText(resultRecord(action.result).session_id);
+        const projectKey = state.selectedProjectKey;
+        if (!sessionId || !projectKey || state.selectedSessionId !== sessionId) return next;
+        return {
+          ...next,
+          timeline: state.timeline.map((entry) => ({ ...entry })),
+          ...(next.sessionRuntime[sessionRuntimeKey(projectKey, sessionId)]
+            ? {
+              sessionRuntime: {
+                ...next.sessionRuntime,
+                [sessionRuntimeKey(projectKey, sessionId)]: {
+                  ...next.sessionRuntime[sessionRuntimeKey(projectKey, sessionId)],
+                  timeline: state.timeline.map((entry) => ({ ...entry })),
+                },
+              },
+            }
+            : {}),
+          sessionViewRevision: state.sessionViewRevision,
+          sessionPreparation: { ...state.sessionPreparation, [sessionRuntimeKey(projectKey, sessionId)]: "ready" },
+        };
+      }
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
     case "session_new": {

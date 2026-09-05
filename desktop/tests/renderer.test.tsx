@@ -1193,6 +1193,381 @@ test("T05 App keeps a background Session stream visible after switching away and
   });
 });
 
+test("App pages history independently across quick A→B→A navigation and dedupes late live output", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectPath = "C:/history-navigation";
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "History",
+      pinned: false,
+      sessions: [
+        { session_id: "session-a", title: "Session A", project_key: projectPath },
+        { session_id: "session-b", title: "Session B", project_key: projectPath },
+      ],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    const runFor = (id: "a" | "b") => ({ run_id: `run-${id}`, turn_id: `turn-${id}`, status: "idle" });
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let visibleSessionId = "session-a";
+    const pendingHistory: Array<{ sessionId: string; resolve: (value: JsonObject) => void }> = [];
+    const historyResult = (sessionId: string, text: string): JsonObject => ({
+      session_id: sessionId,
+      records: [
+        { record_id: `${sessionId}:1:user:0`, session_id: sessionId, sequence: 1, turn_id: `turn-${sessionId.slice(-1)}`, kind: "user", text: `${text} prompt`, is_error: false },
+        { record_id: `${sessionId}:2:assistant:0`, session_id: sessionId, sequence: 2, turn_id: `turn-${sessionId.slice(-1)}`, kind: "assistant", message_id: `${sessionId}-live`, text: `${text} durable final`, is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "history.page") {
+          return await new Promise<JsonObject>((resolve) => {
+            pendingHistory.push({ sessionId: typeof params.session_id === "string" ? params.session_id : "", resolve });
+          });
+        }
+        if (method === "session.resume") {
+          visibleSessionId = typeof params.session_id === "string" ? params.session_id : visibleSessionId;
+          const id = visibleSessionId === "session-b" ? "b" : "a";
+          return { session_id: visibleSessionId, restored: true, replay: [], active_turn: false, run: runFor(id), session_state: { active_turn: false, run: runFor(id) } };
+        }
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { session_id: visibleSessionId, project_key: projectPath, active_turn: false, session_state: { active_turn: false, run: runFor(visibleSessionId === "session-b" ? "b" : "a") } };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: projectPath,
+      selectedSessionId: "session-a",
+      run: runFor("a"),
+      timeline: [{ id: "assistant:run-a:turn-a:a-live", kind: "assistant", text: "A live tail", runId: "run-a", turnId: "turn-a", messageId: "session-a-live", streaming: true }],
+      activeTurn: true,
+      turnStatus: "running",
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const sessionRows = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)"));
+    const row = (title: string) => sessionRows().find((button) => button.textContent?.includes(title));
+    const resolveHistory = (sessionId: string, text: string) => {
+      const index = pendingHistory.findIndex((request) => request.sessionId === sessionId);
+      assert.notEqual(index, -1, `missing pending history request for ${sessionId}`);
+      const request = pendingHistory.splice(index, 1)[0]!;
+      request.resolve(historyResult(sessionId, text));
+    };
+
+    await flush();
+    assert.ok(row("Session B"));
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    assert.equal(pendingHistory.filter((request) => request.sessionId === "session-b").length, 1);
+    act(() => { eventListener?.({ type: "assistant_message_delta", session_id: "session-b", project_key: projectPath, run_id: "run-b", turn_id: "turn-b", message_id: "b-live", text: "B live" }); });
+    await flush();
+
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    assert.equal(pendingHistory.filter((request) => request.sessionId === "session-a").length, 1);
+    act(() => { eventListener?.({ type: "assistant_message_delta", session_id: "session-a", project_key: projectPath, run_id: "run-a", turn_id: "turn-a", message_id: "a-live", text: " A later" }); });
+    await flush();
+
+    // B's page completes after A has become visible. It may populate B's
+    // cache, but it must not replace A's current timeline.
+    resolveHistory("session-b", "B");
+    await flush();
+    assert.match(container.querySelector<HTMLElement>(".session-line.is-selected")?.textContent ?? "", /Session A/u);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /B durable final/u);
+
+    resolveHistory("session-a", "A");
+    await flush();
+    const timelineText = container.querySelector<HTMLElement>(".timeline")?.textContent ?? "";
+    assert.match(timelineText, /A durable final/u);
+    assert.doesNotMatch(timelineText, /B durable final/u);
+    assert.equal(container.querySelectorAll(".timeline-entry--assistant").length, 1, "live and durable A assistant output share one row");
+  });
+});
+
+test("App keeps the visible history on a failed older-page request and retries locally", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectPath = "C:/history-retry";
+    const key = `${projectPath}\u0000session-a`;
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Retry",
+      pinned: false,
+      sessions: [{ session_id: "session-a", title: "Session A", project_key: projectPath }],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    let historyCalls = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "history.page") {
+          historyCalls += 1;
+          if (historyCalls === 1) throw new Error("simulated older-page failure");
+          return {
+            session_id: "session-a",
+            records: [{ record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-old", kind: "user", text: "older prompt", is_error: false }],
+            next_cursor: null,
+            has_more: false,
+            unit_count: 1,
+          };
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: projectPath,
+      selectedSessionId: "session-a",
+      timeline: [{ id: "recent", kind: "assistant", text: "recent answer", sequence: 3, turnId: "turn-recent" }],
+      sessionHistory: {
+        [key]: { records: [{ id: "recent", kind: "assistant", text: "recent answer", sequence: 3, turnId: "turn-recent" }], nextCursor: "older-cursor", hasMore: true, loading: false, error: null, revision: 1 },
+      },
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const timeline = container.querySelector<HTMLElement>(".timeline");
+    assert.ok(timeline);
+    const loadOlder = container.querySelector<HTMLButtonElement>(".timeline-load-older");
+    assert.ok(loadOlder);
+    act(() => { loadOlder!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(historyCalls, 1);
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /recent answer/u, "failed pagination preserves visible content");
+    const retry = container.querySelector<HTMLButtonElement>(".timeline-history-error button");
+    assert.ok(retry);
+    act(() => { retry!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(historyCalls, 2);
+    const text = container.querySelector<HTMLElement>(".timeline")?.textContent ?? "";
+    assert.match(text, /older prompt/u);
+    assert.match(text, /recent answer/u);
+    assert.equal(container.querySelector(".timeline-history-error"), null);
+  });
+});
+
+test("App marks a failed cold preparation and allows a later explicit retry", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectPath = "C:/history-preparation-failure";
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Preparation",
+      pinned: false,
+      sessions: [
+        { session_id: "session-a", title: "Session A", project_key: projectPath },
+        { session_id: "session-b", title: "Session B", project_key: projectPath },
+      ],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    let resumeBCalls = 0;
+    let visibleSessionId = "session-a";
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "session.resume") {
+          visibleSessionId = typeof params.session_id === "string" ? params.session_id : visibleSessionId;
+          if (visibleSessionId === "session-b") {
+            resumeBCalls += 1;
+            if (resumeBCalls === 1) return { session_id: visibleSessionId, preparing: true, replay: [], run: null, session_state: { status: "preparing", active_turn: false, run: null } };
+            if (resumeBCalls === 2) return { session_id: visibleSessionId, preparing: false, preparation_failed: true, replay: [], run: null, session_state: { status: "failed", active_turn: false, run: null } };
+          }
+          return { session_id: visibleSessionId, preparing: false, replay: [], run: null, session_state: { status: "idle", active_turn: false, run: null } };
+        }
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { session_id: visibleSessionId, project_key: projectPath, active_turn: false, session_state: { active_turn: false, run: null } };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", runtimeState: "ready", projects: [project], selectedProjectKey: projectPath, selectedSessionId: "session-a" });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const row = (title: string) => Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)")).find((button) => button.textContent?.includes(title));
+    await flush();
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 320)); });
+    await flush();
+    assert.equal(resumeBCalls, 2, "the preparation poll observes one terminal failure without retrying it");
+    assert.match(container.querySelector<HTMLElement>(".timeline-preparation--failed")?.textContent ?? "", /preparation failed/u);
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true);
+
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    assert.equal(resumeBCalls, 3, "a new explicit selection retries a failed preparation");
+    assert.equal(container.querySelector<HTMLElement>(".timeline-preparation--failed"), null);
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false);
+  });
+});
+
+test("App drops a late preparation response after navigation replaces the visible Session", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectPath = "C:/history-preparation-stale";
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Preparation stale",
+      pinned: false,
+      sessions: [
+        { session_id: "session-a", title: "Session A", project_key: projectPath },
+        { session_id: "session-b", title: "Session B", project_key: projectPath },
+      ],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    let resumeACalls = 0;
+    let resolveA: ((value: JsonObject) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "session.resume") {
+          const sessionId = typeof params.session_id === "string" ? params.session_id : "";
+          if (sessionId === "session-a") {
+            resumeACalls += 1;
+            if (resumeACalls === 1) return { session_id: sessionId, preparing: true, replay: [], run: null, session_state: { status: "preparing", active_turn: false, run: null } };
+            if (resumeACalls === 2) return await new Promise<JsonObject>((resolve) => { resolveA = resolve; });
+          }
+          return { session_id: sessionId, preparing: false, replay: [], run: null, session_state: { status: "idle", active_turn: false, run: null } };
+        }
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { session_id: "session-b", project_key: projectPath, active_turn: false, session_state: { active_turn: false, run: null } };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", runtimeState: "ready", projects: [project], selectedProjectKey: projectPath, selectedSessionId: null });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const wait = async (milliseconds: number) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, milliseconds)); }); };
+    const row = (title: string) => Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)")).find((button) => button.textContent?.includes(title));
+
+    await flush();
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    for (let index = 0; index < 8 && resumeACalls < 2; index += 1) await wait(50);
+    assert.equal(resumeACalls, 2, "A's preparation observer reaches its deferred response");
+    assert.ok(resolveA);
+
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    await wait(50);
+    assert.match(container.querySelector<HTMLElement>(".session-line.is-selected")?.textContent ?? "", /Session B/u);
+
+    resolveA!({ session_id: "session-a", preparing: false, replay: [{ record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-a", kind: "user", text: "late A", is_error: false }], run: null, session_state: { status: "idle", active_turn: false, run: null } });
+    await wait(50);
+    await flush();
+    assert.match(container.querySelector<HTMLElement>(".session-line.is-selected")?.textContent ?? "", /Session B/u);
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /late A/u, "A's late preparation response cannot overwrite B");
+  });
+});
+
+test("App stops an obsolete preparation poll after project-only navigation", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectA = "C:/history-preparation-project-a";
+    const projectB = "C:/history-preparation-project-b";
+    const project = {
+      path: projectA,
+      projectKey: projectA,
+      alias: "Preparation project",
+      pinned: false,
+      sessions: [{ session_id: "session-a", title: "Session A", project_key: projectA }],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    let resumeCalls = 0;
+    let resolveA: ((value: JsonObject) => void) | null = null;
+    let resolvePollReached!: () => void;
+    const pollReached = new Promise<void>((resolve) => { resolvePollReached = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => projectB,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "session.resume") {
+          resumeCalls += 1;
+          if (resumeCalls === 2) {
+            resolvePollReached();
+            return await new Promise<JsonObject>((resolve) => { resolveA = resolve; });
+          }
+          return { session_id: "session-a", preparing: true, replay: [], run: null, session_state: { status: "preparing", active_turn: false, run: null } };
+        }
+        if (method === "project.open") return { project: { path: projectB }, sessions: [], run: null };
+        if (method === "project.sessions") return { sessions: [] };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: projectA,
+      selectedSessionId: null,
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { await tick(); await tick(); await tick(); }); };
+    const wait = async (milliseconds: number) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, milliseconds)); }); };
+    const row = () => container.querySelector<HTMLButtonElement>(".session-line:not(.new-session-line)");
+
+    await flush();
+    assert.ok(row());
+    act(() => { row()!.click(); });
+    await flush();
+    await pollReached;
+    assert.equal(resumeCalls, 2, "the initial preparation and one poll are both observed");
+
+    const open = container.querySelector<HTMLButtonElement>(".secondary-row");
+    assert.ok(open);
+    act(() => { open!.click(); });
+    await flush();
+    resolveA!({ session_id: "session-a", preparing: true, replay: [], run: null, session_state: { status: "preparing", active_turn: false, run: null } });
+    await wait(150);
+    assert.equal(resumeCalls, 2, "project-only navigation clears the obsolete timer before it can poll again");
+    assert.equal(container.querySelector<HTMLElement>(".session-line.is-selected"), null, "the project-only destination has no stale selected Session");
+  });
+});
+
 test("T05 supplementary Runtime status polling is single-flight", async () => {
   await withRendererDom(async (dom, container, root) => {
     const timers: Array<() => void> = [];

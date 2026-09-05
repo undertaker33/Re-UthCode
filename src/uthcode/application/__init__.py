@@ -56,6 +56,7 @@ from .sessions import (
     SessionCatalogEntry,
     SessionMutation,
     SessionOperationError,
+    SessionHistoryPage,
     SessionReplayRecord,
 )
 from uthcode.core.context import ContextUsage
@@ -171,6 +172,7 @@ __all__ = [
     "SessionCatalogEntry",
     "SessionMutation",
     "SessionOperationError",
+    "SessionHistoryPage",
     "SessionReplayRecord",
     "AgentEvent",
     "agent_event_from_dict",

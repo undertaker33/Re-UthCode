@@ -88,6 +88,7 @@ export const RUNTIME_METHODS = [
   "runtime.shutdown",
   "project.open",
   "project.sessions",
+  "history.page",
   "session.new",
   "session.resume",
   "session.rename",

@@ -1064,7 +1064,7 @@ async def test_shutdown_close_failure_is_runtime_boundary_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_new_and_resume_use_fresh_runs_and_safe_replay() -> None:
+async def test_session_new_and_resume_use_fresh_runs_without_full_history_replay() -> None:
     application = _SessionApplication()
     bridge = DesktopBridge(application=application)
     first_run = bridge.run
@@ -1097,16 +1097,7 @@ async def test_session_new_and_resume_use_fresh_runs_and_safe_replay() -> None:
     assert application.resume_session_calls == ["session-restored"]
     assert bridge.run is not first_run
     assert resumed.result is not None
-    assert resumed.result["replay"] == [
-        {
-            "session_id": "session-restored",
-            "sequence": 1,
-            "turn_id": "turn-1",
-            "kind": "user",
-            "text": "hello",
-            "is_error": False,
-        }
-    ]
+    assert resumed.result["replay"] == []
     await bridge.shutdown()
 
 
@@ -1140,18 +1131,7 @@ async def test_session_resume_projects_stable_failure_replay_fields() -> None:
 
     assert resumed.ok is True
     assert resumed.result is not None
-    assert resumed.result["replay"] == [
-        {
-            "session_id": "session-failed",
-            "sequence": 1,
-            "turn_id": "turn-failed",
-            "kind": "failure",
-            "text": "",
-            "is_error": True,
-            "termination_reason": "invalid_provider_response",
-            "failure_reason": "invalid_provider_response",
-        }
-    ]
+    assert resumed.result["replay"] == []
     await bridge.shutdown()
 
 

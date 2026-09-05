@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import unicodedata
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,10 @@ from uthcode.core.history import (
 SESSION_SCHEMA_VERSION = 3
 SESSION_RECORD_SCHEMA_VERSION = 2
 SESSION_TITLE_MAX_LENGTH = 240
+HISTORY_PAGE_SIZE = 30
+HISTORY_PAGE_MAX_SIZE = 100
+HISTORY_READ_BLOCK_BYTES = 16 * 1024
+_HISTORY_CURSOR_VERSION = 1
 
 
 class SessionFileError(RuntimeError):
@@ -238,6 +243,24 @@ class SessionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionHistorySlice:
+    """One bounded, chronological slice of complete transcript units.
+
+    The integration layer deliberately returns raw semantic units rather than
+    the interface replay projection.  This keeps the JSONL reader independent
+    of Application presentation policy while still making the page boundary
+    impossible to split a tool call from its result.
+    """
+
+    session_id: str
+    title: str | None
+    units: tuple[SemanticUnit, ...]
+    next_cursor: str | None
+    has_more: bool
+    bytes_read: int
+
+
+@dataclass(frozen=True, slots=True)
 class TranscriptAppendOutcome:
     snapshot: SessionSnapshot
     transcript_appended: bool
@@ -393,6 +416,78 @@ class SessionFileStore:
         if not path.is_dir():
             raise SessionNotFoundError(f"unknown Session: {session_id}")
         return self._load_snapshot(path, expected_project_key=expected_project_key).snapshot
+
+    def read_history_page(
+        self,
+        session_id: str,
+        *,
+        cursor: str | None = None,
+        page_size: int = HISTORY_PAGE_SIZE,
+        expected_project_key: str | None = None,
+    ) -> SessionHistorySlice:
+        """Read one recent/older page without materializing the full transcript.
+
+        The transcript is append-only JSONL.  A page starts at the tail (or at
+        the byte boundary carried by its opaque cursor) and reads fixed-size
+        blocks backwards until it has enough complete semantic units.  The
+        byte boundary is safe for an older-page request because cursors point
+        to the first byte of the oldest unit already returned.
+        """
+
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise ValueError("page_size must be an integer")
+        if page_size < 1 or page_size > HISTORY_PAGE_MAX_SIZE:
+            raise ValueError(
+                f"page_size must be between 1 and {HISTORY_PAGE_MAX_SIZE}"
+            )
+        path = self.session_path(session_id)
+        if not path.is_dir():
+            raise SessionNotFoundError(f"unknown Session: {session_id}")
+        metadata = _read_metadata(path / "metadata.json")
+        if metadata.session_id != path.name:
+            raise SessionCorruptError("Session metadata id does not match its directory")
+        if expected_project_key is not None and metadata.project_key != expected_project_key:
+            raise SessionNotFoundError("Session belongs to another project")
+        if (path / "history.jsonl").exists():
+            raise SessionIncompatibleError(
+                "old Session v1 history layout is incompatible with Session v3"
+            )
+        transcript_path = path / "transcript.jsonl"
+        if not transcript_path.is_file():
+            raise SessionCorruptError("Session v3 transcript file is missing")
+
+        end_offset = _history_cursor_end_offset(
+            cursor,
+            session_id=session_id,
+            file_size=transcript_path.stat().st_size,
+        )
+        units_with_offsets, has_more, bytes_read = _read_history_units_reverse(
+            transcript_path,
+            session_id=session_id,
+            page_size=page_size,
+            end_offset=end_offset,
+        )
+        # The reverse reader yields newest first.  The renderer and the
+        # Application replay projection consume the normal chronological
+        # order, so reverse only the bounded result here.
+        units_with_offsets.reverse()
+        units = tuple(unit for unit, _offset in units_with_offsets)
+        next_cursor = None
+        if has_more and units_with_offsets:
+            oldest_unit, oldest_offset = units_with_offsets[0]
+            next_cursor = _encode_history_cursor(
+                session_id=session_id,
+                before_sequence=oldest_unit.sequence_start - 1,
+                before_offset=oldest_offset,
+            )
+        return SessionHistorySlice(
+            session_id=session_id,
+            title=metadata.title,
+            units=units,
+            next_cursor=next_cursor,
+            has_more=has_more,
+            bytes_read=bytes_read,
+        )
 
     def persist_tool_result(self, session_id: str, content: str, *, policy: object | None = None) -> object:
         from .tools.tool_result_read import ToolResultFileStore
@@ -787,6 +882,233 @@ def _append_jsonl(path: Path, values: Sequence[Mapping[str, object]]) -> None:
         os.fsync(handle.fileno())
 
 
+def _encode_history_cursor(
+    *,
+    session_id: str,
+    before_sequence: int,
+    before_offset: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "version": _HISTORY_CURSOR_VERSION,
+            "session_id": session_id,
+            "before_sequence": before_sequence,
+            "before_offset": before_offset,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _history_cursor_end_offset(
+    cursor: str | None,
+    *,
+    session_id: str,
+    file_size: int,
+) -> int | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError("history cursor is invalid")
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(
+            base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("history cursor is invalid") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("history cursor is invalid")
+    if value.get("version") != _HISTORY_CURSOR_VERSION or value.get("session_id") != session_id:
+        raise ValueError("history cursor does not belong to this Session")
+    before_sequence = value.get("before_sequence")
+    before_offset = value.get("before_offset")
+    if (
+        isinstance(before_sequence, bool)
+        or not isinstance(before_sequence, int)
+        or before_sequence < 0
+        or isinstance(before_offset, bool)
+        or not isinstance(before_offset, int)
+        or before_offset < 0
+        or before_offset > file_size
+    ):
+        raise ValueError("history cursor is invalid")
+    return before_offset
+
+
+def _iter_jsonl_lines_reverse(
+    path: Path,
+    *,
+    end_offset: int | None,
+    bytes_read: list[int],
+) -> Iterator[tuple[bytes, int, int]]:
+    """Yield complete JSONL lines from newest to oldest in bounded blocks."""
+
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise SessionCorruptError(f"could not stat Session log: {path}") from exc
+    end = file_size if end_offset is None else end_offset
+    if end <= 0:
+        return
+    position = end
+    buffer = b""
+    buffer_start = position
+    # A trailing line without a newline is a recoverable/incomplete tail and
+    # must not become part of the page.  Once a delimiter is consumed, the
+    # segment immediately to its left is known to be complete.
+    # Avoid reading the whole file solely to inspect the last byte.  The
+    # first block below establishes this accurately for a request that starts
+    # at the file tail; a cursor always points at a line boundary.
+    right_boundary_complete = end < file_size
+    try:
+        with path.open("rb") as handle:
+            if end == file_size and end > 0:
+                handle.seek(end - 1)
+                tail = handle.read(1)
+                bytes_read[0] += len(tail)
+                right_boundary_complete = tail == b"\n"
+            while position > 0:
+                start = max(0, position - HISTORY_READ_BLOCK_BYTES)
+                handle.seek(start)
+                chunk = handle.read(position - start)
+                bytes_read[0] += len(chunk)
+                buffer = chunk + buffer
+                buffer_start = start
+                while True:
+                    newline = buffer.rfind(b"\n")
+                    if newline < 0:
+                        break
+                    raw = buffer[newline + 1 :]
+                    raw_start = buffer_start + newline + 1
+                    raw_end = buffer_start + len(buffer)
+                    if raw and right_boundary_complete:
+                        yield raw, raw_start, raw_end
+                    buffer = buffer[:newline]
+                    # This newline is the terminator for the segment now at
+                    # the right edge of ``buffer``.
+                    right_boundary_complete = True
+                position = start
+            if buffer and buffer_start == 0 and right_boundary_complete:
+                # The first line may not have a trailing delimiter in a
+                # hand-written file.  It is only complete when a delimiter
+                # was seen to its right; otherwise it is an incomplete tail.
+                yield buffer, 0, len(buffer)
+    except OSError as exc:
+        raise SessionCorruptError(f"could not read Session log: {path}") from exc
+
+
+def _history_entry_from_line(
+    raw: bytes,
+    *,
+    path: Path,
+    session_id: str,
+) -> TranscriptEntry:
+    value_bytes = raw[:-1] if raw.endswith(b"\r") else raw
+    try:
+        value = json.loads(value_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SessionCorruptError(f"corrupt history record in {path}") from exc
+    if not isinstance(value, Mapping):
+        raise SessionCorruptError(f"Session record must be a JSON object: {path}")
+    kind, sequence = _validate_envelope(value, path=path)
+    if kind != "transcript":
+        raise SessionCorruptError(f"non-Transcript record found in transcript log: {path}")
+    entry_value = value.get("entry")
+    if not isinstance(entry_value, Mapping):
+        raise SessionCorruptError(f"Transcript record entry must be a mapping: {path}")
+    try:
+        entry = TranscriptEntry.from_dict(entry_value)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SessionCorruptError(f"invalid Transcript record in {path}: {exc}") from exc
+    if entry.sequence != sequence:
+        raise SessionCorruptError(
+            f"Transcript envelope and entry sequence differ in {path}"
+        )
+    if entry.session_id != session_id:
+        raise SessionCorruptError("Transcript entry belongs to another Session")
+    return entry
+
+
+def _read_history_units_reverse(
+    path: Path,
+    *,
+    session_id: str,
+    page_size: int,
+    end_offset: int | None,
+) -> tuple[list[tuple[SemanticUnit, int]], bool, int]:
+    """Collect at most ``page_size`` complete units from the JSONL tail."""
+
+    bytes_read = [0]
+    units: list[tuple[SemanticUnit, int]] = []
+    current_id: str | None = None
+    current_turn_id: str | None = None
+    current_entries: list[TranscriptEntry] = []
+    current_start = 0
+    page_full = False
+    has_more = False
+    expected_sequence: int | None = None
+
+    def finish_current() -> bool:
+        nonlocal current_id, current_turn_id, current_entries, current_start
+        if current_id is None or current_turn_id is None or not current_entries:
+            return False
+        unit = SemanticUnit(
+            unit_id=current_id,
+            turn_id=current_turn_id,
+            entries=tuple(reversed(current_entries)),
+        )
+        current_id = None
+        current_turn_id = None
+        current_entries = []
+        if not unit.complete:
+            return False
+        units.append((unit, current_start))
+        return True
+
+    for raw, start, _end in _iter_jsonl_lines_reverse(
+        path,
+        end_offset=end_offset,
+        bytes_read=bytes_read,
+    ):
+        entry = _history_entry_from_line(raw, path=path, session_id=session_id)
+        if expected_sequence is not None and entry.sequence != expected_sequence - 1:
+            raise SessionCorruptError(
+                f"Transcript record sequence is not contiguous in {path}"
+            )
+        expected_sequence = entry.sequence
+        unit_id = entry.semantic_unit_id or entry.turn_id
+        if current_id is not None and unit_id != current_id:
+            completed = finish_current()
+            if page_full:
+                if completed:
+                    has_more = True
+                    break
+            elif completed and len(units) >= page_size:
+                page_full = True
+                # Continue through this older unit so ``has_more`` reflects a
+                # complete historical unit, not merely an incomplete tail.
+        if current_id is None:
+            current_id = unit_id
+            current_turn_id = entry.turn_id
+        # Reverse traversal sees the oldest entry of this unit last.  Keep its
+        # byte offset for the next opaque cursor rather than the newest one.
+        current_start = start
+        current_entries.append(entry)
+
+    if not has_more:
+        completed = finish_current()
+        if page_full:
+            has_more = completed
+        elif completed and len(units) >= page_size:
+            # EOF after exactly a full page means there is no older page.
+            has_more = False
+    if len(units) > page_size:
+        units = units[:page_size]
+    return units, has_more, bytes_read[0]
+
+
 def _read_jsonl_lines(path: Path) -> tuple[tuple[_ParsedLine, ...], int, tuple[str, ...]]:
     try:
         data = path.read_bytes() if path.exists() else b""
@@ -1003,6 +1325,9 @@ def _read_timeline(path: Path, session_id: str, transcript: Transcript) -> tuple
 
 
 __all__ = [
+    "HISTORY_PAGE_MAX_SIZE",
+    "HISTORY_PAGE_SIZE",
+    "HISTORY_READ_BLOCK_BYTES",
     "SESSION_RECORD_SCHEMA_VERSION",
     "SESSION_SCHEMA_VERSION",
     "SESSION_TITLE_MAX_LENGTH",
@@ -1011,6 +1336,7 @@ __all__ = [
     "SessionDurabilityUnknownError",
     "SessionFileError",
     "SessionFileStore",
+    "SessionHistorySlice",
     "SessionIncompatibleError",
     "SessionMetadata",
     "SessionNotFoundError",

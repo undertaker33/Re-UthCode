@@ -127,6 +127,8 @@ desktop/src/renderer/App.tsx
 
 Desktop 的 `PythonRuntime` 只负责一个受控 child 的 stdio、请求相关和 close/reap；Bridge 负责 Application/Run 生命周期和安全 DTO 投影。未提交的 Runtime checkpoint 不跨进程恢复，Runtime crash/protocol error 仍与 Provider/Turn failure 分离。
 
+历史显示通过 Application 的分页出口独立读取，不依赖完整 Run 恢复。Desktop 冷 Session 准备不占用 Bridge 请求接收循环；Application 的异步恢复仅将同步 Session 读盘和 writer 恢复放入线程，Provider 异步预检继续使用原事件循环。分页不会代替发送前所需的完整 Session 恢复。
+
 ```text
 Desktop Session A active
   -> session.new / session.resume(B) / project.open(B)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
 
@@ -11,6 +11,7 @@ from uthcode.core.agent_events import FailureReason, TerminationReason
 from uthcode.core.history import (
     ActiveCheckpoint,
     EpochMacroSummary,
+    SemanticUnit,
     SemanticEntry,
     TranscriptBoundaryError,
     TranscriptEntry,
@@ -26,10 +27,12 @@ from uthcode.core.provider import (
 )
 from uthcode.core.planning import parse_propose_plan_arguments
 from uthcode.integrations.session_files import (
+    HISTORY_PAGE_SIZE,
     TimelineAppendOutcome,
     TranscriptAppendOutcome,
     SessionFileStore,
     SessionFileError,
+    SessionHistorySlice,
     SessionMetadata,
     SessionSnapshot,
     SessionWriter,
@@ -89,6 +92,11 @@ class SessionReplayRecord:
     title: str | None = None
     termination_reason: str | None = None
     failure_reason: str | None = None
+    message_id: str | None = None
+    # Legacy full-message envelopes can contain multiple parts under one
+    # durable sequence.  Keep the disambiguator internal to the safe DTO so
+    # existing replay wire fields remain unchanged.
+    part_index: int | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -110,6 +118,7 @@ class SessionReplayRecord:
             (self.created_at, "created_at"),
             (self.termination_reason, "termination_reason"),
             (self.failure_reason, "failure_reason"),
+            (self.message_id, "message_id"),
         ):
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"replay {field_name} must be a string or None")
@@ -123,12 +132,20 @@ class SessionReplayRecord:
             TerminationReason(self.termination_reason)
         if self.failure_reason is not None:
             FailureReason(self.failure_reason)
+        if self.message_id is not None and not self.message_id.strip():
+            raise ValueError("replay message_id must be non-empty when provided")
         if self.kind == "failure" and self.termination_reason is None:
             raise ValueError("failure replay requires termination_reason")
         if not isinstance(self.is_error, bool):
             raise TypeError("replay is_error must be a boolean")
         if self.title is not None:
             object.__setattr__(self, "title", normalize_session_title(self.title))
+        if self.part_index is not None and (
+            isinstance(self.part_index, bool)
+            or not isinstance(self.part_index, int)
+            or self.part_index < 0
+        ):
+            raise ValueError("replay part_index must be a non-negative integer or None")
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only the bounded replay contract, never raw parts."""
@@ -149,11 +166,53 @@ class SessionReplayRecord:
             "title",
             "termination_reason",
             "failure_reason",
+            "message_id",
         ):
             field_value = getattr(self, field_name)
             if field_value is not None:
                 value[field_name] = field_value
         return value
+
+    @property
+    def record_id(self) -> str:
+        """Stable identity shared by paged replay and live event merging."""
+
+        return ":".join(
+            (
+                self.session_id,
+                str(self.sequence),
+                self.kind,
+                self.tool_call_id or "",
+                str(self.part_index) if self.part_index is not None else "-",
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionHistoryPage:
+    """Application-safe page of complete replay records."""
+
+    session_id: str
+    records: tuple[SessionReplayRecord, ...]
+    next_cursor: str | None
+    has_more: bool
+    unit_count: int
+    bytes_read: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "records": [
+                {
+                    **record.to_dict(),
+                    "record_id": record.record_id,
+                }
+                for record in self.records
+            ],
+            "next_cursor": self.next_cursor,
+            "has_more": self.has_more,
+            "unit_count": self.unit_count,
+        }
 
 
 SessionReplayBuilder = Callable[
@@ -749,8 +808,54 @@ class ApplicationSessionService:
             )
         return tuple(entries)
 
+    def list_catalog_metadata(self) -> tuple[SessionCatalogEntry, ...]:
+        """Return navigation rows without replaying every Session transcript."""
+
+        return tuple(
+            SessionCatalogEntry(
+                session_id=metadata.session_id,
+                project_key=metadata.project_key,
+                last_used_at=metadata.last_used_at,
+                title=metadata.title,
+                model_ref=metadata.model_ref,
+                preview="",
+            )
+            for metadata in self.list_sessions()
+        )
+
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)
+
+    def read_history_page(
+        self,
+        session_id: str,
+        *,
+        cursor: str | None = None,
+        page_size: int = HISTORY_PAGE_SIZE,
+        tool_summary: Callable[[ToolCallPart], str] | None = None,
+    ) -> SessionHistoryPage:
+        """Read and safely project one bounded history page."""
+
+        page: SessionHistorySlice = self.store.read_history_page(
+            session_id,
+            cursor=cursor,
+            page_size=page_size,
+            expected_project_key=self.project_key,
+        )
+        records = _project_replay_units(
+            page.session_id,
+            page.title,
+            page.units,
+            tool_summary=tool_summary,
+        )
+        return SessionHistoryPage(
+            session_id=page.session_id,
+            records=records,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+            unit_count=len(page.units),
+            bytes_read=page.bytes_read,
+        )
 
     def read_session_for_command(self, session_id: str) -> SessionSnapshot:
         """Read a Session while translating storage failures at the Application boundary."""
@@ -976,6 +1081,7 @@ __all__ = [
     "TimelineAppendOutcome",
     "TranscriptAppendOutcome",
     "SessionCatalogEntry",
+    "SessionHistoryPage",
     "SessionMutation",
     "SessionReplayRecord",
     "SessionActiveError",
@@ -1049,6 +1155,11 @@ def _entry_parts(entry: TranscriptEntry) -> tuple[object, ...]:
     raise ValueError("Transcript entry has no typed Message part")
 
 
+def _entry_message_id(entry: TranscriptEntry) -> str | None:
+    value = entry.payload.get("message_id")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _bounded_replay_text(value: str, *, limit: int = 240) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
@@ -1071,20 +1182,39 @@ def _project_replay(
 ) -> tuple[SessionReplayRecord, ...]:
     """Build a chronological, safe projection from complete semantic units."""
 
+    return _project_replay_units(
+        snapshot.session_id,
+        snapshot.title,
+        snapshot.transcript.semantic_units(complete_only=True),
+        tool_summary=tool_summary,
+    )
+
+
+def _project_replay_units(
+    session_id: str,
+    title: str | None,
+    units: Iterable[object],
+    *,
+    tool_summary: Callable[[ToolCallPart], str] | None = None,
+) -> tuple[SessionReplayRecord, ...]:
+    """Project a bounded set of complete units without loading a snapshot."""
+
     records: list[SessionReplayRecord] = []
     calls: dict[str, tuple[str, str]] = {}
     plan_call_ids: set[str] = set()
     plans: dict[str, tuple[int, str, str, str | None]] = {}
     user_seen: set[str] = set()
     legacy_message_ids: set[tuple[str, str, str]] = set()
-    for unit in snapshot.transcript.semantic_units(complete_only=True):
+    for unit in units:
+        if not isinstance(unit, SemanticUnit):
+            raise TypeError("replay units must be SemanticUnit values")
         for entry in unit.entries:
             if entry.kind is TranscriptKind.TURN_FAILURE:
                 termination_reason = entry.payload.get("termination_reason")
                 failure_reason = entry.payload.get("failure_reason")
                 records.append(
                     SessionReplayRecord(
-                        session_id=snapshot.session_id,
+                        session_id=session_id,
                         sequence=entry.sequence,
                         turn_id=entry.turn_id,
                         kind="failure",
@@ -1098,7 +1228,7 @@ def _project_replay(
                         ),
                         is_error=True,
                         created_at=entry.created_at,
-                        title=snapshot.title,
+                        title=title,
                     )
                 )
                 continue
@@ -1107,7 +1237,7 @@ def _project_replay(
             # project that envelope once while leaving current part-local
             # entries untouched (they have no ``message`` key).
             legacy_message = entry.payload.get("message")
-            legacy_message_id = entry.payload.get("message_id")
+            legacy_message_id = _entry_message_id(entry)
             if isinstance(legacy_message, Mapping) and isinstance(
                 legacy_message_id, str
             ) and legacy_message_id.strip():
@@ -1119,7 +1249,7 @@ def _project_replay(
                 if identity in legacy_message_ids:
                     continue
                 legacy_message_ids.add(identity)
-            for part in _entry_parts(entry):
+            for part_index, part in enumerate(_entry_parts(entry)):
                 sequence = entry.sequence
                 if isinstance(part, ToolCallPart):
                     if part.name == "ProposePlan":
@@ -1163,7 +1293,7 @@ def _project_replay(
                             plan_sequence, plan_turn_id, plan_text, plan_created_at = plan
                             records.append(
                                 SessionReplayRecord(
-                                    session_id=snapshot.session_id,
+                                    session_id=session_id,
                                     sequence=plan_sequence,
                                     turn_id=plan_turn_id,
                                     kind="plan",
@@ -1172,7 +1302,9 @@ def _project_replay(
                                     tool_call_id=part.tool_call_id,
                                     is_error=False,
                                     created_at=plan_created_at,
-                                    title=snapshot.title,
+                                    title=title,
+                                    message_id=_entry_message_id(entry),
+                                    part_index=part_index,
                                 )
                             )
                         continue
@@ -1183,7 +1315,7 @@ def _project_replay(
                     status, is_error = _replay_tool_status(part)
                     records.append(
                         SessionReplayRecord(
-                            session_id=snapshot.session_id,
+                            session_id=session_id,
                             sequence=sequence,
                             turn_id=entry.turn_id,
                             kind="tool",
@@ -1193,7 +1325,9 @@ def _project_replay(
                             status=status,
                             is_error=is_error,
                             created_at=entry.created_at,
-                            title=snapshot.title,
+                            title=title,
+                            message_id=_entry_message_id(entry),
+                            part_index=part_index,
                         )
                     )
                     continue
@@ -1223,16 +1357,18 @@ def _project_replay(
                     continue
                 records.append(
                     SessionReplayRecord(
-                        session_id=snapshot.session_id,
+                        session_id=session_id,
                         sequence=sequence,
                         turn_id=entry.turn_id,
                         kind=kind,
                         text=part.text,
                         created_at=entry.created_at,
-                        title=snapshot.title,
+                        title=title,
+                        message_id=_entry_message_id(entry),
+                        part_index=part_index,
                     )
                 )
-    return _normalize_replay(records, snapshot.session_id)
+    return _normalize_replay(records, session_id)
 
 
 def _first_user_preview(snapshot: SessionSnapshot, *, limit: int = 160) -> str:

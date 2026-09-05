@@ -258,13 +258,15 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
           ? "cancelled"
           : "completed";
       return {
-        id: `replay:${sequence}:${index}`,
+        id: nonEmptyText(source.record_id)
+          ?? `replay:${textValue(source.session_id)}:${sequence}:${normalizedKind}:${textValue(source.tool_call_id)}`,
         kind: normalizedKind,
         text: failedTurn
           ? `Turn failed: ${textValue(source.failure_reason) || textValue(source.termination_reason) || "runtime error"}`
           : textValue(source.text),
         runId: nonEmptyText(source.run_id) ?? undefined,
         turnId: nonEmptyText(source.turn_id) ?? undefined,
+        messageId: nonEmptyText(source.message_id) ?? undefined,
         iteration: positiveInteger(source.iteration) ?? undefined,
         toolCallId: nonEmptyText(source.tool_call_id) ?? undefined,
         toolName: nonEmptyText(source.tool_name) ?? undefined,
