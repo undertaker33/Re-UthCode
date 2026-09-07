@@ -498,9 +498,17 @@ async function main() {
     fixtureOutput?.stderr() ?? Buffer.alloc(0),
   ].flatMap((buffer) => persistedSecretMarkers.filter((marker) => buffer.toString("utf8").includes(marker)));
   if (secretLeakArtifacts.length > 0) signalFailures.push(`Fixture secret persisted in process artifacts: ${[...new Set(secretLeakArtifacts)].join(", ")}`);
-  const expectedFixtureRequests = flow === "sessions" ? 8 : null;
+  // Six initial Turns plus one continuation; the plain-text fixture summary
+  // fails validation twice before compaction reports its controlled failure.
+  const expectedFixtureRequests = flow === "sessions" ? 9 : null;
   if (expectedFixtureRequests !== null && fixtureRequests.length !== expectedFixtureRequests) {
     signalFailures.push(`Fixture request count: expected ${expectedFixtureRequests}, observed ${fixtureRequests.length}`);
+  }
+  if (flow === "sessions" && (
+    fixtureRequests.slice(0, 7).some((request) => request.toolCount <= 0)
+    || fixtureRequests.slice(7).some((request) => request.toolCount !== 0)
+  )) {
+    signalFailures.push("Sessions fixture expected seven normal requests followed by two tool-free compaction attempts");
   }
   const status = !failure && driverPassed && electronPassed && signalFailures.length === 0 ? "passed" : "failed";
   const finalFailure = failure ?? (signalFailures.length > 0 ? { message: signalFailures.join("; "), stack: null } : null);

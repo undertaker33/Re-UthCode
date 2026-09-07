@@ -641,18 +641,16 @@ async def test_tui_session_picker_open_close_does_not_create_session(
     task = asyncio.create_task(tui.run_async())
 
     async def wait_until(predicate) -> None:  # type: ignore[no-untyped-def]
-        for _ in range(200):
-            if predicate():
-                return
-            await asyncio.sleep(0.01)
-        raise AssertionError("condition did not become true")
+        async with asyncio.timeout(3):
+            while not predicate():
+                await asyncio.sleep(0.01)
 
     try:
         # is_running is set before prompt_toolkit attaches the pipe reader;
         # synchronize on the actual attachment before injecting keys.
         await wait_until(lambda: tui.ui.is_running and input_attached.is_set())
-        await tui._handle_submission("/resume")
-        assert tui.session_picker.open
+        pipe.send_text("/resume\r")
+        await wait_until(lambda: tui.session_picker.open)
         assert tuple(item.session_id for item in application.list_sessions()) == initial_ids
         # Send the terminal's explicit Kitty Escape sequence so the fixture
         # does not depend on prompt_toolkit's bare-Escape timeout matcher.

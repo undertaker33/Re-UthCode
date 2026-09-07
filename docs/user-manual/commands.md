@@ -37,6 +37,8 @@ Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Co
 
 Context 的 `exact` 只表示当前 Provider 提供了可靠的 preflight count；Provider count 不可用时会显示标注来源的 local estimate，首次还没有可编译请求时显示 `unavailable`。Provider 未提供 cache read/write 字段时也保持 `not_available`，不会用默认零值冒充缓存命中。
 
+Desktop 的手动压缩在所属会话后台执行，可以切到其他会话继续工作；切换不会取消它。压缩中的会话暂时不能发送新请求或重复压缩，可使用取消控件停止。Runtime 面板会显示安全终止原因及是否已有有效提交：取消或失败不代表已完成的压缩被回滚。取消或重启后可再次发起压缩；重启不会自动重试旧请求。遇到真实文件损坏或持续读写故障时，仍需先处理显示的存储错误。
+
 ## `exec` 退出码
 
 | 退出码 | 含义 |

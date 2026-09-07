@@ -680,8 +680,73 @@ class UthCodeApplication:
             tool_summary=self._tool_service.describe_tool_call,
         )
 
-    async def compact_session(self) -> CompactionResult:
-        """Run one manual L4 epoch through the active Turn's Context path."""
+    async def compact_session(
+        self,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> CompactionResult:
+        """Run one manual compaction operation with caller-owned cancellation."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        active = self._session_service.active_session
+        if active is None:
+            raise RuntimeError("no active Session")
+        if active.durability_unknown:
+            raise RuntimeError(
+                "Session History durability is unknown; reconcile before compacting"
+            )
+        if cancellation is None:
+            cancellation = CancellationToken()
+        elif not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        initial_sequence_end = active.timeline.sequence_end
+
+        def cancelled_result() -> CompactionResult:
+            current = self._session_service.active_session
+            timeline = current.timeline if current is not None else active.timeline
+            return CompactionResult(
+                timeline=timeline,
+                summary=timeline.summary if timeline is not None else None,
+                changed=timeline.sequence_end > initial_sequence_end,
+                failure="compaction_cancelled",
+            )
+
+        try:
+            return await self._compact_session_impl(cancellation=cancellation)
+        except GenerationCancelled:
+            if not cancellation.cancelled:
+                raise
+            result = cancelled_result()
+            self._context_service.finish_compaction(
+                result,
+                trigger="manual",
+                cancelled=True,
+            )
+            return result
+        except CancelledError:
+            if not cancellation.cancelled:
+                raise
+            result = cancelled_result()
+            self._context_service.finish_compaction(
+                result,
+                trigger="manual",
+                cancelled=True,
+            )
+            return result
+
+    async def _compact_session_impl(
+        self,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> CompactionResult:
+        """Run one manual L4 pass through the active Session's Context path.
+
+        The caller owns the optional token so a Desktop operation can cancel
+        model-limit preflight, Provider generation, candidate validation, or
+        the final commit boundary without coupling cancellation to Session
+        navigation.
+        """
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
@@ -692,6 +757,12 @@ class UthCodeApplication:
             raise RuntimeError(
                 "Session History durability is unknown; reconcile before compacting"
             )
+        owner_session = session
+        if cancellation is None:
+            cancellation = CancellationToken()
+        elif not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        cancellation.raise_if_cancelled()
 
         provider = self._provider
         model_profile = self.current_model
@@ -707,7 +778,11 @@ class UthCodeApplication:
             None,
             model_profile.max_output_tokens if model_profile is not None else None,
         )
-        provider_limits = await _resolve_model_limits_async(provider, remote_model_id)
+        provider_limits = await _resolve_model_limits_async(
+            provider,
+            remote_model_id,
+            cancellation=cancellation,
+        )
         self._last_provider_limits = provider_limits
         self._last_provider_limits_model = remote_model_id
         self._last_provider_limits_provider = provider
@@ -716,8 +791,8 @@ class UthCodeApplication:
             provider_limits=provider_limits,
             requested_output_reserve=max_output_tokens,
         )
-        cancellation = CancellationToken()
-        manual_run_id = f"manual-compact:{session.session_id}"
+        cancellation.raise_if_cancelled()
+        manual_run_id = f"manual-compact:{owner_session.session_id}"
         manual_tool_definitions = self._tool_service.definitions() + (
             ASK_USER_TOOL_DEFINITION,
             TODO_WRITE_TOOL_DEFINITION,
@@ -743,8 +818,8 @@ class UthCodeApplication:
             request, _snapshot = self._context_service.compose_generation_request(
                 (),
                 run_id=manual_run_id,
-                session_id=session.session_id,
-                transcript=session.transcript,
+                session_id=owner_session.session_id,
+                transcript=owner_session.transcript,
                 instruction_loader=self._instruction_loader,
                 timeline=timeline_value,
                 tool_definitions=manual_tool_definitions,
@@ -801,6 +876,7 @@ class UthCodeApplication:
                 provider,
                 compose,
                 finalize,
+                cancellation=cancellation,
             )
 
         def manual_count(request: GenerationRequest, source: str) -> int:
@@ -814,14 +890,19 @@ class UthCodeApplication:
         async def validate_manual_candidate(
             candidate: CompactionResult,
         ) -> CompactionResult:
-            active = self._session_service.active_session
-            if active is None:
+            nonlocal owner_session
+            cancellation.raise_if_cancelled()
+            # The compact operation owns the Session it captured before the
+            # Provider preflight.  A later navigation must not redirect a
+            # candidate into whichever Session happens to be active now.
+            try:
+                previous_timeline = owner_session.timeline
+            except Exception:
                 return replace(
                     candidate,
                     changed=False,
                     failure="timeline_commit_failed",
                 )
-            previous_timeline = active.timeline
             before_request, before_source = await manual_prospective(previous_timeline)
             after_request, after_source = await manual_prospective(candidate.timeline)
             if before_source == after_source == "exact":
@@ -833,6 +914,7 @@ class UthCodeApplication:
                 # estimate.  Re-account both immutable requests locally.
                 before_count = account_generation_request(before_request).input_tokens
                 after_count = account_generation_request(after_request).input_tokens
+            cancellation.raise_if_cancelled()
             if after_count >= before_count:
                 return replace(
                     candidate,
@@ -889,19 +971,30 @@ class UthCodeApplication:
             )
 
         async def commit(candidate: CompactionResult) -> CompactionResult:
-            active = self._session_service.active_session
-            if active is None:
+            nonlocal owner_session
+            try:
+                # Keep the owner identity stable across the whole operation.
+                # ``_commit_timeline_candidate`` also verifies that this
+                # writer is still active before it attempts recovery.
+                owner_session_id = owner_session.session_id
+            except Exception:
                 return replace(
                     candidate,
                     changed=False,
                     failure="timeline_commit_failed",
                 )
-            return self._commit_timeline_candidate(active, candidate)
+            committed = self._commit_timeline_candidate(owner_session, candidate)
+            recovered = self._session_service.active_session
+            if recovered is not None and recovered.session_id == owner_session_id:
+                # Unknown append recovery closes the quarantined writer and
+                # installs a fresh owner; subsequent epochs must use it.
+                owner_session = recovered
+            return committed
 
         result = await self._context_service.compact_async(
-            session.transcript,
-            timeline=session.timeline,
-            session_id=session.session_id,
+            owner_session.transcript,
+            timeline=owner_session.timeline,
+            session_id=owner_session.session_id,
             summarize=summarize_epoch,
             summarize_oversized_subpass=summarize_subpass,
             summarize_oversized_fold=summarize_fold,
@@ -930,10 +1023,13 @@ class UthCodeApplication:
         }:
             # A low-pressure/manual no-op is a successful no-change outcome;
             # do not fabricate a Timeline candidate or expose a retry error.
+            current_session = self._session_service.active_session
+            if current_session is None or current_session.session_id != owner_session.session_id:
+                current_session = owner_session
             result = replace(
                 result,
-                timeline=session.timeline,
-                summary=(session.timeline.summary if session.timeline is not None else None),
+                timeline=current_session.timeline,
+                summary=(current_session.timeline.summary if current_session.timeline is not None else None),
                 failure=None,
             )
             self._context_service.finalize_compaction(result)
@@ -955,6 +1051,86 @@ class UthCodeApplication:
         if candidate is None:
             return finish(result)
         try:
+            before_timeline = session.timeline
+        except Exception:
+            return finish(replace(
+                result,
+                changed=False,
+                    failure="timeline_commit_failed",
+            ))
+        if self._session_service is None or self._session_service.active_session is not session:
+            # Navigation may have released this owner or installed another
+            # Session while Provider work was in flight.  Never append the
+            # candidate through that unrelated active writer.
+            return finish(replace(
+                result,
+                timeline=before_timeline,
+                summary=before_timeline.summary,
+                changed=False,
+                failure="timeline_commit_failed",
+            ))
+
+        def recover_unknown_commit() -> CompactionResult:
+            """Reconcile an ambiguous append and reopen the owning writer.
+
+            SessionWriter quarantines an unknown append while its lock is
+            held.  The Application can safely release that quarantined writer
+            and reuse the existing command resume boundary to load the
+            authoritative files.  This keeps a normal compact interruption
+            from leaving the Session permanently busy while still preserving
+            an explicit unknown-durability reason when extra records were
+            observed.
+            """
+
+            service = self._session_service
+            if service is None or service.active_session is not session:
+                return finish(replace(
+                    result,
+                    timeline=before_timeline,
+                    summary=before_timeline.summary,
+                    changed=False,
+                    failure="timeline_durability_unknown",
+                ))
+            session_id = session.session_id
+            try:
+                session.close()
+                recovered = service.resume_session_for_command(session_id)
+            except Exception:
+                return finish(replace(
+                    result,
+                    timeline=before_timeline,
+                    summary=before_timeline.summary,
+                    changed=False,
+                    failure="timeline_durability_unknown",
+                ))
+            try:
+                recovered_timeline = recovered.timeline
+                candidate_durable = (
+                    len(recovered_timeline.records) >= len(candidate.records)
+                    and recovered_timeline.records[: len(candidate.records)]
+                    == candidate.records
+                )
+                extra_records = recovered_timeline.records != candidate.records
+                self._refresh_context_for_session(recovered)
+            except Exception:
+                return finish(replace(
+                    result,
+                    changed=False,
+                    failure="timeline_durability_unknown",
+                ))
+            return finish(replace(
+                result,
+                timeline=recovered_timeline,
+                summary=recovered_timeline.summary,
+                changed=candidate_durable,
+                failure=(
+                    "timeline_durability_unknown"
+                    if extra_records or not candidate_durable
+                    else None
+                ),
+            ))
+
+        try:
             outcome = session.append_timeline(candidate)
         except Exception:
             # Validation or a pre-append failure means no Timeline was
@@ -962,28 +1138,16 @@ class UthCodeApplication:
             # retry is safe; do not expose the in-memory candidate as active.
             return finish(replace(
                 result,
-                timeline=session.timeline,
-                summary=(session.timeline.summary if session.timeline is not None else None),
+                timeline=before_timeline,
+                summary=before_timeline.summary,
                 changed=False,
                 failure="timeline_append_failed",
             ))
         if not isinstance(outcome, TimelineAppendOutcome):
             session._quarantine_unknown_durability()
-            return finish(replace(
-                result,
-                timeline=session.timeline,
-                summary=(session.timeline.summary if session.timeline is not None else None),
-                changed=False,
-                failure="timeline_durability_unknown",
-            ))
+            return recover_unknown_commit()
         if outcome.durability == "unknown":
-            return finish(replace(
-                result,
-                timeline=session.timeline,
-                summary=(session.timeline.summary if session.timeline is not None else None),
-                changed=False,
-                failure="timeline_durability_unknown",
-            ))
+            return recover_unknown_commit()
         if not outcome.timeline_appended:
             return finish(replace(
                 result,

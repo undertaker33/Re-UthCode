@@ -72,7 +72,12 @@ export function contextUsageAtBoundary(): ContextUsageProjection {
   return { used_tokens: 0, budget_tokens: 0, available: false, measurement: "unavailable", source: "unavailable" };
 }
 
-export function normalizeCompactionStatus(value: unknown): CompactionStatusProjection {
+function safeCompactionReason(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(value)) return undefined;
+  return value;
+}
+
+export function normalizeCompactionStatus(value: unknown, fallback?: CompactionStatusProjection | null): CompactionStatusProjection {
   const source = asRecord(value);
   const stateValue = source?.state;
   const state: CompactionState = stateValue === "running" || stateValue === "completed" || stateValue === "no_change" || stateValue === "failed" || stateValue === "cancelled"
@@ -83,7 +88,16 @@ export function normalizeCompactionStatus(value: unknown): CompactionStatusProje
     ? triggerValue
     : null;
   const changed = typeof source?.changed === "boolean" ? source.changed : null;
-  return { state, trigger: state === "idle" ? null : trigger, changed: state === "running" ? null : changed };
+  const operationId = nonEmptyText(source?.operation_id)
+    ?? (state === "running" && fallback?.state === "running" ? fallback.operation_id : undefined);
+  const reason = safeCompactionReason(source?.reason);
+  return {
+    state,
+    trigger: state === "idle" ? null : trigger,
+    changed: state === "running" ? null : changed,
+    ...(operationId ? { operation_id: operationId } : {}),
+    ...(reason ? { reason } : {}),
+  };
 }
 
 export function normalizeTodo(value: unknown): TodoItem[] {
@@ -176,7 +190,7 @@ export function sessionRuntimeFromSource(
       : fallback?.lastProviderRequestUsage
         ? { lastProviderRequestUsage: fallback.lastProviderRequestUsage }
         : {}),
-    compactionStatus: compactionValue !== undefined ? normalizeCompactionStatus(compactionValue) : fallback?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
+    compactionStatus: compactionValue !== undefined ? normalizeCompactionStatus(compactionValue, fallback?.compactionStatus) : fallback?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
     permissionMode: permissionModeOf(run),
     activeTurn,
     terminalStatusPending: activeValue === false ? false : fallback?.terminalStatusPending ?? false,

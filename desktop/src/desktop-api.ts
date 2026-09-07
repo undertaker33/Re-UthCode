@@ -98,6 +98,7 @@ export const RUNTIME_METHODS = [
   "turn.pause",
   "turn.resume",
   "turn.cancel",
+  "compaction.cancel",
   "command.complete",
   "command.execute",
   "status.get",

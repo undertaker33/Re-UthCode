@@ -78,6 +78,25 @@ _COMPACTION_STATES = frozenset(
     {"idle", "running", "completed", "no_change", "failed", "cancelled"}
 )
 _COMPACTION_TRIGGERS = frozenset({"manual", "auto", "overflow"})
+_COMPACTION_REASONS = frozenset(
+    {
+        "compaction_failed",
+        "compaction_cancelled",
+        "no_safe_epoch",
+        "oversized_provider_unavailable",
+        "compaction_result_invalid",
+        "repeated_failure",
+        "no_reduction",
+        "no_progress",
+        "timeline_commit_failed",
+        "timeline_append_failed",
+        "timeline_durability_unknown",
+        "epoch_limit_reached",
+        "oversized_fold_unplannable",
+        "oversized_fold_required",
+        "oversized_fold_limit_reached",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +174,7 @@ class CompactionStatus:
     state: str = "idle"
     trigger: str | None = None
     changed: bool | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in _COMPACTION_STATES:
@@ -167,13 +187,20 @@ class CompactionStatus:
             raise ValueError("running Compaction status cannot have changed")
         if not isinstance(self.changed, (bool, type(None))):
             raise TypeError("changed must be a boolean or None")
+        if self.reason is not None and self.reason not in _COMPACTION_REASONS:
+            raise ValueError("unsupported Compaction reason")
+        if self.state in {"idle", "running", "completed", "no_change"} and self.reason is not None:
+            raise ValueError("terminal failure reason is not valid for this Compaction state")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "state": self.state,
             "trigger": self.trigger,
             "changed": self.changed,
         }
+        if self.reason is not None:
+            value["reason"] = self.reason
+        return value
 
 
 class ApplicationContextService:
@@ -192,6 +219,11 @@ class ApplicationContextService:
         self._compact_count = 0
         self._compaction_events: list[dict[str, object]] = []
         self._last_compaction: dict[str, object] | None = None
+        # Process-local evidence for an epoch that reached the durable commit
+        # boundary.  It is used only when an outer asyncio cancellation or a
+        # late exception prevents ``compact_async`` from receiving its normal
+        # result object; it is not a persisted Job or resume cursor.
+        self._compaction_committed_any = False
         self._last_budget: ContextBudget | None = None
         self._last_gate: dict[str, object] | None = None
         self._last_pressure: ContextCountEstimate | None = None
@@ -236,6 +268,7 @@ class ApplicationContextService:
             "compact_count": self._compact_count,
             "compaction_events": copy.deepcopy(self._compaction_events),
             "last_compaction": copy.deepcopy(self._last_compaction),
+            "compaction_committed_any": self._compaction_committed_any,
             "last_budget": self._last_budget,
             "last_gate": copy.deepcopy(self._last_gate),
             "last_pressure": self._last_pressure,
@@ -256,6 +289,8 @@ class ApplicationContextService:
         self._compact_count = int(value.get("compact_count", 0))
         self._compaction_events = copy.deepcopy(value.get("compaction_events", []))  # type: ignore[assignment]
         self._last_compaction = copy.deepcopy(value.get("last_compaction"))  # type: ignore[assignment]
+        committed_any = value.get("compaction_committed_any", False)
+        self._compaction_committed_any = committed_any if isinstance(committed_any, bool) else False
         self._last_budget = value.get("last_budget")  # type: ignore[assignment]
         self._last_gate = copy.deepcopy(value.get("last_gate"))  # type: ignore[assignment]
         self._last_pressure = value.get("last_pressure")  # type: ignore[assignment]
@@ -345,7 +380,9 @@ class ApplicationContextService:
             state="running",
             trigger=trigger,
             changed=None,
+            reason=None,
         )
+        self._compaction_committed_any = False
         # Compaction derives a new Context candidate; an earlier exact usage
         # value cannot describe that in-flight mutation.
         self._refresh_context_estimate()
@@ -367,29 +404,44 @@ class ApplicationContextService:
             raise ValueError("unsupported Compaction trigger")
         if cancelled or result is None and self._compaction_status.state == "running":
             state = "cancelled" if cancelled else "failed"
-            changed = False
+            changed = (
+                result.changed
+                if result is not None
+                else self._compaction_committed_any
+            )
+            reason = "compaction_cancelled" if cancelled else "compaction_failed"
         elif result is None:
             state = "failed"
-            changed = False
+            changed = self._compaction_committed_any
+            reason = "compaction_failed"
         elif result.failure == "compaction_cancelled":
             state = "cancelled"
             changed = result.changed
+            reason = "compaction_cancelled"
         elif result.failure is not None:
-            # A partial bounded pass may retain a durable successful Timeline;
-            # represent that as completed while keeping the detailed reason
-            # in the existing diagnostics projection.
-            state = "completed" if result.changed else "failed"
+            # A partial bounded pass may retain a durable successful Timeline,
+            # but its terminal status remains failed so the caller cannot
+            # mistake an incomplete run for a complete compaction.
+            state = "failed"
             changed = result.changed
+            reason = (
+                result.failure
+                if result.failure in _COMPACTION_REASONS
+                else "compaction_failed"
+            )
         elif result.changed:
             state = "completed"
             changed = True
+            reason = None
         else:
             state = "no_change"
             changed = False
+            reason = None
         self._compaction_status = CompactionStatus(
             state=state,
             trigger=trigger,
             changed=changed,
+            reason=reason,
         )
 
     def compile(
@@ -689,6 +741,20 @@ class ApplicationContextService:
         except Exception:
             self.finish_compaction(None, trigger=trigger)
             raise
+        # Automatic/overflow compaction remains part of the owning Turn's
+        # cancellation contract.  Manual compaction exposes a controlled
+        # ``CompactionResult`` to its operation owner, but an automatic pass
+        # must hand a Provider/Token cancellation back to AgentRun exactly as
+        # before.  Preserve any durable partial result in the status before
+        # propagating the control-flow exception.
+        if (
+            trigger != "manual"
+            and cancellation is not None
+            and cancellation.cancelled
+            and result.failure == "compaction_cancelled"
+        ):
+            self.finish_compaction(result, trigger=trigger, cancelled=True)
+            raise GenerationCancelled()
         self.finish_compaction(result, trigger=trigger)
         return result
 
@@ -926,10 +992,14 @@ class ApplicationContextService:
                         last_failure = None
                         break
                     except GenerationCancelled:
-                        # Provider cancellation is a control-flow exit, not
-                        # an invalid structured compaction result.  Let the
-                        # existing Application/AgentRun cancellation path
-                        # handle it without retrying this epoch.
+                        # A caller-owned manual token is a bounded compaction
+                        # result, not an invalid Provider response.  Keep any
+                        # epochs already committed and expose cancellation at
+                        # the terminal result.  Auto/Turn cancellation keeps
+                        # the existing propagation semantics.
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            break
                         raise
                     except CancelledError:
                         # Preserve asyncio cancellation even when the shared
@@ -967,9 +1037,32 @@ class ApplicationContextService:
                     break
 
                 if validate_candidate is not None:
-                    decision = validate_candidate(candidate_result)
-                    if inspect.isawaitable(decision):
-                        decision = await decision
+                    try:
+                        decision = validate_candidate(candidate_result)
+                        if inspect.isawaitable(decision):
+                            decision = await decision
+                    except GenerationCancelled:
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            outcome(
+                                result=last_success,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                                attempt=epoch_attempt,
+                            )
+                            break
+                        raise
+                    except CancelledError:
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            outcome(
+                                result=last_success,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                                attempt=epoch_attempt,
+                            )
+                            break
+                        raise
                     if isinstance(decision, CompactionResult):
                         candidate_result = decision
                     elif isinstance(decision, bool):
@@ -1022,11 +1115,45 @@ class ApplicationContextService:
                     )
                     break
 
+                if cancellation is not None and cancellation.cancelled:
+                    last_failure = "compaction_cancelled"
+                    outcome(
+                        result=last_success,
+                        failure=last_failure,
+                        epoch=epoch_number,
+                        attempt=epoch_attempt,
+                    )
+                    break
+
                 committed_result = candidate_result
+                committed_ok = True
                 if commit is not None:
-                    committed = commit(candidate_result)
-                    if inspect.isawaitable(committed):
-                        committed = await committed
+                    try:
+                        committed = commit(candidate_result)
+                        if inspect.isawaitable(committed):
+                            committed = await committed
+                    except GenerationCancelled:
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            outcome(
+                                result=last_success,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                                attempt=epoch_attempt,
+                            )
+                            break
+                        raise
+                    except CancelledError:
+                        if cancellation is not None and cancellation.cancelled:
+                            last_failure = "compaction_cancelled"
+                            outcome(
+                                result=last_success,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                                attempt=epoch_attempt,
+                            )
+                            break
+                        raise
                     if isinstance(committed, CompactionResult):
                         committed_result = committed
                         committed_ok = (
@@ -1038,13 +1165,49 @@ class ApplicationContextService:
                         committed_ok = committed
                     else:
                         committed_ok = False
-                    if not committed_ok:
-                        last_failure = "timeline_commit_failed"
-                        outcome(
-                            result=committed_result,
-                            failure=last_failure,
-                            epoch=epoch_number,
+                if not committed_ok:
+                        # A storage adapter may reconcile an ambiguous append
+                        # and return the durable Timeline together with a
+                        # controlled failure reason.  Preserve that partial
+                        # durable epoch in the terminal result instead of
+                        # reporting ``changed=False`` and losing the commit
+                        # evidence at the Context boundary.
+                        partial_commit = (
+                            commit is not None
+                            and isinstance(committed, CompactionResult)
+                            and committed_result.changed
+                            and committed_result.timeline is not None
                         )
+                        if partial_commit:
+                            current_timeline = committed_result.timeline
+                            previous_sequence_end = current_timeline.sequence_end
+                            committed_any = True
+                            self._compaction_committed_any = True
+                            last_success = replace(
+                                committed_result,
+                                timeline=current_timeline,
+                                changed=True,
+                                failure=(
+                                    committed_result.failure
+                                    or "timeline_commit_failed"
+                                ),
+                            )
+                            last_failure = last_success.failure
+                            outcome(
+                                result=last_success,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                            )
+                        else:
+                            last_failure = (
+                                committed_result.failure
+                                or "timeline_commit_failed"
+                            )
+                            outcome(
+                                result=committed_result,
+                                failure=last_failure,
+                                epoch=epoch_number,
+                            )
                         break
 
                 next_timeline = committed_result.timeline or candidate_result.timeline
@@ -1060,24 +1223,44 @@ class ApplicationContextService:
                 current_timeline = next_timeline
                 previous_sequence_end = current_timeline.sequence_end
                 committed_any = True
+                self._compaction_committed_any = True
                 last_success = replace(
                     committed_result,
                     timeline=current_timeline,
                     changed=True,
-                    failure=None,
+                    failure=(
+                        "compaction_cancelled"
+                        if cancellation is not None and cancellation.cancelled
+                        else None
+                    ),
                 )
                 outcome(
                     result=last_success,
-                    failure=None,
+                    failure=last_success.failure,
                     epoch=epoch_number,
                     attempt=epoch_attempt,
                 )
 
+                if cancellation is not None and cancellation.cancelled:
+                    last_failure = "compaction_cancelled"
+                    break
+
                 if should_continue is None:
                     break
-                decision = should_continue(current_timeline)
-                if inspect.isawaitable(decision):
-                    decision = await decision
+                try:
+                    decision = should_continue(current_timeline)
+                    if inspect.isawaitable(decision):
+                        decision = await decision
+                except GenerationCancelled:
+                    if cancellation is not None and cancellation.cancelled:
+                        last_failure = "compaction_cancelled"
+                        break
+                    raise
+                except CancelledError:
+                    if cancellation is not None and cancellation.cancelled:
+                        last_failure = "compaction_cancelled"
+                        break
+                    raise
                 if isinstance(decision, Mapping):
                     continue_value = decision.get("continue", False)
                 elif isinstance(decision, bool):
@@ -1086,6 +1269,9 @@ class ApplicationContextService:
                     raise TypeError("should_continue must return bool or a mapping")
                 if not isinstance(continue_value, bool):
                     raise TypeError("should_continue mapping must contain boolean 'continue'")
+                if cancellation is not None and cancellation.cancelled:
+                    last_failure = "compaction_cancelled"
+                    break
                 if not continue_value:
                     break
             else:

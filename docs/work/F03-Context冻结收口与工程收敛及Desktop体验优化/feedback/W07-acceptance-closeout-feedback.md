@@ -269,3 +269,34 @@ Desktop `session.resume` 不再返回完整 replay；最近页独立显示，冷
 - 按用户更新后的 reviewer 配置，独立 terra/high 完整复审 PASS；其 Python 历史/Bridge/生命周期定向为 `79 passed in 10.88s`，带显式 deferred gate 的 project-only 轮询测试连续 5 次通过。早期该测试固定墙钟次数不稳定，已替换为可控制的响应顺序。
 - 当前事实文档、快速上手和索引同步；冻结正文、Spec、Tasks、Prompt、Checklist 均未改，未归档。没有新增能力欠账。
 - 本轮尚未 package/make、关闭应用或调用真实 Provider。用户已授权两项复审与回归通过后正常关闭、更新标准包并重启；该授权尚未执行。旧安装器不包含本轮增补，原生窗口/真实 Provider 验证不宣称通过。
+
+## 返工第 8 轮：压缩失败／中断恢复（实施中）
+
+历史分页已通过 PR #101 合并，基线为 `256f861cad8b46e324bef2936b041be96f20438e`。本轮仍按用户批准的增补计划实施，不修改任务书，不归档。worker 使用 luna/max，独立 reviewer 使用 terra/high；同一问题两次回归失败由主控接手。Application 与 Desktop 按不重叠写入范围实施，真实子进程恢复测试独立补齐。
+
+### 已完成的回归与恢复测试补充（2026-09-06）
+
+- 初次全量基线 `python -m pytest -q` 为 `1492 passed, 3 skipped, 2 failed in 122.77s`；失败是 TUI pause/shutdown 与 Session Picker 的等待测试，不作为通过证据。Picker 定向复跑仍失败，主控接手，将直接 handler 调用改为实际 pipe `/resume` 输入，并以有界 timeout 等待；打开、Escape 关闭及 Session 数量不变的断言保留。
+- 第二次全量运行收集到了正在新增的 Bridge 操作红测试，结果为 `1493 passed, 3 skipped, 2 failed in 121.62s`，因此不是纯基线或最终候选：`compact_started` 尚未实现是预期红测；另有 TUI pause 等待失败。主控将 TUI 公用等待辅助函数改为原名义时限 `attempts × 0.01s` 的实际 timeout，未吞掉失败、增加重试或修改 TUI 产品代码。
+- 主控执行 `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_tui.py tests/test_w06_integration_delivery.py -q`：`110 passed in 15.47s`；terra/high 独立复审 PASS，其同集合复跑 `110 passed in 14.68s`，核心 pause/cancel 与 paused shutdown 连续 5 轮均 `2 passed`。这不替代压缩改动后的全量回归。
+- 新增 `tests/test_compaction_process_recovery.py`：真实子进程在完整 checkpoint 提交后、以及 derived 已 fsync 但 checkpoint 仅写入半尾时强制退出。父进程核对就绪 PID，仅终止测试自有进程；fresh store 验证历史可读、writer lock 重取、继续追加历史/Timeline 和无重复提交。复用现有文件恢复规则，无持久 Job 或真实 Provider。
+- 子进程测试经 terra/high 发现异常路径可能遗留 child，已由原 worker 补充 contextmanager/finally 回收并复审 PASS。新测试重复 3 次均 `2 passed`；`conda run --no-capture-output -n re-uthcode python -m pytest tests/test_session_files.py tests/test_compaction_process_recovery.py -q` 为 `27 passed`。
+
+本节仅记录已完成的测试补充。Application 取消与提交状态、Desktop 操作通知/取消入口仍在实施；尚未执行本轮最终全量、提交推送、PR、标准打包或应用重启，也未调用真实 Provider。
+
+### 第 8 轮最终实现与回归（2026-09-07）
+
+- Application 手动压缩接收调用方取消控制，覆盖模型预检、生成、校验和提交前检查。终态与是否已有有效提交分别记录：取消或后续 epoch 失败保留已经生效的结果；未知提交通过现有 Timeline reconciliation、writer 关闭重开和权威内容核对恢复，不引入持久 Compact Job，也不重复提交。
+- Desktop Bridge 立即返回 Session/操作身份，在所属 Session 后台执行压缩并发布带身份的进度/终态；显式取消、跨会话导航和其他会话任务可继续。同会话的新 Turn、重复压缩及输入变更受限；关闭时取消并有界等待。终态缓存仅保留轻量投影，不持有 Application/task/token。界面按 Session/操作身份过滤旧通知，显示安全原因及部分提交。
+- luna/max worker 实施，terra/high 独立复审通过。复审关闭了多 epoch owner 重开、自动压缩取消传播、关闭异常保留有效提交、导航命令绕过占用检查及终态强引用遗留等 finding。主控按用户要求接手两次失败的 TUI 等待测试；没有修改 TUI 产品行为。
+- 最终 `conda run --no-capture-output -n re-uthcode python -m pytest -q`：`1512 passed, 3 skipped in 123.18s`，exit 0；包含架构边界、压缩提交链及真实子进程强制退出恢复测试。
+- 设置 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe` 后执行 Desktop `npm test`：`209 passed, 0 failed, 0 skipped`，`36700.6404ms`，exit 0；`npm run typecheck` exit 0。此前中间结果不替代本次最终候选证据。
+- 标准 `conda run --no-capture-output -n re-uthcode npm run package` 首次因 runtime smoke 超过 15000ms 失败；未放宽超时或修改实现，核对无遗留进程后原命令重跑 exit 0，runtime ready/status/shutdown/resource smoke 与 Forge package 完成。`desktop/out/UthCode-win32-x64/resources/app.asar` SHA-256 为 `B03CB4CDB8DB69F5B61F226705FF50A71B11518AC4593A0594AFB49D7780DB7C`。
+- 当前标准包以隔离 HOME 和本地 fixture 执行中英文 `commands` flow 均通过：报告目录 `desktop/dist/ui-acceptance/f03-compact-final-zh`、`f03-compact-final-en`。验证脚本改为检查 RuntimePanel 的压缩终态及本地化文字，适配正式异步协议；该脚本调整经 terra/high 复审。
+- 当前事实、核心设计、命令手册与索引共 7 份文档同步；未改冻结任务书、Spec、Tasks、Prompt 或 Checklist，未新增能力欠账，未归档。未执行 `make`，安装器未更新；未发送真实 Provider 请求。用户真实会话复验仍待进行。
+
+### 第 8 轮 packaged 会话补验
+
+- 英文 `sessions` flow 在当前标准包通过，报告 `desktop/dist/ui-acceptance/f03-sessions-final-verified/acceptance-report.json`，runId `61d3d337-9c67-4c80-9796-7c703f4de4b2`：六个会话、展开历史列表、切换回放、返回续聊及压缩安全失败终态。脚本改用实际观察到的 Session 行身份定位，不再假设 metadata-only 列表包含首条 prompt。
+- 旧脚本预期 8 次请求，实际 9 次。核对本地 fixture 和 Application 调用链后，明确为 7 次普通 Turn 请求及 2 次无工具压缩生成：fixture 只返回普通文本，摘要校验两次失败后受控终止。断言精确核对总数和这两类请求的顺序；没有放宽 Provider 重试策略。此流程不代表压缩成功提交验收，提交与中断恢复由 Python/Bridge 回归覆盖。
+- 脚本 `node --check` 通过；`conda run --no-capture-output -n re-uthcode npx tsx --test tests/cdp-isolation.test.ts` 为 `11 passed, 0 failed`。中文 `sessions` 额外尝试因旧脚本硬编码英文 Chat timeline selector 失败，未将其列为通过；中英文 commands 的成功证据保持有效。本轮没有重跑整个历史视觉矩阵。

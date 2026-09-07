@@ -144,6 +144,10 @@ export interface CompactionStatusProjection {
   state: CompactionState;
   trigger: CompactionTrigger | null;
   changed: boolean | null;
+  /** Bridge-owned operation identity; absent for historical Application status. */
+  operation_id?: string;
+  /** Safe Application/Bridge reason code, never arbitrary exception text. */
+  reason?: string;
 }
 
 export interface SessionSummary {
@@ -581,6 +585,68 @@ function isSettledTurn(state: RendererState): boolean {
   return state.terminalStatusPending || state.turnStatus === "completed" || state.turnStatus === "failed" || state.turnStatus === "cancelled";
 }
 
+const COMPACTION_OPERATION_STATES = new Set<CompactionState>(["running", "completed", "no_change", "failed", "cancelled"]);
+
+function compactionOperationEventProjection(event: AgentEvent): { sessionId: string; projectKey: string; operationId: string; projection: CompactionStatusProjection } | null {
+  const payload = event as Record<string, JsonValue>;
+  const sessionId = nonEmptyText(payload.session_id);
+  const projectKey = nonEmptyText(payload.project_key);
+  const operationId = nonEmptyText(payload.operation_id);
+  const state = payload.state;
+  if (!sessionId || !projectKey || !operationId || typeof state !== "string" || !COMPACTION_OPERATION_STATES.has(state as CompactionState)) return null;
+  const projection = normalizeCompactionStatus({
+    state,
+    trigger: "manual",
+    changed: payload.changed,
+    reason: payload.reason,
+    operation_id: operationId,
+  });
+  if (projection.state === "idle") return null;
+  return { sessionId, projectKey, operationId, projection };
+}
+
+/** Apply Bridge-owned compaction identity before generic Run event filtering. */
+function reduceCompactionOperationEvent(state: RendererState, event: AgentEvent): RendererState {
+  const operation = compactionOperationEventProjection(event);
+  if (!operation) return state;
+  const visible = state.selectedProjectKey === operation.projectKey && state.selectedSessionId === operation.sessionId;
+  const key = sessionRuntimeKey(operation.projectKey, operation.sessionId);
+  const cached = state.sessionRuntime[key];
+  const previous = visible ? state.compactionStatus : cached?.compactionStatus;
+  const previousOperationId = previous?.operation_id;
+  // A terminal projection is still an identity boundary.  A new running
+  // operation may replace a previous terminal one, but an old terminal event
+  // must never overwrite a newer running/terminal operation.
+  if (previousOperationId && previousOperationId !== operation.operationId
+    && (previous.state === "running" || operation.projection.state !== "running")) return state;
+  if (previousOperationId === operation.operationId
+    && previous.state !== "running" && operation.projection.state === "running") return state;
+  // Without a previously observed operation, only the start marker can create
+  // a cache.  This prevents a delayed terminal notification from inventing a
+  // Session state after its start was discarded during lifecycle recovery.
+  if (!previousOperationId && operation.projection.state !== "running") return state;
+
+  if (visible) {
+    const next = { ...state, compactionStatus: operation.projection };
+    return cacheVisibleRuntime(
+      updateSessionRuntimeStatus(next, operation.projectKey, operation.sessionId, runtimeStatus(runtimeSnapshotFromState(next))),
+      operation.projectKey,
+      operation.sessionId,
+    );
+  }
+  const base = cached
+    ? applyRuntimeSnapshot(emptyRuntimeBoundary(state), cached)
+    : emptyRuntimeBoundary(state);
+  const next = { ...base, compactionStatus: operation.projection };
+  const snapshot = runtimeSnapshotFromState(next);
+  return updateSessionRuntimeStatus(
+    { ...state, sessionRuntime: { ...state.sessionRuntime, [key]: snapshot } },
+    operation.projectKey,
+    operation.sessionId,
+    runtimeStatus(snapshot),
+  );
+}
+
 const IDENTITY_REQUIRED_EVENT_TYPES = new Set([
   "turn_started",
   "reasoning_started",
@@ -862,7 +928,7 @@ export type RendererAction =
   | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean; preserveTimeline?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
   | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
-  | { type: "compaction_started"; trigger?: CompactionTrigger }
+  | { type: "compaction_started"; trigger?: CompactionTrigger; operationId?: string; sessionId?: string; projectKey?: string }
   | { type: "agent_event"; event: AgentEvent }
   | { type: "interaction_submitting"; value: boolean }
   | { type: "session_mutation_busy"; value: boolean }
@@ -1001,7 +1067,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
           : statusTargetsVisibleSession && legacyContextPresent
             ? { contextUsage: contextUsageAtBoundary() }
             : {}),
-        ...(statusTargetsVisibleSession && compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue) } : {}),
+        ...(statusTargetsVisibleSession && compactionValue !== undefined ? { compactionStatus: normalizeCompactionStatus(compactionValue, state.compactionStatus) } : {}),
         ...(visibleProviderUsage ? { lastProviderRequestUsage: cloneProviderRequestUsage(visibleProviderUsage) } : {}),
         ...(visibleHydrated ? {
           timeline: visibleHydrated.timeline,
@@ -1153,10 +1219,24 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const runtime = runtimeSnapshotFromState(next);
       return updateSessionRuntimeStatus({ ...next, sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } }, stateWithCache.selectedProjectKey, action.sessionId, "idle");
     }
-    case "compaction_started":
-      return { ...state, compactionStatus: { state: "running", trigger: action.trigger ?? "manual", changed: null }, notice: null };
+    case "compaction_started": {
+      if ((action.sessionId && action.sessionId !== state.selectedSessionId)
+        || (action.projectKey && action.projectKey !== state.selectedProjectKey)) return state;
+      const operationId = nonEmptyText(action.operationId);
+      return {
+        ...state,
+        compactionStatus: {
+          state: "running",
+          trigger: action.trigger ?? "manual",
+          changed: null,
+          ...(operationId ? { operation_id: operationId } : {}),
+        },
+        notice: null,
+      };
+    }
     case "agent_event": {
       const event = action.event as Record<string, JsonValue>;
+      if (event.type === "compaction_operation") return reduceCompactionOperationEvent(state, action.event);
       const eventSessionId = nonEmptyText(event.session_id);
       const eventProjectKey = nonEmptyText(event.project_key) ?? state.selectedProjectKey;
       const offscreen = Boolean(eventSessionId && (eventSessionId !== state.selectedSessionId || (eventProjectKey && eventProjectKey !== state.selectedProjectKey)));
@@ -1206,6 +1286,18 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const params = asRecord(source.params);
       const notice = action.notice ?? null;
       const actionValue = asRecord(source.ui_action);
+      if (source.code === "compact_started") {
+        const operationId = nonEmptyText(params?.operation_id);
+        const sessionId = nonEmptyText(params?.session_id);
+        if (!operationId || !sessionId || (state.selectedSessionId && state.selectedSessionId !== sessionId)) return state;
+        return {
+          ...state,
+          compactionStatus: { state: "running", trigger: "manual", changed: null, operation_id: operationId },
+          commandOutput: notice,
+          notice,
+          composerText: "",
+        };
+      }
       if (source.code === "compact_failed" || source.code === "compact_cancelled" || source.code === "compact_no_change" || source.code === "compact_completed") {
         const compactState: CompactionState = source.code === "compact_failed"
           ? "failed"
@@ -1238,7 +1330,7 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       if (params && Object.prototype.hasOwnProperty.call(params, "compaction_status")) {
         return {
           ...state,
-          compactionStatus: normalizeCompactionStatus(params.compaction_status),
+          compactionStatus: normalizeCompactionStatus(params.compaction_status, state.compactionStatus),
           commandOutput: notice,
           notice,
           composerText: "",

@@ -276,7 +276,7 @@ test("late response for a timed-out request does not poison a live Runtime", asy
   await runtime.shutdown();
 });
 
-test("canonical /compact waits beyond the client deadline while status keeps its timeout", async () => {
+test("/compact uses the normal client deadline and late responses stay harmless", async () => {
   const child = new FakeChild();
   const runtime = new PythonRuntime({
     launch: { command: "python.exe", args: [] },
@@ -285,33 +285,25 @@ test("canonical /compact waits beyond the client deadline while status keeps its
   });
   await runtime.start();
 
-  let compactSettled = false;
-  const compact = runtime
-    .request("command.execute", { text: " \t/CoMpAcT \n" })
-    .finally(() => { compactSettled = true; });
+  const compact = runtime.request("command.execute", { text: " \t/CoMpAcT \n" });
   const compactId = requestId(child);
-  await new Promise((resolve) => setTimeout(resolve, 35));
-  assert.equal(compactSettled, false);
-
-  const withArgument = runtime.request("command.execute", { text: "/compact extra" });
-  await assert.rejects(withArgument, (error: unknown) => {
+  await assert.rejects(compact, (error: unknown) => {
     return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
   });
-  assert.equal(compactSettled, false);
+  assert.equal(runtime.state, "ready");
+  // The Bridge may still finish the operation after the Renderer deadline.
+  // Its late response is correlated and ignored without poisoning Runtime.
+  child.stdout.emit("data", response(compactId, { command: "compact", status: "success" }));
+  assert.equal(runtime.state, "ready");
 
   const status = runtime.request("status.get", {});
-  await assert.rejects(status, (error: unknown) => {
-    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
-  });
-  assert.equal(compactSettled, false);
-
-  child.stdout.emit("data", response(compactId, { command: "compact", status: "success" }));
-  assert.deepEqual(await compact, { command: "compact", status: "success" });
-  assert.equal(runtime.state, "ready");
+  const statusId = requestId(child);
+  child.stdout.emit("data", response(statusId, { state: "ready", active_turn: false }));
+  assert.deepEqual(await status, { state: "ready", active_turn: false });
   await runtime.shutdown();
 });
 
-test("canonical /compact failure settles only when the Bridge reports failure", async () => {
+test("/compact timeout ignores a late Bridge failure response", async () => {
   const child = new FakeChild();
   const runtime = new PythonRuntime({
     launch: { command: "python.exe", args: [] },
@@ -320,25 +312,17 @@ test("canonical /compact failure settles only when the Bridge reports failure", 
   });
   await runtime.start();
 
-  let compactSettled = false;
-  const compact = runtime
-    .request("command.execute", { text: "/compact" })
-    .finally(() => { compactSettled = true; });
+  const compact = runtime.request("command.execute", { text: "/compact" });
   const compactId = requestId(child);
-  await new Promise((resolve) => setTimeout(resolve, 35));
-  assert.equal(compactSettled, false);
-
-  child.stdout.emit("data", errorResponse(compactId, "execution_error", "compact failed"));
   await assert.rejects(compact, (error: unknown) => {
-    return error instanceof RuntimeRequestError
-      && error.kind === "execution_error"
-      && error.message === "compact failed";
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
   });
+  child.stdout.emit("data", errorResponse(compactId, "execution_error", "compact failed"));
   assert.equal(runtime.state, "ready");
   await runtime.shutdown();
 });
 
-test("bounded shutdown reaps a child with an unfinished canonical /compact request", async () => {
+test("bounded shutdown reaps a child with an unfinished /compact request", async () => {
   const child = new FakeChild();
   const runtime = new PythonRuntime({
     launch: { command: "python.exe", args: [] },
@@ -351,13 +335,14 @@ test("bounded shutdown reaps a child with an unfinished canonical /compact reque
   const compact = runtime.request("command.execute", { text: "/compact" });
   const compactId = requestId(child);
   assert.equal(typeof compactId, "string");
+  const compactOutcome = assert.rejects(compact, (error: unknown) => {
+    return error instanceof RuntimeBoundaryError && error.kind === "request_timeout";
+  });
 
   const shutdown = runtime.shutdown();
   assert.equal(JSON.parse(child.writes.at(-1) ?? "{}").method, "runtime.shutdown");
   await shutdown;
-  await assert.rejects(compact, (error: unknown) => {
-    return error instanceof RuntimeBoundaryError && error.kind === "shutdown_timeout";
-  });
+  await compactOutcome;
   assert.equal(runtime.state, "stopped");
 });
 

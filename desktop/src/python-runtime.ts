@@ -65,15 +65,6 @@ interface ReadableLike {
   on(event: "data", listener: (chunk: unknown) => void): this;
 }
 
-function isCanonicalCompactRequest(method: string, params: JsonObject): boolean {
-  // CommandParser remains the authority for command validity.  The transport
-  // only recognizes the exact no-argument canonical spelling when selecting
-  // its client deadline; it never parses aliases or command arguments.
-  return method === "command.execute"
-    && typeof params.text === "string"
-    && params.text.trim().toLowerCase() === "/compact";
-}
-
 export interface ChildProcessLike {
   readonly pid?: number;
   readonly stdin?: WritableLike | null;
@@ -217,12 +208,7 @@ export class PythonRuntime {
   }
 
   async request(method: string, params: JsonObject): Promise<JsonValue> {
-    return this.requestInternal(
-      method,
-      params,
-      false,
-      isCanonicalCompactRequest(method, params) ? undefined : this.requestTimeoutMs,
-    );
+    return this.requestInternal(method, params, false, this.requestTimeoutMs);
   }
 
   private async requestInternal(

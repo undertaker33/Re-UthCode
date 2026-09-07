@@ -21,6 +21,8 @@ from uthcode.application import (
     BehaviorModeSelected,
     CommandOutcome,
     ConfigSource,
+    CompactionResult,
+    CancellationToken,
     EffectiveConfig,
     GenerationCompleted,
     Message,
@@ -194,6 +196,88 @@ class _FakeApplication:
         return ()
 
 
+class _BlockingCompactOperation:
+    """Application-shaped fixture; operation identity belongs to Bridge."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancellation: CancellationToken | None = None
+
+    async def run(self, cancellation: CancellationToken) -> CompactionResult:
+        self.cancellation = cancellation
+        self.started.set()
+        await cancellation.wait()
+        return CompactionResult(timeline=None, summary=None, changed=False, failure="compaction_cancelled")
+
+
+class _BlockingCompactApplication(_FakeApplication):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_id = "compact-session"
+        self.compact_operation = _BlockingCompactOperation()
+
+    async def compact_session(self, *, cancellation: CancellationToken | None = None) -> CompactionResult:
+        if cancellation is None:
+            cancellation = CancellationToken()
+        return await self.compact_operation.run(cancellation)
+
+
+class _NonCooperativeCompactApplication(_BlockingCompactApplication):
+    """Expose a durable partial while the outer operation ignores cancellation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._compaction_status = SimpleNamespace(
+            state="running",
+            trigger="manual",
+            changed=None,
+            reason=None,
+        )
+
+    def status(self) -> object:
+        return SimpleNamespace(compaction_status=self._compaction_status)
+
+    async def compact_session(self, *, cancellation: CancellationToken | None = None) -> CompactionResult:
+        if cancellation is None:
+            cancellation = CancellationToken()
+        self.compact_operation.cancellation = cancellation
+        self.compact_operation.started.set()
+        # The test changes the public status after the durable boundary.  The
+        # await deliberately ignores the token so shutdown must hard-reap the
+        # bridge task and still preserve that known partial result.
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class _FailingAfterPartialCompactApplication(_BlockingCompactApplication):
+    """Raise after publishing a safe failed/partial Application status."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._compaction_status = SimpleNamespace(
+            state="running",
+            trigger="manual",
+            changed=None,
+            reason=None,
+        )
+
+    def status(self) -> object:
+        return SimpleNamespace(compaction_status=self._compaction_status)
+
+    async def compact_session(self, *, cancellation: CancellationToken | None = None) -> CompactionResult:
+        if cancellation is None:
+            cancellation = CancellationToken()
+        self.compact_operation.cancellation = cancellation
+        self.compact_operation.started.set()
+        self._compaction_status = SimpleNamespace(
+            state="failed",
+            trigger="manual",
+            changed=True,
+            reason="timeline_durability_unknown",
+        )
+        raise RuntimeError("provider payload must not cross Desktop")
+
+
 class _BlockingHandle(_FakeHandle):
     """A handle whose stream stays live until the bridge cancels it."""
 
@@ -292,6 +376,17 @@ class _BackgroundSessionApplication(_SessionApplication):
             replay=session.replay,
         )
         return session
+
+
+class _BackgroundCompactApplication(_BackgroundSessionApplication):
+    def __init__(self, session_id: str = "session-a", project: Path | None = None) -> None:
+        super().__init__(session_id, project)
+        self.compact_operation = _BlockingCompactOperation()
+
+    async def compact_session(self, *, cancellation: CancellationToken | None = None) -> CompactionResult:
+        if cancellation is None:
+            cancellation = CancellationToken()
+        return await self.compact_operation.run(cancellation)
 
 
 class _FailingFreshRunApplication(_SessionApplication):
@@ -1940,7 +2035,7 @@ async def test_command_result_is_typed_and_drops_free_form_status_and_errors() -
         )
 
     bridge._dispatcher.dispatch_async = dispatch  # type: ignore[method-assign]
-    for index, text in enumerate(("/status", "/compact", "/plan", "/do", "/model", "/permission full_access", "/help", "/unknown")):
+    for index, text in enumerate(("/status", "/plan", "/do", "/model", "/permission full_access", "/help", "/unknown")):
         result = await bridge.handle_request(
             RequestEnvelope(f"typed-command-{index}", "command.execute", {"text": text})
         )
@@ -1965,6 +2060,286 @@ async def test_command_result_is_typed_and_drops_free_form_status_and_errors() -
     assert command_status.result is not None and status.result is not None
     assert command_status.result["code"] == "status_ready"
     assert command_status.result["params"] == status.result
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_returns_an_operation_and_scopes_cancel_to_session() -> None:
+    application = _BlockingCompactApplication()
+    bridge = DesktopBridge(application=application)
+
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-start", "command.execute", {"text": "/compact"})
+    )
+
+    assert started.ok is True
+    assert started.result is not None
+    assert started.result["code"] == "compact_started"
+    params = started.result["params"]
+    assert isinstance(params["operation_id"], str) and params["operation_id"]
+    assert params["session_id"] == "compact-session"
+    operation_id = params["operation_id"]
+    await asyncio.sleep(0)
+
+    blocked = await bridge.handle_request(
+        RequestEnvelope("compact-turn", "turn.start", {"prompt": "must wait"})
+    )
+    assert blocked.ok is False
+    assert blocked.error is not None and blocked.error.kind == "compaction_active"
+
+    wrong_scope = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-cancel-wrong-session",
+            "compaction.cancel",
+            {"session_id": "other-session", "operation_id": operation_id},
+        )
+    )
+    assert wrong_scope.ok is False
+    assert wrong_scope.error is not None and wrong_scope.error.kind == "stale_operation"
+    assert application.compact_operation.cancellation is not None
+    assert application.compact_operation.cancellation.cancelled is False
+
+    cancelled = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-cancel",
+            "compaction.cancel",
+            {"session_id": "compact-session", "operation_id": operation_id},
+        )
+    )
+    assert cancelled.ok is True
+    assert cancelled.result == {
+        "accepted": True,
+        "operation_id": operation_id,
+        "session_id": "compact-session",
+    }
+    assert application.compact_operation.cancellation is not None
+    assert application.compact_operation.cancellation.cancelled is True
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    events = bridge.drain_outbox()
+    assert any(
+        item.type == "agent_event"
+        and item.event["type"] == "compaction_operation"
+        and item.event["operation_id"] == operation_id
+        and item.event["session_id"] == "compact-session"
+        and item.event["state"] == "cancelled"
+        for item in events
+    )
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_hard_reap_preserves_application_known_partial_compaction() -> None:
+    application = _NonCooperativeCompactApplication()
+    bridge = DesktopBridge(application=application, shutdown_timeout=0.01)
+
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-deadline-start", "command.execute", {"text": "/compact"})
+    )
+    assert started.ok is True and started.result is not None
+    operation_id = started.result["params"]["operation_id"]
+    await application.compact_operation.started.wait()
+    application._compaction_status = SimpleNamespace(
+        state="cancelled",
+        trigger="manual",
+        changed=True,
+        reason="compaction_cancelled",
+    )
+
+    await bridge.shutdown()
+
+    events = bridge.drain_outbox()
+    terminal = [
+        item.event
+        for item in events
+        if item.type == "agent_event"
+        and item.event["type"] == "compaction_operation"
+        and item.event["operation_id"] == operation_id
+        and item.event["state"] == "cancelled"
+    ]
+    assert terminal
+    assert terminal[-1]["changed"] is True
+    assert terminal[-1]["reason"] == "compaction_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_compact_exception_preserves_application_known_partial_compaction() -> None:
+    application = _FailingAfterPartialCompactApplication()
+    bridge = DesktopBridge(application=application)
+
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-exception-start", "command.execute", {"text": "/compact"})
+    )
+    assert started.ok is True and started.result is not None
+    operation_id = started.result["params"]["operation_id"]
+    await application.compact_operation.started.wait()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    events = bridge.drain_outbox()
+    terminal = [
+        item.event
+        for item in events
+        if item.type == "agent_event"
+        and item.event["type"] == "compaction_operation"
+        and item.event["operation_id"] == operation_id
+        and item.event["state"] == "failed"
+    ]
+    assert terminal
+    assert terminal[-1]["changed"] is True
+    assert terminal[-1]["reason"] == "timeline_durability_unknown"
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_compaction_keeps_background_session_alive_for_typed_resume_and_turn() -> None:
+    application_a = _BackgroundCompactApplication("session-a")
+    application_b = _BackgroundSessionApplication("session-b")
+    bridge = DesktopBridge(
+        application=application_a,
+        application_factory=lambda path: _BackgroundSessionApplication("session-new", path),
+    )
+    run_b = application_b.create_run()
+    run_b.handle = _EventHandle()
+    bridge._background_runtimes["session-b"] = {
+        "application": application_b,
+        "run": run_b,
+        "handle": None,
+        "task": None,
+        "dispatcher": bridge._dispatcher,
+        "completion": bridge._completion,
+        "closed": False,
+        "status": "idle",
+        "project_key": "C:/fake",
+    }
+
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-background-start", "command.execute", {"text": "/compact"})
+    )
+    assert started.ok is True and started.result is not None
+    operation_id = started.result["params"]["operation_id"]
+    await application_a.compact_operation.started.wait()
+
+    resumed_b = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-background-resume-b",
+            "command.execute",
+            {"text": "/resume session-b"},
+        )
+    )
+    assert resumed_b.ok is True and resumed_b.result is not None
+    assert resumed_b.result["code"] == "session_resumed"
+    assert bridge.application is application_b
+    assert application_a.compact_operation.cancellation is not None
+    assert application_a.compact_operation.cancellation.cancelled is False
+
+    b_turn = await bridge.handle_request(
+        RequestEnvelope("compact-background-b-turn", "turn.start", {"prompt": "B remains usable"})
+    )
+    assert b_turn.ok is True
+    await bridge.wait_for_idle()
+    assert run_b.started == ["B remains usable"]
+
+    resumed_a = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-background-resume-a",
+            "command.execute",
+            {"text": "/resume session-a"},
+        )
+    )
+    assert resumed_a.ok is True and resumed_a.result is not None
+    assert resumed_a.result["code"] == "session_resumed"
+    assert bridge.application is application_a
+    assert application_a.compact_operation.cancellation.cancelled is False
+
+    cancelled = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-background-cancel",
+            "compaction.cancel",
+            {"session_id": "session-a", "operation_id": operation_id},
+        )
+    )
+    assert cancelled.ok is True
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_compaction_routes_typed_new_through_background_session_boundary() -> None:
+    application_a = _BackgroundCompactApplication("session-a")
+    created: list[_BackgroundSessionApplication] = []
+
+    def factory(path: Path) -> _BackgroundSessionApplication:
+        candidate = _BackgroundSessionApplication("session-new", path)
+        created.append(candidate)
+        return candidate
+
+    bridge = DesktopBridge(application=application_a, application_factory=factory)
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-new-start", "command.execute", {"text": "/compact"})
+    )
+    assert started.ok is True
+    await application_a.compact_operation.started.wait()
+
+    created_result = await bridge.handle_request(
+        RequestEnvelope("compact-new", "command.execute", {"text": "/new"})
+    )
+    assert created_result.ok is True and created_result.result is not None
+    assert created_result.result["code"] == "session_created"
+    assert created
+    assert bridge.application is created[0]
+    assert application_a.compact_operation.cancellation is not None
+    assert application_a.compact_operation.cancellation.cancelled is False
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_compaction_releases_application_token_and_task_references() -> None:
+    application_a = _BackgroundCompactApplication("session-a")
+    application_b = _BackgroundSessionApplication("session-b")
+    bridge = DesktopBridge(application=application_a)
+    run_b = application_b.create_run()
+    bridge._background_runtimes["session-b"] = {
+        "application": application_b,
+        "run": run_b,
+        "handle": None,
+        "task": None,
+        "dispatcher": bridge._dispatcher,
+        "completion": bridge._completion,
+        "closed": False,
+        "status": "idle",
+        "retain": True,
+        "project_key": "C:/fake",
+    }
+
+    started = await bridge.handle_request(
+        RequestEnvelope("compact-release-start", "command.execute", {"text": "/compact"})
+    )
+    assert started.ok is True and started.result is not None
+    operation_id = started.result["params"]["operation_id"]
+    await application_a.compact_operation.started.wait()
+    operation_task = bridge._compaction_operations["session-a"]["task"]
+    assert isinstance(operation_task, asyncio.Task)
+    cancelled = await bridge.handle_request(
+        RequestEnvelope(
+            "compact-release-cancel",
+            "compaction.cancel",
+            {"session_id": "session-a", "operation_id": operation_id},
+        )
+    )
+    assert cancelled.ok is True
+    await operation_task
+
+    operation = bridge._compaction_operations["session-a"]
+    assert operation["state"] == "cancelled"
+    assert operation["changed"] is False
+    assert "application" not in operation
+    assert "token" not in operation
+    assert "task" not in operation
+
+    await bridge._session_resume_background("session-b")
+    assert application_a.close_calls == 1
     await bridge.shutdown()
 
 

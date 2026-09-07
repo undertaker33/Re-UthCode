@@ -870,9 +870,11 @@ async function submitDelayedFlow(session) {
 }
 
 async function submitSessionsFlow(session) {
+  const sessionRows = [];
   await waitFor(session, `first session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture request') && text.includes(${JSON.stringify(expectedText)}); })()`);
 
   const sessionPrompts = ["cdp fixture session two", "cdp fixture session three", "cdp fixture session four", "cdp fixture session five", "cdp fixture session six"];
+  sessionRows.push(await evaluateAction(session, "remember first session identity", "document.querySelector('button.session-line.is-selected')?.getAttribute('aria-label')"));
   for (const [index, prompt] of sessionPrompts.entries()) {
     const ordinal = index + 2;
     await clickText(session, "New chat");
@@ -883,14 +885,21 @@ async function submitSessionsFlow(session) {
     await waitFor(session, `${ordinal}th message ready`, "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
     await clickText(session, "Send");
     await waitFor(session, `${ordinal}th session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes(${JSON.stringify(prompt)}) && text.includes(${JSON.stringify(expectedText)}); })()`);
+    sessionRows.push(await evaluateAction(session, "remember session identity", "document.querySelector('button.session-line.is-selected')?.getAttribute('aria-label')"));
   }
-  await waitFor(session, "session rows beyond five", "document.querySelectorAll('button.session-line:not(.new-session-line)').length >= 6 && [...document.querySelectorAll('button.session-line:not(.new-session-line)')].some((item) => (item.textContent || '').includes('cdp fixture session six')) && [...document.querySelectorAll('button.session-line:not(.new-session-line)')].some((item) => (item.textContent || '').includes('cdp fixture request'))");
+  const expandedSessions = await evaluateAction(session, "expand older session rows", `(() => {
+    const button = [...document.querySelectorAll('button')].find((item) => /^(Show more|显示更多)/u.test(item.textContent?.trim() || ''));
+    button?.click();
+    return Boolean(button) || Boolean(document.querySelector('.session-more[aria-expanded="true"]'));
+  })()`);
+  if (!expandedSessions || sessionRows.some(value => !value) || new Set(sessionRows).size !== 6) throw new Error("six distinct session identities were not observed");
+  await waitFor(session, "session rows beyond five", `(() => { const labels = [...document.querySelectorAll('button.session-line:not(.new-session-line)')].map(item => item.getAttribute('aria-label')); return ${JSON.stringify(sessionRows)}.every(label => labels.includes(label)); })()`);
   await capture(session, "sessions-over-five");
 
   writeLog("action", { action: "select_session", label: "cdp fixture session two" });
   const switched = await evaluateAction(session, "select second session", `(() => {
     const rows = [...document.querySelectorAll('button.session-line:not(.new-session-line)')];
-    const row = rows.find((item) => (item.textContent || '').includes('cdp fixture session two'));
+    const row = rows.find((item) => item.getAttribute('aria-label') === ${JSON.stringify(sessionRows[1])});
     if (!row) return false;
     row.click();
     return true;
@@ -901,7 +910,7 @@ async function submitSessionsFlow(session) {
   writeLog("action", { action: "select_session", label: "cdp fixture request" });
   const replayed = await evaluateAction(session, "select first session for replay", `(() => {
     const rows = [...document.querySelectorAll('button.session-line:not(.new-session-line)')];
-    const row = rows.find((item) => (item.textContent || '').includes('cdp fixture request'));
+    const row = rows.find((item) => item.getAttribute('aria-label') === ${JSON.stringify(sessionRows[0])});
     if (!row) return false;
     row.click();
     return true;
@@ -957,8 +966,8 @@ async function submitCompactCommand(session) {
   const expected = requestedLanguage === "zh-CN"
     ? { heading: "上下文压缩", states: ["已完成", "无变化", "已取消", "失败"], forbidden: ["Compaction", "completed", "No change", "cancelled"] }
     : { heading: "Compaction", states: ["completed", "No change", "cancelled", "failed"], forbidden: ["上下文压缩", "已完成", "无变化", "已取消"] };
-  await waitFor(session, "localized compact terminal", `(() => { const text = document.querySelector('.timeline-notice')?.textContent || ''; return text.includes(${JSON.stringify(expected.heading)}) && ${JSON.stringify(expected.states)}.some((value) => text.includes(value)); })()`);
-  const terminal = await evaluateAction(session, "read localized compact terminal", `(() => ({ text: document.querySelector('.timeline-notice')?.textContent?.trim() || '', count: document.querySelectorAll('.timeline-notice').length }))()`);
+  await waitFor(session, "localized compact terminal", `(() => { const element = document.querySelector('[data-compaction-state]'); return element && ['completed', 'no_change', 'cancelled', 'failed'].includes(element.dataset.compactionState); })()`);
+  const terminal = await evaluateAction(session, "read localized compact terminal", `(() => ({ text: document.querySelector('[data-compaction-state]')?.parentElement?.textContent?.trim() || '', count: document.querySelectorAll('[data-compaction-state]').length }))()`);
   if (terminal.count !== 1 || !terminal.text.includes(expected.heading) || expected.forbidden.some((value) => terminal.text.includes(value))) {
     throw new Error(`compact terminal is not a single localized notice: ${JSON.stringify(terminal)}`);
   }

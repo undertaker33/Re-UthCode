@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { PanelModePreference } from "../desktop-api";
-import type { ConfigurationView, ContextUsageProjection, ProviderRequestUsageProjection, RendererState } from "./state";
+import type { CompactionStatusProjection, ConfigurationView, ContextUsageProjection, ProviderRequestUsageProjection, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon } from "./UiIcon";
@@ -40,6 +40,20 @@ export function providerUsageLabel(usage: ProviderRequestUsageProjection | undef
 export function stateLabel(value: string, t: (key: TranslationKey) => string): string {
   const keys: Partial<Record<string, TranslationKey>> = { ready: "ready", idle: "idle", default: "default", auto: "auto", full_access: "fullAccess", booting: "booting", restarting: "restarting", initializing: "initializing", configuration_required: "configurationRequired", stopped: "stopped", running: "running", pausing: "pausing", paused: "paused", failed: "failed", completed: "completed", no_change: "noChange", cancelled: "cancelled", unknown: "unknown", plan: "plan", manual: "manual", overflow: "overflow", estimate: "estimate", exact: "exact" };
   return keys[value] ? t(keys[value]!) : value;
+}
+const SAFE_COMPACTION_REASON = /^[a-z][a-z0-9_]{0,63}$/u;
+
+function safeCompactionReason(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_COMPACTION_REASON.test(value) ? value : undefined;
+}
+
+export function compactionStatusLabel(status: CompactionStatusProjection, t: (key: TranslationKey) => string): string {
+  const parts = [stateLabel(status.state, t)];
+  if (status.trigger) parts.push(stateLabel(status.trigger, t));
+  if (status.changed === true && status.state !== "completed") parts.push(t("compactionPartialResult"));
+  const reason = safeCompactionReason(status.reason);
+  if (reason) parts.push(`${t("compactionReason")}: ${reason}`);
+  return parts.join(" · ");
 }
 function modelDisplayName(configuration: ConfigurationView | null, modelRef: string | null | undefined): string {
   const reference = modelRef?.trim();
@@ -119,7 +133,7 @@ export function RuntimePanel({ state, onPanelModeChange, id = "runtime-panel", v
           <dl className="runtime-facts">
             <div><dt>{t("turn")}</dt><dd>{state.terminalStatusPending ? t("terminalStatusPending") : stateLabel(state.activeTurn ? state.turnStatus : "idle", t)}</dd></div>
             <div><dt>{t("permission")}</dt><dd>{stateLabel(state.permissionMode, t)}</dd></div>
-            <div><dt>{t("compaction")}</dt><dd>{stateLabel(state.compactionStatus.state, t)}{state.compactionStatus.trigger ? ` · ${stateLabel(state.compactionStatus.trigger, t)}` : ""}</dd></div>
+            <div><dt>{t("compaction")}</dt><dd data-compaction-state={state.compactionStatus.state} data-compaction-changed={state.compactionStatus.changed === null ? "unknown" : state.compactionStatus.changed ? "true" : "false"} data-compaction-reason={safeCompactionReason(state.compactionStatus.reason)}>{compactionStatusLabel(state.compactionStatus, t)}</dd></div>
           </dl>
         </section>
         <section className="runtime-group runtime-group--environment" aria-labelledby={`${id}-environment-heading`}>
