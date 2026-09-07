@@ -49,6 +49,7 @@ from uthcode.core.provider import (
     ToolCallPart,
     Usage,
 )
+from uthcode.integrations import session_files
 
 
 def _completed(text: str, usage: Usage | None = None) -> GenerationCompleted:
@@ -156,6 +157,57 @@ class _L4Provider:
             )
             return
         yield _completed("ordinary answer")
+
+
+class _BlockingCompactProvider(_L4Provider):
+    def __init__(self, *, block_limits: bool = False) -> None:
+        super().__init__(pressure_extra=0)
+        self.block_limits = block_limits
+        self.limits_entered = asyncio.Event()
+        self.compaction_entered = asyncio.Event()
+        self.limits_cancelled = False
+
+    async def resolve_model_limits(self, model: str) -> ModelLimits:
+        if self.block_limits:
+            self.limits_entered.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.limits_cancelled = True
+                raise
+        return super().resolve_model_limits(model)
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        if request.metadata.get("context_compaction_request") is True:
+            self.requests.append(request)
+            self.compaction_entered.set()
+            await cancellation.wait()
+            cancellation.raise_if_cancelled()
+        async for event in super().stream(request, cancellation=cancellation):
+            yield event
+
+
+class _CancelDuringValidationProvider(_L4Provider):
+    def __init__(self) -> None:
+        super().__init__(pressure_extra=0)
+        self.token: CancellationToken | None = None
+        self.ordinary_count_calls = 0
+
+    def count_input_tokens(self, request: GenerationRequest) -> int:
+        value = super().count_input_tokens(request)
+        if request.metadata.get("context_compaction_request") is not True:
+            self.ordinary_count_calls += 1
+            # Candidate validation performs a prospective ordinary count
+            # before the Timeline commit boundary.  Cancelling here verifies
+            # that a candidate is discarded without a durable append.
+            if self.ordinary_count_calls == 1 and self.token is not None:
+                self.token.cancel()
+        return value
 
 
 class _ProspectiveWorkingSetProvider(_L4Provider):
@@ -514,6 +566,21 @@ def _seed_session(application: UthCodeApplication, *, count: int = 70):
     return session
 
 
+async def _seed_session_async(application: UthCodeApplication, *, count: int = 70):
+    session = await application.new_session_for_command_async()
+    for index in range(1, count + 1):
+        message = Message("user", (TextPart(f"fact-{index} " + "x" * 2_000),))
+        entries = transcript_entries_from_message(
+            session.session_id,
+            f"turn-{index}",
+            session.transcript.last_sequence + 1,
+            message,
+        )
+        outcome = session.append_transcript(entries)
+        assert outcome.durability == "durable"
+    return session
+
+
 def _seed_short_session(application: UthCodeApplication):
     session = application.create_session("short-session")
     entries = transcript_entries_from_message(
@@ -524,6 +591,18 @@ def _seed_short_session(application: UthCodeApplication):
     )
     assert session.append_transcript(entries).durability == "durable"
     return session
+
+
+async def _reopen_session_after_compact_cancel(
+    application: UthCodeApplication,
+    session_id: str,
+    *,
+    async_resume: bool = False,
+):
+    application.close()
+    if async_resume:
+        return await application.resume_session_for_command_async(session_id)
+    return application.resume_session_for_command(session_id)
 
 
 def _assert_timeline_refs_are_complete(session) -> None:
@@ -599,6 +678,386 @@ async def test_w05_manual_compact_is_async_low_pressure_and_noop_without_candida
             if request.metadata.get("context_compaction_request") is True
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_unknown_append_reconciles_and_reopens_writer(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _L4Provider(pressure_extra=0)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-manual-compact-unknown",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+    session_id = session.session_id
+    original_append = session_files._append_jsonl
+
+    def append_extra_then_fail(path, values):  # type: ignore[no-untyped-def]
+        batch = tuple(values)
+        original_append(path, batch)
+        extra_record = dict(batch[0]["record"])
+        extra_record["turn_id"] = "ambiguous"
+        extra_record["summary"] = "ambiguous"
+        extra_record["transaction_id"] = "ambiguous-tx"
+        original_append(
+            path,
+            ({
+                "schema_version": 2,
+                "kind": "timeline",
+                "sequence": int(batch[-1]["sequence"]) + 1,
+                "record": extra_record,
+            },),
+        )
+        raise OSError("append outcome is ambiguous")
+
+    monkeypatch.setattr(session_files, "_append_jsonl", append_extra_then_fail)
+    first = await application.compact_session()
+
+    assert first.changed is True
+    assert first.failure == "timeline_durability_unknown"
+    recovered = session_service.active_session
+    assert recovered is not None
+    assert recovered.session_id == session_id
+    assert recovered.durability_unknown is False
+    assert recovered.timeline.trailing_records
+    assert application.status().compaction_status.to_dict() == {
+        "state": "failed",
+        "trigger": "manual",
+        "changed": True,
+        "reason": "timeline_durability_unknown",
+    }
+
+    # The reopened writer remains usable.  A retry reads the authoritative
+    # Timeline and does not append the same compact candidate twice.
+    records_after_recovery = recovered.timeline.records
+    retry = await application.compact_session()
+    assert retry.failure is None
+    assert retry.changed is False
+    assert recovered.timeline.records == records_after_recovery
+    _assert_timeline_refs_are_complete(recovered)
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_unknown_recovery_continues_with_reopened_owner(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _L4Provider(pressure_extra=0)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="w05-manual-compact-unknown-multi",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=6)
+    session_id = session.session_id
+    original_append = session_files._append_jsonl
+    original_reconcile = session_files.SessionWriter._reconcile_timeline_append
+    append_calls = 0
+    reconcile_calls = 0
+
+    def append_once_then_fail(path, values):  # type: ignore[no-untyped-def]
+        nonlocal append_calls
+        append_calls += 1
+        original_append(path, values)
+        if append_calls == 1:
+            raise OSError("append outcome is ambiguous")
+
+    def force_first_reconcile_unknown(writer, before, values):  # type: ignore[no-untyped-def]
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 1:
+            return "unknown", writer.snapshot
+        return original_reconcile(writer, before, values)
+
+    monkeypatch.setattr(session_files, "_append_jsonl", append_once_then_fail)
+    monkeypatch.setattr(
+        session_files.SessionWriter,
+        "_reconcile_timeline_append",
+        force_first_reconcile_unknown,
+    )
+    result = await application.compact_session()
+
+    # The first durable candidate is recovered as an exact prefix, then the
+    # same operation continues with the fresh writer for later epochs.
+    assert result.changed is True
+    assert result.failure is None
+    assert append_calls > 1
+    recovered = session_service.active_session
+    assert recovered is not None
+    assert recovered.session_id == session_id
+    assert recovered.durability_unknown is False
+    checkpoints = [
+        record for record in recovered.timeline.records
+        if isinstance(record, ActiveCheckpoint)
+    ]
+    assert len(checkpoints) > 1
+    assert len({record.transaction_id for record in checkpoints}) == len(checkpoints)
+    records_after = recovered.timeline.records
+
+    retry = await application.compact_session()
+    assert retry.failure is None
+    assert retry.changed is False
+    assert recovered.timeline.records == records_after
+    _assert_timeline_refs_are_complete(recovered)
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_external_cancel_interrupts_model_limit_preflight(tmp_path) -> None:
+    provider = _BlockingCompactProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-cancel-preflight",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = await _seed_session_async(application, count=1)
+    session_id = session.session_id
+    provider.block_limits = True
+    token = CancellationToken()
+    operation = asyncio.create_task(application.compact_session(cancellation=token))
+    await asyncio.wait_for(provider.limits_entered.wait(), timeout=1)
+
+    assert token.cancel() is True
+    result = await asyncio.wait_for(operation, timeout=1)
+    assert result.changed is False
+    assert result.failure == "compaction_cancelled"
+    assert session.timeline.records == ()
+    assert application.status().compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "manual",
+        "changed": False,
+        "reason": "compaction_cancelled",
+    }
+    provider.block_limits = False
+    reopened = await _reopen_session_after_compact_cancel(
+        application,
+        session_id,
+        async_resume=True,
+    )
+    assert reopened.session_id == session_id
+    sent = await application.create_run().start_turn("after cancelled preflight").result()
+    assert sent.status is RunStatus.COMPLETED
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_external_cancel_interrupts_provider_generation(tmp_path) -> None:
+    provider = _BlockingCompactProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-cancel-generate",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = await _seed_session_async(application, count=1)
+    session_id = session.session_id
+    token = CancellationToken()
+    operation = asyncio.create_task(application.compact_session(cancellation=token))
+    await asyncio.wait_for(provider.compaction_entered.wait(), timeout=1)
+
+    assert token.cancel() is True
+    result = await asyncio.wait_for(operation, timeout=1)
+    assert result.changed is False
+    assert result.failure == "compaction_cancelled"
+    assert session.timeline.records == ()
+    assert application.status().compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "manual",
+        "changed": False,
+        "reason": "compaction_cancelled",
+    }
+    reopened = await _reopen_session_after_compact_cancel(
+        application,
+        session_id,
+        async_resume=True,
+    )
+    assert reopened.session_id == session_id
+    sent = await application.create_run().start_turn("after cancelled generation").result()
+    assert sent.status is RunStatus.COMPLETED
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_outer_task_cancel_cleans_preflight_waiter(tmp_path) -> None:
+    provider = _BlockingCompactProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-task-cancel-preflight",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = await _seed_session_async(application, count=1)
+    session_id = session.session_id
+    provider.block_limits = True
+    operation = asyncio.create_task(application.compact_session())
+    await asyncio.wait_for(provider.limits_entered.wait(), timeout=1)
+
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(operation, timeout=1)
+    assert provider.limits_cancelled is True
+
+    provider.block_limits = False
+    reopened = await _reopen_session_after_compact_cancel(
+        application,
+        session_id,
+        async_resume=True,
+    )
+    assert reopened.session_id == session_id
+    sent = await application.create_run().start_turn("after task cancellation").result()
+    assert sent.status is RunStatus.COMPLETED
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_cancellation_before_commit_does_not_append_candidate(tmp_path) -> None:
+    provider = _CancelDuringValidationProvider()
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-cancel-precommit",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=1)
+    session_id = session.session_id
+    token = CancellationToken()
+    provider.token = token
+
+    result = await application.compact_session(cancellation=token)
+
+    assert result.changed is False
+    assert result.failure == "compaction_cancelled"
+    assert session.timeline.records == ()
+    assert application.status().compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "manual",
+        "changed": False,
+        "reason": "compaction_cancelled",
+    }
+    reopened = await _reopen_session_after_compact_cancel(
+        application,
+        session_id,
+    )
+    assert reopened.session_id == session_id
+    retry = await application.compact_session()
+    assert retry.failure is None
+    application.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_external_cancel_after_commit_retains_partial_epoch_and_reopens(
+    tmp_path,
+) -> None:
+    provider = _L4Provider(pressure_extra=0)
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="manual-cancel-partial",
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=EffectiveConfig.single_model(
+            "configured/ref",
+            remote_id="frozen-model",
+            context_window=6_000,
+            max_output_tokens=256,
+        ),
+        session_service=session_service,
+    )
+    session = _seed_session(application, count=6)
+    session_id = session.session_id
+    token = CancellationToken()
+    original_commit = application._commit_timeline_candidate
+    commits = 0
+
+    def commit(owner, candidate):
+        nonlocal commits
+        result = original_commit(owner, candidate)
+        if result.changed:
+            commits += 1
+            if commits == 1:
+                token.cancel()
+        return result
+
+    application._commit_timeline_candidate = commit  # type: ignore[method-assign]
+    result = await application.compact_session(cancellation=token)
+
+    assert commits == 1
+    assert result.changed is True
+    assert result.failure == "compaction_cancelled"
+    assert session.timeline.records
+    first_record_count = len(session.timeline.records)
+
+    reopened = await _reopen_session_after_compact_cancel(
+        application,
+        session_id,
+    )
+    assert reopened.session_id == session_id
+    retry = await application.compact_session()
+    assert retry.failure is None
+    assert len(reopened.timeline.records) >= first_record_count
+    refs = [ref for record in reopened.timeline.records for ref in getattr(record, "refs", ())]
+    assert len(refs) == len({(ref.sequence_start, ref.sequence_end) for ref in refs})
+    application.close()
 
 
 @pytest.mark.asyncio
@@ -1344,6 +1803,47 @@ async def test_cancelled_l4_stops_without_a_pseudo_checkpoint() -> None:
     assert result.changed is False
     assert result.failure == "compaction_cancelled"
     assert result.timeline is None
+
+
+@pytest.mark.asyncio
+async def test_auto_l4_token_cancellation_propagates_to_turn() -> None:
+    transcript = Transcript(
+        "auto-token-cancelled-l4",
+        (
+            TranscriptEntry(
+                "auto-token-cancelled-l4",
+                1,
+                "turn-1",
+                TranscriptKind.USER_MESSAGE,
+                {"text": "fact"},
+                semantic_unit_id="turn-1",
+            ),
+        ),
+    )
+    service = ApplicationContextService(
+        compactor=ContextCompactor(token_estimator=lambda _text: 1)
+    )
+    cancellation = CancellationToken()
+
+    async def summarize(_epoch: CompactionEpoch) -> str:
+        cancellation.cancel()
+        raise GenerationCancelled()
+
+    with pytest.raises(GenerationCancelled):
+        await service.compact_async(
+            transcript,
+            session_id=transcript.session_id,
+            summarize=summarize,
+            cancellation=cancellation,
+            trigger="auto",
+        )
+
+    assert service.compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "auto",
+        "changed": False,
+        "reason": "compaction_cancelled",
+    }
 
 
 async def _assert_mid_call_compaction_cancellation(

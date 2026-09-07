@@ -46,6 +46,10 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 
 ## 状态所有权矩阵
 
+手动压缩接收调用方的取消控制，覆盖模型预检、生成、候选校验与提交边界。`compaction_status` 将终态与 `changed`、安全 `reason` 分开：取消或失败仍可能已提交有效 epoch，不能以终态回滚或否认已提交内容。外层任务取消也保留本次有效提交标记。自动压缩保留原 Turn 生命周期，共享取消和提交正确性处理。
+
+Timeline append 暂不明确时，Application 可关闭 quarantined writer 并通过现有 Session 恢复入口重新核对落盘记录；确认候选已提交后使用新 writer 继续后续 epoch，不重复追加。仍不能确认的结果报告受控失败，但恢复成功的 writer 可供下一次操作使用；持续 I/O 故障或真实损坏不伪报恢复成功。该路径不新增持久 Compact Job，不改变 Transcript 未知提交的既有处理语义。
+
 | 事实 | 唯一权威所有者 | 生命周期 | 对外暴露 |
 | --- | --- | --- | --- |
 | `workdir/platform/date` | `ApplicationRuntimeContext` | Application | 只读属性 |

@@ -383,11 +383,9 @@ def _application(*events: object, delay: float = 0.0) -> UthCodeApplication:
 
 
 async def _wait_until(predicate, attempts: int = 80) -> None:  # type: ignore[no-untyped-def]
-    for _ in range(attempts):
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition did not become true")
+    async with asyncio.timeout(attempts * 0.01):
+        while not predicate():
+            await asyncio.sleep(0.01)
 
 
 async def _start_tui(

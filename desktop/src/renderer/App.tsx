@@ -11,11 +11,11 @@ import {
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
-import { RuntimePanel } from "./RuntimePanel";
+import { compactionStatusLabel, RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
+import { createInitialState, reduceRendererState, type CompactionState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
 import {
   eventIdentity,
   hasCompleteTurnIdentity,
@@ -202,6 +202,8 @@ export function commandResultNotice(
       return localize("runtimeInformation");
     case "help_ready":
       return localize("commandHelp");
+    case "compact_started":
+      return `${localize("compaction")} · ${localize("running")}`;
     case "compact_completed":
       return `${localize("compaction")} · ${localize("completed")}`;
     case "compact_no_change":
@@ -650,6 +652,24 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const terminal = event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled";
     if (terminal && (!hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId }) || !latestMatches())) return;
     dispatch({ type: "agent_event", event });
+    if (event.type === "compaction_operation" && event.state !== "running") {
+      const operationId = stringValue(event.operation_id);
+      const current = stateRef.current.compactionStatus;
+      const stateValue = event.state;
+      const terminalState = stateValue === "completed"
+        || stateValue === "no_change"
+        || stateValue === "failed"
+        || stateValue === "cancelled";
+      if (operationId && terminalState && current.operation_id === operationId) {
+        const status = {
+          state: stateValue as CompactionState,
+          trigger: "manual" as const,
+          changed: event.changed === true ? true : event.changed === false ? false : null,
+          reason: stringValue(event.reason),
+        };
+        dispatch({ type: "notice", text: compactionStatusLabel(status, t) });
+      }
+    }
     if (terminal) {
       // The terminal event is published before the Bridge releases its
       // active handle. Keep one cancellable, backoff poll alive until the
@@ -663,7 +683,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         }
       });
     }
-  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, setLatestTurnIdentity, startTerminalStatusConvergence]);
+  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
 
   const refreshConfiguration = useCallback(async (isOwned?: RuntimeOwnershipCheck) => {
     if (isOwned) {
@@ -948,8 +968,6 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const isCurrent = () => isMounted() && runtimeGeneration() === generation && !hasOwner();
     if (!isCurrent() || commandInFlightRef.current) return;
     commandInFlightRef.current = true;
-    const commandName = text.trimStart().slice(1).split(/\s+/u, 1)[0]?.toLowerCase();
-    if (commandName === "compact") dispatch({ type: "compaction_started", trigger: "manual" });
     try {
       const result = await send("command.execute", { text });
       if (!isCurrent()) return;
@@ -959,6 +977,20 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
       dispatch({ type: "command_result", result, notice: commandResultNotice(result, t) });
       const source = asObject(result);
+      if (source.code === "compact_started") {
+        const params = asObject(source.params);
+        const operationId = stringValue(params.operation_id);
+        const sessionId = stringValue(params.session_id);
+        if (operationId && sessionId) {
+          dispatch({
+            type: "compaction_started",
+            trigger: "manual",
+            operationId,
+            sessionId,
+            projectKey: stateRef.current.selectedProjectKey ?? undefined,
+          });
+        }
+      }
       // `/status` is a read-only query, but its typed facts must be visible
       // even when the user previously hid the optional Runtime panel.  Open
       // only the existing panel for this response and do not persist the
@@ -998,12 +1030,36 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         await api.closeShell();
       }
     } catch (error) {
-      if (commandName === "compact") dispatch({ type: "command_result", result: { command: "compact", status: "execution_error", code: "compact_failed", params: {}, ui_action: null }, notice: t("commandFailed") });
       if (isCurrent()) dispatch({ type: "notice", text: safeErrorMessage(error, t("commandFailed")) });
     } finally {
       commandInFlightRef.current = false;
     }
   }, [api, hasOwner, isMounted, persist, refreshCatalog, refreshRuntimeStatus, runtimeGeneration, send, t, waitForRuntimeUserAccess]);
+
+  const cancelCompaction = useCallback(async () => {
+    if (cancelInFlightRef.current) return;
+    const current = stateRef.current;
+    const operationId = current.compactionStatus.operation_id;
+    const sessionId = current.selectedSessionId;
+    if (!api || current.compactionStatus.state !== "running" || !operationId || !sessionId) return;
+    if ((hasOwner() || current.runtimeState === "restarting")
+      && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return;
+    const latest = stateRef.current;
+    if (latest.compactionStatus.state !== "running"
+      || latest.compactionStatus.operation_id !== operationId
+      || latest.selectedSessionId !== sessionId) return;
+    cancelInFlightRef.current = true;
+    try {
+      const result = asObject(await send("compaction.cancel", { session_id: sessionId, operation_id: operationId }));
+      if (result.accepted !== true && isMounted()) {
+        dispatch({ type: "notice", text: t("compactionCancelFailed") });
+      }
+    } catch (error) {
+      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("compactionCancelFailed")) });
+    } finally {
+      cancelInFlightRef.current = false;
+    }
+  }, [api, hasOwner, isMounted, send, t, waitForRuntimeUserAccess]);
 
   const submitComposer = useCallback(async (text: string) => {
     const isCompactionRunning = () => (stateRef.current.compactionStatus.state as string) === "running";
@@ -1545,7 +1601,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
       />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
-      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} />
+      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} />
     </>
   );
 
@@ -1563,7 +1619,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}`} style={shellStyle}>
-      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && !state.focusMode && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
       {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}

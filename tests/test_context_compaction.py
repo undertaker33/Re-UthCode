@@ -371,6 +371,74 @@ async def test_application_compaction_status_covers_running_and_terminal_boundar
 
 
 @pytest.mark.asyncio
+async def test_external_cancel_after_durable_epoch_keeps_partial_timeline() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService()
+    cancellation = CancellationToken()
+    commits = 0
+
+    def commit(candidate):
+        nonlocal commits
+        commits += 1
+        if commits == 1:
+            cancellation.cancel()
+        return candidate
+
+    result = await service.compact_async(
+        transcript,
+        session_id=transcript.session_id,
+        summarize=lambda epoch: _valid_epoch_response(epoch),
+        commit=commit,
+        should_continue=lambda _timeline: True,
+        cancellation=cancellation,
+        max_epochs=4,
+    )
+
+    assert commits == 1
+    assert result.changed is True
+    assert result.failure == "compaction_cancelled"
+    assert result.timeline is not None
+    assert service.compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "manual",
+        "changed": True,
+        "reason": "compaction_cancelled",
+    }
+
+
+@pytest.mark.asyncio
+async def test_outer_task_cancel_after_durable_epoch_keeps_changed_status() -> None:
+    transcript = _transcript()
+    service = ApplicationContextService()
+    owner = asyncio.current_task()
+    assert owner is not None
+
+    async def continue_after_commit(_timeline):
+        # Deliver cancellation only after the commit callback has returned;
+        # this is the boundary where the prior implementation lost the
+        # durable ``changed`` fact in its outer exception handler.
+        asyncio.get_running_loop().call_soon(owner.cancel)
+        await asyncio.sleep(3600)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.compact_async(
+            transcript,
+            session_id=transcript.session_id,
+            summarize=lambda epoch: _valid_epoch_response(epoch),
+            commit=lambda candidate: candidate,
+            should_continue=continue_after_commit,
+            max_epochs=4,
+        )
+
+    assert service.compaction_status.to_dict() == {
+        "state": "cancelled",
+        "trigger": "manual",
+        "changed": True,
+        "reason": "compaction_cancelled",
+    }
+
+
+@pytest.mark.asyncio
 async def test_compaction_triggers_share_single_flight_without_clobbering_owner_status() -> None:
     transcript = _transcript()
     service = ApplicationContextService()

@@ -965,3 +965,87 @@ test("T06 runtime initialization updates permission from its safe Run projection
   assert.equal(state.run?.run_id, "run-runtime");
   assert.equal(state.permissionMode, "auto");
 });
+
+test("compaction operation events retain per-Session identity and reject stale terminals", () => {
+  const projectKey = "C:/compaction-renderer";
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    projects: [{ path: projectKey, projectKey, alias: "compaction", pinned: false, sessions: [
+      { session_id: "session-a", project_key: projectKey },
+      { session_id: "session-b", project_key: projectKey },
+    ], catalogFresh: true }],
+  });
+  const event = (sessionId: string, operationId: string, operationState: string, changed: boolean | null = null) => ({
+    type: "agent_event" as const,
+    event: {
+      type: "compaction_operation",
+      session_id: sessionId,
+      project_key: projectKey,
+      operation_id: operationId,
+      state: operationState,
+      changed,
+      reason: operationState === "failed" ? "compaction_failed" : null,
+    } as AgentEvent,
+  });
+
+  state = reduceRendererState(state, event("session-a", "op-a-1", "running"));
+  assert.deepEqual(state.compactionStatus, { state: "running", trigger: "manual", changed: null, operation_id: "op-a-1" });
+  state = reduceRendererState(state, event("session-a", "op-a-1", "completed", true));
+  assert.deepEqual(state.compactionStatus, { state: "completed", trigger: "manual", changed: true, operation_id: "op-a-1" });
+
+  state = reduceRendererState(state, event("session-a", "op-a-2", "running"));
+  state = reduceRendererState(state, event("session-a", "op-a-1", "failed"));
+  assert.deepEqual(state.compactionStatus, { state: "running", trigger: "manual", changed: null, operation_id: "op-a-2" });
+  assert.equal(state.compactionStatus.reason, undefined, "the late old failure cannot publish a stale reason");
+});
+
+test("background compaction events are cached and restored on Session navigation", () => {
+  const projectKey = "C:/compaction-background";
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    projects: [{ path: projectKey, projectKey, alias: "background", pinned: false, sessions: [
+      { session_id: "session-a", project_key: projectKey },
+      { session_id: "session-b", project_key: projectKey },
+    ], catalogFresh: true }],
+  });
+  const event = (operationState: string, changed: boolean | null = null) => ({
+    type: "agent_event" as const,
+    event: {
+      type: "compaction_operation",
+      session_id: "session-b",
+      project_key: projectKey,
+      operation_id: "op-b-1",
+      state: operationState,
+      changed,
+      reason: null,
+    } as AgentEvent,
+  });
+  state = reduceRendererState(state, event("running"));
+  assert.equal(state.compactionStatus.state, "idle", "background work does not overwrite the visible Session");
+  assert.equal(state.projects[0]?.sessions[1]?.runtime_status, "running");
+  assert.equal(state.sessionRuntime[sessionRuntimeKey(projectKey, "session-b")]?.compactionStatus.operation_id, "op-b-1");
+
+  state = reduceRendererState(state, event("completed", true));
+  state = reduceRendererState(state, { type: "history_page_started", projectKey, sessionId: "session-b" });
+  assert.equal(state.selectedSessionId, "session-b");
+  assert.deepEqual(state.compactionStatus, { state: "completed", trigger: "manual", changed: true, operation_id: "op-b-1" });
+});
+
+test("compaction terminal events cannot create state without an observed operation", () => {
+  const state = createInitialState({ selectedProjectKey: "C:/compaction-stale", selectedSessionId: "session-a" });
+  const next = reduceRendererState(state, {
+    type: "agent_event",
+    event: {
+      type: "compaction_operation",
+      session_id: "session-a",
+      project_key: "C:/compaction-stale",
+      operation_id: "late-op",
+      state: "completed",
+      changed: true,
+      reason: null,
+    },
+  });
+  assert.equal(next, state);
+});

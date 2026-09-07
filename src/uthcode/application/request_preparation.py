@@ -8,6 +8,7 @@ inputs and for publishing any resulting status.
 
 from __future__ import annotations
 
+import asyncio
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -60,14 +61,56 @@ def validate_model_limits(value: object) -> ModelLimits | None:
 async def resolve_model_limits_async(
     provider: ProviderPort,
     model: str,
+    *,
+    cancellation: CancellationToken | None = None,
 ) -> ModelLimits | None:
+    if cancellation is not None and not isinstance(cancellation, CancellationToken):
+        raise TypeError("cancellation must be a CancellationToken or None")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     resolver = getattr(provider, "resolve_model_limits", None)
     if not callable(resolver):
         return None
     value = resolver(model)
     if inspect.isawaitable(value):
-        value = await value
+        value = await _await_with_cancellation(value, cancellation)
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     return validate_model_limits(value)
+
+
+async def _await_with_cancellation(
+    value: object,
+    cancellation: CancellationToken | None,
+) -> object:
+    """Await one Provider operation while honoring the Application signal.
+
+    Provider capability methods are not required to accept a cancellation
+    argument.  A task race still lets the Application stop waiting at the
+    preflight boundary and prevents a cancelled compact from holding the
+    caller's orchestration path open until a Provider timeout.
+    """
+
+    if cancellation is None:
+        return await value  # type: ignore[misc]
+    task = asyncio.ensure_future(value)  # type: ignore[arg-type]
+    cancellation_wait = asyncio.create_task(cancellation.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            (task, cancellation_wait),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancellation_wait in done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            cancellation.raise_if_cancelled()
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        if not cancellation_wait.done():
+            cancellation_wait.cancel()
+        await asyncio.gather(task, cancellation_wait, return_exceptions=True)
 
 
 def validate_provider_count(value: object) -> ContextCountEstimate | int | None:
@@ -117,16 +160,24 @@ def is_controlled_count_failure(error: Exception) -> bool:
 async def count_input_tokens_async(
     provider: ProviderPort,
     request: GenerationRequest,
+    *,
+    cancellation: CancellationToken | None = None,
 ) -> CountResolution:
     """Use the Provider count capability or return a controlled local fallback."""
 
+    if cancellation is not None and not isinstance(cancellation, CancellationToken):
+        raise TypeError("cancellation must be a CancellationToken or None")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     counter = getattr(provider, "count_input_tokens", None)
     if not callable(counter):
         return CountResolution(None, "capability_missing")
     try:
         value = counter(request)
         while inspect.isawaitable(value):
-            value = await value
+            value = await _await_with_cancellation(value, cancellation)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
     except (GenerationCancelled, CancelledError):
         raise
     except Exception as exc:
@@ -155,23 +206,40 @@ async def prepare_counted_request_async(
         bool | Awaitable[bool],
     ]
     | None = None,
+    cancellation: CancellationToken | None = None,
 ) -> GenerationRequest:
     """Prepare one final ordinary request with a stable count/gate boundary."""
 
+    if cancellation is not None and not isinstance(cancellation, CancellationToken):
+        raise TypeError("cancellation must be a CancellationToken or None")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     counted_request = compose(None, True, None)
-    resolution = await count_input_tokens_async(provider, counted_request)
+    resolution = await count_input_tokens_async(
+        provider,
+        counted_request,
+        cancellation=cancellation,
+    )
     if resolution.fallback_reason is not None:
         return compose(None, False, resolution.fallback_reason)
 
     provider_count = resolution.value
     rebuild_from_sources = True
     for _ in range(8):
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if rebuild_from_sources:
             candidate = compose(provider_count, True, None)
             if candidate != counted_request:
                 counted_request = candidate
-                resolution = await count_input_tokens_async(provider, counted_request)
+                resolution = await count_input_tokens_async(
+                    provider,
+                    counted_request,
+                    cancellation=cancellation,
+                )
                 if resolution.fallback_reason is not None:
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled()
                     return compose(None, False, resolution.fallback_reason)
                 provider_count = resolution.value
             rebuild_from_sources = False
@@ -179,7 +247,9 @@ async def prepare_counted_request_async(
         if on_counted_request is not None:
             retry = on_counted_request(counted_request, provider_count)
             if inspect.isawaitable(retry):
-                retry = await retry
+                retry = await _await_with_cancellation(retry, cancellation)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             if not isinstance(retry, bool):
                 raise TypeError("on_counted_request must return a boolean")
             if retry:
@@ -187,11 +257,19 @@ async def prepare_counted_request_async(
                 continue
 
         final_request = finalize(counted_request, provider_count, False, None)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if final_request == counted_request:
             return counted_request
         counted_request = final_request
-        resolution = await count_input_tokens_async(provider, counted_request)
+        resolution = await count_input_tokens_async(
+            provider,
+            counted_request,
+            cancellation=cancellation,
+        )
         if resolution.fallback_reason is not None:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             return compose(None, False, resolution.fallback_reason)
         provider_count = resolution.value
 
@@ -210,6 +288,8 @@ async def prepare_prospective_request_async(
         [GenerationRequest, ContextCountEstimate | int | None, bool, str | None],
         GenerationRequest,
     ],
+    *,
+    cancellation: CancellationToken | None = None,
 ) -> tuple[GenerationRequest, str]:
     """Build one prospective ordinary request and report ``exact`` or ``local``.
 
@@ -235,6 +315,7 @@ async def prepare_prospective_request_async(
         provider,
         compose,
         prospective_finalize,
+        cancellation=cancellation,
     )
     gate = request.metadata.get("context_gate")
     source = gate.get("count_source") if isinstance(gate, Mapping) else None

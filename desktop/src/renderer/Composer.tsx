@@ -120,10 +120,11 @@ export interface ComposerProps {
   onCommand: (text: string) => void | Promise<void>;
   onPause: () => void | Promise<void>;
   onCancel: () => void | Promise<void>;
+  onCompactCancel?: () => void | Promise<void>;
   onDismissCompletion?: () => void;
 }
 
-export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onDismissCompletion }: ComposerProps) {
+export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onCompactCancel, onDismissCompletion }: ComposerProps) {
   const { language, t } = useTranslation();
   const composerRef = useRef<HTMLElement>(null);
   const composing = useRef(false);
@@ -265,6 +266,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
       <div className="composer-input">
         <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={runtimeRestarting ? t("runtimeRestarting") : pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} aria-describedby={runtimeRestarting ? "composer-state" : undefined} />
         <div className="composer-actions">
+          {compactionRunning && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCompactCancel?.()} disabled={!onCompactCancel || runtimeRestarting}><UiIcon name="stop" />{t("cancel")}</button>}
           {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={inputLocked || state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
           {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()} disabled={inputLocked}><UiIcon name="stop" />{t("cancel")}</button>}
           {/* Keep the historical action hook for integrations that locate the submit

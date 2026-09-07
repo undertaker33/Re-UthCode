@@ -142,6 +142,8 @@ Desktop Session A active
 
 ## Application 职责索引
 
+`compact_session(cancellation=...)` 接受调用方取消控制；Provider 模型预检和计数等待可被中断，取消时清理子任务。手动候选始终归属发起时的 Session；Timeline 未知提交核对需要重开 writer 时，后续 epoch 更新为恢复后的 owner。成功、无需变更、失败、取消与是否已有有效提交分别表达，不自动重试 Provider，也不跨进程恢复旧压缩请求。
+
 | 主题 | 文件 | 关键符号/检索词 |
 | --- | --- | --- |
 | Composition root | `src/uthcode/application/bootstrap.py` | `load_effective_config`, `create_application` |

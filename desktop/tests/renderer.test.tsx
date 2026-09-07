@@ -1786,6 +1786,25 @@ test("T05 RuntimePanel separates Current Context from Last Provider Request Usag
   assert.equal(providerUsageLabel(state.lastProviderRequestUsage, (key) => translate("zh-CN", key)), "总计: 192 · 输入: 128 · 输出: 64 · 缓存读取: 32");
 });
 
+test("T05 RuntimePanel renders safe compaction reason and retained partial result", () => {
+  const state = createInitialState({
+    language: "en",
+    compactionStatus: {
+      state: "failed",
+      trigger: "manual",
+      changed: true,
+      reason: "timeline_durability_unknown",
+    },
+  });
+  const markup = renderLanguage("en", <RuntimePanel state={state} onPanelModeChange={() => undefined} />);
+  assert.match(markup, /data-compaction-state="failed"/u);
+  assert.match(markup, /data-compaction-changed="true"/u);
+  assert.match(markup, /data-compaction-reason="timeline_durability_unknown"/u);
+  assert.match(markup, />failed · Manual · Partial result retained · Reason: timeline_durability_unknown</u);
+  const unsafe = renderLanguage("en", <RuntimePanel state={{ ...state, compactionStatus: { ...state.compactionStatus, reason: "provider payload secret" } } as typeof state} onPanelModeChange={() => undefined} />);
+  assert.doesNotMatch(unsafe, /provider payload secret/u, "unsafe reason text must not be rendered");
+});
+
 test("project pinning absorbs independent Session pins into the project tree", () => {
   const projects = [{ path: "C:/one", projectKey: "C:/one", alias: "One", pinned: false, sessions: [{ session_id: "s1", pinned: true }], catalogFresh: true }];
   const plan = projectPinPlan(projects, [{ projectKey: "C:/one", sessionId: "s1" }, { projectKey: "C:/two", sessionId: "s2" }], "C:/one");
@@ -4307,6 +4326,26 @@ test("T05 Composer gates ordinary sends on the Application compaction status", (
   const settled = createInitialState({ composerText: "continue", compactionStatus: { state: "completed", trigger: "manual", changed: true } });
   const settledMarkup = renderLanguage("en", <Composer state={settled} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.doesNotMatch(settledMarkup, /<textarea[^>]*disabled=""/u);
+});
+
+test("T05 Composer keeps an explicit compaction cancel control available", () => {
+  const running = createInitialState({
+    language: "en",
+    selectedSessionId: "session-a",
+    composerText: "continue",
+    compactionStatus: { state: "running", trigger: "manual", changed: null, operation_id: "operation-a" },
+  });
+  const markup = renderLanguage("en", <Composer
+    state={running}
+    onChange={() => undefined}
+    onSubmit={() => undefined}
+    onCommand={() => undefined}
+    onPause={() => undefined}
+    onCancel={() => undefined}
+    onCompactCancel={() => undefined}
+  />);
+  assert.match(markup, /<button[^>]*title="Cancel"[^>]*aria-label="Cancel"/u);
+  assert.doesNotMatch(markup, /<button[^>]*title="Cancel"[^>]*disabled=""/u);
 });
 
 test("T07 Composer locks every chat control while Runtime recovery owns the lifecycle", () => {

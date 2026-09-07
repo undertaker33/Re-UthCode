@@ -121,6 +121,7 @@ export function emptyRuntimeBoundary(state: RendererState): RendererState {
 }
 
 export function runtimeStatus(snapshot: SessionRuntimeSnapshot): SessionSummary["runtime_status"] {
+  if (snapshot.compactionStatus.state === "running") return "running";
   if (snapshot.pendingInteraction || snapshot.turnStatus === "paused" || snapshot.turnStatus === "pausing") return "waiting";
   if (snapshot.activeTurn && snapshot.turnStatus === "running") return "running";
   if (snapshot.turnStatus === "failed") return "failed";

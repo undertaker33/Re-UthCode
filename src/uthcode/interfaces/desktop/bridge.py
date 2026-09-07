@@ -19,6 +19,7 @@ from pathlib import Path
 import shlex
 import sys
 from typing import TextIO
+from uuid import uuid4
 
 from uthcode.application import (
     AgentEvent,
@@ -32,6 +33,7 @@ from uthcode.application import (
     CommandDispatcher,
     CommandOutcome,
     CommandParser,
+    CancellationToken,
     CompletionCandidate,
     ConfigurationError,
     ConfigurationInitializationRequired,
@@ -110,6 +112,7 @@ _METHODS = frozenset(
         "turn.pause",
         "turn.resume",
         "turn.cancel",
+        "compaction.cancel",
         "command.complete",
         "command.execute",
         "status.get",
@@ -289,6 +292,10 @@ _REPLAY_OUTPUT_FIELDS = (
     "termination_reason",
     "failure_reason",
     "message_id",
+)
+
+_COMPACTION_OPERATION_STATES = frozenset(
+    {"running", "completed", "no_change", "failed", "cancelled"}
 )
 
 
@@ -611,6 +618,11 @@ class DesktopBridge:
         self._run: object | None = None
         self._active_handle: object | None = None
         self._turn_task: asyncio.Task[None] | None = None
+        # Manual compaction is a Bridge-owned asynchronous operation.  The
+        # Application owns the compaction semantics and durable commit; this
+        # map owns only the per-Session task/token/identity needed to route a
+        # cancellation and to keep a parked Session runtime alive.
+        self._compaction_operations: dict[str, dict[str, object]] = {}
         # A selected Session owns its own Application/Run pair.  Keeping
         # those pairs here lets a background Turn continue while the user
         # navigates to another Session in the same project.
@@ -869,6 +881,213 @@ class DesktopBridge:
             return None
         return runtime
 
+    def _compaction_operation_for_session(
+        self,
+        session_id: str | None,
+    ) -> dict[str, object] | None:
+        if session_id is None:
+            return None
+        operation = self._compaction_operations.get(session_id)
+        return operation if isinstance(operation, dict) else None
+
+    def _current_compaction_operation(self) -> dict[str, object] | None:
+        """Return the running operation owned by the selected Session only."""
+
+        operation = self._compaction_operation_for_session(
+            self._session_id_for_application(self._application),
+        )
+        if operation is None or operation.get("state") != "running":
+            return None
+        if operation.get("application") is not self._application:
+            return None
+        return operation
+
+    @staticmethod
+    def _compaction_operation_running(operation: object) -> bool:
+        return isinstance(operation, Mapping) and operation.get("state") == "running"
+
+    def _compaction_running_for_session(self, session_id: str | None) -> bool:
+        return self._compaction_operation_running(
+            self._compaction_operation_for_session(session_id),
+        )
+
+    def _any_compaction_operation_running(self) -> bool:
+        return any(
+            self._compaction_operation_running(operation)
+            for operation in self._compaction_operations.values()
+        )
+
+    @staticmethod
+    def _safe_compaction_reason(value: object) -> str | None:
+        # Application status exposes a validated reason code.  Keep the
+        # transport boundary defensive for lightweight embeddings and never
+        # forward arbitrary Provider/exception prose.
+        if not isinstance(value, str) or not value or len(value) > 64:
+            return None
+        if not value[0].islower() or any(
+            not (character.islower() or character.isdigit() or character == "_")
+            for character in value
+        ):
+            return None
+        return value
+
+    @classmethod
+    def _public_compaction_status(
+        cls,
+        application: object | None,
+    ) -> tuple[bool | None, str | None]:
+        """Read only the safe partial-result fields from Application status."""
+
+        status_method = getattr(application, "status", None)
+        if not callable(status_method):
+            return None, None
+        try:
+            status = status_method()
+            projection = getattr(status, "compaction_status", None)
+            if isinstance(projection, Mapping):
+                changed_value = projection.get("changed")
+                reason_value = projection.get("reason")
+            else:
+                changed_value = getattr(projection, "changed", None)
+                reason_value = getattr(projection, "reason", None)
+            changed = changed_value if isinstance(changed_value, bool) else None
+            return changed, cls._safe_compaction_reason(reason_value)
+        except Exception:
+            return None, None
+
+    @classmethod
+    def _compaction_reason(
+        cls,
+        value: object,
+        *,
+        application: object | None = None,
+        cancelled: bool = False,
+    ) -> str | None:
+        if cancelled:
+            return "compaction_cancelled"
+        if value is None:
+            return None
+        _, status_reason = cls._public_compaction_status(application)
+        if status_reason is not None:
+            return status_reason
+        reason = cls._safe_compaction_reason(value)
+        if reason is not None:
+            return reason
+        return "compaction_failed"
+
+    @staticmethod
+    def _compaction_terminal_projection(
+        operation: Mapping[str, object],
+    ) -> dict[str, object]:
+        state = operation.get("state")
+        if state not in _COMPACTION_OPERATION_STATES:
+            state = "failed"
+        changed = operation.get("changed")
+        if not isinstance(changed, (bool, type(None))):
+            changed = False if state != "running" else None
+        reason = operation.get("reason")
+        reason = DesktopBridge._safe_compaction_reason(reason)
+        projection: dict[str, object] = {
+            "state": state,
+            "trigger": "manual",
+            "changed": changed,
+            "reason": reason,
+        }
+        operation_id = operation.get("operation_id")
+        if isinstance(operation_id, str) and operation_id:
+            projection["operation_id"] = operation_id
+        return projection
+
+    def _publish_compaction_operation(self, operation: Mapping[str, object]) -> None:
+        """Publish only stable identities and safe terminal fields."""
+
+        session_id = operation.get("session_id")
+        project_key = operation.get("project_key")
+        operation_id = operation.get("operation_id")
+        if not all(isinstance(value, str) and value for value in (session_id, project_key, operation_id)):
+            return
+        projection = self._compaction_terminal_projection(operation)
+        self._publish(
+            AgentEventEnvelope(
+                {
+                    "type": "compaction_operation",
+                    "session_id": session_id,
+                    "project_key": project_key,
+                    "operation_id": operation_id,
+                    "state": projection["state"],
+                    "changed": projection["changed"],
+                    "reason": projection["reason"],
+                },
+            )
+        )
+
+    async def _run_compaction_operation(self, operation: dict[str, object]) -> None:
+        """Run the Application operation and reduce it to a safe event DTO."""
+
+        token = operation.get("token")
+        application = operation.get("application")
+        compact = getattr(application, "compact_session", None)
+        try:
+            if not callable(compact) or not isinstance(token, CancellationToken):
+                raise RuntimeError("compaction operation is unavailable")
+            result = await self._call_session_operation(compact, cancellation=token)
+            changed = getattr(result, "changed", None)
+            failure = getattr(result, "failure", None)
+            if not isinstance(changed, bool) or (failure is not None and not isinstance(failure, str)):
+                raise RuntimeError("compaction result is invalid")
+            cancelled = token.cancelled or failure == "compaction_cancelled"
+            operation["state"] = "cancelled" if cancelled else "failed" if failure else "completed" if changed else "no_change"
+            operation["changed"] = changed
+            operation["reason"] = self._compaction_reason(
+                failure,
+                application=application,
+                cancelled=cancelled,
+            )
+        except asyncio.CancelledError:
+            # Shutdown may have to cancel a non-cooperative Application
+            # awaiter after the bounded wait.  Keep the transport task
+            # terminal while preserving an Application-known durable partial.
+            if isinstance(token, CancellationToken):
+                token.cancel()
+            changed, reason = self._public_compaction_status(application)
+            operation["state"] = "cancelled"
+            operation["changed"] = changed if changed is not None else False
+            operation["reason"] = reason or "compaction_cancelled"
+        except Exception:
+            # A failure can arrive after Application has durably committed a
+            # partial Timeline but before its result reaches this awaiter.
+            # Preserve only the public, safe status fields; never forward the
+            # exception or infer that changed means fully completed.
+            changed, reason = self._public_compaction_status(application)
+            operation["state"] = "failed"
+            operation["changed"] = changed if changed is not None else False
+            operation["reason"] = reason or "compaction_failed"
+        finally:
+            # A parked Session is retained only while its operation is live.
+            # Once the Application has reached a terminal result, let the
+            # existing background-runtime lifecycle reclaim it normally.
+            runtime = self._runtime_for_session(operation.get("session_id"))
+            if runtime is not None and runtime.get("application") is application:
+                runtime["retain"] = False
+            try:
+                self._publish_compaction_operation(operation)
+                self._reclaim_background_runtimes()
+            finally:
+                # Terminal operations remain queryable by Session identity,
+                # but must not retain an Application/Token/Task (and its
+                # Context, Provider, or writer) after background reclamation.
+                terminal = {
+                    "session_id": operation.get("session_id"),
+                    "project_key": operation.get("project_key"),
+                    "operation_id": operation.get("operation_id"),
+                    "application_id": operation.get("application_id"),
+                    "state": operation.get("state"),
+                    "changed": operation.get("changed"),
+                    "reason": operation.get("reason"),
+                }
+                operation.clear()
+                operation.update(terminal)
+
     def _session_state_projection(self, runtime: Mapping[str, object] | None = None) -> dict[str, object]:
         handle = runtime.get("handle") if runtime is not None else self._active_handle
         run = runtime.get("run") if runtime is not None else self._run
@@ -909,6 +1128,8 @@ class DesktopBridge:
             if runtime.get("retain") is True:
                 continue
             if runtime.get("handle") is not None:
+                continue
+            if self._compaction_running_for_session(key):
                 continue
             task = runtime.get("task")
             if isinstance(task, asyncio.Task) and not task.done():
@@ -1009,6 +1230,24 @@ class DesktopBridge:
         if application_status is not None:
             projected = _application_status(application_status)
             if projected is not None:
+                operation = self._compaction_operation_for_session(session_id)
+                owner_id = operation.get("application_id") if operation is not None else None
+                same_owner = (
+                    operation is not None
+                    and (
+                        operation.get("application") is application
+                        or isinstance(owner_id, int) and owner_id == id(application)
+                    )
+                )
+                if (
+                    same_owner
+                    and operation.get("state") in _COMPACTION_OPERATION_STATES
+                ):
+                    # During/after a manual operation the Bridge identity is
+                    # the only way to correlate status to the selected
+                    # Session.  It augments, but never replaces, the
+                    # Application's safe status DTO.
+                    projected["compaction_status"] = self._compaction_terminal_projection(operation)
                 result["application"] = projected
         return result
 
@@ -1112,6 +1351,8 @@ class DesktopBridge:
             return await self._turn_resume(params)
         if method == "turn.cancel":
             return await self._turn_cancel(params)
+        if method == "compaction.cancel":
+            return await self._compaction_cancel(params)
         if method == "command.complete":
             return self._command_complete(params)
         if method == "command.execute":
@@ -1312,6 +1553,7 @@ class DesktopBridge:
         try:
             if self._supports_background_sessions() and (
                 self._active_handle is not None
+                or self._current_compaction_operation() is not None
                 or any(runtime.get("handle") is not None for runtime in self._background_runtimes.values())
             ):
                 self._remember_current_runtime()
@@ -1926,6 +2168,8 @@ class DesktopBridge:
         _require_params(params, {"session_id", "title"}, method="session.rename")
         session_id = _text_param(params, "session_id")
         title = _text_param(params, "title")
+        if self._compaction_running_for_session(session_id):
+            raise BridgeError("compaction_active", "Session compaction is active")
         self._ensure_no_active(method="session.rename")
         application = self._require_application()
         rename = getattr(application, "rename_session", None)
@@ -1959,6 +2203,8 @@ class DesktopBridge:
         )
         session_id = _text_param(params, "session_id")
         target = _text_param(params, "target_project_key")
+        if self._compaction_running_for_session(session_id):
+            raise BridgeError("compaction_active", "Session compaction is active")
         self._ensure_no_active(method="session.move")
         # A target is a project identity, not an arbitrary storage path.  The
         # existing Desktop project boundary canonicalizes it and checks that
@@ -2030,6 +2276,8 @@ class DesktopBridge:
             for runtime in self._background_runtimes.values()
         ):
             raise BridgeError("turn_active", f"{method} is unavailable during an active Turn")
+        if self._current_compaction_operation() is not None:
+            raise BridgeError("compaction_active", f"{method} is unavailable during compaction")
 
     async def _turn_start(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"prompt"}, method="turn.start")
@@ -2038,6 +2286,8 @@ class DesktopBridge:
             raise BridgeError("interaction_pending", "pending interaction captures this input")
         if self._active_handle is not None:
             raise BridgeError("turn_active", "a Turn is already active")
+        if self._current_compaction_operation() is not None:
+            raise BridgeError("compaction_active", "a compaction operation is already active")
         application = self._application
         if application is None:
             raise BridgeError("application_required", "Application is not initialized")
@@ -2080,6 +2330,8 @@ class DesktopBridge:
         text = _text_param(params, "text")
         handle = self._active_handle
         if handle is None:
+            if self._current_compaction_operation() is not None:
+                raise BridgeError("compaction_active", "a compaction operation is already active")
             raise BridgeError("turn_idle", "no active Turn accepts steering")
         if self._pending_pause() is not None:
             raise BridgeError("interaction_pending", "pending interaction must be answered or cancelled")
@@ -2098,6 +2350,8 @@ class DesktopBridge:
         _require_params(params, set(), method="turn.pause")
         handle = self._active_handle
         if handle is None:
+            if self._current_compaction_operation() is not None:
+                raise BridgeError("compaction_active", "a compaction operation is already active")
             raise BridgeError("turn_idle", "no active Turn")
         if self._pending_pause() is not None:
             raise BridgeError("interaction_pending", "Turn already has a pending interaction")
@@ -2128,6 +2382,28 @@ class DesktopBridge:
             raise BridgeError("turn_not_cancelled", "Turn was already terminal")
         return {"accepted": bool(accepted), "run": self._snapshot()}
 
+    async def _compaction_cancel(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"session_id", "operation_id"}, method="compaction.cancel")
+        session_id = _text_param(params, "session_id")
+        operation_id = _text_param(params, "operation_id")
+        operation = self._compaction_operation_for_session(session_id)
+        if (
+            operation is None
+            or operation.get("operation_id") != operation_id
+            or operation.get("state") != "running"
+        ):
+            # A cancellation is identity-scoped.  In particular, a stale
+            # button from an older operation must never reach a newer token.
+            raise BridgeError("stale_operation", "compaction operation is no longer active")
+        token = operation.get("token")
+        if not isinstance(token, CancellationToken) or not token.cancel():
+            raise BridgeError("stale_operation", "compaction operation is no longer active")
+        return {
+            "accepted": True,
+            "operation_id": operation_id,
+            "session_id": session_id,
+        }
+
     @staticmethod
     def _parse_response(value: object) -> object:
         if not isinstance(value, Mapping):
@@ -2145,6 +2421,8 @@ class DesktopBridge:
         _require_params(params, {"response"}, method="turn.resume")
         handle = self._active_handle
         if handle is None:
+            if self._current_compaction_operation() is not None:
+                raise BridgeError("compaction_active", "a compaction operation is already active")
             raise BridgeError("stale_response", "no active Turn has a pending response")
         pending = self._pending_pause()
         if pending is None:
@@ -2211,6 +2489,113 @@ class DesktopBridge:
             "argument_prompt": argument_prompt,
         }
 
+    async def _start_compaction(self) -> dict[str, object]:
+        """Start manual compaction without holding the Bridge request loop."""
+
+        application = self._require_application()
+        session_id = self._session_id_for_application(application)
+        if session_id is None:
+            raise BridgeError("session_required", "an active Session is required")
+        compact = getattr(application, "compact_session", None)
+        if not callable(compact):
+            raise BridgeError("command_error", "Application does not support compaction")
+        existing = self._compaction_operation_for_session(session_id)
+        if existing is not None and existing.get("state") == "running":
+            raise BridgeError("compaction_active", "a compaction operation is already active")
+
+        operation: dict[str, object] = {
+            "session_id": session_id,
+            "project_key": str(self._workdir),
+            "operation_id": uuid4().hex,
+            "application": application,
+            "application_id": id(application),
+            "token": CancellationToken(),
+            "state": "running",
+            "changed": None,
+            "reason": None,
+            "task": None,
+        }
+        # Replacing only a terminal operation keeps one identity per Session;
+        # a stale cancel can therefore never target the new token.
+        self._compaction_operations[session_id] = operation
+        runtime = self._runtime_for_session(session_id)
+        if runtime is not None:
+            runtime["retain"] = True
+        self._publish_compaction_operation(operation)
+        task = asyncio.create_task(self._run_compaction_operation(operation))
+        operation["task"] = task
+        return {
+            "command": "compact",
+            "status": OutcomeStatus.SUCCESS.value,
+            "code": "compact_started",
+            "params": {
+                "operation_id": operation["operation_id"],
+                "session_id": session_id,
+            },
+            "ui_action": None,
+        }
+
+    async def _session_command_result(self, invocation: object) -> dict[str, object]:
+        """Route Session slash mutations through the Desktop lifecycle seam."""
+
+        canonical = getattr(invocation, "canonical", None)
+        args = getattr(invocation, "args", ())
+        if canonical == "new":
+            if not self._supports_background_sessions():
+                raise BridgeError("compaction_active", "/new is unavailable during compaction")
+            value = await self._session_new({})
+            restored = False
+        elif canonical == "resume" and isinstance(args, tuple) and len(args) == 1:
+            if not self._supports_background_sessions():
+                raise BridgeError("compaction_active", "/resume is unavailable during compaction")
+            value = await self._session_resume({"session_id": args[0]})
+            restored = True
+        else:
+            raise BridgeError("usage_error", "Session command arguments are invalid")
+        if not isinstance(value, Mapping):
+            raise BridgeError("session_error", "Session command returned no projection")
+        session_id = _session_identity(value.get("session_id"))
+        action = SessionChanged(session_id, restored=restored)
+        result: dict[str, object] = {
+            "command": canonical,
+            "status": OutcomeStatus.SUCCESS.value,
+            "code": "command_completed",
+            "params": self._command_params(canonical, action, OutcomeStatus.SUCCESS.value),
+            "ui_action": _action_value(action),
+        }
+        params = result["params"]
+        if not isinstance(params, dict):
+            raise BridgeError("session_error", "Session command projection is invalid")
+        params["replay"] = _replay_values(value.get("replay", ()))
+        run = _json_safe(value.get("run"))
+        params["run"] = run if isinstance(run, dict) else None
+        model_ref = value.get("model_ref")
+        params["model_ref"] = model_ref if isinstance(model_ref, str) else None
+        params["active_turn"] = value.get("active_turn") is True
+        session_state = _json_safe(value.get("session_state"))
+        if isinstance(session_state, dict):
+            params["session_state"] = session_state
+        if value.get("preparing") is True:
+            params["preparing"] = True
+        if value.get("preparation_failed") is True:
+            params["preparation_failed"] = True
+        # A resumed Session may already own the running compaction.  Include
+        # the Bridge identity in the same typed boundary so its cancel button
+        # cannot be forced to rediscover state through a stale poll.
+        try:
+            status_result = self._status_result()
+        except BridgeError:
+            status_result = {}
+        application_status = status_result.get("application")
+        if isinstance(application_status, Mapping):
+            compaction = application_status.get("compaction_status")
+            if isinstance(compaction, Mapping):
+                projected = _json_safe(dict(compaction))
+                if isinstance(projected, dict):
+                    params["compaction_status"] = projected
+        self._finalize_command_code(result)
+        return result
+
     async def _command_execute(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"text"}, method="command.execute")
         text = _text_param(params, "text")
@@ -2223,8 +2608,33 @@ class DesktopBridge:
         if invocation.is_bare_slash:
             raise BridgeError("usage_error", "bare slash is not a command")
         canonical = invocation.canonical
+        if canonical == "compact" and invocation.is_executable:
+            if self._active_handle is not None:
+                raise BridgeError("turn_active", "/compact is unavailable during an active Turn")
+            if self._current_compaction_operation() is not None:
+                raise BridgeError("compaction_active", "a compaction operation is already active")
+            return await self._start_compaction()
+        if (
+            self._current_compaction_operation() is not None
+            and invocation.is_executable
+            and canonical not in {"status", "help", "new", "resume", "quit"}
+        ):
+            raise BridgeError("compaction_active", f"/{canonical} is unavailable during compaction")
         if self._active_handle is not None and canonical in _ACTIVE_COMMANDS:
             raise BridgeError("turn_active", f"/{canonical} is unavailable during an active Turn")
+        if (
+            self._any_compaction_operation_running()
+            and invocation.is_executable
+            and canonical == "new"
+        ):
+            return await self._session_command_result(invocation)
+        if (
+            self._any_compaction_operation_running()
+            and invocation.is_executable
+            and canonical == "resume"
+            and bool(invocation.args)
+        ):
+            return await self._session_command_result(invocation)
         candidate_run: object | None = None
         if (
             invocation.is_executable
@@ -2641,6 +3051,18 @@ class DesktopBridge:
                     cancel()
                 except Exception:
                     pass
+        operations = [
+            operation
+            for operation in self._compaction_operations.values()
+            if isinstance(operation, dict) and operation.get("state") == "running"
+        ]
+        for operation in operations:
+            token = operation.get("token")
+            if isinstance(token, CancellationToken):
+                try:
+                    token.cancel()
+                except Exception:
+                    pass
         tasks: list[asyncio.Task[None]] = []
         if isinstance(self._turn_task, asyncio.Task):
             tasks.append(self._turn_task)
@@ -2648,6 +3070,11 @@ class DesktopBridge:
             runtime["task"]
             for runtime in self._background_runtimes.values()
             if isinstance(runtime.get("task"), asyncio.Task)
+        )
+        tasks.extend(
+            operation["task"]
+            for operation in operations
+            if isinstance(operation.get("task"), asyncio.Task)
         )
         seen_tasks: set[int] = set()
         for task in tasks:
@@ -2693,6 +3120,7 @@ class DesktopBridge:
                         )
                     return
         self._background_runtimes.clear()
+        self._compaction_operations.clear()
         self._state = "stopped"
         if publish_state:
             self._publish(RuntimeStateEnvelope("stopped"))

@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-09-05
+snapshot_date: 2026-09-07
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -52,7 +52,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-09-05
+status_snapshot: 2026-09-07
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -86,7 +86,7 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全，Compact 1A hotfix 与第 5/6 轮 Runtime/导航修复保留。第 7 轮增补最近 30 个完整单元的尾部块分页、上翻按需加载、冷准备解耦与取消 writer 收尾；Desktop `204 passed`、Python 相关含架构 `171 passed`、typecheck 通过，terra/high 独立复审 PASS。100/1000/5000 单元 fixture 首屏实读均为 49153 bytes。压缩失败/中断协议增补尚待实施；未修改任务书。第 6/7 轮尚未更新标准包，既有安装器不宣称包含这些返工；用户已授权两项验证后正常关闭应用再打包。详细结果与外部未验证边界见 W07 Feedback；用户最终复验待进行，未归档。 |
+| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全。第 7 轮历史尾部分页与冷准备已合并 PR #101；第 8 轮补齐 Session 手动压缩操作、取消/部分提交/恢复、跨会话导航和安全终态显示。luna/max 实施、terra/high 复审通过；最终 Python `1512 passed, 3 skipped`，Desktop `209 passed`，typecheck 通过。标准 package 已更新，中英文 packaged commands 隔离验证通过；未 make，不宣称安装器更新。未修改任务书、未归档；用户最终复验及真实 Provider 验证仍待进行，详见 W07 Feedback。 |
 
 ### `not_implemented`
 
