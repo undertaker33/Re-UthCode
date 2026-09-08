@@ -44,7 +44,7 @@ visible Session A 有 active Turn
 
 - 同一 Session 同时最多一个 active Turn，仍遵守 `AgentRun` 的独占约束；在该 Session 可见时，普通输入是 Steering，暂停/恢复/取消仍指向同一 Turn。
 - 普通侧栏与 Slash 导航保留 Session-owned Run 的事件接收，不把停放的 Run 当作已失效 Run；真正清空工作区时清除显示缓存并拒绝已知旧 Run 的迟到事件。目录刷新省略运行状态时保留已有 running/waiting 等投影；带身份的 status 只更新匹配 Project/Session 的投影，不覆盖另一可见会话。
-- 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。Desktop catalog 读取元数据，不为每个目录项重建完整历史；聊天默认显示最近 30 个完整交互单元，向上接近顶部再读取更早页，不自动补载全部历史。
+- 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。Desktop catalog 读取元数据，并从 Transcript 头部读取到首条完整用户记录生成单行预览，不为每个目录项重建完整历史；侧栏优先显示手动标题，否则显示首条用户消息预览。聊天默认显示最近 30 个完整交互单元，向上接近顶部再读取更早页，不自动补载全部历史。
 - 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录使用稳定身份并与当前实时投影合并；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。
 - Session rename/move 是 Application 的持久元数据操作。Bridge 在任一已保存 runtime 仍有 active Turn 时拒绝这些变更，避免修改与运行中的 Session 边界竞争。
 - 进程内的 per-Session runtime 是导航连续性机制，不是 Session v3 持久格式的一部分。Runtime crash/protocol error 仍与 Provider/Turn 的正式失败投影分离。

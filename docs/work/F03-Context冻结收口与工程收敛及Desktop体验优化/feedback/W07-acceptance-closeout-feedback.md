@@ -300,3 +300,12 @@ Desktop `session.resume` 不再返回完整 replay；最近页独立显示，冷
 - 英文 `sessions` flow 在当前标准包通过，报告 `desktop/dist/ui-acceptance/f03-sessions-final-verified/acceptance-report.json`，runId `61d3d337-9c67-4c80-9796-7c703f4de4b2`：六个会话、展开历史列表、切换回放、返回续聊及压缩安全失败终态。脚本改用实际观察到的 Session 行身份定位，不再假设 metadata-only 列表包含首条 prompt。
 - 旧脚本预期 8 次请求，实际 9 次。核对本地 fixture 和 Application 调用链后，明确为 7 次普通 Turn 请求及 2 次无工具压缩生成：fixture 只返回普通文本，摘要校验两次失败后受控终止。断言精确核对总数和这两类请求的顺序；没有放宽 Provider 重试策略。此流程不代表压缩成功提交验收，提交与中断恢复由 Python/Bridge 回归覆盖。
 - 脚本 `node --check` 通过；`conda run --no-capture-output -n re-uthcode npx tsx --test tests/cdp-isolation.test.ts` 为 `11 passed, 0 failed`。中文 `sessions` 额外尝试因旧脚本硬编码英文 Chat timeline selector 失败，未将其列为通过；中英文 commands 的成功证据保持有效。本轮没有重跑整个历史视觉矩阵。
+
+## 返工第 9 轮：恢复未命名会话的首条消息标题（2026-09-08）
+
+- 用户复验发现侧栏未重命名会话全显示短 ID。根因是第 7 轮 metadata catalog 为避免完整历史读取而固定返回空 preview；第 8 轮 CDP 改用身份导航时没有保留可见标题断言，未发现该产品回归。旧记录保留作为历史证据，本轮纠正实现和验收遗漏。
+- 存储从 Transcript 头部按块读取，找到首条完整用户记录立即停止；Application 复用文本提取和单行 160 字符预览规则，不加载完整 Snapshot，不增加持久索引或缓存。手动 title 仍优先于 preview；空会话维持空 preview；首条超长消息跨块读完，不因 16 KiB 边界退回 ID。读取量取决于首条记录之前的内容，而不随后续历史增长。
+- luna/max 实施、terra/high 独立复审 PASS。新增首条多 part/换行、空会话、手动标题优先、追加 999 条历史后读取量不增加及超 16 KiB 首条测试。CDP 保留身份导航，另断言每个新会话实际可见首条消息；旧包 `f03-session-title-red` 在首条标题等待超时，得到准确红测。
+- 主控定向 Session/存储/Bridge/历史/架构回归：`151 passed in 15.96s`。`python -m pytest -q`：`1515 passed, 3 skipped in 128.32s`，该次收集早于最后新增的长首条测试；其后完整 `tests/test_session_authority.py` 为 `20 passed in 1.21s`，覆盖最终测试内容。Reviewer 独立同文件 `20 passed`。
+- Desktop 全量首次 `208 passed, 1 failed`，失败是既有 consecutive Turn 轮询测试提前发生下一次计时回调，计数 4 而非 3；未修改生产行为或放宽断言。该文件定向 `10 passed`，全量原命令重跑 `209 passed, 0 failed in 37805.7263ms`；`npm run typecheck` exit 0。
+- 复审后核对无 UthCode 进程/窗口，标准 `conda run --no-capture-output -n re-uthcode npm run package` exit 0，runtime smoke 与 Forge package 均成功。新包英文 `sessions` 验收 `f03-session-title-green` PASS，runId `f99f63ef-624b-4141-82a3-c198ec9153c1`，六个会话可见首条消息标题以及切换/回放/续聊全部通过；仍使用隔离 HOME 和本地 fixture，不调用真实 Provider。未执行 make，未更新安装器，也未宣称完成整套中英文视觉矩阵。

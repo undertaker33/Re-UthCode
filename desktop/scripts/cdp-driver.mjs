@@ -874,6 +874,7 @@ async function submitSessionsFlow(session) {
   await waitFor(session, `first session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture request') && text.includes(${JSON.stringify(expectedText)}); })()`);
 
   const sessionPrompts = ["cdp fixture session two", "cdp fixture session three", "cdp fixture session four", "cdp fixture session five", "cdp fixture session six"];
+  await waitFor(session, "first session displays its first user message", "document.querySelector('button.session-line.is-selected')?.innerText?.includes('cdp fixture request')");
   sessionRows.push(await evaluateAction(session, "remember first session identity", "document.querySelector('button.session-line.is-selected')?.getAttribute('aria-label')"));
   for (const [index, prompt] of sessionPrompts.entries()) {
     const ordinal = index + 2;
@@ -885,6 +886,7 @@ async function submitSessionsFlow(session) {
     await waitFor(session, `${ordinal}th message ready`, "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
     await clickText(session, "Send");
     await waitFor(session, `${ordinal}th session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes(${JSON.stringify(prompt)}) && text.includes(${JSON.stringify(expectedText)}); })()`);
+    await waitFor(session, "session displays its first user message", `document.querySelector('button.session-line.is-selected')?.innerText?.includes(${JSON.stringify(prompt)})`);
     sessionRows.push(await evaluateAction(session, "remember session identity", "document.querySelector('button.session-line.is-selected')?.getAttribute('aria-label')"));
   }
   const expandedSessions = await evaluateAction(session, "expand older session rows", `(() => {

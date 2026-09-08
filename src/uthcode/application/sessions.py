@@ -811,17 +811,44 @@ class ApplicationSessionService:
     def list_catalog_metadata(self) -> tuple[SessionCatalogEntry, ...]:
         """Return navigation rows without replaying every Session transcript."""
 
-        return tuple(
-            SessionCatalogEntry(
-                session_id=metadata.session_id,
-                project_key=metadata.project_key,
-                last_used_at=metadata.last_used_at,
-                title=metadata.title,
-                model_ref=metadata.model_ref,
-                preview="",
+        entries: list[SessionCatalogEntry] = []
+        for metadata in self.list_sessions():
+            try:
+                first_user = self.store.read_first_user_entry(
+                    metadata.session_id,
+                    expected_project_key=self.project_key,
+                )
+            except SessionFileError:
+                # Keep the row selectable so an explicit resume can report the
+                # stable storage error instead of hiding a durable Session.
+                entries.append(
+                    SessionCatalogEntry(
+                        session_id=metadata.session_id,
+                        project_key=metadata.project_key,
+                        last_used_at=metadata.last_used_at,
+                        title=metadata.title,
+                        model_ref=metadata.model_ref,
+                        preview="[Session recovery unavailable]",
+                        corrupt=True,
+                    )
+                )
+                continue
+            preview = (
+                _bounded_preview(_preview_value(first_user.payload))
+                if first_user is not None
+                else ""
             )
-            for metadata in self.list_sessions()
-        )
+            entries.append(
+                SessionCatalogEntry(
+                    session_id=metadata.session_id,
+                    project_key=metadata.project_key,
+                    last_used_at=metadata.last_used_at,
+                    title=metadata.title,
+                    model_ref=metadata.model_ref,
+                    preview=preview,
+                )
+            )
+        return tuple(entries)
 
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)
@@ -1377,14 +1404,18 @@ def _first_user_preview(snapshot: SessionSnapshot, *, limit: int = 160) -> str:
     for entry in snapshot.transcript.entries:
         if entry.kind is not TranscriptKind.USER_MESSAGE:
             continue
-        value = _preview_value(entry.payload)
-        if value:
-            normalized = " ".join(value.split())
-            if len(normalized) > limit:
-                return normalized[: max(1, limit - 1)].rstrip() + "…"
-            return normalized
+        preview = _bounded_preview(_preview_value(entry.payload), limit=limit)
+        if preview:
+            return preview
         break
     return "(no user message)"
+
+
+def _bounded_preview(value: str, *, limit: int = 160) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _preview_value(value: object) -> str:
