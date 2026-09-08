@@ -24,7 +24,7 @@ import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
 import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
-import { RuntimeLayoutSelect, RuntimePanel, providerUsageLabel, stateLabel } from "../src/renderer/RuntimePanel";
+import { RuntimeLayoutControls, RuntimePanel, providerUsageLabel, stateLabel } from "../src/renderer/RuntimePanel";
 import { CustomSelect, customSelectConsumesEscape, customSelectPosition, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
 
@@ -378,7 +378,6 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
           onProjectExpandedChange={(projectKey, expanded) => expansionWrites.push({ projectKey, expanded })}
           onNewSession={() => undefined}
           onOpenProject={() => undefined}
-          onOpenProjectSession={() => undefined}
           onResumeSession={() => undefined}
           onAliasChange={() => undefined}
           onTogglePin={(item) => pinWrites.push(item.projectKey)}
@@ -446,6 +445,12 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
     const selectedRow = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line")).find((button) => button.textContent?.includes("session-6"));
     assert.ok(selectedRow, "selected sixth session must be present in the DOM");
     assert.equal(selectedRow?.classList.contains("is-selected"), true);
+    const projectRow = container.querySelector<HTMLButtonElement>(".project-select");
+    assert.ok(projectRow);
+    act(() => { projectRow!.click(); });
+    await tick();
+    assert.equal(container.querySelector(".session-list"), null, "clicking the project row collapses even the currently selected child Session");
+    await renderSidebar([project()], "s6", {}, "selected-sixth-restored");
     const recentRows = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent .recent-line"), (button) => button.querySelectorAll("span")[1]?.textContent ?? "");
     assert.deepEqual(recentRows, sessions.map((session) => session.preview));
 
@@ -743,6 +748,7 @@ test("T05 App ignores a late mutation result after navigation changes the Runtim
     const sourcePath = "C:/source";
     const targetPath = "C:/target";
     const sourceSession = { session_id: "move-late", project_key: sourcePath, title: "Original", preview: "Original preview" };
+    const targetSession = { session_id: "target-session", project_key: targetPath, title: "Target session", preview: "Target preview" };
     let moveCalls = 0;
     let resolveMove: ((value: JsonValue) => void) | null = null;
     const api: DesktopApi = {
@@ -758,6 +764,7 @@ test("T05 App ignores a late mutation result after navigation changes the Runtim
         if (method === "project.open") {
           return { project: { path: String(params.path) }, sessions: [], run: null };
         }
+        if (method === "session.resume") return { session_id: String(params.session_id), replay: [], run: null };
         if (method === "project.sessions") return { sessions: [] };
         return {};
       },
@@ -770,7 +777,7 @@ test("T05 App ignores a late mutation result after navigation changes the Runtim
       runtimeState: "ready",
       projects: [
         { path: sourcePath, projectKey: sourcePath, alias: "Source", pinned: false, sessions: [sourceSession], catalogFresh: true },
-        { path: targetPath, projectKey: targetPath, alias: "Target", pinned: false, sessions: [], catalogFresh: true },
+        { path: targetPath, projectKey: targetPath, alias: "Target", pinned: false, sessions: [targetSession], catalogFresh: true },
       ],
       selectedProjectKey: sourcePath,
       selectedSessionId: sourceSession.session_id,
@@ -793,10 +800,10 @@ test("T05 App ignores a late mutation result after navigation changes the Runtim
     // Navigation is allowed while the mutation is in flight, but it owns a
     // newer Runtime generation. The late Move result must not be applied to
     // the now-selected Target project.
-    const targetSelect = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select"))
-      .find((button) => button.textContent?.includes("Target"));
-    assert.ok(targetSelect);
-    act(() => { targetSelect!.click(); });
+    const targetSessionSelect = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"))
+      .find((button) => button.textContent?.includes("Target session"));
+    assert.ok(targetSessionSelect, "a recent Session remains the navigation entry after project rows became disclosure-only");
+    act(() => { targetSessionSelect!.click(); });
     await flush();
     assert.match(container.querySelector<HTMLElement>(".project-item.is-active")?.textContent ?? "", /Target/u);
     assert.ok(resolveMove);
@@ -1013,7 +1020,8 @@ test("T05 narrow viewport structure keeps Sidebar visible and reopens hidden Run
     assert.ok(shell!.classList.contains("panel-floating"), "docked Runtime switches directly to an overlay on narrow viewports");
     const drawer = container.querySelector<HTMLElement>(".runtime-panel--floating");
     assert.ok(drawer);
-    const drawerTrigger = drawer?.querySelector<HTMLButtonElement>(".custom-select__trigger");
+    const drawerTrigger = drawer?.querySelector<HTMLButtonElement>(".runtime-layout-controls button");
+    assert.ok(drawerTrigger);
     assert.equal(dom.window.document.activeElement, drawerTrigger, "opening the Runtime drawer moves focus into it");
     assert.equal(toggle?.getAttribute("aria-expanded"), "true");
     assert.equal(toggle?.getAttribute("aria-label"), "Close Runtime panel");
@@ -1027,7 +1035,7 @@ test("T05 narrow viewport structure keeps Sidebar visible and reopens hidden Run
     act(() => { toggle!.click(); });
     assert.ok(container.querySelector(".runtime-panel--floating"), "hidden Runtime remains reopenable from the conversation bar");
     const reopened = container.querySelector<HTMLElement>(".runtime-panel--floating");
-    assert.equal(dom.window.document.activeElement, reopened?.querySelector(".custom-select__trigger"));
+    assert.equal(dom.window.document.activeElement, reopened?.querySelector(".runtime-layout-controls button"));
     act(() => { dom.window.document.body.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true })); });
     assert.ok(shell!.classList.contains("panel-hidden"), "outside pointer closes the Runtime drawer");
     assert.equal(dom.window.document.activeElement, toggle, "outside close restores toggle focus");
@@ -1042,7 +1050,8 @@ test("T05 Runtime drawer restores focus when a wide docked panel becomes hidden 
     const runtime = container.querySelector<HTMLElement>("#runtime-panel");
     assert.ok(toggle);
     assert.ok(runtime);
-    const runtimeTrigger = runtime?.querySelector<HTMLButtonElement>(".custom-select__trigger");
+    const runtimeTrigger = runtime?.querySelector<HTMLButtonElement>(".runtime-layout-controls button");
+    assert.ok(runtimeTrigger);
     runtimeTrigger?.focus();
     Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 533 });
     act(() => { dom.window.dispatchEvent(new dom.window.Event("resize")); });
@@ -1871,7 +1880,7 @@ test("T05 Composer exposes separate steering, pause, cancel, and Python-backed c
   assert.match(markup, /暂停/);
   assert.match(markup, /取消/);
   assert.match(markup, /查看或切换当前模型/);
-  assert.match(markup, /id="composer-state"[^>]*role="status"[^>]*aria-live="polite"/u);
+  assert.doesNotMatch(markup, /id="composer-state"|class="composer-state/u);
   assert.doesNotMatch(markup, /full command list|hard-coded/);
 });
 
@@ -2995,7 +3004,7 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
       models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
     };
     const first: ProjectState = { path: "C:/pending-save-a", projectKey: "C:/pending-save-a", alias: "Pending A", pinned: false, sessions: [{ session_id: "session-a" }], catalogFresh: true };
-    const second: ProjectState = { path: "C:/pending-save-b", projectKey: "C:/pending-save-b", alias: "Pending B", pinned: false, sessions: [], catalogFresh: true };
+    const second: ProjectState = { path: "C:/pending-save-b", projectKey: "C:/pending-save-b", alias: "Pending B", pinned: false, sessions: [{ session_id: "session-b", title: "Pending B session" }], catalogFresh: true };
     const preferences: DesktopPreferences = {
       theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
       recentProjects: [{ path: first.path, alias: first.alias }, { path: second.path, alias: second.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: first.projectKey, selectedSessionId: "session-a",
@@ -3016,7 +3025,7 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
         if (method === "runtime.shutdown") return pendingShutdown;
         if (method === "runtime.initialize") return { run: null };
         if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
-        if (method === "session.resume") return { session_id: "session-a", replay: [], run: null };
+        if (method === "session.resume") return { session_id: String(params.session_id), replay: [], run: null };
         if (method === "project.sessions") return { sessions: [] };
         if (method === "status.get") return { active_turn: false };
         if (method === "settings.get") return { configuration: config };
@@ -3060,14 +3069,14 @@ test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets n
     // initialize/open/resume A or overwrite B's owner state.
     act(() => { container.querySelector<HTMLButtonElement>(".settings-view__back")?.click(); });
     await tick();
-    const projectButton = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select")).find((button) => button.textContent?.includes("Pending B"));
-    assert.ok(projectButton);
-    act(() => { projectButton!.click(); });
+    const targetSession = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line")).find((button) => button.textContent?.includes("Pending B session"));
+    assert.ok(targetSession);
+    act(() => { targetSession!.click(); });
     for (let index = 0; index < 5; index += 1) await tick();
     assert.equal(calls.filter((call) => call.method === "project.open").length, 0, "Project B waits for A's already-issued shutdown rather than racing it");
     resolveShutdown?.({});
     for (let index = 0; index < 16; index += 1) await tick();
-    assert.deepEqual(calls.filter((call) => ["runtime.initialize", "project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? null]), [["project.open", second.path]], "stale A recovery cannot publish or continue after B takes ownership");
+    assert.deepEqual(calls.filter((call) => ["runtime.initialize", "project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? call.params.session_id ?? null]), [["project.open", second.path], ["session.resume", "session-b"]], "stale A recovery cannot publish or continue after B takes ownership");
     assert.equal(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent?.includes("Ready"), true);
   });
 });
@@ -3401,8 +3410,9 @@ test("T07 navigation supersedes blocked recovery and unmount suppresses late lif
   await withRendererDom(async (_dom, container, root) => {
     const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
     const first: ProjectState = { path: "C:/recovery-project", projectKey: "C:/recovery-project", alias: "Recovery", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
-    const second: ProjectState = { path: "C:/navigation-project", projectKey: "C:/navigation-project", alias: "Navigation", pinned: false, sessions: [], catalogFresh: true };
+    const second: ProjectState = { path: "C:/navigation-project", projectKey: "C:/navigation-project", alias: "Navigation", pinned: false, sessions: [{ session_id: "session-2", title: "Navigation session" }], catalogFresh: true };
     const calls: string[] = [];
+    const resumedSessions: string[] = [];
     let shutdownCalls = 0;
     let resolveFirstShutdown: ((value: JsonObject) => void) | null = null;
     let resolveSecondShutdown: ((value: JsonObject) => void) | null = null;
@@ -3422,7 +3432,10 @@ test("T07 navigation supersedes blocked recovery and unmount suppresses late lif
         }
         if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
         if (method === "runtime.initialize") return { run: null };
-        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
+        if (method === "session.resume") {
+          resumedSessions.push(String(params.session_id));
+          return { session_id: String(params.session_id), replay: [], run: null };
+        }
         if (method === "project.sessions") return { sessions: [] };
         if (method === "status.get") return { active_turn: false };
         if (method === "settings.get") return { configuration: config };
@@ -3443,15 +3456,15 @@ test("T07 navigation supersedes blocked recovery and unmount suppresses late lif
     assert.equal(shutdownCalls, 1);
     act(() => { container.querySelector<HTMLButtonElement>(".settings-actions button[title=\"Cancel\"]")?.click(); });
     await tick();
-    const projectButton = Array.from(container.querySelectorAll<HTMLButtonElement>(".project-select")).find((button) => button.textContent?.includes("Navigation"));
-    assert.ok(projectButton);
-    act(() => { projectButton!.click(); });
+    const targetSession = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line")).find((button) => button.textContent?.includes("Navigation session"));
+    assert.ok(targetSession);
+    act(() => { targetSession!.click(); });
     for (let index = 0; index < 4; index += 1) await tick();
     assert.equal(shutdownCalls, 1, "navigation waits for the blocked recovery RPC instead of racing it");
     resolveFirstShutdown?.({});
     for (let index = 0; index < 14; index += 1) await tick();
     assert.equal(calls.filter((method) => method === "project.open").length, 1);
-    assert.equal(calls.filter((method) => method === "session.resume").length, 0, "the stale recovery cannot resume the old session");
+    assert.deepEqual(resumedSessions, ["session-2"], "only the new navigation may resume; stale recovery cannot resume the old session");
     assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
 
     // A second blocked recovery is invalidated by unmount. Its in-flight
@@ -3467,6 +3480,7 @@ test("T07 navigation supersedes blocked recovery and unmount suppresses late lif
     resolveSecondShutdown?.({});
     for (let index = 0; index < 6; index += 1) await tick();
     assert.equal(calls.filter((method) => method === "project.open").length, 1, "unmount invalidates the detached recovery before project.open");
+    assert.deepEqual(resumedSessions, ["session-2"], "unmount prevents any late Session resume");
   });
 });
 
@@ -3718,10 +3732,15 @@ test("T07 Runtime switch and three layout modes remain operational", async () =>
   assert.doesNotMatch(settingsMarkup, /aria-label="Project navigation"|aria-label="Runtime information"|settings-runtime|>READY<|>Ready</);
   assert.doesNotMatch(settingsMarkup, /Connect the service that runs your models|Use the model name expected by your provider|Default permission mode for new Runs|Appearance preferences are stored on this Desktop installation/);
   const selectedModes: string[] = [];
-  const modeSelect = RuntimeLayoutSelect({ value: "docked", onChange: (mode) => selectedModes.push(mode), labels: { control: "Layout", docked: "Docked", floating: "Floating", hidden: "Hidden" } }) as React.ReactElement<{ onChange: (value: string) => void }>;
-  assert.equal(modeSelect.type, CustomSelect);
-  for (const value of ["floating", "docked", "hidden"]) modeSelect.props.onChange(value);
-  assert.deepEqual(selectedModes, ["floating", "docked", "hidden"]);
+  const controls = RuntimeLayoutControls({ value: "docked", onChange: (mode) => selectedModes.push(mode), labels: { control: "Layout", docked: "Docked", floating: "Floating", hidden: "Hidden" } });
+  const buttons = React.Children.toArray(controls.props.children) as React.ReactElement<{ onClick: () => void; "aria-label": string; "aria-pressed"?: boolean }>[];
+  assert.equal(buttons.length, 3, "Runtime layout is exposed as the three direct icon controls");
+  assert.deepEqual(buttons.map((button) => button.props["aria-label"]), ["Hidden", "Floating", "Docked"]);
+  assert.equal(buttons[2]?.props["aria-pressed"], true);
+  for (const button of buttons) button.props.onClick();
+  assert.deepEqual(selectedModes, ["hidden", "floating", "docked"]);
+  const controlsMarkup = renderToStaticMarkup(controls);
+  assert.doesNotMatch(controlsMarkup, /listbox|combobox|custom-select/u);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.runtime-panel--docked\s*\{[^}]*position:\s*relative[^}]*width:/s);
   assert.match(css, /\.runtime-panel--floating\s*\{[^}]*position:\s*fixed[^}]*width:\s*304px;[^}]*height:\s*304px;[^}]*border-radius:\s*18px/s);
@@ -4322,10 +4341,62 @@ test("T05 Composer gates ordinary sends on the Application compaction status", (
   const runningMarkup = renderLanguage("en", <Composer state={running} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.match(runningMarkup, /<textarea[^>]*disabled=""/u);
   assert.match(runningMarkup, /<button[^>]*title="Send"[^>]*disabled=""/u);
-  assert.match(runningMarkup, /class="composer-state is-compacting"/u);
+  assert.doesNotMatch(runningMarkup, /class="composer-state/u);
   const settled = createInitialState({ composerText: "continue", compactionStatus: { state: "completed", trigger: "manual", changed: true } });
   const settledMarkup = renderLanguage("en", <Composer state={settled} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />);
   assert.doesNotMatch(settledMarkup, /<textarea[^>]*disabled=""/u);
+});
+
+test("compaction timeline keeps chronological notices and shows running or failed progress", () => {
+  const entries = [
+    { id: "reply", kind: "assistant" as const, text: "previous reply", sequence: 2 },
+    { id: "compact", kind: "compaction" as const, text: "Context compacted", sequence: 2 },
+    { id: "user", kind: "user" as const, text: "next prompt", sequence: 3 },
+  ];
+  const render = (compactionNotice: string, compactionRunning: boolean, compactionCompleted: boolean) => renderLanguage("en", <ChatTimeline entries={entries} todo={[]} compactionAnchor={entries[0]} compactionNotice={compactionNotice} compactionRunning={compactionRunning} compactionCompleted={compactionCompleted} />);
+  const completed = render(translate("en", "contextCompacted"), false, true);
+  assert.equal(completed.split(translate("en", "contextCompacted")).length - 1, 1);
+  assert.ok(completed.indexOf("previous reply") < completed.indexOf(translate("en", "contextCompacted")));
+  assert.ok(completed.indexOf(translate("en", "contextCompacted")) < completed.indexOf("next prompt"));
+  assert.match(render("working", true, false), /compaction-spinner/u);
+  assert.match(render("failed result", false, false), /failed result/u);
+  assert.match(render("cancelled result", false, false), /cancelled result/u);
+});
+
+test("Composer restores input after completion without stealing another control's focus", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    Object.defineProperty(dom.window.document, "hasFocus", { configurable: true, value: () => true });
+    const render = (activeTurn: boolean) => act(() => { root.render(<Composer state={createInitialState({ activeTurn })} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} />); });
+    render(true);
+    render(false);
+    assert.equal(dom.window.document.activeElement === container.querySelector("textarea"), true);
+    render(true);
+    const outside = dom.window.document.getElementById("after")!;
+    act(() => { outside.focus(); });
+    render(false);
+    assert.equal(dom.window.document.activeElement === outside, true);
+  });
+});
+
+test("completion is marked read only in a focused visible window at the timeline tail", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let focused = false;
+    let seen = 0;
+    Object.defineProperty(dom.window.document, "hasFocus", { configurable: true, value: () => focused });
+    Object.defineProperty(dom.window.document, "visibilityState", { configurable: true, value: "visible" });
+    act(() => { root.render(<ChatTimeline entries={[]} todo={[]} onLatestSeen={() => { seen += 1; }} />); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 5)); });
+    assert.equal(seen, 0);
+    const timeline = container.querySelector<HTMLElement>(".timeline")!;
+    Object.defineProperty(timeline, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(timeline, "clientHeight", { configurable: true, value: 300 });
+    focused = true;
+    act(() => { dom.window.dispatchEvent(new dom.window.Event("focus")); });
+    assert.equal(seen, 0);
+    timeline.scrollTop = 700;
+    act(() => { timeline.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
+    assert.equal(seen, 1);
+  });
 });
 
 test("T05 Composer keeps an explicit compaction cancel control available", () => {

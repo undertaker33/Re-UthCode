@@ -58,7 +58,7 @@ class SessionOperationError(RuntimeError):
 
 
 _REPLAY_KINDS = frozenset(
-    {"user", "steering", "reasoning", "assistant", "tool", "plan", "failure"}
+    {"user", "steering", "reasoning", "assistant", "tool", "plan", "failure", "compaction"}
 )
 _REPLAY_TOOL_STATUSES = frozenset(
     {
@@ -177,6 +177,8 @@ class SessionReplayRecord:
     def record_id(self) -> str:
         """Stable identity shared by paged replay and live event merging."""
 
+        if self.kind == "compaction":
+            return f"{self.session_id}:compaction:{self.message_id}"
         return ":".join(
             (
                 self.session_id,
@@ -875,6 +877,19 @@ class ApplicationSessionService:
             page.units,
             tool_summary=tool_summary,
         )
+        records += tuple(
+            SessionReplayRecord(
+                session_id=page.session_id,
+                sequence=checkpoint.display_after_sequence,
+                turn_id=checkpoint.turn_id,
+                kind="compaction",
+                text="Context compacted",
+                message_id=checkpoint.transaction_id,
+            )
+            for checkpoint in page.compactions
+            if checkpoint.display_after_sequence is not None
+        )
+        records = tuple(sorted(records, key=lambda record: (record.sequence, record.kind == "compaction")))
         return SessionHistoryPage(
             session_id=page.session_id,
             records=records,

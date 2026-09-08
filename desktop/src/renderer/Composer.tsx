@@ -139,6 +139,17 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   const runtimeRestarting = state.runtimeState === "restarting";
   const inputLocked = pending || terminalStatusPending || compactionRunning || runtimeRestarting
     || (sessionPreparationStatus !== undefined && sessionPreparationStatus !== "ready");
+  const wasBusy = useRef(state.activeTurn || inputLocked);
+  useEffect(() => {
+    const busy = state.activeTurn || inputLocked;
+    if (wasBusy.current && !busy && document.hasFocus()) {
+      const focused = document.activeElement;
+      if (focused === document.body || focused === null || composerRef.current?.contains(focused)) {
+        composerRef.current?.querySelector<HTMLTextAreaElement>("textarea")?.focus({ preventScroll: true });
+      }
+    }
+    wasBusy.current = busy;
+  }, [state.activeTurn, inputLocked]);
   const hiddenCommands = new Set(["/clear", "/quit", "/resume", "/permission", "/help"]);
   const candidates = useMemo<CompletionOption[]>(() => {
     if (pending || terminalStatusPending || runtimeRestarting || !slashMode) return [];
@@ -280,9 +291,6 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
         <div className="composer-selectors">
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
-        <output id="composer-state" className={`composer-state${state.run?.behavior_mode === "plan" ? " is-plan" : ""}${compactionRunning ? " is-compacting" : ""}`} role="status" aria-live="polite">
-          {runtimeRestarting ? t("runtimeRestarting") : pending ? t("interactionRequired") : compactionRunning ? `${t("compaction")} · ${t("running")}` : terminalStatusPending ? t("terminalStatusPending") : state.run?.behavior_mode === "plan" ? `${t("plan")} · ${stateLabel(state.turnStatus, t)}` : state.activeTurn ? stateLabel(state.turnStatus, t) : t("ready")}
-        </output>
         <div className="composer-model">
           <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />

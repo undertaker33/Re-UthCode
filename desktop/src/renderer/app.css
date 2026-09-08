@@ -152,6 +152,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .timeline-content table { width: 100%; border-collapse: collapse; }
 .timeline-content th, .timeline-content td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; }
 .timeline-notice { border-left: 2px solid var(--accent); padding: 7px 11px; color: var(--muted); font-size: 12px; }
+.timeline-compaction { display: flex; align-items: center; gap: 8px; width: min(820px, calc(100% - 20px)); margin: 12px auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.compaction-message { overflow: hidden; text-overflow: ellipsis; }
+.timeline-compaction.is-running { color: var(--accent-strong); }
+.compaction-spinner { flex: 0 0 12px; width: 12px; height: 12px; border: 1.5px solid var(--line); border-top-color: currentColor; border-right-color: currentColor; border-radius: 50%; animation: compaction-spin 1s linear infinite; }
+.compaction-dots { display: inline-flex; margin-left: -6px; }
+.compaction-dots span { animation: compaction-dot 1.4s ease-in-out infinite; }
+.compaction-dots span:nth-child(2) { animation-delay: .2s; }
+.compaction-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes compaction-spin { to { transform: rotate(360deg); } }
+@keyframes compaction-dot { 0%, 70%, 100% { opacity: .25; } 35% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .compaction-spinner, .compaction-dots span { animation: none; } }
 .timeline-runtime-error { position: sticky; top: 0; z-index: 3; display: flex; max-height: min(180px, 50vh); align-items: flex-start; gap: 10px; overflow: auto; margin-bottom: 18px; border: 1px solid color-mix(in srgb, var(--danger) 58%, var(--line)); border-left: 3px solid var(--danger); border-radius: 10px; padding: 10px 12px; color: var(--text); background: var(--surface); box-shadow: 0 8px 20px var(--shadow); line-height: 1.45; }
 .timeline-runtime-error > span { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
 .timeline-runtime-error button { flex: 0 0 auto; min-height: 30px; border: 1px solid var(--danger); border-radius: 7px; padding: 5px 9px; color: var(--text); background: var(--raised); font-size: 11px; }
@@ -185,16 +196,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-toolbar { display: flex; min-width: 0; align-items: center; gap: 9px; margin-top: 8px; }
 .composer-selectors { display: flex; min-width: 0; align-items: center; }
 .composer-selectors .custom-select { width: 138px; }
-.composer-state { min-width: 0; overflow: hidden; color: var(--faint); font-size: 10px; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
 .composer-model { display: flex; min-width: 0; align-items: center; gap: 8px; margin-left: auto; }
 .composer-model .custom-select { width: clamp(138px, 22vw, 230px); min-width: 0; }
 .composer-model .custom-select__trigger { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .composer-send { display: inline-flex; min-height: 30px; align-items: center; gap: 5px; margin-left: 2px; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 11px; color: var(--on-accent); background: var(--accent-action); font-size: 11px; }
 .composer-send .ui-icon { width: 13px; height: 13px; flex-basis: 13px; }
 .composer-send:disabled { border-color: var(--line); color: var(--muted); background: var(--raised); }
-.composer-state.is-plan { color: var(--accent-strong); }
-.composer-state.is-compacting { color: var(--accent-strong); }
-.composer-state.is-compacting::after { content: ""; display: inline-block; width: 0.75em; height: 0.75em; margin-left: .45em; border: 1px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -.08em; animation: compact-state-spin .9s linear infinite; }
 .context-ring { position: relative; display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }
 .context-ring svg { position: absolute; inset: 0; width: 32px; height: 32px; transform: rotate(-90deg); }
 .context-ring circle { fill: none; stroke-width: 2.5; }
@@ -227,6 +234,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .runtime-panel--floating { position: fixed; z-index: 10; inset: 64px 18px auto auto; width: 304px; height: 304px; max-height: calc(100vh - 82px); border: 1px solid var(--line-strong); border-radius: 18px; background: var(--surface); box-shadow: 0 18px 52px var(--shadow); }
 .runtime-panel--hidden { display: none; }
 .runtime-heading { display: flex; align-items: flex-start; justify-content: space-between; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+.runtime-layout-controls { display: flex; align-items: center; gap: 2px; }
+.sidebar-info-anchor { display: contents; }
+.sidebar-info-card { position: fixed; z-index: 1000; width: 300px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--raised); color: var(--text); box-shadow: 0 10px 32px #0005; pointer-events: none; overflow-wrap: anywhere; }
+.sidebar-info-card strong { display: block; margin-bottom: 10px; font-size: 14px; }
+.sidebar-info-card div { padding-top: 7px; color: var(--muted); font-size: 12px; }
+.runtime-layout-controls .icon-button[aria-pressed="true"] { color: var(--accent-strong); background: var(--raised); }
 .runtime-heading p { margin: 0 0 4px; color: var(--faint); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
 .runtime-heading h2 { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 17px; font-weight: 600; }
 .runtime-heading h2 .ui-icon { width: 17px; height: 17px; flex-basis: 17px; color: var(--accent-strong); }
@@ -334,7 +347,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 @keyframes settings-modal-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes settings-modal-rise { from { opacity: 0; transform: translateY(9px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @keyframes settings-save-spin { to { transform: rotate(360deg); } }
-@keyframes compact-state-spin { to { transform: rotate(360deg); } }
 
 .interaction-surface { position: absolute; right: max(24px, calc((100% - 820px) / 2)); bottom: 153px; left: max(24px, calc((100% - 820px) / 2)); z-index: 7; max-height: min(58vh, 620px); overflow: auto; border: 1px solid var(--line-strong); border-top: 2px solid var(--accent); border-radius: 12px; padding: 18px 20px; background: var(--surface); box-shadow: 0 18px 48px var(--shadow); }
 .interaction-surface__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
@@ -384,7 +396,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .app-shell.panel-docked .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
   .app-shell.panel-docked .composer-selectors { min-width: 0; }
   .app-shell.panel-docked .composer-selectors .custom-select { width: min(138px, 100%); }
-  .app-shell.panel-docked .composer-state { justify-self: end; }
   .app-shell.panel-docked .composer-model { grid-column: 1 / -1; justify-content: flex-end; margin-left: 0; }
   .app-shell.panel-docked .composer-model .custom-select { width: min(230px, calc(100% - 40px)); }
   .app-shell.panel-docked .composer-input { display: flex; min-width: 0; flex-direction: column; align-items: stretch; gap: 6px; }
@@ -417,4 +428,3 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .interaction-surface { right: 8px; bottom: 145px; left: 8px; padding: 14px; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: 0.01ms !important; } }
-@media (prefers-reduced-motion: reduce) { .composer-state.is-compacting::after { animation: none; } }

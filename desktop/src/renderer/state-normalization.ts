@@ -254,14 +254,14 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
       const b = right.value?.sequence;
       const aSequence = typeof a === "number" ? a : Number.MAX_SAFE_INTEGER;
       const bSequence = typeof b === "number" ? b : Number.MAX_SAFE_INTEGER;
-      return aSequence - bSequence || left.index - right.index;
+      return aSequence - bSequence || Number(left.value?.kind === "compaction") - Number(right.value?.kind === "compaction") || left.index - right.index;
     })
     .map(({ value }, index) => {
       const source = value as Record<string, JsonValue>;
       const kind = source.kind;
       const failedTurn = kind === "failure";
       const normalizedKind: TimelineKind =
-        kind === "user" || kind === "steering" || kind === "reasoning" || kind === "assistant" || kind === "tool" || kind === "plan"
+        kind === "user" || kind === "steering" || kind === "reasoning" || kind === "assistant" || kind === "tool" || kind === "plan" || kind === "compaction"
           ? kind
           : "status";
       const sequence = typeof source.sequence === "number" ? source.sequence : index + 1;

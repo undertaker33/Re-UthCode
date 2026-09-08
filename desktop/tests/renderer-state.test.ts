@@ -43,6 +43,19 @@ test("T04 replay is ordered and session labels use title, preview, then short id
   assert.equal(sessionLabel({ session_id: "abcdef1234567890", preview: "" }), "abcdef12");
 });
 
+test("durable compaction rehydrates between the completed reply and the following user message", () => {
+  const timeline = replayToTimeline([
+    replayRecord(3, "user", "next prompt"),
+    replayRecord(2, "compaction", ""),
+    replayRecord(2, "assistant", "completed reply"),
+    replayRecord(1, "user", "first prompt"),
+  ]);
+  assert.deepEqual(
+    timeline.map((entry) => [entry.kind, entry.text]),
+    [["user", "first prompt"], ["assistant", "completed reply"], ["compaction", ""], ["user", "next prompt"]],
+  );
+});
+
 test("T04 session transitions replace replay and keep new session empty", () => {
   const initial = createInitialState();
   const opened = applyProjectOpened(initial, {
@@ -1048,4 +1061,86 @@ test("compaction terminal events cannot create state without an observed operati
     },
   });
   assert.equal(next, state);
+});
+
+test("marking a completed compaction seen clears only the unread badge and keeps its timeline record", () => {
+  const projectKey = "C:/compaction-seen";
+  const sessionId = "session-a";
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    projects: [{ path: projectKey, projectKey, alias: "Seen", pinned: false, sessions: [{ session_id: sessionId }], catalogFresh: true }],
+    timeline: [{ id: "durable-compact", kind: "compaction", text: "", sequence: 3, status: "completed" }],
+  });
+  const event = (operationState: "running" | "completed") => ({
+    type: "agent_event" as const,
+    event: {
+      type: "compaction_operation",
+      session_id: sessionId,
+      project_key: projectKey,
+      operation_id: "op-seen",
+      state: operationState,
+      changed: operationState === "completed" ? true : null,
+      reason: null,
+    } as AgentEvent,
+  });
+  state = reduceRendererState(state, event("running"));
+  state = reduceRendererState(state, event("completed"));
+  const revision = state.sessionActivity?.[key]?.revision;
+  assert.equal(state.sessionActivity?.[key]?.unread, true);
+  assert.ok(revision);
+  state = reduceRendererState(state, { type: "session_result_seen", key, revision: revision! });
+  assert.equal(state.sessionActivity?.[key]?.unread, false);
+  assert.equal(state.projects[0]?.sessions[0]?.unread, false);
+  assert.deepEqual(state.timeline.map((entry) => entry.id), ["durable-compact"], "reading must not remove the durable compaction notice");
+});
+
+test("history rehydration of a prior compaction never creates an unread result", () => {
+  const projectKey = "C:/compaction-history";
+  const sessionId = "session-a";
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    projects: [{ path: projectKey, projectKey, alias: "History", pinned: false, sessions: [{ session_id: sessionId }], catalogFresh: true }],
+  });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: {
+      session_id: sessionId,
+      records: [
+        { record_id: "session-a:1:assistant:0", session_id: sessionId, sequence: 1, kind: "assistant", text: "old reply", is_error: false },
+        { record_id: "session-a:2:compaction:0", session_id: sessionId, sequence: 2, kind: "compaction", text: "", is_error: false },
+        { record_id: "session-a:3:user:0", session_id: sessionId, sequence: 3, kind: "user", text: "later prompt", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.equal(state.sessionActivity?.[key]?.unread ?? false, false);
+  assert.equal(state.projects[0]?.sessions[0]?.unread ?? false, false);
+  assert.deepEqual(state.timeline.map((entry) => entry.kind), ["assistant", "compaction", "user"]);
+});
+
+test("refreshing recent compaction history preserves the older-page cursor and loaded rows", () => {
+  const projectKey = "C:/refresh";
+  const sessionId = "session-a";
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  let state = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: sessionId });
+  const result = (records: unknown[], next_cursor: string) => ({ session_id: sessionId, records, next_cursor, has_more: true });
+  state = reduceRendererState(state, { type: "history_page_loaded", projectKey, sessionId, result: result([
+    { record_id: "old", kind: "assistant", sequence: 2, text: "old reply" },
+  ], "older-cursor") });
+  state = reduceRendererState(state, { type: "history_page_loaded", projectKey, sessionId, refresh: true, result: result([
+    { record_id: "new", kind: "assistant", sequence: 20, text: "latest reply" },
+    { record_id: "compact", kind: "compaction", sequence: 20, text: "Context compacted" },
+  ], "recent-cursor") });
+  assert.equal(state.sessionHistory[key]?.nextCursor, "older-cursor");
+  assert.deepEqual(state.sessionHistory[key]?.records.map(entry => entry.id), ["old", "new", "compact"]);
+  assert.deepEqual(state.timeline.map(entry => entry.id), ["old", "new", "compact"]);
 });

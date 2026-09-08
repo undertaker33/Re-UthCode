@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
 import type { TimelineEntry, TodoItem } from "./state";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon, type UiIconName } from "./UiIcon";
@@ -22,6 +22,11 @@ export interface ChatTimelineProps {
   entries: TimelineEntry[];
   todo: TodoItem[];
   notice?: string | null;
+  compactionNotice?: string | null;
+  compactionAnchor?: Pick<TimelineEntry, "id" | "messageId" | "kind"> | null;
+  compactionRunning?: boolean;
+  compactionCompleted?: boolean;
+  onLatestSeen?: () => void;
   /** Runtime errors are rendered here only when RuntimePanel is not visible. */
   runtimeError?: string | null;
   runtimeErrorVisible?: boolean;
@@ -94,7 +99,7 @@ function timelineContentFingerprint(entries: TimelineEntry[], notice: string | n
   });
 }
 
-export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
@@ -104,7 +109,7 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
   const previousContentFingerprint = useRef<string | null>(null);
   const previousHistoryRevision = useRef(historyRevision);
   const prependAnchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
-  const contentFingerprint = timelineContentFingerprint(entries, notice, runtimeError, runtimeErrorVisible);
+  const contentFingerprint = timelineContentFingerprint(entries, JSON.stringify([notice, compactionNotice]), runtimeError, runtimeErrorVisible);
 
   useLayoutEffect(() => {
     const element = timelineRef.current;
@@ -138,6 +143,22 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
       scrollTimelineToBottom(element);
     }
   }, [contentFingerprint, historyRevision, sessionKey]);
+  useEffect(() => {
+    const element = timelineRef.current;
+    const markSeen = () => {
+      if (element && document.visibilityState === "visible" && document.hasFocus() && isNearBottom(element)) onLatestSeen?.();
+    };
+    const timer = window.setTimeout(markSeen, 0);
+    element?.addEventListener("scroll", markSeen);
+    window.addEventListener("focus", markSeen);
+    document.addEventListener("visibilitychange", markSeen);
+    return () => {
+      window.clearTimeout(timer);
+      element?.removeEventListener("scroll", markSeen);
+      window.removeEventListener("focus", markSeen);
+      document.removeEventListener("visibilitychange", markSeen);
+    };
+  }, [onLatestSeen, contentFingerprint, sessionKey]);
 
   useEffect(() => {
     const element = timelineRef.current;
@@ -190,6 +211,14 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
   // leaves the same text in the generic status channel, suppress that exact
   // duplicate instead of creating two visual/ARIA entities for one failure.
   const visibleNotice = notice && notice !== runtimeError ? notice : null;
+  const compactionIndex = compactionAnchor == null ? -1 : entries.findIndex(entry => entry.id === compactionAnchor.id || (compactionAnchor.messageId && entry.messageId === compactionAnchor.messageId && entry.kind === compactionAnchor.kind));
+  const durableCompactionAtAnchor = compactionCompleted
+    && compactionIndex >= 0 && entries[compactionIndex + 1]?.kind === "compaction";
+  const compactionLine = compactionNotice && (compactionRunning || !durableCompactionAtAnchor) && <p className={`timeline-compaction${compactionRunning ? " is-running" : ""}`} role="status" aria-live="polite">
+    {compactionRunning && <span className="compaction-spinner" aria-hidden="true" />}
+    <span className="compaction-message">{compactionNotice}</span>
+    {compactionRunning && <span className="compaction-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>}
+  </p>;
 
   useEffect(() => {
     if (!entries.some((entry) => entry.kind === "tool" && entry.status === "running")) return undefined;
@@ -208,16 +237,18 @@ export function ChatTimeline({ entries, todo, notice, runtimeError, runtimeError
       {historyError && <div className="timeline-history-error" role="alert"><span>{historyError}</span>{onRetryOlder && <button type="button" onClick={retryOlder}>{t("retry")}</button>}</div>}
       {historyLoading && <p className="timeline-history-loading" role="status">{t("loadOlder")}…</p>}
       {historyHasMore && !historyLoading && onLoadOlder && entries.length > 0 && <button type="button" className="timeline-load-older" onClick={() => { const element = timelineRef.current; if (element) prependAnchor.current = { scrollHeight: element.scrollHeight, scrollTop: element.scrollTop }; onLoadOlder(); }}>{t("loadOlder")}</button>}
-      {visibleNotice && <p className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
+      {visibleNotice && <p id="composer-state" className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
       {showNewMessages && <button type="button" className="timeline-new-messages" data-new-messages="true" aria-label={t("jumpToLatest")} title={t("jumpToLatest")} onClick={jumpToLatest}>{t("newMessages")}</button>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
-      {entries.map((entry) => {
+      {compactionAnchor === null && !historyHasMore && compactionLine}
+      {entries.map((entry, index) => {
+        if (entry.kind === "compaction") return <Fragment key={entry.id}><p className="timeline-compaction" role="status">{t("contextCompacted")}</p>{index === compactionIndex && compactionLine}</Fragment>;
         const status = entry.status || "running";
         const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
-        return <article key={entry.id} className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
+        return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
           <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small className="tool-status" data-status={status} data-error={entry.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null && <span className="tool-elapsed" aria-label={`${elapsed}s`}> · {elapsed}s</span>}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
           <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText }) : renderMarkdown(entry.text, { onCopyText })}</div>
-        </article>;
+        </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
       {todo.length > 0 && <section className="todo-strip" tabIndex={0} aria-label={t("tasks")}><header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status} title={item.content} aria-label={`${item.content}: ${todoStatusLabel(item.status, t)}`}><span className="todo-status-icon" aria-hidden="true"><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span><span>{item.content}</span><span className="sr-only">{todoStatusLabel(item.status, t)}</span></li>)}</ul></section>}
     </section>

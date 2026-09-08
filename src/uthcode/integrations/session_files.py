@@ -33,7 +33,7 @@ SESSION_TITLE_MAX_LENGTH = 240
 HISTORY_PAGE_SIZE = 30
 HISTORY_PAGE_MAX_SIZE = 100
 HISTORY_READ_BLOCK_BYTES = 16 * 1024
-_HISTORY_CURSOR_VERSION = 1
+_HISTORY_CURSOR_VERSION = 2
 
 
 class SessionFileError(RuntimeError):
@@ -258,6 +258,7 @@ class SessionHistorySlice:
     next_cursor: str | None
     has_more: bool
     bytes_read: int
+    compactions: tuple[ActiveCheckpoint, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,10 +492,12 @@ class SessionFileStore:
         if not transcript_path.is_file():
             raise SessionCorruptError("Session v3 transcript file is missing")
 
-        end_offset = _history_cursor_end_offset(
+        timeline_path = path / "timeline.jsonl"
+        end_offset, timeline_end_offset = _history_cursor_end_offsets(
             cursor,
             session_id=session_id,
             file_size=transcript_path.stat().st_size,
+            timeline_size=timeline_path.stat().st_size,
         )
         units_with_offsets, has_more, bytes_read = _read_history_units_reverse(
             transcript_path,
@@ -507,6 +510,9 @@ class SessionFileStore:
         # order, so reverse only the bounded result here.
         units_with_offsets.reverse()
         units = tuple(unit for unit, _offset in units_with_offsets)
+        compactions, timeline_bytes, next_timeline_offset = _read_history_compactions(
+            timeline_path, units=units, end_offset=timeline_end_offset,
+        )
         next_cursor = None
         if has_more and units_with_offsets:
             oldest_unit, oldest_offset = units_with_offsets[0]
@@ -514,6 +520,7 @@ class SessionFileStore:
                 session_id=session_id,
                 before_sequence=oldest_unit.sequence_start - 1,
                 before_offset=oldest_offset,
+                timeline_before_offset=next_timeline_offset,
             )
         return SessionHistorySlice(
             session_id=session_id,
@@ -521,7 +528,8 @@ class SessionFileStore:
             units=units,
             next_cursor=next_cursor,
             has_more=has_more,
-            bytes_read=bytes_read,
+            bytes_read=bytes_read + timeline_bytes,
+            compactions=compactions,
         )
 
     def persist_tool_result(self, session_id: str, content: str, *, policy: object | None = None) -> object:
@@ -757,6 +765,7 @@ class SessionWriter:
         before = self.snapshot
         current_timeline = before.timeline
         try:
+            checkpoint = replace(checkpoint, display_after_sequence=before.transcript.last_sequence)
             candidate_timeline = current_timeline.append_transaction(values, checkpoint)
         except (TypeError, ValueError) as exc:
             raise SessionFileError("Timeline transaction identity is invalid") from exc
@@ -804,7 +813,15 @@ class SessionWriter:
         if not isinstance(timeline, Timeline) or timeline.session_id != self.session_id:
             raise SessionFileError("timeline belongs to another Session")
         current = self.snapshot.timeline
-        if not _timeline_records_equal(timeline.records[: len(current.records)], current.records):
+        prefix = tuple(
+            replace(record, display_after_sequence=stored.display_after_sequence)
+            if isinstance(record, ActiveCheckpoint) and isinstance(stored, ActiveCheckpoint)
+            else record
+            for record, stored in zip(timeline.records[: len(current.records)], current.records)
+        )
+        # Display positions are assigned by this writer, not the model candidate.
+        # Reconciliation below still compares the exact persisted records.
+        if not _timeline_records_equal(prefix, current.records):
             raise SessionFileError("Timeline candidate does not extend the current Timeline")
         added = timeline.records[len(current.records) :]
         if not added or not isinstance(added[-1], ActiveCheckpoint):
@@ -922,6 +939,7 @@ def _encode_history_cursor(
     session_id: str,
     before_sequence: int,
     before_offset: int,
+    timeline_before_offset: int,
 ) -> str:
     payload = json.dumps(
         {
@@ -929,6 +947,7 @@ def _encode_history_cursor(
             "session_id": session_id,
             "before_sequence": before_sequence,
             "before_offset": before_offset,
+            "timeline_before_offset": timeline_before_offset,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -936,14 +955,15 @@ def _encode_history_cursor(
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def _history_cursor_end_offset(
+def _history_cursor_end_offsets(
     cursor: str | None,
     *,
     session_id: str,
     file_size: int,
-) -> int | None:
+    timeline_size: int,
+) -> tuple[int | None, int | None]:
     if cursor is None:
-        return None
+        return None, None
     if not isinstance(cursor, str) or not cursor:
         raise ValueError("history cursor is invalid")
     try:
@@ -959,6 +979,7 @@ def _history_cursor_end_offset(
         raise ValueError("history cursor does not belong to this Session")
     before_sequence = value.get("before_sequence")
     before_offset = value.get("before_offset")
+    timeline_before_offset = value.get("timeline_before_offset")
     if (
         isinstance(before_sequence, bool)
         or not isinstance(before_sequence, int)
@@ -967,9 +988,51 @@ def _history_cursor_end_offset(
         or not isinstance(before_offset, int)
         or before_offset < 0
         or before_offset > file_size
+        or isinstance(timeline_before_offset, bool)
+        or not isinstance(timeline_before_offset, int)
+        or timeline_before_offset < 0
+        or timeline_before_offset > timeline_size
     ):
         raise ValueError("history cursor is invalid")
-    return before_offset
+    return before_offset, timeline_before_offset
+
+
+def _read_history_compactions(
+    path: Path, *, units: tuple[SemanticUnit, ...], end_offset: int | None,
+) -> tuple[tuple[ActiveCheckpoint, ...], int, int]:
+    """Project committed display positions without restoring model history."""
+    if not units:
+        return (), 0, 0
+    lower, upper = units[0].sequence_start, units[-1].sequence_end
+    read = [0]
+    notices: list[ActiveCheckpoint] = []
+    pending: ActiveCheckpoint | None = None
+    next_offset = 0
+    for raw, _start, line_end in _iter_jsonl_lines_reverse(path, end_offset=end_offset, bytes_read=read):
+        try:
+            envelope = json.loads(raw)
+            if envelope.get("kind") != "timeline" or envelope.get("schema_version") != SESSION_RECORD_SCHEMA_VERSION:
+                raise ValueError("invalid Timeline envelope")
+            record = timeline_record_from_dict(envelope["record"])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise SessionCorruptError("invalid Timeline history record") from exc
+        if isinstance(record, ActiveCheckpoint):
+            position = record.display_after_sequence
+            # Historical checkpoints did not record their occurrence. Do not
+            # invent a position from the range of content they compressed.
+            if position is None:
+                break
+            if position < lower:
+                next_offset = line_end + 1
+                break
+            pending = record if position <= upper else None
+        elif pending is not None:
+            if not pending.transaction_id or record.transaction_id != pending.transaction_id:
+                raise SessionCorruptError("Timeline checkpoint has no matching transaction")
+            notices.append(pending)
+            pending = None
+    notices.reverse()
+    return tuple(notices), read[0], next_offset
 
 
 def _iter_jsonl_lines_reverse(
