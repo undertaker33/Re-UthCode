@@ -88,6 +88,8 @@ status_values:
 | --- | --- | --- | --- |
 | F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全。第 7 轮历史尾部分页与冷准备已合并 PR #101；第 8 轮补齐 Session 手动压缩操作、取消/部分提交/恢复、跨会话导航和安全终态显示。luna/max 实施、terra/high 复审通过；最终 Python `1512 passed, 3 skipped`，Desktop `209 passed`，typecheck 通过。标准 package 已更新，中英文 packaged commands 隔离验证通过；未 make，不宣称安装器更新。未修改任务书、未归档；用户最终复验及真实 Provider 验证仍待进行，详见 W07 Feedback。 |
 
+F03 第 9 轮补充（2026-09-08）：修复 metadata catalog 丢失首条用户消息预览、侧栏退回 ID 的回归；保留手动标题优先与历史按需读取。luna/max 实施、terra/high 复审通过，验证详情与此前验收遗漏见 W07 Feedback。
+
 ### `not_implemented`
 
 | Task | 任务包 | 当前路径 | 当前证据 |

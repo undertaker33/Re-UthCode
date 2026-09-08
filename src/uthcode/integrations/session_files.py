@@ -417,6 +417,41 @@ class SessionFileStore:
             raise SessionNotFoundError(f"unknown Session: {session_id}")
         return self._load_snapshot(path, expected_project_key=expected_project_key).snapshot
 
+    def read_first_user_entry(
+        self,
+        session_id: str,
+        *,
+        expected_project_key: str | None = None,
+    ) -> TranscriptEntry | None:
+        """Read the first User Message without materializing the transcript.
+
+        Session catalog refresh needs a useful label for existing Sessions,
+        but it must not replay every historical record.  Read the current v3
+        transcript from its head and stop as soon as a complete User Message
+        entry is found; an empty transcript returns ``None`` without touching
+        the timeline or any other Session state.
+        """
+
+        path = self.session_path(session_id)
+        if not path.is_dir():
+            raise SessionNotFoundError(f"unknown Session: {session_id}")
+        metadata = _read_metadata(path / "metadata.json")
+        if metadata.session_id != path.name:
+            raise SessionCorruptError("Session metadata id does not match its directory")
+        if expected_project_key is not None and metadata.project_key != expected_project_key:
+            raise SessionNotFoundError("Session belongs to another project")
+        if (path / "history.jsonl").exists():
+            raise SessionIncompatibleError(
+                "old Session v1 history layout is incompatible with Session v3"
+            )
+        transcript_path = path / "transcript.jsonl"
+        if not transcript_path.is_file():
+            raise SessionCorruptError("Session v3 transcript file is missing")
+        return _read_first_user_entry(
+            transcript_path,
+            session_id=session_id,
+        )
+
     def read_history_page(
         self,
         session_id: str,
@@ -1029,6 +1064,40 @@ def _history_entry_from_line(
     if entry.session_id != session_id:
         raise SessionCorruptError("Transcript entry belongs to another Session")
     return entry
+
+
+def _read_first_user_entry(
+    path: Path,
+    *,
+    session_id: str,
+) -> TranscriptEntry | None:
+    """Read complete transcript lines until the first User Message."""
+
+    buffer = b""
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(HISTORY_READ_BLOCK_BYTES)
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        break
+                    raw, buffer = buffer[:newline], buffer[newline + 1 :]
+                    if not raw.strip():
+                        continue
+                    entry = _history_entry_from_line(
+                        raw,
+                        path=path,
+                        session_id=session_id,
+                    )
+                    if entry.kind is TranscriptKind.USER_MESSAGE:
+                        return entry
+    except OSError as exc:
+        raise SessionCorruptError(f"could not read Session log: {path}") from exc
+    return None
 
 
 def _read_history_units_reverse(

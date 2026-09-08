@@ -18,7 +18,7 @@ from uthcode.application import (
     ToolResultPart,
     UthCodeApplication,
 )
-from uthcode.core.history import transcript_entries_from_message
+from uthcode.core.history import TranscriptEntry, TranscriptKind, transcript_entries_from_message
 from uthcode.integrations import session_files
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import (
@@ -155,6 +155,9 @@ def test_application_replay_status_and_tui_prioritize_title_over_preview(
         catalog = application.session_catalog()
         assert catalog[0].title == "权威标题"
         assert catalog[0].preview == "真实首条预览"
+        metadata_catalog = application.session_catalog_metadata()
+        assert metadata_catalog[0].title == "权威标题"
+        assert metadata_catalog[0].preview == "真实首条预览"
 
         replay = application.session_replay("visible")
         assert replay and replay[0].title == "权威标题"
@@ -172,6 +175,181 @@ def test_application_replay_status_and_tui_prioritize_title_over_preview(
         assert "真实首条预览" not in rendered
     finally:
         application.close()
+
+
+def test_metadata_catalog_reads_existing_first_user_message_without_full_snapshot(
+    tmp_path: Path,
+) -> None:
+    source, _target, store = _paths(tmp_path)
+    project_key = str(source.resolve())
+    store.create_session("legacy-preview", project_key=project_key)
+    first = TranscriptEntry(
+        "legacy-preview",
+        1,
+        "turn-1",
+        TranscriptKind.USER_MESSAGE,
+        {
+            "role": "user",
+            "parts": [
+                {"type": "text", "text": "首条\n"},
+                {"type": "text", "text": "多 part"},
+            ],
+        },
+        semantic_unit_id="turn-1",
+    )
+    with store.open_writer("legacy-preview", expected_project_key=project_key) as writer:
+        assert writer.append_transcript(first).transcript_appended is True
+
+    service = ApplicationSessionService(
+        storage_root=store.root,
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    service.read_session = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("catalog metadata must not load a complete Session snapshot")
+    )
+
+    catalog = service.list_catalog_metadata()
+    assert catalog[0].preview == "首条 多 part"
+
+
+def test_metadata_catalog_keeps_empty_session_preview_empty(tmp_path: Path) -> None:
+    source, _target, store = _paths(tmp_path)
+    project_key = str(source.resolve())
+    store.create_session("empty-preview", project_key=project_key)
+
+    service = ApplicationSessionService(
+        storage_root=store.root,
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+
+    catalog = service.list_catalog_metadata()
+    assert catalog[0].title is None
+    assert catalog[0].preview == ""
+
+
+def test_metadata_catalog_head_read_does_not_grow_with_appended_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _target, store = _paths(tmp_path)
+    project_key = str(source.resolve())
+    session_id = "head-read"
+    store.create_session(session_id, project_key=project_key)
+
+    entries = [
+        *_user_transcript(session_id, "首条请求"),
+        *(
+            TranscriptEntry(
+                session_id,
+                sequence,
+                f"turn-{sequence}",
+                TranscriptKind.ASSISTANT_MESSAGE,
+                {"text": "history " + ("x" * 256)},
+                semantic_unit_id=f"turn-{sequence}",
+            )
+            for sequence in range(2, 200)
+        ),
+    ]
+    with store.open_writer(session_id, expected_project_key=project_key) as writer:
+        assert writer.append_transcript(entries).transcript_appended is True
+
+    transcript_path = store.session_path(session_id) / "transcript.jsonl"
+    original_open = Path.open
+    reads: list[int] = []
+
+    class _ReadMeter:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def read(self, size: int = -1) -> bytes:
+            value = self._handle.read(size)  # type: ignore[attr-defined]
+            reads.append(len(value))
+            return value
+
+        def __enter__(self) -> "_ReadMeter":
+            self._handle.__enter__()  # type: ignore[attr-defined]
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> object:
+            return self._handle.__exit__(exc_type, exc, traceback)  # type: ignore[attr-defined]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._handle, name)
+
+    def counting_open(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        handle = original_open(path, mode, *args, **kwargs)
+        if path.resolve() == transcript_path.resolve() and mode == "rb":
+            return _ReadMeter(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    service = ApplicationSessionService(
+        storage_root=store.root,
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+    first_catalog = service.list_catalog_metadata()
+    first_bytes = sum(reads)
+    assert first_catalog[0].preview == "首条请求"
+    assert first_bytes > 0
+
+    with store.open_writer(session_id, expected_project_key=project_key) as writer:
+        next_sequence = writer.snapshot.transcript.last_sequence + 1
+        appended = tuple(
+            TranscriptEntry(
+                session_id,
+                next_sequence + offset,
+                f"turn-more-{offset}",
+                TranscriptKind.ASSISTANT_MESSAGE,
+                {"text": "more history " + ("y" * 256)},
+                semantic_unit_id=f"turn-more-{offset}",
+            )
+            for offset in range(999)
+        )
+        assert writer.append_transcript(appended).transcript_appended is True
+
+    reads.clear()
+    second_catalog = service.list_catalog_metadata()
+    second_bytes = sum(reads)
+    assert second_catalog[0].preview == "首条请求"
+    assert second_bytes == first_bytes
+
+
+def test_metadata_catalog_reads_first_user_message_longer_than_read_block(
+    tmp_path: Path,
+) -> None:
+    source, _target, store = _paths(tmp_path)
+    project_key = str(source.resolve())
+    session_id = "long-first-user"
+    store.create_session(session_id, project_key=project_key)
+
+    first_message = "首条用户消息 " + (
+        "x" * (session_files.HISTORY_READ_BLOCK_BYTES + 1_024)
+    )
+    with store.open_writer(session_id, expected_project_key=project_key) as writer:
+        assert writer.append_transcript(_user_transcript(session_id, first_message)).transcript_appended
+
+    transcript_path = store.session_path(session_id) / "transcript.jsonl"
+    assert transcript_path.stat().st_size > session_files.HISTORY_READ_BLOCK_BYTES
+
+    service = ApplicationSessionService(
+        storage_root=store.root,
+        project_key=project_key,
+        instruction_loader=None,
+        store=store,
+    )
+
+    catalog = service.list_catalog_metadata()
+    expected = " ".join(first_message.split())[:159] + "…"
+    assert catalog[0].title is None
+    assert catalog[0].preview == expected
+    assert len(catalog[0].preview) == 160
+    assert catalog[0].preview != session_id
 
 
 def test_move_changes_only_authoritative_membership_and_is_target_idempotent(
