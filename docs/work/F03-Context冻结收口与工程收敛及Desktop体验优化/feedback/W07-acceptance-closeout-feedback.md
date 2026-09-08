@@ -309,3 +309,20 @@ Desktop `session.resume` 不再返回完整 replay；最近页独立显示，冷
 - 主控定向 Session/存储/Bridge/历史/架构回归：`151 passed in 15.96s`。`python -m pytest -q`：`1515 passed, 3 skipped in 128.32s`，该次收集早于最后新增的长首条测试；其后完整 `tests/test_session_authority.py` 为 `20 passed in 1.21s`，覆盖最终测试内容。Reviewer 独立同文件 `20 passed`。
 - Desktop 全量首次 `208 passed, 1 failed`，失败是既有 consecutive Turn 轮询测试提前发生下一次计时回调，计数 4 而非 3；未修改生产行为或放宽断言。该文件定向 `10 passed`，全量原命令重跑 `209 passed, 0 failed in 37805.7263ms`；`npm run typecheck` exit 0。
 - 复审后核对无 UthCode 进程/窗口，标准 `conda run --no-capture-output -n re-uthcode npm run package` exit 0，runtime smoke 与 Forge package 均成功。新包英文 `sessions` 验收 `f03-session-title-green` PASS，runId `f99f63ef-624b-4141-82a3-c198ec9153c1`，六个会话可见首条消息标题以及切换/回放/续聊全部通过；仍使用隔离 HOME 和本地 fixture，不调用真实 Provider。未执行 make，未更新安装器，也未宣称完成整套中英文视觉矩阵。
+
+## 返工第 10 轮：压缩提示持久位置与 Desktop 交互（2026-09-08）
+
+- 用户追加需求不进入冻结任务书，继续归入 F03。项目整行可折叠且不受选中子会话阻止；去掉缓存/项目归属徽标并提供悬停信息；Runtime 使用隐藏、浮动、放大图标，与专注模式区分；最终回复结束恢复 Composer 焦点，但不抢其他控件焦点。
+- 压缩执行时在聊天区显示带动画的单行提示；完成提示不再固定粘在最新消息之后。Timeline checkpoint 保存提交时的 Transcript 位置，历史分页投影出稳定身份的压缩记录；切换、重启及后续对话保持原位置。旧 checkpoint 没有位置时不猜测补写。未提交/不完整候选不展示，提示不进入模型历史。
+- 回复或压缩完成产生未读标记；用户在前台可见聊天尾部后清除，清除不删除压缩提示。近期页刷新与旧页、实时事件按身份合并，并保留已加载旧页游标。
+- terra/high 独立 Python 与 UI 复审通过。主控修复复审发现的旧页重复扫描 Timeline、隐藏按钮 aria-pressed 缺失和废弃 CSS；修复旧 UI 测试选择器，避免错误断言序列化大型 DOM。没有增加持久索引、缓存数据库或 Compact Job。
+- 定向 `tests/test_history_paging.py`：`9 passed in 0.57s`，覆盖重启位置/身份、分页、部分尾部、旧数据和追加约 260 KB Timeline 后旧页读取量不增加。新增状态/渲染定向测试 `5 passed`，窄 Runtime 测试 `2 passed`；typecheck exit 0。完整 Python 和 Desktop 曾因本机 WMI 查询挂起而未完成，不能作为通过证据；系统恢复后重新串行执行最终回归。
+- 当前事实与用户手册同步。未改任务书、未归档、未调用真实 Provider；本轮最终全量、标准包和 Git 交付结果在后续记录中补充。
+
+### 第 10 轮全量发现与修复
+
+- WMI 恢复后首次完整 Python：`5 failed, 1515 passed, 3 skipped in 257.86s`。五项均属于多 epoch 压缩：writer 写入的展示位置不在模型候选中，旧前缀的序列化比较因此误报 `timeline_append_failed`。这是真实代码回归，不归因于环境。
+- 主控修复候选前缀比较：仅对齐 writer 所有的展示位置，其他字段与 transaction identity 继续严格核对；提交 reconciliation 的完整记录比较不变。`python -m pytest tests/test_t09_1_context_protocol_e2e.py tests/test_history_paging.py -q`：`54 passed in 19.43s`。修复重新交 terra/high 复审并执行全量。
+- terra/high 复审 PASS；最终 Python `1520 passed, 3 skipped in 269.22s`，exit 0。Desktop 首次 `215 passed, 1 failed`，既有真实时钟退避测试多触发一次请求；改为可控时钟精确推进各间隔，保留请求数和 Composer 锁定/解锁断言，未改生产轮询。该测试文件 `10 passed`，terra/high 复审 PASS；最终 Desktop `216 passed, 0 failed in 73634.6749ms`，typecheck exit 0。
+- 标准 `conda run --no-capture-output -n re-uthcode npm run package` exit 0，Runtime smoke 与 Forge package 通过。packaged commands 首次因驱动仍寻找旧 Runtime 下拉框失败；驱动改为在对应本地化布局组内点击图标按钮，terra/high 复审 PASS，`node --check` 与 CDP 隔离测试 `11 passed`。同标准包英文报告 `f03-ui10-commands-green`（runId `bd91e1e6-f536-422c-ba8f-df8f369cfca2`）、中文报告 `f03-ui10-commands-zh`（runId `6255a852-caca-487a-9433-a85d5f967160`）均 PASS。中文参数应为 `zh`，一次误传 `zh-CN` 在启动前被拒绝，不计为验收。
+- 本轮只执行上述 packaged commands，不宣称完整视觉矩阵或真实 Provider 验证通过；持久提示的重启与顺序由定向 Python/Renderer 回归覆盖，真实会话体验仍待用户复验。未执行 make，安装器未更新。UTF-8 guard 检查 5 份文档通过，无编码修复；不提交 `.workbuddy/` 或 `临时目录/`。

@@ -3,6 +3,20 @@ import type { ProjectState, SessionSummary } from "./state";
 import { sessionLabel } from "./state";
 import { UiIcon, type UiIconName } from "./UiIcon";
 import { useTranslation } from "./i18n";
+import { createPortal } from "react-dom";
+import type { ReactNode } from "react";
+
+function SidebarInfo({ children, heading, lines }: { children: ReactNode; heading: string; lines: string[] }) {
+  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  const show = (element: HTMLElement) => {
+    const rect = element.firstElementChild?.getBoundingClientRect();
+    if (rect) setPosition({ left: Math.max(8, Math.min(rect.right + 14, window.innerWidth - 328)), top: Math.max(8, Math.min(rect.top, window.innerHeight - 150)) });
+  };
+  return <span className="sidebar-info-anchor" onMouseEnter={event => show(event.currentTarget)} onMouseLeave={() => setPosition(null)} onFocus={event => show(event.currentTarget)} onBlur={() => setPosition(null)} onClick={() => setPosition(null)}>
+    {children}
+    {position && createPortal(<div className="sidebar-info-card" role="tooltip" style={position}><strong>{heading}</strong>{lines.map((line, index) => <div key={index}>{line}</div>)}</div>, document.body)}
+  </span>;
+}
 
 export const MAX_VISIBLE_SESSIONS = 5;
 
@@ -16,7 +30,6 @@ export interface SidebarProps {
   onProjectExpandedChange: (projectKey: string, expanded: boolean) => void;
   onNewSession: () => void;
   onOpenProject: () => void;
-  onOpenProjectSession: (project: ProjectState) => void;
   onResumeSession: (project: ProjectState, sessionId: string) => void;
   onAliasChange: (projectKey: string, alias: string) => void;
   onTogglePin: (project: ProjectState) => void;
@@ -318,7 +331,7 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
   // catalog mutation; the user's explicit "show more" choice remains stable.
   const visibleShowMore = showMore || selectionReveal;
   const visibleGroups = sessionGroups(project.sessions, visibleShowMore);
-  const visibleExpanded = expanded || selectedInProject;
+  const visibleExpanded = expanded;
   useEffect(() => {
     if (selectedInProject && !selectedVisibleInCollapsedList && !showMore && !selectionReveal && !suppressSelectionReveal.current) {
       // Reveal a newly selected row once, without mutating the user's
@@ -341,14 +354,16 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
         openMenu(event);
       }}
     >
-      <div className="project-line">
+      <div className="project-line" onClick={(event) => {
+        if ((event.target as HTMLElement).closest('.menu-trigger, input')) return;
+        setExpanded((value) => !value);
+      }}>
         <button
           type="button"
           className="icon-button disclosure"
           title={`${expanded ? t("collapse") : t("expand")} ${project.alias}`}
           aria-label={`${expanded ? t("collapse") : t("expand")} ${project.alias}`}
           aria-expanded={expanded}
-          onClick={() => setExpanded((value) => !value)}
         ><UiIcon name="chevron" /></button>
         {editing ? <input
           className="alias-input"
@@ -361,14 +376,13 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
             if (event.key === "Enter") { event.preventDefault(); commitAlias(); }
             if (event.key === "Escape") { event.preventDefault(); setAlias(project.alias); setEditing(false); }
           }}
-        /> : <button
+        /> : <SidebarInfo heading={project.alias} lines={[`${project.sessions.length} ${t("session")}`, project.path]}><button
           type="button"
           className="project-select"
-          title={project.path}
           aria-label={`${project.alias} · ${project.path}`}
           aria-current={active ? "page" : undefined}
-          onClick={() => props.onOpenProjectSession(project)}
-        ><UiIcon name="folder" /><span>{project.alias}</span>{!project.catalogFresh && <small>{t("cached")}</small>}</button>}
+          aria-expanded={expanded}
+        ><UiIcon name="folder" /><span>{project.alias}</span></button></SidebarInfo>}
         <button
           type="button"
           className="icon-button menu-trigger"
@@ -499,7 +513,8 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
     onMenuTarget(menuOpen ? null : { kind: "session", projectKey: project.projectKey, sessionId: session.session_id, variant, point: event ? { x: event.clientX, y: event.clientY } : undefined });
   };
   const rowClass = variant === "recent" ? "recent-line" : "session-line";
-  const liveStatus = session.runtime_status ?? "idle";
+  const executionStatus = session.runtime_status ?? "idle";
+  const liveStatus = executionStatus === "running" || executionStatus === "waiting" ? executionStatus : session.unread ? "completed" : executionStatus === "completed" ? "idle" : executionStatus;
   const statusIcon: UiIconName = liveStatus === "completed" ? "check" : liveStatus === "failed" || liveStatus === "cancelled" ? "warning" : liveStatus === "waiting" ? "pause" : liveStatus === "running" ? "status" : "todo";
   const statusLabel = liveStatus === "waiting" ? t("waiting") : liveStatus === "running" ? t("running") : liveStatus === "completed" ? t("completed") : liveStatus === "failed" ? t("failed") : liveStatus === "cancelled" ? t("cancelled") : t("idle");
   return <li className={`session-item${variant === "recent" ? " recent-session-item" : ""}`}>
@@ -524,14 +539,13 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
           if (event.key === "Enter") { event.preventDefault(); commitTitle(); }
           if (event.key === "Escape") { event.preventDefault(); setEditing(false); }
         }}
-      /> : <button
+      /> : <SidebarInfo heading={sessionLabel(session)} lines={[project.alias, project.path]}><button
         type="button"
         className={`${rowClass}${session.session_id === props.selectedSessionId ? " is-selected" : ""}`}
-        title={sessionInfo(project, session)}
         aria-label={sessionInfo(project, session)}
         disabled={session.corrupt === true}
         onClick={() => props.onResumeSession(project, session.session_id)}
-      ><span className={`session-dot session-status-dot is-${liveStatus}`} title={statusLabel} aria-label={statusLabel}><UiIcon name={statusIcon} /></span> <span>{sessionLabel(session)}</span>{session.corrupt && <small>{t("recovery")}</small>}{variant === "recent" && <small>{project.alias}</small>}</button>}
+      ><span className={`session-dot session-status-dot is-${liveStatus}`} title={statusLabel} aria-label={statusLabel}><UiIcon name={statusIcon} /></span> <span>{sessionLabel(session)}</span>{session.corrupt && <small>{t("recovery")}</small>}</button></SidebarInfo>}
       <button
         type="button"
         className="icon-button menu-trigger session-menu-trigger"

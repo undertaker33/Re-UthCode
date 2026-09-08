@@ -58,6 +58,8 @@ Desktop 的侧栏从当前项目的 Session catalog 打开或新建对话。Sess
 
 Composer 顶部显示当前 Todo，底部可选择模型与权限并查看 Context ring。`/compact` 执行期间普通输入会锁定，Runtime panel 显示 Context 与 Compact 的实时安全状态；这些界面信息来自 Application 投影，而不是 Desktop 自行计算的会话状态。
 
+压缩时，聊天区会显示带动画的单行进度；成功后显示“上下文已压缩”，保留在压缩发生的位置，切换会话或重启后仍可在对应历史页查看。更新前未记录发生位置的压缩无法还原为准确的历史提示。侧栏勾号表示回复或压缩完成后尚未查看；窗口获得焦点并显示聊天尾部后清除，历史提示继续保留。项目整行可展开或收起，右侧菜单独立操作；Runtime 面板提供隐藏、浮动和停靠三个图标按钮。
+
 宽屏 Desktop 的 Sidebar 与 Runtime panel 分隔条同时支持 Pointer 拖拽和键盘调整，并以稳定边界写回宽度 preference；拖动预览、窗口变化和缩放只做 viewport clamp，窄屏会关闭分隔条并使用 Runtime overlay。Focus Mode 是临时的 Renderer 展示状态：它隐藏 Sidebar/Runtime，退出时恢复进入前的 `panelMode` 与宽度，不写入 preference。Session ID 和 Markdown fenced code 的复制都经由 `copyText`，代码复制保留解析前的原文；用户滚离底部时 streaming 不抢回 scroll position，并显示 new-message 入口，点击后才回到底部并恢复 follow-tail。
 
 Runtime panel 将两种口径分开显示：Current Context 是 Application 的 `exact` / `estimate` / `unavailable` measurement projection，Last Provider Request Usage 则只表示最近一次 Provider request 的 input/output/total 与明确可用的 cache read/write 字段；后者不会覆盖前者，也不会用默认零值冒充测量。

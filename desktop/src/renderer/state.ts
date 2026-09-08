@@ -43,7 +43,7 @@ import {
 } from "./state-session";
 
 export type RuntimeStateName = "booting" | "restarting" | "ready" | "configuration_required" | "failed" | "stopping" | "stopped";
-export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "tool" | "plan" | "status";
+export type TimelineKind = "user" | "steering" | "reasoning" | "assistant" | "tool" | "plan" | "status" | "compaction";
 export type TimelineStatus = "streaming" | "running" | "completed" | "failed" | "cancelled" | "info";
 export type PermissionModeProjection = "unknown" | "default" | "auto" | "full_access";
 export type ContextMeasurement = "estimate" | "exact" | "unavailable";
@@ -163,6 +163,7 @@ export interface SessionSummary {
   model_ref?: string | null;
   /** Live status supplied by the bridge without changing catalog order. */
   runtime_status?: "idle" | "running" | "waiting" | "completed" | "failed" | "cancelled";
+  unread?: boolean;
 }
 
 export interface ProjectState {
@@ -296,6 +297,7 @@ export interface RendererState {
   terminalStatusPending: boolean;
   /** A Session rename/move RPC is the single in-flight mutation authority. */
   sessionMutationBusy: boolean;
+  sessionActivity?: Record<string, { unread: boolean; revision: number; compaction?: CompactionStatusProjection; compactionAnchor?: Pick<TimelineEntry, "id" | "messageId" | "kind"> | null }>;
   turnStatus: "idle" | "running" | "pausing" | "paused" | "completed" | "failed" | "cancelled";
   pendingInteraction: PendingInteraction | null;
   completionBlocked: string | null;
@@ -486,7 +488,7 @@ function mergeTimelineEntries(
   return result.sort((left, right) => {
     if (left.sequence === undefined) return right.sequence === undefined ? 0 : 1;
     if (right.sequence === undefined) return -1;
-    return left.sequence - right.sequence;
+    return left.sequence - right.sequence || Number(left.kind === "compaction") - Number(right.kind === "compaction");
   });
 }
 
@@ -922,7 +924,7 @@ export type RendererAction =
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
   | { type: "history_page_started"; projectKey: string; sessionId: string }
   | { type: "history_page_loading"; projectKey: string; sessionId: string }
-  | { type: "history_page_loaded"; projectKey: string; sessionId: string; result: unknown; replace?: boolean }
+  | { type: "history_page_loaded"; projectKey: string; sessionId: string; result: unknown; replace?: boolean; refresh?: boolean }
   | { type: "history_page_error"; projectKey: string; sessionId: string; message: string }
   | { type: "session_preparation"; projectKey: string; sessionId: string; status: SessionPreparationState }
   | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean; preserveTimeline?: boolean }
@@ -930,6 +932,7 @@ export type RendererAction =
   | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
   | { type: "compaction_started"; trigger?: CompactionTrigger; operationId?: string; sessionId?: string; projectKey?: string }
   | { type: "agent_event"; event: AgentEvent }
+  | { type: "session_result_seen"; key: string; revision: number }
   | { type: "interaction_submitting"; value: boolean }
   | { type: "session_mutation_busy"; value: boolean }
   | { type: "command_candidates"; result: unknown }
@@ -950,7 +953,7 @@ export type RendererAction =
   | { type: "settings_error"; message: string | null }
   | { type: "settings_saving"; value: boolean };
 
-export function reduceRendererState(state: RendererState, action: RendererAction): RendererState {
+function reduceRendererStateInner(state: RendererState, action: RendererAction): RendererState {
   switch (action.type) {
     case "hydrate_preferences": {
       const preferences = action.preferences;
@@ -1132,10 +1135,11 @@ export function reduceRendererState(state: RendererState, action: RendererAction
       const current = state.sessionHistory[key] ?? emptySessionHistory();
       const replace = action.replace === true || !Object.prototype.hasOwnProperty.call(state.sessionHistory, key);
       const records = replace ? incoming : mergeTimelineEntries(current.records, incoming, true);
+      const keepCursor = action.refresh === true && !replace;
       const nextHistory: SessionHistoryState = {
         records,
-        nextCursor: typeof source.next_cursor === "string" ? source.next_cursor : null,
-        hasMore: source.has_more === true,
+        nextCursor: keepCursor ? current.nextCursor : typeof source.next_cursor === "string" ? source.next_cursor : null,
+        hasMore: keepCursor ? current.hasMore : source.has_more === true,
         loading: false,
         error: null,
         revision: current.revision + 1,
@@ -1378,6 +1382,8 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     }
     case "composer_text":
       return { ...state, composerText: action.text };
+    case "session_result_seen":
+      return state;
     case "clear_timeline":
       return { ...state, timeline: [] };
     case "workspace_cleared":
@@ -1457,6 +1463,42 @@ export function reduceRendererState(state: RendererState, action: RendererAction
     case "settings_saving":
       return { ...state, settingsSaving: action.value };
   }
+}
+
+export function reduceRendererState(state: RendererState, action: RendererAction): RendererState {
+  const next = reduceRendererStateInner(state, action);
+  if (next === state && action.type !== "session_result_seen") return state;
+  const activity = { ...(next.sessionActivity ?? {}) };
+  if (action.type === "workspace_cleared") return { ...next, sessionActivity: {} };
+  const remember = (key: string, before: SessionRuntimeSnapshot | undefined, after: SessionRuntimeSnapshot) => {
+    const previous = activity[key] ?? { unread: false, revision: 0 };
+    const compact = after.compactionStatus;
+    const changed = compact.state !== "idle" && JSON.stringify(compact) !== JSON.stringify(previous.compaction);
+    const compactStarted = compact.state === "running" && (previous.compaction?.state !== "running" || previous.compaction.operation_id !== compact.operation_id);
+    const anchor = (before?.timeline ?? after.timeline).at(-1);
+    const compactFinished = changed && previous.compaction?.state === "running" && compact.state !== "running";
+    const replyFinished = action.type === "agent_event" && action.event.type === "turn_completed"
+      && action.event.turn_id === after.run?.turn_id
+      && after.turnStatus === "completed" && (before?.turnStatus !== "completed" || before.run?.turn_id !== after.run?.turn_id);
+    activity[key] = {
+      ...previous,
+      ...(changed ? { compaction: { ...compact } } : {}),
+      ...(compactStarted ? { compactionAnchor: anchor ? { id: anchor.id, messageId: anchor.messageId, kind: anchor.kind } : null } : {}),
+      ...(compactFinished || replyFinished ? { unread: true, revision: previous.revision + 1 } : {}),
+    };
+  };
+  for (const [key, snapshot] of Object.entries(next.sessionRuntime)) {
+    if (next.selectedSessionId && key === sessionRuntimeKey(next.selectedProjectKey, next.selectedSessionId)) continue;
+    if (snapshot !== state.sessionRuntime[key]) remember(key, state.sessionRuntime[key], snapshot);
+  }
+  if (next.selectedProjectKey && next.selectedSessionId) {
+    const key = sessionRuntimeKey(next.selectedProjectKey, next.selectedSessionId);
+    remember(key, state.selectedProjectKey === next.selectedProjectKey && state.selectedSessionId === next.selectedSessionId ? runtimeSnapshotFromState(state) : undefined, runtimeSnapshotFromState(next));
+  }
+  if (action.type === "session_result_seen" && activity[action.key]?.revision === action.revision) {
+    activity[action.key] = { ...activity[action.key], unread: false };
+  }
+  return { ...next, sessionActivity: activity, projects: next.projects.map(project => ({ ...project, sessions: project.sessions.map(session => ({ ...session, unread: activity[sessionRuntimeKey(project.projectKey, session.session_id)]?.unread ?? false })) })) };
 }
 
 // The Sidebar keeps this existing renderer composition entry because it is a

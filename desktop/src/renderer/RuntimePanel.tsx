@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { PanelModePreference } from "../desktop-api";
 import type { CompactionStatusProjection, ConfigurationView, ContextUsageProjection, ProviderRequestUsageProjection, RendererState } from "./state";
-import { CustomSelect } from "./CustomSelect";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon } from "./UiIcon";
 
@@ -16,8 +15,12 @@ export interface RuntimePanelProps {
   onRestoreToggleFocus?: () => void;
 }
 const RUNTIME_FOCUSABLE_SELECTOR = "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])";
-export function RuntimeLayoutSelect({ value, onChange, labels }: { value: PanelModePreference; onChange: (mode: PanelModePreference) => void; labels: Record<PanelModePreference, string> & { control: string } }) {
-  return <CustomSelect value={value} onChange={(next) => onChange(next as PanelModePreference)} label={labels.control} options={[{ value: "docked", label: labels.docked }, { value: "floating", label: labels.floating }, { value: "hidden", label: labels.hidden }]} />;
+export function RuntimeLayoutControls({ value, onChange, labels }: { value: PanelModePreference; onChange: (mode: PanelModePreference) => void; labels: Record<PanelModePreference, string> & { control: string } }) {
+  return <div className="runtime-layout-controls" role="group" aria-label={labels.control}>
+    <button type="button" className="icon-button" title={labels.hidden} aria-label={labels.hidden} aria-pressed={value === "hidden"} onClick={() => onChange("hidden")}><UiIcon name="minimize" /></button>
+    <button type="button" className="icon-button" title={labels.floating} aria-label={labels.floating} aria-pressed={value === "floating"} onClick={() => onChange("floating")}><UiIcon name="floating" /></button>
+    <button type="button" className="icon-button" title={labels.docked} aria-label={labels.docked} aria-pressed={value === "docked"} onClick={() => onChange("docked")}><UiIcon name="maximize" /></button>
+  </div>;
 }
 function usageLabel(usage: ContextUsageProjection | undefined, t: (key: TranslationKey) => string): string {
   if (!usage) return t("unavailable");
@@ -122,10 +125,9 @@ export function RuntimePanel({ state, onPanelModeChange, id = "runtime-panel", v
         <div>
           <h2><UiIcon name="runtime" />{stateLabel(state.runtimeState, t)}</h2>
         </div>
-        <label>
-          <span className="sr-only">{t("runtimeLayout")}</span>
-          <RuntimeLayoutSelect value={state.panelMode} onChange={onPanelModeChange} labels={{ control: t("runtimeLayout"), docked: t("docked"), floating: t("floating"), hidden: t("hidden") }} />
-        </label>
+        <div>
+          <RuntimeLayoutControls value={state.panelMode} onChange={onPanelModeChange} labels={{ control: t("runtimeLayout"), docked: t("docked"), floating: t("floating"), hidden: t("hidden") }} />
+        </div>
       </header>
       <div className="runtime-groups">
         <section className="runtime-group runtime-group--status" aria-labelledby={`${id}-status-heading`}>

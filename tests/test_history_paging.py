@@ -6,9 +6,16 @@ import json
 import pytest
 
 from uthcode.application.sessions import ApplicationSessionService
-from uthcode.core.history import TranscriptEntry, TranscriptKind
+from uthcode.core.history import (
+    ActiveCheckpoint,
+    SemanticEntry,
+    TranscriptEntry,
+    TranscriptKind,
+    timeline_record_from_dict,
+)
 from uthcode.core.provider import Message, ReasoningPart, TextPart
-from uthcode.integrations.session_files import SessionCorruptError, SessionFileStore
+from uthcode.integrations import session_files
+from uthcode.integrations.session_files import SessionCorruptError, SessionFileStore, SessionWriter
 
 
 def _append_units(store: SessionFileStore, session_id: str, count: int) -> None:
@@ -46,6 +53,145 @@ def _append_units(store: SessionFileStore, session_id: str, count: int) -> None:
         sequence += 1
     with store.open_writer(session_id, expected_project_key="project") as writer:
         writer.append_transcript(entries)
+
+
+def _append_units_to_writer(writer: SessionWriter, start_index: int, count: int) -> None:
+    """Append complete text units after the writer's current transcript tail."""
+
+    entries: list[TranscriptEntry] = []
+    sequence = writer.snapshot.transcript.last_sequence + 1
+    session_id = writer.session_id
+    for index in range(start_index, start_index + count):
+        unit_id = f"turn-{index:04d}"
+        entries.extend(
+            (
+                TranscriptEntry(
+                    session_id,
+                    sequence,
+                    unit_id,
+                    TranscriptKind.USER_MESSAGE,
+                    {
+                        "role": "user",
+                        "part": TextPart(f"message-{index:04d}").to_dict(),
+                    },
+                    semantic_unit_id=unit_id,
+                ),
+                TranscriptEntry(
+                    session_id,
+                    sequence + 1,
+                    unit_id,
+                    TranscriptKind.ASSISTANT_MESSAGE,
+                    {
+                        "role": "assistant",
+                        "part": TextPart(f"answer-{index:04d}").to_dict(),
+                    },
+                    semantic_unit_id=unit_id,
+                ),
+            )
+        )
+        sequence += 2
+    writer.append_transcript(entries)
+
+
+def _commit_compaction(writer: SessionWriter) -> ActiveCheckpoint:
+    end = writer.snapshot.transcript.last_sequence
+    turn = writer.snapshot.transcript.entries[-1].turn_id
+    summary = SemanticEntry(turn, "summary", (writer.snapshot.transcript.reference(end - 1, end),), session_id=writer.session_id)
+    outcome = writer.append_timeline_transaction((summary,), ActiveCheckpoint(turn, (turn,), session_id=writer.session_id))
+    assert outcome.timeline_appended
+    checkpoint = writer.snapshot.timeline.active_checkpoint
+    assert checkpoint is not None
+    return checkpoint
+
+
+def test_compaction_notices_restore_actual_position_and_stable_identity_after_restart(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        _append_units_to_writer(writer, 0, 1)
+        first = _commit_compaction(writer)
+        _append_units_to_writer(writer, 1, 1)
+        second = _commit_compaction(writer)
+        _append_units_to_writer(writer, 2, 1)
+    restarted = SessionFileStore(tmp_path)
+    service = ApplicationSessionService(storage_root=tmp_path, project_key="project", instruction_loader=None, store=restarted)
+    page = service.read_history_page("session-1")
+    assert [(record.kind, record.sequence) for record in page.records] == [
+        ("user", 1), ("assistant", 2), ("compaction", 2),
+        ("user", 3), ("assistant", 4), ("compaction", 4),
+        ("user", 5), ("assistant", 6),
+    ]
+    notices = [record for record in page.records if record.kind == "compaction"]
+    assert [record.message_id for record in notices] == [first.transaction_id, second.transaction_id]
+    assert all(record.text == "Context compacted" for record in notices)
+    assert page.to_dict() == service.read_history_page("session-1").to_dict()
+    snapshot = restarted.read_session("session-1")
+    assert len(snapshot.transcript.entries) == 6
+    assert all("Context compacted" not in str(entry.to_dict()) for entry in snapshot.transcript.entries)
+    assert timeline_record_from_dict(second.to_dict()).display_after_sequence == 4
+
+    collected = []
+    cursor = None
+    while True:
+        older = service.read_history_page("session-1", page_size=1, cursor=cursor)
+        collected.extend(older.records)
+        if not older.has_more:
+            break
+        cursor = older.next_cursor
+    assert len({record.record_id for record in collected}) == len(collected)
+    assert {record.record_id for record in collected} == {record.record_id for record in page.records}
+
+
+def test_history_does_not_publish_uncommitted_or_partial_checkpoint_notice(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        _append_units_to_writer(writer, 0, 1)
+        committed = _commit_compaction(writer)
+    path = store.session_path("session-1") / "timeline.jsonl"
+    pending = SemanticEntry("pending", "not committed", (), session_id="session-1", transaction_id="pending")
+    session_files._append_jsonl(path, [{"schema_version": 2, "kind": "timeline", "sequence": 3, "record": pending.to_dict()}])
+    with path.open("ab") as handle:
+        handle.write(b'{"schema_version":2,"kind":"timeline","sequence":4,"record":')
+    fresh = SessionFileStore(tmp_path)
+    page = fresh.read_history_page("session-1")
+    assert [record.transaction_id for record in page.compactions] == [committed.transaction_id]
+    with fresh.open_writer("session-1", expected_project_key="project") as writer:
+        _append_units_to_writer(writer, 1, 1)
+        later = _commit_compaction(writer)
+    assert [record.transaction_id for record in fresh.read_history_page("session-1").compactions] == [committed.transaction_id, later.transaction_id]
+
+
+def test_old_checkpoint_without_occurrence_position_is_not_guessed(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    _append_units(store, "session-1", 2)
+    summary = SemanticEntry("turn-0000", "old summary", (), session_id="session-1", transaction_id="old")
+    checkpoint = ActiveCheckpoint("turn-0000", ("turn-0000",), session_id="session-1", transaction_id="old")
+    session_files._append_jsonl(store.session_path("session-1") / "timeline.jsonl", [
+        {"schema_version": 2, "kind": "timeline", "sequence": index, "record": record.to_dict()}
+        for index, record in enumerate((summary, checkpoint), 1)
+    ])
+    assert store.read_history_page("session-1").compactions == ()
+
+
+def test_older_page_cursor_does_not_rescan_newer_timeline_bytes(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        _append_units_to_writer(writer, 0, 1)
+        _commit_compaction(writer)
+        _append_units_to_writer(writer, 1, 4)
+    latest = store.read_history_page("session-1", page_size=1)
+    baseline = store.read_history_page("session-1", page_size=1, cursor=latest.next_cursor)
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        summary = SemanticEntry("turn-0004", "newer summary " * 20_000, (writer.snapshot.transcript.reference(9, 10),), session_id="session-1")
+        writer.append_timeline_transaction((summary,), ActiveCheckpoint("turn-0004", ("turn-0004",), session_id="session-1"))
+    older = store.read_history_page("session-1", page_size=1, cursor=latest.next_cursor)
+    assert older.units == baseline.units
+    assert older.compactions == baseline.compactions
+    assert older.bytes_read <= baseline.bytes_read
+    assert older.bytes_read < (store.session_path("session-1") / "timeline.jsonl").stat().st_size
 
 
 def test_history_page_returns_recent_complete_units_and_opaque_cursor(tmp_path: Path) -> None:

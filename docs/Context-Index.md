@@ -90,6 +90,8 @@ status_values:
 
 F03 第 9 轮补充（2026-09-08）：修复 metadata catalog 丢失首条用户消息预览、侧栏退回 ID 的回归；保留手动标题优先与历史按需读取。luna/max 实施、terra/high 复审通过，验证详情与此前验收遗漏见 W07 Feedback。
 
+F03 第 10 轮补充（2026-09-08）：压缩完成提示按实际 Transcript 位置从 Timeline 恢复，切换和重启后保留；历史游标同时携带 Transcript/Timeline 字节边界，旧页不重复扫描新 Timeline。补齐项目行折叠、悬停信息、Runtime 图标、输入焦点和未读清除。terra/high 代码复审通过；本轮全量回归与交付状态见 W07 Feedback，不以此前轮次结果替代。
+
 ### `not_implemented`
 
 | Task | 任务包 | 当前路径 | 当前证据 |

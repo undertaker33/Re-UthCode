@@ -11,11 +11,11 @@ import {
 import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
-import { compactionStatusLabel, RuntimePanel } from "./RuntimePanel";
+import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type CompactionState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
+import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
 import {
   eventIdentity,
   hasCompleteTurnIdentity,
@@ -454,10 +454,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [hasOwner, send, waitForRuntimeLifecycleIdle]);
 
-  const loadHistoryPage = useCallback((projectKey: string, sessionId: string, cursor: string | null, replace: boolean): Promise<void> => {
+  const loadHistoryPage = useCallback((projectKey: string, sessionId: string, cursor: string | null, replace: boolean, refresh = false): Promise<void> => {
     const key = sessionRuntimeKey(projectKey, sessionId);
     const existing = historyRequestsRef.current.get(key);
-    if (existing) return existing.promise;
+    if (existing) return refresh
+      ? existing.promise.then(() => loadHistoryPage(projectKey, sessionId, cursor, replace, refresh))
+      : existing.promise;
     dispatch({ type: "history_page_loading", projectKey, sessionId });
     const token = Symbol("history-page");
     const request = (async () => {
@@ -466,7 +468,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         if (cursor !== null) params.cursor = cursor;
         const result = await send("history.page", params);
         if (historyRequestsRef.current.get(key)?.token !== token) return;
-        dispatch({ type: "history_page_loaded", projectKey, sessionId, result, replace });
+        dispatch({ type: "history_page_loaded", projectKey, sessionId, result, replace, refresh });
       } catch (error) {
         if (historyRequestsRef.current.get(key)?.token !== token) return;
         dispatch({ type: "history_page_error", projectKey, sessionId, message: safeErrorMessage(error, t("sessionCatalogUnavailable")) });
@@ -477,6 +479,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     historyRequestsRef.current.set(key, { token, promise: request });
     return request;
   }, [send, t]);
+
+  const historyPageLoaderRef = useRef(loadHistoryPage);
+  historyPageLoaderRef.current = loadHistoryPage;
 
   const beginSessionPresentation = useCallback((projectKey: string, sessionId: string) => {
     const previousProjectKey = stateRef.current.selectedProjectKey;
@@ -652,24 +657,6 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const terminal = event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled";
     if (terminal && (!hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId }) || !latestMatches())) return;
     dispatch({ type: "agent_event", event });
-    if (event.type === "compaction_operation" && event.state !== "running") {
-      const operationId = stringValue(event.operation_id);
-      const current = stateRef.current.compactionStatus;
-      const stateValue = event.state;
-      const terminalState = stateValue === "completed"
-        || stateValue === "no_change"
-        || stateValue === "failed"
-        || stateValue === "cancelled";
-      if (operationId && terminalState && current.operation_id === operationId) {
-        const status = {
-          state: stateValue as CompactionState,
-          trigger: "manual" as const,
-          changed: event.changed === true ? true : event.changed === false ? false : null,
-          reason: stringValue(event.reason),
-        };
-        dispatch({ type: "notice", text: compactionStatusLabel(status, t) });
-      }
-    }
     if (terminal) {
       // The terminal event is published before the Bridge releases its
       // active handle. Keep one cancellable, backoff poll alive until the
@@ -1561,6 +1548,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     runtimeToggleRef.current?.focus();
   }, [runtimeVisible]);
   const runtimeToggleLabel = runtimeVisible ? t("closeRuntime") : t("openRuntime");
+  const activityKey = sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId ?? "");
+  const activity = state.sessionActivity?.[activityKey];
+  const displayedCompaction = state.compactionStatus.state === "running" ? state.compactionStatus : activity?.compaction ?? state.compactionStatus;
+  useEffect(() => {
+    if (state.selectedProjectKey && state.selectedSessionId && state.compactionStatus.changed === true && state.compactionStatus.state !== "running") {
+      void historyPageLoaderRef.current(state.selectedProjectKey, state.selectedSessionId, null, false, true);
+    }
+  }, [state.selectedProjectKey, state.selectedSessionId, state.compactionStatus.state, state.compactionStatus.changed, state.compactionStatus.operation_id]);
+  const markLatestSeen = useCallback(() => {
+    if (activity?.unread) dispatch({ type: "session_result_seen", key: activityKey, revision: activity.revision });
+  }, [activityKey, activity?.unread, activity?.revision]);
   const visibleHistory = state.selectedProjectKey && state.selectedSessionId
     ? state.sessionHistory[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)]
     : undefined;
@@ -1578,7 +1576,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         </div>
         <div className="conversation-actions">
           {!state.focusMode && <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>}
-          <button ref={focusModeToggleRef} type="button" className="icon-button focus-mode-toggle" title={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-label={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-pressed={state.focusMode} onClick={() => setFocusMode(!state.focusMode)}><UiIcon name="panel" /><span className="sr-only">{state.focusMode ? t("exitFocusMode") : t("enterFocusMode")}</span></button>
+          <button ref={focusModeToggleRef} type="button" className="icon-button focus-mode-toggle" title={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-label={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-pressed={state.focusMode} onClick={() => setFocusMode(!state.focusMode)}><UiIcon name="focus" /><span className="sr-only">{state.focusMode ? t("exitFocusMode") : t("enterFocusMode")}</span></button>
         </div>
       </header>
       <ChatTimeline
@@ -1586,7 +1584,21 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         // TodoWrite is anchored to the composer; keep the timeline focused on
         // conversation and durable replay records.
         todo={[]}
-        notice={state.notice}
+        notice={[...new Set([
+          state.notice,
+          state.runtimeState === "restarting" ? t("runtimeRestarting") : null,
+          state.terminalStatusPending ? t("terminalStatusPending") : null,
+        ].filter(Boolean))].join(" · ") || null}
+        onLatestSeen={markLatestSeen}
+        compactionAnchor={activity?.compactionAnchor}
+        compactionRunning={displayedCompaction.state === "running"}
+        compactionCompleted={displayedCompaction.state === "completed"}
+        compactionNotice={displayedCompaction.state === "running"
+          ? t(displayedCompaction.trigger === "manual" ? "compactingManually" : "compactingAutomatically")
+          : displayedCompaction.state === "completed" ? t("contextCompacted")
+          : displayedCompaction.state === "no_change" ? t("contextCompactionUnneeded")
+          : displayedCompaction.state === "cancelled" ? t("contextCompactionCancelled")
+          : displayedCompaction.state === "failed" ? t("contextCompactionFailed") : null}
         runtimeError={state.runtimeError}
         runtimeErrorVisible={runtimeVisible}
         onOpenSettings={state.runtimeError ? () => void loadSettings() : undefined}
@@ -1619,7 +1631,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}`} style={shellStyle}>
-      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onOpenProjectSession={(project) => void openProjectPath(project.path)} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
       {state.view === "chat" && !state.focusMode && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
       {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}

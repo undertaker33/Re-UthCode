@@ -1,10 +1,14 @@
 import type { ReactNode } from "react";
 
-export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off";
+export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off" | "minimize" | "floating" | "maximize" | "focus";
 
 export function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
     plus: <path d="M8 3.25v9.5M3.25 8h9.5" />,
+    minimize: <path d="M4 11h8" />,
+    floating: <><rect x="5" y="3" width="8" height="8" rx="1" /><path d="M10 13H3V6" /></>,
+    maximize: <rect x="3" y="3" width="10" height="10" rx="1" />,
+    focus: <path d="M6 3H3v3M10 3h3v3M3 10v3h3M13 10v3h-3" />,
     folder: <path d="M2.75 5.25h10.5v7H2.75zM3.25 5.25V3.5h3.2l1.3 1.75" />,
     chevron: <path d="m5 6.25 3 3.25 3-3.25" />,
     pin: <path d="m5.1 3.25 5.8 5.8M9.75 2.75l3.5 3.5-2.2 1.2-2.5 2.5-1.2 2.2-3.5-3.5 2.2-1.2 2.5-2.5zM5.65 10.35l-2.9 2.9" />,

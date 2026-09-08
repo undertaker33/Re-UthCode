@@ -385,6 +385,7 @@ class ActiveCheckpoint:
     session_id: str | None = None
     schema_version: int = TIMELINE_SCHEMA_VERSION
     transaction_id: str | None = field(default=None, compare=False)
+    display_after_sequence: int | None = field(default=None, compare=False)
     record_type: str = field(init=False, default="active_checkpoint")
 
     def __post_init__(self) -> None:
@@ -392,10 +393,16 @@ class ActiveCheckpoint:
             raise TimelineError("ActiveCheckpoint is invalid")
         if self.transaction_id is not None and not self.transaction_id.strip():
             raise TimelineError("ActiveCheckpoint transaction_id is invalid")
+        if self.display_after_sequence is not None and (
+            isinstance(self.display_after_sequence, bool)
+            or not isinstance(self.display_after_sequence, int)
+            or self.display_after_sequence < 1
+        ):
+            raise TimelineError("ActiveCheckpoint display position is invalid")
         object.__setattr__(self, "active_turns", tuple(self.active_turns))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": self.schema_version, "record_type": self.record_type, "turn_id": self.turn_id, "active_turns": list(self.active_turns), **({"session_id": self.session_id} if self.session_id else {}), **({"transaction_id": self.transaction_id} if self.transaction_id else {})}
+        return {"schema_version": self.schema_version, "record_type": self.record_type, "turn_id": self.turn_id, "active_turns": list(self.active_turns), **({"session_id": self.session_id} if self.session_id else {}), **({"transaction_id": self.transaction_id} if self.transaction_id else {}), **({"display_after_sequence": self.display_after_sequence} if self.display_after_sequence is not None else {})}
 
 
 TimelineRecord = SemanticEntry | EpochMacroSummary | ActiveCheckpoint
@@ -412,7 +419,7 @@ def timeline_record_from_dict(data: Mapping[str, Any]) -> TimelineRecord:
     if record_type == "epoch_macro_summary":
         return EpochMacroSummary(summary=str(data["summary"]), refs=_refs(data.get("refs", ())), coverage=tuple(data.get("coverage", ())), **common)
     if record_type == "active_checkpoint":
-        return ActiveCheckpoint(active_turns=tuple(data.get("active_turns", ())), **common)
+        return ActiveCheckpoint(active_turns=tuple(data.get("active_turns", ())), display_after_sequence=data.get("display_after_sequence"), **common)
     raise TimelineError("unknown Timeline record type")
 
 

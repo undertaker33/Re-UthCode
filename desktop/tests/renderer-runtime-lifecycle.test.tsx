@@ -54,7 +54,7 @@ async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement,
   }
 }
 
-test("T05 terminal convergence retries transient failures with backoff past one wait window", async () => {
+test("T05 terminal convergence retries transient failures with backoff past one wait window", async (context) => {
   await withRendererDom(async (_dom, container, root) => {
     const responses = ["error", "active", "active", "active", "active", "idle"] as const;
     let statusCalls = 0;
@@ -80,10 +80,14 @@ test("T05 terminal convergence retries transient failures with backoff past one 
     act(() => { root.render(<App initialState={state} api={api} />); });
     const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
     await act(async () => { await tick(); await tick(); });
-    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-retry", turn_id: "turn-retry", final_text: "done" }); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 550)); });
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    await act(async () => { eventListener?.({ type: "turn_completed", run_id: "run-retry", turn_id: "turn-retry", final_text: "done" }); });
+    for (const delay of [25, 50, 100, 200]) {
+      await act(async () => { context.mock.timers.tick(delay); });
+    }
+    assert.equal(statusCalls, 5);
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, true, "transient errors and active status keep the Composer locked beyond the old timeout window");
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    await act(async () => { context.mock.timers.tick(400); });
     assert.equal(statusCalls, 6, "the same background poll survives five backoff intervals before the false authority");
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "the recovered authoritative false status eventually releases the Composer");
   });

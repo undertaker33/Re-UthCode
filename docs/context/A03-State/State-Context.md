@@ -14,6 +14,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Transcript 新写入按单个 typed Message part 保存角色、连续 identity 和 part 顺序；`ReasoningPart` 与正式 `TextPart` 可独立重建，reasoning 永不成为 final 文本。旧 v3 full-message envelope 只读兼容，不原地迁移。
 - `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放包含 user、steering、reasoning、formal assistant、脱敏 Tool 终态，以及失败 Turn 中已公开的 reasoning/partial assistant 与稳定 `TerminationReason`/`FailureReason`。失败内容只用于 replay，不会作为有效 assistant 响应回灌 Provider；回放不包含 raw ToolResult、SDK exception、native payload、秘密或 pending interaction。
 - `[FACT]` `ApplicationSessionService.read_history_page` 复用同一安全 replay 投影，默认读取最近 30 个完整 semantic unit，再通过不透明游标读取更早页。`SessionFileStore` 从 Transcript JSONL 尾部按块逆读，不先加载完整 Transcript，也不创建持久索引或缓存数据库；分页不拆开同一单元内的 ToolCall/ToolResult，不改变模型 Context 或完整 Session 恢复语义。
+- `[FACT]` 新提交的 Timeline checkpoint 同时保存提交时的 Transcript 序列位置。历史页按块逆读 Timeline，投影落在本页范围内的已提交压缩提示，稳定身份来自 transaction；提示排在该序列之后，重启可恢复，不进入 Provider 消息。不透明游标同时保留 Transcript 与 Timeline 的反读字节边界，旧页不重复扫描较新 Timeline。旧 checkpoint 没有发生位置时不按压缩覆盖范围猜测插入位置；未提交派生记录不产生成功提示。
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。

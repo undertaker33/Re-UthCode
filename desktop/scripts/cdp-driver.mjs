@@ -1110,6 +1110,13 @@ async function setSelect(session, label, value) {
       hidden: ["hidden", "隐藏"],
     };
     const labels = new Set([wantedValue.toLowerCase(), ...(aliases[wantedValue] ?? [])].map((item) => item.toLowerCase()));
+    if (normalizedLabelKey === "runtime panel layout") {
+      const group = [...document.querySelectorAll('.runtime-layout-controls[role="group"]')].find((item) => normalizedLabels.has((item.getAttribute("aria-label") || "").trim().toLowerCase()));
+      const button = [...(group?.querySelectorAll("button") ?? [])].find((item) => labels.has((item.getAttribute("aria-label") || "").trim().toLowerCase()));
+      if (!button) return false;
+      button.click();
+      return true;
+    }
     const trigger = [...document.querySelectorAll(".custom-select__trigger")].find((item) => normalizedLabels.has((item.getAttribute("aria-label") || "").trim().toLowerCase()) || normalizedLabels.has((item.title || "").trim().toLowerCase()) || item.id === wantedLabel);
     if (!trigger) return false;
     trigger.click();
