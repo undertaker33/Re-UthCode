@@ -16,7 +16,8 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`/可选 `display_name`、Model `remote_id`/`display_name`；Provider 显示名不参与稳定 ID 或 Model 引用。`/model` 原子写回只修改用户级 `default_model`。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
 - `[FACT]` Session 只在真实请求或显式 Session 命令需要时打开：`exec <prompt>` 与 TUI 首条普通输入调用 `ensure_session()`，`/new` 显式创建，`/resume` 直接锁定并恢复目标；TUI 启动、退出、help/status 和打开/关闭 Picker 不创建 Session。Session v3 只持久化 metadata（schema 3）、Transcript、Timeline、Tool Result、writer lock 与 Instruction State；metadata 还可保存 Session 自身的 `model_ref`。v1/v2 明确 incompatible。terminal Turn 的 History、Tool Result ref 与 Instruction State 由 Application 提交并在退出时释放 writer。History 的 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State sync 分阶段进入安全 diagnostics，Run cursor 只按可判定 durable 的消息推进；append 后异常先做结构化 identity reconciliation，无法判定时 active Session writer quarantine，新的 Run/语义写入均 fail closed，必须 close 后 fresh writer 验证/恢复才可继续；真正未落盘的 pending batch 才保留原始 Session/Turn identity 并在后续 terminal 边界按 FIFO 重试。
 - `[FACT]` `ApplicationContextService` 是正式请求组合入口：Context Snapshot 的 Instruction Plane、Conversation Plane、default/configured/provider/effective budget provenance 和 `GenerationRequest.tools` 进入同一 Provider-independent DTO；effective input 为 `256_000` 时，该正式 resolver 使用 Eval 选定的 `balanced-208k` profile，其它窗口保留有界自适应派生并服从 configured/provider 收紧；Integration 不重新编译 Context。
-- `[FACT]` `/compact` 已通过 Command/Application/Session 路径调用同一 Context orchestrator；低 pressure 也可手动执行，无完整候选或无 reduction value 时返回成功 no-op。L4/L5 与 overflow recovery 使用 tool-free、bounded、Hard-gated 的 Compact request；ordinary overflow 最多 forced reduction/rebuild/re-gate/retry 一次。
+- `[FACT]` `/compact` 已通过 Command/Application/Session 路径调用同一 Context orchestrator；低 pressure 也可手动执行，无完整候选或候选未降低普通请求 Working Context 时返回成功 no-op。候选验证重建提交前后的普通请求，两侧同为 exact 才比较 Provider count，否则统一用 local accounting；不以摘要自身缩短或压缩请求 token 数作为额外成功门槛。L4/L5 与 overflow recovery 使用 tool-free、bounded、Hard-gated 的 Compact request；ordinary overflow 最多 forced reduction/rebuild/re-gate/retry 一次。
+- `[FACT]` `ApplicationSessionService` 统一持有 Session/History 生命周期；Transcript append、恢复、分页、HistoryRead 引用读取、Tool Result externalization 与 Timeline commit 复用这一权威入口，已删除只作转发的 `ApplicationHistoryService`。
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息，但直到真实普通输入或显式 Session 命令才创建持久 Session；`uthcode exec` 每次创建一个 Run 和一个 Turn，并在真实 prompt 前惰性 ensure。
@@ -140,15 +141,19 @@ Desktop Session A active
 
 同一 Session 的 `AgentRun` 仍只允许一个 active Turn；可见 Session 的 Steering、Pause、Resume 和 Cancel 始终落到该 Session 的同一 handle。rename/move 在任何已保存 runtime 有 active Turn 时不会越过 Bridge 的 Session 边界。
 
-## Application 职责索引
+### 手动压缩编排
 
 `compact_session(cancellation=...)` 接受调用方取消控制；Provider 模型预检和计数等待可被中断，取消时清理子任务。手动候选始终归属发起时的 Session；Timeline 未知提交核对需要重开 writer 时，后续 epoch 更新为恢复后的 owner。成功、无需变更、失败、取消与是否已有有效提交分别表达，不自动重试 Provider，也不跨进程恢复旧压缩请求。
+
+## Application 职责索引
 
 | 主题 | 文件 | 关键符号/检索词 |
 | --- | --- | --- |
 | Composition root | `src/uthcode/application/bootstrap.py` | `load_effective_config`, `create_application` |
 | Application 门面 | `src/uthcode/application/generation.py` | `UthCodeApplication`, `create_run`, `_start_agent_turn`, `select_model`, `status` |
 | Run/Turn 驱动 | `src/uthcode/application/runs.py` | `AgentRun`, `_TurnDriver`, `TurnHandle` |
+| Session / History 生命周期 | `src/uthcode/application/sessions.py` | `ApplicationSessionService`, `read_history_page`, `list_catalog_metadata`, `ApplicationSession.append_timeline_transaction` |
+| Context / Compact 编排 | `src/uthcode/application/context.py` + `src/uthcode/application/compaction.py` + `src/uthcode/application/generation.py` | `ApplicationContextService`, `prepare_compaction_request_async`, `compact_session` |
 | Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService` |
 | Runtime 环境 | `src/uthcode/application/runtime_context.py` | `ApplicationRuntimeContext` |
 | 配置公共模型 | `src/uthcode/application/configuration.py` | `EffectiveConfig`, `LaunchOptions` |
@@ -215,4 +220,5 @@ Subagent/Multi-Agent     -> 当前不存在；需先定义新需求与 Applicati
 conda activate re-uthcode
 python -m pytest tests/test_application.py tests/test_application_runtime.py tests/test_application_runs.py tests/test_cli.py tests/test_command_dispatcher.py -q
 python -m pytest tests/test_tui.py tests/test_architecture_boundaries.py -q
+python -m pytest tests/test_history_paging.py tests/test_history_prepare_lifecycle.py tests/test_t09_1_context_protocol_e2e.py -q
 ```
