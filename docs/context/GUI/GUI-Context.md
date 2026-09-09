@@ -1,5 +1,7 @@
 # Windows Desktop GUI（当前代码上下文）
 
+侧栏历史容器仅允许纵向滚动，禁止横向滚动；会话按钮的 flex 收缩规则跨过悬停信息包装，长标题省略而不挤出菜单按钮。
+
 ```text
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md

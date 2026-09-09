@@ -326,3 +326,11 @@ Desktop `session.resume` 不再返回完整 replay；最近页独立显示，冷
 - terra/high 复审 PASS；最终 Python `1520 passed, 3 skipped in 269.22s`，exit 0。Desktop 首次 `215 passed, 1 failed`，既有真实时钟退避测试多触发一次请求；改为可控时钟精确推进各间隔，保留请求数和 Composer 锁定/解锁断言，未改生产轮询。该测试文件 `10 passed`，terra/high 复审 PASS；最终 Desktop `216 passed, 0 failed in 73634.6749ms`，typecheck exit 0。
 - 标准 `conda run --no-capture-output -n re-uthcode npm run package` exit 0，Runtime smoke 与 Forge package 通过。packaged commands 首次因驱动仍寻找旧 Runtime 下拉框失败；驱动改为在对应本地化布局组内点击图标按钮，terra/high 复审 PASS，`node --check` 与 CDP 隔离测试 `11 passed`。同标准包英文报告 `f03-ui10-commands-green`（runId `bd91e1e6-f536-422c-ba8f-df8f369cfca2`）、中文报告 `f03-ui10-commands-zh`（runId `6255a852-caca-487a-9433-a85d5f967160`）均 PASS。中文参数应为 `zh`，一次误传 `zh-CN` 在启动前被拒绝，不计为验收。
 - 本轮只执行上述 packaged commands，不宣称完整视觉矩阵或真实 Provider 验证通过；持久提示的重启与顺序由定向 Python/Renderer 回归覆盖，真实会话体验仍待用户复验。未执行 make，安装器未更新。UTF-8 guard 检查 5 份文档通过，无编码修复；不提交 `.workbuddy/` 或 `临时目录/`。
+
+## 返工第 11 轮：侧栏横向溢出与安装器（2026-09-09）
+
+- 悬停包装使会话按钮不再是菜单容器的直接子元素，原 flex 收缩规则失效，按钮全宽叠加菜单宽度撑出横向滚动条。修正后代选择器并设置侧栏 `overflow-x: hidden`、`overflow-y: auto`；保持标题省略、菜单及纵向滚动。
+- `npm run typecheck` exit 0；Renderer 定向 `101 passed`。`conda run --no-capture-output -n re-uthcode npm run make` exit 0，完成 Runtime smoke、标准 package 和 Squirrel 安装器。新安装器为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`，175720960 bytes；未运行安装器安装流程。
+- 新包隔离英文 sessions 验收 PASS，runId `d8799702-9405-411d-a7ab-b714e9c2b25d`，报告 `desktop/dist/ui-acceptance/f03-sidebar-sessions`；检查六会话展开截图未见横向滚动条。未调用真实 Provider，未重跑完整 Python 或全套视觉矩阵。
+- 清点后只计划删除可再生成的 `.webpack`、`packaging/.build` 和空的误生成 `desktop/desktop`；删除命令被执行环境策略拒绝，未删除文件，不换方式绕过。依赖、源码、历史验收报告和无关目录保留，清理项未完成。
+- UTF-8 guard 检查两份文档通过，无编码修复；不修改冻结任务书、不归档 F03。
