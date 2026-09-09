@@ -15,6 +15,8 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放包含 user、steering、reasoning、formal assistant、脱敏 Tool 终态，以及失败 Turn 中已公开的 reasoning/partial assistant 与稳定 `TerminationReason`/`FailureReason`。失败内容只用于 replay，不会作为有效 assistant 响应回灌 Provider；回放不包含 raw ToolResult、SDK exception、native payload、秘密或 pending interaction。
 - `[FACT]` `ApplicationSessionService.read_history_page` 复用同一安全 replay 投影，默认读取最近 30 个完整 semantic unit，再通过不透明游标读取更早页。`SessionFileStore` 从 Transcript JSONL 尾部按块逆读，不先加载完整 Transcript，也不创建持久索引或缓存数据库；分页不拆开同一单元内的 ToolCall/ToolResult，不改变模型 Context 或完整 Session 恢复语义。
 - `[FACT]` 新提交的 Timeline checkpoint 同时保存提交时的 Transcript 序列位置。历史页按块逆读 Timeline，投影落在本页范围内的已提交压缩提示，稳定身份来自 transaction；提示排在该序列之后，重启可恢复，不进入 Provider 消息。不透明游标同时保留 Transcript 与 Timeline 的反读字节边界，旧页不重复扫描较新 Timeline。旧 checkpoint 没有发生位置时不按压缩覆盖范围猜测插入位置；未提交派生记录不产生成功提示。
+- `[FACT]` Session catalog 通过 metadata 与 Transcript 首条 user entry 生成导航行，不加载完整 replay；预览规范化空白并限制为 160 字符，手动标题优先，空 Session 保持空预览。历史增长不会要求为获取首条消息扫描后续内容。
+- `[FACT]` History 的读写、恢复、Tool Result externalization 与 Timeline commit 统一由 `ApplicationSessionService` 承担；已移除仅转发调用的 `ApplicationHistoryService`，不再维护平行 History facade。
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
@@ -22,7 +24,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal Turn 边界把新增 Message 转换为 Transcript，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、Transcript、Timeline、Context 与 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
 - `[FACT]` `ApplicationContextService` 从 Prompt/AGENTS/Transcript/Timeline/Application runtime facts/Tool Schema 组成动态 Context Snapshot；default/configured/provider/effective limits、tightened sources、Pressure/Preflight Count、Auto/Hard Gate 与每次 request 的最终 accounting 一起记录安全诊断，Provider cache usage 只在有明确 usage 字段时标记 available。effective input 为 `256_000` 时，冻结的 `ContextBudget` 使用已采纳的 `balanced-208k` 工程 profile（High `208_000`、retained/Low `96_000`、working headroom `48_000`、compaction `64_000/4_096`、count allowance `8_192`）；其它窗口继续使用有界自适应派生并服从 configured/provider 收紧。Active Turn 使用冻结的 ContextBudget，Instruction scope/content 变化才创建新的 instruction epoch。
 - `[FACT]` Context measurement 明确区分 `exact`、`estimate` 与 `unavailable`：Provider preflight count 成功时保留 exact 来源，失败时只使用标注为 local 的保守估计，首次尚无可编译请求时保持 unavailable；prospective request 只返回候选事实，不发布临时 Context 状态。Provider cache read/write 只有 usage 中存在明确字段时才变为 available，默认 `0` 不会伪装成测量值。
-- `[FACT]` L4/L5、manual `/compact` 和 ordinary overflow recovery 复用同一 Application Context orchestrator 与同一 tool-free、Hard-gated Provider path。Multi-Turn response 必须逐项携带与请求完全匹配的 `turn_id`/原始 `refs` coverage；no-reduction 直接返回受控失败而不 append。Oversized oldest complete Turn 只在进程内做 bounded subpass，成功仍只提交一个完整 Turn Fine，失败/取消/invalid 不产生 candidate；manual 与 automatic 路径共享这些规则。成功 transaction 先写 Fine/Macro，最后写 `ActiveCheckpoint`；无 safe epoch 和 unknown durability 不产生伪提交。
+- `[FACT]` L4/L5、manual `/compact` 和 ordinary overflow recovery 复用同一 Application Context orchestrator 与同一 tool-free、Hard-gated Provider path。Multi-Turn response 必须逐项携带与请求完全匹配的 `turn_id`/原始 `refs` coverage。正式 Application 路径以候选前后重新组合的普通 Provider request 判断 Working Context 是否严格下降；两侧均为 exact 时使用 Provider count，否则统一使用 local accounting，不混比来源。摘要长度或压缩请求自身用量不能独立决定成功；不下降时不 append，手动命令可投影为成功 no-op。Oversized oldest complete Turn 只在进程内做 bounded subpass，成功仍只提交一个完整 Turn Fine，失败/取消/invalid 不产生 candidate；manual 与 automatic 路径共享这些规则。成功 transaction 先写 Fine/Macro，最后写 `ActiveCheckpoint`；无 safe epoch 和 unknown durability 不产生伪提交。
 - `[FACT]` 当前 `RunState` 已持有 `BehaviorMode`、可选 `PlanState`、replace-all `TaskState` 和 one-shot `RuntimeFeedback`；新 Turn 保留 conversation 并重置这些当前 Turn 控制事实。
 - `[FACT]` Plan revision/approval、TodoWrite、CompletionBlocked 与同一 Turn Steering 均通过 Core 状态和事件协议闭合；Steering 追加一条真实 user message，不创建第二个 Turn。
 - `[FACT]` `PlanContentDelta` 是公开的、按 Run/Turn/iteration/tool-call identity 归属的自然语言增量事件；Renderer 只消费解码后的 text，随后由 `PlanProposed` 封口并进入 typed Plan Review，不接触 Provider raw JSON 或 `arguments_delta`。
@@ -41,15 +43,21 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 | 公开事件 | `src/uthcode/core/agent_events.py` | `AgentEvent`, `agent_event_from_dict`, `agent_event_from_json` |
 | 暂停事实 | `src/uthcode/core/interaction.py` | `PauseRequest`, typed `PauseResponse` |
 | Run 生命周期 | `src/uthcode/application/runs.py` | `AgentRun._state`, `_active_turn`, `_TurnDriver`, `TurnHandle` |
+| Session / History 权威入口 | `src/uthcode/application/sessions.py` | `ApplicationSessionService`, `read_history_page`, `list_catalog_metadata`, `ApplicationSession.append_timeline_transaction` |
+| Context 编译与状态 | `src/uthcode/application/context.py` + `src/uthcode/core/context.py` | `ApplicationContextService`, `ContextBudget`, `stable_transcript_for_compaction` |
+| 压缩候选与提交编排 | `src/uthcode/core/compaction.py` + `src/uthcode/application/compaction.py` + `src/uthcode/application/generation.py` | `ContextCompactor`, `compaction_input_payload`, `compact_session`, `validate_candidate` |
+| JSONL 存储与分页 | `src/uthcode/integrations/session_files.py` | `SessionFileStore`, `SessionHistorySlice`, `read_first_user_entry` |
 | Application 环境快照 | `src/uthcode/application/runtime_context.py` | `ApplicationRuntimeContext` |
 | 配置模型 | `src/uthcode/application/configuration.py` | `EffectiveConfig`, `ProviderProfile`, `ModelProfile`, `ConfigSource` |
 | TUI 投影状态 | `src/uthcode/interfaces/tui/` | `rendering.py`, `interaction.py`, `state.py` |
 
-## 状态所有权矩阵
+## 压缩取消与提交恢复
 
 手动压缩接收调用方的取消控制，覆盖模型预检、生成、候选校验与提交边界。`compaction_status` 将终态与 `changed`、安全 `reason` 分开：取消或失败仍可能已提交有效 epoch，不能以终态回滚或否认已提交内容。外层任务取消也保留本次有效提交标记。自动压缩保留原 Turn 生命周期，共享取消和提交正确性处理。
 
 Timeline append 暂不明确时，Application 可关闭 quarantined writer 并通过现有 Session 恢复入口重新核对落盘记录；确认候选已提交后使用新 writer 继续后续 epoch，不重复追加。仍不能确认的结果报告受控失败，但恢复成功的 writer 可供下一次操作使用；持续 I/O 故障或真实损坏不伪报恢复成功。该路径不新增持久 Compact Job，不改变 Transcript 未知提交的既有处理语义。
+
+## 状态所有权矩阵
 
 | 事实 | 唯一权威所有者 | 生命周期 | 对外暴露 |
 | --- | --- | --- | --- |
@@ -198,4 +206,6 @@ Todo/Plan/Steering        -> core/planning.py + core/agent.py + application/runs
 conda activate re-uthcode
 python -m pytest tests/test_application_runs.py tests/test_agent_events.py tests/test_agent_interaction.py -q
 python -m pytest tests/test_application_runtime.py tests/test_configuration.py tests/test_config_loader_integration.py -q
+python -m pytest tests/test_context_budget_gate.py tests/test_context_compaction.py tests/test_t09_1_context_protocol_e2e.py -q
+python -m pytest tests/test_history_contract.py tests/test_history_paging.py tests/test_session_authority.py tests/test_compaction_process_recovery.py -q
 ```

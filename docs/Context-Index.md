@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-09-07
+snapshot_date: 2026-09-09
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -52,7 +52,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-09-07
+status_snapshot: 2026-09-09
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -86,11 +86,9 @@ status_values:
 
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
-| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | W01～W07 Feedback 齐全。第 7 轮历史尾部分页与冷准备已合并 PR #101；第 8 轮补齐 Session 手动压缩操作、取消/部分提交/恢复、跨会话导航和安全终态显示。luna/max 实施、terra/high 复审通过；最终 Python `1512 passed, 3 skipped`，Desktop `209 passed`，typecheck 通过。标准 package 已更新，中英文 packaged commands 隔离验证通过；未 make，不宣称安装器更新。未修改任务书、未归档；用户最终复验及真实 Provider 验证仍待进行，详见 W07 Feedback。 |
+| F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | 截至 PR #105（`1218e31`），W01～W07 Feedback 齐全，冻结 Checklist 全部勾选，仍未归档。第 10 轮记录最终 Python `1520 passed, 3 skipped`、Desktop `216 passed`、typecheck 及中英文 packaged commands 通过；第 11 轮侧栏修复后记录 Renderer 定向 `101 passed`、typecheck、标准 package/make 与隔离英文 sessions 通过，安装器已生成但未执行安装流程。本次文档同步未重跑上述产品验证；真实 Provider、完整视觉矩阵和用户最终复验仍未完成，详见 W07 Feedback。 |
 
-F03 第 9 轮补充（2026-09-08）：修复 metadata catalog 丢失首条用户消息预览、侧栏退回 ID 的回归；保留手动标题优先与历史按需读取。luna/max 实施、terra/high 复审通过，验证详情与此前验收遗漏见 W07 Feedback。
-
-F03 第 10 轮补充（2026-09-08）：压缩完成提示按实际 Transcript 位置从 Timeline 恢复，切换和重启后保留；历史游标同时携带 Transcript/Timeline 字节边界，旧页不重复扫描新 Timeline。补齐项目行折叠、悬停信息、Runtime 图标、输入焦点和未读清除。terra/high 代码复审通过；本轮全量回归与交付状态见 W07 Feedback，不以此前轮次结果替代。
+F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷 Session 准备与首屏显示解耦；目录按需读取首条用户消息预览，手动标题优先。手动压缩按 Session 后台执行、支持取消并保留有效 epoch；完成提示按提交时 Transcript 位置从 Timeline 恢复，分页游标保留 Transcript/Timeline 字节边界。Desktop 支持项目整行折叠、悬停信息、Runtime 布局图标、完成后输入焦点恢复与尾部已读清除，侧栏保持纵向滚动并抑制横向溢出。
 
 ### `not_implemented`
 

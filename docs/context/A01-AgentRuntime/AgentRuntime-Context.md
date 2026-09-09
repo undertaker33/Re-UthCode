@@ -36,7 +36,8 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 | ReAct Runtime | `src/uthcode/core/agent.py` | `AgentLoop`, `AgentTurnExecution`, `AgentExecutionSegment`, `AgentLoopConfig` |
 | Application Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService`, `_SecretRedactor`, `describe_tool_call`, `_create_agent_loop` |
 | Turn 依赖快照与 Prompt 注入 | `src/uthcode/application/generation.py` | `_start_agent_turn`, `_prepare_request` |
-| Context/History 组合 | `src/uthcode/application/context.py`, `src/uthcode/application/history.py` | `compose_generation_request`、内部 Message→Transcript 转换 |
+| Context 与请求准备 | `src/uthcode/application/context.py`, `src/uthcode/application/request_preparation.py` | `compose_generation_request`、Provider limits/count 与请求安全检查；Message→Transcript 转换直接复用 `core/history.py:transcript_entries_from_message` |
+| 压缩协议与 Provider 请求 | `src/uthcode/core/compaction.py`, `src/uthcode/application/compaction.py` | `ContextCompactor`、严格摘要解析、有界分批与 tool-free summarizer；`core/context.py` 保留 budget/compiler/gate |
 | Session 结果与 History 边界 | `src/uthcode/application/sessions.py`, `src/uthcode/integrations/session_files.py` | `ApplicationSession`, `SessionWriter`, `ToolResultRead` |
 | Provider 适配 | `src/uthcode/integrations/providers/` | `anthropic.py`, `openai_responses.py`, `openai_compat.py`, `fake.py`, `factory.py` |
 | Tool 适配 | `src/uthcode/integrations/tools/` | `factory.py`, `file_tools.py`, `search_tools.py`, `process_tools.py`, `workspace.py` |
@@ -111,7 +112,7 @@ tool:
 - `[ABSENT]` 并行 Tool Batch、DAG、通用工作流引擎。
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
-- `[FACT]` Context Compiler、Transcript/Timeline、Compactor 有界分批/校验机制与 Session persistence 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产 tool-free L4/L5 summarizer 与 manual `/compact` 共用 bounded request，Timeline commit 采用 derived records first、`ActiveCheckpoint` last；overflow recovery 最多 retry 一次。
+- `[FACT]` Context Compiler、Transcript/Timeline、Compactor 有界分批/校验机制与 Session persistence 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产 tool-free L4/L5 summarizer 与 manual `/compact` 共用 bounded request，Timeline commit 采用 derived records first、`ActiveCheckpoint` last；overflow recovery 最多 retry 一次。提交前以同源 measurement 比较 compact 前后的 ordinary working request，未缩小则返回 `no_reduction`；summary input/output 大小只作诊断，不单独决定提交。取消会传播至压缩链，已提交 epoch 保留，未提交候选丢弃。
 - `[FACT]` 用户显式 `context_window`、可靠 Provider runtime `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 与固定 `256_000` default input operating window 是当前 limits 来源；当 effective input 为 `256_000` 时，正式 resolver 使用 Eval 选定的 `balanced-208k` 工程 profile（High `208_000`、retained/Low `96_000`、working headroom `48_000`、compaction `64_000/4_096`、count allowance `8_192`，L4 最多 `4` 个 epoch）。其它 effective window 继续按有界自适应派生，并按 configured/provider/default 收紧、记录 provenance；Provider call 前按 input、output、combined 三个维度执行 Hard Gate，不使用 bundled metadata 或型号名称推断。
 - `[FACT]` `FailureReason` 是 Core 的小型、Provider-independent、JSON-safe 终态事实；Application 将它与 `PauseReason` 投影为安全文案，Interface 不按 SDK 异常或 HTTP 状态自行分类。
 - `[BOUNDARY]` Session 只恢复已完整提交的 Transcript、committed Timeline、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。

@@ -15,6 +15,7 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 - `[FACT]` 已实现五类 typed pause kind：`USER_REQUESTED`、`USER_INPUT_REQUIRED`、`PROVIDER_UNAVAILABLE`、`PERMISSION_REQUIRED`、`PLAN_REVIEW_REQUIRED`；Provider unavailable 的 `PauseReason` 可区分 `NETWORK_ERROR`、`RATE_LIMITED` 与 `TIMEOUT`。
 - `[FACT]` 暂停/恢复保持同一个 `AgentTurnExecution`、同一个 `TurnHandle` 和同一个事件流，不创建替代 Turn。
 - `[FACT]` 取消优先于待处理的恢复或审批响应；取消幂等。
+- `[FACT]` 手动 Session 压缩接收调用方 `CancellationToken`，覆盖预检、摘要生成、候选校验和提交前检查；这是独立应用操作，不增加 Turn pause kind。取消或后续 epoch 失败不会撤销先前有效 checkpoint；自动压缩也传播当前 Turn 的取消信号。Desktop 操作按 Session/operation identity 归属，导航到其他 Session 不取消它；同会话冲突操作受 Bridge 限制。
 - `[FACT]` Agent Loop 在 trusted preflight 与 Permission 之间直接执行 PLAN 只读检查，并在 usage accounting 后、assistant final 提交前直接执行 unfinished-task 阻断；Plan Review 只由合法 `ProposePlan` 控制 ToolCall 触发。
 - `[FACT]` Plan Review 使用现有 typed pause/resume，TodoWrite 与同一 Turn Steering 使用同一 Core execution 边界；不创建第二个控制 Runtime。
 - `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。

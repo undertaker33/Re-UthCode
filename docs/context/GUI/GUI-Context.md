@@ -5,6 +5,8 @@
 ```text
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md
+snapshot_date: 2026-09-09
+verified_through_commit: 1218e31
 scope: Windows Desktop renderer + Electron bridge + Application session boundary
 source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/ + desktop/tests/ + tests/
 ```
@@ -23,7 +25,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` `desktop/src/renderer/state.ts` 是唯一 `RendererState`/reducer authority；`useRuntimeLifecycle` 独占 runtime generation、owner/tail、`AbortController`、stale guard 和 terminal convergence。`App.tsx` 只组合这些边界，不另建 Runtime/Run 生命周期状态机。
 - `[FACT]` Settings 的 Provider→Model 编辑始终使用同一个 modal root、focus trap 和 return-focus owner。非秘密配置由 Settings 页面 draft 持有；reveal 值只存在 editor-local state，待写入的 replacement ref 只为失败重试保留，Save 仍经 Configuration Application 出口。Session ID 与 Markdown code fence 原文复制共用 `copyText`。
 - `[FACT]` Sidebar/Runtime panel 宽度由 Renderer layout state 管理，viewport/窄屏只做 presentation clamp，稳定 separator commit 才写 preference。Focus Mode 是 Renderer-only transient：隐藏 Sidebar/Runtime，退出时恢复进入前的 `panelMode`/宽度且不写 preference；`Last Provider Request Usage` 与 Current Context 数值始终分离。
-- `[FACT]` 项目整行（菜单和编辑输入除外）切换展开状态，选中子会话不阻止收起。侧栏移除缓存和项目归属行内标签，悬停卡片展示项目/会话名称及所属路径；Runtime 布局使用隐藏、浮动、停靠三个图标按钮，专注模式使用独立图标。
+- `[FACT]` 侧栏历史容器只允许纵向滚动；会话按钮跨过悬停信息包装保持 flex 收缩，长标题省略而不挤出菜单按钮。项目整行（菜单和编辑输入除外）切换展开状态，选中子会话不阻止收起。侧栏移除缓存和项目归属行内标签，悬停卡片展示项目/会话名称及所属路径；Runtime 布局使用隐藏、浮动、停靠三个图标按钮，专注模式使用独立图标。
 - `[FACT]` Composer 不再展示就绪/运行中的通用状态文案；运行结束且用户未将焦点移至其他控件时恢复输入焦点。回复或压缩完成产生会话级未读标记，只有可见且获得焦点的窗口已显示聊天尾部才清除；清除标记不删除聊天内容。
 - `[FACT]` 压缩进度是聊天中的单行提示，运行时带旋转与省略点动画。完成后的持久提示来自历史页，按实际提交位置排列，不固定在最新回复之后；刷新最近页保留已加载旧页和游标，不自动补载全部历史。失败、取消和无需变更的即时提示不被既有成功记录遮蔽。
 - `[BOUNDARY]` 现有 CDP/packaged acceptance 使用隔离 profile、DOM/keyboard/CDP 合成输入和 CSS viewport 观察；它可以证明 Renderer/Bridge/Application 投影与键盘/ARIA/布局合同，但不等同于 native pointer、Windows 原生缩放或人工视觉验收。未具备这些环境时不能把 synthetic viewport 或普通 mouse 对照写成 native input PASS。
@@ -50,7 +52,7 @@ visible Session A 有 active Turn
 - 同一 Session 同时最多一个 active Turn，仍遵守 `AgentRun` 的独占约束；在该 Session 可见时，普通输入是 Steering，暂停/恢复/取消仍指向同一 Turn。
 - 普通侧栏与 Slash 导航保留 Session-owned Run 的事件接收，不把停放的 Run 当作已失效 Run；真正清空工作区时清除显示缓存并拒绝已知旧 Run 的迟到事件。目录刷新省略运行状态时保留已有 running/waiting 等投影；带身份的 status 只更新匹配 Project/Session 的投影，不覆盖另一可见会话。
 - 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。Desktop catalog 读取元数据，并从 Transcript 头部读取到首条完整用户记录生成单行预览，不为每个目录项重建完整历史；侧栏优先显示手动标题，否则显示首条用户消息预览。聊天默认显示最近 30 个完整交互单元，向上接近顶部再读取更早页，不自动补载全部历史。
-- 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录使用稳定身份并与当前实时投影合并；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。
+- 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录使用稳定身份并与当前实时投影合并；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。游标同时保存 Transcript 与 Timeline 字节边界，翻旧页不会重复扫描更新的 Timeline；压缩完成记录从 Timeline 投影，并按对应的 Transcript 提交位置插入聊天。
 - Session rename/move 是 Application 的持久元数据操作。Bridge 在任一已保存 runtime 仍有 active Turn 时拒绝这些变更，避免修改与运行中的 Session 边界竞争。
 - 进程内的 per-Session runtime 是导航连续性机制，不是 Session v3 持久格式的一部分。Runtime crash/protocol error 仍与 Provider/Turn 的正式失败投影分离。
 
@@ -72,11 +74,31 @@ Electron 生命周期、IPC、Python child  -> desktop/src/main.ts + desktop/src
 Desktop JSONL 协议、Session/Turn 边界 -> src/uthcode/interfaces/desktop/bridge.py
 Session 模型、Context 原子提交        -> src/uthcode/application/generation.py + context.py + sessions.py
 Session metadata/store                  -> src/uthcode/application/sessions.py + integrations/session_files.py
-Renderer 状态、导航、事件投影          -> desktop/src/renderer/state.ts + App.tsx
+Renderer reducer authority              -> desktop/src/renderer/state.ts
+Session / DTO 纯转换                    -> desktop/src/renderer/state-session.ts + state-normalization.ts
+Runtime generation / owner / terminal   -> desktop/src/renderer/useRuntimeLifecycle.ts
+Renderer 导航、布局与组合                -> desktop/src/renderer/App.tsx
 Composer / Todo / Context 显示          -> desktop/src/renderer/Composer.tsx + RuntimePanel.tsx
 侧栏 Session 管理                       -> desktop/src/renderer/Sidebar.tsx
-Settings 视图                           -> desktop/src/renderer/SettingsView.tsx
+聊天分页、阅读位置、代码块复制          -> desktop/src/renderer/ChatTimeline.tsx + safe-markdown.tsx
+Settings draft / 单根编辑器             -> desktop/src/renderer/SettingsView.tsx + SettingsEditorModal.tsx + settings-draft.ts
+历史分页与压缩提示持久投影               -> application/sessions.py + integrations/session_files.py（位于 src/uthcode/）
 ```
+
+## 事实与测试定位
+
+| 关注点 | 对应测试 |
+| --- | --- |
+| reducer、Session 缓存和导航隔离 | `desktop/tests/renderer-state.test.ts`、`renderer-session.test.tsx` |
+| runtime ownership、迟到事件和终态收敛 | `desktop/tests/renderer-runtime-lifecycle.test.tsx`、`runtime-process.test.ts` |
+| 单根 Settings、返回焦点和秘密显示生命周期 | `desktop/tests/renderer-settings.test.tsx` |
+| Markdown 原文复制、历史分页和阅读位置 | `desktop/tests/renderer-chat.test.tsx` |
+| 布局与临时 Focus Mode | `desktop/tests/renderer-state-ui.test.tsx`、`renderer.test.tsx` |
+| 冷 Session 准备、压缩取消及跨 Session 运行 | `tests/test_history_prepare_lifecycle.py`、`tests/test_desktop_bridge.py` |
+| 历史游标与持久压缩提示 | `tests/test_history_paging.py` |
+| 目录首条消息预览 | `tests/test_session_authority.py` |
+
+以下是行为改动后的验证入口，不表示本次文档同步重新执行了功能验收。
 
 ## 最小验证索引
 

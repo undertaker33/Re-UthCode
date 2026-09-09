@@ -2,7 +2,9 @@
 
 UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`permissions.toml` 管理工具权限规则。Provider 只允许在用户级配置中定义；项目配置只能选择用户级 Provider 和模型参数。API Key 可直接写入用户级 `api_key`（literal），或使用 `env:VARIABLE_NAME` 读取当前进程环境变量；项目配置禁止凭据和端点。
 
-TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Desktop Settings 页只编辑下文列出的模型、Provider、默认权限和主题等界面设置；API key 输入只用于本次配置写入，不会显示或持久化到 Desktop preference 文件。
+TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Desktop Settings 页编辑下文列出的模型、Provider、默认权限及主题、语言等界面设置。API key 默认遮蔽，可在 Provider 编辑器内显式查看已保存的值；关闭编辑器后不保留该显隐状态，也不会将密钥写入 Desktop preference 文件。
+
+点击 Provider 打开编辑器，再进入其 Model 编辑页。Model 的“应用”或“返回”回到 Provider 页，修改仍属于草稿；Provider 的“应用”将草稿带回设置页，编辑器中的“取消”放弃本次 Provider 编辑及其中的 Model 修改。最后点击设置页的保存才写入用户配置。仅查看已有 API key 不会把它作为新密钥提交；只有主动编辑密钥输入框才提交替换值。
 
 Desktop Settings 修改已配置 Provider ID 时会提交显式 rename 映射，并同步更新引用该 Provider 的 Model Profile。未输入新 key 时，用户配置中原有的 literal 或 `env:VARIABLE_NAME` 表达会原样保留；只有输入 replacement key 时才替换该值。Provider ID 冲突或不存在的源 ID 会拒绝整次写入，失败不会改动配置文件。
 
