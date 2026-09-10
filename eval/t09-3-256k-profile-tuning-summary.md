@@ -129,3 +129,16 @@ prefix 仍来自真实 `ApplicationContextService.compose_generation_request`、
 - effective input 小于或大于 `256_000` 时继续使用现有有界自适应派生；Provider/configured ceiling 仍只收紧 effective limit，不会把 balanced 的 256K 数值硬写进更小窗口。input、output、combined 三个 Hard Gate 以及 Active Turn freeze 未改变。
 - `eval/profile.py` 中的 `production-default` 保留为 W04 原始历史公式 baseline，用于复核原始 compare；它不再代表当前生产 resolver。`balanced-208k` 仍是候选轴记录，同时也是当前 256K 正式默认的事实来源。
 - 新增 Core exact-profile 与正式 Application Turn 回归，并调整 High→Low fake provider 断言按实际 safety allowance 计算；本轮定向、Eval、架构、全量和工具链精确结果记录在对应返工 Feedback。
+
+## 从 Eval 使用说明迁入的历史记录
+
+以下内容于 2026-09-10 从 `eval/README.md` 移入，保留原有 W03/W04 记录。它们描述当时的授权和实验结果，不表示本次文档整理重新运行了实验，也不替代上文各轮次的精确证据。
+
+### W03 真实 baseline 授权记录
+
+本次 W03 未获得该授权，因此七题真实 baseline 的状态是 `NOT VERIFIED (authorization required)`，没有执行网络调用或读取秘密值。固定模型、次数和实验 ID 应在另行授权后由用户确认并记录。
+
+### W04 返工补充
+
+v5 长负载通过真实 `ApplicationContextService.compose_generation_request`、`ContextCompiler` 和 `InstructionLoader` 记录 conversation growth、compact 前后 stable reuse，以及 project instruction source 加入后的 expected invalidation。报告中的成功 workload source 与标准 diagnostic fact 保持区分：前者为 `not_applicable`，后者为 `not_available` 并保留 reason 与 `source_status`。
+每个最终候选用两个 attempts 记录 route seed 0/1；`workload_route` 的机器可读值包含 required evidence 读取、`ToolResultRead` 到 EOF、`EditFile`、修改后复读和 `complete`，并由 verifier success 与定向测试共同验收。

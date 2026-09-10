@@ -1,12 +1,11 @@
 # UthCode 能力欠账清单
 
-> 仅记录 **已交付任务包中，因为后置能力尚未实现而刻意没有继续设计/实施的部分**。
+> 仅记录 **任务包中因后置能力尚未实现而刻意未继续设计或实施、仍待回补的部分；在工作包拆分时登记，后续按实际回补情况更新或删除**。
 >
 > 不把后续完整能力本身列为欠账。
 
 | 来源 | 欠账需求 | 回补前置 / 触发条件 |
 |---|---|---|
-| **T01 Provider** | 暂无明确能力欠账 | 当前 Provider 边界未发现必须依赖后置能力才能补齐的部分 |
 | **T03 System Prompt** | Memory 或 Skill Instructions 在真实能力出现时作为新的强类型 Context Source 接入；已冻结的 AGENTS / Project Instructions、Prompt Asset、Runtime、Environment、Transcript/Timeline 和 Interaction History 由 T09/T09-1 正式回补 | 首个 Memory 或 Skill Instructions 来源开始实施 |
 | **T04 Tool System** | 支持运行期间动态出现、启停或消失的 Tool，而不是只处理当前稳定 Tool 集合 | Skill、MCP 或其他真实动态 Tool 来源出现 |
 | **T05 Agent Loop / Run** | 当前 active/paused Turn 的有效 Runtime State 可以跨进程、跨程序生命周期恢复；T09 工作包只恢复完整提交的 Session 语义历史并从新 Turn 继续 | 正式 Persistent Runtime Recovery 开始实施 |
@@ -18,20 +17,19 @@
 | **T09 Prompt / Context Engineering** | 确定性 Working Set 只保护必要上下文并按预算保留 recent complete semantic units；不检索久远但“相关”的证据 | Memory / Evidence Retrieval 有正式需求和可靠证据模型时 |
 | **T09 Prompt / Context Engineering** | 大 Tool Result 只有单项/Session 配额与 session-scoped ref；不提供跨 Session Artifact 生命周期、清理与 GC | 出现独立 Artifact Store 生命周期需求时 |
 | **T09 Prompt / Context Engineering** | Compaction 只做有界滚动批次；不实现层级 Summary Graph、后台 Context Agent 或高级渐进式压缩 | Eval 证明简单 Compaction 无法满足真实长任务时 |
-| **T09-2 工程收敛与提前抽象清理** | 暂无明确能力欠账 | 当前收敛未因后置能力而停止，也不保留未来入口 |
 
 ## 维护原则
 
-后续开发某项能力时，只需要检查它是否命中了上表的“回补前置 / 触发条件”。
+清单只保留真实未结欠账，不添加“暂无欠账”占位行；任务包自身无欠账时在其对应章节写“无”。后续开发先核对是否命中上表的“回补前置 / 触发条件”，命中不自动授权扩大范围；维护流程遵守 [工作包规则](rules/WorkPackageRules.md)。
 
 例如：
 
 ```text
-开始做 Context
-→ 回看 T03 / T04 / T05 欠账
+开始做 Memory / Evidence Retrieval
+→ 回看 T03 / B01 / T09 的对应条目
 
-开始做 Session
-→ 回看 T05 / T06 欠账
+开始做跨进程 Runtime Recovery
+→ 回看 T05 / T06 / T09 的恢复边界
 
 开始做 Skill 或 MCP
 → 回看 T03 / T04 / T07

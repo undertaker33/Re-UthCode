@@ -196,20 +196,20 @@ Plan proposal 进入 `PLAN_REVIEW_REQUIRED` 后使用同一套 typed pause/resum
 
 ## 验证方法
 
-自动验证：
+在既有 `re-uthcode` 环境中按改动选择验证，不默认执行下表全部命令。多个场景重叠时合并测试集合，同一版本的有效结果可以复用。
 
-```powershell
-conda activate re-uthcode
-python -m pytest tests/test_tui.py tests/test_architecture_boundaries.py -q
-python -m pytest tests/test_command_dispatcher.py tests/test_command_registry.py tests/test_command_completion.py tests/test_tui.py -q
-python -m pytest -q
-python -m compileall -q src tests
-python -m pip check
-```
+| 改动范围 | 验证入口 |
+| --- | --- |
+| TUI 输入、渲染或交互 | `python -m pytest tests/test_tui.py -q`；局部修改可选对应测试 |
+| Slash 定义、解析或补全 | `python -m pytest tests/test_command_dispatcher.py tests/test_command_registry.py tests/test_command_completion.py tests/test_tui.py -q` |
+| 模块依赖或架构边界 | `python -m pytest tests/test_architecture_boundaries.py -q` |
+| 任务明确要求全量回归，或具体跨模块问题无法由定向验证覆盖 | `python -m pytest -q` |
+| 导入或编译问题涉及定向测试未覆盖的文件 | 对受影响范围运行 `python -m compileall -q <路径>` |
+| Python 依赖或环境发生变化 | `python -m pip check` |
 
-静态检查需要确认源码与依赖中不存在旧 TUI 双轨实现，不包含 alternate-screen、鼠标跟踪和 `CSI 3J`。
+必要检查通过后停止；新增修改、失败或具体未解决问题出现时才补充或重跑受影响部分。修改终端模式或依赖时，检查没有恢复旧 TUI 双轨实现、alternate-screen、鼠标跟踪或 `CSI 3J`。
 
-Windows Terminal 人工验收：
+以下是 Windows Terminal 人工验收场景索引，按受影响行为及任务包要求选择，不要求每次局部修改全量重跑：
 
 1. 启动后确认先清当前视口，再显示 Logo；外部滚动条可用。
 2. 用中文输入法发送“你好”，确认界面文字和 Provider 收到的内容完全一致。

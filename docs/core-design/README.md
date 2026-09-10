@@ -28,6 +28,16 @@ A04 Orchestration
 
 ---
 
+## 已有专题
+
+| 层级 | 专题 |
+| --- | --- |
+| A01 执行 | [模型服务抽象](A01-AgentRuntime/01-模型服务抽象.md) · [原生协议快照](A01-AgentRuntime/02-原生协议快照.md) · [系统指令权威链路](A01-AgentRuntime/03-系统指令权威链路.md) |
+| A01 工具 | [工具调用闭合协议](A01-AgentRuntime/04-工具调用闭合协议.md) · [文件修改事实门禁](A01-AgentRuntime/05-文件修改事实门禁.md) · [Bash 中止收口](A01-AgentRuntime/06-Bash中止收口.md) |
+| A04 编排 | [斜杠命令编排](A04-Orchestration/01-斜杠命令编排.md) · [可替换交互层](A04-Orchestration/02-可替换交互层.md) |
+
+A02 Control 与 A03 State 暂无独立教程文章，当前实现分别见 [Control Context](../context/A02-Control/Control-Context.md) 和 [State Context](../context/A03-State/State-Context.md)。下面的四层说明是理解与检索视图，不代表 Python 顶层模块或已建齐的教程目录。
+
 ## 为什么是四层
 
 先看一次最普通的 Coding Agent 任务。
@@ -160,13 +170,7 @@ UthCode 的 Control 层负责的正是这件事。Permission、Ask User、Pause 
 
 > **Control 决定“现在能不能继续”。**
 
-目录：
-
-```text
-A02-Control/
-```
-
-当前代码事实：
+当前代码事实（暂无独立教程目录）：
 
 [`../context/A02-Control/Control-Context.md`](../context/A02-Control/Control-Context.md)
 
@@ -221,13 +225,7 @@ Application 在决定是否提交 Compact candidate 时，会用同一个 reques
 
 > **State 决定“Agent 现在处于什么状态、还能看到什么”。**
 
-目录：
-
-```text
-A03-State/
-```
-
-当前代码事实：
+当前代码事实（暂无独立教程目录）：
 
 [`../context/A03-State/State-Context.md`](../context/A03-State/State-Context.md)
 

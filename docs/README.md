@@ -15,7 +15,7 @@
 | `OutstandingDebtList.md` | 拆分与设计人员 | 因后置能力未实现而保留的真实能力欠账 |
 | `rules/` | 编码代理 | 工作包规则、用户决策边界等长期工程规则 |
 
-当前事实发生冲突时，以 `src/ + tests/` 为准；`Context-Index.md` 与 `context/` 用于定位和解释当前事实，工作包与归档记录只提供需求和历史证据。
+当前事实发生冲突时，以 `src/ + desktop/src/ + tests/ + desktop/tests/` 为准；`Context-Index.md` 与 `context/` 用于定位和解释当前事实，工作包与归档记录只提供需求和历史证据。
 
 ## 2. 按场景读取
 
@@ -35,19 +35,20 @@
 | --- | --- |
 | 项目定位、安装入口或主要能力 | 根 `README.md`、`user-manual/getting-started.md` |
 | 配置字段、发现规则或安全边界 | `user-manual/configuration.md`、相关 `context/**` |
+| Desktop 界面、导航、设置或 Bridge 行为 | `context/GUI/GUI-Context.md`、对应 `user-manual/` 页面；涉及共享运行语义时同步相关 `context/**` 与 `core-design/` |
 | CLI 或 Slash Command | `user-manual/commands.md`、相关 `context/**` |
 | Tool 新增、删除、改名或模式可见性变化 | `Tools.md`、相关用户手册、`core-design/`、相关 `context/**` |
 | Agent Core 的运行语义或长期边界 | 相关 `core-design/`、相关 `context/**`，必要时更新根 README |
 | 工作包创建、重拆或状态变化 | `Context-Index.md`、`OutstandingDebtList.md` 和工作包要求的记录 |
 | 包级验收 | 上述所有与该包能力相关的文档；不得只更新工作包 Feedback |
 
-用户手册回答“如何使用”，核心设计回答“Agent Core 如何运作”，当前事实文档回答“代码现在如何实现”，工作包回答“本次交付要求和结果是什么”。不同文档可以描述同一能力，但不要互相替代，也不要让用户文档直接变成任务书摘要。
+用户手册回答“如何使用”，核心设计回答“Agent Core 如何运作”，当前事实文档回答“代码现在如何实现”，工作包回答“本次交付要求和结果是什么”。不同文档可以描述同一能力，但不要互相替代，也不要让用户文档直接变成任务书摘要。跨层机制的完整参数和失败语义集中在负责该机制的当前事实文档，索引及其他层只保留本层结论与链接，避免复制多份细节。
 
 ## 4. 文档验收
 
 维护文档时至少检查：
 
-- 内容与当前 `src/ + tests/` 一致，不把规划中或归档中的能力写成当前事实；
+- 内容与当前 `src/ + desktop/src/ + tests/ + desktop/tests/` 一致，不把规划中或归档中的能力写成当前事实；
 - 文档内部链接有效；
 - 中文 Markdown 能以 UTF-8 解码，无 replacement character 和常见乱码；
 - Markdown fenced code block 成对闭合；

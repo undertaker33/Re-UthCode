@@ -18,7 +18,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` 每个已打开的真实配置 Desktop Session 对应独立的 Application/Run 运行时投影。切换 Session、新建 Session 或打开另一项目时，旧 Session 的 active Turn 被停放为 background runtime，不因界面导航而取消；再次选择该 Session 会重新激活其已有 runtime，或以共享持久 Session store 的新 Application 恢复它。
 - `[FACT]` background AgentEvent 附带 `session_id` 与 `project_key`。Renderer 以二者为键缓存每个 Session 的 timeline、Todo、Run、typed interaction、Context/Compact 和终态投影；侧栏按该投影显示 running、waiting、completed、failed、cancelled 或 idle。这个缓存是 Interface 投影，不是持久状态或第二份业务权威。
 - `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application。
-- `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会同时原子写回用户级 `default_model` 和该 Session 的 `model_ref`，并刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；失败时不发布拆分的模型/Context/metadata 状态。
+- `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
 - `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
 - `[FACT]` `/model` 参数补全向用户显示 Model 的 `display_name`，但执行值仍为规范的 logical Model Profile ID。Settings 中 Provider 的可选 `display_name` 也只用于列表和弹窗标题，缺失时回退稳定 Provider Profile ID；修改显示名不会改变 Model 引用。Composer 的模型、权限选择器在 active Turn、pending interaction、Compact 或 runtime restart 时禁用，避免绕过 Application 边界。
 - `[FACT]` Context ring 和 Runtime panel 只展示 Application 的 `context_status`/`compaction_status`。Bridge 在 assistant/reasoning/plan 流式文本、Todo 状态和工具完成事件到来时记录有界 `live_delta` 估计；terminal Provider usage 只更新独立的 `Last Provider Request Usage` 投影，不覆盖当前 Working Context 的 measurement。Renderer 在 active Turn 或 Compact 期间以一秒节奏补充查询 `status.get`，不会以该轮询替代事件流。
@@ -72,7 +72,7 @@ visible Session A 有 active Turn
 ```text
 Electron 生命周期、IPC、Python child  -> desktop/src/main.ts + desktop/src/preload.ts + desktop/src/python-runtime.ts
 Desktop JSONL 协议、Session/Turn 边界 -> src/uthcode/interfaces/desktop/bridge.py
-Session 模型、Context 原子提交        -> src/uthcode/application/generation.py + context.py + sessions.py
+Session 模型、Context 更新与回滚        -> src/uthcode/application/generation.py + context.py + sessions.py
 Session metadata/store                  -> src/uthcode/application/sessions.py + integrations/session_files.py
 Renderer reducer authority              -> desktop/src/renderer/state.ts
 Session / DTO 纯转换                    -> desktop/src/renderer/state-session.ts + state-normalization.ts

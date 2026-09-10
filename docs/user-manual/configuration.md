@@ -2,13 +2,21 @@
 
 UthCode 使用两个互相独立的配置文件：`config.toml` 管理模型，`permissions.toml` 管理工具权限规则。Provider 只允许在用户级配置中定义；项目配置只能选择用户级 Provider 和模型参数。API Key 可直接写入用户级 `api_key`（literal），或使用 `env:VARIABLE_NAME` 读取当前进程环境变量；项目配置禁止凭据和端点。
 
-TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Desktop Settings 页编辑下文列出的模型、Provider、默认权限及主题、语言等界面设置。API key 默认遮蔽，可在 Provider 编辑器内显式查看已保存的值；关闭编辑器后不保留该显隐状态，也不会将密钥写入 Desktop preference 文件。
+TUI、`uthcode exec` 和 Windows Desktop 共用这套当前配置 schema。Desktop Settings 页只编辑下文列出的模型、Provider、默认权限及主题、语言等界面设置；API key 默认隐藏，用户可通过显式查看按钮读取保存的 literal 或 `env:VARIABLE_NAME` 表达；查看不会解析环境变量，也不会读取运行时 Provider 的 `SecretValue`。新输入只用于配置写入，查看或输入的 key 均不保存到 Desktop preference 文件。
 
 点击 Provider 打开编辑器，再进入其 Model 编辑页。Model 的“应用”或“返回”回到 Provider 页，修改仍属于草稿；Provider 的“应用”将草稿带回设置页，编辑器中的“取消”放弃本次 Provider 编辑及其中的 Model 修改。最后点击设置页的保存才写入用户配置。仅查看已有 API key 不会把它作为新密钥提交；只有主动编辑密钥输入框才提交替换值。
 
 Desktop Settings 修改已配置 Provider ID 时会提交显式 rename 映射，并同步更新引用该 Provider 的 Model Profile。未输入新 key 时，用户配置中原有的 literal 或 `env:VARIABLE_NAME` 表达会原样保留；只有输入 replacement key 时才替换该值。Provider ID 冲突或不存在的源 ID 会拒绝整次写入，失败不会改动配置文件。
 
-Desktop 的每个持久 Session 还保存自身的可选模型偏好 `model_ref`。在 Composer 中切换模型时，UthCode 会先验证 Provider/输入上限，再原子更新用户级 `default_model`、当前 Session 的模型偏好和该 Session 的运行时 Context；任一步失败都不会发布部分更新。恢复一个旧 Session 时会恢复它自己的模型，但不改写后来用于新建 Session 的用户默认模型；因此新建 Session 始终采用当前用户级 `default_model`。
+Desktop 的每个持久 Session 还保存自身的可选模型偏好 `model_ref`。在 Composer 中切换模型时，UthCode 先验证 Provider/输入上限，再依次写入用户级 `default_model`、当前 Session 的模型偏好，并更新运行时模型与 Context。配置和 Session metadata 各自采用单文件原子写入；中途异常会尝试恢复原状态，回滚本身失败时会报告切换失败。这不是跨文件与进程退出的全局事务，不保证所有故障下都没有部分写入。恢复一个旧 Session 时会恢复它自己的模型，但不改写后来用于新建 Session 的用户默认模型；因此新建 Session 始终采用当前用户级 `default_model`。
+
+## 配置发现与覆盖
+
+两种配置文件共用目录发现规则：先加载用户级文件；在 Git 仓库中，再从仓库根到当前工作目录逐层读取各级 `.uthcode/` 下的同名文件；非 Git 目录只读取当前目录的项目文件，不向父目录搜索。候选路径在加载前规范化、解析物理路径并去重。
+
+普通配置按“内置默认值 → 用户配置 → 从根到当前目录的项目配置”合并，较近目录只可覆盖允许字段或收紧已有上限，不能绕过 Provider、凭据和权限限制。权限文件使用下文的规则匹配与优先级，不把普通配置的字段覆盖方式套用于权限求值。
+
+例如在 `repo/subdir` 启动时，可同时加载 `repo/.uthcode/config.toml` 和 `repo/subdir/.uthcode/config.toml`。遇到意外配置时，可通过 `/status` 核对加载来源。
 
 ## `config.toml`
 

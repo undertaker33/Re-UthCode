@@ -47,7 +47,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner run `
 
 Fake Provider 只用于验证 `task -> external attempt -> Application Run/Turn -> verifier -> report` 的离线链路，并按任务声明完成 AskUser 或 PlanReview typed pause/resume；permission-boundary 还会触发一次未授权的外部读取以验证阻断。它不注入标准答案或完整 Patch；正确性始终由 verifier 的 hard/partial/forbidden checks 决定。
 
-W04 profile workload 的 Provider 只根据已观察的 ToolResult、外部页边界和文件内容推进未完成目标；读取批次、页大小和复读顺序允许多个有效路径。实现修改由实际 `ReadFile` 结果推导为一个局部 `EditFile`，不保存标准完整 Patch，也不规定唯一 ToolCall 序列。多-attempt profile 由 runner 按 attempt 编号传入受控 `route_seed`；报告的 `workload_route` fact 保存实际 trace、完整读取/分页/编辑/复读和 verifier 前置路线事实。
+Profile workload 的 Provider 只根据已观察的 ToolResult、外部页边界和文件内容推进未完成目标；读取批次、页大小和复读顺序允许多个有效路径。实现修改由实际 `ReadFile` 结果推导为一个局部 `EditFile`，不保存标准完整 Patch，也不规定唯一 ToolCall 序列。多-attempt profile 由 runner 按 attempt 编号传入受控 `route_seed`；报告的 `workload_route` fact 保存实际 trace、完整读取/分页/编辑/复读和 verifier 前置路线事实。
 
 由于 Fake 不伪造模型对 fixture 的修改，除 `plan-only` 的只读成功路径外，单题 Fake smoke 默认会如实产生 `agent_failure`/verifier failure；这不是 baseline 分数，而是用于验收失败归因、artifact 和 report 链路。真实模型运行或独立的 verifier gold/partial/forbidden 测试才用于评估任务正确性。
 
@@ -64,7 +64,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner compare `
 
 ## T09-3 256K 离线候选调优
 
-W04 的长上下文候选只通过私有、可替换的 Eval seam 复用现有 `ContextBudget` resolver 和 `ApplicationContextService.compact_async`；它们不是 `create_application` 的公开参数，也不会写入项目或用户配置。候选轴单独记录完整参数，不能混入控制指纹。当前固定候选为：
+长上下文候选只通过私有、可替换的 Eval seam 复用现有 `ContextBudget` resolver 和 `ApplicationContextService.compact_async`；它们不是 `create_application` 的公开参数，也不会写入项目或用户配置。候选轴单独记录完整参数，不能混入控制指纹。当前固定候选为：
 
 | Candidate | Effective / auto gate | Retained / fine | Compact input / output | Max epochs / count allowance |
 | --- | ---: | ---: | ---: | ---: |
@@ -72,7 +72,7 @@ W04 的长上下文候选只通过私有、可替换的 Eval seam 复用现有 `
 | `balanced-208k` | `256000 / 208000` | `96000 / 16000` | `64000 / 4096` | `4 / 8192` |
 | `compact-224k` | `256000 / 224000` | `128000 / 12000` | `48000 / 3072` | `3 / 12288` |
 
-`production-default` 这一行保留 W04 采纳前的历史公式，供报告 compare 复核；当前正式生产 resolver 在 effective input 为 `256000` 时使用 Eval 选定的 `balanced-208k`：High Water `208000`、retained/Low Water `96000`、working headroom `48000`、compaction input/output `64000/4096`、count allowance `8192`。该默认属于生产内部工程策略，不新增产品配置字段；低于或高于 `256000` 的 effective window 继续使用有界自适应派生并服从 configured/provider 收紧。
+`production-default` 这一行保留调优结果采纳前的历史公式，供报告 compare 复核；当前正式生产 resolver 在 effective input 为 `256000` 时使用 Eval 选定的 `balanced-208k`：High Water `208000`、retained/Low Water `96000`、working headroom `48000`、compaction input/output `64000/4096`、count allowance `8192`。该默认属于生产内部工程策略，不新增产品配置字段；低于或高于 `256000` 的 effective window 继续使用有界自适应派生并服从 configured/provider 收紧。
 
 运行同一受控长负载：
 
@@ -108,7 +108,7 @@ conda run --no-capture-output -n re-uthcode python -m eval.runner run `
   --live-authorized
 ```
 
-本次 W03 未获得该授权，因此七题真实 baseline 的状态是 `NOT VERIFIED (authorization required)`，没有执行网络调用或读取秘密值。固定模型、次数和实验 ID 应在另行授权后由用户确认并记录。
+每次真实运行都需取得本次网络访问与费用授权，并明确模型、次数和实验 ID。未实际运行的 baseline 标记为未验证；历史授权与结果记录见 [调优汇总中的历史补充](t09-3-256k-profile-tuning-summary.md#从-eval-使用说明迁入的历史记录)。
 
 ## 结果解释
 
@@ -136,7 +136,6 @@ clean 会在删除前重新校验专用根、manifest 身份、三个组件的�
 
 运行产物应始终位于专用外部根目录；不要用新增 ignore 规则掩盖仓库污染。完成后可用 `git status --short` 和 attempt 的 `repository_status_delta` 检查源码仓库是否保持原样。
 
-## W04 返工补充
+## 历史调优证据
 
-v5 长负载通过真实 `ApplicationContextService.compose_generation_request`、`ContextCompiler` 和 `InstructionLoader` 记录 conversation growth、compact 前后 stable reuse，以及 project instruction source 加入后的 expected invalidation。报告中的成功 workload source 与标准 diagnostic fact 保持区分：前者为 `not_applicable`，后者为 `not_available` 并保留 reason 与 `source_status`。
-每个最终候选用两个 attempts 记录 route seed 0/1；`workload_route` 的机器可读值包含 required evidence 读取、`ToolResultRead` 到 EOF、`EditFile`、修改后复读和 `complete`，并由 verifier success 与定向测试共同验收。
+候选实验、返工过程、当时的授权状态与精确运行结果见 [T09-3 256K 离线调优汇总](t09-3-256k-profile-tuning-summary.md)。历史结果不代表当前 checkout 已重新执行验收；日常运行按本文入口操作。

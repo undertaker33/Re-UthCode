@@ -23,7 +23,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Provider 流中的 `ReasoningPart` 与 `TextPart` 始终保持 typed 边界并按到达顺序投影为公开事件；跨 Provider/model identity 时不把 reasoning 降级为 assistant 正文，`STOP` 只有非空正式 `TextPart` 才能完成，`TurnResult.final_text` 只来自正式正文。
 - `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；唯一的 `create_application -> create_run -> start_turn` 链路将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
 - `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
-- `[FACT]` terminal History persistence 将 JSONL append+fsync、reload、last-used/metadata touch 与 Instruction State metadata sync 分开记录 outcome；只有可判定 `durability=durable` 的 History append 才按 `persisted_message_count` 推进 Run 的 process cursor。append 后的 reload/touch 失败会保留 durable 事实并显示 partial diagnostics；无法通过结构化 History identity reconciliation 判定时，active Session writer 进入 quarantine，所有新 Run 与语义写入 fail closed，不重试未知批次。必须显式关闭 writer，再由 fresh writer 重新打开并验证/恢复后才解除 quarantine。真正未落盘的 append 失败则 cursor 不推进；失败批次在进程内保留原始 Session/Turn identity 并按 FIFO 重试。
+- `[FACT]` Tool batch 和 terminal 边界通过 Application 提交 History；只有已确认持久化的消息才推进 cursor，未知副作用或未知落盘结果不盲目重试。完整规则见 [A03 History 持久化与恢复](../A03-State/State-Context.md#history-持久化与恢复)。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。
 
 ## 权威源码索引
@@ -80,7 +80,7 @@ AgentRun.start_turn(user_input)
 
 - `ProviderPort` 的具体 Provider 名称不得进入 Runtime 分支判断。
 - Application 独占 `system_prompt` 与 `model` 注入；外部请求传入这两个字段会被拒绝。
-- Provider/model、ContextBudget、ToolDefinition 顺序、请求准备器在 Turn 启动时固定；Turn 中途切换模型只影响后续 Turn。
+- Provider/model、ContextBudget、捕获的工具定义集合与顺序、请求准备器在 Turn 启动时固定；工具可见视图按每次 iteration 的 Behavior Mode 过滤，批准 Plan 后同一 Turn 切回 DEFAULT。Turn 中途切换模型只影响后续 Turn。
 - Provider 流必须经过 `validated_provider_stream`；不完整、矛盾或缺终态的流不能提交 Assistant Message/Usage。
 - 每个 Provider 给出的原始 `tool_call_id` 必须恰好得到一个 `ToolResultPart`；未知工具、参数错误、拒绝、异常、超限、取消也必须闭合 ID。
 - Tool 先 `prepare_call`，再权限判断，再 `execute_prepared`；审批恢复不得二次 preflight 或二次执行。
@@ -104,7 +104,8 @@ tool:
   Glob      -> workspace 内路径匹配
   Grep      -> workspace 内内容搜索
   Bash      -> workdir 下未沙箱化进程执行
-  ToolResultRead -> 当前 Session opaque ref 的有界页读取
+  ToolResultRead -> 当前 Session opaque Tool Result ref 的有界页读取
+  HistoryRead -> 当前 Session opaque Transcript ref 的有界页读取
 ```
 
 ## 不属于当前执行层
@@ -113,7 +114,7 @@ tool:
 - `[ABSENT]` LangGraph/LangChain Runtime 或旧 Runtime 兼容入口。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Subagent/Multi-Agent；不要从工作包名称推断这些能力已实现。
 - `[FACT]` Context Compiler、Transcript/Timeline、Compactor 有界分批/校验机制与 Session persistence 已由 Application 接入正式 Agent path；Run 内未提交消息只作为当前进程增量编译。生产 tool-free L4/L5 summarizer 与 manual `/compact` 共用 bounded request，Timeline commit 采用 derived records first、`ActiveCheckpoint` last；overflow recovery 最多 retry 一次。提交前以同源 measurement 比较 compact 前后的 ordinary working request，未缩小则返回 `no_reduction`；summary input/output 大小只作诊断，不单独决定提交。取消会传播至压缩链，已提交 epoch 保留，未提交候选丢弃。
-- `[FACT]` 用户显式 `context_window`、可靠 Provider runtime `max_input_tokens`、`max_output_tokens`、可选 `max_combined_tokens` 与固定 `256_000` default input operating window 是当前 limits 来源；当 effective input 为 `256_000` 时，正式 resolver 使用 Eval 选定的 `balanced-208k` 工程 profile（High `208_000`、retained/Low `96_000`、working headroom `48_000`、compaction `64_000/4_096`、count allowance `8_192`，L4 最多 `4` 个 epoch）。其它 effective window 继续按有界自适应派生，并按 configured/provider/default 收紧、记录 provenance；Provider call 前按 input、output、combined 三个维度执行 Hard Gate，不使用 bundled metadata 或型号名称推断。
+- `[FACT]` 输入预算由 default/configured/provider 来源收紧，并在 Active Turn 冻结；每次 Provider call 前执行分维 Hard Gate。256K 生产参数与其他窗口派生规则统一见 [A03 Context 预算与诊断](../A03-State/State-Context.md#context-预算与诊断)。
 - `[FACT]` `FailureReason` 是 Core 的小型、Provider-independent、JSON-safe 终态事实；Application 将它与 `PauseReason` 投影为安全文案，Interface 不按 SDK 异常或 HTTP 状态自行分类。
 - `[BOUNDARY]` Session 只恢复已完整提交的 Transcript、committed Timeline、Tool Result ref 和最小 Instruction State；不恢复 Runtime checkpoint、Pending Tool、Permission、AskUser waiter 或 Provider 协程位置。
 - `[DEFER]` Memory、retrieval 等真实后置能力仍不属于当前执行层。

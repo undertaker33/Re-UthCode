@@ -20,7 +20,7 @@ Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Co
 | `/model` | 打开模型选择器 |
 | `/model <model-ref>` | 切换后续请求使用的模型 |
 | `/permission` | 打开权限模式选择器 |
-| `/permission <default\|auto\|full_access>` | 切换当前运行的权限模式 |
+| `/permission <default\|auto\|full_access>` | 切换当前 Run 的权限模式；`default`/`auto` 同时写回用户默认权限，`full_access` 仅当前 Run 有效 |
 | `/plan` | 进入 Plan Mode |
 | `/do` | 返回默认执行模式 |
 | `/compact` | 通过 Application 的同一 Compact orchestrator 执行手动压缩；低 pressure 也可执行，无候选时返回成功 no-op，不创建垃圾 Timeline record |
@@ -29,7 +29,9 @@ Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Co
 | `/status` | 显示当前模型、Provider、配置来源、分维 configured/provider/default/effective limits 与 provenance、Pressure/Preflight、Auto/Hard Gate、Timeline checkpoint、Compact outcome、History persistence outcome 和 cache availability；Context measurement 会明确显示 `exact`、`estimate` 或 `unavailable` |
 | `/quit` | 退出 UthCode |
 
-常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/s`、`/q`、`/exit`。
+常用别名：`/h`、`/?`、`/models`、`/m`、`/build`、`/c`、`/s`、`/q`、`/exit`。
+
+`/permission default` 和 `/permission auto` 会先写回用户级 `config.toml` 的 `default_permission_mode`，供后续新建 Run 使用，再更新当前 Run；不会改变其他已经创建的 Run。`/permission full_access` 不写配置，也不改变新 Run 的默认权限。
 
 上表就是当前 Registry 的全部命令；未列出的 Slash 名称返回“未知命令”。`/compact` 不接受额外参数（例如 `/compact -- focus` 是用法错误）。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
 
