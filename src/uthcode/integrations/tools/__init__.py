@@ -18,6 +18,10 @@ from .history_read import (
     decode_history_ref,
     format_history_read_page,
 )
+from .document_tools import DocumentReadError, ReadDocumentTool
+from .image_tools import ImageReadError, ViewImageTool
+from .process_sessions import ProcessOutput, ProcessRead, ProcessSessionError, ProcessSessionManager
+from .process_tools import ProcessTool
 
 __all__ = [
     "HISTORY_READ_SCHEMA_VERSION",
@@ -31,4 +35,13 @@ __all__ = [
     "HistoryReadTool",
     "decode_history_ref",
     "format_history_read_page",
+    "DocumentReadError",
+    "ReadDocumentTool",
+    "ImageReadError",
+    "ViewImageTool",
+    "ProcessOutput",
+    "ProcessRead",
+    "ProcessSessionError",
+    "ProcessSessionManager",
+    "ProcessTool",
 ]

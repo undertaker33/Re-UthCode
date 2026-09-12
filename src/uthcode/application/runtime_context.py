@@ -23,6 +23,7 @@ class ApplicationRuntimeContext:
     platform_name: str
     platform_release: str
     current_date: str
+    process_manager: object | None = None
 
     def __post_init__(self) -> None:
         workdir = Path(self.workdir).expanduser().resolve(strict=False)

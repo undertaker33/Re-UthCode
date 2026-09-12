@@ -11,7 +11,7 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,14 @@ from uthcode.core.permission import (
     ResourceScope,
 )
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
-from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
+from uthcode.core.tool import (
+    ToolExecutionResult,
+    ToolFailure,
+    ToolFailureKind,
+    ToolPlanningAccess,
+    ToolPreparation,
+    ToolSideEffect,
+)
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.integrations.permissions import (
     BASH_ACTION_FACT_MARKER,
@@ -31,6 +38,8 @@ from uthcode.integrations.permissions import (
     BASH_SENSITIVE_TARGET_MARKER,
     is_sensitive_resource,
 )
+
+from .process_sessions import ProcessSessionError, ProcessSessionManager
 
 
 _CANCELLED = "Error: command cancelled"
@@ -1717,10 +1726,13 @@ def _bash_action_summary(command: str) -> str:
 
 
 class BashTool:
-    """Run a command with the current OS shell and current user privileges.
+    """Start one process session with the current OS shell and user privileges.
 
-    This is unsandboxed process execution.  It does not provide an operating
-    system sandbox, command allow-list, or privilege elevation.
+    Bash is the only process launch Tool.  ``yield_time_ms`` controls how long
+    this Tool waits for an initial observation.  ``timeout_seconds`` is an
+    explicit process lifetime/termination policy; when omitted, a running
+    process remains available to the Process Tool without a hidden total
+    lifetime.  This is unsandboxed process execution.
     """
 
     _definition = ToolDefinition(
@@ -1730,20 +1742,40 @@ class BashTool:
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
+                "yield_time_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 60000,
+                    "default": 1000,
+                },
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 600,
-                    "default": 120,
                 },
+                "pty": {"type": "boolean", "default": False},
+                "rows": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 24},
+                "cols": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 80},
             },
             "required": ["command"],
             "additionalProperties": False,
         },
     )
 
-    def __init__(self, workdir: str | os.PathLike[str] | Path) -> None:
+    def __init__(
+        self,
+        workdir: str | os.PathLike[str] | Path,
+        *,
+        process_manager: ProcessSessionManager | None = None,
+        session_provider: Callable[[], object | None] | None = None,
+    ) -> None:
         self._workdir = Path(workdir).expanduser().resolve(strict=False)
+        self._process_manager = process_manager or ProcessSessionManager()
+        self._session_provider = session_provider
+
+    @property
+    def process_manager(self) -> ProcessSessionManager:
+        return self._process_manager
 
     @property
     def definition(self) -> ToolDefinition:
@@ -1783,61 +1815,385 @@ class BashTool:
             return _error(_CANCELLED)
         try:
             command = _text(arguments, "command")
-            timeout_seconds = _timeout(arguments.get("timeout_seconds", 120))
+            yield_time_ms = _yield_time(arguments.get("yield_time_ms", 1000))
+            timeout_value = arguments.get("timeout_seconds")
+            timeout_seconds = None if timeout_value is None else _timeout(timeout_value)
+            pty = arguments.get("pty", False)
+            if not isinstance(pty, bool):
+                raise TypeError("pty must be a boolean")
+            rows = _size(arguments.get("rows", 24), "rows")
+            cols = _size(arguments.get("cols", 80), "cols")
         except (TypeError, ValueError) as exc:
             return _error(f"Error: invalid arguments for Bash: {exc}")
-
-        started: _StartedProcess | None = None
+        session_id = _owner_session_id(self._session_provider)
+        turn_id = _owner_turn_id(cancellation)
+        started = None
         try:
-            started = await _start_process(command, self._workdir)
-        except (OSError, RuntimeError, ValueError) as exc:
-            return _error(f"Error: failed to start command: {exc}")
-        process = started.process
-
-        communication = asyncio.create_task(process.communicate())
-        cancellation_wait = asyncio.create_task(cancellation.wait())
-        try:
-            done, _ = await asyncio.wait(
-                (communication, cancellation_wait),
-                timeout=float(timeout_seconds),
-                return_when=asyncio.FIRST_COMPLETED,
+            started = await self._process_manager.start(
+                session_id=session_id,
+                command=command,
+                cwd=self._workdir,
+                pty=pty,
+                rows=rows,
+                cols=cols,
+                turn_id=turn_id,
+                timeout_seconds=(None if timeout_seconds is None else float(timeout_seconds)),
             )
-
-            if communication in done:
-                try:
-                    stdout, stderr = communication.result()
-                except (OSError, asyncio.CancelledError) as exc:
-                    return _error(f"Error: failed to collect command output: {exc}")
-                return _completed_result(process.returncode, stdout, stderr)
-
-            timed_out = not cancellation_wait in done
-            stopped = await _terminate_process_tree(started)
-            reaped = await _await_communication(communication)
-            if not stopped or not reaped:
-                return _error(
-                    "Error: command ended without confirmed process and pipe reaping"
+        except (OSError, RuntimeError, ValueError, ProcessSessionError) as exc:
+            return _error(f"Error: failed to start command: {exc}")
+        try:
+            wait_limit = float(yield_time_ms) / 1000.0
+            if timeout_seconds is not None:
+                wait_limit = min(wait_limit, float(timeout_seconds))
+            await _wait_for_process_observation(
+                self._process_manager,
+                started,
+                cancellation,
+                wait_limit,
+            )
+            if cancellation.cancelled:
+                confirmed = await self._process_manager.stop(started.process_id, session_id)
+                return _process_failure(
+                    "Error: command cancelled" if confirmed else "Error: command cancellation state is unknown",
+                    ToolFailureKind.CANCELLED if confirmed else ToolFailureKind.SIDE_EFFECT_UNKNOWN,
+                    started,
+                    side_effect=ToolSideEffect.APPLIED if confirmed else ToolSideEffect.UNKNOWN,
                 )
-            if timed_out:
-                return _error(
-                    f"Error: command timed out after {timeout_seconds}s"
+            if started.timed_out:
+                return _process_failure(
+                    f"Error: command timed out after {timeout_seconds}s" if timeout_seconds is not None else "Error: command timed out",
+                    ToolFailureKind.TIMEOUT,
+                    started,
+                    side_effect=ToolSideEffect.APPLIED,
                 )
-            return _error(_CANCELLED)
+            # An explicit timeout is a lifetime policy.  The default path has
+            # no total lifetime and simply returns a running handle.
+            if timeout_seconds is not None and started.state == "running":
+                elapsed = float(yield_time_ms) / 1000.0
+                if elapsed >= float(timeout_seconds):
+                    confirmed = await self._process_manager.stop(started.process_id, session_id)
+                    return _process_failure(
+                        f"Error: command timed out after {timeout_seconds}s" if confirmed else "Error: command timeout state is unknown",
+                        ToolFailureKind.TIMEOUT if confirmed else ToolFailureKind.SIDE_EFFECT_UNKNOWN,
+                        started,
+                        side_effect=ToolSideEffect.APPLIED if confirmed else ToolSideEffect.UNKNOWN,
+                    )
+            return _process_result(self._process_manager.read(started.process_id, session_id), started)
         except asyncio.CancelledError as cancellation_error:
-            # A task cancellation is distinct from the Core cancellation token,
-            # but the child must still be terminated before the task exits.
-            stopped = await _terminate_process_tree(started)
-            reaped = await _await_communication(communication)
-            if not stopped or not reaped:
-                raise RuntimeError(
-                    "Error: cancelled command ended without confirmed process "
-                    "and pipe reaping"
-                ) from cancellation_error
+            confirmed = await self._process_manager.stop(started.process_id, session_id)
+            if not confirmed:
+                raise RuntimeError("Error: cancelled command ended with unknown process state") from cancellation_error
             raise
-        finally:
-            if not cancellation_wait.done():
-                cancellation_wait.cancel()
-            await asyncio.gather(cancellation_wait, return_exceptions=True)
-            started.control.close()
+
+
+class ProcessTool:
+    """List, read, write, resize, or stop a Session-owned process."""
+
+    _definition = ToolDefinition(
+        "Process",
+        "Inspect or control a running Bash process in the active Session.",
+        {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "read", "write", "stop", "resize"]},
+                "operation": {"type": "string", "enum": ["list", "read", "write", "stop", "resize"]},
+                "process_id": {"type": "string"},
+                "cursor": {"type": "integer", "minimum": 0},
+                "input": {"type": "string"},
+                "data": {"type": "string"},
+                "eof": {"type": "boolean"},
+                "rows": {"type": "integer", "minimum": 1, "maximum": 4096},
+                "cols": {"type": "integer", "minimum": 1, "maximum": 4096},
+            },
+            "additionalProperties": False,
+        },
+    )
+
+    def __init__(
+        self,
+        process_manager: ProcessSessionManager,
+        *,
+        session_provider: Callable[[], object | None] | None = None,
+    ) -> None:
+        self._process_manager = process_manager
+        self._session_provider = session_provider
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return self._definition
+
+    @property
+    def planning_access(self) -> ToolPlanningAccess:
+        return ToolPlanningAccess.READ_ONLY
+
+    def preflight(self, arguments: JsonPayload) -> ToolPreparation:
+        action = _process_action(arguments)
+        process_id = arguments.get("process_id")
+        resource = process_id if isinstance(process_id, str) and process_id else "Session processes"
+        effect = Effect.READ if action in {"list", "read"} else Effect.WRITE
+        if action == "stop":
+            effect = Effect.DESTRUCTIVE
+        return ToolPreparation(
+            action=PermissionAction(
+                tool="Process",
+                action=action,
+                effect=effect,
+                resource=resource,
+                scope=ResourceScope.INSIDE,
+            ),
+            execution_arguments=arguments,
+        )
+
+    async def execute(
+        self,
+        arguments: JsonPayload,
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionResult:
+        if cancellation.cancelled:
+            return _error("Error: process operation cancelled")
+        try:
+            action = _process_action(arguments)
+            session_id = _owner_session_id(self._session_provider)
+            if action == "list":
+                import json
+                processes = self._process_manager.list(session_id)
+                return ToolExecutionResult(
+                    json.dumps(processes, ensure_ascii=False, sort_keys=True),
+                    details={"processes": processes},
+                )
+            process_id = arguments.get("process_id")
+            if not isinstance(process_id, str) or not process_id:
+                raise ProcessSessionError("Error: process_id is required", kind="invalid_input")
+            if action == "read":
+                cursor = arguments.get("cursor", 0)
+                read = self._process_manager.read(process_id, session_id, cursor)
+                return _process_read_result(read)
+            if action == "write":
+                value = arguments.get("input", arguments.get("data", ""))
+                if not isinstance(value, str):
+                    raise ProcessSessionError("Error: input must be text", kind="invalid_input")
+                eof = arguments.get("eof", False)
+                if not isinstance(eof, bool):
+                    raise ProcessSessionError("Error: eof must be a boolean", kind="invalid_input")
+                managed = await self._process_manager.write(process_id, session_id, value, eof=eof)
+                return ToolExecutionResult(
+                    f"Process {process_id} accepted {len(value)} input characters" + (" and EOF" if eof else ""),
+                    process_id=managed.process_id,
+                    process_state=managed.state,
+                    side_effect=ToolSideEffect.APPLIED,
+                )
+            if action == "resize":
+                rows = _size(arguments.get("rows"), "rows")
+                cols = _size(arguments.get("cols"), "cols")
+                managed = await self._process_manager.resize(process_id, session_id, rows, cols)
+                return ToolExecutionResult(
+                    f"Process {process_id} resized to {rows}x{cols}",
+                    process_id=managed.process_id,
+                    process_state=managed.state,
+                    side_effect=ToolSideEffect.APPLIED,
+                )
+            confirmed = await self._process_manager.stop(process_id, session_id)
+            if not confirmed:
+                return _process_failure(
+                    "Error: process stop state is unknown",
+                    ToolFailureKind.SIDE_EFFECT_UNKNOWN,
+                    self._process_manager.get(process_id, session_id),
+                    side_effect=ToolSideEffect.UNKNOWN,
+                )
+            managed = self._process_manager.get(process_id, session_id)
+            return ToolExecutionResult(
+                f"Process {process_id} stopped",
+                process_id=managed.process_id,
+                process_state=managed.state,
+                exit_code=managed.exit_code,
+                side_effect=ToolSideEffect.APPLIED,
+            )
+        except ProcessSessionError as exc:
+            kind = ToolFailureKind.SIDE_EFFECT_UNKNOWN if exc.unknown else _failure_kind(exc.kind)
+            side_effect = ToolSideEffect.UNKNOWN if exc.unknown else ToolSideEffect.NONE
+            return ToolExecutionResult(
+                str(exc),
+                is_error=True,
+                failure=ToolFailure(kind.value, False),
+                side_effect=side_effect,
+            )
+        except (TypeError, ValueError) as exc:
+            return _error(f"Error: invalid Process arguments: {exc}")
+
+
+async def _wait_for_process_observation(
+    manager: ProcessSessionManager,
+    managed: object,
+    cancellation: CancellationToken,
+    wait_seconds: float,
+) -> None:
+    process_id = getattr(managed, "process_id")
+    session_id = getattr(managed, "session_id")
+    deadline = asyncio.get_running_loop().time() + max(0.0, wait_seconds)
+    initial_cursor = getattr(managed, "next_sequence", 0)
+    while getattr(managed, "state", "unknown") == "running":
+        if cancellation.cancelled:
+            return
+        if getattr(managed, "next_sequence", 0) != initial_cursor:
+            process = getattr(managed, "process", None)
+            watcher = getattr(managed, "watcher_task", None)
+            if watcher is not None and not watcher.done():
+                try:
+                    # Give a command that flushed output and exited a short
+                    # chance to publish its exit code, while keeping a
+                    # genuinely long-lived command a short-wait observation.
+                    await asyncio.wait_for(asyncio.shield(watcher), 0.05)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            return
+        await asyncio.sleep(0.01)
+    return
+
+
+def _owner_session_id(provider: Callable[[], object | None] | None) -> str:
+    if provider is None:
+        return "default"
+    try:
+        active = provider()
+        value = getattr(active, "session_id", None)
+        return value if isinstance(value, str) and value else "default"
+    except Exception:
+        return "default"
+
+
+def _owner_turn_id(cancellation: CancellationToken) -> str | None:
+    value = getattr(cancellation, "turn_id", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _process_action(arguments: Mapping[str, object]) -> str:
+    value = arguments.get("action", arguments.get("operation"))
+    if value not in {"list", "read", "write", "stop", "resize"}:
+        raise ProcessSessionError("Error: action must be list, read, write, stop, or resize", kind="invalid_input")
+    return str(value)
+
+
+def _failure_kind(value: str) -> ToolFailureKind:
+    try:
+        return ToolFailureKind(value)
+    except ValueError:
+        return ToolFailureKind.PROCESS_FAILED
+
+
+def _process_result(read: object, managed: object) -> ToolExecutionResult:
+    entries = getattr(read, "entries")
+    sections: list[str] = []
+    streams: dict[str, list[str]] = {"stdout": [], "stderr": [], "terminal": []}
+    for entry in entries:
+        streams.setdefault(entry.stream, []).append(entry.text)
+    if getattr(managed, "pty", None) is not None:
+        sections.extend(streams.get("terminal", []))
+    else:
+        if streams.get("stdout"):
+            sections.append(f"STDOUT:\n{''.join(streams['stdout']).rstrip()}")
+        if streams.get("stderr"):
+            sections.append(f"STDERR:\n{''.join(streams['stderr']).rstrip()}")
+    if not sections:
+        sections.append("(no output)" if getattr(read, "state") == "exited" else "(no new output)")
+    if getattr(read, "cursor_expired"):
+        sections.insert(0, f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+    state = getattr(read, "state")
+    exit_code = getattr(read, "exit_code")
+    timed_out = getattr(managed, "timed_out", False) is True
+    timeout_seconds = getattr(managed, "timeout_seconds", None)
+    if timed_out:
+        timeout_text = (
+            f"Error: command timed out after {timeout_seconds:g}s"
+            if isinstance(timeout_seconds, (int, float))
+            else "Error: command timed out"
+        )
+        sections.insert(0, timeout_text)
+    if state == "exited" and exit_code not in (None, 0):
+        sections.append(f"Exit code: {exit_code}")
+    failed = timed_out or (state == "exited" and exit_code not in (None, 0))
+    return ToolExecutionResult(
+        "\n".join(sections),
+        is_error=failed,
+        failure=(ToolFailure(ToolFailureKind.TIMEOUT.value, False) if timed_out else (ToolFailure(ToolFailureKind.PROCESS_FAILED.value, False) if failed else None)),
+        side_effect=ToolSideEffect.APPLIED,
+        process_id=getattr(managed, "process_id"),
+        process_state=state,
+        exit_code=exit_code,
+        stream="terminal" if getattr(managed, "pty", None) is not None else None,
+        next_cursor=str(getattr(read, "next_cursor")),
+        details={
+            "entries": tuple(
+                {
+                    "sequence": entry.sequence,
+                    "stream": entry.stream,
+                    "text": entry.text,
+                }
+                for entry in entries
+            ),
+            "earliest_cursor": getattr(read, "earliest_cursor"),
+            "cursor_expired": getattr(read, "cursor_expired"),
+            "expired": getattr(read, "expired", False),
+            "expiration_reason": getattr(read, "expiration_reason", None),
+        },
+    )
+
+
+def _process_read_result(read: object) -> ToolExecutionResult:
+    entries = getattr(read, "entries")
+    sections = [f"[{entry.stream}] {entry.text}" for entry in entries]
+    if not sections:
+        sections.append("(no new output)")
+    if getattr(read, "cursor_expired"):
+        sections.insert(0, f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+    state = getattr(read, "state")
+    exit_code = getattr(read, "exit_code")
+    if state == "exited" and exit_code not in (None, 0):
+        sections.append(f"Exit code: {exit_code}")
+    return ToolExecutionResult(
+        "\n".join(sections),
+        is_error=state == "exited" and exit_code not in (None, 0),
+        failure=(ToolFailure(ToolFailureKind.PROCESS_FAILED.value, False) if state == "exited" and exit_code not in (None, 0) else None),
+        side_effect=ToolSideEffect.NONE,
+        process_id=getattr(read, "process_id"),
+        process_state=state,
+        exit_code=exit_code,
+        next_cursor=str(getattr(read, "next_cursor")),
+        details={
+            "entries": tuple(
+                {
+                    "sequence": entry.sequence,
+                    "stream": entry.stream,
+                    "text": entry.text,
+                }
+                for entry in entries
+            ),
+            "earliest_cursor": getattr(read, "earliest_cursor"),
+            "cursor_expired": getattr(read, "cursor_expired"),
+            "expired": getattr(read, "expired", False),
+            "expiration_reason": getattr(read, "expiration_reason", None),
+        },
+    )
+
+
+def _process_failure(
+    message: str,
+    kind: ToolFailureKind,
+    managed: object,
+    *,
+    side_effect: ToolSideEffect,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        message,
+        is_error=True,
+        failure=ToolFailure(kind.value, False),
+        side_effect=side_effect,
+        process_id=getattr(managed, "process_id"),
+        process_state=getattr(managed, "state", None),
+        exit_code=getattr(managed, "exit_code", None),
+    )
 
 
 async def _start_process(command: str, workdir: Path) -> _StartedProcess:
@@ -2044,8 +2400,29 @@ def _timeout(value: object) -> int:
     return value
 
 
+def _yield_time(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("yield_time_ms must be an integer")
+    if not 0 <= value <= 60000:
+        raise ValueError("yield_time_ms must be between 0 and 60000")
+    return value
+
+
+def _size(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 4096:
+        raise ValueError(f"{name} must be between 1 and 4096")
+    return value
+
+
 def _error(message: str) -> ToolExecutionResult:
     return ToolExecutionResult(message, is_error=True)
 
 
-__all__ = ["BashTool", "classify_bash_command", "safe_bash_command_summary"]
+__all__ = [
+    "BashTool",
+    "ProcessTool",
+    "ProcessSessionError",
+    "ProcessSessionManager",
+    "classify_bash_command",
+    "safe_bash_command_summary",
+]

@@ -48,6 +48,8 @@ from uthcode.application import (
     OpenPermissionPicker,
     OpenSessionPicker,
     OutcomeStatus,
+    PermissionApprovalChoice,
+    PermissionApprovalRequest,
     PermissionApprovalResponse,
     PermissionMode,
     PermissionModeSelected,
@@ -113,6 +115,12 @@ _METHODS = frozenset(
         "attachment.import",
         "attachment.preview",
         "attachment.remove",
+        "process.list",
+        "process.read",
+        "process.write",
+        "process.stop",
+        "process.permission.release",
+        "process.resize",
         "session.new",
         "session.resume",
         "session.rename",
@@ -633,10 +641,15 @@ class DesktopBridge:
         # map owns only the per-Session task/token/identity needed to route a
         # cancellation and to keep a parked Session runtime alive.
         self._compaction_operations: dict[str, dict[str, object]] = {}
+        # Pending direct Process approvals retain only the already-prepared
+        # Tool call and its immutable Action.  Execution still goes through
+        # the same Application ToolExecutor after the response arrives.
+        self._pending_process_operations: dict[str, dict[str, object]] = {}
         # A selected Session owns its own Application/Run pair.  Keeping
         # those pairs here lets a background Turn continue while the user
         # navigates to another Session in the same project.
         self._background_runtimes: dict[str, dict[str, object]] = {}
+        self._process_event_unsubscribers: dict[int, Callable[[], None]] = {}
         self._outbox: list[Envelope] = []
         self._outbox_signal: asyncio.Event | None = None
         self._seen_request_ids: set[str] = set()
@@ -658,6 +671,7 @@ class DesktopBridge:
         self._dispatcher = CommandDispatcher(self._registry, application)
         self._completion = CompletionEngine(self._registry, application)
         if application is not None:
+            self._bind_process_events(application)
             self._replace_run(application)
 
     @property
@@ -681,6 +695,64 @@ class DesktopBridge:
         self._run = run
         return run
 
+    def _bind_process_events(self, application: object) -> None:
+        """Route Application-owned process observations to Desktop events."""
+
+        subscribe = getattr(application, "subscribe_process_events", None)
+        if not callable(subscribe) or id(application) in self._process_event_unsubscribers:
+            return
+        try:
+            unsubscribe = subscribe(
+                lambda observation, owner=application: self._publish_process_event(owner, observation)
+            )
+        except Exception:
+            return
+        if callable(unsubscribe):
+            self._process_event_unsubscribers[id(application)] = unsubscribe
+
+    def _unbind_process_events(self, application: object) -> None:
+        unsubscribe = self._process_event_unsubscribers.pop(id(application), None)
+        if unsubscribe is not None:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+
+    def _publish_process_event(self, application: object, observation: object) -> None:
+        if not isinstance(observation, Mapping):
+            return
+        event_type = observation.get("type")
+        if event_type not in {"process_output", "process_state"}:
+            return
+        safe: dict[str, object] = {"type": event_type}
+        for field_name in (
+            "session_id",
+            "process_id",
+            "sequence",
+            "next_cursor",
+            "state",
+            "exit_code",
+            "pty",
+            "turn_id",
+            "stream",
+            "text",
+            "timed_out",
+        ):
+            value = observation.get(field_name)
+            if value is not None:
+                safe[field_name] = value
+        runtime_context = getattr(application, "runtime_context", None)
+        owner_workdir = getattr(runtime_context, "workdir", None)
+        if not isinstance(owner_workdir, (str, Path)):
+            owner_workdir = self._workdir
+        safe["project_key"] = str(Path(owner_workdir).expanduser().resolve(strict=False))
+        try:
+            projected = _json_safe(safe)
+            if isinstance(projected, dict):
+                self._publish(AgentEventEnvelope(projected))
+        except Exception:
+            return
+
     @staticmethod
     def _create_run(application: object) -> object:
         create_run = getattr(application, "create_run", None)
@@ -697,6 +769,20 @@ class DesktopBridge:
         return run
 
     def _publish(self, envelope: Envelope) -> None:
+        if isinstance(envelope, AgentEventEnvelope):
+            event_type = envelope.event.get("type")
+            if event_type in {"process_output", "process_state"}:
+                # A stalled Renderer must not turn a long-lived process into
+                # an unbounded transport queue.  The authoritative ring and
+                # cursor API remain available through process.read.
+                process_events = [
+                    index
+                    for index, item in enumerate(self._outbox)
+                    if isinstance(item, AgentEventEnvelope)
+                    and item.event.get("type") in {"process_output", "process_state"}
+                ]
+                if len(process_events) >= 256:
+                    del self._outbox[process_events[0]]
         self._outbox.append(envelope)
         signal = self._outbox_signal
         if signal is not None:
@@ -795,6 +881,13 @@ class DesktopBridge:
         previous_status = previous.get("status") if isinstance(previous, Mapping) else None
         previous_pause = previous.get("pending_pause") if isinstance(previous, Mapping) else None
         previous_task_state = previous.get("task_state") if isinstance(previous, Mapping) else None
+        has_live_processes = getattr(self._application, "has_live_processes", None)
+        retain_processes = False
+        if callable(has_live_processes):
+            try:
+                retain_processes = has_live_processes() is True
+            except Exception:
+                retain_processes = False
         self._background_runtimes[key] = {
             "application": self._application,
             "run": self._run,
@@ -803,6 +896,7 @@ class DesktopBridge:
             "dispatcher": self._dispatcher,
             "completion": self._completion,
             "closed": False,
+            "retain": retain_processes,
             "status": (
                 "running" if self._active_handle is not None else "idle"
             ) if reset_turn_projection or not isinstance(previous_status, str) else previous_status,
@@ -820,6 +914,7 @@ class DesktopBridge:
         if application is None or run is None:
             raise BridgeError("session_error", "Session runtime is unavailable")
         self._application = application
+        self._bind_process_events(application)
         self._run = run
         self._active_handle = runtime.get("handle")
         task = runtime.get("task")
@@ -1137,6 +1232,13 @@ class DesktopBridge:
                 continue
             if runtime.get("retain") is True:
                 continue
+            has_live_processes = getattr(runtime.get("application"), "has_live_processes", None)
+            if callable(has_live_processes):
+                try:
+                    if has_live_processes() is True:
+                        continue
+                except Exception:
+                    continue
             if runtime.get("handle") is not None:
                 continue
             if self._compaction_running_for_session(key):
@@ -1349,6 +1451,18 @@ class DesktopBridge:
             return await self._attachment_preview(params)
         if method == "attachment.remove":
             return await self._attachment_remove(params)
+        if method == "process.list":
+            return await self._process_list(params)
+        if method == "process.read":
+            return await self._process_read(params)
+        if method == "process.write":
+            return await self._process_write(params)
+        if method == "process.stop":
+            return await self._process_stop(params)
+        if method == "process.permission.release":
+            return await self._process_permission_release(params)
+        if method == "process.resize":
+            return await self._process_resize(params)
         if method == "session.new":
             return await self._session_new(params)
         if method == "session.resume":
@@ -1466,7 +1580,21 @@ class DesktopBridge:
             run = self._create_run(application)
         except BridgeError:
             close = getattr(application, "close", None)
-            if callable(close):
+            close_async = getattr(application, "close_async", None)
+            if callable(close_async):
+                try:
+                    await close_async()
+                except Exception:
+                    self._state = "failed"
+                    if publish_state:
+                        self._publish(
+                            RuntimeStateEnvelope(
+                                "failed",
+                                ErrorPayload("application_close_failed", "Application close failed"),
+                            )
+                        )
+                    return
+            elif callable(close):
                 try:
                     close()
                 except Exception:
@@ -1609,6 +1737,7 @@ class DesktopBridge:
                             pass
                     raise BridgeError("application_close_failed", "previous Application could not close") from None
         self._application = candidate
+        self._bind_process_events(candidate)
         self._workdir = path
         self._run = candidate_run
         self._dispatcher = candidate_dispatcher
@@ -1989,6 +2118,7 @@ class DesktopBridge:
                 "retain": True,
             }
         )
+        self._bind_process_events(candidate)
 
     @staticmethod
     def _background_resume_result(
@@ -2385,6 +2515,217 @@ class DesktopBridge:
         except (RuntimeError, ValueError, TypeError):
             raise BridgeError("attachment_error", "attachment could not be removed") from None
         return {"removed": True, "ref": ref, "session_id": session_id}
+
+    def _process_application(self) -> object:
+        application = self._require_application()
+        if self._current_compaction_operation() is not None:
+            raise BridgeError("compaction_active", "process control is unavailable during compaction")
+        return application
+
+    async def _process_operation(
+        self,
+        params: Mapping[str, object],
+        *,
+        action: str,
+        required: set[str],
+    ) -> dict[str, object]:
+        optional_by_action = {
+            "list": set(),
+            "read": {"cursor"},
+            "write": {"input", "data", "eof"},
+            "stop": set(),
+            "resize": set(),
+        }
+        allowed = (
+            set(required)
+            | optional_by_action.get(action, set())
+            | {"permission_id", "permission_choice"}
+        )
+        missing = required - set(params)
+        if missing:
+            raise BridgeError(
+                "invalid_request",
+                f"process.{action} is missing fields: {sorted(missing)!r}",
+            )
+        extra = set(params) - allowed
+        if extra:
+            raise BridgeError(
+                "invalid_request",
+                f"process.{action} has unknown fields: {sorted(extra)!r}",
+            )
+        operation = dict(params)
+        permission_id = operation.pop("permission_id", None)
+        raw_choice = operation.pop("permission_choice", None)
+        if permission_id is not None and (not isinstance(permission_id, str) or not permission_id.strip()):
+            raise BridgeError("invalid_request", "permission_id must be a non-empty string")
+        try:
+            choice = None if raw_choice is None else PermissionApprovalChoice(raw_choice)
+        except (TypeError, ValueError):
+            raise BridgeError("invalid_request", "permission_choice is invalid") from None
+        operation["action"] = action
+        application = self._process_application()
+        run = self._require_run()
+        prepare = getattr(application, "prepare_process_operation", None)
+        execute = getattr(application, "execute_prepared_process_operation", None)
+        authorize = getattr(run, "authorize_action", None)
+        if not callable(prepare) or not callable(execute) or not callable(authorize):
+            raise BridgeError("process_unavailable", "process operations are unavailable")
+
+        pending: dict[str, object] | None = None
+        if permission_id is not None:
+            pending_value = self._pending_process_operations.pop(permission_id, None)
+            if not isinstance(pending_value, dict):
+                raise BridgeError("permission_request_expired", "process permission request is no longer pending")
+            if pending_value.get("application") is not application or pending_value.get("run") is not run:
+                raise BridgeError("permission_request_expired", "process permission request belongs to another Session")
+            if pending_value.get("operation") != operation:
+                raise BridgeError("permission_request_mismatch", "process permission request does not match the operation")
+            pending = pending_value
+            prepared = pending.get("prepared")
+            decision = pending.get("decision")
+        else:
+            if choice is not None:
+                raise BridgeError("invalid_request", "permission_choice requires permission_id")
+            prepared = prepare(operation)
+            if not hasattr(prepared, "action"):
+                message = str(getattr(prepared, "content", "Error: invalid Process arguments"))
+                raise BridgeError("invalid_request", message)
+            try:
+                decision = authorize(prepared.action)
+            except Exception:
+                raise BridgeError("permission_error", "process permission evaluation failed") from None
+
+        if decision is None or not hasattr(decision, "decision"):
+            raise BridgeError("permission_error", "process permission evaluation failed")
+        if decision.action != prepared.action:
+            raise BridgeError("permission_error", "process permission action changed")
+        if getattr(decision.decision, "value", decision.decision) == "deny":
+            raise BridgeError("permission_denied", "permission denied")
+        if getattr(decision.decision, "value", decision.decision) == "ask" and choice is None:
+            snapshot = getattr(run, "snapshot", lambda: None)()
+            run_id = getattr(snapshot, "run_id", "desktop-process-run") or "desktop-process-run"
+            turn_id = getattr(snapshot, "turn_id", "desktop-process-turn") or "desktop-process-turn"
+            call = getattr(prepared, "call", None)
+            tool_call_id = getattr(call, "tool_call_id", uuid4().hex)
+            request = PermissionApprovalRequest.from_decision(
+                decision,
+                permission_id=uuid4().hex,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+            )
+            self._pending_process_operations[request.permission_id] = {
+                "application": application,
+                "run": run,
+                "operation": operation,
+                "prepared": prepared,
+                "decision": decision,
+            }
+            return {"permission_required": request.to_dict()}
+        if choice is PermissionApprovalChoice.REJECT:
+            raise BridgeError("permission_denied", "permission rejected")
+        token = CancellationToken()
+        token.session_id = self._session_id_for_application(application)  # type: ignore[attr-defined]
+        try:
+            outcome = await execute(prepared, cancellation=token)
+        except asyncio.CancelledError:
+            token.cancel()
+            raise BridgeError("process_cancelled", "process operation was cancelled") from None
+        except Exception:
+            raise BridgeError("process_error", f"process.{action} failed") from None
+        if getattr(outcome, "is_error", False):
+            content = str(getattr(outcome, "content", "process operation failed"))
+            failure = getattr(getattr(outcome, "failure", None), "kind", "process_failed")
+            raise BridgeError(
+                "permission_denied" if failure == "permission_denied" else "process_error",
+                content,
+            )
+        if choice is PermissionApprovalChoice.SESSION:
+            grant = getattr(run, "grant_action_for_session", None)
+            if callable(grant):
+                grant(prepared.action)
+        return self._process_operation_result(action, outcome)
+
+    @staticmethod
+    def _process_operation_result(action: str, outcome: object) -> dict[str, object]:
+        details = getattr(outcome, "details", {})
+        if not isinstance(details, Mapping):
+            details = {}
+        projected = _json_safe(details)
+        if not isinstance(projected, dict):
+            projected = {}
+        if action == "list":
+            processes = projected.get("processes", [])
+            return {"processes": processes if isinstance(processes, list) else []}
+        if action == "read":
+            entries = projected.get("entries", [])
+            result: dict[str, object] = {
+                "process_id": getattr(outcome, "process_id", None),
+                "entries": entries if isinstance(entries, list) else [],
+                "next_cursor": int(getattr(outcome, "next_cursor", "0") or 0),
+                "earliest_cursor": projected.get("earliest_cursor", 0),
+                "cursor_expired": projected.get("cursor_expired", False),
+                "state": getattr(outcome, "process_state", None),
+                "exit_code": getattr(outcome, "exit_code", None),
+                "expired": projected.get("expired", False),
+                "expiration_reason": projected.get("expiration_reason"),
+            }
+            return result
+        return {
+            "process_id": getattr(outcome, "process_id", None),
+            "state": getattr(outcome, "process_state", None),
+            "exit_code": getattr(outcome, "exit_code", None),
+            "confirmed": action == "stop" and getattr(outcome, "process_state", None) == "exited",
+        }
+
+    async def _process_list(self, params: Mapping[str, object]) -> dict[str, object]:
+        return await self._process_operation(params, action="list", required=set())
+
+    async def _process_read(self, params: Mapping[str, object]) -> dict[str, object]:
+        return await self._process_operation(params, action="read", required={"process_id"})
+
+    async def _process_write(self, params: Mapping[str, object]) -> dict[str, object]:
+        return await self._process_operation(params, action="write", required={"process_id"})
+
+    async def _process_stop(self, params: Mapping[str, object]) -> dict[str, object]:
+        return await self._process_operation(params, action="stop", required={"process_id"})
+
+    async def _process_permission_release(
+        self,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Drop a prepared Process approval without executing its operation.
+
+        Renderer cancellation/navigation has already decided not to execute
+        the destructive call.  This narrow cleanup boundary only removes the
+        Bridge-owned prepared record; it never invokes a Tool or manager.
+        """
+
+        _require_params(
+            params,
+            {"permission_id", "process_id"},
+            method="process.permission.release",
+        )
+        permission_id = _text_param(params, "permission_id")
+        process_id = _text_param(params, "process_id")
+        pending = self._pending_process_operations.get(permission_id)
+        if pending is None:
+            return {"permission_id": permission_id, "released": False}
+        operation = pending.get("operation")
+        if not isinstance(operation, Mapping) or operation.get("process_id") != process_id:
+            raise BridgeError(
+                "permission_request_mismatch",
+                "process permission request does not match the process",
+            )
+        self._pending_process_operations.pop(permission_id, None)
+        return {"permission_id": permission_id, "released": True}
+
+    async def _process_resize(self, params: Mapping[str, object]) -> dict[str, object]:
+        return await self._process_operation(
+            params,
+            action="resize",
+            required={"process_id", "rows", "cols"},
+        )
 
     async def _turn_start(self, params: Mapping[str, object]) -> dict[str, object]:
         allowed = {"prompt", "attachments"}
@@ -3247,7 +3588,21 @@ class DesktopBridge:
                 continue
             seen_applications.add(id(application))
             close = getattr(application, "close", None)
-            if callable(close):
+            close_async = getattr(application, "close_async", None)
+            if callable(close_async):
+                try:
+                    await close_async()
+                except Exception:
+                    self._state = "failed"
+                    if publish_state:
+                        self._publish(
+                            RuntimeStateEnvelope(
+                                "failed",
+                                ErrorPayload("application_close_failed", "Application close failed"),
+                            )
+                        )
+                    return
+            elif callable(close):
                 try:
                     close()
                 except Exception:
@@ -3260,8 +3615,10 @@ class DesktopBridge:
                             )
                         )
                     return
+            self._unbind_process_events(application)
         self._background_runtimes.clear()
         self._compaction_operations.clear()
+        self._pending_process_operations.clear()
         self._state = "stopped"
         if publish_state:
             self._publish(RuntimeStateEnvelope("stopped"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from importlib import import_module
 from os import PathLike
 from pathlib import Path
@@ -18,6 +19,7 @@ from uthcode.integrations.config.loader import (
     resolve_user_home,
 )
 from uthcode.integrations.tools.factory import create_default_tools
+from uthcode.integrations.tools.process_sessions import ProcessSessionManager
 from uthcode.integrations.permissions import load_permission_rules
 from uthcode.integrations.instruction_files import (
     InstructionFileReader,
@@ -344,6 +346,12 @@ def create_application(
         store=session_store,
     )
     attachment_service = AttachmentService(session_service.store)
+    process_manager = runtime_context.process_manager
+    if process_manager is None:
+        process_manager = ProcessSessionManager()
+        runtime_context = replace(runtime_context, process_manager=process_manager)
+    elif not isinstance(process_manager, ProcessSessionManager):
+        raise TypeError("runtime_context.process_manager must be a ProcessSessionManager or None")
     set_asset_resolver = getattr(provider, "set_asset_resolver", None)
     if callable(set_asset_resolver):
         def resolve_asset(asset_ref: str, _mime_type: str) -> bytes | None:
@@ -365,6 +373,9 @@ def create_application(
         create_default_tools(
             runtime_context.workdir,
             on_path_access=loader.activate_for_path,
+            attachment_service=attachment_service,
+            session_provider=lambda: session_service.active_session,
+            process_manager=process_manager,
         )
         if tools is None
         else tuple(tools)

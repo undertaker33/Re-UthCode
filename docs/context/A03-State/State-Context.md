@@ -35,6 +35,8 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Session 原始附件由 `AttachmentFileStore` 绑定到所属 Session：导入副本以 opaque ref、SHA-256、大小、MIME、图片尺寸和 submitted 状态持久化；导入和请求边界共用有限的图片宽、高、像素限制，所有 `asset_ref` 必须属于 active Session。Transcript/replay/Context 只保存可重读 ref 与安全元数据。已提交原图不会被草稿或派生缓存清理删除，未提交临时文件与派生预览可重建清理。
 - `[FACT]` 图片输入在 Application 的 Turn 与模型候选边界预检；`supports_images` 为 `true`、`false` 或未知，未知按不支持。待发 GenerationRequest 的图片 count、来源、字节和独立 token 估算进入受控 request diagnostics；有来源尺寸/字节的 local estimate 会进入 `RequestAccounting`/Gate，未知估计按不可安全发送处理，Provider Integration 的实际 count 仍优先。Provider Integration 在请求边界解析 active Session asset ref，Context compaction 只有在保留 ref coverage 且 Working Context 严格下降后才提交。
 - `[FACT]` Desktop Renderer 以 `project_key + session_id` 缓存每个 Session 的 timeline、Todo、Run、interaction、Context/Compact 和终态投影，支持后台 Turn 事件在不可见时继续更新。该缓存仅是 Interface state，Session Transcript/Timeline/metadata 仍是唯一持久语义来源。
+- `[FACT]` ProcessSessionManager 持有 Session-owned 活进程及默认 2 MiB 的有界 UTF-8 输出环；每个 Session 默认保留 32 个正常终态和 128 个 `expired` 淘汰事实。`read` 通过单调 cursor 返回增量、最早位置和 cursor 过期事实，淘汰后仍可读取明确的过期原因。进程在 ToolCall/Turn 完成后仍可发布 `process_output`/`process_state`，Application 统一按 Session/process identity 做跨 chunk Secret 脱敏，再由 Desktop/Renderer 更新日志；这些事件不进入 RunState、Transcript、History 或 Provider Context。
+- `[FACT]` Turn 终态的清理边界是本 Turn 新建进程；成功 Turn 保留服务进程并允许下一 Turn 读取/控制，取消/失败只清理本 Turn，Session/Application shutdown 才清理全部进程。UI 日志和 Bridge outbox 都有界，游标过期要求从 `process.read` 重新读取当前环。
 - `[BOUNDARY]` Session v3 持久化 metadata（schema 3）、Transcript、Timeline、Tool Result ref、writer lock 和 Instruction State；record envelope 仍为 schema 2。v1/v2 明确 incompatible，不迁移、不双读；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## History 持久化与恢复
@@ -64,6 +66,7 @@ Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call �
 | 压缩候选与提交编排 | `src/uthcode/core/compaction.py` + `src/uthcode/application/compaction.py` + `src/uthcode/application/generation.py` | `ContextCompactor`, `compaction_input_payload`, `compact_session`, `validate_candidate` |
 | JSONL 存储与分页 | `src/uthcode/integrations/session_files.py` | `SessionFileStore`, `SessionHistorySlice`, `read_first_user_entry` |
 | Application 环境快照 | `src/uthcode/application/runtime_context.py` | `ApplicationRuntimeContext` |
+| Process 会话与观察 | `src/uthcode/integrations/tools/process_sessions.py` + `src/uthcode/application/generation.py` | `ProcessSessionManager`, `ProcessRead`, `subscribe_process_events`, `project_process_output` |
 | 配置模型 | `src/uthcode/application/configuration.py` | `EffectiveConfig`, `ProviderProfile`, `ModelProfile`, `ConfigSource` |
 | TUI 投影状态 | `src/uthcode/interfaces/tui/` | `rendering.py`, `interaction.py`, `state.py` |
 
@@ -159,14 +162,17 @@ assistant_message_delta / assistant_message_completed
 usage_updated
 tool_batch_started
 tool_started / tool_progress* / tool_finished
-tool_batch_finished
-turn_pausing? / user_input_requested? / turn_paused / turn_resumed?
-turn_completed | turn_failed | turn_cancelled
+   tool_batch_finished
+   turn_pausing? / user_input_requested? / turn_paused / turn_resumed?
+   turn_completed | turn_failed | turn_cancelled
 ```
+
+Process 的 `process_output`/`process_state` 观察事件不插入上述 Turn 序列；它们按 Session/process identity 和单调 sequence 独立到达，允许在 `turn_completed` 之后继续更新后台日志。
 
 - `events()` 只有一个消费者；`result()` 可重复等待并返回相同终态。
 - Event 是内容安全投影：工具原始结果、写入正文、秘密值不得进入工具活动事件。
 - `ToolProgress` 只承载执行期间的有界观察；它由 Application 脱敏并按 Run/Turn/iteration/batch/tool identity 发布，既不进入 History，也不成为模型上下文。
+- Process output/state 同样只承载有界观察；Application 按跨 chunk 尾部规则脱敏后投影给 Interface，不能因为事件晚于 ToolFinished/TurnCompleted 就重开 Turn 或写入 History。
 - Tool Result 的结构化图片、文件和来源引用保留次序；大结果只把文本正文写入 Session ref，inline、externalized 和 persistence failure 的可见结果都保留这些引用，失败元数据叠加而不覆盖已知执行事实。
 - `AssistantMessageCompleted.message` 是公开化后的消息；Provider 原生 item 不应泄漏到 Interface。
 - TUI 对已提交终端内容只追加，不维护可替代 Core conversation 的 transcript 状态。
@@ -186,6 +192,7 @@ implemented context:
   Planning context          = BehaviorMode + PlanState + TaskState + RuntimeFeedback
   Plan stream                = PlanContentDelta text projection -> PlanProposed -> typed Plan Review
   Status projection          = Application context_status + compaction_status
+  Process observation        = Session-owned ProcessRead ring/cursor -> Application redaction -> Desktop per-Session log
   Desktop live display       = Bridge live_delta estimate + Renderer per-Session cache; no authority
   Turn snapshots            = provider/model/tool definitions/rules captured at defined boundaries
 
@@ -203,6 +210,7 @@ not implemented context:
 - 同一 Run 同时最多一个 active Turn；终态必须释放 active slot。
 - Pause 不是 `RunStatus`；不要新增第二套 paused state 与 Core continuation 竞争权威性。
 - JSON 方法不等于 Runtime checkpoint；只有 Application Session lifecycle 明确调用时才执行 durable Transcript/Timeline append，不由 Core 或 Interface 隐式写盘。
+- Process observer、Bridge outbox 和 Renderer process log 都是有界投影；它们不能成为新的状态权威，也不能以日志事件恢复或重放进程输入。
 
 ## 修改路由
 

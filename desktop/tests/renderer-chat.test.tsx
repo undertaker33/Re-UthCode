@@ -88,6 +88,56 @@ test("ChatTimeline replays durable attachment metadata with an image preview and
   assert.match(markup, /12 B/u);
 });
 
+test("ChatTimeline renders bounded Session process observations separately from the Turn timeline", () => {
+  const markup = renderEnglish(<ChatTimeline
+    entries={[]}
+    todo={[]}
+    processLogs={[
+      { processId: "process-1", sequence: 1, stream: "stdout", text: "live output" },
+      { processId: "process-1", sequence: 2, stream: "status", text: "", state: "exited", exitCode: 0 },
+    ]}
+    sessionKey="process-session"
+  />);
+  assert.match(markup, /data-process-log="true"/u);
+  assert.match(markup, /Process logs \(2\)/u);
+  assert.match(markup, /live output/u);
+  assert.match(markup, /\[status\] exited/u);
+});
+
+test("ChatTimeline exposes process.read continuation and terminal facts", () => {
+  const reads: Array<[string, number]> = [];
+  const stopped: string[] = [];
+  const markup = renderEnglish(<ChatTimeline
+    entries={[]}
+    todo={[]}
+    processLogs={[
+      { processId: "process-1", sequence: 4, stream: "stdout", text: "available" },
+    ]}
+    processReaders={{
+      "process-1": {
+        nextCursor: 9,
+        earliestCursor: 4,
+        cursorExpired: true,
+        state: "running",
+        expired: false,
+        loading: false,
+        error: null,
+      },
+    }}
+    onReadProcess={(processId, cursor) => reads.push([processId, cursor])}
+    onStopProcess={(processId) => stopped.push(processId)}
+    sessionKey="process-session"
+  />);
+  assert.match(markup, /Read newer/u);
+  assert.match(markup, /Load earliest/u);
+  assert.match(markup, />Stop</u);
+  assert.match(markup, /Cursor expired; earliest cursor: 4/u);
+  assert.match(markup, /data-process-session="process-session"/u);
+  assert.match(markup, /data-process-owner="process-1"/u);
+  assert.deepEqual(reads, []);
+  assert.deepEqual(stopped, []);
+});
+
 test("code fence copy preserves exact raw body for empty, CRLF, blank, whitespace, and unclosed fences", async () => {
   const cases: Array<[string, string]> = [
     ["```text\n```", ""],

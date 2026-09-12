@@ -210,6 +210,27 @@ export interface TimelineEntry {
   attachments?: DesktopAttachmentDraft[];
 }
 
+export interface ProcessLogEntry {
+  processId: string;
+  sequence: number;
+  stream: "stdout" | "stderr" | "terminal" | "status";
+  text: string;
+  state?: string;
+  exitCode?: number | null;
+  nextCursor?: number;
+  cursorExpired?: boolean;
+}
+
+export interface ProcessReaderState {
+  nextCursor: number;
+  earliestCursor: number;
+  cursorExpired: boolean;
+  state: string | null;
+  expired: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
 export interface SessionHistoryState {
   /** Durable pages only; live events remain in the per-session runtime cache. */
   records: TimelineEntry[];
@@ -328,6 +349,10 @@ export interface RendererState {
   /** Increments only when the visible Session/Project timeline is replaced. */
   sessionViewRevision: number;
   nextStatusId: number;
+  /** Bounded live process logs keyed by project/session identity. */
+  processLogs: Record<string, ProcessLogEntry[]>;
+  /** Cursor and request ownership facts for continuation through process.read. */
+  processReaders: Record<string, Record<string, ProcessReaderState>>;
 }
 
 export interface SessionRuntimeSnapshot {
@@ -399,6 +424,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   ignoredRunIds: [],
   sessionViewRevision: 0,
   nextStatusId: 1,
+  processLogs: {},
+  processReaders: {},
 };
 
 export function createInitialState(overrides: Partial<RendererState> = {}): RendererState {
@@ -424,6 +451,12 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
       }]))
       : {},
     sessionPreparation: overrides.sessionPreparation ? { ...overrides.sessionPreparation } : {},
+    processLogs: overrides.processLogs
+      ? Object.fromEntries(Object.entries(overrides.processLogs).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry }))]))
+      : {},
+    processReaders: overrides.processReaders
+      ? Object.fromEntries(Object.entries(overrides.processReaders).map(([key, readers]) => [key, Object.fromEntries(Object.entries(readers).map(([processId, reader]) => [processId, { ...reader }]))]))
+      : {},
   };
 }
 
@@ -698,6 +731,136 @@ const SETTLED_TURN_EVENT_TYPES = new Set([
   "turn_resumed",
 ]);
 
+function reduceProcessEvent(state: RendererState, event: AgentEvent): RendererState {
+  const payload = event as Record<string, JsonValue>;
+  const processId = nonEmptyText(payload.process_id);
+  const sessionId = nonEmptyText(payload.session_id);
+  if (!processId || !sessionId) return state;
+  const projectKey = nonEmptyText(payload.project_key) ?? state.selectedProjectKey ?? "";
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  const sequence = typeof payload.sequence === "number" && Number.isSafeInteger(payload.sequence) && payload.sequence >= 0
+    ? payload.sequence
+    : 0;
+  const streamValue = nonEmptyText(payload.stream);
+  const stream: ProcessLogEntry["stream"] = streamValue === "stderr" || streamValue === "terminal" || streamValue === "status" ? streamValue : "stdout";
+  const text = textValue(payload.text);
+  const previous = state.processLogs[key] ?? [];
+  if (payload.type === "process_output" && previous.some((entry) => entry.processId === processId && entry.sequence === sequence)) return state;
+  const existing = previous.filter((entry) => !(entry.processId === processId && entry.sequence === sequence));
+  const entry: ProcessLogEntry = {
+    processId,
+    sequence,
+    stream,
+    text,
+    ...(nonEmptyText(payload.state) ? { state: nonEmptyText(payload.state) ?? undefined } : {}),
+    ...(typeof payload.exit_code === "number" || payload.exit_code === null ? { exitCode: payload.exit_code as number | null } : {}),
+    ...(typeof payload.next_cursor === "number" ? { nextCursor: payload.next_cursor } : {}),
+  };
+  const nextEntries = [...existing, entry]
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-128);
+  const previousReaders = state.processReaders[key] ?? {};
+  const previousReader = previousReaders[processId];
+  const nextCursor = typeof payload.next_cursor === "number" && Number.isSafeInteger(payload.next_cursor) && payload.next_cursor >= 0
+    ? payload.next_cursor
+    : previousReader?.nextCursor ?? 0;
+  const nextReader: ProcessReaderState = {
+    nextCursor,
+    earliestCursor: previousReader?.earliestCursor ?? (nextEntries[0]?.sequence ?? nextCursor),
+    cursorExpired: previousReader?.cursorExpired ?? false,
+    state: nonEmptyText(payload.state) ?? previousReader?.state ?? null,
+    expired: previousReader?.expired ?? false,
+    loading: false,
+    error: previousReader?.error ?? null,
+  };
+  return {
+    ...state,
+    processLogs: { ...state.processLogs, [key]: nextEntries },
+    processReaders: {
+      ...state.processReaders,
+      [key]: { ...previousReaders, [processId]: nextReader },
+    },
+  };
+}
+
+function processReaderFor(state: RendererState, key: string, processId: string): ProcessReaderState {
+  return state.processReaders[key]?.[processId] ?? {
+    nextCursor: 0,
+    earliestCursor: 0,
+    cursorExpired: false,
+    state: null,
+    expired: false,
+    loading: false,
+    error: null,
+  };
+}
+
+function reduceProcessReadStarted(state: RendererState, action: Extract<RendererAction, { type: "process_read_started" }>): RendererState {
+  const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+  const previous = processReaderFor(state, key, action.processId);
+  return {
+    ...state,
+    processReaders: {
+      ...state.processReaders,
+      [key]: {
+        ...(state.processReaders[key] ?? {}),
+        [action.processId]: { ...previous, loading: true, error: null },
+      },
+    },
+  };
+}
+
+function reduceProcessReadLoaded(state: RendererState, action: Extract<RendererAction, { type: "process_read_loaded" }>): RendererState {
+  const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+  const source = asRecord(action.result);
+  if (!source) return state;
+  const rawEntries = Array.isArray(source.entries) ? source.entries : [];
+  const entries: ProcessLogEntry[] = rawEntries.flatMap((value) => {
+    const item = asRecord(value);
+    if (!item) return [];
+    const sequence = item.sequence;
+    if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) return [];
+    const streamValue = nonEmptyText(item.stream);
+    const stream: ProcessLogEntry["stream"] = streamValue === "stderr" || streamValue === "terminal" || streamValue === "status" ? streamValue : "stdout";
+    return [{
+      processId: action.processId,
+      sequence,
+      stream,
+      text: textValue(item.text),
+      ...(typeof source.state === "string" ? { state: source.state } : {}),
+      ...(typeof source.exit_code === "number" || source.exit_code === null ? { exitCode: source.exit_code as number | null } : {}),
+      ...(typeof source.next_cursor === "number" ? { nextCursor: source.next_cursor } : {}),
+      ...(source.cursor_expired === true ? { cursorExpired: true } : {}),
+    }];
+  });
+  const previous = state.processLogs[key] ?? [];
+  const byIdentity = new Map(previous.map((entry) => [`${entry.processId}:${entry.sequence}`, entry]));
+  entries.forEach((entry) => byIdentity.set(`${entry.processId}:${entry.sequence}`, entry));
+  const nextEntries = [...byIdentity.values()].sort((left, right) => left.sequence - right.sequence).slice(-128);
+  const nextCursor = typeof source.next_cursor === "number" && Number.isSafeInteger(source.next_cursor) && source.next_cursor >= 0 ? source.next_cursor : (entries.at(-1)?.nextCursor ?? processReaderFor(state, key, action.processId).nextCursor);
+  const earliestCursor = typeof source.earliest_cursor === "number" && Number.isSafeInteger(source.earliest_cursor) && source.earliest_cursor >= 0 ? source.earliest_cursor : (nextEntries[0]?.sequence ?? nextCursor);
+  const reader: ProcessReaderState = {
+    nextCursor,
+    earliestCursor,
+    cursorExpired: source.cursor_expired === true,
+    state: typeof source.state === "string" ? source.state : null,
+    expired: source.expired === true,
+    loading: false,
+    error: null,
+  };
+  return {
+    ...state,
+    processLogs: { ...state.processLogs, [key]: nextEntries },
+    processReaders: { ...state.processReaders, [key]: { ...(state.processReaders[key] ?? {}), [action.processId]: reader } },
+  };
+}
+
+function reduceProcessReadError(state: RendererState, action: Extract<RendererAction, { type: "process_read_error" }>): RendererState {
+  const key = sessionRuntimeKey(action.projectKey, action.sessionId);
+  const previous = processReaderFor(state, key, action.processId);
+  return { ...state, processReaders: { ...state.processReaders, [key]: { ...(state.processReaders[key] ?? {}), [action.processId]: { ...previous, loading: false, error: action.message } } } };
+}
+
 function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererState {
   const payload = event as Record<string, JsonValue>;
   const type = textValue(payload.type);
@@ -705,6 +868,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   const eventRunId = nonEmptyText(payload.run_id);
   const currentRunId = nonEmptyText(state.run?.run_id);
   const currentTurnId = nonEmptyText(state.run?.turn_id);
+  if (type === "process_output" || type === "process_state") return reduceProcessEvent(state, event);
   if (eventRunId && state.ignoredRunIds.includes(eventRunId)) return state;
   if (eventRunId && currentRunId && eventRunId !== currentRunId) return state;
   // Agent events are scoped to a complete Run/Turn identity. Runtime-only
@@ -937,6 +1101,9 @@ export type RendererAction =
   | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
   | { type: "compaction_started"; trigger?: CompactionTrigger; operationId?: string; sessionId?: string; projectKey?: string }
   | { type: "agent_event"; event: AgentEvent }
+  | { type: "process_read_started"; projectKey: string; sessionId: string; processId: string }
+  | { type: "process_read_loaded"; projectKey: string; sessionId: string; processId: string; result: unknown }
+  | { type: "process_read_error"; projectKey: string; sessionId: string; processId: string; message: string }
   | { type: "session_result_seen"; key: string; revision: number }
   | { type: "interaction_submitting"; value: boolean }
   | { type: "session_mutation_busy"; value: boolean }
@@ -1280,6 +1447,12 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       const stored = { ...state.sessionRuntime, [key]: snapshot };
       return updateSessionRuntimeStatus({ ...state, sessionRuntime: stored }, eventProjectKey, eventSessionId as string, runtimeStatus(snapshot));
     }
+    case "process_read_started":
+      return reduceProcessReadStarted(state, action);
+    case "process_read_loaded":
+      return reduceProcessReadLoaded(state, action);
+    case "process_read_error":
+      return reduceProcessReadError(state, action);
     case "interaction_submitting":
       return state.pendingInteraction ? { ...state, pendingInteraction: { ...state.pendingInteraction, submitting: action.value } } : state;
     case "session_mutation_busy":
@@ -1447,6 +1620,8 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           runtimeError: null,
           runtimeState: "stopped",
           sessionRuntime: {},
+          processLogs: {},
+          processReaders: {},
           ignoredRunIds: [...new Set(invalidatedRunIds)].slice(-20),
           sessionViewRevision: state.sessionViewRevision + 1,
         };

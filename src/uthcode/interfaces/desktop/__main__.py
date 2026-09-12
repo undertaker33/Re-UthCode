@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
-
-from uthcode.interfaces.desktop.bridge import DesktopBridge
 
 
 def _configure_utf8_stdio() -> None:
@@ -19,6 +18,12 @@ def _configure_utf8_stdio() -> None:
 
 def main() -> None:
     _configure_utf8_stdio()
+    if "--uthcode-pdf-worker" in sys.argv[1:]:
+        worker_module = importlib.import_module("uthcode.integrations.pdf_worker")
+        worker_module.main()
+        return
+    from uthcode.interfaces.desktop.bridge import DesktopBridge
+
     asyncio.run(DesktopBridge().serve_forever())
 
 

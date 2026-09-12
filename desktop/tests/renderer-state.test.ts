@@ -809,6 +809,103 @@ test("T08 reducer ignores late stream data and duplicate tool terminals", () => 
   assert.equal(reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "late-answer", text: "late" })), state);
 });
 
+test("T09 process events remain visible after Turn completion, dedupe, and expire by bound", () => {
+  const projectKey = "C:/Projects/process-events";
+  const sessionKey = sessionRuntimeKey(projectKey, "session-1");
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-1",
+    run: { run_id: "run-1", turn_id: "turn-1", status: "completed" },
+    activeTurn: false,
+    turnStatus: "completed",
+  });
+  const event = (sequence: number, type: "process_output" | "process_state" = "process_output"): AgentEvent => ({
+    type,
+    project_key: projectKey,
+    session_id: "session-1",
+    process_id: "process-1",
+    sequence,
+    next_cursor: sequence + 1,
+    stream: "stdout",
+    text: type === "process_output" ? `line-${sequence}` : "",
+    ...(type === "process_state" ? { state: "exited", exit_code: 0 } : {}),
+  });
+
+  const dispatch = (value: AgentEvent): void => {
+    state = reduceRendererState(state, { type: "agent_event", event: value });
+  };
+  dispatch(event(0));
+  dispatch(event(1));
+  const deduped = reduceRendererState(state, { type: "agent_event", event: event(1) });
+  assert.equal(deduped.processLogs[sessionKey]?.length, 2);
+  for (let sequence = 2; sequence < 140; sequence += 1) dispatch(event(sequence));
+  dispatch(event(140, "process_state"));
+  const logs = state.processLogs[sessionKey] ?? [];
+  assert.equal(logs.length, 128);
+  assert.equal(logs[0]?.sequence, 13);
+  assert.equal(logs.at(-1)?.state, "exited");
+  assert.equal(state.timeline.length, 0, "late process observations do not mutate the Turn timeline");
+});
+
+test("T09 process.read continuation merges pages and exposes cursor expiry", () => {
+  const projectKey = "C:/Projects/process-read";
+  const sessionId = "session-1";
+  const sessionKey = sessionRuntimeKey(projectKey, sessionId);
+  let state = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: sessionId });
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: {
+      type: "process_output",
+      project_key: projectKey,
+      session_id: sessionId,
+      process_id: "process-1",
+      sequence: 4,
+      next_cursor: 5,
+      stream: "stdout",
+      text: "live",
+    },
+  });
+  state = reduceRendererState(state, {
+    type: "process_read_started",
+    projectKey,
+    sessionId,
+    processId: "process-1",
+  });
+  assert.equal(state.processReaders[sessionKey]?.["process-1"]?.loading, true);
+  state = reduceRendererState(state, {
+    type: "process_read_loaded",
+    projectKey,
+    sessionId,
+    processId: "process-1",
+    result: {
+      entries: [
+        { sequence: 1, stream: "stdout", text: "earliest" },
+        { sequence: 4, stream: "stdout", text: "live replay" },
+      ],
+      next_cursor: 9,
+      earliest_cursor: 1,
+      cursor_expired: true,
+      state: "exited",
+      exit_code: 0,
+    },
+  });
+  const logs = state.processLogs[sessionKey] ?? [];
+  assert.deepEqual(logs.map((entry) => entry.sequence), [1, 4]);
+  assert.equal(state.processReaders[sessionKey]?.["process-1"]?.nextCursor, 9);
+  assert.equal(state.processReaders[sessionKey]?.["process-1"]?.earliestCursor, 1);
+  assert.equal(state.processReaders[sessionKey]?.["process-1"]?.cursorExpired, true);
+  assert.equal(state.processReaders[sessionKey]?.["process-1"]?.state, "exited");
+
+  const stale = reduceRendererState(state, {
+    type: "process_read_loaded",
+    projectKey: "C:/Projects/other",
+    sessionId,
+    processId: "process-1",
+    result: { entries: [{ sequence: 20, stream: "stdout", text: "stale" }], next_cursor: 21 },
+  });
+  assert.equal(stale.processLogs[sessionKey]?.length, 2);
+});
+
 test("T08 TaskState projection keeps the newest iteration", () => {
   let state = createInitialState({ run: { run_id: "run-1", turn_id: "turn-1", status: "running" }, activeTurn: true, turnStatus: "running" });
   const event = (iteration: number, content: string) => ({ type: "agent_event" as const, event: { type: "task_state_changed", run_id: "run-1", turn_id: "turn-1", iteration, task_state: { items: [{ content, status: "in_progress" }] } } });
