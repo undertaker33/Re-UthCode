@@ -43,6 +43,7 @@ from .configuration import (
 )
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
 from .sessions import ApplicationSessionService
+from .attachments import AttachmentService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
@@ -342,6 +343,24 @@ def create_application(
         instruction_loader=loader,
         store=session_store,
     )
+    attachment_service = AttachmentService(session_service.store)
+    set_asset_resolver = getattr(provider, "set_asset_resolver", None)
+    if callable(set_asset_resolver):
+        def resolve_asset(asset_ref: str, _mime_type: str) -> bytes | None:
+            if not isinstance(asset_ref, str) or not asset_ref.startswith("attachment:"):
+                return None
+            parts = asset_ref.split(":", 2)
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                return None
+            active = session_service.active_session
+            if active is None or parts[1] != active.session_id:
+                return None
+            try:
+                return attachment_service.read(active.session_id, parts[2])
+            except Exception:
+                return None
+
+        set_asset_resolver(resolve_asset)
     tool_values = (
         create_default_tools(
             runtime_context.workdir,
@@ -373,6 +392,7 @@ def create_application(
         ),
         instruction_loader=loader,
         session_service=session_service,
+        attachment_service=attachment_service,
     )
 
 

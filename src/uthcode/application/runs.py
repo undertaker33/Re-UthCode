@@ -256,7 +256,10 @@ class AgentRun:
     def start_turn(self, user_input: str | MessageInput) -> TurnHandle:
         """Synchronously reserve the Run and return a lazily driven Turn."""
 
-        MessageInput.normalize(user_input)
+        normalized = MessageInput.normalize(user_input)
+        preflight = getattr(self._application, "_preflight_user_input", None)
+        if callable(preflight):
+            preflight(normalized)
         if self._active_turn is not None:
             raise RuntimeError("AgentRun already has an active Turn")
         if any(batch.blocked for batch in self._pending_persistence_batches):

@@ -309,6 +309,28 @@ class _LoadedSnapshot:
     timeline_record_sequence: int
 
 
+def _attachment_refs_in_value(value: object, *, session_id: str) -> frozenset[str]:
+    """Find durable attachment refs without interpreting legacy Message shapes."""
+
+    prefix = f"attachment:{session_id}:"
+    found: set[str] = set()
+
+    def visit(item: object) -> None:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if key == "asset_ref" and isinstance(nested, str) and nested.startswith(prefix):
+                    ref = nested[len(prefix) :]
+                    if ref:
+                        found.add(ref)
+                visit(nested)
+        elif isinstance(item, (tuple, list)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return frozenset(found)
+
+
 class _ExclusiveFileLock:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -537,6 +559,86 @@ class SessionFileStore:
 
         return ToolResultFileStore(self).persist(session_id, content, policy=policy)  # type: ignore[arg-type]
 
+    def persist_attachment(
+        self,
+        session_id: str,
+        content: bytes | bytearray | memoryview,
+        *,
+        display_name: str,
+        mime_type: str | None = None,
+        policy: object | None = None,
+    ) -> object:
+        from .attachment_files import AttachmentFileStore
+
+        return AttachmentFileStore(self, policy=policy).persist(  # type: ignore[arg-type]
+            session_id,
+            content,
+            display_name=display_name,
+            mime_type=mime_type,
+        )
+
+    def read_attachment(self, session_id: str, ref: str) -> bytes:
+        from .attachment_files import AttachmentFileStore
+
+        return AttachmentFileStore(self).read(session_id, ref)
+
+    def mark_attachment_submitted(self, session_id: str, ref: str) -> object:
+        from .attachment_files import AttachmentFileStore
+
+        return AttachmentFileStore(self).mark_submitted(session_id, ref)
+
+    def remove_draft_attachment(self, session_id: str, ref: str) -> None:
+        from .attachment_files import AttachmentFileStore
+
+        AttachmentFileStore(self).remove_draft(session_id, ref)
+
+    def cleanup_attachments(self, session_id: str) -> dict[str, int]:
+        from .attachment_files import AttachmentFileStore
+
+        return AttachmentFileStore(self).cleanup(session_id)
+
+    def attachment_is_durable(self, session_id: str, ref: str) -> bool:
+        """Return whether durable Transcript currently owns an attachment ref."""
+
+        snapshot = self.read_session(session_id)
+        refs = _attachment_refs_in_value(
+            tuple(entry.to_dict() for entry in snapshot.transcript.entries),
+            session_id=session_id,
+        )
+        return ref in refs
+
+    def reconcile_attachment_lifecycle(
+        self,
+        session_id: str,
+        referenced_refs: Sequence[str] | None = None,
+    ) -> dict[str, int]:
+        """Reconcile submitted metadata and cleanup at a Session boundary."""
+
+        from .attachment_files import AttachmentError, AttachmentFileStore
+
+        store = AttachmentFileStore(self)
+        if referenced_refs is None:
+            snapshot = self.read_session(session_id)
+            refs = _attachment_refs_in_value(
+                tuple(entry.to_dict() for entry in snapshot.transcript.entries),
+                session_id=session_id,
+            )
+        else:
+            refs = frozenset(referenced_refs)
+        submitted = 0
+        failed = 0
+        for ref in sorted(refs):
+            try:
+                before = store.reference(session_id, ref)
+                if not before.submitted:
+                    store.mark_submitted(session_id, ref)
+                    submitted += 1
+            except (AttachmentError, OSError):
+                failed += 1
+        result = store.cleanup(session_id)
+        result.update({"submitted": submitted, "submission_failed": failed})
+        return result
+
     def read_tool_result(self, session_id: str, ref: str, *, offset: int = 0, limit: int | None = None, policy: object | None = None) -> object:
         from .tools.tool_result_read import ToolResultFileStore
 
@@ -611,6 +713,7 @@ class SessionWriter:
         try:
             self._loaded = self.store._load_snapshot(path, expected_project_key=self.expected_project_key)
             self._repair_tails()
+            self._reconcile_attachment_lifecycle()
         except Exception:
             self._lock.release()
             raise
@@ -622,8 +725,12 @@ class SessionWriter:
 
     def close(self) -> None:
         if not self._closed:
-            self._closed = True
-            self._lock.release()
+            try:
+                if self._loaded is not None:
+                    self._reconcile_attachment_lifecycle()
+            finally:
+                self._closed = True
+                self._lock.release()
 
     @property
     def durability_unknown(self) -> bool:
@@ -729,6 +836,62 @@ class SessionWriter:
             self.quarantine_unknown_durability()
             return TranscriptAppendOutcome(self.snapshot, False, False, False, "transcript_durability_unknown", "unknown")
         return self._finish_transcript(True, None)
+
+    def persist_attachment(
+        self,
+        content: bytes | bytearray | memoryview,
+        *,
+        display_name: str,
+        mime_type: str | None = None,
+        policy: object | None = None,
+    ) -> object:
+        """Persist one imported attachment while this Session is owned."""
+
+        self._require_writable()
+        return self.store.persist_attachment(
+            self.session_id,
+            content,
+            display_name=display_name,
+            mime_type=mime_type,
+            policy=policy,
+        )
+
+    def read_attachment(self, ref: str) -> bytes:
+        self._require_open()
+        return self.store.read_attachment(self.session_id, ref)
+
+    def mark_attachment_submitted(self, ref: str) -> object:
+        self._require_writable()
+        return self.store.mark_attachment_submitted(self.session_id, ref)
+
+    def remove_draft_attachment(self, ref: str) -> None:
+        self._require_writable()
+        self.store.remove_draft_attachment(self.session_id, ref)
+
+    def cleanup_attachments(self) -> dict[str, int]:
+        self._require_writable()
+        return self.store.cleanup_attachments(self.session_id)
+
+    def _reconcile_attachment_lifecycle(self) -> None:
+        """Best-effort boundary reconciliation; durable History remains authoritative."""
+
+        self._require_open()
+        assert self._loaded is not None
+        refs = _attachment_refs_in_value(
+            tuple(entry.to_dict() for entry in self._loaded.snapshot.transcript.entries),
+            session_id=self.session_id,
+        )
+        try:
+            self.store.reconcile_attachment_lifecycle(self.session_id, tuple(refs))
+        except Exception:
+            # The append is already durable.  Reopening retries metadata
+            # reconciliation; deletion remains blocked by the durable scan.
+            return
+
+    def reconcile_attachment_lifecycle(self) -> None:
+        """Retry attachment metadata reconciliation while this writer is open."""
+
+        self._reconcile_attachment_lifecycle()
 
     def _finish_transcript(self, reload_succeeded: bool, failure_stage: str | None) -> TranscriptAppendOutcome:
         metadata_synced = True

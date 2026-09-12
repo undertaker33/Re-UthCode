@@ -1766,6 +1766,7 @@ class ApplicationContextService:
         disable_reductions: bool = False,
         reduction_levels: Sequence[str] = (),
         current_turn_id: str | None = None,
+        request_metadata_builder: Callable[[GenerationRequest], Mapping[str, object]] | None = None,
         publish: bool = True,
     ) -> tuple[GenerationRequest, ContextSnapshot]:
         """Compile and, when limits are supplied, preflight one final request.
@@ -1828,6 +1829,8 @@ class ApplicationContextService:
             not isinstance(current_turn_id, str) or not current_turn_id
         ):
             raise ValueError("current_turn_id must be a non-empty string or None")
+        if request_metadata_builder is not None and not callable(request_metadata_builder):
+            raise TypeError("request_metadata_builder must be callable or None")
         reduction_levels = tuple(reduction_levels)
         if any(not isinstance(level, str) or not level for level in reduction_levels):
             raise ValueError("reduction_levels must contain non-empty strings")
@@ -1894,7 +1897,7 @@ class ApplicationContextService:
         }
 
         def build_candidate(candidate_messages: Sequence[Message]) -> GenerationRequest:
-            return GenerationRequest(
+            request = GenerationRequest(
                 messages=tuple(candidate_messages),
                 system_prompt=prompt,
                 model=model,
@@ -1904,6 +1907,15 @@ class ApplicationContextService:
                 temperature=temperature,
                 metadata=base_metadata,
             )
+            if request_metadata_builder is not None:
+                additions = request_metadata_builder(request)
+                if not isinstance(additions, Mapping):
+                    raise TypeError("request_metadata_builder must return a mapping")
+                request = replace(
+                    request,
+                    metadata={**dict(request.metadata), **dict(additions)},
+                )
+            return request
 
         request = build_candidate(conversation)
         accounting = account_generation_request(request)
@@ -1964,12 +1976,21 @@ class ApplicationContextService:
                         accounting=accounting,
                         pressure_count=pressure_count,
                     )
-            if not gate.hard_safe and not defer_hard_gate:
+            # Context-only callers are used for read-only candidate snapshots
+            # (for example compaction comparisons) and have no Integration
+            # source from which to resolve attachment bytes.  The formal
+            # Application request path always supplies ``request_metadata_builder``
+            # and therefore enforces the unavailable-image Hard Gate here.
+            image_gate_deferred = (
+                request_metadata_builder is None
+                and "image_estimate_unavailable" in gate.reason
+            )
+            if not gate.hard_safe and not defer_hard_gate and not image_gate_deferred:
                 raise ContextRequestSafetyError(
                     "final request failed the preflight Hard Gate: " + gate.reason
                 )
 
-        metadata = dict(base_metadata)
+        metadata = dict(request.metadata)
         metadata["request_accounting"] = accounting.to_dict()
         if context_budget is not None and gate is not None:
             metadata["context_budget"] = context_budget.to_dict()

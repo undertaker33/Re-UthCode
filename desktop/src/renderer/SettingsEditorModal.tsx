@@ -191,6 +191,7 @@ export function SettingsEditorModal({
           context_window: null,
           max_output_tokens: null,
           reasoning_effort: null,
+          supports_images: false,
         },
       },
     }));
@@ -342,6 +343,7 @@ export function SettingsEditorModal({
                 <div className="settings-row"><label htmlFor={modelFieldId(fieldPrefix, editingModelRef, "context")}>{t("contextWindow")}</label><input id={modelFieldId(fieldPrefix, editingModelRef, "context")} type="number" min="1" value={editedModel.context_window == null ? "" : String(editedModel.context_window)} onChange={(event) => updateModel(editingModelRef, "context_window", parseOptionalPositiveInteger(event.target.value))} disabled={settingsBusy} /></div>
                 <div className="settings-row"><label htmlFor={modelFieldId(fieldPrefix, editingModelRef, "output")}>{t("maxOutput")}</label><input id={modelFieldId(fieldPrefix, editingModelRef, "output")} type="number" min="1" value={editedModel.max_output_tokens == null ? "" : String(editedModel.max_output_tokens)} onChange={(event) => updateModel(editingModelRef, "max_output_tokens", parseOptionalPositiveInteger(event.target.value))} disabled={settingsBusy} /></div>
                 <div className="settings-row"><span className="settings-row__label">{t("reasoning")}</span><CustomSelect id={modelFieldId(fieldPrefix, editingModelRef, "reasoning")} label={t("reasoning")} value={stringValue(editedModel.reasoning_effort)} options={reasoningEffortOptions.map((value) => ({ value, label: value || "—" }))} onChange={(value) => updateModel(editingModelRef, "reasoning_effort", value || null)} disabled={settingsBusy} /></div>
+                <label className="settings-default-toggle"><input type="checkbox" checked={editedModel.supports_images === true} onChange={(event) => updateModel(editingModelRef, "supports_images", event.target.checked)} disabled={settingsBusy} />{t("supportsImages")}</label>
                 <label className="settings-default-toggle"><input type="checkbox" checked={draft.default_model === editingModelRef} onChange={(event) => { if (!settingsBusy && event.target.checked) onDraftChange((current) => ({ ...current, default_model: editingModelRef })); }} disabled={settingsBusy} />{t("makeDefault")}</label>
               </>}
             </div>

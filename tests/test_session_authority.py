@@ -85,6 +85,48 @@ def test_legacy_metadata_without_title_is_read_without_rewrite(tmp_path: Path) -
     assert metadata_path.read_bytes() == before
 
 
+def test_existing_text_session_reopens_without_duplicate_records_or_dual_write(
+    tmp_path: Path,
+) -> None:
+    source, _target, store = _paths(tmp_path)
+    project_key = str(source.resolve())
+    session_id = "legacy-text"
+    store.create_session(session_id, project_key=project_key)
+    legacy = TranscriptEntry(
+        session_id,
+        1,
+        "turn-text",
+        TranscriptKind.USER_MESSAGE,
+        {
+            "type": "text",
+            "message": Message("user", (TextPart("你好，旧文字会话"),)).to_dict(),
+        },
+        semantic_unit_id="turn-text",
+    )
+    transcript_path = store.session_path(session_id) / "transcript.jsonl"
+    timeline_path = store.session_path(session_id) / "timeline.jsonl"
+    session_files._append_jsonl(
+        transcript_path,
+        ({"schema_version": 2, "kind": "transcript", "sequence": 1, "entry": legacy.to_dict()},),
+    )
+    before_transcript = transcript_path.read_bytes()
+    before_timeline = timeline_path.read_bytes()
+
+    application, _service = _real_application(store, project_key)
+    try:
+        first = application.resume_session_for_command(session_id)
+        first_replay = first.replay
+        first_entries = first.transcript.entries
+        application.close()
+        second = application.resume_session_for_command(session_id)
+        assert second.transcript.entries == first_entries == (legacy,)
+        assert second.replay == first_replay
+        assert transcript_path.read_bytes() == before_transcript
+        assert timeline_path.read_bytes() == before_timeline
+    finally:
+        application.close()
+
+
 @pytest.mark.parametrize("title", ["", " \n\t ", "x" * (SESSION_TITLE_MAX_LENGTH + 1)])
 def test_title_validation_rejects_empty_or_overlong_values(tmp_path: Path, title: str) -> None:
     source, _target, store = _paths(tmp_path)

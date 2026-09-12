@@ -96,6 +96,11 @@ export function sourceConfig(value: ConfigurationView | null): ConfigurationWrit
       context_window: profile.context_window ?? null,
       max_output_tokens: profile.max_output_tokens ?? null,
       reasoning_effort: profile.reasoning_effort ?? null,
+      supports_images: profile.supports_images === true
+        ? true
+        : profile.supports_images === false
+          ? false
+          : null,
     };
   }
   const requestedDefault = stringValue(value?.default_model);

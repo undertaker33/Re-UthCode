@@ -1,4 +1,4 @@
-import type { JsonValue } from "../desktop-api";
+import type { DesktopAttachmentDraft, JsonValue } from "../desktop-api";
 import type {
   CompactionState,
   CompactionStatusProjection,
@@ -245,6 +245,34 @@ export function messageReasoning(value: unknown): string {
     .join("");
 }
 
+function normalizeAttachment(value: unknown): DesktopAttachmentDraft | null {
+  const source = asRecord(value);
+  const ref = nonEmptyText(source?.ref);
+  const displayName = nonEmptyText(source?.display_name) ?? nonEmptyText(source?.name);
+  const mimeType = nonEmptyText(source?.mime_type);
+  const size = typeof source?.size_bytes === "number" && Number.isSafeInteger(source.size_bytes) && source.size_bytes >= 0
+    ? source.size_bytes
+    : null;
+  if (!ref || !displayName || !mimeType || size === null) return null;
+  const width = typeof source?.width === "number" && Number.isSafeInteger(source.width) && source.width > 0 ? source.width : null;
+  const height = typeof source?.height === "number" && Number.isSafeInteger(source.height) && source.height > 0 ? source.height : null;
+  const dataUrl = typeof source?.data_url === "string" && /^data:[^,]+,/.test(source.data_url) ? source.data_url : undefined;
+  return {
+    ref,
+    display_name: displayName,
+    mime_type: mimeType,
+    size_bytes: size,
+    ...(width !== null ? { width } : {}),
+    ...(height !== null ? { height } : {}),
+    ...(dataUrl ? { data_url: dataUrl } : {}),
+  };
+}
+
+export function normalizeAttachments(value: unknown): DesktopAttachmentDraft[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(normalizeAttachment).filter((item): item is DesktopAttachmentDraft => item !== null);
+}
+
 export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
   return records
     .map((value, index) => ({ value: asRecord(value), index }))
@@ -265,6 +293,7 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
           ? kind
           : "status";
       const sequence = typeof source.sequence === "number" ? source.sequence : index + 1;
+      const attachments = normalizeAttachments(source.attachments);
       const statusValue = source.status;
       const terminalStatus: TimelineStatus = statusValue === "failed" || statusValue === "error" || statusValue === "rejected"
         ? "failed"
@@ -290,6 +319,7 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
         planState: normalizedKind === "plan"
           ? terminalStatus === "failed" ? "failed" : terminalStatus === "cancelled" ? "cancelled" : "final"
           : undefined,
+        ...(attachments.length > 0 ? { attachments } : {}),
         sequence,
       };
     });

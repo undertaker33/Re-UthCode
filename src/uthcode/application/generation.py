@@ -28,13 +28,18 @@ from uthcode.core.provider import (
     CancellationToken,
     GenerationCancelled,
     GenerationRequest,
+    FilePart,
+    ImagePart,
     Message,
     MessageInput,
     ModelLimits,
     ProviderIdentity,
+    ProviderConfigurationError,
     ProviderPort,
     ReasoningOptions,
+    SourcePart,
     ToolDefinition,
+    ToolResultPart,
     Usage,
 )
 from uthcode.core.history import (
@@ -71,6 +76,7 @@ from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
+from .attachments import AttachmentService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
@@ -157,6 +163,48 @@ def _reasoning_options(effort: str | None) -> ReasoningOptions | None:
     if effort is None:
         return None
     return ReasoningOptions(enabled=effort != "none", effort=effort)
+
+
+def _part_has_image(part: object) -> bool:
+    if isinstance(part, ImagePart):
+        return True
+    if isinstance(part, ToolResultPart):
+        return any(_part_has_image(item) for item in part.content.parts)
+    return False
+
+
+def _message_input_has_images(value: MessageInput) -> bool:
+    return any(_part_has_image(part) for part in value.parts)
+
+
+def _transcript_has_images(entries: object, *, after_sequence: int = 0) -> bool:
+    if not isinstance(entries, Sequence):
+        return False
+    for entry in entries:
+        sequence = getattr(entry, "sequence", None)
+        if isinstance(sequence, int) and sequence <= after_sequence:
+            continue
+        payload = getattr(entry, "payload", None)
+        if not isinstance(payload, Mapping):
+            continue
+        part = payload.get("part")
+        if isinstance(part, Mapping) and part.get("type") == "image":
+            return True
+        nested = part.get("content") if isinstance(part, Mapping) else None
+        if isinstance(nested, Sequence) and any(
+            isinstance(item, Mapping) and item.get("type") == "image"
+            for item in nested
+        ):
+            return True
+        message = payload.get("message")
+        if isinstance(message, Mapping):
+            parts = message.get("parts")
+            if isinstance(parts, Sequence) and any(
+                isinstance(item, Mapping) and item.get("type") == "image"
+                for item in parts
+            ):
+                return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +321,7 @@ class UthCodeApplication:
         instruction_loader: InstructionLoader | None = None,
         context_service: ApplicationContextService | None = None,
         session_service: ApplicationSessionService | None = None,
+        attachment_service: AttachmentService | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -301,11 +350,15 @@ class UthCodeApplication:
             raise TypeError("context_service must be ApplicationContextService or None")
         if session_service is not None and not isinstance(session_service, ApplicationSessionService):
             raise TypeError("session_service must be ApplicationSessionService or None")
+        if attachment_service is not None and not isinstance(attachment_service, AttachmentService):
+            raise TypeError("attachment_service must be AttachmentService or None")
         self._tool_service = tool_service
         self._permission_rules_loader = permission_rules_loader
         self._instruction_loader = instruction_loader
         self._context_service = context_service or ApplicationContextService()
         self._session_service = session_service
+        self._attachment_service = attachment_service
+        self._configure_provider_asset_resolver(self._provider)
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
         self._last_provider_request_usage = public_usage_diagnostics(None)
         self._history_persistence_diagnostics: dict[str, object] = {
@@ -382,6 +435,54 @@ class UthCodeApplication:
         """Return the optional durable Session lifecycle service."""
 
         return self._session_service
+
+    @property
+    def attachment_service(self) -> AttachmentService | None:
+        """Return the Session-owned attachment import service, if configured."""
+
+        return self._attachment_service
+
+    def import_attachment(
+        self,
+        content: bytes | bytearray | memoryview,
+        *,
+        display_name: str,
+        mime_type: str | None = None,
+        session_id: str | None = None,
+    ):
+        service = self._attachment_service
+        active = self._active_session_id()
+        requested = active if session_id is None else session_id
+        if service is None or active is None:
+            raise RuntimeError("durable Session attachments are not configured")
+        if requested != active:
+            raise ProviderConfigurationError("attachment Session does not own the active Application Session")
+        return service.import_bytes(
+            requested,
+            content,
+            display_name=display_name,
+            mime_type=mime_type,
+        )
+
+    def preview_attachment(self, ref: str, *, session_id: str | None = None) -> dict[str, object]:
+        service = self._attachment_service
+        active = self._active_session_id()
+        requested = active if session_id is None else session_id
+        if service is None or active is None:
+            raise RuntimeError("durable Session attachments are not configured")
+        if requested != active:
+            raise ProviderConfigurationError("attachment Session does not own the active Application Session")
+        return service.preview(requested, ref)
+
+    def remove_attachment(self, ref: str, *, session_id: str | None = None) -> None:
+        service = self._attachment_service
+        active = self._active_session_id()
+        requested = active if session_id is None else session_id
+        if service is None or active is None:
+            raise RuntimeError("durable Session attachments are not configured")
+        if requested != active:
+            raise ProviderConfigurationError("attachment Session does not own the active Application Session")
+        service.remove_draft(requested, ref)
 
     @property
     def current_model_ref(self) -> str:
@@ -840,6 +941,10 @@ class UthCodeApplication:
                 candidate_messages=candidate_messages,
                 disable_reductions=disable_reductions,
                 reduction_levels=reduction_levels,
+                request_metadata_builder=lambda request: self._request_metadata(
+                    request,
+                    expected_session_id=owner_session.session_id,
+                ),
                 publish=False,
             )
             return request
@@ -1196,6 +1301,126 @@ class UthCodeApplication:
                 "Session History durability is unknown; close and reopen the "
                 "Session to reconcile before starting a new Turn"
             )
+
+    def _preflight_user_input(self, user_input: str | MessageInput) -> None:
+        """Reject image input before a Run accepts/clears the composer draft."""
+
+        normalized = MessageInput.normalize(user_input)
+        self._validate_parts_assets(normalized.parts, expected_session_id=self._active_session_id())
+        if not _message_input_has_images(normalized):
+            return
+        model = self.current_model
+        if model is None or model.supports_images is not True:
+            raise ProviderConfigurationError(
+                "selected model does not explicitly support image input"
+            )
+
+    def _preflight_model_images(
+        self,
+        model: ModelProfile,
+        *,
+        transcript: object | None = None,
+        timeline: object | None = None,
+    ) -> None:
+        """Validate a candidate against images in its prospective context.
+
+        A committed Context Timeline replaces the covered raw turns with
+        text summaries for the next request.  Keep the source image in the
+        durable Transcript, while allowing a text model after that image has
+        actually exited the working request through normal compaction.
+        """
+
+        if model.supports_images is True:
+            return
+        if transcript is None:
+            session = self._session_service.active_session if self._session_service is not None else None
+            transcript = None if session is None else session.transcript
+        entries = getattr(transcript, "entries", ())
+        covered_end = getattr(timeline, "sequence_end", 0)
+        if isinstance(covered_end, bool) or not isinstance(covered_end, int):
+            covered_end = 0
+        if not _transcript_has_images(entries, after_sequence=covered_end):
+            return
+        raise ProviderConfigurationError(
+            "selected model does not explicitly support image input in Session history"
+        )
+
+    def _validate_asset_ref(
+        self,
+        asset_ref: object,
+        *,
+        expected_session_id: str | None,
+        image_dimensions: tuple[int | None, int | None] = (None, None),
+        expected_size_bytes: int | None = None,
+    ) -> None:
+        """Validate one Provider-visible attachment reference at Application input."""
+
+        if not isinstance(asset_ref, str) or not asset_ref.startswith("attachment:"):
+            return
+        parts = asset_ref.split(":", 2)
+        if len(parts) != 3 or not parts[1] or not parts[2]:
+            raise ProviderConfigurationError("attachment reference is malformed")
+        owner_session_id, ref = parts[1], parts[2]
+        if expected_session_id is None or owner_session_id != expected_session_id:
+            raise ProviderConfigurationError("attachment reference does not belong to the active Session")
+        service = self._attachment_service
+        if service is None:
+            raise ProviderConfigurationError("Session attachments are not configured")
+        try:
+            reference = service.reference(expected_session_id, ref)
+        except Exception as exc:
+            raise ProviderConfigurationError("attachment reference is unavailable") from exc
+        if reference.mime_type.startswith("image/"):
+            service.validate_image_dimensions(reference.width, reference.height)
+        width, height = image_dimensions
+        if width is not None or height is not None:
+            if (reference.width, reference.height) != (width, height):
+                raise ProviderConfigurationError("attachment image dimensions do not match its Session metadata")
+            service.validate_image_dimensions(width, height)
+        if expected_size_bytes is not None and expected_size_bytes != reference.size_bytes:
+            raise ProviderConfigurationError("attachment byte size does not match its Session metadata")
+
+    def _validate_parts_assets(
+        self,
+        parts: Sequence[object],
+        *,
+        expected_session_id: str | None,
+    ) -> None:
+        for part in parts:
+            if isinstance(part, (ImagePart, FilePart, SourcePart)):
+                if isinstance(part, ImagePart) and self._attachment_service is not None:
+                    self._attachment_service.validate_image_dimensions(part.width, part.height)
+                self._validate_asset_ref(
+                    part.asset_ref,
+                    expected_session_id=expected_session_id,
+                    image_dimensions=(
+                        (part.width, part.height)
+                        if isinstance(part, ImagePart)
+                        else (None, None)
+                    ),
+                    expected_size_bytes=(
+                        part.size_bytes
+                        if isinstance(part, FilePart)
+                        else None
+                    ),
+                )
+            elif isinstance(part, ToolResultPart):
+                self._validate_parts_assets(
+                    part.content.parts,
+                    expected_session_id=expected_session_id,
+                )
+
+    def _request_metadata(
+        self,
+        request: GenerationRequest,
+        *,
+        expected_session_id: str | None,
+    ) -> Mapping[str, object]:
+        self._validate_parts_assets(
+            tuple(part for message in request.messages for part in message.parts),
+            expected_session_id=expected_session_id,
+        )
+        return {"image_accounting": self._image_accounting(request, expected_session_id=expected_session_id)}
 
     @property
     def default_permission_mode(self) -> PermissionMode:
@@ -1965,6 +2190,10 @@ class UthCodeApplication:
                 ),
                 context_budget=context_budget,
                 defer_hard_gate=True,
+                request_metadata_builder=lambda request: self._request_metadata(
+                    request,
+                    expected_session_id=session_id,
+                ),
                 publish=True,
             )
         except Exception:
@@ -1994,7 +2223,120 @@ class UthCodeApplication:
         )
         if not isinstance(candidate_provider, ProviderPort):
             raise TypeError("Provider builder must return a ProviderPort")
+        self._configure_provider_asset_resolver(candidate_provider)
         return candidate_model, candidate_provider
+
+    def _configure_provider_asset_resolver(self, provider: ProviderPort) -> None:
+        service = self._attachment_service
+        setter = getattr(provider, "set_asset_resolver", None)
+        if service is None or not callable(setter):
+            return
+
+        def resolve_asset(asset_ref: str, _mime_type: str) -> bytes | None:
+            if not isinstance(asset_ref, str) or not asset_ref.startswith("attachment:"):
+                return None
+            parts = asset_ref.split(":", 2)
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                return None
+            if parts[1] != self._active_session_id():
+                return None
+            try:
+                return service.read(self._active_session_id() or "", parts[2])
+            except Exception:
+                return None
+
+        setter(resolve_asset)
+
+    def _image_accounting(
+        self,
+        request: GenerationRequest,
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return separate image count/size/token facts for request diagnostics."""
+
+        count = 0
+        image_bytes = 0
+        file_count = 0
+        file_bytes = 0
+        resolved = False
+        estimate_bytes = 0
+        estimate_available = True
+        estimate_sources: list[str] = []
+        service = self._attachment_service
+
+        def visit(part: object) -> None:
+            nonlocal count, image_bytes, file_count, file_bytes, resolved
+            nonlocal estimate_bytes, estimate_available
+            if isinstance(part, ImagePart):
+                count += 1
+                part_bytes = 0
+                width, height = part.width, part.height
+                was_resolved = False
+                if service is not None and part.asset_ref.startswith("attachment:"):
+                    pieces = part.asset_ref.split(":", 2)
+                    if len(pieces) == 3:
+                        try:
+                            reference = service.reference(pieces[1], pieces[2])
+                            self._validate_asset_ref(
+                                part.asset_ref,
+                                expected_session_id=expected_session_id,
+                                image_dimensions=(part.width, part.height),
+                            )
+                            part_bytes = reference.size_bytes
+                            width, height = reference.width, reference.height
+                            resolved = True
+                            was_resolved = True
+                        except ProviderConfigurationError:
+                            raise
+                        except Exception as exc:
+                            raise ProviderConfigurationError("attachment reference is unavailable") from exc
+                if part_bytes == 0 and part.width and part.height:
+                    part_bytes = part.width * part.height * 4
+                image_bytes += part_bytes
+                if width and height:
+                    expanded = width * height * 4
+                    estimate_bytes += max(part_bytes, expanded)
+                    estimate_sources.append(
+                        "attachment_store_dimensions" if was_resolved else "core_dimensions"
+                    )
+                elif part_bytes:
+                    estimate_bytes += part_bytes
+                    estimate_sources.append("attachment_store_bytes" if was_resolved else "core_bytes")
+                else:
+                    estimate_available = False
+            elif isinstance(part, FilePart):
+                file_count += 1
+                if part.size_bytes is not None:
+                    file_bytes += part.size_bytes
+            elif isinstance(part, ToolResultPart):
+                for nested in part.content.parts:
+                    visit(nested)
+
+        for message in request.messages:
+            for part in message.parts:
+                visit(part)
+        # This is a bounded structural estimate used for pressure accounting;
+        # provider token endpoints remain authoritative when available.
+        if count == 0:
+            estimate_available = True
+        image_tokens = (
+            max(1, (estimate_bytes + 127_999) // 128_000)
+            if count and estimate_available and estimate_bytes
+            else 0
+        )
+        estimate_source = "+".join(dict.fromkeys(estimate_sources)) if estimate_sources else "unavailable"
+        return {
+            "image_count": count,
+            "image_bytes": image_bytes,
+            "image_tokens": image_tokens,
+            "image_estimate_bytes": estimate_bytes,
+            "image_estimate_available": estimate_available,
+            "estimate_source": estimate_source,
+            "file_count": file_count,
+            "file_bytes": file_bytes,
+            "source": "attachment_store" if resolved else "core_parts",
+        }
 
     @staticmethod
     def _model_context_budget(
@@ -2223,6 +2565,11 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        self._preflight_model_images(
+            candidate_model,
+            transcript=snapshot.transcript,
+            timeline=snapshot.timeline,
+        )
         provider_limits = self._resolve_model_limits_sync_strict(
             candidate_model.remote_id,
             provider=candidate_provider,
@@ -2245,6 +2592,11 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        self._preflight_model_images(
+            candidate_model,
+            transcript=snapshot.transcript,
+            timeline=snapshot.timeline,
+        )
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
@@ -2258,6 +2610,11 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        self._preflight_model_images(
+            candidate_model,
+            transcript=session.transcript,
+            timeline=session.timeline,
+        )
         provider_limits = self._resolve_model_limits_sync_strict(
             candidate_model.remote_id,
             provider=candidate_provider,
@@ -2279,6 +2636,11 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        self._preflight_model_images(
+            candidate_model,
+            transcript=session.transcript,
+            timeline=session.timeline,
+        )
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
@@ -2297,6 +2659,12 @@ class UthCodeApplication:
         """Synchronously select a model for callers without an event loop."""
 
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        active = self._session_service.active_session if self._session_service is not None else None
+        self._preflight_model_images(
+            candidate_model,
+            transcript=None if active is None else active.transcript,
+            timeline=None if active is None else active.timeline,
+        )
         provider_limits = self._resolve_model_limits_sync_strict(
             candidate_model.remote_id,
             provider=candidate_provider,
@@ -2313,6 +2681,12 @@ class UthCodeApplication:
         """Select a model after resolving its Provider ceiling on this loop."""
 
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
+        active = self._session_service.active_session if self._session_service is not None else None
+        self._preflight_model_images(
+            candidate_model,
+            transcript=None if active is None else active.transcript,
+            timeline=None if active is None else active.timeline,
+        )
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
@@ -2351,6 +2725,7 @@ class UthCodeApplication:
 
         # A new Turn invalidates any exact usage from the previous terminal
         # boundary before Core can emit its first event.
+        self._preflight_user_input(user_input)
         self._context_service.refresh_context_estimate()
         provider = self._provider
         model_ref = self._current_model_ref
@@ -2614,6 +2989,10 @@ class UthCodeApplication:
                     defer_hard_gate=defer_hard_gate,
                     count_fallback=count_fallback,
                     current_turn_id=turn_id if active_session_id() is not None else None,
+                    request_metadata_builder=lambda request: self._request_metadata(
+                        request,
+                        expected_session_id=active_session_id(),
+                    ),
                     publish=publish,
                 )
                 return replace(
@@ -2659,6 +3038,10 @@ class UthCodeApplication:
                     disable_reductions=True,
                     reduction_levels=_request_reduction_levels(candidate),
                     current_turn_id=turn_id if active_session_id() is not None else None,
+                    request_metadata_builder=lambda request: self._request_metadata(
+                        request,
+                        expected_session_id=active_session_id(),
+                    ),
                     publish=publish,
                 )
                 return replace(

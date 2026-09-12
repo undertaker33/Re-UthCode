@@ -10,6 +10,8 @@ Application public exports or the strict protocol envelopes.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections.abc import Awaitable, Callable, Mapping
 from enum import Enum
 import inspect
@@ -23,6 +25,8 @@ from uuid import uuid4
 
 from uthcode.application import (
     AgentEvent,
+    AttachmentError,
+    AttachmentReference,
     agent_event_from_dict,
     ApplicationStatus,
     ApplicationRuntimeContext,
@@ -67,8 +71,11 @@ from uthcode.application import (
     read_user_api_key,
     read_user_configuration,
     write_user_configuration,
+    FilePart,
+    ImagePart,
+    MessageInput,
+    TextPart,
 )
-
 from .protocol import (
     AgentEventEnvelope,
     Envelope,
@@ -103,6 +110,9 @@ _METHODS = frozenset(
         "project.open",
         "project.sessions",
         "history.page",
+        "attachment.import",
+        "attachment.preview",
+        "attachment.remove",
         "session.new",
         "session.resume",
         "session.rename",
@@ -1333,6 +1343,12 @@ class DesktopBridge:
             return {"sessions": _catalog_entries(self._application_sessions())}
         if method == "history.page":
             return self._history_page(params)
+        if method == "attachment.import":
+            return await self._attachment_import(params)
+        if method == "attachment.preview":
+            return await self._attachment_preview(params)
+        if method == "attachment.remove":
+            return await self._attachment_remove(params)
         if method == "session.new":
             return await self._session_new(params)
         if method == "session.resume":
@@ -2279,9 +2295,111 @@ class DesktopBridge:
         if self._current_compaction_operation() is not None:
             raise BridgeError("compaction_active", f"{method} is unavailable during compaction")
 
+    async def _attachment_session_id(self) -> str:
+        application = self._application
+        if application is None:
+            raise BridgeError("application_required", "Application is not initialized")
+        ensure = getattr(application, "ensure_session_async", None)
+        if callable(ensure):
+            result = ensure()
+            if inspect.isawaitable(result):
+                await result
+        session_id = self._session_id_for_application(application)
+        if not session_id:
+            raise BridgeError("session_error", "Session could not be opened")
+        return session_id
+
+    async def _attachment_import(self, params: Mapping[str, object]) -> dict[str, object]:
+        missing = {"name", "data_base64"} - set(params)
+        extra = set(params) - {"name", "data_base64", "mime_type"}
+        if missing or extra:
+            if missing:
+                raise BridgeError(
+                    "invalid_request",
+                    f"attachment.import is missing fields: {sorted(missing)!r}",
+                )
+            raise BridgeError(
+                "invalid_request",
+                f"attachment.import has unknown fields: {sorted(extra)!r}",
+            )
+        name = _text_param(params, "name")
+        mime_type = params.get("mime_type")
+        if mime_type is not None and (not isinstance(mime_type, str) or not mime_type.strip()):
+            raise BridgeError("invalid_request", "mime_type is invalid")
+        encoded = params.get("data_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise BridgeError("invalid_request", "data_base64 must be non-empty")
+        # The byte hard cap is enforced again by AttachmentFileStore.  Keep
+        # the wire bound here so a malformed request cannot allocate an
+        # unbounded decode buffer before the Application boundary.
+        if len(encoded) > 24 * 1024 * 1024:
+            raise BridgeError("attachment_too_large", "attachment is too large")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise BridgeError("invalid_request", "data_base64 is invalid") from None
+        session_id = await self._attachment_session_id()
+        application = self._application
+        assert application is not None
+        try:
+            reference = application.import_attachment(
+                data,
+                display_name=name,
+                mime_type=mime_type,
+                session_id=session_id,
+            )
+        except AttachmentError as exc:
+            raise BridgeError(exc.code, "attachment could not be imported") from None
+        except (RuntimeError, ValueError, TypeError):
+            raise BridgeError("attachment_error", "attachment could not be imported") from None
+        if not isinstance(reference, AttachmentReference):
+            raise BridgeError("attachment_error", "attachment reference is invalid")
+        result = reference.to_dict()
+        result["asset_ref"] = reference.asset_ref
+        return {"attachment": result}
+
+    async def _attachment_preview(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"ref"}, method="attachment.preview")
+        ref = _text_param(params, "ref")
+        session_id = await self._attachment_session_id()
+        application = self._application
+        assert application is not None
+        try:
+            value = application.preview_attachment(ref, session_id=session_id)
+        except AttachmentError:
+            raise BridgeError("attachment_error", "attachment preview is unavailable") from None
+        except (RuntimeError, ValueError, TypeError):
+            raise BridgeError("attachment_error", "attachment preview is unavailable") from None
+        return {"attachment": value}
+
+    async def _attachment_remove(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"ref"}, method="attachment.remove")
+        ref = _text_param(params, "ref")
+        session_id = await self._attachment_session_id()
+        application = self._application
+        assert application is not None
+        try:
+            application.remove_attachment(ref, session_id=session_id)
+        except AttachmentError:
+            raise BridgeError("attachment_error", "attachment could not be removed") from None
+        except (RuntimeError, ValueError, TypeError):
+            raise BridgeError("attachment_error", "attachment could not be removed") from None
+        return {"removed": True, "ref": ref, "session_id": session_id}
+
     async def _turn_start(self, params: Mapping[str, object]) -> dict[str, object]:
-        _require_params(params, {"prompt"}, method="turn.start")
-        prompt = _text_param(params, "prompt")
+        allowed = {"prompt", "attachments"}
+        extra = set(params) - allowed
+        if extra:
+            raise BridgeError("invalid_request", f"turn.start has unknown fields: {sorted(extra)!r}")
+        raw_prompt = params.get("prompt", "")
+        if not isinstance(raw_prompt, str):
+            raise BridgeError("invalid_request", "prompt must be a string")
+        prompt = raw_prompt
+        raw_attachments = params.get("attachments", ())
+        if not isinstance(raw_attachments, (list, tuple)):
+            raise BridgeError("invalid_request", "attachments must be an array")
+        if not prompt.strip() and not raw_attachments:
+            raise BridgeError("invalid_request", "prompt or attachments is required")
         if self._pending_pause() is not None:
             raise BridgeError("interaction_pending", "pending interaction captures this input")
         if self._active_handle is not None:
@@ -2305,8 +2423,31 @@ class DesktopBridge:
         start = getattr(run, "start_turn", None)
         if not callable(start):
             raise BridgeError("turn_error", "Run cannot start a Turn")
+        user_input: object = prompt
+        if raw_attachments:
+            service = getattr(application, "attachment_service", None)
+            session_id = self._session_id_for_application(application)
+            if service is None or not session_id:
+                raise BridgeError("attachment_error", "Session attachments are unavailable")
+            parts: list[object] = []
+            if prompt.strip():
+                parts.append(TextPart(prompt))
+            for item in raw_attachments:
+                if not isinstance(item, Mapping):
+                    raise BridgeError("invalid_request", "attachment item must be an object")
+                ref = item.get("ref")
+                if not isinstance(ref, str) or not ref.strip():
+                    raise BridgeError("invalid_request", "attachment ref is invalid")
+                kind = item.get("kind")
+                if kind is not None and kind not in {"image", "file"}:
+                    raise BridgeError("invalid_request", "attachment kind is invalid")
+                try:
+                    parts.append(service.part(session_id, ref, kind=kind))
+                except Exception:
+                    raise BridgeError("attachment_error", "attachment is unavailable") from None
+            user_input = MessageInput(tuple(parts))
         try:
-            handle = start(prompt)
+            handle = start(user_input)
         except Exception:
             raise BridgeError("turn_error", "Turn could not be started") from None
         if handle is None:

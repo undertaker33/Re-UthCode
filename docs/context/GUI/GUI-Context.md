@@ -5,7 +5,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md
-snapshot_date: 2026-09-09
+snapshot_date: 2026-09-12
 verified_through_commit: 1218e31
 scope: Windows Desktop renderer + Electron bridge + Application session boundary
 source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/ + desktop/tests/ + tests/
@@ -20,6 +20,8 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
 - `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
+- `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
+- `[FACT]` Renderer 的附件导入/预览在跨 IPC await 前捕获 `project_key`、Session、`sessionViewRevision` 和运行代次 owner；返回后只向仍拥有该视图的 Composer 写入草稿或错误，切换 Session 不会把迟到结果污染新 Session，首次惰性创建 Session 仍可正常接收结果。
 - `[FACT]` `/model` 参数补全向用户显示 Model 的 `display_name`，但执行值仍为规范的 logical Model Profile ID。Settings 中 Provider 的可选 `display_name` 也只用于列表和弹窗标题，缺失时回退稳定 Provider Profile ID；修改显示名不会改变 Model 引用。Composer 的模型、权限选择器在 active Turn、pending interaction、Compact 或 runtime restart 时禁用，避免绕过 Application 边界。
 - `[FACT]` Context ring 和 Runtime panel 只展示 Application 的 `context_status`/`compaction_status`。Bridge 在 assistant/reasoning/plan 流式文本、Todo 状态和工具完成事件到来时记录有界 `live_delta` 估计；terminal Provider usage 只更新独立的 `Last Provider Request Usage` 投影，不覆盖当前 Working Context 的 measurement。Renderer 在 active Turn 或 Compact 期间以一秒节奏补充查询 `status.get`，不会以该轮询替代事件流。
 - `[FACT]` `desktop/src/renderer/state.ts` 是唯一 `RendererState`/reducer authority；`useRuntimeLifecycle` 独占 runtime generation、owner/tail、`AbortController`、stale guard 和 terminal convergence。`App.tsx` 只组合这些边界，不另建 Runtime/Run 生命周期状态机。
@@ -32,6 +34,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` 手动 `/compact` 返回操作身份后由 Session 所属的后台任务执行，Bridge 通过带 `session_id`、`project_key`、`operation_id` 的 `compaction_operation` 通知投影进度和结果。Composer 锁定该 Session 的普通输入并提供显式取消入口，`compaction.cancel` 校验 Session/操作身份；状态区分 completed、no_change、cancelled、failed，另保留有效提交 `changed` 与安全 `reason`，Runtime 面板显示原因和提交说明。无需 Compact 的成功 no-op 不伪造一次成功压缩。
 - `[FACT]` Bridge 请求接收仍串行，仅长时间手动压缩脱离该循环；切换 Session 不取消压缩，已停放的压缩运行时保留至终态。`/compact` 启动请求恢复使用普通 RPC 等待上限，不再靠免除 30 秒超时等待整个压缩。普通 RPC 超时只结束当前等待，迟到的合法响应不会把存活 Runtime 判为协议损坏；已超时请求的 ID 保留至响应到达或进程边界结束。关闭时取消活动操作、等待收尾，再关闭 writer；外层 PythonRuntime 保留有界 child 回收边界，重新启动不会自动重试旧压缩。
 - `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、界面主题和语言。API key 仅经受控配置写入/按需显示通道处理；Desktop preference 不保存 key。保存当前可见 Session 有 active Turn 时被禁止。
+- `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入，保存仍服从 active Turn 禁止边界。
 - `[FACT]` 普通 Session/Project navigation 与真正 `runtime.shutdown -> runtime.initialize` 生命周期分开显示：前者保留 operation gate 与 generation ownership，但不显示“正在重启”。`CustomSelect` 的 listbox 通过 `document.body` portal 进入 fixed overlay，按 trigger/viewport 几何上下放置，并在滚动、resize、键盘与 Escape 边界更新或关闭，因此不受 modal overflow 裁剪。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
 - `[BOUNDARY]` Desktop 只恢复已提交的 Session Transcript、Timeline、Tool Result ref、Instruction State 和 `model_ref`；不会跨进程恢复 active Turn、typed interaction waiter 或 Runtime checkpoint。
@@ -62,10 +65,10 @@ visible Session A 有 active Turn
 | --- | --- | --- |
 | Sidebar | Project/Session 目录、title/preview、pin、rename/move 和 per-Session 运行状态；选择一行不取消其他 Session 的后台 Turn | Session catalog + Renderer 的事件缓存；rename/move 由 Application 提交 |
 | Chat timeline | 最近历史优先显示，上翻按页加载；与当前 Session 的安全 AgentEvent 流合并 | Bridge 安全 DTO / Application Session |
-| Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring；Todo 条置于输入区上方 | Command/Turn/Context Application 投影 |
+| Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring、选择/粘贴/拖拽附件和仅附件发送；Todo 条置于输入区上方 | Command/Turn/Context/Session Attachment Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
-| Settings | Provider/Model/default/Permission 与 theme/language 编辑；不保存明文 API key 到 Desktop preference | Configuration Application boundary + Renderer preference |
+| Settings | Provider/Model/default/Permission 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference | Configuration Application boundary + Renderer preference |
 
 ## 修改路由
 
@@ -93,6 +96,7 @@ Settings draft / 单根编辑器             -> desktop/src/renderer/SettingsVie
 | runtime ownership、迟到事件和终态收敛 | `desktop/tests/renderer-runtime-lifecycle.test.tsx`、`runtime-process.test.ts` |
 | 单根 Settings、返回焦点和秘密显示生命周期 | `desktop/tests/renderer-settings.test.tsx` |
 | Markdown 原文复制、历史分页和阅读位置 | `desktop/tests/renderer-chat.test.tsx` |
+| 附件选择/粘贴/拖拽、预览/移除、仅附件发送和失败重发 | `desktop/tests/renderer-attachments.test.tsx`、`tests/test_desktop_bridge.py` |
 | 布局与临时 Focus Mode | `desktop/tests/renderer-state-ui.test.tsx`、`renderer.test.tsx` |
 | 冷 Session 准备、压缩取消及跨 Session 运行 | `tests/test_history_prepare_lifecycle.py`、`tests/test_desktop_bridge.py` |
 | 历史游标与持久压缩提示 | `tests/test_history_paging.py` |

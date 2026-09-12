@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type KeyboardEvent } from "react";
+import type { DesktopAttachmentDraft } from "../desktop-api";
 import type { ConfigurationView, ContextUsageProjection, PermissionModeProjection, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation, type TranslationKey } from "./i18n";
@@ -113,18 +114,28 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "runtimeState" | "composerText" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
+  state: Pick<RendererState, "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
   sessionPreparationStatus?: "preparing" | "ready" | "failed";
   onChange: (text: string) => void;
-  onSubmit: (text: string) => void | Promise<void>;
+  onSubmit: (text: string, attachments: readonly DesktopAttachmentDraft[]) => void | Promise<void>;
   onCommand: (text: string) => void | Promise<void>;
   onPause: () => void | Promise<void>;
   onCancel: () => void | Promise<void>;
   onCompactCancel?: () => void | Promise<void>;
   onDismissCompletion?: () => void;
+  onChooseAttachment: () => void | Promise<void>;
+  onPasteAttachment: () => void | Promise<void>;
+  onImportFile: (file: File) => void | Promise<void>;
+  onRemoveAttachment: (ref: string) => void | Promise<void>;
 }
 
-export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onCompactCancel, onDismissCompletion }: ComposerProps) {
+function attachmentSizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onCompactCancel, onDismissCompletion, onChooseAttachment, onPasteAttachment, onImportFile, onRemoveAttachment }: ComposerProps) {
   const { language, t } = useTranslation();
   const composerRef = useRef<HTMLElement>(null);
   const composing = useRef(false);
@@ -208,8 +219,21 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   }, [language, state.configuration, state.currentModelRef, state.modelCandidates]);
 
   const submit = () => {
-    if (inputLocked || !hasText) return;
-    void onSubmit(state.composerText);
+    const hasAttachmentOnlyPayload = !state.activeTurn && state.composerAttachments.length > 0;
+    if (inputLocked || (!hasText && !hasAttachmentOnlyPayload)) return;
+    void onSubmit(state.composerText, state.composerAttachments);
+  };
+
+  const handleDrop = (event: ReactDragEvent<HTMLElement>) => {
+    if (inputLocked || state.activeTurn || event.dataTransfer.files.length === 0) return;
+    event.preventDefault();
+    Array.from(event.dataTransfer.files).forEach((file) => { void onImportFile(file); });
+  };
+
+  const handlePaste = (event: ReactClipboardEvent<HTMLElement>) => {
+    if (inputLocked || state.activeTurn || event.clipboardData.files.length === 0) return;
+    event.preventDefault();
+    Array.from(event.clipboardData.files).forEach((file) => { void onImportFile(file); });
   };
 
   const chooseCompletion = (index: number) => {
@@ -262,7 +286,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   };
 
   return (
-    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined}>
+    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (!inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
       {state.todo.length > 0 && <section className="composer-todo todo-strip" tabIndex={0} aria-label={t("tasks")} data-iteration={state.todoIteration}>
         <header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{state.todo.length}</span></header>
         <ul>{state.todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>
@@ -284,18 +308,31 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
               control from the input action group. The visible control lives in the
               bottom toolbar; this zero-area proxy preserves that DOM contract while
               avoiding a second tab stop or accessible name. */}
-          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || !hasText} />
+          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && state.composerAttachments.length === 0))} />
         </div>
       </div>
+      {state.composerAttachments.length > 0 && <div className="composer-attachments" aria-label={t("attachments")}>
+        {state.composerAttachments.map((attachment) => <article className="composer-attachment" key={attachment.ref}>
+          {attachment.data_url && attachment.mime_type.startsWith("image/")
+            ? <img src={attachment.data_url} alt={attachment.display_name} />
+            : <span className="composer-attachment__fallback" aria-hidden="true">{attachment.mime_type.startsWith("image/") ? "IMG" : "FILE"}</span>}
+          <span className="composer-attachment__meta"><strong>{attachment.display_name}</strong><small>{attachmentSizeLabel(attachment.size_bytes)}</small></span>
+          <button type="button" title={t("attachmentRemove")} aria-label={`${t("attachmentRemove")}: ${attachment.display_name}`} onClick={() => void onRemoveAttachment(attachment.ref)} disabled={inputLocked || state.activeTurn}><UiIcon name="trash" /></button>
+        </article>)}
+      </div>}
       <div className="composer-toolbar">
         <div className="composer-selectors">
+          <div className="composer-attachment-actions">
+            <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" />{t("attachmentChoose")}</button>
+            <button type="button" title={t("attachmentPaste")} aria-label={t("attachmentPaste")} onClick={() => void onPasteAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="copy" />{t("attachmentPaste")}</button>
+          </div>
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>
         <div className="composer-model">
           <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />
         </div>
-        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || !hasText}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && state.composerAttachments.length === 0))}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
       </div>
     </section>
   );

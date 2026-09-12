@@ -29,6 +29,7 @@ from .generation import (
     pause_message,
 )
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
+from .attachments import AttachmentError, AttachmentReference, AttachmentService
 from .instructions import (
     InstructionAuthorization,
     InstructionBlock,
@@ -169,6 +170,9 @@ __all__ = [
     "ApplicationStatus",
     "ApplicationRuntimeContext",
     "ApplicationContextService",
+    "AttachmentError",
+    "AttachmentReference",
+    "AttachmentService",
     "ContextStatus",
     "CompactionStatus",
     "ApplicationSession",

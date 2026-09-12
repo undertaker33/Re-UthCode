@@ -14,6 +14,7 @@ import uthcode.interfaces.desktop.bridge as bridge_module
 
 from uthcode.application import (
     AgentEvent,
+    AttachmentService,
     ApplicationStatus,
     ApplicationRuntimeContext,
     ApplicationSessionService,
@@ -71,6 +72,7 @@ from uthcode.core.agent_events import (
     TurnPaused,
     agent_event_from_dict as core_agent_event_from_dict,
 )
+from uthcode.core.provider import ModelLimits
 from uthcode.core.permission import Effect, ResourceScope, RuleSet
 from uthcode.application import ToolResultPart
 from uthcode.integrations.providers.fake import FakeProvider
@@ -519,6 +521,92 @@ async def test_bridge_emits_ready_turn_events_in_application_order_and_rejects_s
         assert [event["type"] for event in events][-1] == "turn_completed"
         assert [event["turn_id"] for event in events]
         assert len({event["turn_id"] for event in events}) == 1
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_real_application_attachment_import_and_attachment_only_turn_have_one_durable_turn(
+    tmp_path: Path,
+) -> None:
+    """Exercise the Desktop JSONL path through the durable Application boundary."""
+
+    provider = FakeProvider(
+        events=(_completed("attachment received"),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.desktop"),
+    )
+    configuration = EffectiveConfig(
+        default_model="fake/vision",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/vision": ModelProfile(
+                "fake/vision",
+                "fake",
+                "vision-model",
+                supports_images=True,
+            ),
+        },
+    )
+    sessions = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=str(tmp_path.resolve()),
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=configuration,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path,
+            platform_name="test",
+            platform_release="1",
+            current_date="2026-09-12",
+        ),
+        session_service=sessions,
+        attachment_service=AttachmentService(sessions.store),
+    )
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+    try:
+        imported = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-import",
+                "attachment.import",
+                {
+                    "name": "inline.png",
+                    "mime_type": "image/png",
+                    "data_base64": "aW1hZ2UtYnl0ZXM=",
+                },
+            )
+        )
+        assert imported.ok is True
+        assert imported.result is not None
+        attachment = imported.result["attachment"]
+        assert isinstance(attachment, dict)
+        ref = attachment["ref"]
+        assert isinstance(ref, str)
+
+        started = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-turn",
+                "turn.start",
+                {"attachments": [{"ref": ref, "kind": "image"}]},
+            )
+        )
+        assert started.ok is True
+        await bridge.wait_for_idle()
+        assert len(provider.recorded_requests) == 1
+        assert len(provider.recorded_requests[0].messages) >= 1
+        assert any(
+            part.asset_ref == attachment["asset_ref"]
+            for message in provider.recorded_requests[0].messages
+            for part in message.parts
+            if hasattr(part, "asset_ref")
+        )
+        session = sessions.active_session
+        assert session is not None
+        assert len(session.transcript.entries) == 2
+        assert session.transcript.entries[0].kind.value == "user_message"
+        assert session.transcript.entries[1].kind.value == "assistant_message"
+        assert application.attachment_service.reference(session.session_id, ref).submitted is True
     finally:
         await bridge.shutdown()
 

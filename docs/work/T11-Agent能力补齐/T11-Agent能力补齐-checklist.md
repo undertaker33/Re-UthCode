@@ -24,22 +24,22 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T04 会话原始附件与历史恢复
 
-- [ ] A04（R02/R04）：通过 `tests/test_session_files.py`、`test_history_paging.py` 增补 验证；通过条件：源文件改变/删除后副本稳定；程序重开和历史分页仍可查看；无引用临时文件能清理，已提交原图不被缓存清除。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A07（R02/R04）：通过 `tests/test_session_authority.py` 增补及迁移样本 验证；通过条件：必要结构迁移保留既有文字 Session，重复打开无重复迁移/丢记录；不维持双写格式。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T04 的完成边界并记录对应代码/定向证据：删除源文件后已提交附件和图像仍能恢复；重发使用原副本；原图不会被缓存清除。
+- [x] A04（R02/R04）：通过 `tests/test_session_files.py`、`test_history_paging.py` 增补 验证；通过条件：源文件改变/删除后副本稳定；程序重开和历史分页仍可查看；无引用临时文件能清理，已提交原图不被缓存清除。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A07（R02/R04）：通过 `tests/test_session_authority.py` 增补及迁移样本 验证；通过条件：必要结构迁移保留既有文字 Session，重复打开无重复迁移/丢记录；不维持双写格式。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T04 的完成边界并记录对应代码/定向证据：删除源文件后已提交附件和图像仍能恢复；重发使用原副本；原图不会被缓存清除。
 
 ## T05 图片能力预检与 Context 压缩
 
-- [ ] A05（R03）：通过 `tests/test_provider_model_limits.py`、`test_configuration.py` 增补 验证；通过条件：新图/历史图阻止不支持模型请求；切换失败保留旧模型/草稿；压缩退出当前请求后可使用文字模型，ViewImage 明确不可用。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A06（R04）：通过 `tests/test_context_compiler.py`、`test_context_budget_gate.py`、`test_context_compaction.py` 增补 验证；通过条件：图像有非零且有来源计量；真实请求 Gate；压缩后 ref 可再读，候选实际缩小、无静默丢图/多摘要复制。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T05 的完成边界并记录对应代码/定向证据：图片正常退出请求后可切文字模型；不得暗中删图或压缩以强行切换；256K 文字 profile 不重调。
+- [x] A05（R03）：通过 `tests/test_provider_model_limits.py`、`test_configuration.py` 增补 验证；通过条件：新图/历史图阻止不支持模型请求；切换失败保留旧模型/草稿；压缩退出当前请求后可使用文字模型，ViewImage 明确不可用。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A06（R04）：通过 `tests/test_context_compiler.py`、`test_context_budget_gate.py`、`test_context_compaction.py` 增补 验证；通过条件：图像有非零且有来源计量；真实请求 Gate；压缩后 ref 可再读，候选实际缩小、无静默丢图/多摘要复制。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T05 的完成边界并记录对应代码/定向证据：图片正常退出请求后可切文字模型；不得暗中删图或压缩以强行切换；256K 文字 profile 不重调。
 
 ## T06 Desktop 附件输入与回放
 
-- [ ] A03（R01/R02）：通过 计划新增 `tests/test_attachments.py`；`desktop/tests/renderer-chat.test.tsx` / 新增附件交互用例 验证；通过条件：拖拽/选择/粘贴、仅附件发送、预览/移除、失败保留与重发；一个用户提交不产生重复 Turn。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A04（R02/R04）：通过 `tests/test_session_files.py`、`test_history_paging.py` 增补 验证；通过条件：源文件改变/删除后副本稳定；程序重开和历史分页仍可查看；无引用临时文件能清理，已提交原图不被缓存清除。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A05（R03）：通过 `tests/test_provider_model_limits.py`、`test_configuration.py` 增补 验证；通过条件：新图/历史图阻止不支持模型请求；切换失败保留旧模型/草稿；压缩退出当前请求后可使用文字模型，ViewImage 明确不可用。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T06 的完成边界并记录对应代码/定向证据：一个提交只有一个 Turn；切 Session 草稿归属正确；失败保留可编辑草稿；同一正式输入同时服务 Headless。
+- [x] A03（R01/R02）：通过 计划新增 `tests/test_attachments.py`；`desktop/tests/renderer-chat.test.tsx` / 新增附件交互用例 验证；通过条件：拖拽/选择/粘贴、仅附件发送、预览/移除、失败保留与重发；一个用户提交不产生重复 Turn。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A04（R02/R04）：通过 `tests/test_session_files.py`、`test_history_paging.py` 增补 验证；通过条件：源文件改变/删除后副本稳定；程序重开和历史分页仍可查看；无引用临时文件能清理，已提交原图不被缓存清除。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A05（R03）：通过 `tests/test_provider_model_limits.py`、`test_configuration.py` 增补 验证；通过条件：新图/历史图阻止不支持模型请求；切换失败保留旧模型/草稿；压缩退出当前请求后可使用文字模型，ViewImage 明确不可用。证据记录于 W02 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T06 的完成边界并记录对应代码/定向证据：一个提交只有一个 Turn；切 Session 草稿归属正确；失败保留可编辑草稿；同一正式输入同时服务 Headless。
 
 ## T07 文档定位读取与工具图片
 

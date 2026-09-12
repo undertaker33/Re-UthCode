@@ -93,6 +93,7 @@ _MODEL_MAPPING_FIELDS = frozenset(
         "context_window",
         "max_output_tokens",
         "reasoning_effort",
+        "supports_images",
     }
 )
 _REASONING_EFFORTS = frozenset(
@@ -173,6 +174,7 @@ class ModelProfile:
     context_window: int | None = None
     max_output_tokens: int | None = None
     reasoning_effort: str | None = None
+    supports_images: bool | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.model_ref, "model_ref")
@@ -204,6 +206,8 @@ class ModelProfile:
                 raise ConfigurationModelError(
                     "reasoning_effort must be one of: none, minimal, low, medium, high, xhigh, max"
                 )
+        if self.supports_images is not None and not isinstance(self.supports_images, bool):
+            raise ConfigurationModelError("supports_images must be a boolean or None")
         if self.display_name is None:
             object.__setattr__(self, "display_name", self.remote_id)
 
@@ -247,6 +251,7 @@ class UserModelView:
     context_window: object | None = None
     max_output_tokens: object | None = None
     reasoning_effort: object | None = None
+    supports_images: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_ref, str):
@@ -261,6 +266,7 @@ class UserModelView:
             "context_window": self.context_window,
             "max_output_tokens": self.max_output_tokens,
             "reasoning_effort": self.reasoning_effort,
+            "supports_images": self.supports_images,
         }
 
 
@@ -291,6 +297,7 @@ def _safe_user_model(value: object, model_ref: str) -> UserModelView:
         context_window=value.get("context_window"),
         max_output_tokens=value.get("max_output_tokens"),
         reasoning_effort=value.get("reasoning_effort"),
+        supports_images=value.get("supports_images"),
     )
 
 
@@ -612,6 +619,7 @@ class EffectiveConfig:
                     context_window=value.get("context_window"),
                     max_output_tokens=value.get("max_output_tokens"),
                     reasoning_effort=value.get("reasoning_effort"),
+                    supports_images=value.get("supports_images"),
                 )
             else:
                 raise TypeError("models must contain ModelProfile values")
@@ -686,6 +694,7 @@ class EffectiveConfig:
         max_output_tokens: int | None = None,
         context_window: int | None = None,
         reasoning_effort: str | None = None,
+        supports_images: bool | None = None,
         source: ConfigSource | str | Path | None = None,
     ) -> EffectiveConfig:
         """Build a minimal valid configuration for an embedded caller."""
@@ -714,6 +723,7 @@ class EffectiveConfig:
                     context_window=context_window,
                     max_output_tokens=max_output_tokens,
                     reasoning_effort=reasoning_effort,
+                    supports_images=supports_images,
                 )
             },
             sources=config_source,

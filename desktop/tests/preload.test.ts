@@ -34,6 +34,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
       calls.push({ channel, args });
       if (channel === "desktop.project.pick") return Promise.resolve("C:\\Projects\\UthCode");
       if (channel === "desktop.preference.read") return Promise.resolve({ theme: "system" });
+      if (channel === "desktop.attachment.pick" || channel === "desktop.attachment.clipboard") return Promise.resolve(null);
       return Promise.resolve({ ok: true });
     },
     on(channel: string, listener: Listener) {
@@ -51,10 +52,12 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(exposed.name, "uthcode");
   assert.equal(exposed.api, api);
   assert.deepEqual(Object.keys(api).sort(), [
+    "chooseAttachment",
     "closeShell",
     "copyText",
     "openProject",
     "openProjectInExplorer",
+    "pasteAttachment",
     "readPreference",
     "requestRuntime",
     "subscribeAgentEvents",
@@ -72,6 +75,8 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   await api.readPreference("theme");
   await api.writePreference("theme", "dark");
   await api.writePreference("pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]);
+  assert.equal(await api.chooseAttachment(), null);
+  assert.equal(await api.pasteAttachment(), null);
 
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
@@ -82,6 +87,8 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     { channel: "desktop.preference.read", args: ["theme"] },
     { channel: "desktop.preference.write", args: ["theme", "dark"] },
     { channel: "desktop.preference.write", args: ["pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]] },
+    { channel: "desktop.attachment.pick", args: [] },
+    { channel: "desktop.attachment.clipboard", args: [] },
   ]);
 
   const events: unknown[] = [];
