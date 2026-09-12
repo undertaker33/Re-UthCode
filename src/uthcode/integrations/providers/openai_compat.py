@@ -26,6 +26,8 @@ from uthcode.core.provider import (
     GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
+    FilePart,
+    ImagePart,
     InvalidProviderResponseError,
     Message,
     NativeItem,
@@ -41,6 +43,7 @@ from uthcode.core.provider import (
     ProviderTimeoutError,
     ReasoningDelta,
     ReasoningPart,
+    SourcePart,
     TextDelta,
     TextPart,
     ToolCallArgumentsDelta,
@@ -91,12 +94,44 @@ def _message_text(message: Message) -> str:
         if isinstance(part, TextPart):
             values.append(part.text)
         elif isinstance(part, ToolResultPart):
-            values.append(part.content)
+            values.append(str(part.content))
         else:
             raise InvalidProviderResponseError(
                 "Chat message contains an unsupported part"
             )
     return "".join(values)
+
+
+def _chat_content(parts: Sequence[object]) -> tuple[object, bool]:
+    """Return Chat Completions content and whether it is multimodal."""
+
+    values: list[dict[str, object]] = []
+    has_image = False
+    for part in parts:
+        if isinstance(part, TextPart):
+            values.append({"type": "text", "text": part.text})
+        elif isinstance(part, ImagePart):
+            has_image = True
+            values.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": part.asset_ref},
+                }
+            )
+        elif isinstance(part, FilePart):
+            values.append(
+                {
+                    "type": "text",
+                    "text": f"File: {part.display_name} ({part.mime_type}, asset {part.asset_ref})",
+                }
+            )
+        elif isinstance(part, SourcePart):
+            values.append({"type": "text", "text": f"Source: {part.asset_ref}"})
+        else:
+            raise InvalidProviderResponseError("Chat content contains an unsupported part")
+    if not has_image and all(item.get("type") == "text" for item in values):
+        return "".join(str(item["text"]) for item in values), False
+    return values, True
 
 
 def _native_at(
@@ -188,8 +223,9 @@ def _request_messages(
         messages.append({"role": "system", "content": request.system_prompt})
     for message in request.messages:
         if message.role == "user":
+            content, _ = _chat_content(message.parts)
             messages.append(
-                {"role": message.role, "content": _message_text(message)}
+                {"role": message.role, "content": content}
             )
         elif message.role == "assistant":
             messages.append(_assistant_message(message, identity))
@@ -199,13 +235,32 @@ def _request_messages(
                     raise InvalidProviderResponseError(
                         "Chat tool message contains an unsupported part"
                     )
+                tool_text = str(part.content)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": part.tool_call_id,
-                        "content": part.content,
+                        "content": tool_text,
                     }
                 )
+                image_parts = tuple(
+                    item for item in part.content.parts if isinstance(item, ImagePart)
+                )
+                if image_parts:
+                    projection: list[dict[str, object]] = [
+                        {
+                            "type": "text",
+                            "text": f"Tool result {part.tool_call_id} image source:",
+                        }
+                    ]
+                    projection.extend(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image.asset_ref},
+                        }
+                        for image in image_parts
+                    )
+                    messages.append({"role": "user", "content": projection})
         else:
             raise InvalidProviderResponseError(f"Chat message role is unsupported: {message.role}")
     return messages

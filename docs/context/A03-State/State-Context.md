@@ -20,6 +20,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
+- `[FACT]` Tool 执行期间的 `ToolProgress` 由 `CancellationToken.report_progress()` 进入唯一 live `AgentEvent` 流；Application 负责归属、跨 chunk 有界尾部脱敏与限量。它不写入 `RunState`、Transcript、Tool Result 正文或 Provider history；无实时报告时，结果携带的 progress 只作完成边界的受控兜底。
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；failed `TurnResult`/`TurnFailed` 可携带 JSON-safe `FailureReason`，successful/cancelled 终态不伪造该字段；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
 - `[FACT]` History 在请求准备、完整 Tool batch 和 terminal 边界持久化；按已确认 durability 推进 cursor。详细提交、半失败与恢复规则见下文 [History 持久化与恢复](#history-持久化与恢复)。
 - `[FACT]` `ApplicationContextService` 编译动态 Context Snapshot 并执行预算与 Gate。生产参数、诊断和冻结边界见下文 [Context 预算与诊断](#context-预算与诊断)。
@@ -154,7 +155,7 @@ reasoning_started / reasoning_delta / reasoning_finished
 assistant_message_delta / assistant_message_completed
 usage_updated
 tool_batch_started
-tool_started / tool_finished
+tool_started / tool_progress* / tool_finished
 tool_batch_finished
 turn_pausing? / user_input_requested? / turn_paused / turn_resumed?
 turn_completed | turn_failed | turn_cancelled
@@ -162,6 +163,8 @@ turn_completed | turn_failed | turn_cancelled
 
 - `events()` 只有一个消费者；`result()` 可重复等待并返回相同终态。
 - Event 是内容安全投影：工具原始结果、写入正文、秘密值不得进入工具活动事件。
+- `ToolProgress` 只承载执行期间的有界观察；它由 Application 脱敏并按 Run/Turn/iteration/batch/tool identity 发布，既不进入 History，也不成为模型上下文。
+- Tool Result 的结构化图片、文件和来源引用保留次序；大结果只把文本正文写入 Session ref，inline、externalized 和 persistence failure 的可见结果都保留这些引用，失败元数据叠加而不覆盖已知执行事实。
 - `AssistantMessageCompleted.message` 是公开化后的消息；Provider 原生 item 不应泄漏到 Interface。
 - TUI 对已提交终端内容只追加，不维护可替代 Core conversation 的 transcript 状态。
 - `/clear` 清理视口投影，不替换 `AgentRun`，因此不清除 conversation。

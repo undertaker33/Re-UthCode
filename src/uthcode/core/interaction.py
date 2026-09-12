@@ -24,7 +24,7 @@ from .permission import (
     ResourceScope,
     RuleKind,
 )
-from .provider import JsonPayload, ToolDefinition
+from .provider import JsonPayload, MessageInput, ToolDefinition
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -366,29 +366,38 @@ class SteeringRequest(_JsonModel):
     steering_id: str
     run_id: str
     turn_id: str
-    text: str
+    text: str | MessageInput
 
     def __post_init__(self) -> None:
-        for field_name in ("steering_id", "run_id", "turn_id", "text"):
+        for field_name in ("steering_id", "run_id", "turn_id"):
             _require_text(getattr(self, field_name), field_name)
+        if not isinstance(self.text, (str, MessageInput)):
+            raise TypeError("text must be a string or MessageInput")
+        if isinstance(self.text, str) and not self.text.strip():
+            raise ValueError("text must be a non-empty string")
+        if isinstance(self.text, MessageInput) and not self.text.parts:
+            raise ValueError("text must contain at least one content part")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "steering_id": self.steering_id,
             "run_id": self.run_id,
             "turn_id": self.turn_id,
-            "text": self.text,
+            "text": self.text.to_dict() if isinstance(self.text, MessageInput) else self.text,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> SteeringRequest:
         payload = _as_mapping(value, "steering request")
         _expect_keys(payload, {"steering_id", "run_id", "turn_id", "text"})
+        raw_text = _required(payload, "text")
+        if isinstance(raw_text, Mapping):
+            raw_text = MessageInput.from_dict(raw_text)
         return cls(
             _required(payload, "steering_id"),  # type: ignore[arg-type]
             _required(payload, "run_id"),  # type: ignore[arg-type]
             _required(payload, "turn_id"),  # type: ignore[arg-type]
-            _required(payload, "text"),  # type: ignore[arg-type]
+            raw_text,  # type: ignore[arg-type]
         )
 
     @classmethod

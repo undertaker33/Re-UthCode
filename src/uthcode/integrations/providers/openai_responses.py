@@ -27,6 +27,8 @@ from uthcode.core.provider import (
     GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
+    FilePart,
+    ImagePart,
     InvalidProviderResponseError,
     Message,
     NativeItem,
@@ -42,6 +44,7 @@ from uthcode.core.provider import (
     ProviderTimeoutError,
     ReasoningDelta,
     ReasoningPart,
+    SourcePart,
     TextDelta,
     TextPart,
     ToolCallArgumentsDelta,
@@ -331,12 +334,39 @@ def _request_text(message: Message) -> str:
         if isinstance(part, TextPart):
             text.append(part.text)
         elif isinstance(part, ToolResultPart):
-            text.append(part.content)
+            text.append(str(part.content))
         else:
             raise InvalidProviderResponseError(
                 "Responses user message contains an unsupported part"
             )
     return "".join(text)
+
+
+def _responses_content(parts: Sequence[object]) -> list[dict[str, object]]:
+    values: list[dict[str, object]] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            values.append({"type": "input_text", "text": part.text})
+        elif isinstance(part, ImagePart):
+            values.append(
+                {
+                    "type": "input_image",
+                    "image_url": part.asset_ref,
+                    "detail": "auto",
+                }
+            )
+        elif isinstance(part, FilePart):
+            values.append(
+                {
+                    "type": "input_text",
+                    "text": f"File: {part.display_name} ({part.mime_type}, asset {part.asset_ref})",
+                }
+            )
+        elif isinstance(part, SourcePart):
+            values.append({"type": "input_text", "text": f"Source: {part.asset_ref}"})
+        else:
+            raise InvalidProviderResponseError("Responses content contains an unsupported part")
+    return values
 
 
 def _native_at(
@@ -361,7 +391,7 @@ def _request_input(
             values.append(
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": _request_text(message)}],
+                    "content": _responses_content(message.parts),
                 }
             )
             continue
@@ -371,11 +401,16 @@ def _request_input(
                     raise InvalidProviderResponseError(
                         "Responses tool message contains an unsupported part"
                     )
+                output: object
+                if len(part.content.parts) == 1 and isinstance(part.content.parts[0], TextPart):
+                    output = str(part.content)
+                else:
+                    output = _responses_content(part.content.parts)
                 values.append(
                     {
                         "type": "function_call_output",
                         "call_id": part.tool_call_id,
-                        "output": part.content,
+                        "output": output,
                     }
                 )
             continue

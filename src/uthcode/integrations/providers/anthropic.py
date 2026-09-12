@@ -28,6 +28,8 @@ from uthcode.core.provider import (
     GenerationCancelled,
     GenerationCompleted,
     GenerationRequest,
+    FilePart,
+    ImagePart,
     InvalidProviderResponseError,
     Message,
     ModelLimits,
@@ -44,6 +46,7 @@ from uthcode.core.provider import (
     ProviderTimeoutError,
     ReasoningDelta,
     ReasoningPart,
+    SourcePart,
     TextDelta,
     TextPart,
     ToolCallArgumentsDelta,
@@ -106,12 +109,52 @@ def _message_text(message: Message) -> str:
         if isinstance(part, TextPart):
             values.append(part.text)
         elif isinstance(part, ToolResultPart):
-            values.append(part.content)
+            values.append(str(part.content))
         else:
             raise InvalidProviderResponseError(
                 "Anthropic message contains an unsupported part"
             )
     return "".join(values)
+
+
+def _image_block(part: ImagePart) -> dict[str, object]:
+    """Convert a Core image reference to the Anthropic image source shape."""
+
+    ref = part.asset_ref
+    if ref.startswith("data:") and "," in ref:
+        header, data = ref.split(",", 1)
+        if ";base64" in header:
+            media_type = header[5:].split(";", 1)[0] or part.mime_type
+            if media_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+                raise InvalidProviderResponseError(
+                    "Anthropic image media type is unsupported"
+                )
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            }
+    return {"type": "image", "source": {"type": "url", "url": ref}}
+
+
+def _content_blocks(parts: Sequence[object]) -> list[dict[str, object]]:
+    blocks: list[dict[str, object]] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            blocks.append({"type": "text", "text": part.text})
+        elif isinstance(part, ImagePart):
+            blocks.append(_image_block(part))
+        elif isinstance(part, FilePart):
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": f"File: {part.display_name} ({part.mime_type}, asset {part.asset_ref})",
+                }
+            )
+        elif isinstance(part, SourcePart):
+            blocks.append({"type": "text", "text": f"Source: {part.asset_ref}"})
+        else:
+            raise InvalidProviderResponseError("Anthropic content contains an unsupported part")
+    return blocks
 
 
 def _native_at(
@@ -193,7 +236,7 @@ def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[s
     if message.role == "assistant":
         return _assistant_content(message, identity)
     if message.role == "user":
-        return [{"type": "text", "text": _message_text(message)}]
+        return _content_blocks(message.parts)
     if message.role == "tool":
         blocks: list[dict[str, object]] = []
         for part in message.parts:
@@ -201,11 +244,16 @@ def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[s
                 raise InvalidProviderResponseError(
                     "Anthropic tool message contains an unsupported part"
                 )
+            content: object
+            if len(part.content.parts) == 1 and isinstance(part.content.parts[0], TextPart):
+                content = str(part.content)
+            else:
+                content = _content_blocks(part.content.parts)
             blocks.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": part.tool_call_id,
-                    "content": part.content,
+                    "content": content,
                     "is_error": part.is_error,
                 }
             )

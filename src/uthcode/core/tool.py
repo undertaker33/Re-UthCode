@@ -13,6 +13,8 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from .provider import (
     CancellationToken,
+    ContentPart,
+    ContentSequence,
     GenerationCancelled,
     JsonPayload,
     ToolCallPart,
@@ -23,17 +25,129 @@ from .permission import Effect, PermissionAction, ResourceScope
 
 
 @dataclass(frozen=True, slots=True)
+class ToolFailure:
+    """Stable classification for a Tool failure fact."""
+
+    kind: str
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind:
+            raise ValueError("failure kind must be a non-empty string")
+        if not isinstance(self.retryable, bool):
+            raise TypeError("failure retryable must be a boolean")
+
+    def to_dict(self) -> dict[str, object]:
+        return {"kind": self.kind, "retryable": self.retryable}
+
+
+class ToolFailureKind(str, Enum):
+    INVALID_INPUT = "invalid_input"
+    NOT_FOUND = "not_found"
+    PERMISSION_DENIED = "permission_denied"
+    PROCESS_FAILED = "process_failed"
+    TIMEOUT = "timeout"
+    NETWORK_ERROR = "network_error"
+    UNAVAILABLE = "unavailable"
+    CANCELLED = "cancelled"
+    SIDE_EFFECT_UNKNOWN = "side_effect_unknown"
+    UNSUPPORTED = "unsupported"
+    CONFLICT = "conflict"
+    RESOURCE_LIMIT = "resource_limit"
+    NOT_EXECUTED = "not_executed"
+
+
+class ToolSideEffect(str, Enum):
+    NONE = "none"
+    APPLIED = "applied"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolProgress:
+    """Bounded, provider-independent observation emitted by a Tool."""
+
+    stage: str
+    text: str = ""
+    current: int | None = None
+    total: int | None = None
+    stream: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, str) or not self.stage or len(self.stage) > 64:
+            raise ValueError("progress stage must be 1-64 characters")
+        if not isinstance(self.text, str) or len(self.text) > 512:
+            raise ValueError("progress text must be at most 512 characters")
+        for name in ("current", "total"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"progress {name} must be a non-negative integer or None")
+        if self.total is not None and self.current is not None and self.current > self.total:
+            raise ValueError("progress current cannot exceed total")
+        if self.stream is not None:
+            if self.stream not in {"stdout", "stderr", "terminal", "status"}:
+                raise ValueError("progress stream is unsupported")
+
+    def to_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {"stage": self.stage, "text": self.text}
+        if self.current is not None:
+            value["current"] = self.current
+        if self.total is not None:
+            value["total"] = self.total
+        if self.stream is not None:
+            value["stream"] = self.stream
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
     """The small result returned by one Core Tool implementation."""
 
-    content: str
+    content: str | ContentSequence | ContentPart | Sequence[ContentPart]
     is_error: bool = False
+    failure: ToolFailure | None = None
+    side_effect: ToolSideEffect = ToolSideEffect.NONE
+    resource: str | None = None
+    process_id: str | None = None
+    process_state: str | None = None
+    exit_code: int | None = None
+    stream: str | None = None
+    next_cursor: str | None = None
+    progress: tuple[ToolProgress, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.content, str):
-            raise TypeError("content must be a string")
+        if not isinstance(self.content, ContentSequence):
+            object.__setattr__(self, "content", ContentSequence(self.content))
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
+        failure = self.failure
+        if failure is not None and not isinstance(failure, ToolFailure):
+            raise TypeError("failure must be a ToolFailure or None")
+        side_effect = self.side_effect
+        if not isinstance(side_effect, ToolSideEffect):
+            try:
+                side_effect = ToolSideEffect(side_effect)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("side_effect must be a ToolSideEffect") from exc
+            object.__setattr__(self, "side_effect", side_effect)
+        for field_name in ("resource", "process_id", "process_state", "stream", "next_cursor"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be a non-empty string or None")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise TypeError("exit_code must be an integer or None")
+        progress = self.progress
+        if isinstance(progress, (str, bytes, bytearray)) or not isinstance(progress, Sequence):
+            raise TypeError("progress must be a sequence of ToolProgress values")
+        progress = tuple(progress)
+        if not all(isinstance(item, ToolProgress) for item in progress):
+            raise TypeError("progress must contain ToolProgress values")
+        object.__setattr__(self, "progress", progress)
 
 
 class ToolExecutionStatus(str, Enum):
@@ -66,17 +180,26 @@ class ToolExecutionOutcome:
 
     tool_call_id: str
     tool_name: str
-    content: str
+    content: str | ContentSequence | ContentPart | Sequence[ContentPart]
     is_error: bool
     status: ToolExecutionStatus
+    failure: ToolFailure | None = None
+    side_effect: ToolSideEffect = ToolSideEffect.NONE
+    resource: str | None = None
+    process_id: str | None = None
+    process_state: str | None = None
+    exit_code: int | None = None
+    stream: str | None = None
+    next_cursor: str | None = None
+    progress: tuple[ToolProgress, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
             raise ValueError("tool_call_id must be a non-empty string")
         if not isinstance(self.tool_name, str) or not self.tool_name:
             raise ValueError("tool_name must be a non-empty string")
-        if not isinstance(self.content, str):
-            raise TypeError("content must be a string")
+        if not isinstance(self.content, ContentSequence):
+            object.__setattr__(self, "content", ContentSequence(self.content))
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
         if not isinstance(self.status, ToolExecutionStatus):
@@ -84,10 +207,47 @@ class ToolExecutionOutcome:
                 object.__setattr__(self, "status", ToolExecutionStatus(self.status))
             except (TypeError, ValueError) as exc:
                 raise ValueError("status must be a ToolExecutionStatus") from exc
+        failure = self.failure
+        if failure is not None and not isinstance(failure, ToolFailure):
+            raise TypeError("failure must be a ToolFailure or None")
+        side_effect = self.side_effect
+        if not isinstance(side_effect, ToolSideEffect):
+            try:
+                side_effect = ToolSideEffect(side_effect)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("side_effect must be a ToolSideEffect") from exc
+            object.__setattr__(self, "side_effect", side_effect)
+        for field_name in ("resource", "process_id", "process_state", "stream", "next_cursor"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be a non-empty string or None")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise TypeError("exit_code must be an integer or None")
+        progress = self.progress
+        if isinstance(progress, (str, bytes, bytearray)) or not isinstance(progress, Sequence):
+            raise TypeError("progress must be a sequence of ToolProgress values")
+        progress = tuple(progress)
+        if not all(isinstance(item, ToolProgress) for item in progress):
+            raise TypeError("progress must contain ToolProgress values")
+        object.__setattr__(self, "progress", progress)
 
     @property
     def result(self) -> ToolResultPart:
-        return ToolResultPart(self.tool_call_id, self.content, self.is_error)
+        metadata: dict[str, object] = {}
+        if self.status is not ToolExecutionStatus.SUCCEEDED or self.side_effect is not ToolSideEffect.NONE:
+            metadata["execution_status"] = self.status.value
+            metadata["side_effect"] = self.side_effect.value
+        if self.failure is not None:
+            metadata["failure"] = self.failure.to_dict()
+        for field_name in ("resource", "process_id", "process_state", "stream", "next_cursor"):
+            value = getattr(self, field_name)
+            if value is not None:
+                metadata[field_name] = value
+        if self.exit_code is not None:
+            metadata["exit_code"] = self.exit_code
+        return ToolResultPart(self.tool_call_id, self.content, self.is_error, metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,16 +512,24 @@ class ToolExecutor:
         prepared: PreparedToolCall,
         *,
         cancellation: CancellationToken,
+        progress_sink: Callable[[ToolProgress], None] | None = None,
     ) -> ToolResultPart:
         """Execute one already-prepared call without validation or preflight."""
 
-        return (await self.execute_prepared_outcome(prepared, cancellation=cancellation)).result
+        return (
+            await self.execute_prepared_outcome(
+                prepared,
+                cancellation=cancellation,
+                progress_sink=progress_sink,
+            )
+        ).result
 
     async def execute_prepared_outcome(
         self,
         prepared: PreparedToolCall,
         *,
         cancellation: CancellationToken,
+        progress_sink: Callable[[ToolProgress], None] | None = None,
     ) -> ToolExecutionOutcome:
         """Execute one call and return the complete execution fact.
 
@@ -374,6 +542,8 @@ class ToolExecutor:
             raise TypeError("prepared must be a PreparedToolCall")
         if not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken")
+        if progress_sink is not None and not callable(progress_sink):
+            raise TypeError("progress_sink must be callable or None")
         call = prepared.call
         tool = prepared.tool
         if cancellation.cancelled:
@@ -383,7 +553,16 @@ class ToolExecutor:
                 "Error: tool call cancelled",
                 True,
                 ToolExecutionStatus.CANCELLED,
+                ToolFailure(ToolFailureKind.CANCELLED.value, retryable=True),
             )
+        installed_sink = None
+        if progress_sink is not None:
+            def emit_progress(value: object) -> None:
+                if not isinstance(value, ToolProgress):
+                    raise TypeError("Tool progress reports must be ToolProgress values")
+                progress_sink(value)
+
+            installed_sink = cancellation.set_progress_sink(emit_progress)
         try:
             result = await tool.execute(
                 prepared.execution_arguments,
@@ -405,6 +584,7 @@ class ToolExecutor:
                     "Error: tool call cancelled",
                     True,
                     ToolExecutionStatus.CANCELLED,
+                    ToolFailure(ToolFailureKind.CANCELLED.value, retryable=True),
                 )
             raise
         except Exception:
@@ -414,7 +594,12 @@ class ToolExecutor:
                 f"Error: tool execution failed for {call.name}",
                 True,
                 ToolExecutionStatus.UNKNOWN,
+                ToolFailure(ToolFailureKind.SIDE_EFFECT_UNKNOWN.value, retryable=False),
+                ToolSideEffect.UNKNOWN,
             )
+        finally:
+            if progress_sink is not None:
+                cancellation.restore_progress_sink(installed_sink)
 
         if not isinstance(result, ToolExecutionResult):
             return ToolExecutionOutcome(
@@ -423,13 +608,27 @@ class ToolExecutor:
                 "Error: tool execution returned an invalid result",
                 True,
                 ToolExecutionStatus.UNKNOWN,
+                ToolFailure(ToolFailureKind.SIDE_EFFECT_UNKNOWN.value, retryable=False),
+                ToolSideEffect.UNKNOWN,
             )
+        failure = result.failure
+        if result.is_error and failure is None:
+            failure = ToolFailure(ToolFailureKind.UNAVAILABLE.value, retryable=False)
         return ToolExecutionOutcome(
             call.tool_call_id,
             call.name,
             result.content,
             result.is_error,
             ToolExecutionStatus.FAILED if result.is_error else ToolExecutionStatus.SUCCEEDED,
+            failure,
+            result.side_effect,
+            result.resource,
+            result.process_id,
+            result.process_state,
+            result.exit_code,
+            result.stream,
+            result.next_cursor,
+            result.progress,
         )
 
     def _cancelled(self, call: ToolCallPart) -> ToolResultPart:
@@ -504,6 +703,10 @@ __all__ = [
     "ToolExecutionOutcome",
     "ToolExecutionResult",
     "ToolExecutionStatus",
+    "ToolFailure",
+    "ToolFailureKind",
+    "ToolProgress",
+    "ToolSideEffect",
     "ToolExecutor",
     "ToolPlanningAccess",
     "ToolPlanningMetadata",

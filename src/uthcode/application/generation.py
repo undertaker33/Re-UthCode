@@ -29,6 +29,7 @@ from uthcode.core.provider import (
     GenerationCancelled,
     GenerationRequest,
     Message,
+    MessageInput,
     ModelLimits,
     ProviderIdentity,
     ProviderPort,
@@ -122,6 +123,8 @@ def failure_message(reason: FailureReason | None) -> str:
         return "当前会话内容无法安全整理，请缩短请求或重试。"
     if reason is FailureReason.PERSISTENCE_UNAVAILABLE:
         return "会话无法安全保存，请检查存储后重试。"
+    if reason is FailureReason.TOOL_SIDE_EFFECT_UNKNOWN:
+        return "工具执行状态无法确认，已停止后续调用，请检查实际副作用。"
     return "生成失败，请稍后重试。"
 
 
@@ -2327,7 +2330,7 @@ class UthCodeApplication:
     def _start_agent_turn(
         self,
         state: RunState,
-        user_input: str,
+        user_input: str | MessageInput,
         *,
         turn_id: str,
         cancellation: CancellationToken,

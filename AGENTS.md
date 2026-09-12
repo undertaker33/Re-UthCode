@@ -54,6 +54,7 @@ interfaces -> application -> core
 - Provider 逻辑保持实现无关；Runtime 中不得按 Provider 名称分支。通用 SDK、HTTP、校验和重试能力优先使用成熟依赖。
 - Tool Batch 严格 FIFO；每个 `ToolCall` 必须得到对应 `ToolResult`。单个 Tool 被拒绝或发生普通错误时，应形成受控结果，不直接使整个 Run 崩溃。
 - Agent Loop 是 `RunState` 的唯一写入者；Tool、Provider、Permission、Storage 和 Interface 只能返回结果、事件或控制响应。
+- Tool 可通过当前 `CancellationToken.report_progress()` 发布有界执行观察；Application 在唯一 `AgentEvent` 流中完成归属、跨 chunk 尾部脱敏和限量投影，进度不写入 `RunState`、History 或 Provider 请求。
 - `Bash` 是当前 OS 用户权限下的 unsandboxed process execution，不得描述为 Sandbox。
 - Permission 固定支持 `default`、`auto`、`full_access`。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但仍受用户/项目显式 Guard ASK/DENY 和灾难性 circuit breaker 约束；工具注册、参数校验、OS 权限和第三方权限始终有效，项目配置不得静默启用 `full_access`。
 - Permission Approval 是应用层授权，不是 OS Sandbox。Session Grant 只属于当前 `AgentRun`，不得自动持久化。
