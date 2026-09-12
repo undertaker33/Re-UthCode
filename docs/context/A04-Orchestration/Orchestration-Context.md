@@ -12,7 +12,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
-- `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context。
+- `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context，并为同一 Application/Session 注入共享 `ProcessSessionManager`；正式工具集合包含文档、图片和进程控制能力。
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`/可选 `display_name`、Model `remote_id`/`display_name`；Provider 显示名不参与稳定 ID 或 Model 引用。`/model` 对用户配置的原子写回只修改顶层 `default_model`；当前 Session 的模型偏好另行保存，整体切换采用异常回滚，见 [配置说明](../../user-manual/configuration.md)。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
 - `[FACT]` Session 在真实请求或显式 Session 命令需要时打开：`exec <prompt>` 与 TUI 首条普通输入调用 `ensure_session()`，`/new` 显式创建，`/resume` 锁定并恢复目标；启动、help/status 和 Picker 不创建空 Session。Application 编排 History 提交并在退出时释放 writer；Session 格式、durability 与恢复边界统一见 [A03 State](../A03-State/State-Context.md#history-持久化与恢复)。
 - `[FACT]` Session 附件经 `AttachmentService` 导入为所属 Session 的固定副本；导入和待发请求都校验 active Session 归属及有限的图片宽、高、像素限制，只有 Transcript append 确认持久化后才标记 submitted。Application replay/Context 只传递可重读的 `asset_ref` 与安全附件元数据，Provider Integration 在请求边界读取副本，未提交草稿可移除，已提交原图不参与临时/派生清理。
@@ -23,7 +23,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 - `[FACT]` `create_application -> create_run -> start_turn` 组合用户级安全 Permission 默认值、固定 PLAN/unfinished 控制检查、`ProposePlan`/Task 控制、同一 Turn Steering 和唯一 Agent Loop/driver；没有可插拔 Hook 组合阶段。
 - `[FACT]` `/permission default|auto` 先原子写回用户配置并更新 Application 默认值，再由结构化 action 更新当前 Run；`full_access` 不写配置、不改变新 Run 默认值，TUI picker 复用同一命令路径。
 - `[FACT]` TUI 启动一个长生命周期 `AgentRun` 以保留多轮消息，但直到真实普通输入或显式 Session 命令才创建持久 Session；`uthcode exec` 每次创建一个 Run 和一个 Turn，并在真实 prompt 前惰性 ensure。
-- `[FACT]` Windows Desktop 通过 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 `src/uthcode/interfaces/desktop/bridge.py` 接入同一个 Application/Run/Turn/AgentEvent 链；Renderer 只投影 Bridge 的安全结果，配置、Session、Command 和 typed Interaction 不在 TypeScript 中复制。真实配置的 Desktop 为每个已打开 Session 保存独立 Application/Run runtime，`session.new`、`session.resume` 和 `project.open` 可停放旧 Session 的 active Turn 并切换显示而不取消它；普通 navigation 复用串行 operation/generation ownership，但不发布 Runtime `restarting`。background 事件携带 Session/Project identity，由 Renderer 按 Session 缓存，完成后 Bridge 关闭回收。Bridge 暴露 Application 的 `context_status`/`compaction_status` 安全投影以及 AskUser、Permission、Plan、Pause、Retry typed interaction；Context ring、Runtime panel 和交互控件不取得 Core/Application 内部 authority。
+- `[FACT]` Windows Desktop 通过 `desktop/src/main.ts`、`desktop/src/preload.ts`、`desktop/src/python-runtime.ts` 与 `src/uthcode/interfaces/desktop/bridge.py` 接入同一个 Application/Run/Turn/AgentEvent 链；Renderer 只投影 Bridge 的安全结果，配置、Session、Command 和 typed Interaction 不在 TypeScript 中复制。真实配置的 Desktop 为每个已打开 Session 保存独立 Application/Run runtime，`session.new`、`session.resume` 和 `project.open` 可停放旧 Session 的 active Turn 并切换显示而不取消它；普通 navigation 复用串行 operation/generation ownership，但不发布 Runtime `restarting`。background 事件携带 Session/Project identity，由 Renderer 按 Session 缓存，完成后仅在没有活进程时 Bridge 关闭回收。Bridge 还订阅 Application 的 Process output/state 观察，在 Turn 完成后继续投影有界、脱敏的后台日志，并暴露 `process.list/read/write/stop/resize` RPC；Context ring、Runtime panel 和交互控件不取得 Core/Application 内部 authority。
 - `[FACT]` Desktop 附件选择、剪贴板、拖拽和粘贴先经 Main/preload 的受控字节 DTO，再由 Bridge 调用 Application Session 附件导入；Composer 仅提交 opaque ref，成功 Turn 才清空草稿，失败保留可编辑附件，历史回放只消费安全附件 DTO。
 - `[FACT]` Application `_TurnDriver` 把多个 Core execution segment 编排为一条持续事件流，并在暂停时等待 Interface 的 typed response。
 - `[ABSENT]` Subagent、任务拆分器、Multi-Agent、Agent 间消息、并行 Worker、任务队列、通用 Scheduler。
@@ -68,7 +68,7 @@ python -m uthcode / uthcode
      -> 用户 config + 项目 config 合并与安全校验
   -> create_application
      -> provider factory
-     -> create_default_tools(workdir)
+     -> create_default_tools(workdir, attachment_service, session_provider, process_manager)
      -> permission rule loader
      -> ApplicationToolService
      -> UthCodeApplication
@@ -126,6 +126,7 @@ desktop/src/renderer/App.tsx
   -> desktop/src/python-runtime.ts（console JSONL child，windowsHide）
   -> src/uthcode/interfaces/desktop/bridge.py
   -> UthCodeApplication -> AgentRun -> TurnHandle -> Core AgentEvent
+  -> Application ProcessSessionManager -> process_output/process_state -> Bridge outbox
   -> Python Runtime JSONL -> Main -> Preload -> Renderer state projection
 ```
 
@@ -139,7 +140,7 @@ Desktop Session A active
   -> Bridge 保存 A 的 application/run/handle/task
   -> 切换到 B 已有 runtime，或新建共享 durable Session store 的 Application
   -> A 的 AgentEvent 附 session_id + project_key，Renderer 在 A 的缓存更新 timeline/Todo/status
-  -> A terminal 后可关闭回收；Desktop shutdown 才统一 cancel/close 所有仍活跃 runtime
+  -> A terminal 后仍保留 Session-owned 活进程与后台日志；无活进程时才可回收；Desktop shutdown 统一 cancel/close 所有 runtime/process
 ```
 
 同一 Session 的 `AgentRun` 仍只允许一个 active Turn；可见 Session 的 Steering、Pause、Resume 和 Cancel 始终落到该 Session 的同一 handle。rename/move 在任何已保存 runtime 有 active Turn 时不会越过 Bridge 的 Session 边界。
@@ -158,6 +159,7 @@ Desktop Session A active
 | Session / History 生命周期 | `src/uthcode/application/sessions.py` | `ApplicationSessionService`, `read_history_page`, `list_catalog_metadata`, `ApplicationSession.append_timeline_transaction` |
 | Context / Compact 编排 | `src/uthcode/application/context.py` + `src/uthcode/application/compaction.py` + `src/uthcode/application/generation.py` | `ApplicationContextService`, `prepare_compaction_request_async`, `compact_session` |
 | Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService` |
+| 进程生命周期与事件路由 | `src/uthcode/application/generation.py` + `src/uthcode/integrations/tools/process_sessions.py` | `ProcessSessionManager`, `subscribe_process_events`, `cleanup_turn_processes` |
 | Runtime 环境 | `src/uthcode/application/runtime_context.py` | `ApplicationRuntimeContext` |
 | 配置公共模型 | `src/uthcode/application/configuration.py` | `EffectiveConfig`, `LaunchOptions` |
 | Slash Command | `src/uthcode/application/commands/` | `CommandRegistry`, `CommandParser`, `CommandDispatcher`, `CommandOutcome` |
@@ -192,6 +194,7 @@ implemented:
 - Desktop 可并存多个 Session runtime，但每个 runtime 都是独立 `Application -> AgentRun -> TurnHandle` 链；Renderer 的 per-Session 缓存不能成为共享 RunState 或持久 Runtime checkpoint。
 - 同一个 Turn 的事件与结果来自同一次 execution；不得为事件消费和结果等待创建双执行。
 - 普通 Tool 必须经过 `AgentRun.start_turn` 的唯一权限与暂停链；Application 不提供独立的手工 Tool 执行门面。
+- Process 的控制 RPC 先由 Application 通过已注册的 Process Tool 形成 `PermissionAction`，再经现有 ToolExecutor 执行；Bridge 不能绕过 Session/Permission 直接持有或操作 OS handle。stdin/EOF 属于独立输入授权，stop 仍是 destructive action。成功 Turn 后的 output observer 继续走 Application→Desktop 单一路由，不能制造新 Turn。
 - active Turn 捕获 Provider/model/tool definitions；运行中切换模型不得改变它。
 - 编排异常必须收口为 Core terminal result、关闭事件流并释放 Run active slot。
 - 新 Interface 应复用 Application Command、Run、Turn、Event 合同，不复制 Agent Loop 或状态机。

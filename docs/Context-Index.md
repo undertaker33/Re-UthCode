@@ -29,7 +29,7 @@ source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
 | `docs/context/A03-State/` | 状态层当前代码上下文 | Run/Turn、Event、Context、Memory、Todo/Plan、进度任务 |
 | `docs/context/A04-Orchestration/` | 编排层当前代码上下文 | Application、入口、CLI/TUI、Subagent、任务拆分、Multi-Agent 任务 |
 | `docs/context/TUI/` | 当前 TUI 的长期实现上下文；不是工作包 | 修改 TUI 交互、终端渲染、输入、滚动、暂停界面时读取 |
-| `docs/context/GUI/` | 当前 Windows Desktop GUI 的长期实现上下文；不是工作包 | 修改 Desktop Renderer、Electron/Bridge、Project/Session 导航、Composer、Todo/Plan、Settings、Context/Compact 显示时读取 |
+| `docs/context/GUI/` | 当前 Windows Desktop GUI 的长期实现上下文；不是工作包 | 修改 Desktop Renderer、Electron/Bridge、Project/Session 导航、Composer、Todo/Plan、Settings、Context/Compact 或后台 Process 日志时读取 |
 | `docs/work/` | 工作包根目录；直接 FXX/TXX/BXX 子目录保存活跃正式工作包，`archive/` 保存历史记录 | 收到需求文件、拆分任务包或执行用户指定 Worker Prompt 时按需读取；工作包规则见 `docs/rules/WorkPackageRules.md` |
 | `docs/work/archive/` | 用户手动归档的已完成工作包；历史证据，不代表当前代码结构 | 当前事实不足、需要追溯已确认需求或历史验收证据时按需读取；禁止默认全量扫描 |
 
@@ -46,8 +46,8 @@ path_migration:
 | --- | --- | --- | --- | --- |
 | 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、固定 PLAN 非 READ 与 unfinished-task 控制检查 | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定控制检查；AskUser 为 1—4 题，选择题始终有自由输入且不再接受旧 `allow_other`/“Other”分支；无 OS Sandbox、动态控制 registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
-| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering | 已有 Run/Turn、事件、Session v3、Transcript/Timeline、Context Budget/Gate、L4/L5、HistoryRead、Plan/Todo 与安全状态投影；持久化失败与预算参数集中见状态层文档；无跨进程 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode | 已有单 Agent Application、CLI/TUI/Desktop、惰性 Session 与共享命令/Compact/HistoryRead 用例；Desktop 按 Session 保留后台运行时；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Plan/Task、Steering |
+| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering、Process 观察 | 已有 Run/Turn、事件、Session v3、Transcript/Timeline、Context Budget/Gate、L4/L5、HistoryRead、Plan/Todo 与安全状态投影；Session-owned Process ring/cursor 和 Turn 外持续日志由 Application 投影；持久化失败与预算参数集中见状态层文档；无跨进程 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、Process、历史 |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode、Process 生命周期 | 已有单 Agent Application、CLI/TUI/Desktop、惰性 Session 与共享命令/Compact/HistoryRead 用例；Desktop 按 Session 保留后台运行时和活进程，并由 Application 事件路由到 Renderer；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Process、Plan/Task、Steering |
 
 ## current-status
 
@@ -96,9 +96,9 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 | --- | --- | --- | --- |
 | T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W06 Feedback 齐全，自动回归、Runtime/PyInstaller smoke、package/make、Installer 自动测试和 packaged Electron 中英文 CDP 视觉验收已有证据；冻结 Checklist 共 86 项，仍有 20 项未完成，覆盖 Project/Session、Composer/Slash、AskUser/Plan、Settings/主题、真实 Desktop/Installer/Feature Parity 与最终状态收口，其中部分旧验收语义已被 F02 新需求取代但不得回写冻结文件，保持 `not_implemented` |
 | F02 | Desktop GUI 交互与上下文缺陷修复 | `docs/work/F02-DesktopGUI交互与上下文缺陷修复/` | W01～W05 已实施；W06 的既有 `w06-rework-*` 16 份 packaged/CDP 报告记录完整交互矩阵历史证据，P3 收紧 ResizeObserver stderr allowlist 后另有定向报告；在合入 W03/W05 返工后又从当前源码重建 SHA-256 `6cf2fd8e9e79074554aeb072de713f8edf7696679a5b656f12ae25a0c7c32849` 的 packaged app，并以 `commands` flow 分别通过 en/zh-CN canonical Slash、typed `/compact` 与 typed `/status` 当前包集成验收，报告均无 console/renderer exception/unexplained stderr。完整 16 场未使用当前包重跑，W06 Checklist 仍保留人工、真实 Provider、干净 Windows 与视觉/可访问性未验证项，因此仍为 `not_implemented` |
-| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-09-12 W01（T01→T03）经三轮返工、Terra 第四轮审核通过；W02（T04→T06）经一轮返工、Terra 第二轮审核通过，A03/A04/A05/A06/A07 与对应完成边界证据见 W02 Feedback；A02/T19 真实 Provider、Tavily、Windows packaged/native/manual 验收待用户配置或环境后补测；T07→T20 尚未实施，整包保持 `not_implemented`。 |
+| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-09-12 W01（T01→T03）经三轮返工、Terra 第四轮审核通过；W02（T04→T06）经一轮返工、Terra 第二轮审核通过。W03（T07→T09）经总控一轮预审返工及 Terra 四轮返工、第五轮审核通过：四格式有界读取/PDF 页图、Bash/Process Session、Windows 原生 PTY/Job 回收、跨 Turn Application→Desktop 有界日志与授权控制链；A09/A11/A13/A14/A16 有当前实测，A10/A12（POSIX）/A15 packaged 与其余后续项仍未完成，具体命令和限制见 W03 Feedback。A02/T19 真实 Provider、Tavily、Windows packaged/native/manual 验收待用户配置或环境后补测；整包保持 `not_implemented`。 |
 
-2026-09-12 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。上述数字是现有 Checklist/Feedback 盘点，既有测试证据未重跑；T11 仅已接入 W01/W02 明确交付范围，后续能力及未验证环境仍不能据此视为完成。
+2026-09-12 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W03 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；WSL 无 conda 的 POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
 
 ## 跨层最短链路
 
@@ -114,12 +114,13 @@ interfaces/cli.py 或 interfaces/tui/app.py
   -> core/permission.py:PermissionEvaluator
   -> application/runs.py:_TurnDriver
   -> AgentEvent 流 / TurnResult
+  -> Application ProcessSessionManager 观察（跨 Turn）
 
 desktop/src/renderer/App.tsx
   -> desktop/src/preload.ts -> desktop/src/main.ts -> desktop/src/python-runtime.ts
   -> src/uthcode/interfaces/desktop/bridge.py
   -> 同一 Application/Run/Turn/Core/AgentEvent 链
-  -> Desktop background event 附 `session_id`/`project_key`，由 Renderer 作 per-Session 显示缓存
+  -> Application Process 事件 -> Bridge 有界 outbox -> Desktop background event 附 `session_id`/`project_key`，由 Renderer 作 per-Session 显示缓存
 ```
 
 配置字段与发现规则见 [配置说明](user-manual/configuration.md)；逻辑 Model Profile ID 用于选择和显示，`GenerationRequest.model` 使用远端 `remote_id`。Context 预算、256K profile 与冻结边界见 [A03 Context 预算与诊断](context/A03-State/State-Context.md#context-预算与诊断)。

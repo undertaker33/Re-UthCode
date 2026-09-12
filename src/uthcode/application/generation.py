@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import CancelledError
 import inspect
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -30,6 +31,7 @@ from uthcode.core.provider import (
     GenerationRequest,
     FilePart,
     ImagePart,
+    JsonPayload,
     Message,
     MessageInput,
     ModelLimits,
@@ -38,6 +40,7 @@ from uthcode.core.provider import (
     ProviderPort,
     ReasoningOptions,
     SourcePart,
+    ToolCallPart,
     ToolDefinition,
     ToolResultPart,
     Usage,
@@ -102,6 +105,7 @@ from .request_preparation import (
     count_input_tokens_async as _count_input_tokens_async,
 )
 from .compaction import summarize_compaction_epoch_with_provider as _summarize_compaction_epoch_with_provider
+from uthcode.core.tool import PreparedToolCall, ToolExecutionOutcome
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
@@ -352,12 +356,28 @@ class UthCodeApplication:
             raise TypeError("session_service must be ApplicationSessionService or None")
         if attachment_service is not None and not isinstance(attachment_service, AttachmentService):
             raise TypeError("attachment_service must be AttachmentService or None")
+        # Keep Session and attachment owners available while composing the
+        # Application tool service.  The composition root supplies Process;
+        # this class only installs its public observation projections.
+        self._session_service = session_service
+        self._attachment_service = attachment_service
         self._tool_service = tool_service
+        process_manager = runtime_context.process_manager
+        if process_manager is not None:
+            set_output_projector = getattr(process_manager, "set_output_projector", None)
+            if callable(set_output_projector):
+                set_output_projector(self._tool_service.project_process_output)
+            set_command_projector = getattr(process_manager, "set_command_projector", None)
+            if callable(set_command_projector):
+                set_command_projector(self._tool_service.project_process_command)
+        self._process_event_subscribers: list[Callable[[Mapping[str, object]], None]] = []
+        self._process_manager_unsubscribe: Callable[[], None] | None = None
+        subscribe_process = getattr(process_manager, "subscribe", None)
+        if callable(subscribe_process):
+            self._process_manager_unsubscribe = subscribe_process(self._receive_process_observation)
         self._permission_rules_loader = permission_rules_loader
         self._instruction_loader = instruction_loader
         self._context_service = context_service or ApplicationContextService()
-        self._session_service = session_service
-        self._attachment_service = attachment_service
         self._configure_provider_asset_resolver(self._provider)
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
         self._last_provider_request_usage = public_usage_diagnostics(None)
@@ -430,6 +450,45 @@ class UthCodeApplication:
 
         self._context_service.record_live_delta(text, source=source)
 
+    def subscribe_process_events(
+        self,
+        callback: Callable[[Mapping[str, object]], None],
+    ) -> Callable[[], None]:
+        """Subscribe to live, redacted process observations for one Application."""
+
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        if callback not in self._process_event_subscribers:
+            self._process_event_subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            try:
+                self._process_event_subscribers.remove(callback)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def _receive_process_observation(self, observation: Mapping[str, object]) -> None:
+        try:
+            if observation.get("_projected") is True:
+                project = {
+                    key: value
+                    for key, value in observation.items()
+                    if key != "_projected"
+                }
+            else:
+                project = self._tool_service.project_process_output(observation)
+        except Exception:
+            # Process output is observational; a projection problem must not
+            # alter the child or the authoritative Tool/Run state.
+            return
+        for callback in tuple(self._process_event_subscribers):
+            try:
+                callback(project)
+            except Exception:
+                continue
+
     @property
     def session_service(self) -> ApplicationSessionService | None:
         """Return the optional durable Session lifecycle service."""
@@ -441,6 +500,74 @@ class UthCodeApplication:
         """Return the Session-owned attachment import service, if configured."""
 
         return self._attachment_service
+
+    def _process_runtime(self):
+        manager = self._runtime_context.process_manager
+        if manager is None:
+            raise RuntimeError("process runtime is unavailable")
+        active = self._active_session_id()
+        if active is None:
+            raise RuntimeError("an active Session is required")
+        return manager, active
+
+    def prepare_process_operation(
+        self,
+        arguments: Mapping[str, object],
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> PreparedToolCall | ToolResultPart:
+        """Prepare a Desktop Process call through the registered Tool path."""
+
+        if not isinstance(arguments, Mapping):
+            raise TypeError("Process arguments must be a mapping")
+        call = ToolCallPart(uuid.uuid4().hex, "Process", JsonPayload(arguments))
+        return self._tool_service.prepare_tool_call(call, cancellation=cancellation)
+
+    async def execute_prepared_process_operation(
+        self,
+        prepared: PreparedToolCall,
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionOutcome:
+        """Execute an approved Process call through the existing executor."""
+
+        return await self._tool_service.execute_prepared_tool(
+            prepared,
+            cancellation=cancellation,
+        )
+
+    def list_processes(self) -> tuple[dict[str, object], ...]:
+        raise RuntimeError("process.list must use the Application Tool boundary")
+
+    def has_live_processes(self) -> bool:
+        try:
+            manager, session_id = self._process_runtime()
+            values = manager.list(session_id)
+            return any(
+                item.get("state") not in {"exited", "expired"}
+                for item in values
+                if isinstance(item, Mapping)
+            )
+        except Exception:
+            return False
+
+    async def cleanup_turn_processes(self, turn_id: str) -> None:
+        manager, session_id = self._process_runtime()
+        shutdown_turn = getattr(manager, "shutdown_turn", None)
+        if callable(shutdown_turn):
+            await shutdown_turn(session_id, turn_id)
+
+    def read_process(self, process_id: str, *, cursor: int = 0) -> dict[str, object]:
+        raise RuntimeError("process.read must use the Application Tool boundary")
+
+    async def write_process(self, process_id: str, data: str, *, eof: bool = False) -> dict[str, object]:
+        raise RuntimeError("process.write must use the Application Tool boundary")
+
+    async def stop_process(self, process_id: str) -> dict[str, object]:
+        raise RuntimeError("process.stop must use the Application Tool boundary")
+
+    async def resize_process(self, process_id: str, rows: int, cols: int) -> dict[str, object]:
+        raise RuntimeError("process.resize must use the Application Tool boundary")
 
     def import_attachment(
         self,
@@ -1273,10 +1400,56 @@ class UthCodeApplication:
         return self._session_service.list_sessions()
 
     def close(self) -> None:
-        """Release any Application-held Session writer lock."""
+        """Release Session state and request shutdown of owned processes."""
 
+        manager = self._runtime_context.process_manager
+        session_id = self._active_session_id()
+        if manager is not None and session_id is not None:
+            shutdown_session = getattr(manager, "shutdown_session", None)
+            if callable(shutdown_session):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    try:
+                        asyncio.run(shutdown_session(session_id))
+                    except Exception:
+                        pass
+                else:
+                    # Synchronous Application.close is retained for existing
+                    # callers; the Desktop Bridge uses close_async below so
+                    # it can await this cleanup before publishing stopped.
+                    loop.create_task(shutdown_session(session_id))
         if self._session_service is not None:
             self._session_service.close()
+        unsubscribe = self._process_manager_unsubscribe
+        self._process_manager_unsubscribe = None
+        if unsubscribe is not None:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+
+    async def close_async(self) -> None:
+        """Await process shutdown before releasing the Session writer."""
+
+        manager = self._runtime_context.process_manager
+        session_id = self._active_session_id()
+        if manager is not None and session_id is not None:
+            shutdown_session = getattr(manager, "shutdown_session", None)
+            if callable(shutdown_session):
+                try:
+                    await shutdown_session(session_id)
+                except Exception:
+                    pass
+        if self._session_service is not None:
+            self._session_service.close()
+        unsubscribe = self._process_manager_unsubscribe
+        self._process_manager_unsubscribe = None
+        if unsubscribe is not None:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
 
     def create_run(self, *, run_id: str | None = None) -> AgentRun:
         """Create one isolated in-memory Agent Run."""

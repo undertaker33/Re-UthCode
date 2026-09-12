@@ -43,24 +43,24 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T07 文档定位读取与工具图片
 
-- [ ] A09（R05/R06）：通过 计划新增 `tests/test_document_tools.py`、`test_image_tools.py` 验证；通过条件：四种小型代表文件的页/段落/表/单元格/slide 定位正确；扫描 PDF 页图可读；损坏/加密/超限/取消受控；不宣称公式重算。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A09（R05/R06）：通过 计划新增 `tests/test_document_tools.py`、`test_image_tools.py` 验证；通过条件：四种小型代表文件的页/段落/表/单元格/slide 定位正确；扫描 PDF 页图可读；损坏/加密/超限/取消受控；不宣称公式重算。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A10（R05/R06，实际打包依赖）：通过 Windows packaged 手动读取四格式与渲染 PDF 页 验证；通过条件：原生 PDF/图片依赖在安装产物可用，无开发机隐式依赖；当前视觉模型能收到渲染页。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T07 的完成边界并记录对应代码/定向证据：四格式、损坏/加密/超限/取消有定位和受控结果；不支持图片时明确不可用；安装产物实际读取由 T19 验证。
+- [x] 核对 Tasks T07 的完成边界并记录对应代码/定向证据：四格式、损坏/加密/超限/取消有定位和受控结果；不支持图片时明确不可用；安装产物实际读取由 T19 验证。
 
 ## T08 进程会话与原生 PTY
 
-- [ ] A11（R12/R13/R25）：通过 `tests/test_builtin_process_tool.py` 增补；计划新增 `tests/test_process_sessions.py` 验证；通过条件：短等待返回 process_id/running；后续读到增量和退出码；等待无输出不被判死；不同 Session ID 控制被拒绝。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A11（R12/R13/R25）：通过 `tests/test_builtin_process_tool.py` 增补；计划新增 `tests/test_process_sessions.py` 验证；通过条件：短等待返回 process_id/running；后续读到增量和退出码；等待无输出不被判死；不同 Session ID 控制被拒绝。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A14（R11/R15）：通过 既有 descendant 终止用例扩展 PTY 验证；通过条件：timeout/cancel/异常截停后本 Turn 进程及后代不继续写 marker；此前 Turn 保留服务按规则存活；shutdown 全部回收；确认失败明确 unknown。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A14（R11/R15）：通过 既有 descendant 终止用例扩展 PTY 验证；通过条件：timeout/cancel/异常截停后本 Turn 进程及后代不继续写 marker；此前 Turn 保留服务按规则存活；shutdown 全部回收；确认失败明确 unknown。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] 核对 Tasks T08 的完成边界并记录对应代码/定向证据：短等待返回 running，后续有增量/退出码；原生 isatty、输入/EOF/resize 可测试；取消能解阻塞读并确认回收或报告 unknown。
 
 ## T09 进程生命周期与 Desktop 有界日志
 
-- [ ] A13（R13/R15）：通过 `tests/test_desktop_bridge.py` / process 用例 验证；通过条件：Turn 完成后服务仍在；会话导航不关闭；新 Turn 能读取/停止；显式关闭后无法再控制旧句柄。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A14（R11/R15）：通过 既有 descendant 终止用例扩展 PTY 验证；通过条件：timeout/cancel/异常截停后本 Turn 进程及后代不继续写 marker；此前 Turn 保留服务按规则存活；shutdown 全部回收；确认失败明确 unknown。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A13（R13/R15）：通过 `tests/test_desktop_bridge.py` / process 用例 验证；通过条件：Turn 完成后服务仍在；会话导航不关闭；新 Turn 能读取/停止；显式关闭后无法再控制旧句柄。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A14（R11/R15）：通过 既有 descendant 终止用例扩展 PTY 验证；通过条件：timeout/cancel/异常截停后本 Turn 进程及后代不继续写 marker；此前 Turn 保留服务按规则存活；shutdown 全部回收；确认失败明确 unknown。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A15（R14—R16，Windows 实机）：通过 标准 `npm run package` / `npm run make`（依现有 scripts）后人工操作 验证；通过条件：安装产物中 PTY、中文/ANSI 日志、stdin、停止和关闭有效；不是 CDP 布局测试代替原生进程验证。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A16（R16/R17）：通过 Desktop renderer state/chat/session 测试；受控高频日志样本 验证；通过条件：卡片缩略/折叠/分页、后台归属、阅读位置正确；内存有界；跨 chunk Secret 不泄漏；TUI 忽略进度仍能结束。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T09 的完成边界并记录对应代码/定向证据：后台 Session 活进程不被闲置回收；已结束 Turn 日志可持续更新；跨 chunk Secret 不泄露，内存/磁盘有界；原生安装验收留 T19。
+- [x] A16（R16/R17）：通过 Desktop renderer state/chat/session 测试；受控高频日志样本 验证；通过条件：卡片缩略/折叠/分页、后台归属、阅读位置正确；内存有界；跨 chunk Secret 不泄漏；TUI 忽略进度仍能结束。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T09 的完成边界并记录对应代码/定向证据：后台 Session 活进程不被闲置回收；已结束 Turn 日志可持续更新；跨 chunk Secret 不泄露，内存/磁盘有界；原生安装验收留 T19。
 
 ## T10 搜索、抓取与可信搜索配置
 

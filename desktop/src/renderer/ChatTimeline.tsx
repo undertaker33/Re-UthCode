@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
-import type { TimelineEntry, TodoItem } from "./state";
+import type { ProcessLogEntry, ProcessReaderState, TimelineEntry, TodoItem } from "./state";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon, type UiIconName } from "./UiIcon";
 import { renderMarkdown } from "./safe-markdown";
@@ -46,6 +46,12 @@ export interface ChatTimelineProps {
   historyRevision?: number;
   /** Cold runtime preparation is independent from the visible history page. */
   preparationStatus?: "preparing" | "ready" | "failed";
+  /** Bounded process observations for the selected Session. */
+  processLogs?: ProcessLogEntry[];
+  /** Authoritative process.read continuation state for the selected Session. */
+  processReaders?: Record<string, ProcessReaderState>;
+  onReadProcess?: (processId: string, cursor: number) => void;
+  onStopProcess?: (processId: string) => void;
 }
 
 function entryLabel(entry: TimelineEntry, t: (key: TranslationKey) => string): string {
@@ -111,7 +117,7 @@ function timelineContentFingerprint(entries: TimelineEntry[], notice: string | n
   });
 }
 
-export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
@@ -252,6 +258,25 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
       {visibleNotice && <p id="composer-state" className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
       {showNewMessages && <button type="button" className="timeline-new-messages" data-new-messages="true" aria-label={t("jumpToLatest")} title={t("jumpToLatest")} onClick={jumpToLatest}>{t("newMessages")}</button>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
+      {processLogs.length > 0 && <details className="timeline-process-log" data-process-log="true">
+        <summary>Process logs ({processLogs.length})</summary>
+        <div className="timeline-process-log__body">
+          {Array.from(new Set(processLogs.map((entry) => entry.processId))).map((processId) => {
+            const reader = processReaders[processId];
+            const processEntries = processLogs.filter((entry) => entry.processId === processId);
+            return <section className="timeline-process-log__process" key={processId} data-process-session={sessionKey} data-process-owner={processId}>
+              <header><strong>{processId.slice(0, 8)}</strong>{reader?.state && <span>{reader.state}</span>}{onReadProcess && <>
+                <button type="button" onClick={() => onReadProcess(processId, reader?.nextCursor ?? (processEntries.at(-1)?.nextCursor ?? 0))} disabled={reader?.loading === true}>{reader?.loading ? "Reading…" : "Read newer"}</button>
+                {(reader?.earliestCursor ?? 0) > 0 && <button type="button" onClick={() => onReadProcess(processId, 0)} disabled={reader?.loading === true}>Load earliest</button>}
+              </>}{onStopProcess && reader?.state === "running" && <button type="button" onClick={() => onStopProcess(processId)}>Stop</button>}</header>
+              {reader?.cursorExpired && <p className="timeline-process-log__notice" role="status">Cursor expired; earliest cursor: {reader.earliestCursor}. Read from the earliest available output.</p>}
+              {reader?.expired && <p className="timeline-process-log__notice" role="status">Process output expired from the Session quota.</p>}
+              {reader?.error && <p className="timeline-process-log__notice" role="alert">{reader.error}</p>}
+              {processEntries.map((entry) => <pre key={`${entry.processId}:${entry.sequence}`} data-process-id={entry.processId} data-process-sequence={entry.sequence}>{entry.text || `[${entry.stream}] ${entry.state ?? ""}`}</pre>)}
+            </section>;
+          })}
+        </div>
+      </details>}
       {compactionAnchor === null && !historyHasMore && compactionLine}
       {entries.map((entry, index) => {
         if (entry.kind === "compaction") return <Fragment key={entry.id}><p className="timeline-compaction" role="status">{t("contextCompacted")}</p>{index === compactionIndex && compactionLine}</Fragment>;

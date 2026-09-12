@@ -9,7 +9,9 @@ from os import PathLike
 from pathlib import Path, PureWindowsPath
 
 from uthcode.core.provider import (
+    CancellationToken,
     ContentSequence,
+    JsonPayload,
     TextPart,
     ProviderPort,
     ToolCallPart,
@@ -23,7 +25,13 @@ from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.planning import PROPOSE_PLAN_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
-from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry, ToolProgress as CoreToolProgress
+from uthcode.core.tool import (
+    PreparedToolCall,
+    Tool,
+    ToolExecutor,
+    ToolRegistry,
+    ToolProgress as CoreToolProgress,
+)
 from uthcode.core.tool import (
     ToolExecutionOutcome,
     ToolResultMaterialization,
@@ -240,6 +248,7 @@ class ApplicationToolService:
         "_workdir",
         "_externalization_stats",
         "_progress_buffers",
+        "_process_progress_buffers",
     )
 
     def __init__(
@@ -314,11 +323,54 @@ class ApplicationToolService:
             tuple[str, str, int, str, str, str],
             tuple[str, CoreToolProgress],
         ] = {}
+        self._process_progress_buffers: dict[tuple[str, str], str] = {}
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Return the immutable, registration-ordered public definitions."""
 
         return self._registry.definitions()
+
+    def ensure_tool(self, tool: Tool) -> None:
+        """Add one Application-composed Tool to the existing registry.
+
+        Formal bootstrap normally supplies Process with the other built-ins.
+        The small composition seam also lets embedders that supplied a custom
+        Tool tuple use the same Application authorization path without a
+        second executor or a manager call from an Interface.
+        """
+
+        if not isinstance(tool, Tool):
+            raise TypeError("tool must implement the Tool protocol")
+        if self._registry.get(tool.definition.name) is None:
+            self._registry.register(tool)
+
+    def tool(self, name: str) -> Tool | None:
+        """Return one registered Tool for Application-owned orchestration."""
+
+        return self._registry.get(name)
+
+    def prepare_tool_call(
+        self,
+        call: ToolCallPart,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> PreparedToolCall | ToolResultPart:
+        """Prepare a registered call through the one Core ToolExecutor."""
+
+        return self._executor.prepare_call(call, cancellation=cancellation)
+
+    async def execute_prepared_tool(
+        self,
+        prepared: PreparedToolCall,
+        *,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionOutcome:
+        """Execute an already-authorized call through the same executor."""
+
+        return await self._executor.execute_prepared_outcome(
+            prepared,
+            cancellation=cancellation,
+        )
 
     def public_diagnostics(self) -> dict[str, object]:
         """Return aggregate Tool-result persistence facts without payloads."""
@@ -458,6 +510,54 @@ class ApplicationToolService:
             )
             for index in range(0, len(joined), 512)
         )
+
+    def project_process_output(
+        self,
+        observation: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Redact one live process observation with cross-chunk state.
+
+        Process output is an Application event stream, not a Tool result or
+        RunState message.  The short retained suffix is still necessary: a
+        credential can be split at any pump boundary, including after the
+        ToolCall and Turn have already completed.
+        """
+
+        if not isinstance(observation, Mapping):
+            raise TypeError("process observation must be a mapping")
+        session_id = observation.get("session_id")
+        process_id = observation.get("process_id")
+        if not isinstance(session_id, str) or not session_id or not isinstance(process_id, str) or not process_id:
+            raise ValueError("process observation identity is invalid")
+        key = (session_id, process_id)
+        incoming = observation.get("text")
+        incoming_text = incoming if isinstance(incoming, str) else ""
+        raw = self._process_progress_buffers.get(key, "") + incoming_text
+        state = observation.get("state")
+        terminal = observation.get("type") == "process_state" or state in {"exited", "unknown"}
+        if not raw and not terminal:
+            return dict(observation)
+        if terminal:
+            self._process_progress_buffers.pop(key, None)
+            safe_text = self._redactor.redact(raw)
+        else:
+            hold = min(self._redactor.progress_tail_length(raw), len(raw))
+            safe_raw = raw[:-hold] if hold else raw
+            safe_text = self._redactor.redact(safe_raw)
+            self._process_progress_buffers[key] = raw[-hold:] if hold else ""
+        projected = dict(observation)
+        # The process ring owns the byte bound.  Do not truncate a chunk here:
+        # doing so would make process.read disagree with the same sanitized
+        # cursor stream used by live events and Tool results.
+        projected["text"] = safe_text
+        return projected
+
+    def project_process_command(self, command: str) -> str:
+        """Project Process.list command metadata through the same redactor."""
+
+        if not isinstance(command, str):
+            return "<command unavailable>"
+        return _truncate_summary(self._redactor.redact(command), limit=512)
 
     def project_tool_progress(
         self,
@@ -885,6 +985,7 @@ def _execution_metadata(outcome: ToolExecutionOutcome) -> dict[str, object]:
             metadata[field_name] = value
     if outcome.exit_code is not None:
         metadata["exit_code"] = outcome.exit_code
+    metadata.update(outcome.details)
     return metadata
 
 

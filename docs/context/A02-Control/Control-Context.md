@@ -18,6 +18,8 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 - `[FACT]` 手动 Session 压缩接收调用方 `CancellationToken`，覆盖预检、摘要生成、候选校验和提交前检查；这是独立应用操作，不增加 Turn pause kind。取消或后续 epoch 失败不会撤销先前有效 checkpoint；自动压缩也传播当前 Turn 的取消信号。Desktop 操作按 Session/operation identity 归属，导航到其他 Session 不取消它；同会话冲突操作受 Bridge 限制。
 - `[FACT]` Agent Loop 在 trusted preflight 与 Permission 之间直接执行 PLAN 只读检查，并在 usage accounting 后、assistant final 提交前直接执行 unfinished-task 阻断；Plan Review 只由合法 `ProposePlan` 控制 ToolCall 触发。
 - `[FACT]` Plan Review 使用现有 typed pause/resume，TodoWrite 与同一 Turn Steering 使用同一 Core execution 边界；不创建第二个控制 Runtime。
+- `[FACT]` `Process` 的 `list`/`read` 是 `READ`，stdin/EOF `write` 是独立 `WRITE` 输入授权，PTY `resize` 是 `WRITE`，`stop` 是 `DESTRUCTIVE`；启动 Bash 获批不会自动授权后续输入或停止动作。所有操作仍校验当前 Application/Session 所属的 process identity。
+- `[FACT]` Process cancellation、Turn failure 和异常只终止该 Turn 新建的进程；成功 Turn 保留 Session-owned 服务，显式 Session shutdown 才全量回收。Windows 使用原生 Job 归属后代，PTY 使用 pywinpty/ConPTY；POSIX 使用 process group/ptyprocess，回收无法确认时报告 `unknown`。
 - `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。
 - `[ABSENT]` 当前没有 OS Sandbox、动态控制扩展 registry、第三方 Hook plugin 生命周期或可热插拔控制点。
 
@@ -31,7 +33,8 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 | Runtime 控制点 | `src/uthcode/core/agent.py` | `run_segment`, `_run_tool_batch`, `_pause_*_segment`, `_apply_response`, `cancel` |
 | Application 协调 | `src/uthcode/application/runs.py` | `AgentRun`, `_TurnDriver`, `TurnHandle.pause/resume/cancel`, `pending_pause` |
 | 权限文件与默认 Guard | `src/uthcode/integrations/permissions.py` | `load_permission_rules`, `default_guard_rules`, `discover_permission_paths` |
-| Tool Action preflight | `src/uthcode/integrations/tools/` | `PermissionAction`, `Effect`, `ResourceScope`, `classify_bash_command` |
+| Tool Action preflight | `src/uthcode/integrations/tools/` | `PermissionAction`, `Effect`, `ResourceScope`, `classify_bash_command`, `ProcessTool.preflight` |
+| Process ownership/cancellation | `src/uthcode/integrations/tools/process_sessions.py` + `src/uthcode/application/runs.py` | `ProcessSessionManager`, `shutdown_turn`, `shutdown_session`, `CancellationToken` |
 | 安全摘要 | `src/uthcode/core/command_security.py`, `src/uthcode/application/tools.py` | `safe_bash_command_summary`, `_SecretRedactor` |
 | TUI 控制投影 | `src/uthcode/interfaces/tui/interaction.py`, `app.py` | `TuiInteractionState`, `open_pause`, `TurnHandle.resume` |
 
@@ -111,6 +114,7 @@ running segment
 - `PLAN_REVIEW_REQUIRED`（Plan Review）、`USER_INPUT_REQUIRED`（AskUser）、`PERMISSION_REQUIRED`（Permission）、`PROVIDER_UNAVAILABLE`（Retry，区分 network/rate-limit/timeout）与 `USER_REQUESTED` 是互斥的 typed interaction；pending typed interaction 存在时拒绝普通 Steering，输入优先交给对应 typed response。
 - 用户主动暂停是 cooperative pause，不等于取消；Provider attempt 可被暂停信号打断，正在执行的普通 Tool 不因暂停被强杀。
 - `Bash` 取消会尝试终止进程树，但执行仍使用当前 OS 用户权限；不得描述为沙箱。
+- `Bash` 取消会尝试终止进程树，但执行仍使用当前 OS 用户权限；Process 的 stdin、EOF、resize 和 stop 重新经过对应 effect 的 PermissionAction，不得因原始启动授权而跳过。
 - 未知错误对外转为稳定、无内部异常正文的失败事件/结果。
 
 ## 不属于当前控制层

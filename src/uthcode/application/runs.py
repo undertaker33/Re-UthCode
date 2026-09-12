@@ -230,6 +230,16 @@ class AgentRun:
             session_grants=self._session_grants,
         )
 
+    def authorize_action(self, action: PermissionAction) -> PermissionDecision:
+        """Evaluate one Application-owned action with this Run's policy snapshot."""
+
+        return self._resolve_permission(action)
+
+    def grant_action_for_session(self, action: PermissionAction) -> None:
+        """Apply the existing Run-local Session grant semantics after approval."""
+
+        self._store_session_grant(action)
+
     def _store_session_grant(self, action: PermissionAction) -> None:
         if not isinstance(action, PermissionAction) or action.resource is None:
             return
@@ -276,6 +286,13 @@ class AgentRun:
         turn_id = uuid.uuid4().hex
         self._turn_session_id = self._application._active_session_id()
         cancellation = CancellationToken()
+        # The token remains the execution-scoped context already passed to
+        # every Tool.  These safe identities let long lived Integration
+        # resources keep routing observations to the originating Session and
+        # Turn without putting OS handles into RunState or history.
+        cancellation.run_id = self._state.run_id  # type: ignore[attr-defined]
+        cancellation.turn_id = turn_id  # type: ignore[attr-defined]
+        cancellation.session_id = self._turn_session_id  # type: ignore[attr-defined]
         execution = self._application._start_agent_turn(
             self._state,
             user_input,
@@ -773,7 +790,7 @@ class _TurnDriver:
                 result = segment.result
                 if result is None:
                     raise RuntimeError("terminal segment has no result")
-                self._finish_terminal(result)
+                await self._finish_terminal(result)
                 return
         except asyncio.CancelledError:
             self.execution.cancel()
@@ -786,11 +803,11 @@ class _TurnDriver:
             except asyncio.CancelledError:
                 segment = self.execution.cancelled_segment(event_sink=self._emit_event)
             if segment.terminal and segment.result is not None:
-                self._finish_terminal(segment.result)
+                await self._finish_terminal(segment.result)
             else:
-                self._finish_unexpected()
+                await self._finish_unexpected()
         except Exception:
-            self._finish_unexpected()
+            await self._finish_unexpected()
         finally:
             if self._task is asyncio.current_task():
                 self._task = None
@@ -810,7 +827,16 @@ class _TurnDriver:
         self._end_enqueued = True
         self._queue.put_nowait(_END)
 
-    def _finish_terminal(self, result: TurnResult) -> None:
+    async def _finish_terminal(self, result: TurnResult) -> None:
+        if result.status is not RunStatus.COMPLETED:
+            cleanup = getattr(self._run._application, "cleanup_turn_processes", None)
+            if callable(cleanup):
+                try:
+                    await cleanup(result.turn_id)
+                except Exception:
+                    # The terminal result remains authoritative; an unknown
+                    # process state is surfaced by the Process/Bridge facts.
+                    pass
         if self._result_value is None:
             self._result_value = result
             if self._result_future is None:
@@ -823,7 +849,7 @@ class _TurnDriver:
         self._clear_pause_coordination()
         self._close_event_stream()
 
-    def _finish_unexpected(self) -> None:
+    async def _finish_unexpected(self) -> None:
         try:
             segment = self.execution.fail_internal(event_sink=self._emit_event)
         except Exception:
@@ -831,7 +857,7 @@ class _TurnDriver:
             for event in segment.events:
                 self._emit_event(event)
         if segment.result is not None:
-            self._finish_terminal(segment.result)
+            await self._finish_terminal(segment.result)
         else:
             self._clear_pause_coordination()
             self._close_event_stream()

@@ -17,7 +17,8 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` 调用链固定为 `renderer/App.tsx -> preload.ts -> main.ts -> python-runtime.ts -> interfaces/desktop/bridge.py -> UthCodeApplication -> AgentRun -> TurnHandle -> AgentEvent`。Python child 只处理受控 stdio/请求与关闭回收；Bridge 处理 Application、Run、Session 和安全投影。
 - `[FACT]` 每个已打开的真实配置 Desktop Session 对应独立的 Application/Run 运行时投影。切换 Session、新建 Session 或打开另一项目时，旧 Session 的 active Turn 被停放为 background runtime，不因界面导航而取消；再次选择该 Session 会重新激活其已有 runtime，或以共享持久 Session store 的新 Application 恢复它。
 - `[FACT]` background AgentEvent 附带 `session_id` 与 `project_key`。Renderer 以二者为键缓存每个 Session 的 timeline、Todo、Run、typed interaction、Context/Compact 和终态投影；侧栏按该投影显示 running、waiting、completed、failed、cancelled 或 idle。这个缓存是 Interface 投影，不是持久状态或第二份业务权威。
-- `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application。
+- `[FACT]` Bridge 同时订阅 Application 的 `process_output`/`process_state` 观察；它们带 `session_id`、`process_id`、单调 sequence、state/exit code 和有界脱敏文本，可以在 `turn.completed` 之后继续进入 Desktop outbox。Bridge outbox 丢弃最旧日志后仍可通过 `process.read(cursor)` 补读，Renderer 每个 Session 只保留有界 process log。
+- `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成且没有 Session-owned 活进程的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application 及其进程。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
 - `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
 - `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
@@ -37,6 +38,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入，保存仍服从 active Turn 禁止边界。
 - `[FACT]` 普通 Session/Project navigation 与真正 `runtime.shutdown -> runtime.initialize` 生命周期分开显示：前者保留 operation gate 与 generation ownership，但不显示“正在重启”。`CustomSelect` 的 listbox 通过 `document.body` portal 进入 fixed overlay，按 trigger/viewport 几何上下放置，并在滚动、resize、键盘与 Escape 边界更新或关闭，因此不受 modal overflow 裁剪。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
+- `[FACT]` `desktop/src/renderer/state.ts` 在 Turn identity 门禁之前处理进程观察，以便已结束 Turn 的后台输出仍按 `project_key + session_id` 更新；每个 Session 的 process log 有界，`ChatTimeline` 显示状态/退出码、`process.read` 的续读按钮和 cursor-expired/终态淘汰事实，异步回包在 Session 切换后不会写入新 Session，输入文本不回显为日志。
 - `[BOUNDARY]` Desktop 只恢复已提交的 Session Transcript、Timeline、Tool Result ref、Instruction State 和 `model_ref`；不会跨进程恢复 active Turn、typed interaction waiter 或 Runtime checkpoint。
 - `[ABSENT]` 当前没有 Web/IDE GUI、Renderer 直连 Provider/Core、Renderer 自建 Agent Loop、跨进程 Runtime continuation、Subagent 或 Multi-Agent GUI 编排。
 
@@ -65,6 +67,7 @@ visible Session A 有 active Turn
 | --- | --- | --- |
 | Sidebar | Project/Session 目录、title/preview、pin、rename/move 和 per-Session 运行状态；选择一行不取消其他 Session 的后台 Turn | Session catalog + Renderer 的事件缓存；rename/move 由 Application 提交 |
 | Chat timeline | 最近历史优先显示，上翻按页加载；与当前 Session 的安全 AgentEvent 流合并 | Bridge 安全 DTO / Application Session |
+| Process logs | 当前 Session 的后台输出缩略/折叠、状态、退出码和续读提示；Turn 完成后仍可更新 | Application Process observer + Bridge `process.read` / Renderer bounded cache |
 | Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring、选择/粘贴/拖拽附件和仅附件发送；Todo 条置于输入区上方 | Command/Turn/Context/Session Attachment Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
@@ -75,9 +78,11 @@ visible Session A 有 active Turn
 ```text
 Electron 生命周期、IPC、Python child  -> desktop/src/main.ts + desktop/src/preload.ts + desktop/src/python-runtime.ts
 Desktop JSONL 协议、Session/Turn 边界 -> src/uthcode/interfaces/desktop/bridge.py
+Process RPC/事件 outbox                 -> src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/generation.py
 Session 模型、Context 更新与回滚        -> src/uthcode/application/generation.py + context.py + sessions.py
 Session metadata/store                  -> src/uthcode/application/sessions.py + integrations/session_files.py
 Renderer reducer authority              -> desktop/src/renderer/state.ts
+Process log projection                  -> desktop/src/renderer/state.ts + desktop/src/renderer/ChatTimeline.tsx
 Session / DTO 纯转换                    -> desktop/src/renderer/state-session.ts + state-normalization.ts
 Runtime generation / owner / terminal   -> desktop/src/renderer/useRuntimeLifecycle.ts
 Renderer 导航、布局与组合                -> desktop/src/renderer/App.tsx

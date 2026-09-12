@@ -7,6 +7,8 @@ export interface InteractionSurfaceProps {
   interaction: PendingInteraction;
   onSubmit: (response: JsonObject) => void | Promise<void>;
   onCancel: () => void | Promise<void>;
+  /** Process-control approvals are independent from a Turn pause. */
+  showCancel?: boolean;
 }
 
 export function interactionSurfaceKey(interaction: Pick<PendingInteraction, "pauseId">): string {
@@ -108,7 +110,7 @@ export function buildRetryResponse(interaction: PendingInteraction): JsonObject 
   return { type: "retry_provider", ...responseIdentity(interaction) };
 }
 
-export function InteractionSurface({ interaction, onSubmit, onCancel }: InteractionSurfaceProps) {
+export function InteractionSurface({ interaction, onSubmit, onCancel, showCancel = false }: InteractionSurfaceProps) {
   const { t } = useTranslation();
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [step, setStep] = useState(0);
@@ -254,7 +256,7 @@ export function InteractionSurface({ interaction, onSubmit, onCancel }: Interact
     const permission = asRecord(request);
     const choices = Array.isArray(permission.choices) ? permission.choices.filter((choice): choice is string => typeof choice === "string") : [];
     const permissionId = typeof permission.permission_id === "string" ? permission.permission_id : "";
-    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("permissionApproval")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("permissionRequired")}</p><h2>{String(permission.tool ?? t("tool"))}</h2></div><span>{String(permission.action ?? t("reviewAction"))}</span></div><p className="interaction-copy">{String(permission.reason ?? t("approvalReason"))}</p><div className="interaction-actions">{choices.map((choice) => <button type="button" title={choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")} key={choice} className={choice === "reject" ? "danger-button" : "accent-button"} onClick={() => submitResponse(buildPermissionResponse(interaction, permissionId, choice))} disabled={interaction.submitting}>{choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")}</button>)}</div></section>;
+    return <section {...modalProps} className="interaction-surface" role="dialog" aria-modal="true" aria-label={t("permissionApproval")}><div className="interaction-surface__header"><div><p className="eyebrow">{t("permissionRequired")}</p><h2>{String(permission.tool ?? t("tool"))}</h2></div><span>{String(permission.action ?? t("reviewAction"))}</span></div><p className="interaction-copy">{String(permission.reason ?? t("approvalReason"))}</p><div className="interaction-actions">{choices.map((choice) => <button type="button" title={choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")} key={choice} className={choice === "reject" ? "danger-button" : "accent-button"} onClick={() => submitResponse(buildPermissionResponse(interaction, permissionId, choice))} disabled={interaction.submitting}>{choice === "once" ? t("allowOnce") : choice === "session" ? t("allowSession") : t("reject")}</button>)}{showCancel && <button type="button" title={t("cancel")} onClick={cancelInteraction} disabled={interaction.submitting}>{t("cancel")}</button>}</div></section>;
   }
 
   if (interaction.kind === "plan_review_required") {

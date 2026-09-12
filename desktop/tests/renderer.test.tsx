@@ -16,7 +16,7 @@ import {
   type SessionSummary,
   type RendererState,
 } from "../src/renderer/state";
-import { applyProjectOpened, applySessionMutation } from "../src/renderer/state-session";
+import { applyProjectOpened, applySessionMutation, sessionRuntimeKey } from "../src/renderer/state-session";
 import { App, clampLayoutWidth, clampedLayoutWidths, commandResultNotice, layoutWidthBounds, projectNavigationPreferences, projectPinPlan, projectRemovalPlan, safeErrorMessage } from "../src/renderer/App";
 import { MAX_VISIBLE_SESSIONS, Sidebar, menuPosition, sessionGroups } from "../src/renderer/Sidebar";
 import { ChatTimeline, isNearBottom, scrollTimelineToBottom } from "../src/renderer/ChatTimeline";
@@ -107,6 +107,250 @@ test("semantic shell mounts without prototype state", () => {
   assert.match(markup, /Runtime/);
   assert.doesNotMatch(markup, /Log out|Usage|account|Hover preview|demo/u);
   assert.doesNotMatch(markup, /prompt\(|confirm\(/u);
+});
+
+test("T09 App completes the Process stop permission flow without dropping ASK results", async () => {
+  const project: ProjectState = {
+    path: "C:/process-permission",
+    projectKey: "C:/process-permission",
+    alias: "Process permission",
+    pinned: false,
+    catalogFresh: true,
+    sessions: [{ session_id: "session-1", title: "Session 1" }],
+  };
+  const sessionKey = sessionRuntimeKey(project.projectKey, "session-1");
+  const scenarios = [
+    { name: "approve", choice: "once" as const },
+    { name: "reject", choice: "reject" as const },
+    { name: "cancel", choice: null },
+  ];
+  const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+
+  for (const scenario of scenarios) {
+    await withRendererDom(async (_dom, container, root) => {
+      const stopRequests: JsonObject[] = [];
+      const permissionReleases: JsonObject[] = [];
+      const api: DesktopApi = {
+        openProject: async () => null,
+        openProjectInExplorer: async () => undefined,
+        copyText: async () => undefined,
+        closeShell: async () => undefined,
+        requestRuntime: async (method, params) => {
+          if (method === "process.stop") {
+            stopRequests.push({ ...params });
+            if (!Object.prototype.hasOwnProperty.call(params, "permission_id")) {
+              return { permission_required: { permission_id: `permission-${scenario.name}`, tool: "Process", action: "stop", reason: "Stopping this process is destructive.", choices: ["once", "reject"] } };
+            }
+            if (scenario.choice === "reject") throw Object.assign(new Error("permission rejected"), { kind: "permission_denied" });
+            return { process_id: "process-1", state: "exited", exit_code: 0, confirmed: true };
+          }
+          if (method === "process.permission.release") {
+            permissionReleases.push({ ...params });
+            return { permission_id: params.permission_id ?? null, released: true };
+          }
+          if (method === "status.get") return { active_turn: false, runtime: { state: "ready" } };
+          if (method === "project.sessions") return { sessions: project.sessions };
+          return {};
+        },
+        subscribeAgentEvents: () => () => undefined,
+        readPreference: async () => undefined as never,
+        writePreference: async () => undefined,
+      };
+      const state = createInitialState({
+        language: "en",
+        runtimeState: "ready",
+        projects: [project],
+        selectedProjectKey: project.projectKey,
+        selectedSessionId: "session-1",
+        processLogs: {
+          [sessionKey]: [{ processId: "process-1", sequence: 1, stream: "status", text: "", state: "running" }],
+        },
+        processReaders: {
+          [sessionKey]: {
+            "process-1": { nextCursor: 1, earliestCursor: 0, cursorExpired: false, state: "running", expired: false, loading: false, error: null },
+          },
+        },
+      });
+      act(() => { root.render(<App initialState={state} api={api} />); });
+      await flush();
+      const stop = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Stop");
+      assert.ok(stop, `${scenario.name}: running Process must expose Stop`);
+      act(() => { stop!.click(); stop!.click(); });
+      for (let index = 0; index < 3; index += 1) await flush();
+      assert.equal(stopRequests.length, 1, `${scenario.name}: repeated clicks must issue one initial stop request`);
+      assert.match(container.textContent ?? "", /Permission required/u, `${scenario.name}: ASK must be visible`);
+
+      if (scenario.choice === "once") {
+        const allow = container.querySelector<HTMLButtonElement>('button[title="Allow once"]');
+        assert.ok(allow);
+        act(() => { allow!.click(); });
+        for (let index = 0; index < 3; index += 1) await flush();
+        assert.deepEqual(stopRequests[1], { process_id: "process-1", permission_id: "permission-approve", permission_choice: "once" });
+        assert.doesNotMatch(container.textContent ?? "", /Permission required/u);
+      } else if (scenario.choice === "reject") {
+        const reject = container.querySelector<HTMLButtonElement>('button[title="Reject"]');
+        assert.ok(reject);
+        act(() => { reject!.click(); });
+        for (let index = 0; index < 3; index += 1) await flush();
+        assert.deepEqual(stopRequests[1], { process_id: "process-1", permission_id: "permission-reject", permission_choice: "reject" });
+        assert.match(container.textContent ?? "", /Process stop was rejected; the process is still running\./u);
+        assert.match(container.textContent ?? "", /running/u);
+      } else {
+        const cancel = container.querySelector<HTMLButtonElement>('button[title="Cancel"]');
+        assert.ok(cancel);
+        act(() => { cancel!.click(); });
+        await flush();
+        assert.equal(stopRequests.length, 1, "cancel must not replay the destructive stop request");
+        for (let index = 0; index < 3; index += 1) await flush();
+        assert.deepEqual(permissionReleases, [{ permission_id: "permission-cancel", process_id: "process-1" }]);
+        assert.doesNotMatch(container.textContent ?? "", /Permission required/u);
+      }
+    });
+  }
+});
+
+test("T09 App releases a late Process permission after Session navigation", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const project: ProjectState = {
+      path: "C:/process-permission-navigation",
+      projectKey: "C:/process-permission-navigation",
+      alias: "Process permission navigation",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [{ session_id: "session-a", title: "Session A" }, { session_id: "session-b", title: "Session B" }],
+    };
+    const sessionKey = sessionRuntimeKey(project.projectKey, "session-a");
+    const stopRequests: JsonObject[] = [];
+    const permissionReleases: JsonObject[] = [];
+    let resolveStop: ((value: JsonObject) => void) | null = null;
+    const pendingStop = new Promise<JsonObject>((resolve) => { resolveStop = resolve; });
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "process.stop") {
+          stopRequests.push({ ...params });
+          return pendingStop;
+        }
+        if (method === "process.permission.release") {
+          permissionReleases.push({ ...params });
+          return { permission_id: params.permission_id ?? null, released: true };
+        }
+        if (method === "session.resume") return { session_id: "session-b", restored: true, replay: [], run: { run_id: "run-b", turn_id: "turn-b", status: "idle" }, active_turn: false, session_state: { status: "idle" } };
+        if (method === "history.page") return { session_id: "session-b", records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { active_turn: false, runtime: { state: "ready" } };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined as never,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: project.projectKey,
+      selectedSessionId: "session-a",
+      expandedProjects: { [project.projectKey]: true },
+      processLogs: {
+        [sessionKey]: [{ processId: "process-1", sequence: 1, stream: "status", text: "", state: "running" }],
+      },
+      processReaders: {
+        [sessionKey]: {
+          "process-1": { nextCursor: 1, earliestCursor: 0, cursorExpired: false, state: "running", expired: false, loading: false, error: null },
+        },
+      },
+    });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const stop = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Stop");
+    assert.ok(stop);
+    act(() => { stop!.click(); });
+    await flush();
+    assert.deepEqual(stopRequests, [{ process_id: "process-1" }]);
+
+    const sessionB = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-list .session-line")).find((button) => button.textContent?.includes("Session B"));
+    assert.ok(sessionB);
+    act(() => { sessionB!.click(); });
+    for (let index = 0; index < 8; index += 1) await flush();
+    resolveStop?.({ permission_required: { permission_id: "permission-stale", tool: "Process", action: "stop", reason: "Stopping this process is destructive.", choices: ["once", "reject"] } });
+    for (let index = 0; index < 8; index += 1) await flush();
+    assert.deepEqual(permissionReleases, [{ permission_id: "permission-stale", process_id: "process-1" }]);
+    assert.equal(stopRequests.length, 1, "a stale ASK response must never replay Stop");
+    assert.doesNotMatch(container.textContent ?? "", /Permission required/u, "a stale Session must not show the old approval");
+  });
+});
+
+test("T09 App releases a visible Process permission during root unmount", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const project: ProjectState = {
+      path: "C:/process-permission-unmount",
+      projectKey: "C:/process-permission-unmount",
+      alias: "Process permission unmount",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [{ session_id: "session-1", title: "Session 1" }],
+    };
+    const sessionKey = sessionRuntimeKey(project.projectKey, "session-1");
+    const stopRequests: JsonObject[] = [];
+    const permissionReleases: JsonObject[] = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "process.stop") {
+          stopRequests.push({ ...params });
+          return { permission_required: { permission_id: "permission-unmount", tool: "Process", action: "stop", reason: "Stopping this process is destructive.", choices: ["once", "reject"] } };
+        }
+        if (method === "process.permission.release") {
+          permissionReleases.push({ ...params });
+          return { permission_id: params.permission_id ?? null, released: true };
+        }
+        if (method === "status.get") return { active_turn: false, runtime: { state: "ready" } };
+        if (method === "project.sessions") return { sessions: project.sessions };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => undefined as never,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: project.projectKey,
+      selectedSessionId: "session-1",
+      processLogs: {
+        [sessionKey]: [{ processId: "process-1", sequence: 1, stream: "status", text: "", state: "running" }],
+      },
+      processReaders: {
+        [sessionKey]: {
+          "process-1": { nextCursor: 1, earliestCursor: 0, cursorExpired: false, state: "running", expired: false, loading: false, error: null },
+        },
+      },
+    });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const stop = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Stop");
+    assert.ok(stop);
+    act(() => { stop!.click(); });
+    for (let index = 0; index < 3; index += 1) await flush();
+    assert.deepEqual(stopRequests, [{ process_id: "process-1" }]);
+    assert.match(container.textContent ?? "", /Permission required/u);
+    assert.deepEqual(permissionReleases, []);
+
+    act(() => { root.unmount(); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(permissionReleases, [{ permission_id: "permission-unmount", process_id: "process-1" }]);
+    assert.equal(stopRequests.length, 1, "unmount cleanup must never replay Stop");
+  });
 });
 
 test("T08 renderer error projection keeps transport details out of both localized UIs", () => {

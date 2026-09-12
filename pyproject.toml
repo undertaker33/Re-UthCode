@@ -18,6 +18,13 @@ dependencies = [
     "regex>=2025.7,<2027",
     "rich>=15,<16",
     "tomlkit>=0.15,<0.16",
+    "Pillow>=11,<13",
+    "pypdfium2>=4.30,<5",
+    "python-docx>=1.1,<2",
+    "openpyxl>=3.1,<4",
+    "python-pptx>=1.0,<2",
+    "pywinpty>=2.0,<3; sys_platform == 'win32'",
+    "ptyprocess>=0.7,<1; sys_platform != 'win32'",
 ]
 
 [project.scripts]

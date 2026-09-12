@@ -15,7 +15,7 @@ import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView } from "./state";
+import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type PendingInteraction } from "./state";
 import {
   eventIdentity,
   hasCompleteTurnIdentity,
@@ -203,6 +203,34 @@ function attachmentDraftFromResult(value: unknown): DesktopAttachmentDraft | nul
   };
 }
 
+interface PendingProcessPermission {
+  projectKey: string;
+  sessionId: string;
+  processId: string;
+  request: JsonObject;
+  submitting: boolean;
+}
+
+function processPermissionFromResult(value: unknown, projectKey: string, sessionId: string, processId: string): PendingProcessPermission | null {
+  const permission = asObject(asObject(value).permission_required);
+  const permissionId = stringValue(permission.permission_id);
+  const choices = Array.isArray(permission.choices)
+    ? permission.choices.filter((choice): choice is string => typeof choice === "string" && choice.length > 0)
+    : [];
+  if (!permissionId || choices.length === 0) return null;
+  const request: JsonObject = { permission_id: permissionId, choices };
+  for (const key of ["tool", "action", "reason", "run_id", "turn_id", "tool_call_id"] as const) {
+    if (typeof permission[key] === "string") request[key] = permission[key];
+  }
+  return { projectKey, sessionId, processId, request, submitting: false };
+}
+
+function runtimeRequestKind(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const kind = (error as { kind?: unknown }).kind;
+  return typeof kind === "string" ? kind : "";
+}
+
 /**
  * Project every failed Desktop call to a renderer-owned localized message.
  *
@@ -341,6 +369,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const commandInFlightRef = useRef(false);
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
+  const [pendingProcessPermission, setPendingProcessPermission] = useState<PendingProcessPermission | null>(null);
+  const pendingProcessPermissionRef = useRef<PendingProcessPermission | null>(null);
+  const processStopInFlightRef = useRef<string | null>(null);
+  const processPermissionSubmitRef = useRef<string | null>(null);
+  const processPermissionReleaseRef = useRef<string | null>(null);
   const runtimeStatusPollRef = useRef<Promise<boolean> | null>(null);
   const historyRequestsRef = useRef<Map<string, { token: symbol; promise: Promise<void> }>>(new Map());
   const preparationPollSequenceRef = useRef(0);
@@ -701,6 +734,154 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       });
     }
   }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
+
+  const readProcess = useCallback(async (processId: string, cursor: number) => {
+    const projectKey = stateRef.current.selectedProjectKey;
+    const sessionId = stateRef.current.selectedSessionId;
+    if (!projectKey || !sessionId || !Number.isSafeInteger(cursor) || cursor < 0) return;
+    dispatch({ type: "process_read_started", projectKey, sessionId, processId });
+    try {
+      const result = await send("process.read", { process_id: processId, cursor });
+      const current = stateRef.current;
+      // A late response is discarded at the ownership boundary.  The
+      // reducer also keys data by this exact Session, so background replies
+      // cannot be attached to the visible Session by process id alone.
+      if (current.selectedProjectKey !== projectKey || current.selectedSessionId !== sessionId) {
+        // Clear the loading flag in the parked Session cache without exposing
+        // the stale result in the newly selected Session.  Returning to the
+        // old Session must leave its reader retryable.
+        dispatch({ type: "process_read_error", projectKey, sessionId, processId, message: t("runtimeError") });
+        return;
+      }
+      dispatch({ type: "process_read_loaded", projectKey, sessionId, processId, result });
+    } catch (error) {
+      const current = stateRef.current;
+      if (current.selectedProjectKey === projectKey && current.selectedSessionId === sessionId) {
+        dispatch({ type: "process_read_error", projectKey, sessionId, processId, message: safeErrorMessage(error, t("runtimeError")) });
+      } else {
+        dispatch({ type: "process_read_error", projectKey, sessionId, processId, message: t("runtimeError") });
+      }
+    }
+  }, [send, t]);
+
+  const releaseProcessPermission = useCallback(async (pending: PendingProcessPermission) => {
+    const permissionId = stringValue(pending.request.permission_id);
+    if (!permissionId || processPermissionReleaseRef.current === permissionId) return;
+    processPermissionReleaseRef.current = permissionId;
+    try {
+      await send("process.permission.release", {
+        permission_id: permissionId,
+        process_id: pending.processId,
+      });
+    } catch {
+      // Cleanup is best effort at the transport boundary.  The Bridge also
+      // clears all prepared approvals on shutdown; never retry a request that
+      // could be racing a Session/Application replacement.
+      if (isMounted() && stateRef.current.selectedProjectKey === pending.projectKey && stateRef.current.selectedSessionId === pending.sessionId) {
+        dispatch({ type: "notice", text: t("processStopFailed") });
+      }
+    } finally {
+      if (processPermissionReleaseRef.current === permissionId) processPermissionReleaseRef.current = null;
+    }
+  }, [isMounted, send, t]);
+
+  useEffect(() => {
+    // Runtime lifecycle teardown marks the App unmounted before this cleanup
+    // runs. Release the Bridge-owned prepared approval directly from the ref;
+    // the release helper suppresses UI dispatch while unmounted and its
+    // permission-id guard keeps StrictMode/unmount cleanup idempotent.
+    return () => {
+      const pending = pendingProcessPermissionRef.current;
+      if (!pending) return;
+      pendingProcessPermissionRef.current = null;
+      processPermissionSubmitRef.current = null;
+      void releaseProcessPermission(pending);
+    };
+  }, [releaseProcessPermission]);
+
+  const stopProcess = useCallback(async (processId: string) => {
+    const projectKey = stateRef.current.selectedProjectKey;
+    const sessionId = stateRef.current.selectedSessionId;
+    if (!projectKey || !sessionId || !processId || pendingProcessPermissionRef.current || processStopInFlightRef.current) return;
+    const operationKey = `${projectKey}\u0000${sessionId}\u0000${processId}`;
+    processStopInFlightRef.current = operationKey;
+    try {
+      const result = await send("process.stop", { process_id: processId });
+      const permission = processPermissionFromResult(result, projectKey, sessionId, processId);
+      const current = stateRef.current;
+      if (!isMounted() || current.selectedProjectKey !== projectKey || current.selectedSessionId !== sessionId) {
+        if (permission) void releaseProcessPermission(permission);
+        return;
+      }
+      if (!permission) {
+        if (asObject(result).permission_required !== undefined) {
+          dispatch({ type: "notice", text: t("processStopFailed") });
+        }
+        return;
+      }
+      // Set the ref before React commits the modal so a second click in the
+      // same task cannot issue another destructive stop request.
+      pendingProcessPermissionRef.current = permission;
+      setPendingProcessPermission(permission);
+    } catch (error) {
+      const current = stateRef.current;
+      if (current.selectedProjectKey === projectKey && current.selectedSessionId === sessionId) {
+        dispatch({ type: "notice", text: runtimeRequestKind(error) === "permission_denied" ? t("processStopRejected") : t("processStopFailed") });
+      }
+    } finally {
+      if (processStopInFlightRef.current === operationKey) processStopInFlightRef.current = null;
+    }
+  }, [isMounted, releaseProcessPermission, send, t]);
+
+  const cancelProcessPermission = useCallback(() => {
+    const pending = pendingProcessPermissionRef.current;
+    if (!pending || processPermissionSubmitRef.current) return;
+    pendingProcessPermissionRef.current = null;
+    setPendingProcessPermission(null);
+    void releaseProcessPermission(pending);
+  }, [releaseProcessPermission]);
+
+  const submitProcessPermission = useCallback(async (response: JsonObject) => {
+    const pending = pendingProcessPermissionRef.current;
+    const permissionId = stringValue(response.permission_id);
+    const choice = stringValue(response.choice);
+    if (!pending || !permissionId || permissionId !== stringValue(pending.request.permission_id) || !choice || processPermissionSubmitRef.current) return;
+    const current = stateRef.current;
+    if (current.selectedProjectKey !== pending.projectKey || current.selectedSessionId !== pending.sessionId) {
+      pendingProcessPermissionRef.current = null;
+      setPendingProcessPermission(null);
+      return;
+    }
+    const submissionKey = `${permissionId}\u0000${choice}`;
+    processPermissionSubmitRef.current = submissionKey;
+    setPendingProcessPermission({ ...pending, submitting: true });
+    try {
+      const result = await send("process.stop", {
+        process_id: pending.processId,
+        permission_id: permissionId,
+        permission_choice: choice,
+      });
+      const after = stateRef.current;
+      if (!isMounted() || after.selectedProjectKey !== pending.projectKey || after.selectedSessionId !== pending.sessionId) return;
+      const repeatedRequest = processPermissionFromResult(result, pending.projectKey, pending.sessionId, pending.processId);
+      if (repeatedRequest) {
+        pendingProcessPermissionRef.current = repeatedRequest;
+        setPendingProcessPermission(repeatedRequest);
+        return;
+      }
+      pendingProcessPermissionRef.current = null;
+      setPendingProcessPermission(null);
+    } catch (error) {
+      const after = stateRef.current;
+      pendingProcessPermissionRef.current = null;
+      if (isMounted() && after.selectedProjectKey === pending.projectKey && after.selectedSessionId === pending.sessionId) {
+        setPendingProcessPermission(null);
+        dispatch({ type: "notice", text: choice === "reject" && runtimeRequestKind(error) === "permission_denied" ? t("processStopRejected") : t("processStopFailed") });
+      }
+    } finally {
+      if (processPermissionSubmitRef.current === submissionKey) processPermissionSubmitRef.current = null;
+    }
+  }, [isMounted, send, t]);
 
   const refreshConfiguration = useCallback(async (isOwned?: RuntimeOwnershipCheck) => {
     if (isOwned) {
@@ -1692,6 +1873,29 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const visiblePreparation = state.selectedProjectKey && state.selectedSessionId
     ? state.sessionPreparation[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)]
     : undefined;
+  useEffect(() => {
+    const pending = pendingProcessPermissionRef.current;
+    if (!pending) return;
+    if (pending.projectKey === state.selectedProjectKey && pending.sessionId === state.selectedSessionId) return;
+    // A permission request is bound to the Application/Session that prepared
+    // it. Navigation invalidates it locally; no approval is replayed for the
+    // newly selected Session and a late response cannot re-open the dialog.
+    pendingProcessPermissionRef.current = null;
+    processPermissionSubmitRef.current = null;
+    setPendingProcessPermission(null);
+    void releaseProcessPermission(pending);
+  }, [releaseProcessPermission, state.selectedProjectKey, state.selectedSessionId]);
+  const processPermissionInteraction: PendingInteraction | null = pendingProcessPermission
+    ? {
+      kind: "permission_required",
+      pauseId: `process-stop:${pendingProcessPermission.projectKey}:${pendingProcessPermission.sessionId}:${stringValue(pendingProcessPermission.request.permission_id)}`,
+      runId: stringValue(pendingProcessPermission.request.run_id),
+      turnId: stringValue(pendingProcessPermission.request.turn_id),
+      toolCallId: stringValue(pendingProcessPermission.request.tool_call_id),
+      request: pendingProcessPermission.request,
+      submitting: pendingProcessPermission.submitting,
+    }
+    : null;
   const content = state.view === "settings" ? (
     <SettingsView state={state} onRevealApiKey={revealSettingsApiKey} onBack={backFromSettings} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
   ) : (
@@ -1737,9 +1941,19 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         historyError={visibleHistory?.error ?? null}
         historyRevision={visibleHistory?.revision ?? 0}
         preparationStatus={visiblePreparation}
+        processLogs={state.selectedProjectKey && state.selectedSessionId
+          ? state.processLogs[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)] ?? []
+          : []}
+        processReaders={state.selectedProjectKey && state.selectedSessionId
+          ? state.processReaders[sessionRuntimeKey(state.selectedProjectKey, state.selectedSessionId)] ?? {}
+          : {}}
+        onReadProcess={readProcess}
+        onStopProcess={stopProcess}
         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
       />
-      {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
+      {processPermissionInteraction
+        ? <InteractionSurface key={interactionSurfaceKey(processPermissionInteraction)} interaction={processPermissionInteraction} onSubmit={submitProcessPermission} onCancel={cancelProcessPermission} showCancel />
+        : state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
       <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} onChooseAttachment={chooseAttachment} onPasteAttachment={pasteAttachment} onImportFile={importDroppedAttachment} onRemoveAttachment={removeAttachment} />
     </>
   );

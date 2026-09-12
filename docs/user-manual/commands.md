@@ -11,6 +11,8 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 
 Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Configuration 公共出口；Slash 命令的名称、参数、权限和 Session 语义与本页 TUI 参考一致。Desktop 为每个已打开的持久 Session 保留独立运行时投影：切换会话或项目不会取消另一个 Session 的 active Turn，后台状态显示在侧栏；跨进程仍只恢复已提交的 Session 内容。
 
+`Bash` 是唯一的进程启动 Tool。`yield_time_ms` 只决定当前调用等待多久，`timeout_seconds` 才是可选的进程总寿命限制；没有显式 timeout 时，后台服务不会因 ToolCall 返回而自动终止。返回的 `process_id` 只在所属 Application/Session 中有效，可用 `Process` 的 `list`、`read`、`write`、`stop` 和 `resize` 操作继续观察或控制。`read` 使用有界增量游标，游标过期时按返回的最早位置续读；stdin/EOF 是独立的执行输入授权。Desktop 在 Turn 完成后仍接收该 Session 的有界、脱敏进程日志，Session 关闭时才统一回收其进程。
+
 ## TUI 命令
 
 | 命令 | 作用 |

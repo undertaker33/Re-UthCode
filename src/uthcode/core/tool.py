@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, TypeAlias, runtime_checkable
 
@@ -117,6 +117,7 @@ class ToolExecutionResult:
     stream: str | None = None
     next_cursor: str | None = None
     progress: tuple[ToolProgress, ...] = ()
+    details: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, ContentSequence):
@@ -148,6 +149,10 @@ class ToolExecutionResult:
         if not all(isinstance(item, ToolProgress) for item in progress):
             raise TypeError("progress must contain ToolProgress values")
         object.__setattr__(self, "progress", progress)
+        details = self.details
+        if not isinstance(details, Mapping):
+            raise TypeError("details must be a mapping")
+        object.__setattr__(self, "details", dict(details))
 
 
 class ToolExecutionStatus(str, Enum):
@@ -192,6 +197,7 @@ class ToolExecutionOutcome:
     stream: str | None = None
     next_cursor: str | None = None
     progress: tuple[ToolProgress, ...] = ()
+    details: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
@@ -232,6 +238,10 @@ class ToolExecutionOutcome:
         if not all(isinstance(item, ToolProgress) for item in progress):
             raise TypeError("progress must contain ToolProgress values")
         object.__setattr__(self, "progress", progress)
+        details = self.details
+        if not isinstance(details, Mapping):
+            raise TypeError("details must be a mapping")
+        object.__setattr__(self, "details", dict(details))
 
     @property
     def result(self) -> ToolResultPart:
@@ -247,6 +257,7 @@ class ToolExecutionOutcome:
                 metadata[field_name] = value
         if self.exit_code is not None:
             metadata["exit_code"] = self.exit_code
+        metadata.update(self.details)
         return ToolResultPart(self.tool_call_id, self.content, self.is_error, metadata)
 
 
@@ -629,6 +640,7 @@ class ToolExecutor:
             result.stream,
             result.next_cursor,
             result.progress,
+            result.details,
         )
 
     def _cancelled(self, call: ToolCallPart) -> ToolResultPart:
