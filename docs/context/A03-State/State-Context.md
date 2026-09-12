@@ -32,12 +32,14 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Application `status()` 提供安全的 `context_status` 与 `compaction_status` 投影；Context ring、Runtime panel 和 Compact 状态只消费这些 Application 事实，不在 Interface 维护第二份 Context/Compaction authority。
 - `[FACT]` 流式 Desktop Event 到达时，Bridge 只把 assistant/reasoning/plan 文本、Task 状态或工具完成摘要交给 Application 记录有界 `live_delta` 估计；terminal Provider usage 只写入独立的 Last Provider Request Usage，不覆盖当前 Working Context 的 measurement。Renderer 对 live Context/Compact 的缓存和短周期 `status.get` 轮询只用于显示，不改变 Context authority。
 - `[FACT]` Session metadata 的可选 `model_ref` 是持久 Session 事实。模型选择会以同一 Application 边界提交用户级新建默认模型、active Session 模型和 Context；恢复 Session 先预检并只恢复其模型，不倒写用户默认值。
+- `[FACT]` Session 原始附件由 `AttachmentFileStore` 绑定到所属 Session：导入副本以 opaque ref、SHA-256、大小、MIME、图片尺寸和 submitted 状态持久化；导入和请求边界共用有限的图片宽、高、像素限制，所有 `asset_ref` 必须属于 active Session。Transcript/replay/Context 只保存可重读 ref 与安全元数据。已提交原图不会被草稿或派生缓存清理删除，未提交临时文件与派生预览可重建清理。
+- `[FACT]` 图片输入在 Application 的 Turn 与模型候选边界预检；`supports_images` 为 `true`、`false` 或未知，未知按不支持。待发 GenerationRequest 的图片 count、来源、字节和独立 token 估算进入受控 request diagnostics；有来源尺寸/字节的 local estimate 会进入 `RequestAccounting`/Gate，未知估计按不可安全发送处理，Provider Integration 的实际 count 仍优先。Provider Integration 在请求边界解析 active Session asset ref，Context compaction 只有在保留 ref coverage 且 Working Context 严格下降后才提交。
 - `[FACT]` Desktop Renderer 以 `project_key + session_id` 缓存每个 Session 的 timeline、Todo、Run、interaction、Context/Compact 和终态投影，支持后台 Turn 事件在不可见时继续更新。该缓存仅是 Interface state，Session Transcript/Timeline/metadata 仍是唯一持久语义来源。
 - `[BOUNDARY]` Session v3 持久化 metadata（schema 3）、Transcript、Timeline、Tool Result ref、writer lock 和 Instruction State；record envelope 仍为 schema 2。v1/v2 明确 incompatible，不迁移、不双读；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## History 持久化与恢复
 
-Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal Turn 边界把新增 Message 转换为 Transcript，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、Transcript、Timeline、Context 与 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
+Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call 前和 terminal Turn 边界把新增 Message 转换为 Transcript，通过 active Session 的单 writer 提交，并同步最小 Instruction State；`HistoryAppendOutcome` 分开表达 JSONL append+fsync、reload、last-used/metadata touch 与 durability，`HistoryPersistenceOutcome` 再表达 Instruction State sync、failure stage 和 durable message cursor。可判定 durable 的半成功不会把已落盘消息再次作为 process delta；append 后异常先按结构化 identity reconciliation 判定，仍未知则 active Session writer quarantine，所有新 Run、Transcript、Timeline、Context 与 Tool Result 语义写入 fail closed。只有显式 close 后 fresh writer 重新打开并验证/恢复，quarantine 才解除。Session writer 的 open/close 生命周期会幂等重试 Transcript 引用附件的 submitted 标记，并清理无引用临时/派生文件；durable Transcript 引用优先保护原图。真正未落盘的 pending batch 保留原始 Session/Turn identity，恢复时按 FIFO 提交，不改写原 Turn 边界。
 
 详细实现位于 `src/uthcode/application/sessions.py` 与 `src/uthcode/integrations/session_files.py`。其他层引用此处的持久化语义，不另行维护完整失败矩阵。
 
@@ -57,6 +59,7 @@ Application 在首次 Provider call 前、完整 Tool batch 后/下一次 call �
 | 暂停事实 | `src/uthcode/core/interaction.py` | `PauseRequest`, typed `PauseResponse` |
 | Run 生命周期 | `src/uthcode/application/runs.py` | `AgentRun._state`, `_active_turn`, `_TurnDriver`, `TurnHandle` |
 | Session / History 权威入口 | `src/uthcode/application/sessions.py` | `ApplicationSessionService`, `read_history_page`, `list_catalog_metadata`, `ApplicationSession.append_timeline_transaction` |
+| Session 附件与资产 ref | `src/uthcode/application/attachments.py` + `src/uthcode/integrations/attachment_files.py` | `AttachmentService`, `AttachmentFileStore`, `AttachmentReference` |
 | Context 编译与状态 | `src/uthcode/application/context.py` + `src/uthcode/core/context.py` | `ApplicationContextService`, `ContextBudget`, `stable_transcript_for_compaction` |
 | 压缩候选与提交编排 | `src/uthcode/core/compaction.py` + `src/uthcode/application/compaction.py` + `src/uthcode/application/generation.py` | `ContextCompactor`, `compaction_input_payload`, `compact_session`, `validate_candidate` |
 | JSONL 存储与分页 | `src/uthcode/integrations/session_files.py` | `SessionFileStore`, `SessionHistorySlice`, `read_first_user_entry` |

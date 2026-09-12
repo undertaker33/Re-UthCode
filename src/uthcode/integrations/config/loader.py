@@ -59,6 +59,7 @@ _MODEL_FIELDS = frozenset(
         "context_window",
         "max_output_tokens",
         "reasoning_effort",
+        "supports_images",
     }
 )
 _SUPPORTED_PROVIDER_KINDS = frozenset(
@@ -402,6 +403,7 @@ def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
                 "context_window": profile.get("context_window"),
                 "max_output_tokens": profile.get("max_output_tokens"),
                 "reasoning_effort": profile.get("reasoning_effort"),
+                "supports_images": profile.get("supports_images"),
             }
     result["models"] = safe_models
     return result
@@ -729,6 +731,7 @@ def _model_profiles(
         context_window = raw_profile.get("context_window")
         max_output_tokens = raw_profile.get("max_output_tokens")
         reasoning_effort = raw_profile.get("reasoning_effort")
+        supports_images = raw_profile.get("supports_images")
         if (
             not isinstance(model_ref, str)
             or not model_ref.strip()
@@ -763,6 +766,7 @@ def _model_profiles(
                     or reasoning_effort not in _REASONING_EFFORTS
                 )
             )
+            or (supports_images is not None and not isinstance(supports_images, bool))
         ):
             raise ConfigurationError(
                 "invalid Model profile",
@@ -781,6 +785,8 @@ def _model_profiles(
             raw["max_output_tokens"] = max_output_tokens
         if "reasoning_effort" in raw_profile:
             raw["reasoning_effort"] = reasoning_effort
+        if "supports_images" in raw_profile:
+            raw["supports_images"] = supports_images
         result[model_ref] = raw
     return result
 
@@ -829,6 +835,16 @@ def _merge_models(
                     "project context_window cannot expand the user limit",
                     path=path,
                     field=f"models.{model_ref}.context_window",
+                )
+        if project and "supports_images" in raw_profile:
+            user_profile = user_models.get(model_ref, {})
+            user_supports_images = user_profile.get("supports_images")
+            project_supports_images = raw_profile.get("supports_images")
+            if project_supports_images is True and user_supports_images is not True:
+                raise ConfigurationError(
+                    "project supports_images cannot expand an unknown or disabled user capability",
+                    path=path,
+                    field=f"models.{model_ref}.supports_images",
                 )
         current = target.setdefault(model_ref, {})
         current.update(raw_profile)

@@ -1,8 +1,8 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
 import squirrelStartup from "electron-squirrel-startup";
-import { stat } from "node:fs/promises";
-import { isAbsolute, resolve, join } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname, isAbsolute, resolve, join } from "node:path";
 
 // Squirrel.Windows starts the app with a short-lived lifecycle argument while
 // installing, updating, or uninstalling.  Handle it before registering the
@@ -45,6 +45,8 @@ export const IPC_CHANNELS = Object.freeze({
   pickProject: "desktop.project.pick",
   openProjectInExplorer: "desktop.project.explorer",
   copyText: "desktop.clipboard.copy-text",
+  pickAttachment: "desktop.attachment.pick",
+  clipboardAttachment: "desktop.attachment.clipboard",
   closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
   runtimeEvent: "desktop.runtime.event",
@@ -176,6 +178,7 @@ interface MainIpcOptions {
   ipc?: Pick<typeof ipcMain, "handle" | "removeHandler">;
   setNativeTheme?: (theme: DesktopPreferences["theme"]) => void;
   writeClipboard?: (value: string) => void;
+  readClipboardImage?: () => Promise<Buffer | null> | Buffer | null;
 }
 
 export function registerIpcHandlers(options: MainIpcOptions): () => void {
@@ -188,6 +191,16 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   const closeShell = options.closeShell ?? beginApplicationShutdown;
   const setNativeTheme = options.setNativeTheme ?? ((theme: DesktopPreferences["theme"]) => { nativeTheme.themeSource = theme; });
   const writeClipboard = options.writeClipboard ?? ((value: string) => clipboard.writeText(value));
+  const readClipboardImage = options.readClipboardImage ?? (async (): Promise<Buffer | null> => {
+    const items = await clipboard.read();
+    for (const item of items) {
+      const mimeType = item.types.find((value) => value.toLowerCase().startsWith("image/"));
+      if (!mimeType) continue;
+      const blob = await item.getType(mimeType) as Blob;
+      return Buffer.from(await blob.arrayBuffer());
+    }
+    return null;
+  });
 
   const onPickProject = async (event: IpcMainInvokeEvent): Promise<string | null> => {
     assertSender(event);
@@ -220,6 +233,55 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       writeClipboard(value);
     } catch {
       throw new MainBoundaryError("clipboard_write_failed", "Clipboard text could not be copied");
+    }
+  };
+
+  const attachmentMime = (path: string): string => {
+    const ext = extname(path).toLowerCase();
+    return ({
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".pdf": "application/pdf",
+      ".txt": "text/plain",
+      ".md": "text/markdown",
+      ".json": "application/json",
+    } as Record<string, string>)[ext] ?? "application/octet-stream";
+  };
+
+  const encodeAttachment = (name: string, mimeType: string, data: Buffer) => {
+    if (data.byteLength > 16 * 1024 * 1024) {
+      throw new MainBoundaryError("attachment_too_large", "Attachment is too large");
+    }
+    return { name, mime_type: mimeType, data_base64: data.toString("base64") };
+  };
+
+  const onPickAttachment = async (event: IpcMainInvokeEvent): Promise<unknown> => {
+    assertSender(event);
+    const result = await showOpenDialog(options.window, {
+      properties: ["openFile"],
+      title: "Attach file",
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    const source = result.filePaths[0]!;
+    try {
+      return encodeAttachment(basename(source), attachmentMime(source), await readFile(source));
+    } catch (error) {
+      if (error instanceof MainBoundaryError) throw error;
+      throw new MainBoundaryError("attachment_read_failed", "Attachment could not be read");
+    }
+  };
+
+  const onClipboardAttachment = async (event: IpcMainInvokeEvent): Promise<unknown> => {
+    assertSender(event);
+    try {
+      const image = await readClipboardImage();
+      if (!image || image.byteLength === 0) return null;
+      return encodeAttachment("clipboard.png", "image/png", image);
+    } catch {
+      throw new MainBoundaryError("attachment_read_failed", "Clipboard image could not be read");
     }
   };
 
@@ -314,6 +376,8 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   ipc.handle(IPC_CHANNELS.pickProject, onPickProject);
   ipc.handle(IPC_CHANNELS.openProjectInExplorer, onOpenProjectInExplorer);
   ipc.handle(IPC_CHANNELS.copyText, onCopyText);
+  ipc.handle(IPC_CHANNELS.pickAttachment, onPickAttachment);
+  ipc.handle(IPC_CHANNELS.clipboardAttachment, onClipboardAttachment);
   ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);

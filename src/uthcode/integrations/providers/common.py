@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import math
 from collections.abc import Mapping, Sequence
@@ -10,6 +11,31 @@ from enum import Enum
 from typing import Callable
 
 from uthcode.core.provider import CancellationToken, GenerationCancelled, JsonValue
+
+
+AssetResolver = Callable[[str, str], str | bytes | bytearray | memoryview | None]
+
+
+def resolve_asset_url(
+    asset_ref: str,
+    mime_type: str,
+    resolver: AssetResolver | None = None,
+) -> str:
+    """Resolve a Session reference only at the provider wire boundary."""
+
+    if resolver is None or not asset_ref.startswith("attachment:"):
+        return asset_ref
+    value = resolver(asset_ref, mime_type)
+    if value is None:
+        raise ValueError("attachment asset is unavailable")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        encoded = base64.b64encode(bytes(value)).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+    raise TypeError("attachment resolver returned an unsupported value")
 
 
 def plain_json(value: object) -> JsonValue:
@@ -148,9 +174,11 @@ def raise_if_cancelled(token: CancellationToken) -> None:
 
 __all__ = [
     "close_stream",
+    "AssetResolver",
     "next_stream_value",
     "plain_json",
     "raise_if_cancelled",
     "require_json_object",
     "usage_int",
+    "resolve_asset_url",
 ]

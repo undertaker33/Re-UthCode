@@ -65,6 +65,23 @@ export interface DesktopPreferences {
   selectedSessionId: string | null;
 }
 
+export interface DesktopAttachmentInput {
+  name: string;
+  mime_type: string;
+  data_base64: string;
+}
+
+/** Renderer-safe projection of one Session-owned imported attachment. */
+export interface DesktopAttachmentDraft {
+  ref: string;
+  display_name: string;
+  mime_type: string;
+  size_bytes: number;
+  width?: number | null;
+  height?: number | null;
+  data_url?: string;
+}
+
 export const PREFERENCE_KEYS = [
   "theme",
   "language",
@@ -89,6 +106,9 @@ export const RUNTIME_METHODS = [
   "project.open",
   "project.sessions",
   "history.page",
+  "attachment.import",
+  "attachment.preview",
+  "attachment.remove",
   "session.new",
   "session.resume",
   "session.rename",
@@ -126,6 +146,9 @@ export interface DesktopApi {
     key: K,
     value: DesktopPreferences[K],
   ): Promise<DesktopPreferences>;
+  /** Explicit Main-owned file/clipboard import. */
+  chooseAttachment(): Promise<DesktopAttachmentInput | null>;
+  pasteAttachment(): Promise<DesktopAttachmentInput | null>;
 }
 
 export function isPreferenceKey(value: unknown): value is PreferenceKey {

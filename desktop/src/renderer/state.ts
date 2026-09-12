@@ -1,4 +1,4 @@
-import type { AgentEvent, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, DesktopAttachmentDraft, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import {
   DEFAULT_RUNTIME_PANEL_WIDTH,
   DEFAULT_SIDEBAR_WIDTH,
@@ -207,6 +207,7 @@ export interface TimelineEntry {
   endedAt?: number;
   planRevision?: number;
   planState?: "draft" | "final" | "failed" | "cancelled";
+  attachments?: DesktopAttachmentDraft[];
 }
 
 export interface SessionHistoryState {
@@ -309,6 +310,8 @@ export interface RendererState {
   notice: string | null;
   diagnostics: string[];
   composerText: string;
+  /** Session-owned imported drafts waiting for the next Turn. */
+  composerAttachments: DesktopAttachmentDraft[];
   panelMode: PanelModePreference;
   sidebarWidth: number;
   runtimePanelWidth: number;
@@ -381,6 +384,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   notice: null,
   diagnostics: [],
   composerText: "",
+  composerAttachments: [],
   panelMode: "docked",
   sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   runtimePanelWidth: DEFAULT_RUNTIME_PANEL_WIDTH,
@@ -407,6 +411,7 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
     timeline: overrides.timeline?.map((entry) => ({ ...entry })) ?? [],
     todo: overrides.todo?.map((item) => ({ ...item })) ?? [],
     diagnostics: overrides.diagnostics ? [...overrides.diagnostics] : [],
+    composerAttachments: overrides.composerAttachments?.map((attachment) => ({ ...attachment })) ?? [],
     ignoredRunIds: overrides.ignoredRunIds ? [...overrides.ignoredRunIds] : [],
     sessionModels: overrides.sessionModels ? { ...overrides.sessionModels } : {},
     sessionRuntime: overrides.sessionRuntime
@@ -938,6 +943,9 @@ export type RendererAction =
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
   | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string }
+  | { type: "composer_attachment_added"; attachment: DesktopAttachmentDraft }
+  | { type: "composer_attachment_removed"; ref: string }
+  | { type: "composer_attachments_cleared" }
   | { type: "command_result"; result: unknown; notice?: string | null }
   | { type: "composer_text"; text: string }
   | { type: "clear_timeline" }
@@ -1114,6 +1122,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         sessionViewRevision: stateWithCache.sessionViewRevision + 1,
         runtimeError: null,
         notice: null,
+        composerAttachments: [],
       };
     }
     case "history_page_loading": {
@@ -1173,13 +1182,20 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     }
     case "session_resumed":
       {
-        const next = applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime);
+        const next = {
+          ...applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime),
+          // Draft attachments belong to the selected Session. A successful
+          // resume may replace the owner even when the visible timeline is
+          // temporarily preserved during preparation.
+          composerAttachments: [],
+        };
         if (!action.preserveTimeline) return next;
         const sessionId = nonEmptyText(resultRecord(action.result).session_id);
         const projectKey = state.selectedProjectKey;
         if (!sessionId || !projectKey || state.selectedSessionId !== sessionId) return next;
         return {
           ...next,
+          composerAttachments: [],
           timeline: state.timeline.map((entry) => ({ ...entry })),
           ...(next.sessionRuntime[sessionRuntimeKey(projectKey, sessionId)]
             ? {
@@ -1205,6 +1221,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         ...permissionUnknownAtRunBoundary(stateWithCache, action.run, action.preserveSessionRuntime !== true),
         selectedSessionId: action.sessionId,
         timeline: [],
+        composerAttachments: [],
         todo: [],
         todoIteration: 0,
         activeTurn: false,
@@ -1277,10 +1294,18 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
     case "turn_accepted": {
       const acceptedRun = normalizeRun(action.run);
-      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0 }) };
+      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, turnId: next.run?.turn_id, status: "completed" }], nextStatusId: next.nextStatusId + 1 };
     }
+    case "composer_attachment_added": {
+      if (state.composerAttachments.some((attachment) => attachment.ref === action.attachment.ref)) return state;
+      return { ...state, composerAttachments: [...state.composerAttachments, { ...action.attachment }] };
+    }
+    case "composer_attachment_removed":
+      return { ...state, composerAttachments: state.composerAttachments.filter((attachment) => attachment.ref !== action.ref) };
+    case "composer_attachments_cleared":
+      return state.composerAttachments.length === 0 ? state : { ...state, composerAttachments: [] };
     case "command_result": {
       const source = resultRecord(action.result);
       // Command results are a typed Desktop contract.  Never render

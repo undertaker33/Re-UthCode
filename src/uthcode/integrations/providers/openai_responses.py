@@ -57,12 +57,14 @@ from uthcode.core.provider import (
 )
 
 from .common import (
+    AssetResolver,
     close_stream,
     next_stream_value,
     plain_json,
     raise_if_cancelled,
     require_json_object,
     usage_int,
+    resolve_asset_url,
 )
 
 
@@ -342,7 +344,10 @@ def _request_text(message: Message) -> str:
     return "".join(text)
 
 
-def _responses_content(parts: Sequence[object]) -> list[dict[str, object]]:
+def _responses_content(
+    parts: Sequence[object],
+    asset_resolver: AssetResolver | None = None,
+) -> list[dict[str, object]]:
     values: list[dict[str, object]] = []
     for part in parts:
         if isinstance(part, TextPart):
@@ -351,7 +356,7 @@ def _responses_content(parts: Sequence[object]) -> list[dict[str, object]]:
             values.append(
                 {
                     "type": "input_image",
-                    "image_url": part.asset_ref,
+                    "image_url": resolve_asset_url(part.asset_ref, part.mime_type, asset_resolver),
                     "detail": "auto",
                 }
             )
@@ -384,6 +389,7 @@ def _native_at(
 def _request_input(
     request: GenerationRequest,
     identity: ProviderIdentity,
+    asset_resolver: AssetResolver | None = None,
 ) -> list[dict[str, object]]:
     values: list[dict[str, object]] = []
     for message in request.messages:
@@ -391,7 +397,7 @@ def _request_input(
             values.append(
                 {
                     "role": "user",
-                    "content": _responses_content(message.parts),
+                    "content": _responses_content(message.parts, asset_resolver),
                 }
             )
             continue
@@ -405,7 +411,7 @@ def _request_input(
                 if len(part.content.parts) == 1 and isinstance(part.content.parts[0], TextPart):
                     output = str(part.content)
                 else:
-                    output = _responses_content(part.content.parts)
+                    output = _responses_content(part.content.parts, asset_resolver)
                 values.append(
                     {
                         "type": "function_call_output",
@@ -566,15 +572,20 @@ class OpenAIResponsesProvider:
         client: AsyncOpenAI,
         *,
         max_output_tokens: int | None = None,
+        asset_resolver: AssetResolver | None = None,
     ) -> None:
         self._model_name = model_name
         self._client = client
         self._max_output_tokens = max_output_tokens
+        self._asset_resolver = asset_resolver
         self._identity = ProviderIdentity("openai", "responses", model_name)
 
     @property
     def identity(self) -> ProviderIdentity:
         return self._identity
+
+    def set_asset_resolver(self, resolver: AssetResolver | None) -> None:
+        self._asset_resolver = resolver
 
     async def stream(
         self,
@@ -587,7 +598,7 @@ class OpenAIResponsesProvider:
         mapped_error: ProviderError | None = None
         completed: ProviderResponse | None = None
         try:
-            input_values = _request_input(request, self._identity)
+            input_values = _request_input(request, self._identity, self._asset_resolver)
             model = request.model or self._model_name
             max_output_tokens = (
                 request.max_output_tokens
@@ -1116,6 +1127,7 @@ def build_openai_responses_provider(
     base_url: str | None = None,
     http_client: object | None = None,
     max_output_tokens: int | None = None,
+    asset_resolver: AssetResolver | None = None,
 ) -> ProviderPort:
     """Build an OpenAI Responses Provider without making a model request."""
 
@@ -1128,6 +1140,7 @@ def build_openai_responses_provider(
         model_name,
         resolved_client,
         max_output_tokens=max_output_tokens,
+        asset_resolver=asset_resolver,
     )
 
 

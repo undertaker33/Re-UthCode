@@ -19,8 +19,11 @@ from uthcode.core.history import (
     TranscriptRef,
 )
 from uthcode.core.provider import (
+    FilePart,
+    ImagePart,
     Message,
     ReasoningPart,
+    SourcePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -38,6 +41,7 @@ from uthcode.integrations.session_files import (
     SessionWriter,
     normalize_session_title,
 )
+from uthcode.integrations.attachment_files import AttachmentError, AttachmentReference
 
 from .instructions import InstructionError, InstructionLoader, InstructionStateMetadata
 
@@ -93,6 +97,9 @@ class SessionReplayRecord:
     termination_reason: str | None = None
     failure_reason: str | None = None
     message_id: str | None = None
+    # Attachment metadata is safe to expose; bytes remain Session-owned and
+    # are fetched through an explicit preview/read boundary.
+    attachments: tuple[Mapping[str, object], ...] = ()
     # Legacy full-message envelopes can contain multiple parts under one
     # durable sequence.  Keep the disambiguator internal to the safe DTO so
     # existing replay wire fields remain unchanged.
@@ -134,6 +141,14 @@ class SessionReplayRecord:
             FailureReason(self.failure_reason)
         if self.message_id is not None and not self.message_id.strip():
             raise ValueError("replay message_id must be non-empty when provided")
+        if not isinstance(self.attachments, tuple):
+            object.__setattr__(self, "attachments", tuple(self.attachments))
+        normalized_attachments: list[Mapping[str, object]] = []
+        for attachment in self.attachments:
+            if not isinstance(attachment, Mapping):
+                raise TypeError("replay attachments must contain mappings")
+            normalized_attachments.append(dict(attachment))
+        object.__setattr__(self, "attachments", tuple(normalized_attachments))
         if self.kind == "failure" and self.termination_reason is None:
             raise ValueError("failure replay requires termination_reason")
         if not isinstance(self.is_error, bool):
@@ -171,6 +186,8 @@ class SessionReplayRecord:
             field_value = getattr(self, field_name)
             if field_value is not None:
                 value[field_name] = field_value
+        if self.attachments:
+            value["attachments"] = [dict(item) for item in self.attachments]
         return value
 
     @property
@@ -373,7 +390,49 @@ class ApplicationSession:
         entries: TranscriptEntry | Sequence[TranscriptEntry],
     ) -> TranscriptAppendOutcome:
         self._require_writable()
-        return self._writer.append_transcript(entries)
+        outcome = self._writer.append_transcript(entries)
+        if outcome.transcript_appended:
+            values = (entries,) if isinstance(entries, TranscriptEntry) else tuple(entries)
+            for ref in _attachment_refs_from_entries(values, self.session_id):
+                try:
+                    self._writer.mark_attachment_submitted(ref)
+                except AttachmentError:
+                    # The transcript is already durable.  Retry the metadata
+                    # transition now and again at the next Session boundary;
+                    # never duplicate the Turn to recover this side effect.
+                    self._writer.reconcile_attachment_lifecycle()
+        return outcome
+
+    def persist_attachment(
+        self,
+        content: bytes | bytearray | memoryview,
+        *,
+        display_name: str,
+        mime_type: str | None = None,
+        policy: object | None = None,
+    ) -> AttachmentReference:
+        self._require_writable()
+        value = self._writer.persist_attachment(
+            content,
+            display_name=display_name,
+            mime_type=mime_type,
+            policy=policy,
+        )
+        if not isinstance(value, AttachmentReference):
+            raise TypeError("attachment store returned an invalid reference")
+        return value
+
+    def read_attachment(self, ref: str) -> bytes:
+        self._require_open()
+        return self._writer.read_attachment(ref)
+
+    def remove_draft_attachment(self, ref: str) -> None:
+        self._require_writable()
+        self._writer.remove_draft_attachment(ref)
+
+    def cleanup_attachments(self) -> dict[str, int]:
+        self._require_writable()
+        return self._writer.cleanup_attachments()
 
     def append_timeline_transaction(
         self,
@@ -1202,6 +1261,35 @@ def _entry_message_id(entry: TranscriptEntry) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _attachment_refs_from_entries(
+    entries: Sequence[TranscriptEntry],
+    session_id: str,
+) -> tuple[str, ...]:
+    """Extract only this Session's opaque attachment refs from durable parts."""
+
+    prefix = f"attachment:{session_id}:"
+    refs: set[str] = set()
+    for entry in entries:
+        try:
+            parts = _entry_parts(entry)
+        except (TypeError, ValueError, KeyError):
+            continue
+        for part in parts:
+            asset_ref = getattr(part, "asset_ref", None)
+            if isinstance(asset_ref, str) and asset_ref.startswith(prefix):
+                ref = asset_ref[len(prefix) :]
+                if ref:
+                    refs.add(ref)
+            if isinstance(part, ToolResultPart):
+                for nested in part.content:
+                    nested_ref = getattr(nested, "asset_ref", None)
+                    if isinstance(nested_ref, str) and nested_ref.startswith(prefix):
+                        ref = nested_ref[len(prefix) :]
+                        if ref:
+                            refs.add(ref)
+    return tuple(sorted(refs))
+
+
 def _bounded_replay_text(value: str, *, limit: int = 240) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
@@ -1215,6 +1303,14 @@ def _replay_tool_status(result: ToolResultPart) -> tuple[str, bool]:
     if status not in _REPLAY_TOOL_STATUSES:
         status = "failed" if result.is_error else "succeeded"
     return status, result.is_error
+
+
+def _attachment_projection(part: object) -> Mapping[str, object] | None:
+    """Project an attachment/source part without copying its bytes."""
+
+    if isinstance(part, (ImagePart, FilePart, SourcePart)):
+        return part.to_dict()
+    return None
 
 
 def _project_replay(
@@ -1369,6 +1465,41 @@ def _project_replay_units(
                             created_at=entry.created_at,
                             title=title,
                             message_id=_entry_message_id(entry),
+                            attachments=tuple(
+                                _attachment_projection(item)
+                                for item in part.content
+                                if _attachment_projection(item) is not None
+                            ),
+                            part_index=part_index,
+                        )
+                    )
+                    continue
+                attachment = _attachment_projection(part)
+                if attachment is not None:
+                    if entry.kind in (
+                        TranscriptKind.USER_MESSAGE,
+                        TranscriptKind.USER_STEERING,
+                    ):
+                        attachment_kind = "steering" if entry.kind is TranscriptKind.USER_STEERING or entry.turn_id in user_seen else "user"
+                        user_seen.add(entry.turn_id)
+                    elif entry.kind in {
+                        TranscriptKind.ASSISTANT_MESSAGE,
+                        TranscriptKind.FAILED_ASSISTANT_MESSAGE,
+                    }:
+                        attachment_kind = "assistant"
+                    else:
+                        continue
+                    records.append(
+                        SessionReplayRecord(
+                            session_id=session_id,
+                            sequence=sequence,
+                            turn_id=entry.turn_id,
+                            kind=attachment_kind,
+                            text="",
+                            created_at=entry.created_at,
+                            title=title,
+                            message_id=_entry_message_id(entry),
+                            attachments=(attachment,),
                             part_index=part_index,
                         )
                     )

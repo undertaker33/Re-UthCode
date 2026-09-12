@@ -82,6 +82,20 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   assert.equal(fresh.run?.run_id, "fresh-run");
 });
 
+test("T06 session resume clears draft attachments so they cannot cross Session ownership", () => {
+  const state = createInitialState({
+    selectedProjectKey: "C:/Projects/one",
+    selectedSessionId: "one",
+    composerAttachments: [{ ref: "draft-one", display_name: "one.png", mime_type: "image/png", size_bytes: 4 }],
+  });
+  const resumed = reduceRendererState(state, {
+    type: "session_resumed",
+    result: { session_id: "two", replay: [], run: null },
+  });
+  assert.equal(resumed.selectedSessionId, "two");
+  assert.deepEqual(resumed.composerAttachments, []);
+});
+
 test("history pages merge with live output, dedupe stable identities, and ignore stale Sessions", () => {
   const projectKey = "C:/Projects/history-renderer";
   const key = sessionRuntimeKey(projectKey, "session-a");

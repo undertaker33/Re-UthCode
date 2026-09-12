@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   DesktopApi,
+  DesktopAttachmentInput,
   DesktopPreferences,
   JsonObject,
   JsonValue,
@@ -94,6 +95,16 @@ export function installPreload(
       const next = await ipcRenderer.invoke("desktop.preference.write", key, value);
       requireJsonObject(next, "preference response");
       return next as unknown as DesktopPreferences;
+    },
+    async chooseAttachment(): Promise<DesktopAttachmentInput | null> {
+      const result = await ipcRenderer.invoke("desktop.attachment.pick");
+      if (result !== null) requireJsonObject(result, "attachment picker response");
+      return result as DesktopAttachmentInput | null;
+    },
+    async pasteAttachment(): Promise<DesktopAttachmentInput | null> {
+      const result = await ipcRenderer.invoke("desktop.attachment.clipboard");
+      if (result !== null) requireJsonObject(result, "attachment clipboard response");
+      return result as DesktopAttachmentInput | null;
     },
   });
   contextBridge.exposeInMainWorld("uthcode", api);

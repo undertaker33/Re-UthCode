@@ -59,12 +59,14 @@ from uthcode.core.provider import (
 )
 
 from .common import (
+    AssetResolver,
     close_stream,
     next_stream_value,
     plain_json,
     raise_if_cancelled,
     require_json_object,
     usage_int,
+    resolve_asset_url,
 )
 
 
@@ -117,10 +119,10 @@ def _message_text(message: Message) -> str:
     return "".join(values)
 
 
-def _image_block(part: ImagePart) -> dict[str, object]:
+def _image_block(part: ImagePart, asset_resolver: AssetResolver | None = None) -> dict[str, object]:
     """Convert a Core image reference to the Anthropic image source shape."""
 
-    ref = part.asset_ref
+    ref = resolve_asset_url(part.asset_ref, part.mime_type, asset_resolver)
     if ref.startswith("data:") and "," in ref:
         header, data = ref.split(",", 1)
         if ";base64" in header:
@@ -136,13 +138,16 @@ def _image_block(part: ImagePart) -> dict[str, object]:
     return {"type": "image", "source": {"type": "url", "url": ref}}
 
 
-def _content_blocks(parts: Sequence[object]) -> list[dict[str, object]]:
+def _content_blocks(
+    parts: Sequence[object],
+    asset_resolver: AssetResolver | None = None,
+) -> list[dict[str, object]]:
     blocks: list[dict[str, object]] = []
     for part in parts:
         if isinstance(part, TextPart):
             blocks.append({"type": "text", "text": part.text})
         elif isinstance(part, ImagePart):
-            blocks.append(_image_block(part))
+            blocks.append(_image_block(part, asset_resolver))
         elif isinstance(part, FilePart):
             blocks.append(
                 {
@@ -232,11 +237,15 @@ def _assistant_content(
     return content
 
 
-def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[str, object]]:
+def _message_blocks(
+    message: Message,
+    identity: ProviderIdentity,
+    asset_resolver: AssetResolver | None = None,
+) -> list[dict[str, object]]:
     if message.role == "assistant":
         return _assistant_content(message, identity)
     if message.role == "user":
-        return _content_blocks(message.parts)
+        return _content_blocks(message.parts, asset_resolver)
     if message.role == "tool":
         blocks: list[dict[str, object]] = []
         for part in message.parts:
@@ -248,7 +257,7 @@ def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[s
             if len(part.content.parts) == 1 and isinstance(part.content.parts[0], TextPart):
                 content = str(part.content)
             else:
-                content = _content_blocks(part.content.parts)
+                content = _content_blocks(part.content.parts, asset_resolver)
             blocks.append(
                 {
                     "type": "tool_result",
@@ -264,6 +273,7 @@ def _message_blocks(message: Message, identity: ProviderIdentity) -> list[dict[s
 def _request_messages(
     request: GenerationRequest,
     identity: ProviderIdentity,
+    asset_resolver: AssetResolver | None = None,
 ) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
     for message in request.messages:
@@ -271,7 +281,7 @@ def _request_messages(
         messages.append(
             {
                 "role": role,
-                "content": _message_blocks(message, identity),
+                "content": _message_blocks(message, identity, asset_resolver),
             }
         )
     return messages
@@ -372,15 +382,20 @@ class AnthropicProvider:
         client: AsyncAnthropic,
         *,
         max_output_tokens: int | None = None,
+        asset_resolver: AssetResolver | None = None,
     ) -> None:
         self._model_name = model_name
         self._client = client
         self._max_output_tokens = max_output_tokens
+        self._asset_resolver = asset_resolver
         self._identity = ProviderIdentity("anthropic", "messages", model_name)
 
     @property
     def identity(self) -> ProviderIdentity:
         return self._identity
+
+    def set_asset_resolver(self, resolver: AssetResolver | None) -> None:
+        self._asset_resolver = resolver
 
     async def resolve_model_limits(self, model: str) -> ModelLimits | None:
         """Read reliable runtime limits when the configured client exposes them."""
@@ -422,7 +437,7 @@ class AnthropicProvider:
             return None
         kwargs: dict[str, object] = {
             "model": request.model or self._model_name,
-            "messages": _request_messages(request, self._identity),
+            "messages": _request_messages(request, self._identity, self._asset_resolver),
         }
         cache_breakpoint = _stable_cache_breakpoint(request)
         system = _request_system(request, cache_breakpoint=cache_breakpoint)
@@ -456,7 +471,7 @@ class AnthropicProvider:
         mapped_error: ProviderError | None = None
         completed: ProviderResponse | None = None
         try:
-            messages = _request_messages(request, self._identity)
+            messages = _request_messages(request, self._identity, self._asset_resolver)
             max_output_tokens = (
                 request.max_output_tokens
                 if request.max_output_tokens is not None
@@ -849,6 +864,7 @@ def build_anthropic_provider(
     base_url: str | None = None,
     http_client: object | None = None,
     max_output_tokens: int | None = None,
+    asset_resolver: AssetResolver | None = None,
 ) -> ProviderPort:
     """Build an Anthropic Provider without making a model request."""
 
@@ -861,6 +877,7 @@ def build_anthropic_provider(
         model_name,
         resolved_client,
         max_output_tokens=max_output_tokens,
+        asset_resolver=asset_resolver,
     )
 
 

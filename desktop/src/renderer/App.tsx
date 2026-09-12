@@ -8,7 +8,7 @@ import {
   SIDEBAR_WIDTH_MAX,
   SIDEBAR_WIDTH_MIN,
 } from "../desktop-api";
-import type { AgentEvent, DesktopApi, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { RuntimePanel } from "./RuntimePanel";
@@ -171,6 +171,36 @@ function runtimeApi(explicit?: DesktopApi): DesktopApi | undefined {
 function asObject(value: unknown): JsonObject {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as JsonObject;
   return {};
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function attachmentDraftFromResult(value: unknown): DesktopAttachmentDraft | null {
+  const source = asObject(value);
+  const ref = stringValue(source.ref);
+  const displayName = stringValue(source.display_name) || stringValue(source.name);
+  const mimeType = stringValue(source.mime_type);
+  const sizeBytes = typeof source.size_bytes === "number" && Number.isSafeInteger(source.size_bytes) && source.size_bytes >= 0 ? source.size_bytes : null;
+  if (!ref || !displayName || !mimeType || sizeBytes === null) return null;
+  const width = typeof source.width === "number" && Number.isSafeInteger(source.width) && source.width > 0 ? source.width : null;
+  const height = typeof source.height === "number" && Number.isSafeInteger(source.height) && source.height > 0 ? source.height : null;
+  const dataUrl = typeof source.data_url === "string" && /^data:[^,]+,/.test(source.data_url) ? source.data_url : undefined;
+  return {
+    ref,
+    display_name: displayName,
+    mime_type: mimeType,
+    size_bytes: sizeBytes,
+    ...(width !== null ? { width } : {}),
+    ...(height !== null ? { height } : {}),
+    ...(dataUrl ? { data_url: dataUrl } : {}),
+  };
 }
 
 /**
@@ -1048,9 +1078,98 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [api, hasOwner, isMounted, send, t, waitForRuntimeUserAccess]);
 
-  const submitComposer = useCallback(async (text: string) => {
+  const importAttachmentInput = useCallback(async (input: DesktopAttachmentInput) => {
+    if (!api || !isMounted() || stateRef.current.activeTurn) return;
+    const owner = {
+      generation: runtimeGeneration(),
+      projectKey: stateRef.current.selectedProjectKey,
+      sessionId: stateRef.current.selectedSessionId,
+      viewRevision: stateRef.current.sessionViewRevision,
+    };
+    const ownsAttachment = () => {
+      const current = stateRef.current;
+      return isMounted()
+        && runtimeGeneration() === owner.generation
+        && current.selectedProjectKey === owner.projectKey
+        && current.sessionViewRevision === owner.viewRevision
+        && (owner.sessionId === null || current.selectedSessionId === owner.sessionId);
+    };
+    try {
+      const result = asObject(await send("attachment.import", {
+        name: input.name,
+        mime_type: input.mime_type,
+        data_base64: input.data_base64,
+      }));
+      if (!ownsAttachment()) return;
+      const draft = attachmentDraftFromResult(asObject(result).attachment);
+      if (!draft) {
+        dispatch({ type: "notice", text: t("attachmentImportFailed") });
+        return;
+      }
+      // Preview is a separate bounded request.  A preview failure must not
+      // discard the durable imported original or make the draft uneditable.
+      try {
+        const preview = asObject(await send("attachment.preview", { ref: draft.ref }));
+        if (!ownsAttachment()) return;
+        const withPreview = attachmentDraftFromResult({ ...draft, ...asObject(asObject(preview).attachment) });
+        dispatch({ type: "composer_attachment_added", attachment: withPreview ?? draft });
+      } catch {
+        if (!ownsAttachment()) return;
+        dispatch({ type: "composer_attachment_added", attachment: draft });
+      }
+    } catch (error) {
+      if (ownsAttachment()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentImportFailed")) });
+    }
+  }, [api, isMounted, runtimeGeneration, send, t]);
+
+  const chooseAttachment = useCallback(async () => {
+    if (!api || stateRef.current.activeTurn) return;
+    try {
+      const input = await api.chooseAttachment();
+      if (input) await importAttachmentInput(input);
+    } catch (error) {
+      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentImportFailed")) });
+    }
+  }, [api, importAttachmentInput, isMounted, t]);
+
+  const pasteAttachment = useCallback(async () => {
+    if (!api || stateRef.current.activeTurn) return;
+    try {
+      const input = await api.pasteAttachment();
+      if (input) await importAttachmentInput(input);
+    } catch (error) {
+      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentImportFailed")) });
+    }
+  }, [api, importAttachmentInput, isMounted, t]);
+
+  const importDroppedAttachment = useCallback(async (file: File) => {
+    if (stateRef.current.activeTurn || file.size <= 0) return;
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      await importAttachmentInput({
+        name: file.name || "attachment",
+        mime_type: file.type || "application/octet-stream",
+        data_base64: bytesToBase64(data),
+      });
+    } catch (error) {
+      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentImportFailed")) });
+    }
+  }, [importAttachmentInput, isMounted, t]);
+
+  const removeAttachment = useCallback(async (ref: string) => {
+    if (!api || !ref || stateRef.current.activeTurn) return;
+    try {
+      await send("attachment.remove", { ref });
+      dispatch({ type: "composer_attachment_removed", ref });
+    } catch (error) {
+      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentRemoveFailed")) });
+    }
+  }, [api, isMounted, send, t]);
+
+  const submitComposer = useCallback(async (text: string, attachments: readonly DesktopAttachmentDraft[] = stateRef.current.composerAttachments) => {
     const isCompactionRunning = () => (stateRef.current.compactionStatus.state as string) === "running";
-    if (!api || !isMounted() || !text.trim() || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
+    const selectedAttachments = stateRef.current.activeTurn ? [] : attachments;
+    if (!api || !isMounted() || (!text.trim() && selectedAttachments.length === 0) || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
     const selectedProjectKey = stateRef.current.selectedProjectKey;
     const selectedSessionId = stateRef.current.selectedSessionId;
     const preparation = selectedProjectKey && selectedSessionId
@@ -1072,7 +1191,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     try {
       const result = steering
         ? await send("turn.steer", { text })
-        : await send("turn.start", { prompt: text });
+        : await send("turn.start", {
+          prompt: text,
+          ...(selectedAttachments.length > 0 ? {
+            attachments: selectedAttachments.map((attachment) => ({
+              ref: attachment.ref,
+              kind: attachment.mime_type.startsWith("image/") ? "image" : "file",
+            })),
+          } : {}),
+        });
       if (!isMounted() || (pendingStart && pendingTurnStart() !== pendingStart)) return;
       // Bridge `turn.start` returns a flat Run DTO; only `turn.steer` wraps
       // that DTO under `run`. Keep the shapes separate and require both
@@ -1613,7 +1740,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
       />
       {state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
-      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} />
+      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} onChooseAttachment={chooseAttachment} onPasteAttachment={pasteAttachment} onImportFile={importDroppedAttachment} onRemoveAttachment={removeAttachment} />
     </>
   );
 

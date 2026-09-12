@@ -90,6 +90,18 @@ function todoStatusLabel(status: TodoItem["status"], t: (key: TranslationKey) =>
   return status === "completed" ? t("completed") : status === "in_progress" ? t("inProgress") : t("pending");
 }
 
+function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => string) {
+  if (!entry.attachments || entry.attachments.length === 0) return null;
+  return <div className="timeline-attachments" aria-label={t("attachments")}>
+    {entry.attachments.map((attachment) => <div className="timeline-attachment" key={`${entry.id}:${attachment.ref}`}>
+      {attachment.data_url && attachment.mime_type.startsWith("image/")
+        ? <img src={attachment.data_url} alt={attachment.display_name} loading="lazy" />
+        : <span className="timeline-attachment__fallback" aria-hidden="true">{attachment.mime_type.startsWith("image/") ? "IMG" : "FILE"}</span>}
+      <span><strong>{attachment.display_name}</strong><small>{attachment.size_bytes.toLocaleString()} B</small></span>
+    </div>)}
+  </div>;
+}
+
 function timelineContentFingerprint(entries: TimelineEntry[], notice: string | null | undefined, runtimeError: string | null | undefined, runtimeErrorVisible: boolean): string {
   return JSON.stringify({
     entries: entries.map((entry) => [entry.id, entry.kind, entry.text, entry.status, entry.streaming, entry.endedAt]),
@@ -247,7 +259,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
         const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
         return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
           <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small className="tool-status" data-status={status} data-error={entry.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null && <span className="tool-elapsed" aria-label={`${elapsed}s`}> · {elapsed}s</span>}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
-          <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText }) : renderMarkdown(entry.text, { onCopyText })}</div>
+          <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText }) : renderMarkdown(entry.text, { onCopyText })}{renderAttachmentRows(entry, t)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
       {todo.length > 0 && <section className="todo-strip" tabIndex={0} aria-label={t("tasks")}><header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status} title={item.content} aria-label={`${item.content}: ${todoStatusLabel(item.status, t)}`}><span className="todo-status-icon" aria-hidden="true"><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span><span>{item.content}</span><span className="sr-only">{todoStatusLabel(item.status, t)}</span></li>)}</ul></section>}

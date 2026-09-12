@@ -66,6 +66,28 @@ test("safe Markdown keeps raw HTML inert and code fences expose language plus ra
   });
 });
 
+test("ChatTimeline replays durable attachment metadata with an image preview and file fallback", () => {
+  const markup = renderEnglish(<ChatTimeline
+    entries={[{
+      id: "user-attachment",
+      kind: "user",
+      text: "",
+      attachments: [
+        { ref: "image-ref", display_name: "diagram.png", mime_type: "image/png", size_bytes: 4, data_url: "data:image/png;base64,AAAA" },
+        { ref: "file-ref", display_name: "notes.txt", mime_type: "text/plain", size_bytes: 12 },
+      ],
+    }]}
+    todo={[]}
+    sessionKey="attachment-history"
+  />);
+  assert.match(markup, /timeline-attachments/u);
+  assert.match(markup, /alt="diagram\.png"/u);
+  assert.match(markup, /data:image\/png;base64,AAAA/u);
+  assert.match(markup, /notes\.txt/u);
+  assert.match(markup, />FILE</u);
+  assert.match(markup, /12 B/u);
+});
+
 test("code fence copy preserves exact raw body for empty, CRLF, blank, whitespace, and unclosed fences", async () => {
   const cases: Array<[string, string]> = [
     ["```text\n```", ""],

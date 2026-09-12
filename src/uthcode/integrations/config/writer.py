@@ -32,6 +32,7 @@ _MODEL_FIELDS = frozenset(
         "context_window",
         "max_output_tokens",
         "reasoning_effort",
+        "supports_images",
     }
 )
 
@@ -118,6 +119,7 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
                     "context_window",
                     "max_output_tokens",
                     "reasoning_effort",
+                    "supports_images",
                 }:
                     raise ConfigurationError(
                         "unsupported configuration field",
@@ -307,6 +309,7 @@ def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
         "context_window",
         "max_output_tokens",
         "reasoning_effort",
+        "supports_images",
     )
     toml_names = {"provider_profile_id": "provider"}
     for model_ref, raw_profile in requested.items():

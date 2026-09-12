@@ -56,12 +56,14 @@ from uthcode.core.provider import (
 )
 
 from .common import (
+    AssetResolver,
     close_stream,
     next_stream_value,
     plain_json,
     raise_if_cancelled,
     require_json_object,
     usage_int,
+    resolve_asset_url,
 )
 
 
@@ -102,7 +104,10 @@ def _message_text(message: Message) -> str:
     return "".join(values)
 
 
-def _chat_content(parts: Sequence[object]) -> tuple[object, bool]:
+def _chat_content(
+    parts: Sequence[object],
+    asset_resolver: AssetResolver | None = None,
+) -> tuple[object, bool]:
     """Return Chat Completions content and whether it is multimodal."""
 
     values: list[dict[str, object]] = []
@@ -115,7 +120,7 @@ def _chat_content(parts: Sequence[object]) -> tuple[object, bool]:
             values.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": part.asset_ref},
+                    "image_url": {"url": resolve_asset_url(part.asset_ref, part.mime_type, asset_resolver)},
                 }
             )
         elif isinstance(part, FilePart):
@@ -217,13 +222,14 @@ def _assistant_message(
 def _request_messages(
     request: GenerationRequest,
     identity: ProviderIdentity,
+    asset_resolver: AssetResolver | None = None,
 ) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
     if request.system_prompt is not None:
         messages.append({"role": "system", "content": request.system_prompt})
     for message in request.messages:
         if message.role == "user":
-            content, _ = _chat_content(message.parts)
+            content, _ = _chat_content(message.parts, asset_resolver)
             messages.append(
                 {"role": message.role, "content": content}
             )
@@ -256,7 +262,7 @@ def _request_messages(
                     projection.extend(
                         {
                             "type": "image_url",
-                            "image_url": {"url": image.asset_ref},
+                            "image_url": {"url": resolve_asset_url(image.asset_ref, image.mime_type, asset_resolver)},
                         }
                         for image in image_parts
                     )
@@ -380,16 +386,21 @@ class OpenAICompatProvider:
         *,
         base_url: str,
         max_output_tokens: int | None = None,
+        asset_resolver: AssetResolver | None = None,
     ) -> None:
         self._model_name = model_name
         self._client = client
         self._base_url = base_url
         self._max_output_tokens = max_output_tokens
+        self._asset_resolver = asset_resolver
         self._identity = ProviderIdentity("openai", "chat_completions", model_name)
 
     @property
     def identity(self) -> ProviderIdentity:
         return self._identity
+
+    def set_asset_resolver(self, resolver: AssetResolver | None) -> None:
+        self._asset_resolver = resolver
 
     async def stream(
         self,
@@ -412,7 +423,7 @@ class OpenAICompatProvider:
             )
             kwargs: dict[str, object] = {
                 "model": request.model or self._model_name,
-                "messages": _request_messages(request, self._identity),
+                "messages": _request_messages(request, self._identity, self._asset_resolver),
                 "max_tokens": max_output_tokens,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -683,6 +694,7 @@ def build_openai_compat_provider(
     api_key: str | None = None,
     http_client: object | None = None,
     max_output_tokens: int | None = None,
+    asset_resolver: AssetResolver | None = None,
 ) -> ProviderPort:
     """Build a Chat Completions Provider without making a model request."""
 
@@ -696,6 +708,7 @@ def build_openai_compat_provider(
         resolved_client,
         base_url=base_url,
         max_output_tokens=max_output_tokens,
+        asset_resolver=asset_resolver,
     )
 
 

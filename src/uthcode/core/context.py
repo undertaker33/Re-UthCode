@@ -60,7 +60,9 @@ from .prompt import (
 )
 from .provider import (
     ContextCountEstimate,
+    FilePart,
     GenerationRequest,
+    ImagePart,
     Message,
     ModelLimits,
     NativeItem,
@@ -435,6 +437,11 @@ class RequestAccounting:
     messages_tokens: int
     tools_tokens: int
     framing_tokens: int
+    image_tokens: int = 0
+    image_count: int = 0
+    image_bytes: int = 0
+    image_estimate_available: bool = True
+    image_estimate_source: str = "none"
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -442,10 +449,17 @@ class RequestAccounting:
             "messages_tokens",
             "tools_tokens",
             "framing_tokens",
+            "image_tokens",
+            "image_count",
+            "image_bytes",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field_name} must be a non-negative integer")
+        if not isinstance(self.image_estimate_available, bool):
+            raise TypeError("image_estimate_available must be a boolean")
+        if not isinstance(self.image_estimate_source, str) or not self.image_estimate_source:
+            raise ValueError("image_estimate_source must be a non-empty string")
 
     @property
     def input_tokens(self) -> int:
@@ -454,16 +468,97 @@ class RequestAccounting:
             + self.messages_tokens
             + self.tools_tokens
             + self.framing_tokens
+            + self.image_tokens
         )
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "instruction_tokens": self.instruction_tokens,
             "messages_tokens": self.messages_tokens,
             "tools_tokens": self.tools_tokens,
             "framing_tokens": self.framing_tokens,
+            "image_tokens": self.image_tokens,
+            "image_count": self.image_count,
+            "image_bytes": self.image_bytes,
+            "image_estimate_available": self.image_estimate_available,
+            "image_estimate_source": self.image_estimate_source,
             "input_tokens": self.input_tokens,
         }
+
+
+def _image_accounting(request: GenerationRequest) -> dict[str, object]:
+    """Return conservative, provider-independent image accounting facts.
+
+    Application integrations may provide a sourced estimate in request
+    metadata.  Direct Core callers still get a useful dimension-based
+    estimate when ImageParts carry dimensions; an image without either source
+    is explicitly unavailable so a local Hard Gate can fail closed.
+    """
+
+    image_count = 0
+    image_bytes = 0
+    image_tokens = 0
+    available = True
+    sources: list[str] = []
+
+    def visit(part: object) -> None:
+        nonlocal image_count, image_bytes, image_tokens, available
+        if isinstance(part, ImagePart):
+            image_count += 1
+            if part.width is None or part.height is None:
+                available = False
+                return
+            estimated_bytes = part.width * part.height * 4
+            image_bytes += estimated_bytes
+            image_tokens += max(1, (estimated_bytes + 127_999) // 128_000)
+            sources.append("core_dimensions")
+        elif isinstance(part, ToolResultPart):
+            for nested in part.content.parts:
+                visit(nested)
+
+    for message in request.messages:
+        for part in message.parts:
+            visit(part)
+
+    raw = request.metadata.get("image_accounting")
+    if isinstance(raw, Mapping) and image_count:
+        raw_count = raw.get("image_count", image_count)
+        raw_tokens = raw.get("image_tokens")
+        raw_bytes = raw.get("image_estimate_bytes", raw.get("image_bytes", image_bytes))
+        raw_available = raw.get("image_estimate_available", True)
+        raw_source = raw.get("estimate_source", raw.get("source"))
+        if (
+            isinstance(raw_count, int)
+            and not isinstance(raw_count, bool)
+            and raw_count >= image_count
+        ):
+            image_count = raw_count
+        if isinstance(raw_tokens, int) and not isinstance(raw_tokens, bool) and raw_tokens >= 0:
+            image_tokens = raw_tokens
+        if isinstance(raw_bytes, int) and not isinstance(raw_bytes, bool) and raw_bytes >= 0:
+            image_bytes = raw_bytes
+        if isinstance(raw_available, bool):
+            available = raw_available
+        if isinstance(raw_source, str) and raw_source:
+            sources = [raw_source]
+
+    if image_count == 0:
+        available = True
+        image_tokens = 0
+        image_bytes = 0
+        source = "none"
+    elif not available:
+        image_tokens = 0
+        source = "unavailable"
+    else:
+        source = "+".join(dict.fromkeys(sources)) or "request_metadata"
+    return {
+        "image_count": image_count,
+        "image_bytes": image_bytes,
+        "image_tokens": image_tokens,
+        "image_estimate_available": available,
+        "image_estimate_source": source,
+    }
 
 
 def account_generation_request(
@@ -509,11 +604,17 @@ def account_generation_request(
         sort_keys=True,
         separators=(",", ":"),
     )
+    image = _image_accounting(request)
     return RequestAccounting(
         instruction_tokens=_estimate_tokens(estimator, instruction),
         messages_tokens=_estimate_tokens(estimator, messages),
         tools_tokens=_estimate_tokens(estimator, tools),
         framing_tokens=_estimate_tokens(estimator, framing),
+        image_tokens=int(image["image_tokens"]),
+        image_count=int(image["image_count"]),
+        image_bytes=int(image["image_bytes"]),
+        image_estimate_available=bool(image["image_estimate_available"]),
+        image_estimate_source=str(image["image_estimate_source"]),
     )
 
 
@@ -639,6 +740,15 @@ def evaluate_gates(
     reasons: list[str] = []
     if not input_safe:
         reasons.append("input_limit_exceeded")
+    if (
+        accounting is not None
+        and accounting.image_count > 0
+        and not accounting.image_estimate_available
+        and count.kind != "preflight_provider_count"
+        and not count.source.startswith("provider.")
+    ):
+        input_safe = False
+        reasons.append("image_estimate_unavailable")
     if not output_safe:
         reasons.append("output_limit_exceeded")
     if not combined_safe:
