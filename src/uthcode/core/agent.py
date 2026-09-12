@@ -52,6 +52,7 @@ from .provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    MessageInput,
     NetworkError,
     ProviderConfigurationError,
     ProviderError,
@@ -113,8 +114,11 @@ from .tool import (
     ToolExecutor,
     ToolPlanningAccess,
     ToolRegistry,
+    ToolProgress as CoreToolProgress,
     ToolResultMaterialization,
     ToolResultMaterializer,
+    ToolFailureKind,
+    ToolSideEffect,
 )
 
 
@@ -301,16 +305,14 @@ class RunState:
     def new_turn(
         self,
         turn_id: str,
-        user_input: str,
+        user_input: str | MessageInput,
         *,
         behavior_mode: BehaviorMode | None = None,
     ) -> RunState:
         """Create the next immutable Turn while retaining the conversation."""
 
         _require_text(turn_id, "turn_id")
-        if not isinstance(user_input, str) or not user_input.strip():
-            raise ValueError("user_input must be a non-empty string")
-        user_message = Message(role="user", parts=(TextPart(user_input),))
+        user_message = MessageInput.normalize(user_input).to_message()
         next_mode = self.behavior_mode if behavior_mode is None else behavior_mode
         return RunState(
             run_id=self.run_id,
@@ -826,6 +828,7 @@ class AgentLoop:
         session_grant_sink: SessionGrantSink | None = None,
         result_materializer: ToolResultMaterializer | None = None,
         overflow_handler: OverflowHandler | None = None,
+        tool_progress_projector: Callable[..., Sequence[AgentEvent]] | None = None,
     ) -> None:
         if not isinstance(provider, ProviderPort):
             raise TypeError("provider must implement ProviderPort")
@@ -849,6 +852,8 @@ class AgentLoop:
             raise TypeError("result_materializer must be callable or None")
         if overflow_handler is not None and not callable(overflow_handler):
             raise TypeError("overflow_handler must be callable or None")
+        if tool_progress_projector is not None and not callable(tool_progress_projector):
+            raise TypeError("tool_progress_projector must be callable or None")
         self._provider = provider
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
@@ -859,6 +864,7 @@ class AgentLoop:
         self._session_grant_sink = session_grant_sink
         self._result_materializer = result_materializer
         self._overflow_handler = overflow_handler
+        self._tool_progress_projector = tool_progress_projector
 
     @property
     def config(self) -> AgentLoopConfig:
@@ -867,7 +873,7 @@ class AgentLoop:
     def start_turn(
         self,
         state: RunState,
-        user_input: str,
+        user_input: str | MessageInput,
         *,
         turn_id: str | None = None,
         cancellation: CancellationToken | None = None,
@@ -1493,6 +1499,12 @@ class AgentTurnExecution:
                     return self._paused_segment(events)
                 if batch_status == "cancelled":
                     return self._cancel_segment(events)
+                if batch_status == "side_effect_unknown":
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.SIDE_EFFECT_UNKNOWN,
+                        FailureReason.TOOL_SIDE_EFFECT_UNKNOWN,
+                    )
                 if batch_status == "internal_error":
                     return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
                 if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
@@ -1548,7 +1560,7 @@ class AgentTurnExecution:
         self._emit_steering_requested(events)
         self._set_state(
             messages=self._state.messages
-            + (Message(role="user", parts=(TextPart(request.text),)),),
+            + (MessageInput.normalize(request.text).to_message(),),
             runtime_feedback=RuntimeFeedback(
                 RuntimeFeedbackKind.USER_STEERING,
                 _STEERING_FEEDBACK_TEXT,
@@ -2148,16 +2160,75 @@ class AgentTurnExecution:
     async def _execute_prepared(
         self,
         prepared: PreparedToolCall,
+        *,
+        events: list[AgentEvent],
+        iteration: int,
+        batch_id: str,
     ) -> tuple[ToolResultPart, bool, str]:
         """Execute exactly one already-prepared call and normalize failures."""
 
         call = prepared.call
         outcome = None
+        live_progress_count = 0
+
+        def project(
+            progress: Sequence[CoreToolProgress],
+            *,
+            flush: bool = False,
+        ) -> None:
+            projector = self._loop._tool_progress_projector
+            if projector is None or (not progress and not flush):
+                return
+            try:
+                projected = projector(
+                    tuple(progress),
+                    run_id=self._state.run_id,
+                    turn_id=self._state.turn_id,
+                    iteration=iteration,
+                    batch_id=batch_id,
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.name,
+                    flush=flush,
+                )
+                if isinstance(projected, AgentEvent):
+                    projected_values = (projected,)
+                else:
+                    projected_values = tuple(projected)
+                for event in projected_values:
+                    if isinstance(event, AgentEvent):
+                        self._append(events, event)
+            except Exception:
+                # Progress is observational.  A projection failure must not
+                # change the already-authorized Tool execution or expose raw
+                # progress text through a fallback path.
+                return
+
+        def publish_progress(progress: CoreToolProgress) -> None:
+            nonlocal live_progress_count
+            live_progress_count += 1
+            # The Application releases the currently safe prefix immediately
+            # and retains only a bounded raw suffix that could complete a
+            # credential on the next report.
+            project((progress,))
+
+        def flush_progress() -> None:
+            project((), flush=True)
+
         try:
-            outcome = await self._loop._tool_executor.execute_prepared_outcome(
-                prepared,
-                cancellation=self._cancellation,
-            )
+            try:
+                outcome = await self._loop._tool_executor.execute_prepared_outcome(
+                    prepared,
+                    cancellation=self._cancellation,
+                    progress_sink=publish_progress,
+                )
+            finally:
+                # Older Tools may return progress only in their final result;
+                # consume that fact as a bounded fallback while the live
+                # report path above remains the primary incremental outlet.
+                if outcome is not None and live_progress_count == 0:
+                    for progress in outcome.progress:
+                        publish_progress(progress)
+                flush_progress()
             if self._loop._result_materializer is None:
                 result = outcome.result
             else:
@@ -2202,12 +2273,102 @@ class AgentTurnExecution:
                     call.tool_call_id,
                     message,
                     True,
-                    {"execution_status": execution_status, "persistence_status": "failed"},
+                    {
+                        "execution_status": execution_status,
+                        "persistence_status": "failed",
+                        "failure": {
+                            "kind": ToolFailureKind.SIDE_EFFECT_UNKNOWN.value,
+                            "retryable": False,
+                        },
+                        "side_effect": ToolSideEffect.UNKNOWN.value,
+                    },
                 ),
                 True,
-                "failed",
+                (
+                    "unknown"
+                    if outcome is not None
+                    and (
+                        outcome.status.value == "unknown"
+                        or outcome.side_effect is ToolSideEffect.UNKNOWN
+                    )
+                    else "failed"
+                ),
             )
+        if outcome is not None and (
+            outcome.status.value == "unknown"
+            or outcome.side_effect is ToolSideEffect.UNKNOWN
+        ):
+            return result, False, "unknown"
         return result, False, "failed" if result.is_error else "finished"
+
+    def _close_unknown_side_effect_tools(
+        self,
+        events: list[AgentEvent],
+    ) -> None:
+        """Close the rest of a FIFO batch after a result became uncertain."""
+
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            return
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        batch_id = self._require_batch_id()
+        while index < len(continuation.tool_calls):
+            call = continuation.tool_calls[index]
+            known = (
+                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or (
+                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or call.name == PROPOSE_PLAN_TOOL_DEFINITION.name or self._loop._tool_registry.get(call.name) is not None
+            command = self._safe_command(call, known=known)
+            self._append(
+                events,
+                ToolStarted(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                ),
+            )
+            results.append(
+                ToolResultPart(
+                    call.tool_call_id,
+                    "Error: tool call not executed after a previous Tool side effect became unknown",
+                    True,
+                    {
+                        "failure": {
+                            "kind": ToolFailureKind.NOT_EXECUTED.value,
+                            "retryable": False,
+                        },
+                        "side_effect": ToolSideEffect.NONE.value,
+                    },
+                )
+            )
+            self._append(
+                events,
+                ToolFinished(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                    "not_executed",
+                    True,
+                ),
+            )
+            index += 1
+        self._continuation = replace(
+            continuation,
+            completed_tool_results=tuple(results),
+            next_tool_index=index,
+            pending_pause=None,
+        )
+        self._close_tool_batch(events, status="side_effect_unknown")
 
     def _close_stale_tools_for_steering(self, events: list[AgentEvent]) -> None:
         """Close every not-yet-started call without executing stale side effects."""
@@ -2454,7 +2615,12 @@ class AgentTurnExecution:
                         controlled = True
                         status = "denied"
                     else:
-                        result, controlled, status = await self._execute_prepared(resumed_prepared)
+                        result, controlled, status = await self._execute_prepared(
+                            resumed_prepared,
+                            events=events,
+                            iteration=continuation.iteration,
+                            batch_id=batch_id,
+                        )
                         if (
                             choice is PermissionApprovalChoice.SESSION
                             and not result.is_error
@@ -2517,7 +2683,10 @@ class AgentTurnExecution:
                                     status = "failed"
                                 elif decision.decision is Decision.ALLOW:
                                     result, controlled, status = await self._execute_prepared(
-                                        prepared_or_result
+                                        prepared_or_result,
+                                        events=events,
+                                        iteration=continuation.iteration,
+                                        batch_id=batch_id,
                                     )
                                 elif decision.decision is Decision.DENY:
                                     result = _controlled_tool_result(
@@ -2542,7 +2711,7 @@ class AgentTurnExecution:
                                     )
                                     return "paused"
 
-            if not controlled:
+            if not controlled and status != "unknown":
                 status = "failed" if result.is_error else "finished"
             results.append(result)
             self._append(
@@ -2566,6 +2735,9 @@ class AgentTurnExecution:
                 next_tool_index=index,
                 pending_pause=None,
             )
+            if status == "unknown":
+                self._close_unknown_side_effect_tools(events)
+                return "side_effect_unknown"
             await sleep(0)
             if self._cancellation.cancelled:
                 self._cancel_remaining_tools(events)

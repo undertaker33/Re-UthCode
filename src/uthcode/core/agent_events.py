@@ -24,8 +24,11 @@ from .interaction import (
 )
 from .provider import (
     JsonPayload,
+    FilePart,
+    ImagePart,
     Message,
     ReasoningPart,
+    SourcePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -73,8 +76,11 @@ def _public_message(message: object, *, role: str) -> Message:
         raise ValueError(f"message role must be {role!r}")
     if message.native_items:
         raise ValueError("AgentEvent messages must not contain native_items")
-    if not all(isinstance(part, (TextPart, ReasoningPart)) for part in message.parts):
-        raise ValueError("AgentEvent messages must contain only display-safe text parts")
+    allowed = (TextPart, ReasoningPart)
+    if role == "user":
+        allowed = (TextPart, ImagePart, FilePart, SourcePart)
+    if not all(isinstance(part, allowed) for part in message.parts):
+        raise ValueError("AgentEvent messages must contain only display-safe content parts")
     return message
 
 
@@ -553,6 +559,43 @@ class ToolFinished(AgentEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolProgress(AgentEvent):
+    """Display-safe, bounded observation for one running Tool."""
+
+    event_type: ClassVar[str] = "tool_progress"
+    iteration: int
+    batch_id: str
+    tool_call_id: str
+    tool_name: str
+    stage: str
+    text: str = ""
+    current: int | None = None
+    total: int | None = None
+    stream: str | None = None
+
+    def __post_init__(self) -> None:
+        AgentEvent.__post_init__(self)
+        _require_positive_int(self.iteration, "iteration")
+        for field_name in ("batch_id", "tool_call_id", "tool_name", "stage"):
+            _require_text(getattr(self, field_name), field_name)
+        if len(self.stage) > 64:
+            raise ValueError("stage must be at most 64 characters")
+        if not isinstance(self.text, str) or len(self.text) > 512:
+            raise ValueError("progress text must be at most 512 characters")
+        for field_name in ("current", "total"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_non_negative_int(value, field_name)
+        if self.total is not None and self.current is not None and self.current > self.total:
+            raise ValueError("current cannot exceed total")
+        if self.stream is not None and self.stream not in {"stdout", "stderr", "terminal", "status"}:
+            raise ValueError("stream is unsupported")
+
+
+ToolProgressEvent = ToolProgress
+
+
+@dataclass(frozen=True, slots=True)
 class ToolBatchFinished(AgentEvent):
     event_type: ClassVar[str] = "tool_batch_finished"
     iteration: int
@@ -576,6 +619,7 @@ class FailureReason(str, Enum):
     INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
     CONTEXT_UNRESOLVABLE = "context_unresolvable"
     PERSISTENCE_UNAVAILABLE = "persistence_unavailable"
+    TOOL_SIDE_EFFECT_UNKNOWN = "tool_side_effect_unknown"
     INTERNAL = "internal"
 
 
@@ -588,6 +632,7 @@ class TerminationReason(str, Enum):
     PROVIDER_ERROR = "provider_error"
     INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
     USER_CANCELLED = "user_cancelled"
+    SIDE_EFFECT_UNKNOWN = "side_effect_unknown"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -667,6 +712,7 @@ AgentEventValue: TypeAlias = (
     | ToolBatchStarted
     | ToolStarted
     | ToolFinished
+    | ToolProgress
     | ToolBatchFinished
     | TurnCompleted
     | TurnFailed
@@ -699,6 +745,7 @@ _EVENT_TYPES: dict[str, type[AgentEvent]] = {
         ToolBatchStarted,
         ToolStarted,
         ToolFinished,
+        ToolProgress,
         ToolBatchFinished,
         TurnCompleted,
         TurnFailed,
@@ -974,6 +1021,37 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             _required(payload, "status"),  # type: ignore[arg-type]
             _required(payload, "is_error"),  # type: ignore[arg-type]
         )
+    if event_type == ToolProgress.event_type:
+        _expect_keys(
+            payload,
+            {
+                "type",
+                "run_id",
+                "turn_id",
+                "iteration",
+                "batch_id",
+                "tool_call_id",
+                "tool_name",
+                "stage",
+                "text",
+                "current",
+                "total",
+                "stream",
+            },
+        )
+        return ToolProgress(
+            run_id,
+            turn_id,
+            _required(payload, "iteration"),  # type: ignore[arg-type]
+            _required(payload, "batch_id"),  # type: ignore[arg-type]
+            _required(payload, "tool_call_id"),  # type: ignore[arg-type]
+            _required(payload, "tool_name"),  # type: ignore[arg-type]
+            _required(payload, "stage"),  # type: ignore[arg-type]
+            _required(payload, "text"),  # type: ignore[arg-type]
+            payload.get("current"),  # type: ignore[arg-type]
+            payload.get("total"),  # type: ignore[arg-type]
+            payload.get("stream"),  # type: ignore[arg-type]
+        )
     if event_type == ToolBatchFinished.event_type:
         _expect_keys(payload, {"type", "run_id", "turn_id", "iteration", "batch_id", "tool_call_ids", "status"})
         return ToolBatchFinished(
@@ -1029,6 +1107,8 @@ __all__ = [
     "ToolBatchFinished",
     "ToolBatchStarted",
     "ToolFinished",
+    "ToolProgress",
+    "ToolProgressEvent",
     "ToolStarted",
     "TaskStateChanged",
     "TurnCancelled",

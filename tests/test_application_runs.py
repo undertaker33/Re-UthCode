@@ -37,6 +37,7 @@ from uthcode.core.agent_events import (
     ReasoningDelta as AgentReasoningDelta,
     ToolBatchFinished,
     ToolFinished,
+    ToolProgress,
     ToolStarted,
     TurnCancelled,
     TurnCompleted,
@@ -101,7 +102,12 @@ from uthcode.core.provider import (
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.application.tools import ApplicationToolService
-from uthcode.core.tool import ToolExecutionResult, ToolPlanningAccess, ToolPreparation
+from uthcode.core.tool import (
+    ToolExecutionResult,
+    ToolPlanningAccess,
+    ToolPreparation,
+    ToolProgress as CoreToolProgress,
+)
 
 
 TEST_LIMITS = ModelLimits(max_input_tokens=1_000_000, source="test.fake")
@@ -832,6 +838,301 @@ async def test_application_tool_activity_is_fifo_and_names_have_one_owner(
     assert all(event.tool_name not in event.command for event in (*started, *finished))
     assert first.trace == ["preflight:one", "execute:one"]
     assert second.trace == ["preflight:two", "execute:two"]
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_is_projected_live_and_cross_chunk_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "T11-SPLIT-PROGRESS-SECRET"
+    monkeypatch.setenv("T11_PROGRESS_SECRET", secret)
+
+    class ProgressTool:
+        definition = ToolDefinition(
+            "Progress",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+        def __init__(self) -> None:
+            self.first_reported = asyncio.Event()
+            self.second_reported = asyncio.Event()
+            self.release_second = asyncio.Event()
+            self.finish = asyncio.Event()
+
+        @property
+        def planning_access(self) -> ToolPlanningAccess:
+            return ToolPlanningAccess.READ_ONLY
+
+        def preflight(self, arguments) -> ToolPreparation:
+            return ToolPreparation(
+                PermissionAction(
+                    tool="Progress",
+                    action="execute",
+                    effect=Effect.READ,
+                    resource="workspace/progress",
+                    scope=ResourceScope.INSIDE,
+                ),
+                arguments,
+            )
+
+        async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+            del arguments
+            cancellation.report_progress(
+                CoreToolProgress("copy", "prefix-" + secret[:10], current=1, total=2)
+            )
+            self.first_reported.set()
+            await self.release_second.wait()
+            cancellation.report_progress(
+                CoreToolProgress("copy", secret[10:] + "-suffix", current=2, total=2)
+            )
+            self.second_reported.set()
+            await self.finish.wait()
+            return ToolExecutionResult("done")
+
+    tool = ProgressTool()
+    provider = _ScriptedProvider(
+        (
+            (_response(ToolCallPart("progress-call", "Progress", {"value": "one"}), finish_reason=FinishReason.TOOL_CALLS),),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        tools=(tool,),
+    )
+    run = application.create_run(run_id="live-progress")
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    handle = run.start_turn("run progress")
+    observed: list[AgentEvent] = []
+
+    async def collect_live() -> list[AgentEvent]:
+        async for event in handle.events():
+            observed.append(event)
+        return observed
+
+    events_task = asyncio.create_task(collect_live())
+
+    await asyncio.wait_for(tool.first_reported.wait(), timeout=1)
+    for _ in range(100):
+        if any(isinstance(event, ToolProgress) for event in observed):
+            break
+        await asyncio.sleep(0)
+    live_events = [event for event in observed if isinstance(event, ToolProgress)]
+    # A safe text prefix reaches the unique live stream before the Tool is
+    # released or completed; only the possible credential suffix is held.
+    assert any(event.current == 1 and event.text for event in live_events)
+    assert secret not in "".join(event.to_json() for event in live_events)
+
+    tool.release_second.set()
+    await asyncio.wait_for(tool.second_reported.wait(), timeout=1)
+    live_events = [event for event in observed if isinstance(event, ToolProgress)]
+    assert any(event.current == 2 and event.text for event in live_events)
+    assert secret not in "".join(event.to_json() for event in live_events)
+    tool.finish.set()
+    events = await asyncio.wait_for(events_task, timeout=1)
+    progress_events = [event for event in events if isinstance(event, ToolProgress)]
+    assert [event.current for event in progress_events if event.current is not None][:2] == [1, 2]
+    assert secret not in "".join(event.to_json() for event in progress_events)
+    assert any("<redacted>" in event.text for event in progress_events)
+    assert secret not in run.snapshot().to_json()
+
+
+@pytest.mark.asyncio
+async def test_long_known_secret_progress_tail_is_bounded_by_secret_and_flushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_prefix = "T11-LONG-PROGRESS-"
+    secret = secret_prefix + ("0123456789abcdef" * 30)[: 400 - len(secret_prefix)]
+    assert len(secret) == 400
+    monkeypatch.setenv("T11_LONG_PROGRESS_SECRET", secret)
+
+    class LongProgressTool:
+        definition = ToolDefinition(
+            "LongProgress",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+        def __init__(self) -> None:
+            self.first_reported = asyncio.Event()
+            self.second_reported = asyncio.Event()
+            self.release_second = asyncio.Event()
+            self.finish = asyncio.Event()
+
+        @property
+        def planning_access(self) -> ToolPlanningAccess:
+            return ToolPlanningAccess.READ_ONLY
+
+        def preflight(self, arguments) -> ToolPreparation:
+            return ToolPreparation(
+                PermissionAction(
+                    tool="LongProgress",
+                    action="execute",
+                    effect=Effect.READ,
+                    resource="workspace/long-progress",
+                    scope=ResourceScope.INSIDE,
+                ),
+                arguments,
+            )
+
+        async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+            del arguments
+            cancellation.report_progress(
+                CoreToolProgress("copy", secret[:300], current=1, total=2)
+            )
+            self.first_reported.set()
+            await self.release_second.wait()
+            cancellation.report_progress(
+                CoreToolProgress("copy", secret[300:], current=2, total=2)
+            )
+            self.second_reported.set()
+            await self.finish.wait()
+            return ToolExecutionResult("done")
+
+    tool = LongProgressTool()
+    provider = _ScriptedProvider(
+        (
+            (_response(ToolCallPart("long-progress-call", "LongProgress", {"value": "one"}), finish_reason=FinishReason.TOOL_CALLS),),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        tools=(tool,),
+    )
+    run = application.create_run(run_id="long-live-progress")
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    handle = run.start_turn("run long progress")
+    observed: list[AgentEvent] = []
+
+    async def collect_live() -> list[AgentEvent]:
+        async for event in handle.events():
+            observed.append(event)
+        return observed
+
+    events_task = asyncio.create_task(collect_live())
+    await asyncio.wait_for(tool.first_reported.wait(), timeout=1)
+    assert secret not in "".join(
+        event.to_json() for event in observed if isinstance(event, ToolProgress)
+    )
+
+    tool.release_second.set()
+    await asyncio.wait_for(tool.second_reported.wait(), timeout=1)
+    live_events = [event for event in observed if isinstance(event, ToolProgress)]
+    assert any(event.current == 2 and event.text for event in live_events)
+    assert secret not in "".join(event.to_json() for event in live_events)
+
+    tool.finish.set()
+    events = await asyncio.wait_for(events_task, timeout=1)
+    progress_events = [event for event in events if isinstance(event, ToolProgress)]
+    assert [event.current for event in progress_events if event.current is not None][:2] == [1, 2]
+    assert any("<redacted>" in event.text for event in progress_events)
+    assert secret not in run.snapshot().to_json()
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_preserves_whitespace_between_live_reports(
+    tmp_path: Path,
+) -> None:
+    class WhitespaceProgressTool:
+        definition = ToolDefinition(
+            "WhitespaceProgress",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+
+        def __init__(self) -> None:
+            self.first_reported = asyncio.Event()
+            self.second_reported = asyncio.Event()
+            self.release_second = asyncio.Event()
+            self.finish = asyncio.Event()
+
+        @property
+        def planning_access(self) -> ToolPlanningAccess:
+            return ToolPlanningAccess.READ_ONLY
+
+        def preflight(self, arguments) -> ToolPreparation:
+            return ToolPreparation(
+                PermissionAction(
+                    tool="WhitespaceProgress",
+                    action="execute",
+                    effect=Effect.READ,
+                    resource="workspace/whitespace-progress",
+                    scope=ResourceScope.INSIDE,
+                ),
+                arguments,
+            )
+
+        async def execute(self, arguments, *, cancellation: CancellationToken) -> ToolExecutionResult:
+            del arguments
+            cancellation.report_progress(
+                CoreToolProgress("copy", "ordinary alpha ", current=1, total=2)
+            )
+            self.first_reported.set()
+            await self.release_second.wait()
+            cancellation.report_progress(
+                CoreToolProgress("copy", "ordinary beta", current=2, total=2)
+            )
+            self.second_reported.set()
+            await self.finish.wait()
+            return ToolExecutionResult("done")
+
+    tool = WhitespaceProgressTool()
+    provider = _ScriptedProvider(
+        (
+            (_response(ToolCallPart("whitespace-call", "WhitespaceProgress", {"value": "one"}), finish_reason=FinishReason.TOOL_CALLS),),
+            (_response(TextPart("done")),),
+        )
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        tools=(tool,),
+    )
+    run = application.create_run(run_id="whitespace-live-progress")
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+    handle = run.start_turn("run whitespace progress")
+    observed: list[AgentEvent] = []
+
+    async def collect_live() -> list[AgentEvent]:
+        async for event in handle.events():
+            observed.append(event)
+        return observed
+
+    events_task = asyncio.create_task(collect_live())
+    await asyncio.wait_for(tool.first_reported.wait(), timeout=1)
+    tool.release_second.set()
+    await asyncio.wait_for(tool.second_reported.wait(), timeout=1)
+    tool.finish.set()
+    events = await asyncio.wait_for(events_task, timeout=1)
+
+    progress_events = [event for event in events if isinstance(event, ToolProgress)]
+    assert "".join(event.text for event in progress_events) == (
+        "ordinary alpha ordinary beta"
+    )
+    assert not any(event.text.startswith("ordinarybeta") for event in progress_events)
+    assert observed
+    assert run.snapshot().status is RunStatus.COMPLETED
 
 
 @pytest.mark.asyncio

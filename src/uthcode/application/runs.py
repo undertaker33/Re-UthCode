@@ -48,7 +48,14 @@ from uthcode.core.permission import (
     SessionGrant,
 )
 from uthcode.core.planning import BehaviorMode
-from uthcode.core.provider import CancellationToken, Message, ReasoningPart, TextPart, Usage
+from uthcode.core.provider import (
+    CancellationToken,
+    Message,
+    MessageInput,
+    ReasoningPart,
+    TextPart,
+    Usage,
+)
 
 if TYPE_CHECKING:
     from .generation import UthCodeApplication
@@ -246,13 +253,10 @@ class AgentRun:
         if grant not in self._session_grants:
             self._session_grants.append(grant)
 
-    def start_turn(self, user_input: str) -> TurnHandle:
+    def start_turn(self, user_input: str | MessageInput) -> TurnHandle:
         """Synchronously reserve the Run and return a lazily driven Turn."""
 
-        if not isinstance(user_input, str):
-            raise TypeError("user_input must be a string")
-        if not user_input.strip():
-            raise ValueError("user_input must be a non-empty string")
+        MessageInput.normalize(user_input)
         if self._active_turn is not None:
             raise RuntimeError("AgentRun already has an active Turn")
         if any(batch.blocked for batch in self._pending_persistence_batches):
@@ -610,7 +614,7 @@ class _TurnDriver:
         self.ensure_started_if_possible()
         return True
 
-    def request_steering(self, text: str) -> bool:
+    def request_steering(self, text: str | MessageInput) -> bool:
         if self._result_value is not None or self.execution.state.status is not RunStatus.RUNNING:
             return False
         if (

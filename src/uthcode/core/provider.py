@@ -255,6 +255,179 @@ class ReasoningPart(_JsonModel):
 
 
 @dataclass(frozen=True, slots=True)
+class ImagePart(_JsonModel):
+    """A provider-independent reference to one image asset.
+
+    The Core contract deliberately carries only the stable asset reference and
+    small descriptive facts.  Image bytes are resolved by an Integration at
+    the provider boundary and therefore never enter messages, events, or
+    diagnostics.
+    """
+
+    asset_ref: str
+    mime_type: str
+    width: int | None = None
+    height: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.asset_ref, "asset_ref")
+        _require_text(self.mime_type, "mime_type")
+        if not self.mime_type.startswith("image/"):
+            raise ValueError("mime_type must identify an image")
+        object.__setattr__(self, "width", _require_positive_optional_int(self.width, "width"))
+        object.__setattr__(self, "height", _require_positive_optional_int(self.height, "height"))
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "type": "image",
+            "asset_ref": self.asset_ref,
+            "mime_type": self.mime_type,
+        }
+        if self.width is not None:
+            value["width"] = self.width
+        if self.height is not None:
+            value["height"] = self.height
+        return value
+
+    @property
+    def source(self) -> str:
+        """Provider adapters use ``source`` as a descriptive alias."""
+
+        return self.asset_ref
+
+
+@dataclass(frozen=True, slots=True)
+class FilePart(_JsonModel):
+    """A stable reference to a user or tool supplied file."""
+
+    asset_ref: str
+    display_name: str
+    mime_type: str
+    size_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.asset_ref, "asset_ref")
+        _require_text(self.display_name, "display_name")
+        _require_text(self.mime_type, "mime_type")
+        object.__setattr__(self, "size_bytes", _require_non_negative_optional_int(self.size_bytes, "size_bytes"))
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "type": "file",
+            "asset_ref": self.asset_ref,
+            "display_name": self.display_name,
+            "mime_type": self.mime_type,
+        }
+        if self.size_bytes is not None:
+            value["size_bytes"] = self.size_bytes
+        return value
+
+    @property
+    def source(self) -> str:
+        return self.asset_ref
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePart(_JsonModel):
+    """A source/location reference associated with content."""
+
+    asset_ref: str
+    page: int | None = None
+    sheet: str | None = None
+    range: str | None = None
+    slide: int | None = None
+    paragraph: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.asset_ref, "asset_ref")
+        object.__setattr__(self, "page", _require_positive_optional_int(self.page, "page"))
+        object.__setattr__(self, "slide", _require_positive_optional_int(self.slide, "slide"))
+        for name in ("sheet", "range", "paragraph"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_text(value, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {"type": "source", "asset_ref": self.asset_ref}
+        for name in ("page", "sheet", "range", "slide", "paragraph"):
+            item = getattr(self, name)
+            if item is not None:
+                value[name] = item
+        return value
+
+    @property
+    def source(self) -> str:
+        return self.asset_ref
+
+
+ContentPart: TypeAlias = TextPart | ImagePart | FilePart | SourcePart
+
+
+class ContentSequence(str):
+    """String-compatible ordered content.
+
+    Existing text-only callers continue to receive normal string behaviour,
+    while structured callers can inspect ``parts`` without maintaining a
+    second content representation.  The sequence is immutable and keeps no
+    asset bytes.
+    """
+
+    def __new__(
+        cls,
+        value: str | ContentPart | Sequence[ContentPart] | ContentSequence,
+    ) -> ContentSequence:
+        if isinstance(value, ContentSequence):
+            parts = value.parts
+            text = str(value)
+        elif isinstance(value, str):
+            parts = (TextPart(value),)
+            text = value
+        elif isinstance(value, (TextPart, ImagePart, FilePart, SourcePart)):
+            parts = (value,)
+            text = _content_text(parts)
+        else:
+            if isinstance(value, (bytes, bytearray)) or not isinstance(value, Sequence):
+                raise TypeError("content must be text or a sequence of content parts")
+            parts = tuple(value)
+            if not parts or not all(
+                isinstance(part, (TextPart, ImagePart, FilePart, SourcePart))
+                for part in parts
+            ):
+                raise TypeError("content sequence must contain ContentPart values")
+            text = _content_text(parts)
+        obj = str.__new__(cls, text)
+        obj.parts = tuple(parts)
+        return obj
+
+    @property
+    def contents(self) -> tuple[ContentPart, ...]:
+        return self.parts
+
+    def to_list(self) -> list[dict[str, Any]]:
+        return [part.to_dict() for part in self.parts]
+
+
+def _content_text(parts: Sequence[ContentPart]) -> str:
+    return "".join(part.text for part in parts if isinstance(part, TextPart))
+
+
+def _require_positive_optional_int(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer or None")
+    return value
+
+
+def _require_non_negative_optional_int(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer or None")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCallPart(_JsonModel):
     tool_call_id: str
     name: str
@@ -277,14 +450,14 @@ class ToolCallPart(_JsonModel):
 @dataclass(frozen=True, slots=True)
 class ToolResultPart(_JsonModel):
     tool_call_id: str
-    content: str
+    content: str | ContentSequence | ContentPart | Sequence[ContentPart]
     is_error: bool = False
     metadata: JsonPayload = field(default_factory=JsonPayload)
 
     def __post_init__(self) -> None:
         _require_text(self.tool_call_id, "tool_call_id")
-        if not isinstance(self.content, str):
-            raise TypeError("content must be a string")
+        if not isinstance(self.content, ContentSequence):
+            object.__setattr__(self, "content", ContentSequence(self.content))
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
         object.__setattr__(self, "metadata", JsonPayload(self.metadata))
@@ -293,15 +466,31 @@ class ToolResultPart(_JsonModel):
         value = {
             "type": "tool_result",
             "tool_call_id": self.tool_call_id,
-            "content": self.content,
+            "content": (
+                str(self.content)
+                if len(self.content.parts) == 1 and isinstance(self.content.parts[0], TextPart)
+                else self.content.to_list()
+            ),
             "is_error": self.is_error,
         }
         if self.metadata:
             value["metadata"] = _json_value(self.metadata)
         return value
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ToolResultPart:
+        raw_content = value["content"]
+        if isinstance(raw_content, Sequence) and not isinstance(raw_content, (str, bytes, bytearray)):
+            raw_content = tuple(_part_from_dict(item) for item in raw_content)
+        return cls(
+            tool_call_id=value["tool_call_id"],
+            content=raw_content,
+            is_error=value.get("is_error", False),
+            metadata=value.get("metadata", {}),
+        )
 
-MessagePart: TypeAlias = TextPart | ReasoningPart | ToolCallPart | ToolResultPart
+
+MessagePart: TypeAlias = TextPart | ReasoningPart | ToolCallPart | ToolResultPart | ContentPart
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +548,29 @@ def _part_from_dict(value: Mapping[str, Any]) -> MessagePart:
         return TextPart(text=value["text"])
     if part_type == "reasoning":
         return ReasoningPart(text=value["text"])
+    if part_type == "image":
+        return ImagePart(
+            asset_ref=value["asset_ref"],
+            mime_type=value["mime_type"],
+            width=value.get("width"),
+            height=value.get("height"),
+        )
+    if part_type == "file":
+        return FilePart(
+            asset_ref=value["asset_ref"],
+            display_name=value["display_name"],
+            mime_type=value["mime_type"],
+            size_bytes=value.get("size_bytes"),
+        )
+    if part_type == "source":
+        return SourcePart(
+            asset_ref=value["asset_ref"],
+            page=value.get("page"),
+            sheet=value.get("sheet"),
+            range=value.get("range"),
+            slide=value.get("slide"),
+            paragraph=value.get("paragraph"),
+        )
     if part_type == "tool_call":
         return ToolCallPart(
             tool_call_id=value["tool_call_id"],
@@ -366,9 +578,14 @@ def _part_from_dict(value: Mapping[str, Any]) -> MessagePart:
             arguments=value.get("arguments", {}),
         )
     if part_type == "tool_result":
+        raw_content = value["content"]
+        if isinstance(raw_content, Sequence) and not isinstance(raw_content, (str, bytes, bytearray)):
+            if not all(isinstance(item, Mapping) for item in raw_content):
+                raise TypeError("tool result content list must contain mappings")
+            raw_content = tuple(_part_from_dict(item) for item in raw_content)
         return ToolResultPart(
             tool_call_id=value["tool_call_id"],
-            content=value["content"],
+            content=raw_content,
             is_error=value.get("is_error", False),
             metadata=value.get("metadata", {}),
         )
@@ -387,7 +604,7 @@ class Message(_JsonModel):
             raise ValueError("role must be one of: user, assistant, tool")
         parts = _as_tuple(self.parts, "parts")
         if not all(
-            isinstance(part, (TextPart, ReasoningPart, ToolCallPart, ToolResultPart))
+            isinstance(part, (TextPart, ReasoningPart, ImagePart, FilePart, SourcePart, ToolCallPart, ToolResultPart))
             for part in parts
         ):
             raise TypeError("parts must contain UthCode message parts")
@@ -418,6 +635,53 @@ class Message(_JsonModel):
                 NativeItem.from_dict(item) for item in value.get("native_items", ())
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MessageInput(_JsonModel):
+    """Formal input value shared by text-only and attachment turns."""
+
+    parts: tuple[ContentPart, ...] = ()
+
+    def __post_init__(self) -> None:
+        parts = self.parts
+        if isinstance(parts, str) or not isinstance(parts, Sequence):
+            raise TypeError("parts must be a sequence of ContentPart values")
+        parts = tuple(parts)
+        if not parts or not all(
+            isinstance(part, (TextPart, ImagePart, FilePart, SourcePart))
+            for part in parts
+        ):
+            raise ValueError("parts must contain at least one ContentPart")
+        object.__setattr__(self, "parts", parts)
+
+    @classmethod
+    def from_text(cls, text: str) -> MessageInput:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+        return cls((TextPart(text),))
+
+    @classmethod
+    def normalize(cls, value: str | MessageInput | Sequence[ContentPart]) -> MessageInput:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls.from_text(value)
+        return cls(tuple(value))
+
+    @property
+    def text(self) -> str:
+        return _content_text(self.parts)
+
+    def to_message(self, *, role: str = "user") -> Message:
+        return Message(role=role, parts=self.parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"parts": [part.to_dict() for part in self.parts]}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> MessageInput:
+        return cls(tuple(_part_from_dict(item) for item in value.get("parts", ())))
 
 
 @dataclass(frozen=True, slots=True)
@@ -952,6 +1216,7 @@ class CancellationToken:
         self._cancelled = False
         self._lock = threading.Lock()
         self._waiters: set[asyncio.Future[None]] = set()
+        self._progress_sink: Any = None
 
     @property
     def cancelled(self) -> bool:
@@ -1001,6 +1266,39 @@ class CancellationToken:
     def raise_if_cancelled(self) -> None:
         if self.cancelled:
             raise GenerationCancelled()
+
+    def set_progress_sink(self, sink: Any) -> Any:
+        """Install one execution-scoped Tool progress callback.
+
+        The Core cancellation object is already the only per-execution value
+        passed into every Tool.  Keeping the optional outlet here lets a Tool
+        report bounded observations during execution without changing the
+        stable ``Tool.execute(..., cancellation=...)`` signature.  The caller
+        must restore the returned previous value after execution.
+        """
+
+        if sink is not None and not callable(sink):
+            raise TypeError("progress sink must be callable or None")
+        with self._lock:
+            previous = self._progress_sink
+            self._progress_sink = sink
+        return previous
+
+    def restore_progress_sink(self, sink: Any) -> None:
+        """Restore the progress callback returned by ``set_progress_sink``."""
+
+        if sink is not None and not callable(sink):
+            raise TypeError("progress sink must be callable or None")
+        with self._lock:
+            self._progress_sink = sink
+
+    def report_progress(self, progress: Any) -> None:
+        """Publish one execution-scoped Tool observation when enabled."""
+
+        with self._lock:
+            sink = self._progress_sink
+        if sink is not None:
+            sink(progress)
 
 
 async def validated_provider_stream(
@@ -1080,10 +1378,15 @@ __all__ = [
     "GenerationCancelled",
     "GenerationCompleted",
     "GenerationRequest",
+    "ContentPart",
+    "ContentSequence",
+    "FilePart",
+    "ImagePart",
     "InvalidProviderResponseError",
     "JsonPayload",
     "JsonValue",
     "Message",
+    "MessageInput",
     "MessagePart",
     "ModelLimits",
     "MissingSecretError",
@@ -1103,6 +1406,7 @@ __all__ = [
     "ReasoningDelta",
     "ReasoningOptions",
     "ReasoningPart",
+    "SourcePart",
     "TextDelta",
     "TextPart",
     "ToolCallArgumentsDelta",

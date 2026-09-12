@@ -22,9 +22,12 @@ from uthcode.core.provider import (
     FinishReason,
     GenerationCompleted,
     GenerationRequest,
+    ImagePart,
+    FilePart,
     Message,
     ProviderIdentity,
     ProviderResponse,
+    SourcePart,
     TextPart,
     ToolCallPart,
     ToolDefinition,
@@ -36,8 +39,11 @@ from uthcode.core.tool import (
     ToolResultPersistenceStatus,
     ToolExecutionResult,
     ToolExecutor,
+    ToolFailure,
+    ToolFailureKind,
     ToolPreparation,
     ToolRegistry,
+    ToolSideEffect,
 )
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.integrations.tools import tool_result_read
@@ -292,6 +298,126 @@ def test_application_materialization_separates_execution_and_persistence_facts(
         writer.close()
 
 
+def test_materialization_externalizes_only_text_and_keeps_reference_order(
+    tmp_path: Path,
+) -> None:
+    _store, writer = _session(tmp_path)
+    try:
+        policy = _policy(
+            inline_threshold_bytes=4,
+            preview_limit_bytes=4,
+            single_result_hard_cap_bytes=64,
+            session_quota_bytes=64,
+        )
+        service = ApplicationToolService(
+            (),
+            session_provider=lambda: type(
+                "ActiveSession",
+                (),
+                {
+                    "session_id": "session-a",
+                    "persist_tool_result": writer.persist_tool_result,
+                    "read_tool_result": writer.read_tool_result,
+                },
+            )(),
+            tool_result_policy=policy,
+        )
+        content = (
+            TextPart("abcdefgh"),
+            ImagePart("asset://image", "image/png"),
+            FilePart("asset://file", "report.pdf", "application/pdf"),
+            SourcePart("asset://file", page=2),
+        )
+        materialized = service.materialize_tool_result(
+            ToolExecutionOutcome(
+                "structured-call",
+                "BigTool",
+                content,
+                False,
+                ToolExecutionStatus.SUCCEEDED,
+            )
+        )
+
+        assert materialized.persistence_status is ToolResultPersistenceStatus.EXTERNALIZED
+        assert [type(part) for part in materialized.result.content.parts] == [
+            TextPart,
+            ImagePart,
+            FilePart,
+            SourcePart,
+        ]
+        assert materialized.result.content.parts[1:] == content[1:]
+        assert materialized.reference is not None
+        page = writer.read_tool_result(materialized.reference, limit=8, policy=policy)
+        assert page.content == "abcdefgh"
+    finally:
+        writer.close()
+
+
+def test_materialization_hard_cap_keeps_structured_references() -> None:
+    service = ApplicationToolService(
+        (),
+        tool_result_policy=_policy(
+            inline_threshold_bytes=4,
+            preview_limit_bytes=4,
+            single_result_hard_cap_bytes=6,
+        ),
+    )
+    content = (
+        TextPart("abcdefgh"),
+        ImagePart("asset://image", "image/png"),
+        FilePart("asset://file", "report.pdf", "application/pdf"),
+        SourcePart("asset://file", page=2),
+    )
+
+    materialized = service.materialize_tool_result(
+        ToolExecutionOutcome(
+            "hard-cap-call",
+            "BigTool",
+            content,
+            False,
+            ToolExecutionStatus.SUCCEEDED,
+        )
+    )
+
+    assert materialized.persistence_status is ToolResultPersistenceStatus.FAILED
+    assert [type(part) for part in materialized.result.content.parts] == [
+        TextPart,
+        ImagePart,
+        FilePart,
+        SourcePart,
+    ]
+    assert materialized.result.metadata["error_code"] == ToolResultTooLarge.code
+
+
+def test_materialization_inline_keeps_structured_references() -> None:
+    service = ApplicationToolService(
+        (),
+        tool_result_policy=_policy(
+            inline_threshold_bytes=16,
+            single_result_hard_cap_bytes=32,
+        ),
+    )
+    content = (
+        TextPart("ok"),
+        ImagePart("asset://image", "image/png"),
+        FilePart("asset://file", "report.pdf", "application/pdf"),
+        SourcePart("asset://file", page=2),
+    )
+
+    materialized = service.materialize_tool_result(
+        ToolExecutionOutcome(
+            "inline-structured-call",
+            "SmallTool",
+            content,
+            False,
+            ToolExecutionStatus.SUCCEEDED,
+        )
+    )
+
+    assert materialized.persistence_status is ToolResultPersistenceStatus.INLINE
+    assert materialized.result.content.parts == content
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["abcdefghi", "A😀B中C😀D"])
 async def test_tool_result_read_returns_bounded_page_metadata_and_utf8_continuation(
@@ -466,7 +592,12 @@ def test_persistence_failure_keeps_successful_execution_and_never_requests_retry
     outcome = ToolExecutionOutcome(
         "call-2",
         "WriteTool",
-        "side effect completed",
+        (
+            TextPart("side effect completed"),
+            ImagePart("asset://image", "image/png"),
+            FilePart("asset://file", "report.pdf", "application/pdf"),
+            SourcePart("asset://file", page=2),
+        ),
         False,
         ToolExecutionStatus.SUCCEEDED,
     )
@@ -478,6 +609,12 @@ def test_persistence_failure_keeps_successful_execution_and_never_requests_retry
     assert materialized.result.is_error is False
     assert materialized.result.metadata["execution_status"] == "succeeded"
     assert materialized.result.metadata["persistence_status"] == "failed"
+    assert [type(part) for part in materialized.result.content.parts] == [
+        TextPart,
+        ImagePart,
+        FilePart,
+        SourcePart,
+    ]
     assert "already ran" in materialized.result.content
     assert "retried" in materialized.result.content
 
@@ -508,6 +645,14 @@ def test_persistence_failure_preserves_failed_execution_error_truth() -> None:
         "the Tool returned an error",
         True,
         ToolExecutionStatus.FAILED,
+        ToolFailure(ToolFailureKind.PROCESS_FAILED.value, retryable=True),
+        ToolSideEffect.PARTIAL,
+        "workspace/output.txt",
+        "proc-7",
+        "exited",
+        17,
+        "stderr",
+        "cursor-7",
     )
 
     materialized = service.materialize_tool_result(outcome)
@@ -515,6 +660,17 @@ def test_persistence_failure_preserves_failed_execution_error_truth() -> None:
     assert materialized.result.is_error is True
     assert materialized.result.metadata["execution_status"] == "failed"
     assert materialized.result.metadata["persistence_status"] == "failed"
+    assert materialized.result.metadata["failure"] == {
+        "kind": "process_failed",
+        "retryable": True,
+    }
+    assert materialized.result.metadata["side_effect"] == "partial"
+    assert materialized.result.metadata["resource"] == "workspace/output.txt"
+    assert materialized.result.metadata["process_id"] == "proc-7"
+    assert materialized.result.metadata["process_state"] == "exited"
+    assert materialized.result.metadata["exit_code"] == 17
+    assert materialized.result.metadata["stream"] == "stderr"
+    assert materialized.result.metadata["next_cursor"] == "cursor-7"
 
 
 @pytest.mark.asyncio

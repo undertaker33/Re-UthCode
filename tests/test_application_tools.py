@@ -22,7 +22,7 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.core.permission import PermissionMode
-from uthcode.core.tool import ToolExecutionResult
+from uthcode.core.tool import ToolExecutionResult, ToolProgress as CoreToolProgress
 from uthcode.integrations.tools.factory import create_default_tools
 
 
@@ -137,3 +137,29 @@ def test_application_tool_summary_redacts_sensitive_assignments(tmp_path, assign
 
     assert secret not in summary
     assert "<redacted>" in summary
+
+
+def test_projected_progress_preserves_whitespace_between_reports() -> None:
+    service = ApplicationToolService(())
+    context = {
+        "run_id": "run",
+        "turn_id": "turn",
+        "iteration": 1,
+        "batch_id": "batch",
+        "tool_call_id": "call",
+        "tool_name": "Tool",
+    }
+
+    first = service.project_tool_progress_chunks(
+        (CoreToolProgress("copy", "ordinary alpha ", current=1, total=2),),
+        **context,
+    )
+    second = service.project_tool_progress_chunks(
+        (CoreToolProgress("copy", "ordinary beta", current=2, total=2),),
+        **context,
+    )
+    flushed = service.project_tool_progress_chunks((), flush=True, **context)
+
+    assert "".join(event.text for event in (*first, *second, *flushed)) == (
+        "ordinary alpha ordinary beta"
+    )

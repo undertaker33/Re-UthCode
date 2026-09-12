@@ -9,6 +9,8 @@ from os import PathLike
 from pathlib import Path, PureWindowsPath
 
 from uthcode.core.provider import (
+    ContentSequence,
+    TextPart,
     ProviderPort,
     ToolCallPart,
     ToolDefinition,
@@ -16,11 +18,12 @@ from uthcode.core.provider import (
 )
 from uthcode.core.secrets import SecretValue
 from uthcode.core.agent import AgentLoop
+from uthcode.core.agent_events import ToolProgress as ToolProgressEvent
 from uthcode.core.command_security import safe_bash_command_summary
 from uthcode.core.interaction import ASK_USER_TOOL_DEFINITION
 from uthcode.core.planning import PROPOSE_PLAN_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION
 from uthcode.core.permission import PermissionAction, PermissionDecision
-from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry
+from uthcode.core.tool import Tool, ToolExecutor, ToolRegistry, ToolProgress as CoreToolProgress
 from uthcode.core.tool import (
     ToolExecutionOutcome,
     ToolResultMaterialization,
@@ -155,6 +158,51 @@ class _SecretRedactor:
             redacted = _replace_bounded_value(redacted, secret)
         return redacted
 
+    def progress_tail_length(self, value: str) -> int:
+        """Return the short raw suffix that may still complete a secret."""
+
+        if not value:
+            return 0
+        configured_values = [
+            os.environ[name]
+            for name in self._secret_env_names
+            if os.environ.get(name)
+        ]
+        configured_values.extend(secret.reveal() for secret in self._secret_values)
+        configured_values.extend(
+            value
+            for value in os.environ.values()
+            if _is_ambient_secret_candidate(value) and len(value) > 2
+        )
+        completed_end = 0
+        for secret in set(configured_values):
+            if secret:
+                position = value.rfind(secret)
+                if position >= 0:
+                    completed_end = max(completed_end, position + len(secret))
+        candidate = value[completed_end:]
+        longest = 0
+        for secret in set(configured_values):
+            if not secret:
+                continue
+            upper = min(len(secret) - 1, len(candidate))
+            for length in range(upper, 0, -1):
+                if candidate.endswith(secret[:length]):
+                    longest = max(longest, length)
+                    break
+        # Keep common credential-shaped prefixes bounded even when their
+        # concrete value is supplied only by an ambient environment source.
+        lowered = candidate.lower()
+        for prefix in ("sk-", "bearer ", "token=", "api_key=", "authorization:"):
+            index = lowered.rfind(prefix)
+            if index >= 0 and index + len(prefix) <= len(candidate):
+                # Shape-only credentials have no configured full length.  A
+                # single ToolProgress report is bounded at 512 characters;
+                # keep that existing observation bound for this conservative
+                # fallback while configured Secret values use their real size.
+                longest = max(longest, min(len(candidate) - index, 512))
+        return longest
+
 
 def _replace_authorization(match: re.Match[str]) -> str:
     scheme = match.group("scheme")
@@ -191,6 +239,7 @@ class ApplicationToolService:
         "_history_read_policy",
         "_workdir",
         "_externalization_stats",
+        "_progress_buffers",
     )
 
     def __init__(
@@ -261,6 +310,10 @@ class ApplicationToolService:
             "failed_bytes": 0,
             "last": None,
         }
+        self._progress_buffers: dict[
+            tuple[str, str, int, str, str, str],
+            tuple[str, CoreToolProgress],
+        ] = {}
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Return the immutable, registration-ordered public definitions."""
@@ -346,6 +399,218 @@ class ApplicationToolService:
         except Exception:
             return _SUMMARY_UNAVAILABLE
 
+    def redact_progress(self, progress: CoreToolProgress) -> CoreToolProgress:
+        """Apply the Application's bounded, secret-aware progress projection."""
+
+        if not isinstance(progress, CoreToolProgress):
+            raise TypeError("progress must be a ToolProgress")
+        text = self._redactor.redact(_progress_text(progress.text))
+        return CoreToolProgress(
+            stage=progress.stage,
+            text=_truncate_summary(text, limit=512),
+            current=progress.current,
+            total=progress.total,
+            stream=progress.stream,
+        )
+
+    def redact_progress_chunks(
+        self,
+        progress: Sequence[CoreToolProgress],
+    ) -> tuple[CoreToolProgress, ...]:
+        """Sanitize a bounded chunk window as one value before publishing.
+
+        Joining the short window lets the existing SecretValue-aware redactor
+        catch a credential split across two chunks.  The window is bounded and
+        the emitted values remain ordinary progress observations, never Tool
+        results or RunState messages.
+        """
+
+        values = tuple(progress)
+        if len(values) > 256:
+            raise ValueError("progress chunk window is too large")
+        if not all(isinstance(item, CoreToolProgress) for item in values):
+            raise TypeError("progress must contain ToolProgress values")
+        if not values:
+            return ()
+        joined = _truncate_summary(
+            self._redactor.redact(_progress_text("".join(item.text for item in values))),
+            limit=512 * 256,
+        )
+        first = values[0]
+        if not joined:
+            last = values[-1]
+            return (
+                CoreToolProgress(
+                    stage=first.stage,
+                    text="",
+                    current=last.current,
+                    total=last.total,
+                    stream=last.stream,
+                ),
+            )
+        return tuple(
+            CoreToolProgress(
+                stage=first.stage,
+                text=joined[index : index + 512],
+                current=values[-1].current,
+                total=values[-1].total,
+                stream=values[-1].stream,
+            )
+            for index in range(0, len(joined), 512)
+        )
+
+    def project_tool_progress(
+        self,
+        progress: CoreToolProgress,
+        *,
+        run_id: str,
+        turn_id: str,
+        iteration: int,
+        batch_id: str,
+        tool_call_id: str,
+        tool_name: str,
+    ) -> ToolProgressEvent:
+        """Attach ownership after sanitizing one Tool progress observation."""
+
+        projected = self.redact_progress(progress)
+        return ToolProgressEvent(
+            run_id,
+            turn_id,
+            iteration,
+            batch_id,
+            tool_call_id,
+            tool_name,
+            projected.stage,
+            projected.text,
+            projected.current,
+            projected.total,
+            projected.stream,
+        )
+
+    def project_tool_progress_chunks(
+        self,
+        progress: Sequence[CoreToolProgress],
+        *,
+        run_id: str,
+        turn_id: str,
+        iteration: int,
+        batch_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        flush: bool = False,
+    ) -> tuple[ToolProgressEvent, ...]:
+        """Publish safe progress text while retaining only a short raw tail.
+
+        A report is redacted together with the suffix retained from the
+        previous report.  Text that cannot be part of a credential prefix is
+        emitted immediately; only that bounded suffix remains in memory until
+        the next report or the end-of-execution flush.
+        """
+
+        values = tuple(progress)
+        if not all(isinstance(item, CoreToolProgress) for item in values):
+            raise TypeError("progress must contain ToolProgress values")
+        key = (run_id, turn_id, iteration, batch_id, tool_call_id, tool_name)
+        emitted: list[ToolProgressEvent] = []
+
+        def redact_window(item: CoreToolProgress, text: str) -> str:
+            chunks = tuple(
+                CoreToolProgress(
+                    stage=item.stage,
+                    text=text[index : index + 512],
+                    current=item.current,
+                    total=item.total,
+                    stream=item.stream,
+                )
+                for index in range(0, len(text), 512)
+            )
+            return "".join(
+                chunk.text for chunk in self.redact_progress_chunks(chunks)
+            )
+
+        def project_text(item: CoreToolProgress, text: str) -> None:
+            if not text:
+                projected = CoreToolProgress(
+                    stage=item.stage,
+                    current=item.current,
+                    total=item.total,
+                    stream=item.stream,
+                )
+                emitted.append(
+                    self.project_tool_progress(
+                        projected,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        iteration=iteration,
+                        batch_id=batch_id,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                    )
+                )
+                return
+            for index in range(0, len(text), 512):
+                projected = CoreToolProgress(
+                    stage=item.stage,
+                    text=text[index : index + 512],
+                    current=item.current,
+                    total=item.total,
+                    stream=item.stream,
+                )
+                emitted.append(
+                    self.project_tool_progress(
+                        projected,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        iteration=iteration,
+                        batch_id=batch_id,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                    )
+                )
+
+        for item in values:
+            previous = self._progress_buffers.get(key)
+            previous_text = previous[0] if previous is not None else ""
+            incoming = _progress_text(item.text)
+            raw = previous_text + incoming
+            if not raw:
+                project_text(item, "")
+                continue
+
+            hold = 0
+            if not flush:
+                hold = min(self._redactor.progress_tail_length(raw), len(raw))
+                # A completed secret can overlap a still-open suffix.  Keep
+                # enough context that the prefix released now cannot become
+                # part of a credential after a later report arrives.
+                while hold < len(raw):
+                    prefix = raw[:-hold] if hold else raw
+                    additional = self._redactor.progress_tail_length(prefix)
+                    if additional <= 0:
+                        break
+                    next_hold = min(
+                        len(raw),
+                        hold + additional,
+                    )
+                    if next_hold <= hold:
+                        break
+                    hold = next_hold
+
+            safe_raw = raw[:-hold] if hold else raw
+            safe_text = redact_window(item, raw if flush else safe_raw)
+            if hold and not flush:
+                self._progress_buffers[key] = (raw[-hold:], item)
+            else:
+                self._progress_buffers.pop(key, None)
+            project_text(item, safe_text)
+
+        if flush and not values:
+            previous = self._progress_buffers.pop(key, None)
+            if previous is not None:
+                raw, item = previous
+                project_text(item, redact_window(item, raw))
+        return tuple(emitted)
+
     def _create_agent_loop(
         self,
         provider: ProviderPort,
@@ -371,6 +636,7 @@ class ApplicationToolService:
             permission_resolver=permission_resolver,
             session_grant_sink=session_grant_sink,
             result_materializer=self.materialize_tool_result,
+            tool_progress_projector=self.project_tool_progress_chunks,
             overflow_handler=overflow_handler,
         )
 
@@ -382,10 +648,9 @@ class ApplicationToolService:
 
         if not isinstance(outcome, ToolExecutionOutcome):
             raise TypeError("outcome must be a ToolExecutionOutcome")
-        size_bytes = len(outcome.content.encode("utf-8"))
-        execution_metadata: dict[str, object] = {
-            "execution_status": outcome.status.value,
-        }
+        text_content = str(outcome.content)
+        size_bytes = len(text_content.encode("utf-8"))
+        execution_metadata = _execution_metadata(outcome)
 
         # ToolResultRead is already a bounded page.  Never recursively
         # externalize the only reader for an externalized result.
@@ -408,9 +673,12 @@ class ApplicationToolService:
             }
             result = ToolResultPart(
                 outcome.tool_call_id,
-                "Error: Tool execution completed, but the result exceeded the "
-                f"{self._tool_result_policy.single_result_hard_cap_bytes}-byte hard cap; "
-                "the Tool already ran and will not be retried",
+                _content_with_text(
+                    outcome.content,
+                    "Error: Tool execution completed, but the result exceeded the "
+                    f"{self._tool_result_policy.single_result_hard_cap_bytes}-byte hard cap; "
+                    "the Tool already ran and will not be retried",
+                ),
                 outcome.is_error,
                 metadata,
             )
@@ -437,7 +705,7 @@ class ApplicationToolService:
 
         try:
             reference = session.persist_tool_result(
-                outcome.content,
+                text_content,
                 policy=self._tool_result_policy,
             )
             if not isinstance(reference, ToolResultReference):
@@ -471,13 +739,13 @@ class ApplicationToolService:
             "sha256": reference.sha256,
         }
         visible = format_externalized_preview(
-            outcome.content,
+            text_content,
             reference,
             preview_limit_bytes=self._tool_result_policy.preview_limit_bytes,
         )
         result = ToolResultPart(
             outcome.tool_call_id,
-            visible,
+            _content_with_text(outcome.content, visible),
             outcome.is_error,
             metadata,
         )
@@ -501,14 +769,19 @@ class ApplicationToolService:
     ) -> ToolResultMaterialization:
         self._record_materialization("failed", size_bytes, error_code)
         metadata: Mapping[str, object] = {
-            "execution_status": outcome.status.value,
+            **_execution_metadata(outcome),
             "persistence_status": ToolResultPersistenceStatus.FAILED.value,
             "error_code": error_code,
             "size_bytes": size_bytes,
         }
         return ToolResultMaterialization(
             execution=outcome,
-            result=ToolResultPart(outcome.tool_call_id, message, outcome.is_error, metadata),
+            result=ToolResultPart(
+                outcome.tool_call_id,
+                _content_with_text(outcome.content, message),
+                outcome.is_error,
+                metadata,
+            ),
             persistence_status=ToolResultPersistenceStatus.FAILED,
             size_bytes=size_bytes,
             error_code=error_code,
@@ -598,6 +871,45 @@ class ApplicationToolService:
         )
 
 
+def _execution_metadata(outcome: ToolExecutionOutcome) -> dict[str, object]:
+    """Preserve known execution facts when Application adds persistence facts."""
+
+    metadata: dict[str, object] = {"execution_status": outcome.status.value}
+    if outcome.side_effect.value != "none":
+        metadata["side_effect"] = outcome.side_effect.value
+    if outcome.failure is not None:
+        metadata["failure"] = outcome.failure.to_dict()
+    for field_name in ("resource", "process_id", "process_state", "stream", "next_cursor"):
+        value = getattr(outcome, field_name)
+        if value is not None:
+            metadata[field_name] = value
+    if outcome.exit_code is not None:
+        metadata["exit_code"] = outcome.exit_code
+    return metadata
+
+
+def _content_with_text(content: ContentSequence, replacement: str) -> ContentSequence:
+    """Replace only textual slots while retaining every reference in order."""
+
+    if not isinstance(content, ContentSequence):
+        content = ContentSequence(content)
+    parts = list(content.parts)
+    replaced = False
+    projected: list[object] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            if not replaced:
+                projected.append(TextPart(replacement))
+                replaced = True
+            else:
+                projected.append(TextPart(""))
+        else:
+            projected.append(part)
+    if not replaced:
+        projected.insert(0, TextPart(replacement))
+    return ContentSequence(tuple(projected))
+
+
 def _safe_text(value: object, fallback: str) -> str:
     if not isinstance(value, str) or not value.strip():
         return fallback
@@ -634,10 +946,18 @@ def _single_line(value: str) -> str:
     return " ".join(value.replace("\r", " ").replace("\n", " ").split())
 
 
-def _truncate_summary(value: str) -> str:
-    if len(value) <= _MAX_SUMMARY_CHARS:
+def _progress_text(value: str) -> str:
+    """Normalize line breaks while preserving ordinary progress whitespace."""
+
+    return value.replace("\r", " ").replace("\n", " ")
+
+
+def _truncate_summary(value: str, *, limit: int = _MAX_SUMMARY_CHARS) -> str:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 2:
+        raise ValueError("limit must be an integer >= 2")
+    if len(value) <= limit:
         return value
-    return value[: _MAX_SUMMARY_CHARS - 1] + "…"
+    return value[: limit - 1] + "…"
 
 
 __all__ = ["ApplicationToolService"]

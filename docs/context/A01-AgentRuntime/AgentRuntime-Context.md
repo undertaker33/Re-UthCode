@@ -19,10 +19,11 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` `BehaviorMode`、`PlanState`、`TaskState` 和同一 Turn 的 Steering 都属于当前 Core execution 事实；`TodoWrite` 是 Core 特殊控制工具，不是第二个 Tool Runtime。
 - `[FACT]` 普通 Tool Batch 严格 FIFO；当前批次不会并行执行工具。
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
+- `[FACT]` Tool 可在执行期间经由 `CancellationToken.report_progress()` 发布有界观察；Agent Loop 将其送入 Application 的脱敏、跨 chunk 有界尾部投影，再通过同一 `AgentEvent` 流发布 `ToolProgress`。进度不会进入 `RunState`、Tool Result 正文、History 或 Provider 请求；结果中的 progress 仅作为没有实时报告时的受控兜底。
 - `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造包含 dynamic default/configured/provider/effective limits 及 provenance、Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的最终请求；每次 Provider call 前都经过 Preflight Hard Gate，Provider Integration 只负责原生协议映射。
 - `[FACT]` Provider 流中的 `ReasoningPart` 与 `TextPart` 始终保持 typed 边界并按到达顺序投影为公开事件；跨 Provider/model identity 时不把 reasoning 降级为 assistant 正文，`STOP` 只有非空正式 `TextPart` 才能完成，`TurnResult.final_text` 只来自正式正文。
 - `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；唯一的 `create_application -> create_run -> start_turn` 链路将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
-- `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
+- `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；只有文本正文写入 Session opaque ref，图片、文件和来源引用按原次序保留在可见结构化结果中；物化失败继续叠加 execution failure、side effect、resource、process 与退出事实。`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
 - `[FACT]` Tool batch 和 terminal 边界通过 Application 提交 History；只有已确认持久化的消息才推进 cursor，未知副作用或未知落盘结果不盲目重试。完整规则见 [A03 History 持久化与恢复](../A03-State/State-Context.md#history-持久化与恢复)。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。
 
@@ -68,7 +69,7 @@ AgentRun.start_turn(user_input)
            -> trusted preflight
            -> fixed PLAN non-READ check
            -> Control 层 PermissionDecision
-           -> execute 或受控错误 ToolResultPart
+           -> execute（期间通过 Application 投影 ToolProgress）或受控错误 ToolResultPart
            -> ToolFinished
         -> 将全部原始 call_id 对应结果组成一个 role=tool Message
         -> ToolBatchFinished
@@ -85,7 +86,7 @@ AgentRun.start_turn(user_input)
 - 每个 Provider 给出的原始 `tool_call_id` 必须恰好得到一个 `ToolResultPart`；未知工具、参数错误、拒绝、异常、超限、取消也必须闭合 ID。
 - Tool 先 `prepare_call`，再权限判断，再 `execute_prepared`；审批恢复不得二次 preflight 或二次执行。
 - 单个 Tool 被拒绝或普通失败时，当前批次继续；错误作为 Tool Result 回给模型。
-- 工具成功/错误正文进入模型消息，但公开 Tool 事件只携带脱敏、截断摘要。
+- 工具成功/错误正文进入模型消息，但公开 Tool 事件只携带脱敏、截断摘要；执行中的 ToolProgress 只走 Application 安全投影，不进入模型消息。
 - 默认限制：`max_iterations=50`、`max_tool_calls_per_iteration=16`、`max_consecutive_unknown_tools=3`。
 
 ## Provider 与 Tool 当前矩阵

@@ -8,19 +8,19 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T01 统一内容与正式输入
 
-- [ ] A01（R01/R06/R10，统一合同）：通过 `tests/test_provider_contract.py`、`test_tool_core.py`、`test_agent_events.py` 增补 验证；通过条件：文字/图片/文件/工具内容 round-trip；无原生对象/秘密进入公开投影；旧文本主链可用。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T01 的完成边界并记录对应代码/定向证据：文字主链和新内容 round-trip 可运行；未实现的附件导入由 T04/T06 完成，不留 legacy 执行路径。
+- [x] A01（R01/R06/R10，统一合同）：通过 `tests/test_provider_contract.py`、`test_tool_core.py`、`test_agent_events.py` 增补 验证；通过条件：文字/图片/文件/工具内容 round-trip；无原生对象/秘密进入公开投影；旧文本主链可用。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T01 的完成边界并记录对应代码/定向证据：文字主链和新内容 round-trip 可运行；未实现的附件导入由 T04/T06 完成，不留 legacy 执行路径。
 
 ## T02 工具失败、副作用与进度合同
 
-- [ ] A08（R10/R11/R24）：通过 `tests/test_tool_result_persistence.py`、`test_agent_loop.py` 增补 验证；通过条件：写成功保存失败不重做；unknown 副作用截停；未执行批尾也有对应结果；普通工具错误返回模型继续处理。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T02 的完成边界并记录对应代码/定向证据：写成功但保存失败不重复写；unknown 不纠偏重试；进度不写 RunState、不灌入模型历史；真实日志展示留 T09。
+- [x] A08（R10/R11/R24）：通过 `tests/test_tool_result_persistence.py`、`test_agent_loop.py` 增补 验证；通过条件：写成功保存失败不重做；unknown 副作用截停；未执行批尾也有对应结果；普通工具错误返回模型继续处理。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T02 的完成边界并记录对应代码/定向证据：写成功但保存失败不重复写；unknown 不纠偏重试；进度不写 RunState、不灌入模型历史；真实日志展示留 T09。
 
 ## T03 三协议图片序列化
 
-- [ ] A01（R01/R06/R10，统一合同）：通过 `tests/test_provider_contract.py`、`test_tool_core.py`、`test_agent_events.py` 增补 验证；通过条件：文字/图片/文件/工具内容 round-trip；无原生对象/秘密进入公开投影；旧文本主链可用。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A01（R01/R06/R10，统一合同）：通过 `tests/test_provider_contract.py`、`test_tool_core.py`、`test_agent_events.py` 增补 验证；通过条件：文字/图片/文件/工具内容 round-trip；无原生对象/秘密进入公开投影；旧文本主链可用。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A02（R03/R06，三协议真实入模）：通过 既有三个 Provider integration 测试 + 人工真实 Provider 验收 验证；通过条件：检查实际 SDK 请求并让模型分别回答用户图和工具图中的不同内容；记录具体模型/端点/SDK；不以只返回路径或 Mock 冒充通过。证据记录于 W01 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T03 的完成边界并记录对应代码/定向证据：三协议真实 SDK 请求结构可检验；实际 Provider 内容理解证据必须由 T19 补齐，不能在本 Task 只凭 Mock 勾选 A02。
+- [x] 核对 Tasks T03 的完成边界并记录对应代码/定向证据：三协议真实 SDK 请求结构可检验；实际 Provider 内容理解证据必须由 T19 补齐，不能在本 Task 只凭 Mock 勾选 A02。
 
 ## T04 会话原始附件与历史恢复
 
