@@ -96,6 +96,16 @@ _MODEL_MAPPING_FIELDS = frozenset(
         "supports_images",
     }
 )
+_SEARCH_MAPPING_FIELDS = frozenset(
+    {
+        "enabled",
+        "provider",
+        "api_key",
+        "max_results",
+        "max_fetch_bytes",
+        "timeout_seconds",
+    }
+)
 _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -212,6 +222,69 @@ class ModelProfile:
             object.__setattr__(self, "display_name", self.remote_id)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class SearchConfiguration:
+    """Trusted user-level search settings.
+
+    The endpoint is intentionally not configurable.  Tavily is the only
+    approved search service for this task; project configuration may only
+    disable it or tighten bounded limits.
+    """
+
+    enabled: bool = False
+    provider: str = "tavily"
+    api_key: SecretValue | str | None = None
+    max_results: int = 5
+    max_fetch_bytes: int = 2 * 1024 * 1024
+    timeout_seconds: float = 20.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigurationModelError("search.enabled must be a boolean")
+        if not isinstance(self.provider, str) or self.provider.strip().lower() != "tavily":
+            raise ConfigurationModelError("search.provider must be tavily")
+        object.__setattr__(self, "provider", "tavily")
+        if isinstance(self.api_key, str) and not self.api_key.strip():
+            object.__setattr__(self, "api_key", None)
+        elif self.api_key is not None and not isinstance(self.api_key, SecretValue):
+            object.__setattr__(self, "api_key", SecretValue(self.api_key))
+        for field_name in ("max_results", "max_fetch_bytes"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigurationModelError(f"search.{field_name} must be a positive integer")
+        if self.max_results > 20:
+            raise ConfigurationModelError("search.max_results must be at most 20")
+        if self.max_fetch_bytes > 16 * 1024 * 1024:
+            raise ConfigurationModelError("search.max_fetch_bytes exceeds the safety limit")
+        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, (int, float)):
+            raise ConfigurationModelError("search.timeout_seconds must be a positive number")
+        if self.timeout_seconds <= 0 or self.timeout_seconds > 120:
+            raise ConfigurationModelError("search.timeout_seconds must be between 0 and 120")
+
+    @property
+    def api_key_configured(self) -> bool:
+        return self.api_key is not None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "provider": self.provider,
+            "api_key_configured": self.api_key_configured,
+            "max_results": self.max_results,
+            "max_fetch_bytes": self.max_fetch_bytes,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            "SearchConfiguration("
+            f"enabled={self.enabled!r}, provider={self.provider!r}, "
+            f"api_key={'<redacted>' if self.api_key is not None else None!r}, "
+            f"max_results={self.max_results!r}, max_fetch_bytes={self.max_fetch_bytes!r}, "
+            f"timeout_seconds={self.timeout_seconds!r})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class UserProviderView:
     """Display-safe projection of one user Provider profile."""
@@ -309,6 +382,7 @@ class UserConfigurationView:
     default_permission_mode: object = "default"
     providers: Mapping[str, UserProviderView] = MappingProxyType({})
     models: Mapping[str, UserModelView] = MappingProxyType({})
+    search: Mapping[str, object] = MappingProxyType({})
     path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -328,6 +402,17 @@ class UserConfigurationView:
             models[model_ref] = _safe_user_model(value, model_ref)
         object.__setattr__(self, "providers", MappingProxyType(providers))
         object.__setattr__(self, "models", MappingProxyType(models))
+        if not isinstance(self.search, Mapping):
+            raise TypeError("search must be a mapping")
+        safe_search: dict[str, object] = {}
+        for key, value in self.search.items():
+            if not isinstance(key, str):
+                raise TypeError("search keys must be strings")
+            if key == "api_key":
+                safe_search["api_key_configured"] = bool(value)
+            else:
+                safe_search[key] = value
+        object.__setattr__(self, "search", MappingProxyType(safe_search))
         if self.path is not None:
             object.__setattr__(self, "path", Path(self.path))
 
@@ -343,6 +428,7 @@ class UserConfigurationView:
                 model_ref: profile.to_dict()
                 for model_ref, profile in self.models.items()
             },
+            "search": dict(self.search),
         }
 
 
@@ -462,6 +548,7 @@ class UserConfigurationWriteRequest:
     default_permission_mode: PermissionMode | str | None = None
     providers: Mapping[str, object] | None = None
     models: Mapping[str, object] | None = None
+    search: Mapping[str, object] | None = None
     provider_renames: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -475,6 +562,19 @@ class UserConfigurationWriteRequest:
             "models",
             _freeze_user_write_section(self.models, field_name="models"),
         )
+        if self.search is not None:
+            if not isinstance(self.search, Mapping):
+                raise TypeError("search must be a mapping")
+            search_values: dict[str, object] = {}
+            for key, value in self.search.items():
+                if not isinstance(key, str):
+                    raise TypeError("search keys must be strings")
+                if key == "api_key" and value not in (None, "") and not isinstance(value, SecretValue):
+                    if not isinstance(value, str):
+                        raise TypeError("search.api_key must be a string")
+                    value = SecretValue(value)
+                search_values[key] = value
+            object.__setattr__(self, "search", _freeze_user_write_mapping(search_values, field="search"))
         object.__setattr__(
             self,
             "provider_renames",
@@ -506,6 +606,17 @@ class UserConfigurationWriteRequest:
             if self.models is None
             else {model_ref: dict(profile) for model_ref, profile in self.models.items()}
         )
+        safe_search = None
+        if self.search is not None:
+            safe_search = {}
+            for key, value in self.search.items():
+                if key == "api_key":
+                    safe_search["api_key_configured"] = (
+                        isinstance(value, SecretValue)
+                        or (isinstance(value, str) and bool(value.strip()))
+                    )
+                else:
+                    safe_search[key] = value
         mode = self.default_permission_mode
         if isinstance(mode, PermissionMode):
             mode = mode.value
@@ -514,6 +625,7 @@ class UserConfigurationWriteRequest:
             "default_permission_mode": mode,
             "providers": providers,
             "models": models,
+            "search": safe_search,
             "provider_renames": (
                 None
                 if self.provider_renames is None
@@ -528,6 +640,7 @@ class UserConfigurationWriteRequest:
             f"default_permission_mode={self.default_permission_mode!r}, "
             f"providers={None if self.providers is None else '<redacted>'!r}, "
             f"models={None if self.models is None else tuple(self.models)!r}, "
+            f"search={None if self.search is None else '<redacted>'!r}, "
             f"provider_renames={None if self.provider_renames is None else dict(self.provider_renames)!r})"
         )
 
@@ -549,6 +662,7 @@ class EffectiveConfig:
     models: Mapping[str, ModelProfile]
     sources: tuple[ConfigSource, ...] = ()
     default_permission_mode: PermissionMode = PermissionMode.DEFAULT
+    search: SearchConfiguration | Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.default_model, "default_model")
@@ -561,6 +675,30 @@ class EffectiveConfig:
         if mode is PermissionMode.FULL_ACCESS:
             raise ConfigurationModelError("default_permission_mode cannot be full_access")
         object.__setattr__(self, "default_permission_mode", mode)
+        search_value = self.search
+        if search_value is None:
+            search_config = SearchConfiguration()
+        elif isinstance(search_value, SearchConfiguration):
+            search_config = search_value
+        elif isinstance(search_value, Mapping):
+            unsupported_search = [
+                key for key in search_value if key not in _SEARCH_MAPPING_FIELDS
+            ]
+            if unsupported_search:
+                raise ConfigurationModelError(
+                    f"unsupported search field: {unsupported_search[0]!r}"
+                )
+            search_config = SearchConfiguration(
+                enabled=search_value.get("enabled", False),
+                provider=search_value.get("provider", "tavily"),
+                api_key=search_value.get("api_key"),
+                max_results=search_value.get("max_results", 5),
+                max_fetch_bytes=search_value.get("max_fetch_bytes", 2 * 1024 * 1024),
+                timeout_seconds=search_value.get("timeout_seconds", 20.0),
+            )
+        else:
+            raise TypeError("search must be SearchConfiguration, mapping, or None")
+        object.__setattr__(self, "search", search_config)
         if not isinstance(self.providers, Mapping):
             raise TypeError("providers must be a mapping")
         if not isinstance(self.models, Mapping):
@@ -663,7 +801,7 @@ class EffectiveConfig:
         unsupported = [
             key
             for key in value
-            if key not in {"default_model", "providers", "models", "default_permission_mode"}
+            if key not in {"default_model", "providers", "models", "default_permission_mode", "search"}
         ]
         if unsupported:
             raise ConfigurationModelError(
@@ -678,6 +816,7 @@ class EffectiveConfig:
             models=value.get("models", {}),
             sources=tuple(sources),
             default_permission_mode=value.get("default_permission_mode", "default"),
+            search=value.get("search"),
         )
 
     @classmethod
@@ -695,6 +834,7 @@ class EffectiveConfig:
         context_window: int | None = None,
         reasoning_effort: str | None = None,
         supports_images: bool | None = None,
+        search: SearchConfiguration | Mapping[str, object] | None = None,
         source: ConfigSource | str | Path | None = None,
     ) -> EffectiveConfig:
         """Build a minimal valid configuration for an embedded caller."""
@@ -727,6 +867,7 @@ class EffectiveConfig:
                 )
             },
             sources=config_source,
+            search=search,
         )
 
     @property
@@ -749,6 +890,7 @@ __all__ = [
     "ModelProfile",
     "ProviderKind",
     "ProviderProfile",
+    "SearchConfiguration",
     "UserConfigurationView",
     "UserConfigurationWriteRequest",
     "UserModelView",

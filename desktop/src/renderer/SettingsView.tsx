@@ -63,6 +63,8 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
   const editorSnapshot = useRef<ConfigurationWrite | null>(null);
   const replacementKeys = useRef<Record<string, string>>({});
   const touchedKeys = useRef<Record<string, boolean>>({});
+  const [searchReplacementKey, setSearchReplacementKey] = useState("");
+  const [searchKeyTouched, setSearchKeyTouched] = useState(false);
   const settingsSavingPrevious = useRef(state.settingsSaving);
   const settingsSaveStarted = useRef(false);
   const { t } = useTranslation();
@@ -74,6 +76,8 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
     setDraft(sourceConfig(state.configuration));
     replacementKeys.current = {};
     touchedKeys.current = {};
+    setSearchReplacementKey("");
+    setSearchKeyTouched(false);
     editorSnapshot.current = null;
   }, [state.configuration]);
 
@@ -162,10 +166,18 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
   const save = async () => {
     if (settingsInteractionLocked()) return;
     settingsSaveStarted.current = true;
-    const request = settingsSaveRequest(draft, replacementKeys.current, touchedKeys.current);
+    const request = settingsSaveRequest(
+      draft,
+      replacementKeys.current,
+      touchedKeys.current,
+      searchReplacementKey,
+      searchKeyTouched,
+    );
     try {
       await onSave(request);
       clearReplacement();
+      setSearchReplacementKey("");
+      setSearchKeyTouched(false);
     } catch {
       // Preserve only the explicit replacement ref so a rejected Save can be
       // retried. Revealed values live solely inside the unmounted modal.
@@ -216,6 +228,22 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
         <section className={`settings-section${activeCategory === "defaults" ? "" : " settings-section--inactive"}`} id="settings-defaults" aria-labelledby="settings-defaults-title" aria-hidden={activeCategory !== "defaults" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">02</p><h2 id="settings-defaults-title">{t("defaults")}</h2></div></div>
           <div className="settings-row"><span className="settings-row__label">{t("permission")}</span><CustomSelect label={t("permission")} value={draft.default_permission_mode ?? "default"} options={[{ value: "default", label: t("default") }, { value: "auto", label: t("auto") }]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_permission_mode: value === "auto" ? "auto" : "default" })); }} disabled={settingsBusy} /></div>
           <div className="settings-row"><span className="settings-row__label">{t("defaultModel")}</span><CustomSelect label={t("defaultModel")} value={draft.default_model ?? ""} options={[{ value: "", label: "—" }, ...models.map(([ref, model]) => ({ value: ref, label: modelLabel(model, t("unnamedModel")) }))]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_model: value })); }} disabled={settingsBusy} /></div>
+          {(() => {
+            const search = draft.search ?? {};
+            const searchEnabled = search.enabled === true;
+            const updateSearch = (field: string, value: unknown) => {
+              if (settingsInteractionLocked() || state.activeTurn) return;
+              setDraft((current) => ({ ...current, search: { ...(current.search ?? {}), [field]: value } }));
+            };
+            const limitValue = (field: string, fallback: number) => typeof search[field] === "number" ? String(search[field]) : String(fallback);
+            return <div className="settings-search" aria-label={t("searchSettings")}>
+              <div className="settings-row settings-row--checkbox"><label className="settings-row__label" htmlFor="settings-search-enabled">{t("webSearch")}</label><input id="settings-search-enabled" type="checkbox" checked={searchEnabled} onChange={(event) => updateSearch("enabled", event.currentTarget.checked)} disabled={settingsBusy || state.activeTurn} /><span className="settings-row__value">{search.provider === "tavily" || search.provider === undefined ? "Tavily" : stringValue(search.provider)}</span></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-key">{t("searchApiKey")}</label><input id="settings-search-key" type="password" value={searchReplacementKey} placeholder={search.api_key_configured === true ? t("apiKeySaved") : t("enterKey")} onChange={(event) => { setSearchReplacementKey(event.currentTarget.value); setSearchKeyTouched(true); }} disabled={settingsBusy || state.activeTurn} autoComplete="off" /></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-max-results">{t("searchMaxResults")}</label><input id="settings-search-max-results" type="number" min={1} max={20} value={limitValue("max_results", 5)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1 && value <= 20) updateSearch("max_results", value); }} disabled={settingsBusy || state.activeTurn} /></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-max-bytes">{t("searchMaxBytes")}</label><input id="settings-search-max-bytes" type="number" min={1024} max={16777216} value={limitValue("max_fetch_bytes", 2097152)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1024 && value <= 16777216) updateSearch("max_fetch_bytes", value); }} disabled={settingsBusy || state.activeTurn} /></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-timeout">{t("searchTimeout")}</label><input id="settings-search-timeout" type="number" min={1} max={120} step={1} value={limitValue("timeout_seconds", 20)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1 && value <= 120) updateSearch("timeout_seconds", value); }} disabled={settingsBusy || state.activeTurn} /></div>
+            </div>;
+          })()}
         </section>
         <section className={`settings-section${activeCategory === "interface" ? "" : " settings-section--inactive"}`} id="settings-interface" aria-labelledby="settings-interface-title" aria-hidden={activeCategory !== "interface" || undefined}>
           <div className="settings-section__heading"><div><p className="eyebrow">03</p><h2 id="settings-interface-title">{t("interface")}</h2></div></div>

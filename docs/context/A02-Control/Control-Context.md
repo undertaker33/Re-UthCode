@@ -20,6 +20,9 @@ explicit_absence: OS sandbox + dynamic hook registry/plugin lifecycle
 - `[FACT]` Plan Review 使用现有 typed pause/resume，TodoWrite 与同一 Turn Steering 使用同一 Core execution 边界；不创建第二个控制 Runtime。
 - `[FACT]` `Process` 的 `list`/`read` 是 `READ`，stdin/EOF `write` 是独立 `WRITE` 输入授权，PTY `resize` 是 `WRITE`，`stop` 是 `DESTRUCTIVE`；启动 Bash 获批不会自动授权后续输入或停止动作。所有操作仍校验当前 Application/Session 所属的 process identity。
 - `[FACT]` Process cancellation、Turn failure 和异常只终止该 Turn 新建的进程；成功 Turn 保留 Session-owned 服务，显式 Session shutdown 才全量回收。Windows 使用原生 Job 归属后代，PTY 使用 pywinpty/ConPTY；POSIX 使用 process group/ptyprocess，回收无法确认时报告 `unknown`。
+- `[FACT]` `WebSearch` 是可选的外部 `READ`；`WebFetch` 对每一个 HTTP redirect 目标重新做公开地址与注入授权判断，响应正文、PDF 下载和来源元数据都受有界读取与取消控制。
+- `[FACT]` `ApplyPatch` 在一次 `WRITE` 授权前解析完整 Codex patch、预检所有目标的读取事实与冲突；执行时逐目标再次核对并原子提交，移动或多目标提交部分失败时返回已提交/失败/未执行集合与磁盘事实。
+- `[FACT]` `GitWorkspace` 只执行受控 argv 的 status/diff/log/show/branch 查询，固定关闭 external diff、textconv、可选 index lock 和交互网络，不把查询当作写入授权。
 - `[BOUNDARY]` Permission Approval 是应用层授权，不是 OS Sandbox。
 - `[ABSENT]` 当前没有 OS Sandbox、动态控制扩展 registry、第三方 Hook plugin 生命周期或可热插拔控制点。
 

@@ -43,6 +43,22 @@ max_output_tokens = 4096
 reasoning_effort = "medium"
 ```
 
+联网搜索是可选的用户级配置。当前只支持 Tavily；端点由代码固定，实际请求固定使用 `search_depth = "basic"`、`include_answer = false`，不会根据输入自动升级收费深度：
+
+```toml
+[search]
+enabled = true
+provider = "tavily"
+api_key = "env:TAVILY_API_KEY"
+max_results = 5
+max_fetch_bytes = 2097152
+timeout_seconds = 20.0
+```
+
+默认 `enabled = false`。`api_key` 只允许写在用户配置中，可使用 literal 或 `env:VARIABLE_NAME`；解析后仅作为内部 `SecretValue` 在请求边界取值，不进入 Prompt、History、Event、日志、Snapshot、diagnostics 或 Eval artifact。项目配置只能关闭搜索或收紧 `max_results`、`max_fetch_bytes`、`timeout_seconds`，不能写搜索凭据、重定向端点，也不能在用户未配置时启用搜索。
+
+Desktop Settings 的 Search 区域保存启用状态、固定 provider、key 输入和三个上限字段。key 输入只在 editor-local 草稿和受控配置写入通道存在，安全设置回读只显示是否已配置；当前可见 Session 有 active Turn 时，整次设置保存会被拒绝，既有运行时不会因保存而重启。
+
 使用 env 写法时，在启动 UthCode 的终端中设置密钥：
 
 ```powershell

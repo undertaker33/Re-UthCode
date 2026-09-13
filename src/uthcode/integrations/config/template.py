@@ -21,6 +21,14 @@ USER_CONFIG_TEMPLATE = """# UthCode user configuration
 default_model = \"\"
 default_permission_mode = \"default\"
 
+[search]
+enabled = false
+provider = \"tavily\"
+max_results = 5
+max_fetch_bytes = 2097152
+timeout_seconds = 20.0
+# api_key = \"env:TAVILY_API_KEY\"
+
 [providers.slot-1]
 kind = \"\"
 api_key = \"\"

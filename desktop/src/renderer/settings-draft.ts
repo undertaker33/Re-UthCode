@@ -7,6 +7,7 @@ export interface ConfigurationWrite {
   default_permission_mode?: "default" | "auto";
   providers?: Record<string, Record<string, unknown>>;
   models?: Record<string, Record<string, unknown>>;
+  search?: Record<string, unknown>;
 }
 
 export type SettingsCategory = "providers" | "defaults" | "interface" | "about";
@@ -17,6 +18,7 @@ export function configurationRequest(value: ConfigurationWrite): ConfigurationWr
   if (value.default_permission_mode !== undefined) request.default_permission_mode = value.default_permission_mode;
   if (value.providers) request.providers = Object.fromEntries(Object.entries(value.providers).map(([key, profile]) => [key, { ...profile }]));
   if (value.models) request.models = Object.fromEntries(Object.entries(value.models).map(([key, profile]) => [key, { ...profile }]));
+  if (value.search) request.search = { ...value.search };
   return request;
 }
 
@@ -37,7 +39,18 @@ export function settingsSaveRequest(
   draft: ConfigurationWrite,
   replacementKeys: Record<string, string>,
   touchedKeys: Record<string, boolean>,
+  searchReplacementKey = "",
+  searchKeyTouched = false,
 ): ConfigurationWrite {
+  const search = draft.search
+    ? (() => {
+      const next = { ...draft.search };
+      delete next.api_key_configured;
+      delete next.api_key;
+      if (searchKeyTouched) next.api_key = searchReplacementKey;
+      return next;
+    })()
+    : undefined;
   return configurationRequest({
     ...draft,
     providers: Object.fromEntries(Object.entries(draft.providers ?? {}).map(([id, profile]) => {
@@ -56,6 +69,7 @@ export function settingsSaveRequest(
         return [ref, next];
       }))
       : draft.models,
+    search,
   });
 }
 
@@ -105,11 +119,17 @@ export function sourceConfig(value: ConfigurationView | null): ConfigurationWrit
   }
   const requestedDefault = stringValue(value?.default_model);
   const defaultModel = requestedDefault && models[requestedDefault] ? requestedDefault : Object.keys(models)[0] ?? "";
+  const searchValue = value?.search;
+  const search = searchValue && typeof searchValue === "object"
+    ? { ...(searchValue as Record<string, unknown>) }
+    : undefined;
+  if (search) delete search.api_key;
   return {
     default_model: defaultModel,
     default_permission_mode: value?.default_permission_mode === "auto" ? "auto" : "default",
     providers,
     models,
+    ...(search ? { search } : {}),
   };
 }
 

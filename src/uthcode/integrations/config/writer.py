@@ -20,7 +20,7 @@ from .template import USER_CONFIG_TEMPLATE
 
 
 _ROOT_FIELDS = frozenset(
-    {"default_model", "default_permission_mode", "providers", "models"}
+    {"default_model", "default_permission_mode", "providers", "models", "search"}
 )
 _PAYLOAD_FIELDS = _ROOT_FIELDS | {"provider_renames"}
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
@@ -34,6 +34,9 @@ _MODEL_FIELDS = frozenset(
         "reasoning_effort",
         "supports_images",
     }
+)
+_SEARCH_FIELDS = frozenset(
+    {"enabled", "provider", "api_key", "max_results", "max_fetch_bytes", "timeout_seconds"}
 )
 
 
@@ -126,6 +129,15 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
                         path=path,
                         field=f"models.{model_ref}.{key}",
                     )
+    search = mapping.get("search", {})
+    if isinstance(search, Mapping):
+        for key in search:
+            if key not in _SEARCH_FIELDS:
+                raise ConfigurationError(
+                    "unsupported configuration field",
+                    path=path,
+                    field=f"search.{key}",
+                )
 
 
 def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
@@ -173,7 +185,7 @@ def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
     for section_name, allowed in (
         ("providers", _PROVIDER_FIELDS),
         ("models", _MODEL_FIELDS),
-    ):
+        ):
         if section_name not in payload or payload[section_name] is None:
             continue
         section = payload[section_name]
@@ -203,6 +215,17 @@ def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
                         path=path,
                         field=f"{section_name}.{profile_id}.{key}",
                     )
+    if "search" in payload and payload["search"] is not None:
+        search = payload["search"]
+        if not isinstance(search, Mapping):
+            raise ConfigurationError("value must be a table", path=path, field="search")
+        for key in search:
+            if key not in _SEARCH_FIELDS:
+                raise ConfigurationError(
+                    "unsupported configuration field",
+                    path=path,
+                    field=f"search.{key}",
+                )
 
 
 def _replace_or_get_table(document: Any, name: str) -> Any:
@@ -325,6 +348,18 @@ def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
                 del profile[toml_name]
 
 
+def _apply_search(document: Any, requested: Mapping[str, Any]) -> None:
+    section = _replace_or_get_table(document, "search")
+    for key in _SEARCH_FIELDS:
+        if key in requested:
+            _set_or_delete(section, key, requested[key])
+        elif key in section:
+            # A complete search update owns this small table.  Omitted key
+            # values return to their safe defaults instead of retaining a
+            # credential or endpoint accidentally.
+            del section[key]
+
+
 def write_user_config(
     path: str | os.PathLike[str] | Path,
     payload: Mapping[str, Any],
@@ -363,6 +398,8 @@ def write_user_config(
         _apply_providers(document, payload["providers"])
     if "models" in payload and payload["models"] is not None:
         _apply_models(document, payload["models"])
+    if "search" in payload and payload["search"] is not None:
+        _apply_search(document, payload["search"])
 
     candidate = _plain(document)
     if not isinstance(candidate, Mapping):

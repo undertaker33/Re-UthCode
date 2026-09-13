@@ -12,7 +12,7 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 
 - `[FACT]` 当前编排单位是 `UthCodeApplication -> AgentRun -> TurnHandle`，不是 Agent Team。
 - `[FACT]` Application 是全部 Interface 的统一入口；TUI/CLI 不直接导入 Core、Integration 或 Provider SDK。
-- `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context，并为同一 Application/Session 注入共享 `ProcessSessionManager`；正式工具集合包含文档、图片和进程控制能力。
+- `[FACT]` `create_application` 组合配置、Provider、默认 Tool、权限规则加载器和 Runtime Context，并为同一 Application/Session 注入共享 `ProcessSessionManager`；正式工具集合包含文档、图片、进程控制、ApplyPatch、只读 Git、公开 Fetch，并在用户级 Tavily 搜索配置有效时加入 WebSearch。搜索配置与工具定义在 Turn 启动时随 Application 快照固定。
 - `[FACT]` 用户配置使用 `default_model`、Provider `api_key`/可选 `display_name`、Model `remote_id`/`display_name`；Provider 显示名不参与稳定 ID 或 Model 引用。`/model` 对用户配置的原子写回只修改顶层 `default_model`；当前 Session 的模型偏好另行保存，整体切换采用异常回滚，见 [配置说明](../../user-manual/configuration.md)。逻辑 Model Profile ID 只用于界面和状态，GenerationRequest 使用快照的远端 `remote_id`。
 - `[FACT]` Session 在真实请求或显式 Session 命令需要时打开：`exec <prompt>` 与 TUI 首条普通输入调用 `ensure_session()`，`/new` 显式创建，`/resume` 锁定并恢复目标；启动、help/status 和 Picker 不创建空 Session。Application 编排 History 提交并在退出时释放 writer；Session 格式、durability 与恢复边界统一见 [A03 State](../A03-State/State-Context.md#history-持久化与恢复)。
 - `[FACT]` Session 附件经 `AttachmentService` 导入为所属 Session 的固定副本；导入和待发请求都校验 active Session 归属及有限的图片宽、高、像素限制，只有 Transcript append 确认持久化后才标记 submitted。Application replay/Context 只传递可重读的 `asset_ref` 与安全附件元数据，Provider Integration 在请求边界读取副本，未提交草稿可移除，已提交原图不参与临时/派生清理。
@@ -68,7 +68,7 @@ python -m uthcode / uthcode
      -> 用户 config + 项目 config 合并与安全校验
   -> create_application
      -> provider factory
-     -> create_default_tools(workdir, attachment_service, session_provider, process_manager)
+     -> create_default_tools(workdir, attachment_service, session_provider, process_manager, search_configuration)
      -> permission rule loader
      -> ApplicationToolService
      -> UthCodeApplication

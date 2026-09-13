@@ -12,7 +12,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 
 - `[FACT]` `core/agent.py` 实现显式、集中、顺序可读的 ReAct Agent Loop；没有图节点、边、Reducer 或 Runtime DSL。
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
-- `[FACT]` 正式 Application 的 Integration 工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`、`ReadDocument`、`ViewImage`、`Process`；后两类文档/图像工具和进程工具仍通过同一 Tool Registry 进入 Agent Loop。
+- `[FACT]` 正式 Application 的基础 Integration 工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`、`ReadDocument`、`ViewImage`、`Process`、`ApplyPatch`、`GitWorkspace`、`WebFetch`；启用可信用户级搜索配置时再加入 `WebSearch`。这些工具都通过同一 Tool Registry 进入 Agent Loop，`ApplyPatch` 在 PLAN 隐藏，其余只读定义按 planning access 过滤。
 - `[FACT]` `ReadDocument` 对 PDF、DOCX、XLSX、PPTX 返回带页/段落/sheet/range/slide 定位的有界结构；`ViewImage` 通过 Session-owned attachment ref 返回图片或 PDF 页图。公式文本与缓存值分开保留，不执行 XLSX 重算；解析损坏、加密、超限和取消返回受控 Tool error。PDFium 文本解析和 PDF 页渲染在短生命周期私有宿主执行，取消会终止宿主；开发入口直接使用 `uthcode.integrations.pdf_worker`，frozen 入口使用 `--uthcode-pdf-worker`。
 - `[FACT]` `Bash` 是唯一进程启动入口；`yield_time_ms` 只限制当前 ToolCall 等待，显式 `timeout_seconds` 才限制进程总寿命，默认无总寿命。`Process` 按 Session 读取有界输出、写 stdin/EOF、停止和 PTY resize，进程完成后可继续由 Application 事件路由观察。
 - `[FACT]` `AskUserQuestion` 是 Core 特殊工具协议：随 Turn 暴露给 Provider，但不进入普通 `ToolRegistry` 执行路径。
@@ -25,7 +25,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造包含 dynamic default/configured/provider/effective limits 及 provenance、Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的最终请求；每次 Provider call 前都经过 Preflight Hard Gate，Provider Integration 只负责原生协议映射。
 - `[FACT]` Provider 流中的 `ReasoningPart` 与 `TextPart` 始终保持 typed 边界并按到达顺序投影为公开事件；跨 Provider/model identity 时不把 reasoning 降级为 assistant 正文，`STOP` 只有非空正式 `TextPart` 才能完成，`TurnResult.final_text` 只来自正式正文。
 - `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；唯一的 `create_application -> create_run -> start_turn` 链路将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
-- `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；只有文本正文写入 Session opaque ref，图片、文件和来源引用按原次序保留在可见结构化结果中；物化失败继续叠加 execution failure、side effect、resource、process 与退出事实。`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径。
+- `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；只有文本正文写入 Session opaque ref，图片、文件和来源引用按原次序保留在可见结构化结果中；物化失败继续叠加 execution failure、side effect、resource、process 与退出事实。`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径，也不递归物化另一份结果。
 - `[FACT]` Tool batch 和 terminal 边界通过 Application 提交 History；只有已确认持久化的消息才推进 cursor，未知副作用或未知落盘结果不盲目重试。完整规则见 [A03 History 持久化与恢复](../A03-State/State-Context.md#history-持久化与恢复)。
 - `[FACT]` Process output/state 是 Application-owned 的观察事件，不是 ToolResult、RunState、History 或 Provider 请求；ToolCall 已完成后，仍可按 Session/process identity 以单调 sequence 继续路由到 Desktop。Application 对跨 chunk Secret 做有界尾部脱敏，Process ring/游标过期只报告 gap，不伪造新 Turn。
 - `[FACT]` Bash effect 与 scope 分开判定；可静态解析且始终留在 workdir 内的 `cd`/`chdir`/`Set-Location` 只读组合可保持 `inside`，Windows `cd /d <literal>` 参与相同物理范围演算；普通、嵌套 CMD 括号组按 group depth 递归聚合内部连接符两侧的可见 effect，不等同不透明嵌套执行。越界或控制流/目标不确定时保守为 `outside/unknown`。
@@ -44,7 +44,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 | 压缩协议与 Provider 请求 | `src/uthcode/core/compaction.py`, `src/uthcode/application/compaction.py` | `ContextCompactor`、严格摘要解析、有界分批与 tool-free summarizer；`core/context.py` 保留 budget/compiler/gate |
 | Session 结果与 History 边界 | `src/uthcode/application/sessions.py`, `src/uthcode/integrations/session_files.py` | `ApplicationSession`, `SessionWriter`, `ToolResultRead` |
 | Provider 适配 | `src/uthcode/integrations/providers/` | `anthropic.py`, `openai_responses.py`, `openai_compat.py`, `fake.py`, `factory.py` |
-| Tool 适配 | `src/uthcode/integrations/tools/` 与 `src/uthcode/integrations/pdf_worker.py` | `factory.py`, `file_tools.py`, `search_tools.py`, `document_tools.py`, `image_tools.py`, `process_tools.py`, `process_sessions.py`, `document_workers.py`, `workspace.py`；headless PDF worker 入口 |
+| Tool 适配 | `src/uthcode/integrations/tools/` 与 `src/uthcode/integrations/pdf_worker.py` | `factory.py`, `file_tools.py`, `search_tools.py`, `web_tools.py`, `patch_tools.py`, `git_tools.py`, `document_tools.py`, `image_tools.py`, `process_tools.py`, `process_sessions.py`, `document_workers.py`, `tool_result_read.py`, `workspace.py`；headless PDF worker 入口 |
 
 ## 单 Turn 执行算法
 
@@ -111,6 +111,10 @@ tool:
   ReadDocument -> PDF/DOCX/XLSX/PPTX 的有界定位读取
   ViewImage -> 图片读取与 PDF 页图 ImagePart/SourcePart
   Process   -> 当前 Session 的 process list/read/write/stop/resize
+  ApplyPatch -> Codex patch 方言的全计划预检与逐目标原子提交
+  GitWorkspace -> 受控 argv 的只读 status/diff/log/show/branch
+  WebFetch  -> 逐跳重判权限的公开 HTTP(S) 有界抓取
+  WebSearch -> 可选的固定 Tavily basic 搜索与来源用量
   ToolResultRead -> 当前 Session opaque Tool Result ref 的有界页读取
   HistoryRead -> 当前 Session opaque Transcript ref 的有界页读取
 ```

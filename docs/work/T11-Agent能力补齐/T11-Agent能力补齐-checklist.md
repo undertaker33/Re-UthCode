@@ -64,25 +64,25 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T10 搜索、抓取与可信搜索配置
 
-- [ ] A17（R07/R08/R20）：通过 计划新增 `tests/test_web_tools.py`；配置相关测试 验证；通过条件：无配置/认证/限额/429/取消有分类；Key 不进入事件/trace；项目 search 凭据/重定向硬失败；不自动升级收费模式。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A17（R07/R08/R20）：通过 计划新增 `tests/test_web_tools.py`；配置相关测试 验证；通过条件：无配置/认证/限额/429/取消有分类；Key 不进入事件/trace；项目 search 凭据/重定向硬失败；不自动升级收费模式。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T10 的完成边界并记录对应代码/定向证据：正式配置到工具集合按 Turn 快照；来源可继续读取；不发会话全文、不带浏览器 Cookie、不启动浏览器；真实服务调用由 T19 验证。
+- [x] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T10 的完成边界并记录对应代码/定向证据：正式配置到工具集合按 Turn 快照；来源可继续读取；不发会话全文、不带浏览器 Cookie、不启动浏览器；真实服务调用由 T19 验证。
 
 ## T11 ApplyPatch 预检与部分提交
 
-- [ ] A19（R18/R28）：通过 计划新增 `tests/test_patch_tool.py`；现有 file tool 测试 验证；通过条件：增删改/移动；未读、变化、重复 hunk/目标冲突预检零改动；提交失败 changed/failed/not_applied 与磁盘一致。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T11 的完成边界并记录对应代码/定向证据：增删改移动、重复 hunk、未读/变化/目标冲突及提交中失败结果与磁盘一致；未知副作用走 T02 停止链。
+- [x] A19（R18/R28）：通过 计划新增 `tests/test_patch_tool.py`；现有 file tool 测试 验证；通过条件：增删改/移动；未读、变化、重复 hunk/目标冲突预检零改动；提交失败 changed/failed/not_applied 与磁盘一致。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T11 的完成边界并记录对应代码/定向证据：增删改移动、重复 hunk、未读/变化/目标冲突及提交中失败结果与磁盘一致；未知副作用走 T02 停止链。
 
 ## T12 Git 工作区只读查询
 
-- [ ] A20（R19）：通过 计划新增 `tests/test_git_tools.py`，使用临时 Git repo 验证；通过条件：status/diff/log/show/branch、未跟踪、detached/unborn/非 Git、特殊文件名准确；查询无仓库写和外部 diff 程序执行。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T12 的完成边界并记录对应代码/定向证据：查询没有仓库写、联网或外部 diff 程序执行；缺 Git 返回 unavailable，不自动安装。
+- [x] A20（R19）：通过 计划新增 `tests/test_git_tools.py`，使用临时 Git repo 验证；通过条件：status/diff/log/show/branch、未跟踪、detached/unborn/非 Git、特殊文件名准确；查询无仓库写和外部 diff 程序执行。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T12 的完成边界并记录对应代码/定向证据：查询没有仓库写、联网或外部 diff 程序执行；缺 Git 返回 unavailable，不自动安装。
 
 ## T13 Glob/Grep 有界检索与续读
 
-- [ ] A21（R26）：通过 `tests/test_builtin_search_tools.py` 增补 验证；通过条件：忽略/隐藏/二进制/敏感路径/链接权限、分页、正则超时；大结果先限量而非全部加载后截断；续读条件不串查询。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T13 的完成边界并记录对应代码/定向证据：忽略/隐藏/超时/分页/变化与权限回归可观测；不承诺全局检索快照，不引入必须分发的 rg。
+- [x] A21（R26）：通过 `tests/test_builtin_search_tools.py` 增补 验证；通过条件：忽略/隐藏/二进制/敏感路径/链接权限、分页、正则超时；大结果先限量而非全部加载后截断；续读条件不串查询。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T13 的完成边界并记录对应代码/定向证据：忽略/隐藏/超时/分页/变化与权限回归可观测；不承诺全局检索快照，不引入必须分发的 rg。
 
 ## T14 异常纠偏与截停替代固定上限
 

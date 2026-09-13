@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from uthcode.core.tool import Tool, ToolPlanningMetadata
-
 from .file_tools import EditFileTool, ReadFileTool, WriteFileTool
 from .image_tools import ViewImageTool
 from .document_tools import ReadDocumentTool
 from .process_tools import BashTool, ProcessTool
 from .process_sessions import ProcessSessionManager
 from .search_tools import GlobTool, GrepTool
+from .patch_tools import ApplyPatchTool
+from .git_tools import GitWorkspaceTool
 from .workspace import FileReadTracker, WorkspacePathResolver
+from .web_tools import FetchWebTool, TavilySearchTool
 
 
 def create_default_tools(
@@ -24,6 +26,9 @@ def create_default_tools(
     attachment_service: object | None = None,
     session_provider: Callable[[], object | None] | None = None,
     process_manager: ProcessSessionManager | None = None,
+    search_configuration: Mapping[str, object] | object | None = None,
+    web_transport: object | None = None,
+    redirect_authorizer: Callable[[str], object] | None = None,
 ) -> tuple[Tool, ...]:
     """Create one isolated, ordered set of the built-in tools.
 
@@ -39,6 +44,8 @@ def create_default_tools(
     resolver = WorkspacePathResolver(workdir)
     tracker = FileReadTracker()
     manager = process_manager or ProcessSessionManager()
+    web_max_bytes = _search_value(search_configuration, "max_fetch_bytes", 2 * 1024 * 1024)
+    web_timeout = _search_value(search_configuration, "timeout_seconds", 20.0)
 
     def read_asset(session_id: str, ref: str) -> bytes:
         reader = getattr(attachment_service, "read", None)
@@ -106,8 +113,35 @@ def create_default_tools(
                     on_path_access=on_path_access,
                 ),
                 ProcessTool(manager, session_provider=session_provider),
+                ApplyPatchTool(resolver, tracker, on_path_access=on_path_access),
+                GitWorkspaceTool(resolver.root),
+                FetchWebTool(
+                    max_bytes=web_max_bytes,
+                    timeout_seconds=web_timeout,
+                    transport=web_transport,
+                    redirect_authorizer=redirect_authorizer,
+                    asset_writer=write_asset if attachment_service is not None else None,
+                ),
             )
         )
+        if search_configuration is not None:
+            enabled = (
+                search_configuration.get("enabled", False)
+                if isinstance(search_configuration, Mapping)
+                else getattr(search_configuration, "enabled", False)
+            )
+            key = (
+                search_configuration.get("api_key")
+                if isinstance(search_configuration, Mapping)
+                else getattr(search_configuration, "api_key", None)
+            )
+            if enabled and key is not None:
+                base_tools.append(
+                    TavilySearchTool(
+                        search_configuration,
+                        transport=web_transport,
+                    )
+                )
     tools: Sequence[Tool] = tuple(base_tools)
     if not all(isinstance(tool, ToolPlanningMetadata) for tool in tools):
         raise TypeError("all built-in tools must declare planning_access")
@@ -115,3 +149,11 @@ def create_default_tools(
 
 
 __all__ = ["create_default_tools"]
+
+
+def _search_value(configuration: object | None, name: str, default: object) -> object:
+    if isinstance(configuration, Mapping):
+        return configuration.get(name, default)
+    if configuration is None:
+        return default
+    return getattr(configuration, name, default)

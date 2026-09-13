@@ -2525,6 +2525,76 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
 
 
 @pytest.mark.asyncio
+async def test_settings_save_search_round_trips_safe_view_and_blocks_active_turn(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "local"
+''',
+        encoding="utf-8",
+    )
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+    saved = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-search-save",
+            "settings.save",
+            {
+                "search": {
+                    "enabled": True,
+                    "provider": "tavily",
+                    "api_key": "desktop-search-secret",
+                    "max_results": 3,
+                    "max_fetch_bytes": 4096,
+                    "timeout_seconds": 7.0,
+                }
+            },
+        )
+    )
+    assert saved.ok is True
+    assert saved.result is not None
+    encoded = json.dumps(saved.to_dict(), ensure_ascii=False)
+    assert "desktop-search-secret" not in encoded
+    assert saved.result["configuration"]["search"] == {
+        "enabled": True,
+        "provider": "tavily",
+        "api_key_configured": True,
+        "max_results": 3,
+        "max_fetch_bytes": 4096,
+        "timeout_seconds": 7.0,
+    }
+    rendered = user.read_text(encoding="utf-8")
+    assert 'api_key = "desktop-search-secret"' in rendered
+
+    active = await bridge.handle_request(
+        RequestEnvelope("settings-search-get", "settings.get", {})
+    )
+    assert active.ok is True
+    assert "desktop-search-secret" not in json.dumps(active.to_dict(), ensure_ascii=False)
+    bridge._active_handle = object()
+    blocked = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-search-blocked",
+            "settings.save",
+            {"search": {"enabled": False}},
+        )
+    )
+    assert blocked.ok is False
+    assert blocked.error is not None and blocked.error.kind == "turn_active"
+    bridge._active_handle = None
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("expression", "environment_name", "environment_value"),
     [

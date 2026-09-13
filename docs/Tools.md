@@ -1,6 +1,6 @@
 # UthCode 可用 Tool
 
-正式 Application 当前共实现 **14 个 Tool 名称**：9 个 Integration 执行工具、2 个当前 Session 作用域的证据读取工具和 3 个由 Core 处理的控制工具。实际向模型提供哪些 Tool，取决于当前行为模式。
+正式 Application 当前共实现 **17 个基础 Tool 名称**：12 个 Integration 执行工具、2 个当前 Session 作用域的证据读取工具和 3 个由 Core 处理的控制工具。用户级搜索配置有效且启用时，再增加可选的 `WebSearch`，总数为 18 个。实际向模型提供哪些 Tool，取决于当前行为模式。
 
 ## 默认执行工具
 
@@ -15,8 +15,13 @@
 | `ReadDocument` | 有界读取 PDF、DOCX、XLSX、PPTX 的结构化内容 |
 | `ViewImage` | 读取图片或把 PDF 指定页渲染为模型可见的图片资产 |
 | `Process` | 查询或控制当前 Session 所属的 Bash 进程 |
+| `ApplyPatch` | 按 Codex patch 方言预检并原子提交文件增删改和移动 |
+| `GitWorkspace` | 以只读、无外部 diff 的方式查询 Git 工作区 |
+| `WebFetch` | 对公开 HTTP(S) 地址逐跳授权并有界抓取正文或 PDF |
 
-这 9 个 Tool 进入普通 Tool Registry，执行前会完成参数准备、路径或命令分析以及权限判断。`ReadDocument`、`ViewImage` 和 `Process` 的只读定义在 Plan Mode 可见；`Process` 的 `write`、`resize`、`stop` 操作仍分别进入输入、写入或破坏性权限判断。
+这 12 个 Tool 进入普通 Tool Registry，执行前会完成参数准备、路径或命令分析以及权限判断。`ReadDocument`、`ViewImage`、`Process`、`GitWorkspace` 和 `WebFetch` 的只读定义在 Plan Mode 可见；`Process` 的 `write`、`resize`、`stop` 操作仍分别进入输入、写入或破坏性权限判断，`ApplyPatch` 在 Plan Mode 隐藏。
+
+启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 
 ### `ReadDocument`
 
@@ -63,8 +68,10 @@ Plan 草稿通过公开的 `PlanContentDelta` 事件增量投影自然语言文�
 
 | 模式 | 向模型提供的 Tool | 数量 |
 | --- | --- | ---: |
-| 默认执行模式 | 9 个 Integration 执行工具、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`TodoWrite` | 13 |
+| 默认执行模式 | 12 个 Integration 执行工具、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`TodoWrite` | 17 |
+| 默认执行模式（搜索已配置） | 上述工具加 `WebSearch` | 18 |
 | Plan Mode | 9 个只读 Integration 定义、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`ProposePlan` | 13 |
+| Plan Mode（搜索已配置） | 上述工具加只读 `WebSearch` | 14 |
 
 Plan Mode 中的 `Bash` 以及 `Process` 的只读查询可以准备；写入、停止、resize 或其他非 `READ` 操作会在 trusted preflight 后、Permission 前由 Agent Loop 的固定检查受控拒绝。`ReadDocument`/`ViewImage` 仅在当前模型声明支持所需输入且 Session 资源可用时形成有效请求。
 

@@ -5,7 +5,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md
-snapshot_date: 2026-09-12
+snapshot_date: 2026-09-13
 verified_through_commit: 1218e31
 scope: Windows Desktop renderer + Electron bridge + Application session boundary
 source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/ + desktop/tests/ + tests/
@@ -34,7 +34,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[BOUNDARY]` 现有 CDP/packaged acceptance 使用隔离 profile、DOM/keyboard/CDP 合成输入和 CSS viewport 观察；它可以证明 Renderer/Bridge/Application 投影与键盘/ARIA/布局合同，但不等同于 native pointer、Windows 原生缩放或人工视觉验收。未具备这些环境时不能把 synthetic viewport 或普通 mouse 对照写成 native input PASS。
 - `[FACT]` 手动 `/compact` 返回操作身份后由 Session 所属的后台任务执行，Bridge 通过带 `session_id`、`project_key`、`operation_id` 的 `compaction_operation` 通知投影进度和结果。Composer 锁定该 Session 的普通输入并提供显式取消入口，`compaction.cancel` 校验 Session/操作身份；状态区分 completed、no_change、cancelled、failed，另保留有效提交 `changed` 与安全 `reason`，Runtime 面板显示原因和提交说明。无需 Compact 的成功 no-op 不伪造一次成功压缩。
 - `[FACT]` Bridge 请求接收仍串行，仅长时间手动压缩脱离该循环；切换 Session 不取消压缩，已停放的压缩运行时保留至终态。`/compact` 启动请求恢复使用普通 RPC 等待上限，不再靠免除 30 秒超时等待整个压缩。普通 RPC 超时只结束当前等待，迟到的合法响应不会把存活 Runtime 判为协议损坏；已超时请求的 ID 保留至响应到达或进程边界结束。关闭时取消活动操作、等待收尾，再关闭 writer；外层 PythonRuntime 保留有界 child 回收边界，重新启动不会自动重试旧压缩。
-- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、界面主题和语言。API key 仅经受控配置写入/按需显示通道处理；Desktop preference 不保存 key。保存当前可见 Session 有 active Turn 时被禁止。
+- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。保存当前可见 Session 有 active Turn 时被禁止，搜索设置也不能绕过这一边界。
 - `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入，保存仍服从 active Turn 禁止边界。
 - `[FACT]` 普通 Session/Project navigation 与真正 `runtime.shutdown -> runtime.initialize` 生命周期分开显示：前者保留 operation gate 与 generation ownership，但不显示“正在重启”。`CustomSelect` 的 listbox 通过 `document.body` portal 进入 fixed overlay，按 trigger/viewport 几何上下放置，并在滚动、resize、键盘与 Escape 边界更新或关闭，因此不受 modal overflow 裁剪。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
@@ -71,7 +71,7 @@ visible Session A 有 active Turn
 | Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring、选择/粘贴/拖拽附件和仅附件发送；Todo 条置于输入区上方 | Command/Turn/Context/Session Attachment Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
-| Settings | Provider/Model/default/Permission 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference | Configuration Application boundary + Renderer preference |
+| Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference，active Turn 时禁止保存 | Configuration Application boundary + Renderer preference |
 
 ## 修改路由
 

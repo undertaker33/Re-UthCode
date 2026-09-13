@@ -118,6 +118,7 @@ class ToolExecutionResult:
     next_cursor: str | None = None
     progress: tuple[ToolProgress, ...] = ()
     details: Mapping[str, object] = field(default_factory=dict)
+    permission_action: PermissionAction | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, ContentSequence):
@@ -138,6 +139,11 @@ class ToolExecutionResult:
             value = getattr(self, field_name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{field_name} must be a non-empty string or None")
+        if self.permission_action is not None and not isinstance(
+            self.permission_action,
+            PermissionAction,
+        ):
+            raise TypeError("permission_action must be a PermissionAction or None")
         if self.exit_code is not None and (
             isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
         ):
@@ -198,6 +204,7 @@ class ToolExecutionOutcome:
     next_cursor: str | None = None
     progress: tuple[ToolProgress, ...] = ()
     details: Mapping[str, object] = field(default_factory=dict)
+    permission_action: PermissionAction | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
@@ -227,6 +234,11 @@ class ToolExecutionOutcome:
             value = getattr(self, field_name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{field_name} must be a non-empty string or None")
+        if self.permission_action is not None and not isinstance(
+            self.permission_action,
+            PermissionAction,
+        ):
+            raise TypeError("permission_action must be a PermissionAction or None")
         if self.exit_code is not None and (
             isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
         ):
@@ -641,6 +653,7 @@ class ToolExecutor:
             result.next_cursor,
             result.progress,
             result.details,
+            permission_action=result.permission_action,
         )
 
     def _cancelled(self, call: ToolCallPart) -> ToolResultPart:
