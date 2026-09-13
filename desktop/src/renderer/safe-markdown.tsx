@@ -1,9 +1,22 @@
 import { useState, type ElementType, type ReactNode } from "react";
 import { useTranslation } from "./i18n";
+import type { ArtifactDescriptor } from "../desktop-api";
 
 export interface MarkdownRenderOptions {
   /** Narrow Desktop clipboard adapter; never read from window/electron here. */
   onCopyText?: (text: string) => Promise<void>;
+  /** Open a previously validated local artifact through Main. */
+  onOpenArtifact?: (path: string) => Promise<void>;
+  /** Resolve a model-provided artifact reference into the formal DTO. */
+  onDescribeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  /** Ask Main to show its picker and authorize one external artifact file. */
+  onAuthorizeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  authorizeArtifactLabel?: string;
+  /** Reveal a previously validated local artifact in the system shell. */
+  onRevealArtifact?: (path: string) => Promise<void>;
+  /** Request a controlled image preview for a formal artifact DTO. */
+  onPreviewArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  artifacts?: Readonly<Record<string, ArtifactDescriptor>>;
 }
 
 export function safeHref(value: string): string | null {
@@ -16,7 +29,26 @@ export function safeHref(value: string): string | null {
   return null;
 }
 
-export function renderInline(source: string): ReactNode[] {
+export function ArtifactCard({ artifact, onOpen, onReveal, onPreview }: { artifact: ArtifactDescriptor; onOpen?: () => Promise<void>; onReveal?: () => Promise<void>; onPreview?: () => Promise<void> }) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const run = async (action?: () => Promise<void>) => {
+    if (!action || busy) return;
+    setBusy(true);
+    try { await action(); } finally { setBusy(false); }
+  };
+  return <span className="artifact-card" data-artifact-kind={artifact.kind} data-artifact-path={artifact.path} role="group">
+    {artifact.data_url && artifact.kind === "image" ? <img src={artifact.data_url} alt={artifact.name} loading="lazy" /> : null}
+    <span className="artifact-card__meta"><strong>{artifact.name}</strong><small>{artifact.mime_type} · {artifact.size_bytes.toLocaleString()} B</small></span>
+    <span className="artifact-card__actions">
+      {artifact.preview_supported && onPreview && <button type="button" onClick={() => void run(onPreview)} disabled={busy}>{t("artifactPreview")}</button>}
+      {onOpen && artifact.kind !== "executable" && <button type="button" onClick={() => void run(onOpen)} disabled={busy}>{t("artifactOpen")}</button>}
+      {onReveal && <button type="button" onClick={() => void run(onReveal)} disabled={busy}>{t("artifactReveal")}</button>}
+    </span>
+  </span>;
+}
+
+export function renderInline(source: string, options: MarkdownRenderOptions = {}): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\[[^\]]+\]\(([^)\s]+)\)|`[^`]*`|\*\*[^*]+\*\*|\*[^*]+\*)/gu;
   let last = 0;
@@ -27,8 +59,29 @@ export function renderInline(source: string): ReactNode[] {
     if (start > last) nodes.push(source.slice(last, start));
     if (token.startsWith("[") && match[2]) {
       const label = token.slice(1, token.indexOf("]("));
-      const href = safeHref(match[2]);
-      nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{label}</a> : <span key={`link-${index}`}>{label}</span>);
+      const target = match[2];
+      if (target.startsWith("artifact:") && (options.onDescribeArtifact || options.onOpenArtifact)) {
+        const path = target.slice("artifact:".length);
+        const artifact = options.artifacts?.[path];
+        if (artifact) {
+          nodes.push(<ArtifactCard
+            key={`artifact-card-${index}`}
+            artifact={artifact}
+            onOpen={options.onOpenArtifact ? async () => { await options.onOpenArtifact?.(path); } : undefined}
+            onReveal={options.onRevealArtifact ? async () => { await options.onRevealArtifact?.(path); } : undefined}
+            onPreview={options.onPreviewArtifact ? async () => { await options.onPreviewArtifact?.(path); } : undefined}
+          />);
+        } else {
+          const describe = options.onDescribeArtifact ?? options.onOpenArtifact;
+          nodes.push(<span key={`artifact-${index}`} className="artifact-link-group">
+            <button type="button" className="artifact-link" onClick={() => void describe?.(path)}>{label}</button>
+            {options.onAuthorizeArtifact && <button type="button" className="artifact-authorize" onClick={() => void options.onAuthorizeArtifact?.(path)}>{options.authorizeArtifactLabel ?? "Authorize external file"}</button>}
+          </span>);
+        }
+      } else {
+        const href = safeHref(target);
+        nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{label}</a> : <span key={`link-${index}`}>{label}</span>);
+      }
     } else if (token.startsWith("`") && token.endsWith("`")) {
       nodes.push(<code key={`code-${index}`}>{token.slice(1, -1)}</code>);
     } else if (token.startsWith("**")) {
@@ -147,7 +200,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
     if (heading) {
       const level = heading[1].length;
       const Heading = `h${level}` as ElementType;
-      blocks.push(<Heading key={`heading-${blockIndex}`}>{renderInline(heading[2])}</Heading>);
+      blocks.push(<Heading key={`heading-${blockIndex}`}>{renderInline(heading[2], options)}</Heading>);
       index += 1;
       blockIndex += 1;
       continue;
@@ -160,7 +213,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         rows.push(tableCells(lines[index] ?? ""));
         index += 1;
       }
-      blocks.push(<table key={`table-${blockIndex}`}><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "")}</td>)}</tr>)}</tbody></table>);
+      blocks.push(<table key={`table-${blockIndex}`}><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell, options)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "", options)}</td>)}</tr>)}</tbody></table>);
       blockIndex += 1;
       continue;
     }
@@ -187,7 +240,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         index += 1;
       }
       const List = orderedList ? "ol" : "ul";
-      blocks.push(<List key={`list-${blockIndex}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInline(item)}</li>)}</List>);
+      blocks.push(<List key={`list-${blockIndex}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInline(item, options)}</li>)}</List>);
       blockIndex += 1;
       continue;
     }
@@ -199,7 +252,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
       paragraph.push(next);
       index += 1;
     }
-    blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
+    blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part, options)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
     blockIndex += 1;
   }
   return blocks;

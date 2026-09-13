@@ -107,6 +107,7 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                     "uthcode.integrations.config.data",
                     "uthcode.integrations.config.loader",
                     "uthcode.integrations.instruction_files",
+                    "uthcode.integrations.attachment_files",
                     "uthcode.integrations.session_files",
                     "uthcode.integrations.permissions",
                         "uthcode.integrations.providers.factory",
@@ -114,6 +115,8 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                         "uthcode.integrations.tools.process_sessions",
                     }
                 )
+        if source_path.name == "generation.py":
+            allowed_integration_imports.add("uthcode.integrations.attachment_files")
         if source_path.name == "sessions.py":
             allowed_integration_imports.update(
                 {

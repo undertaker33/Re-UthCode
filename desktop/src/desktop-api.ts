@@ -82,6 +82,18 @@ export interface DesktopAttachmentDraft {
   data_url?: string;
 }
 
+/** Application validated artifact metadata; the Renderer never receives fs or shell handles. */
+export interface ArtifactDescriptor {
+  path: string;
+  name: string;
+  kind: "file" | "image" | "office" | "executable" | "unsupported" | string;
+  mime_type: string;
+  size_bytes: number;
+  default_action: "open" | "reveal" | string;
+  preview_supported: boolean;
+  data_url?: string;
+}
+
 export const PREFERENCE_KEYS = [
   "theme",
   "language",
@@ -109,6 +121,10 @@ export const RUNTIME_METHODS = [
   "attachment.import",
   "attachment.preview",
   "attachment.remove",
+  "artifact.describe",
+  "artifact.preview",
+  "artifact.open",
+  "artifact.reveal",
   "process.list",
   "process.read",
   "process.write",
@@ -155,6 +171,8 @@ export interface DesktopApi {
   /** Explicit Main-owned file/clipboard import. */
   chooseAttachment(): Promise<DesktopAttachmentInput | null>;
   pasteAttachment(): Promise<DesktopAttachmentInput | null>;
+  /** Ask Main to let the user explicitly authorize one external artifact file. */
+  authorizeExternalArtifact?(): Promise<string | null>;
 }
 
 export function isPreferenceKey(value: unknown): value is PreferenceKey {

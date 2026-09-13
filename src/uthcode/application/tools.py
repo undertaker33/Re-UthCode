@@ -83,6 +83,25 @@ _SENSITIVE_OPTION_VALUE = re.compile(
     rf"{_SENSITIVE_NAME}[ \t]+)"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
 )
+
+
+def tool_result_policy_for_output_limit(output_bytes: int) -> ToolResultPolicy:
+    """Tighten the existing Tool Result policy to one configured byte cap."""
+
+    if isinstance(output_bytes, bool) or not isinstance(output_bytes, int) or output_bytes < 1024:
+        raise ValueError("output_bytes must be an integer of at least 1024")
+    defaults = ToolResultPolicy()
+    return ToolResultPolicy(
+        inline_threshold_bytes=min(defaults.inline_threshold_bytes, output_bytes),
+        preview_limit_bytes=min(defaults.preview_limit_bytes, output_bytes),
+        single_result_hard_cap_bytes=output_bytes,
+        session_quota_bytes=max(
+            output_bytes,
+            min(defaults.session_quota_bytes, output_bytes * 8),
+        ),
+        read_page_limit_bytes=min(defaults.read_page_limit_bytes, output_bytes),
+        read_output_limit_bytes=min(defaults.read_output_limit_bytes, output_bytes),
+    )
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)(?P<prefix>\bAuthorization\s*[:=]\s*)"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s,;\"']+"
@@ -1123,4 +1142,4 @@ def _truncate_summary(value: str, *, limit: int = _MAX_SUMMARY_CHARS) -> str:
     return value[: limit - 1] + "…"
 
 
-__all__ = ["ApplicationToolService"]
+__all__ = ["ApplicationToolService", "tool_result_policy_for_output_limit"]

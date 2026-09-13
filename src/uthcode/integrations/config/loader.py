@@ -49,7 +49,7 @@ class ConfigurationInitializationRequired(ConfigurationError):
         )
 
 
-_ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode", "search"})
+_ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode", "search", "tool_limits"})
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
 _MODEL_FIELDS = frozenset(
     {
@@ -68,6 +68,7 @@ _SEARCH_FIELDS = frozenset(
 _PROJECT_SEARCH_FIELDS = frozenset(
     {"enabled", "provider", "max_results", "max_fetch_bytes", "timeout_seconds"}
 )
+_TOOL_LIMITS_FIELDS = frozenset({"timeout_seconds", "output_bytes", "attachment_bytes"})
 _SUPPORTED_PROVIDER_KINDS = frozenset(
     {"fake", "anthropic", "openai_responses", "openai_compat"}
 )
@@ -358,12 +359,14 @@ def _validate_user_mapping(mapping: Mapping[str, Any], *, path: Path) -> None:
     _validate_provider_tables(mapping, path=path)
     _validate_model_tables(mapping, path=path, project=False)
     _validate_search_table(mapping, path=path, project=False)
+    _validate_tool_limits_table(mapping, path=path, project=False)
 
 
 def _validate_project_mapping(mapping: Mapping[str, Any], *, path: Path) -> None:
     _validate_root(mapping, path=path, project=True)
     _validate_model_tables(mapping, path=path, project=True)
     _validate_search_table(mapping, path=path, project=True)
+    _validate_tool_limits_table(mapping, path=path, project=True)
 
 
 def _validate_search_table(
@@ -418,6 +421,58 @@ def _validate_search_table(
         _validate_api_key_expression(search.get("api_key"), path=path, field="search.api_key")
 
 
+def _validate_tool_limits_table(
+    mapping: Mapping[str, Any],
+    *,
+    path: Path,
+    project: bool,
+) -> None:
+    raw_limits = _require_table(mapping.get("tool_limits", {}), path=path, field="tool_limits")
+    _check_fields(
+        raw_limits,
+        allowed=_TOOL_LIMITS_FIELDS,
+        path=path,
+        prefix="tool_limits",
+        project=project,
+    )
+    timeout = raw_limits.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout <= 0
+        or timeout > 600
+    ):
+        raise ConfigurationError(
+            "tool_limits.timeout_seconds must be between 0 and 600",
+            path=path,
+            field="tool_limits.timeout_seconds",
+        )
+    for name, maximum in (
+        ("output_bytes", 16 * 1024 * 1024),
+        ("attachment_bytes", 64 * 1024 * 1024),
+    ):
+        value = raw_limits.get(name)
+        minimum = 1024 if name == "output_bytes" else 1
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < minimum
+        ):
+            raise ConfigurationError(
+                (
+                    f"tool_limits.{name} must be an integer of at least 1024"
+                    if name == "output_bytes"
+                    else f"tool_limits.{name} must be a positive integer"
+                ),
+                path=path,
+                field=f"tool_limits.{name}",
+            )
+        if value is not None and value > maximum:
+            raise ConfigurationError(
+                f"tool_limits.{name} exceeds the safety limit",
+                path=path,
+                field=f"tool_limits.{name}",
+            )
+
+
 def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     """Project a parsed user config to current fields without credentials."""
 
@@ -435,6 +490,14 @@ def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
         if "api_key" in raw_search:
             safe_search["api_key_configured"] = bool(raw_search.get("api_key"))
         result["search"] = safe_search
+
+    raw_tool_limits = mapping.get("tool_limits", {})
+    if isinstance(raw_tool_limits, Mapping):
+        result["tool_limits"] = {
+            key: raw_tool_limits[key]
+            for key in ("timeout_seconds", "output_bytes", "attachment_bytes")
+            if key in raw_tool_limits
+        }
 
     raw_providers = mapping.get("providers", {})
     safe_providers: dict[str, dict[str, Any]] = {}
@@ -594,6 +657,18 @@ def validate_user_config_mapping(
     )
     models = _model_tables(mapping, path=target)
     search = _search_table(mapping, path=target, resolve_secrets=resolve_secrets)
+    tool_limits = _tool_limits_table(mapping, path=target)
+    user_source = LoadedConfigSource("user", target)
+    field_sources: dict[str, LoadedConfigSource] = {
+        "default_model": user_source,
+        "default_permission_mode": user_source,
+    }
+    field_sources.update({f"search.{name}": user_source for name in search})
+    field_sources.update({f"tool_limits.{name}": user_source for name in tool_limits})
+    for model_ref, profile in models.items():
+        field_sources.update(
+            {f"model.{model_ref}.{name}": user_source for name in profile}
+        )
     selected_ref = mapping.get("default_model")
     if not providers and not models and _blank(selected_ref):
         raise ConfigurationInitializationRequired(target)
@@ -639,6 +714,8 @@ def validate_user_config_mapping(
         sources=(LoadedConfigSource("user", target),),
         default_permission_mode=default_permission_mode,
         search=search,
+        tool_limits=tool_limits,
+        field_sources=field_sources,
     )
 
 
@@ -788,6 +865,15 @@ def _search_table(
         _validate_api_key_expression(api_key_value, path=path, field="search.api_key")
         result["api_key_configured"] = True
     return result
+
+
+def _tool_limits_table(mapping: Mapping[str, Any], *, path: Path) -> dict[str, object]:
+    raw_limits = _require_table(mapping.get("tool_limits", {}), path=path, field="tool_limits")
+    return {
+        "timeout_seconds": raw_limits.get("timeout_seconds"),
+        "output_bytes": raw_limits.get("output_bytes", 2 * 1024 * 1024),
+        "attachment_bytes": raw_limits.get("attachment_bytes", 16 * 1024 * 1024),
+    }
 
 
 def _model_tables(mapping: Mapping[str, Any], *, path: Path) -> dict[str, dict[str, Any]]:
@@ -985,6 +1071,45 @@ def _merge_search(
     target["provider"] = "tavily"
 
 
+def _merge_tool_limits(
+    target: dict[str, object],
+    overlay: Mapping[str, Any],
+    *,
+    path: Path,
+    user_limits: Mapping[str, object],
+) -> None:
+    raw_limits = _require_table(overlay.get("tool_limits", {}), path=path, field="tool_limits")
+    if not raw_limits:
+        return
+    for name in ("output_bytes", "attachment_bytes"):
+        if name not in raw_limits:
+            continue
+        project_value = raw_limits[name]
+        user_value = user_limits.get(name)
+        if user_value is not None and project_value > user_value:
+            raise ConfigurationError(
+                f"project tool_limits.{name} cannot expand the user limit",
+                path=path,
+                field=f"tool_limits.{name}",
+            )
+        target[name] = project_value
+    if "timeout_seconds" in raw_limits:
+        project_timeout = raw_limits["timeout_seconds"]
+        user_timeout = user_limits.get("timeout_seconds")
+        if (
+            user_timeout is not None
+            and project_timeout is not None
+            and project_timeout > user_timeout
+        ):
+            raise ConfigurationError(
+                "project tool_limits.timeout_seconds cannot expand the user limit",
+                path=path,
+                field="tool_limits.timeout_seconds",
+            )
+        if project_timeout is not None:
+            target["timeout_seconds"] = project_timeout
+
+
 def load_config_data(
     *,
     cwd: str | os.PathLike[str] | Path | None = None,
@@ -1026,25 +1151,59 @@ def load_config_data(
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
     search = _search_table(user_mapping, path=user_path)
+    tool_limits = _tool_limits_table(user_mapping, path=user_path)
     user_models = {key: dict(value) for key, value in models.items()}
     user_search = dict(search)
+    user_tool_limits = dict(tool_limits)
     selected_ref = user_mapping.get("default_model")
     if not providers and not models and _blank(selected_ref):
         raise ConfigurationInitializationRequired(user_path)
     sources = [LoadedConfigSource("user", user_path)]
+    user_source = sources[0]
+    field_sources: dict[str, LoadedConfigSource] = {
+        "default_model": user_source,
+        "default_permission_mode": user_source,
+    }
+    field_sources.update({f"search.{name}": user_source for name in search})
+    field_sources.update({f"tool_limits.{name}": user_source for name in tool_limits})
+    for model_ref, profile in models.items():
+        field_sources.update(
+            {f"model.{model_ref}.{name}": user_source for name in profile}
+        )
 
     for kind, path in paths[1:]:
         project_mapping = _read_mapping(path)
         _validate_project_mapping(project_mapping, path=path)
+        source = LoadedConfigSource(kind, path)
+        raw_search = _require_table(project_mapping.get("search", {}), path=path, field="search")
+        raw_limits = _require_table(project_mapping.get("tool_limits", {}), path=path, field="tool_limits")
+        raw_models = _require_table(project_mapping.get("models", {}), path=path, field="models")
         _merge_models(models, project_mapping, path=path, user_models=user_models)
         _merge_search(search, project_mapping, path=path, user_search=user_search)
+        _merge_tool_limits(
+            tool_limits,
+            project_mapping,
+            path=path,
+            user_limits=user_tool_limits,
+        )
+        for name in raw_search:
+            field_sources[f"search.{name}"] = source
+        for name in raw_limits:
+            field_sources[f"tool_limits.{name}"] = source
+        for model_ref, profile in raw_models.items():
+            if isinstance(profile, Mapping):
+                for name in profile:
+                    field_sources[f"model.{model_ref}.{name}"] = source
         if "default_model" in project_mapping:
             selected_ref = project_mapping["default_model"]
-        sources.append(LoadedConfigSource(kind, path))
+            field_sources["default_model"] = source
+        sources.append(source)
 
     if model is not None:
         selected_ref = model
-        sources.append(LoadedConfigSource("cli"))
+        cli_source = LoadedConfigSource("cli")
+        sources.append(cli_source)
+        field_sources["default_model"] = cli_source
     if not isinstance(selected_ref, str) or not selected_ref.strip():
         raise ConfigurationError(
             "configuration requires a default_model",
@@ -1067,6 +1226,8 @@ def load_config_data(
         sources=tuple(sources),
         default_permission_mode=default_permission_mode,
         search=search,
+        tool_limits=tool_limits,
+        field_sources=field_sources,
     )
 
 

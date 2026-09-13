@@ -6,8 +6,6 @@ import pytest
 
 from uthcode.core.agent import (
     AgentLoop,
-    AgentLoopConfig,
-    AgentLoopConfigError,
     AgentTurnExecution,
     RunSnapshot,
     RunState,
@@ -16,30 +14,6 @@ from uthcode.core.agent import (
     TurnResult,
 )
 from uthcode.core.provider import Message, TextPart, Usage
-
-
-def test_agent_loop_config_has_the_confirmed_limits() -> None:
-    assert AgentLoopConfig() == AgentLoopConfig(50, 16, 3)
-
-
-@pytest.mark.parametrize(
-    "field_name",
-    ["max_iterations", "max_tool_calls_per_iteration", "max_consecutive_unknown_tools"],
-)
-@pytest.mark.parametrize("value", [0, -1])
-def test_agent_loop_config_rejects_non_positive_values(field_name: str, value: int) -> None:
-    with pytest.raises(AgentLoopConfigError):
-        AgentLoopConfig(**{field_name: value})
-
-
-@pytest.mark.parametrize(
-    "field_name",
-    ["max_iterations", "max_tool_calls_per_iteration", "max_consecutive_unknown_tools"],
-)
-@pytest.mark.parametrize("value", [True, False, 1.5, "3", None])
-def test_agent_loop_config_rejects_bool_and_invalid_types(field_name: str, value: object) -> None:
-    with pytest.raises((TypeError, ValueError)):
-        AgentLoopConfig(**{field_name: value})  # type: ignore[arg-type]
 
 
 def test_run_state_is_deeply_immutable_and_new_turn_resets_turn_values() -> None:
@@ -53,7 +27,7 @@ def test_run_state_is_deeply_immutable_and_new_turn_resets_turn_values() -> None
         consecutive_unknown_tools=2,
         usage=Usage(input_tokens=8, output_tokens=5),
         status=RunStatus.FAILED,
-        termination_reason=TerminationReason.MAX_ITERATIONS,
+        termination_reason=TerminationReason.RUNAWAY_DETECTED,
     )
 
     next_state = state.new_turn("turn-2", "continue")

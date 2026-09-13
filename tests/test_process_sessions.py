@@ -4,13 +4,14 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from uthcode.core.provider import CancellationToken
 from uthcode.integrations.tools.process_sessions import ProcessSessionError, ProcessSessionManager
-from uthcode.integrations.tools.process_tools import BashTool
+from uthcode.integrations.tools.process_tools import BashTool, ProcessTool
 
 
 def _python(command: str) -> str:
@@ -118,3 +119,107 @@ async def test_turn_cleanup_stops_only_the_cancelled_turn_and_session_shutdown_c
 
     await manager.shutdown_session("s1")
     assert manager.list("s1") == ()
+
+
+@pytest.mark.asyncio
+async def test_process_read_waits_for_bounded_time_when_running_process_is_idle(tmp_path: Path) -> None:
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("import time; time.sleep(1.0)"),
+        cwd=tmp_path,
+    )
+    tool = ProcessTool(
+        manager,
+        session_provider=lambda: type("S", (), {"session_id": "s1"})(),
+    )
+
+    started = time.monotonic()
+    result = await tool.execute(
+        {"action": "read", "process_id": process.process_id, "cursor": 0, "wait_ms": 160},
+        cancellation=CancellationToken(),
+    )
+    elapsed = time.monotonic() - started
+
+    assert not result.is_error
+    assert elapsed >= 0.12
+    assert elapsed < 0.8
+    assert result.process_state == "running"
+    assert "no new output" in str(result.content)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_process_read_wait_is_cancelled_without_waiting_for_deadline(tmp_path: Path) -> None:
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("import time; time.sleep(5.0)"),
+        cwd=tmp_path,
+    )
+    tool = ProcessTool(
+        manager,
+        session_provider=lambda: type("S", (), {"session_id": "s1"})(),
+    )
+    cancellation = CancellationToken()
+    task = asyncio.create_task(
+        tool.execute(
+            {"action": "read", "process_id": process.process_id, "wait_ms": 3000},
+            cancellation=cancellation,
+        )
+    )
+    await asyncio.sleep(0.05)
+    started = time.monotonic()
+    cancellation.cancel()
+    result = await task
+    elapsed = time.monotonic() - started
+
+    assert result.is_error
+    assert "cancelled" in str(result.content).lower()
+    assert elapsed < 0.5
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_process_read_rejects_zero_wait_instead_of_bypassing_the_bound(tmp_path: Path) -> None:
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("import time; time.sleep(1.0)"),
+        cwd=tmp_path,
+    )
+    tool = ProcessTool(
+        manager,
+        session_provider=lambda: type("S", (), {"session_id": "s1"})(),
+    )
+    result = await tool.execute(
+        {"action": "read", "process_id": process.process_id, "wait_ms": 0},
+        cancellation=CancellationToken(),
+    )
+    assert result.is_error
+    assert "between 50 and 60000" in str(result.content)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_process_read_returns_on_terminal_state_before_wait_deadline(tmp_path: Path) -> None:
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("import time; time.sleep(.12)"),
+        cwd=tmp_path,
+    )
+    tool = ProcessTool(
+        manager,
+        session_provider=lambda: type("S", (), {"session_id": "s1"})(),
+    )
+    started = time.monotonic()
+    result = await tool.execute(
+        {"action": "read", "process_id": process.process_id, "wait_ms": 1000},
+        cancellation=CancellationToken(),
+    )
+    elapsed = time.monotonic() - started
+    assert not result.is_error
+    assert result.process_state == "exited"
+    assert elapsed < 0.8
+    await manager.shutdown()

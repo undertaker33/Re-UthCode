@@ -184,6 +184,61 @@ timeout_seconds = 5.0
     )
 
 
+def test_tool_limits_merge_and_project_can_only_tighten_user_values(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "base/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."base/ref"]
+provider = "local"
+remote_id = "base"
+
+[tool_limits]
+timeout_seconds = 30.0
+output_bytes = 8192
+attachment_bytes = 32768
+''',
+        encoding="utf-8",
+    )
+    root = tmp_path / "repo"
+    cwd = root / "child"
+    cwd.mkdir(parents=True)
+    (root / ".git").mkdir()
+    project = root / ".uthcode" / "config.toml"
+    project.parent.mkdir()
+    project.write_text(
+        '''[tool_limits]
+timeout_seconds = 5.0
+output_bytes = 4096
+attachment_bytes = 16384
+''',
+        encoding="utf-8",
+    )
+
+    data = load_config_data(cwd=cwd, home=home)
+    assert data.tool_limits == {
+        "timeout_seconds": 5.0,
+        "output_bytes": 4096,
+        "attachment_bytes": 16384,
+    }
+    assert data.field_sources["tool_limits.output_bytes"].kind == "project"
+    assert data.field_sources["tool_limits.attachment_bytes"].kind == "project"
+
+    for field, value in (
+        ("timeout_seconds", 31.0),
+        ("output_bytes", 16384),
+        ("attachment_bytes", 65536),
+    ):
+        project.write_text(f"[tool_limits]\n{field} = {value}\n", encoding="utf-8")
+        with pytest.raises(ConfigurationError, match="cannot expand"):
+            load_config_data(cwd=cwd, home=home)
+
+
 @pytest.mark.parametrize(
     "project_search",
     [

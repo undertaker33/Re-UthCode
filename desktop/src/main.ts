@@ -47,6 +47,7 @@ export const IPC_CHANNELS = Object.freeze({
   copyText: "desktop.clipboard.copy-text",
   pickAttachment: "desktop.attachment.pick",
   clipboardAttachment: "desktop.attachment.clipboard",
+  authorizeExternalArtifact: "desktop.artifact.authorize-external",
   closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
   runtimeEvent: "desktop.runtime.event",
@@ -173,7 +174,9 @@ interface MainIpcOptions {
   isPackaged: boolean;
   showOpenDialog?: typeof dialog.showOpenDialog;
   openPath?: typeof shell.openPath;
+  showItemInFolder?: typeof shell.showItemInFolder;
   registeredProjects?: Set<string>;
+  authorizedExternalArtifacts?: Set<string>;
   closeShell?: () => void;
   ipc?: Pick<typeof ipcMain, "handle" | "removeHandler">;
   setNativeTheme?: (theme: DesktopPreferences["theme"]) => void;
@@ -187,7 +190,9 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     assertTrustedRenderer(event, options.window, options.rendererEntry, options.isPackaged);
   const showOpenDialog = options.showOpenDialog ?? dialog.showOpenDialog;
   const openPath = options.openPath ?? shell.openPath;
+  const showItemInFolder = options.showItemInFolder ?? shell?.showItemInFolder ?? (() => undefined);
   const ipc = options.ipc ?? ipcMain;
+  const authorizedExternalArtifacts = options.authorizedExternalArtifacts ?? new Set<string>();
   const closeShell = options.closeShell ?? beginApplicationShutdown;
   const setNativeTheme = options.setNativeTheme ?? ((theme: DesktopPreferences["theme"]) => { nativeTheme.themeSource = theme; });
   const writeClipboard = options.writeClipboard ?? ((value: string) => clipboard.writeText(value));
@@ -285,9 +290,65 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     }
   };
 
+  const onAuthorizeExternalArtifact = async (event: IpcMainInvokeEvent): Promise<string | null> => {
+    assertSender(event);
+    const result = await showOpenDialog(options.window, {
+      properties: ["openFile"],
+      title: "Authorize one external artifact",
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    const selected = result.filePaths[0];
+    if (typeof selected !== "string" || !isAbsolute(selected)) {
+      throw new MainBoundaryError("artifact_invalid", "Authorized artifact path is invalid");
+    }
+    const target = resolve(selected);
+    try {
+      const details = await stat(target);
+      if (!details.isFile()) throw new Error("not a file");
+    } catch {
+      throw new MainBoundaryError("artifact_not_found", "Authorized artifact file is unavailable");
+    }
+    // The picker is the only source of this one-process grant. The Renderer
+    // cannot provide a path or turn an artifact URI into authorization.
+    authorizedExternalArtifacts.add(target);
+    return target;
+  };
+
   const onCloseShell = async (event: IpcMainInvokeEvent): Promise<void> => {
     assertSender(event);
     closeShell();
+  };
+
+  const handleArtifactResult = async (result: unknown, method: string): Promise<unknown> => {
+    if (!isJsonObject(result) || !isJsonObject(result.artifact) || typeof result.artifact.path !== "string") {
+      throw new MainBoundaryError("artifact_unavailable", "Artifact descriptor is invalid");
+    }
+    const target = resolve(result.artifact.path);
+    try {
+      const details = await stat(target);
+      if (!details.isFile()) throw new Error("not a file");
+    } catch {
+      throw new MainBoundaryError("artifact_not_found", "Artifact file is unavailable");
+    }
+    const registered = Array.from(registeredProjects).some((root) => target === root || target.startsWith(`${root}${process.platform === "win32" ? "\\" : "/"}`));
+    if (!registered && !authorizedExternalArtifacts.has(target)) {
+      throw new MainBoundaryError("artifact_not_authorized", "Artifact is not authorized by Desktop");
+    }
+    if (method === "artifact.describe" || method === "artifact.preview") return result;
+    const kind = result.artifact.kind;
+    const action = method === "artifact.reveal"
+      || kind === "executable"
+      || kind === "unsupported"
+      || result.artifact.default_action === "reveal"
+      ? "reveal"
+      : "open";
+    if (action === "reveal") {
+      showItemInFolder(target);
+      return result;
+    }
+    const failure = await openPath(target);
+    if (failure) throw new MainBoundaryError("artifact_open_failed", "Artifact could not be opened");
+    return result;
   };
 
   const onRuntimeRequest = async (
@@ -327,6 +388,22 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       // Opening is a consumer of Main authority.  It never creates trust;
       // new projects must first pass through the Main folder picker.
       requestParams = { ...payload.params, path: projectPath };
+    } else if (payload.method.startsWith("artifact.")) {
+      const rawPath = payload.params.path;
+      if (typeof rawPath !== "string" || !rawPath.trim() || /[\u0000\r\n;|&<>]/u.test(rawPath) || /^(?:[a-z][a-z0-9+.-]*):\/\//iu.test(rawPath)) {
+        throw new MainBoundaryError("artifact_invalid", "Artifact path is invalid");
+      }
+      const candidate = isAbsolute(rawPath) ? resolve(rawPath) : rawPath;
+      const insideRegisteredProject = isAbsolute(candidate) && Array.from(registeredProjects).some((root) => candidate === root || candidate.startsWith(`${root}${process.platform === "win32" ? "\\" : "/"}`));
+      const externalAuthorized = isAbsolute(candidate) && authorizedExternalArtifacts.has(candidate);
+      if (!insideRegisteredProject && !externalAuthorized && isAbsolute(candidate)) {
+        throw new MainBoundaryError("artifact_not_authorized", "Artifact is not authorized by Desktop");
+      }
+      requestParams = {
+        ...payload.params,
+        ...(isAbsolute(candidate) ? { path: candidate } : {}),
+        authorized_external: externalAuthorized,
+      };
     }
     try {
       await options.runtime.start();
@@ -343,7 +420,11 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
         }
         return result;
       }
-      return await request;
+      const result = await request;
+      if (payload.method.startsWith("artifact.")) {
+        return await handleArtifactResult(result, payload.method);
+      }
+      return result;
     } catch (error) {
       if (error instanceof RuntimeBoundaryError || error instanceof RuntimeRequestError) throw error;
       throw new MainBoundaryError("runtime_error", "Desktop Runtime request failed");
@@ -378,6 +459,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   ipc.handle(IPC_CHANNELS.copyText, onCopyText);
   ipc.handle(IPC_CHANNELS.pickAttachment, onPickAttachment);
   ipc.handle(IPC_CHANNELS.clipboardAttachment, onClipboardAttachment);
+  ipc.handle(IPC_CHANNELS.authorizeExternalArtifact, onAuthorizeExternalArtifact);
   ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);

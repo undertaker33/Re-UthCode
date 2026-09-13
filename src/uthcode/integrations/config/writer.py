@@ -20,7 +20,14 @@ from .template import USER_CONFIG_TEMPLATE
 
 
 _ROOT_FIELDS = frozenset(
-    {"default_model", "default_permission_mode", "providers", "models", "search"}
+    {
+        "default_model",
+        "default_permission_mode",
+        "providers",
+        "models",
+        "search",
+        "tool_limits",
+    }
 )
 _PAYLOAD_FIELDS = _ROOT_FIELDS | {"provider_renames"}
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
@@ -38,6 +45,7 @@ _MODEL_FIELDS = frozenset(
 _SEARCH_FIELDS = frozenset(
     {"enabled", "provider", "api_key", "max_results", "max_fetch_bytes", "timeout_seconds"}
 )
+_TOOL_LIMITS_FIELDS = frozenset({"timeout_seconds", "output_bytes", "attachment_bytes"})
 
 
 def _chmod_private(path: Path) -> None:
@@ -138,6 +146,15 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
                     path=path,
                     field=f"search.{key}",
                 )
+    tool_limits = mapping.get("tool_limits", {})
+    if isinstance(tool_limits, Mapping):
+        for key in tool_limits:
+            if key not in _TOOL_LIMITS_FIELDS:
+                raise ConfigurationError(
+                    "unsupported configuration field",
+                    path=path,
+                    field=f"tool_limits.{key}",
+                )
 
 
 def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
@@ -225,6 +242,17 @@ def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
                     "unsupported configuration field",
                     path=path,
                     field=f"search.{key}",
+                )
+    if "tool_limits" in payload and payload["tool_limits"] is not None:
+        tool_limits = payload["tool_limits"]
+        if not isinstance(tool_limits, Mapping):
+            raise ConfigurationError("value must be a table", path=path, field="tool_limits")
+        for key in tool_limits:
+            if key not in _TOOL_LIMITS_FIELDS:
+                raise ConfigurationError(
+                    "unsupported configuration field",
+                    path=path,
+                    field=f"tool_limits.{key}",
                 )
 
 
@@ -360,6 +388,15 @@ def _apply_search(document: Any, requested: Mapping[str, Any]) -> None:
             del section[key]
 
 
+def _apply_tool_limits(document: Any, requested: Mapping[str, Any]) -> None:
+    section = _replace_or_get_table(document, "tool_limits")
+    for key in _TOOL_LIMITS_FIELDS:
+        if key in requested:
+            _set_or_delete(section, key, requested[key])
+        elif key in section:
+            del section[key]
+
+
 def write_user_config(
     path: str | os.PathLike[str] | Path,
     payload: Mapping[str, Any],
@@ -400,6 +437,8 @@ def write_user_config(
         _apply_models(document, payload["models"])
     if "search" in payload and payload["search"] is not None:
         _apply_search(document, payload["search"])
+    if "tool_limits" in payload and payload["tool_limits"] is not None:
+        _apply_tool_limits(document, payload["tool_limits"])
 
     candidate = _plain(document)
     if not isinstance(candidate, Mapping):

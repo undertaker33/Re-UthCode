@@ -70,7 +70,6 @@ def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
         AgentExecutionSegment,
         AgentEvent,
         AgentLoop,
-        AgentLoopConfig,
         AgentTurnExecution,
         RunSnapshot,
         RunState,
@@ -80,7 +79,6 @@ def test_core_exposes_agent_contract_without_provider_side_effects() -> None:
     assert AgentEvent is not None
     assert AgentExecutionSegment is not None
     assert AgentLoop is not None
-    assert AgentLoopConfig is not None
     assert AgentTurnExecution is not None
     assert RunSnapshot is not None
     assert RunState is not None

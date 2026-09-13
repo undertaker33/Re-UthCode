@@ -86,7 +86,8 @@ from uthcode.core.permission import (
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
-from .attachments import AttachmentService
+from .attachments import ArtifactService, AttachmentService
+from uthcode.integrations.attachment_files import AttachmentPolicy
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
@@ -100,7 +101,7 @@ from .sessions import (
     SessionReplayRecord,
     SessionOperationError,
 )
-from .tools import ApplicationToolService
+from .tools import ApplicationToolService, tool_result_policy_for_output_limit
 from .provider_usage import cumulative_usage_delta, public_usage_diagnostics
 from .request_preparation import (
     effective_output_reserve as _effective_output_reserve,
@@ -143,6 +144,8 @@ def failure_message(reason: FailureReason | None) -> str:
         return "会话无法安全保存，请检查存储后重试。"
     if reason is FailureReason.TOOL_SIDE_EFFECT_UNKNOWN:
         return "工具执行状态无法确认，已停止后续调用，请检查实际副作用。"
+    if reason is FailureReason.RUNAWAY_DETECTED:
+        return "检测到工具或完成行为重复，已停止运行，请检查任务状态后重试。"
     return "生成失败，请稍后重试。"
 
 
@@ -335,6 +338,7 @@ class UthCodeApplication:
         context_service: ApplicationContextService | None = None,
         session_service: ApplicationSessionService | None = None,
         attachment_service: AttachmentService | None = None,
+        artifact_service: ArtifactService | None = None,
     ) -> None:
         self._provider = provider
         self._configuration = configuration
@@ -373,6 +377,11 @@ class UthCodeApplication:
         # this class only installs its public observation projections.
         self._session_service = session_service
         self._attachment_service = attachment_service
+        if artifact_service is None:
+            artifact_service = ArtifactService(runtime_context.workdir)
+        if not isinstance(artifact_service, ArtifactService):
+            raise TypeError("artifact_service must be ArtifactService or None")
+        self._artifact_service = artifact_service
         self._tool_service = tool_service
         process_manager = runtime_context.process_manager
         if process_manager is not None:
@@ -512,6 +521,32 @@ class UthCodeApplication:
         """Return the Session-owned attachment import service, if configured."""
 
         return self._attachment_service
+
+    @property
+    def artifact_service(self) -> ArtifactService:
+        return self._artifact_service
+
+    def describe_artifact(
+        self,
+        path: str,
+        *,
+        authorized_external: bool = False,
+    ) -> dict[str, object]:
+        return self._artifact_service.describe(
+            path,
+            authorized_external=authorized_external,
+        ).to_dict()
+
+    def preview_artifact(
+        self,
+        path: str,
+        *,
+        authorized_external: bool = False,
+    ) -> dict[str, object]:
+        return self._artifact_service.preview(
+            path,
+            authorized_external=authorized_external,
+        )
 
     def _process_runtime(self):
         manager = self._runtime_context.process_manager
@@ -713,6 +748,7 @@ class UthCodeApplication:
             session_provider=lambda: session_service.active_session,
             process_manager=manager,
             search_configuration=configuration.search,
+            tool_limits=configuration.tool_limits,
             redirect_authorizer=authorize_redirect,
         )
         secret_values = tuple(
@@ -727,8 +763,19 @@ class UthCodeApplication:
             workdir=self._runtime_context.workdir,
             secret_values=secret_values,
             session_provider=lambda: session_service.active_session,
-            tool_result_policy=self._tool_service._tool_result_policy,
+            tool_result_policy=tool_result_policy_for_output_limit(
+                configuration.tool_limits.output_bytes,
+            ),
             history_read_policy=self._tool_service._history_read_policy,
+        )
+        attachment_service.files.policy = AttachmentPolicy(
+            single_attachment_hard_cap_bytes=configuration.tool_limits.attachment_bytes,
+            preview_limit_bytes=min(256 * 1024, configuration.tool_limits.attachment_bytes),
+        )
+        manager.max_output_bytes = configuration.tool_limits.output_bytes
+        self._artifact_service.preview_limit_bytes = min(
+            256 * 1024,
+            configuration.tool_limits.attachment_bytes,
         )
 
         # Commit only after provider and every Tool has been composed.  No

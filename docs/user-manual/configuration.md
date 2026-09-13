@@ -59,6 +59,17 @@ timeout_seconds = 20.0
 
 Desktop Settings 的 Search 区域保存启用状态、固定 provider、key 输入和三个上限字段。key 输入只在 editor-local 草稿和受控配置写入通道存在，安全设置回读只显示是否已配置；当前可见 Session 有 active Turn 时，整次设置保存会被拒绝，既有运行时不会因保存而重启。
 
+工具执行的单次等待、输出和附件上限位于 `[tool_limits]`。这些字段只允许用户配置；项目配置可以进一步收紧，不能放大用户值。`timeout_seconds` 省略或写为 `null` 时不增加隐藏的进程总寿命限制，`output_bytes` 和 `attachment_bytes` 分别约束单次工具输出与单个附件：
+
+```toml
+[tool_limits]
+timeout_seconds = 30.0
+output_bytes = 1048576
+attachment_bytes = 8388608
+```
+
+Desktop Settings 会显示 configured/effective/source 三类配置事实：configured 是可写入用户配置，effective 是当前工作目录合并后的下一安全边界值，source 会分别标出 search、vision、tool limits 和 attachment limits 来自 default、user 或 project。保存通过同一配置出口校验，并在下一安全边界更新当前和后台运行时；active、background 和 compact 快照在该边界保持一致。已启动进程保留启动时的参数与脱敏投影，不因配置保存重启，项目收紧值也不会反写用户配置。
+
 使用 env 写法时，在启动 UthCode 的终端中设置密钥：
 
 ```powershell

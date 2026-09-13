@@ -125,6 +125,28 @@ test("Settings uses one Provider/Model modal root with transactional Back and Ca
   });
 });
 
+test("Settings displays effective project limits and their source beside the user draft", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const state = createInitialState({
+      configuration: {
+        ...baseConfiguration(),
+        configured: { ...baseConfiguration(), search: { enabled: true, max_results: 8 }, tool_limits: { output_bytes: 16777216, attachment_bytes: 16777216 } },
+        effective: { ...baseConfiguration(), search: { enabled: true, max_results: 2 }, tool_limits: { output_bytes: 4096, attachment_bytes: 4096 }, models: { "provider/model": { ...baseConfiguration().models["provider/model"], supports_images: false } } },
+        source: { search: "project", vision: "project", tool_limits: "project", attachment_limits: "project" },
+      },
+      settingsLoaded: true,
+    });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const summary = container.querySelector<HTMLElement>(".settings-effective");
+    assert.ok(summary);
+    assert.match(summary!.textContent ?? "", /Effective at next safe boundary/u);
+    assert.match(summary!.textContent ?? "", /Max results: 2/u);
+    assert.match(summary!.textContent ?? "", /Tool output limit \(bytes\): 4096/u);
+    assert.match(summary!.textContent ?? "", /Source: project/u);
+  });
+});
+
 test("Settings keeps API key reveal editor-local and writes only an explicit replacement", async () => {
   await withRendererDom(async (dom, container, root) => {
     const saves: ConfigurationWrite[] = [];

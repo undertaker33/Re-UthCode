@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from uthcode.integrations.config.data import LoadedConfigData
+from uthcode.integrations.attachment_files import AttachmentPolicy
 from uthcode.integrations.config.loader import (
     ConfigurationError as IntegrationConfigurationError,
     ConfigurationInitializationRequired as IntegrationConfigurationInitializationRequired,
@@ -45,10 +46,11 @@ from .configuration import (
 )
 from .generation import ModelWriter, ProviderBuilder, UthCodeApplication
 from .sessions import ApplicationSessionService
-from .attachments import AttachmentService
+from .attachments import ArtifactService, AttachmentService
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
+from .tools import tool_result_policy_for_output_limit
 
 
 class ConfigurationError(ValueError):
@@ -115,6 +117,7 @@ def read_user_configuration(
     providers_raw = raw.get("providers", {})
     models_raw = raw.get("models", {})
     search_raw = raw.get("search", {})
+    tool_limits_raw = raw.get("tool_limits", {})
     return UserConfigurationView(
         default_model=raw.get("default_model", ""),
         default_permission_mode=raw.get("default_permission_mode", "default"),
@@ -125,6 +128,9 @@ def read_user_configuration(
         ),
         models=models_raw if isinstance(models_raw, Mapping) else {},
         search=search_raw if isinstance(search_raw, Mapping) else {},
+        tool_limits=(
+            tool_limits_raw if isinstance(tool_limits_raw, Mapping) else {}
+        ),
         path=path,
     )
 
@@ -196,6 +202,8 @@ def _user_write_payload(
             )
             for key, value in request.search.items()
         }
+    if request.tool_limits is not None:
+        payload["tool_limits"] = dict(request.tool_limits)
     if request.provider_renames is not None:
         payload["provider_renames"] = dict(request.provider_renames)
     return payload
@@ -220,6 +228,7 @@ def write_user_configuration(
                 "providers",
                 "models",
                 "search",
+                "tool_limits",
                 "provider_renames",
             }
         ]
@@ -235,6 +244,7 @@ def write_user_configuration(
             providers=request.get("providers"),
             models=request.get("models"),
             search=request.get("search"),
+            tool_limits=request.get("tool_limits"),
             provider_renames=request.get("provider_renames"),
         )
     path = _user_config_path(home)
@@ -375,10 +385,22 @@ def create_application(
         instruction_loader=loader,
         store=session_store,
     )
-    attachment_service = AttachmentService(session_service.store)
+    attachment_service = AttachmentService(
+        session_service.store,
+        policy=AttachmentPolicy(
+            single_attachment_hard_cap_bytes=config.tool_limits.attachment_bytes,
+            preview_limit_bytes=min(256 * 1024, config.tool_limits.attachment_bytes),
+        ),
+    )
+    artifact_service = ArtifactService(
+        runtime_context.workdir,
+        preview_limit_bytes=min(256 * 1024, config.tool_limits.attachment_bytes),
+    )
     process_manager = runtime_context.process_manager
     if process_manager is None:
-        process_manager = ProcessSessionManager()
+        process_manager = ProcessSessionManager(
+            max_output_bytes=config.tool_limits.output_bytes,
+        )
         runtime_context = replace(runtime_context, process_manager=process_manager)
     elif not isinstance(process_manager, ProcessSessionManager):
         raise TypeError("runtime_context.process_manager must be a ProcessSessionManager or None")
@@ -407,6 +429,7 @@ def create_application(
             session_provider=lambda: session_service.active_session,
             process_manager=process_manager,
             search_configuration=config.search,
+            tool_limits=config.tool_limits,
             web_transport=web_transport,
             redirect_authorizer=_redirect_authorizer,
         )
@@ -436,6 +459,9 @@ def create_application(
             workdir=runtime_context.workdir,
             secret_values=secret_values,
             session_provider=lambda: session_service.active_session,
+            tool_result_policy=tool_result_policy_for_output_limit(
+                config.tool_limits.output_bytes,
+            ),
         ),
         permission_rules_loader=(
             lambda: load_permission_rules(cwd=runtime_context.workdir)
@@ -443,6 +469,7 @@ def create_application(
         instruction_loader=loader,
         session_service=session_service,
         attachment_service=attachment_service,
+        artifact_service=artifact_service,
     )
 
 
@@ -457,6 +484,10 @@ def _instruction_user_root(config: EffectiveConfig) -> Path:
 
 def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
     sources = tuple(ConfigSource(source.kind, source.path) for source in data.sources)
+    field_sources = {
+        field: ConfigSource(source.kind, source.path)
+        for field, source in data.field_sources.items()
+    }
     try:
         return EffectiveConfig.from_mapping(
             {
@@ -465,8 +496,10 @@ def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
                 "models": data.models,
                 "default_permission_mode": data.default_permission_mode,
                 "search": data.search,
+                "tool_limits": data.tool_limits,
             },
             sources=sources,
+            field_sources=field_sources,
         )
     except (ConfigurationModelError, TypeError, ValueError) as exc:
         source_path = data.sources[-1].path if data.sources else None

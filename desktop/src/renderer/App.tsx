@@ -8,7 +8,7 @@ import {
   SIDEBAR_WIDTH_MAX,
   SIDEBAR_WIDTH_MIN,
 } from "../desktop-api";
-import type { AgentEvent, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, ArtifactDescriptor, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { RuntimePanel } from "./RuntimePanel";
@@ -1656,6 +1656,65 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [copyText, t]);
 
+  const openArtifact = useCallback(async (path: string) => {
+    try {
+      await send("artifact.open", { path });
+    } catch {
+      dispatch({ type: "notice", text: t("artifactOpenFailed") });
+    }
+  }, [send, t]);
+
+  const artifactDescriptor = useCallback((value: unknown): ArtifactDescriptor | null => {
+    const result = asObject(value);
+    const artifact = asObject(result.artifact);
+    if (typeof artifact.path !== "string" || typeof artifact.name !== "string" || typeof artifact.kind !== "string" || typeof artifact.mime_type !== "string" || typeof artifact.size_bytes !== "number" || typeof artifact.preview_supported !== "boolean") return null;
+    return artifact as unknown as ArtifactDescriptor;
+  }, []);
+
+  const describeArtifact = useCallback(async (path: string): Promise<ArtifactDescriptor | null> => {
+    try {
+      const descriptor = artifactDescriptor(await send("artifact.describe", { path }));
+      if (!descriptor) throw new Error("invalid artifact descriptor");
+      return descriptor;
+    } catch {
+      dispatch({ type: "notice", text: t("artifactOpenFailed") });
+      return null;
+    }
+  }, [artifactDescriptor, send, t]);
+
+  const authorizeExternalArtifact = useCallback(async (_path: string): Promise<ArtifactDescriptor | null> => {
+    if (!api?.authorizeExternalArtifact) return null;
+    try {
+      const selected = await api.authorizeExternalArtifact();
+      if (!selected) return null;
+      const descriptor = artifactDescriptor(await send("artifact.describe", { path: selected }));
+      if (!descriptor) throw new Error("invalid authorized artifact descriptor");
+      return descriptor;
+    } catch {
+      dispatch({ type: "notice", text: t("artifactOpenFailed") });
+      return null;
+    }
+  }, [api, artifactDescriptor, send, t]);
+
+  const revealArtifact = useCallback(async (path: string) => {
+    try {
+      await send("artifact.reveal", { path });
+    } catch {
+      dispatch({ type: "notice", text: t("artifactOpenFailed") });
+    }
+  }, [send, t]);
+
+  const previewArtifact = useCallback(async (path: string): Promise<ArtifactDescriptor | null> => {
+    try {
+      const descriptor = artifactDescriptor(await send("artifact.preview", { path }));
+      if (!descriptor) throw new Error("invalid artifact preview");
+      return descriptor;
+    } catch {
+      dispatch({ type: "notice", text: t("artifactOpenFailed") });
+      return null;
+    }
+  }, [artifactDescriptor, send, t]);
+
   const removeProject = useCallback(async (project: ProjectState) => {
     const current = stateRef.current;
     const removal = projectRemovalPlan(current.projects, current.selectedProjectKey, project.projectKey);
@@ -1934,6 +1993,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         runtimeErrorVisible={runtimeVisible}
         onOpenSettings={state.runtimeError ? () => void loadSettings() : undefined}
         onCopyText={copyText}
+        onOpenArtifact={openArtifact}
+        onDescribeArtifact={describeArtifact}
+        onAuthorizeArtifact={authorizeExternalArtifact}
+        onRevealArtifact={revealArtifact}
+        onPreviewArtifact={previewArtifact}
         onLoadOlder={loadOlderHistory}
         onRetryOlder={retryHistory}
         historyHasMore={visibleHistory?.hasMore ?? false}

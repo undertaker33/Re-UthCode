@@ -358,7 +358,12 @@ async def test_desktop_settings_save_reloads_search_for_next_turn_and_keeps_proc
                         "max_results": 3,
                         "max_fetch_bytes": 4096,
                         "timeout_seconds": 7.0,
-                    }
+                    },
+                    "tool_limits": {
+                        "timeout_seconds": 5.0,
+                        "output_bytes": 4096,
+                        "attachment_bytes": 8192,
+                    },
                 },
             )
         )
@@ -369,6 +374,8 @@ async def test_desktop_settings_save_reloads_search_for_next_turn_and_keeps_proc
         assert application.configuration.search.enabled is True  # type: ignore[union-attr]
         assert application.configuration.search.max_results == 3  # type: ignore[union-attr]
         assert application.configuration.search.max_fetch_bytes == 4096  # type: ignore[union-attr]
+        assert application.configuration.tool_limits.output_bytes == 4096  # type: ignore[union-attr]
+        assert manager.max_output_bytes == 4096
         assert any(definition.name == "WebSearch" for definition in application.tool_definitions())
 
         handle = bridge.run.start_turn("verify the next turn tool view")  # type: ignore[union-attr]

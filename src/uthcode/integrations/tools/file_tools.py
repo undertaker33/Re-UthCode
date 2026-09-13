@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -107,7 +108,13 @@ class ReadFileTool:
             f"{line_number}\t{line}"
             for line_number, line in enumerate(selected, start=offset)
         ]
-        return ToolExecutionResult("\n".join(numbered))
+        return ToolExecutionResult(
+            "\n".join(numbered),
+            details={
+                "evidence": "read_content",
+                "content_digest": _content_digest(content),
+            },
+        )
 
 
 class WriteFileTool:
@@ -182,6 +189,12 @@ class WriteFileTool:
 
         if cancellation.cancelled:
             return _cancelled()
+        before_digest: str | None = None
+        if path.is_file():
+            try:
+                before_digest = _bytes_digest(path.read_bytes())
+            except OSError as exc:
+                return _error(f"Error: failed to read file before writing: {exc}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if cancellation.cancelled:
@@ -191,8 +204,17 @@ class WriteFileTool:
             return _error(f"Error: failed to write file: {exc}")
 
         self._tracker.update(path)
+        try:
+            after_digest = _bytes_digest(path.read_bytes())
+        except OSError as exc:
+            return _error(f"Error: failed to confirm file write: {exc}")
         return ToolExecutionResult(
-            f"Successfully wrote to {self._resolver.display(path)}"
+            f"Successfully wrote to {self._resolver.display(path)}",
+            details={
+                "evidence": "file_change",
+                "changed": before_digest != after_digest,
+                "content_digest": after_digest,
+            },
         )
 
 
@@ -298,8 +320,17 @@ class EditFileTool:
             return _error(f"Error: failed to write file: {exc}")
 
         self._tracker.update(path)
+        try:
+            after_digest = _bytes_digest(path.read_bytes())
+        except OSError as exc:
+            return _error(f"Error: failed to confirm file edit: {exc}")
         return ToolExecutionResult(
-            f"Successfully edited {self._resolver.display(path)}"
+            f"Successfully edited {self._resolver.display(path)}",
+            details={
+                "evidence": "file_change",
+                "changed": _content_digest(content) != after_digest,
+                "content_digest": after_digest,
+            },
         )
 
 
@@ -322,6 +353,14 @@ def _error(message: str) -> ToolExecutionResult:
 
 def _cancelled() -> ToolExecutionResult:
     return ToolExecutionResult(_CANCELLED, is_error=True)
+
+
+def _content_digest(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _bytes_digest(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
 def _notify_path_access(

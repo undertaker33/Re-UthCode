@@ -30,7 +30,14 @@ from .generation import (
     pause_message,
 )
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
-from .attachments import AttachmentError, AttachmentReference, AttachmentService
+from .attachments import (
+    ArtifactDescriptor,
+    ArtifactError,
+    ArtifactService,
+    AttachmentError,
+    AttachmentReference,
+    AttachmentService,
+)
 from .instructions import (
     InstructionAuthorization,
     InstructionBlock,
@@ -172,6 +179,9 @@ __all__ = [
     "ApplicationRuntimeContext",
     "ApplicationContextService",
     "AttachmentError",
+    "ArtifactDescriptor",
+    "ArtifactError",
+    "ArtifactService",
     "AttachmentReference",
     "AttachmentService",
     "ContextStatus",

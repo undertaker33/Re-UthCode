@@ -9,6 +9,7 @@ import { ChatTimeline } from "../src/renderer/ChatTimeline";
 import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { LanguageProvider } from "../src/renderer/i18n";
 import type { TimelineEntry } from "../src/renderer/state";
+import type { ArtifactDescriptor } from "../src/desktop-api";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><div id=root></div></body></html>", { url: "http://localhost/" });
@@ -86,6 +87,50 @@ test("ChatTimeline replays durable attachment metadata with an image preview and
   assert.match(markup, /notes\.txt/u);
   assert.match(markup, />FILE</u);
   assert.match(markup, /12 B/u);
+});
+
+test("ChatTimeline resolves artifact links into the formal card and controlled preview", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const artifact: ArtifactDescriptor = {
+      path: "C:\\Projects\\UthCode\\preview.png",
+      name: "preview.png",
+      kind: "image",
+      mime_type: "image/png",
+      size_bytes: 4,
+      default_action: "open",
+      preview_supported: true,
+    };
+    let describeCalls = 0;
+    let openCalls = 0;
+    let previewCalls = 0;
+    const render = () => root.render(<LanguageProvider value="en"><ChatTimeline
+      entries={[codeEntry("[preview](artifact:C:\\Projects\\UthCode\\preview.png)")]}
+      todo={[]}
+      sessionKey="artifact-session"
+      onDescribeArtifact={async () => { describeCalls += 1; return artifact; }}
+      onOpenArtifact={async () => { openCalls += 1; }}
+      onPreviewArtifact={async () => { previewCalls += 1; return { ...artifact, data_url: "data:image/png;base64,AAAA" }; }}
+    /></LanguageProvider>);
+    act(render);
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const link = container.querySelector<HTMLButtonElement>(".artifact-link");
+    assert.ok(link);
+    act(() => { link!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(describeCalls, 1);
+    assert.ok(container.querySelector(".artifact-card"));
+    const preview = container.querySelector<HTMLButtonElement>(".artifact-card__actions button");
+    assert.ok(preview);
+    act(() => { preview!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(previewCalls, 1);
+    assert.ok(container.querySelector('img[src="data:image/png;base64,AAAA"]'));
+    const open = Array.from(container.querySelectorAll<HTMLButtonElement>(".artifact-card__actions button")).find((button) => button.textContent === "Open");
+    assert.ok(open);
+    act(() => { open!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(openCalls, 1);
+  });
 });
 
 test("ChatTimeline renders bounded Session process observations separately from the Turn timeline", () => {

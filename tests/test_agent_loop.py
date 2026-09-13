@@ -11,7 +11,6 @@ import pytest
 from uthcode.core.agent import (
     AgentExecutionSegment,
     AgentLoop,
-    AgentLoopConfig,
     AssistantMessageKind,
     ExecutionBoundary,
     PersistenceUnavailableError,
@@ -19,6 +18,8 @@ from uthcode.core.agent import (
     RunState,
     RunStatus,
     TerminationReason,
+    _AnomalyDecision,
+    _RunawayDetector,
 )
 from uthcode.core.agent_events import (
     AssistantMessageCompleted,
@@ -168,6 +169,7 @@ class RecordingTool:
     peak_active: int = 0
     cancel_on_execute: bool = False
     delay: float = 0.0
+    result_details: dict[str, object] = field(default_factory=dict)
 
     @property
     def definition(self) -> ToolDefinition:
@@ -190,7 +192,7 @@ class RecordingTool:
                 await asyncio.sleep(self.delay)
             if self.cancel_on_execute:
                 cancellation.cancel()
-            return ToolExecutionResult(self.output, self.error)
+            return ToolExecutionResult(self.output, self.error, details=self.result_details)
         finally:
             self.active -= 1
 
@@ -317,8 +319,10 @@ def _loop(
     provider,
     tools: tuple[Tool, ...] = (),
     *,
-    config: AgentLoopConfig | None = None,
+    max_tool_calls_per_iteration: int = 16,
+    max_consecutive_unknown_tools: int = 3,
     descriptions: dict[str, str] | None = None,
+    runtime_contexts: list[RuntimePromptContext] | None = None,
 ) -> AgentLoop:
     registry = ToolRegistry(tools)
     executor = ToolExecutor(registry)
@@ -329,6 +333,8 @@ def _loop(
         definitions: tuple[ToolDefinition, ...],
         _runtime_context: RuntimePromptContext,
     ) -> GenerationRequest:
+        if runtime_contexts is not None:
+            runtime_contexts.append(_runtime_context)
         return GenerationRequest(messages=messages, tools=definitions)
 
     def describe(call: ToolCallPart) -> str:
@@ -341,7 +347,8 @@ def _loop(
         registry,
         executor,
         prepare,
-        config=config,
+        max_tool_calls_per_iteration=max_tool_calls_per_iteration,
+        max_consecutive_unknown_tools=max_consecutive_unknown_tools,
         tool_call_describer=describe,
         permission_resolver=lambda action: evaluator.evaluate(
             action,
@@ -1103,9 +1110,7 @@ async def test_max_limits_close_tool_batch_before_terminal_failure() -> None:
         ToolCallPart("two", "missing", {}),
     )
     provider = ScriptedProvider([[_response(*calls, finish_reason=FinishReason.TOOL_CALLS)]])
-    execution = _start(
-        _loop(provider, config=AgentLoopConfig(max_tool_calls_per_iteration=1))
-    )
+    execution = _start(_loop(provider, max_tool_calls_per_iteration=1))
     events, result, _ = await _drive(execution)
 
     assert result.termination_reason is TerminationReason.MAX_TOOL_CALLS
@@ -2399,7 +2404,7 @@ async def test_t08_cancel_wins_over_pending_tool_steering() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_iterations() -> None:
+async def test_t14_unfinished_completion_stops_after_bounded_correction() -> None:
     pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
     provider = ScriptedProvider(
         [
@@ -2411,6 +2416,9 @@ async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_itera
             ],
             [_response(TextPart("premature one"), usage=Usage(1, 1))],
             [_response(TextPart("premature two"), usage=Usage(2, 2))],
+            [_response(TextPart("premature three"), usage=Usage(1, 1))],
+            [_response(TextPart("premature four"), usage=Usage(1, 1))],
+            [_response(TextPart("premature five"), usage=Usage(1, 1))],
         ]
     )
     registry = ToolRegistry()
@@ -2422,7 +2430,6 @@ async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_itera
             messages=messages,
             tools=definitions,
         ),
-        config=AgentLoopConfig(max_iterations=3),
     )
     execution = loop.start_turn(
         RunState.initial("run-1"),
@@ -2434,15 +2441,238 @@ async def test_t08_unfinished_completion_retries_stop_at_authoritative_max_itera
     events, result, _segments = await _drive(execution)
 
     assert result.status is RunStatus.FAILED
-    assert result.termination_reason is TerminationReason.MAX_ITERATIONS
-    assert result.usage == Usage(3, 3)
-    assert len([event for event in events if isinstance(event, CompletionBlocked)]) == 2
+    assert result.termination_reason is TerminationReason.RUNAWAY_DETECTED
+    assert result.usage == Usage(6, 6)
+    assert len([event for event in events if isinstance(event, CompletionBlocked)]) == 5
     assert not any(isinstance(event, TurnCompleted) for event in events)
     assert all(
         TextPart("premature one") not in message.parts
         and TextPart("premature two") not in message.parts
         for message in execution.state.messages
     )
+
+
+@pytest.mark.asyncio
+async def test_t14_formal_loop_edit_evidence_resets_final_block_before_retest() -> None:
+    pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
+    completed = {"todos": [{"content": "verify", "status": "completed"}]}
+    edit = RecordingTool(
+        "EditFile",
+        output="Successfully edited note.txt",
+        result_details={"evidence": "file_change", "changed": True},
+    )
+    provider = ScriptedProvider(
+        [
+            [_response(ToolCallPart("todo-1", "TodoWrite", pending), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature one"))],
+            [_response(TextPart("premature two"))],
+            [_response(TextPart("premature three"))],
+            [_response(ToolCallPart("edit-1", "EditFile", {"value": "note"}), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature after edit one"))],
+            [_response(TextPart("premature after edit two"))],
+            [_response(ToolCallPart("todo-2", "TodoWrite", completed), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("done"))],
+        ]
+    )
+    loop = _loop(provider, (edit,))
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION, edit.definition),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.termination_reason is TerminationReason.FINAL_ANSWER
+    assert result.final_text == "done"
+    assert result.termination_reason is not TerminationReason.RUNAWAY_DETECTED
+    assert edit.started == ["note"]
+    assert len([event for event in events if isinstance(event, CompletionBlocked)]) == 5
+
+
+@pytest.mark.asyncio
+async def test_t14_formal_loop_repeated_read_same_digest_keeps_final_block_evidence() -> None:
+    pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
+    read = RecordingTool(
+        "ReadFile",
+        output="same content",
+        result_details={"evidence": "read_content", "content_digest": "digest-same"},
+    )
+    provider = ScriptedProvider(
+        [
+            [_response(ToolCallPart("todo-1", "TodoWrite", pending), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(ToolCallPart("read-1", "ReadFile", {"value": "same.txt"}), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature one"))],
+            [_response(TextPart("premature two"))],
+            [_response(TextPart("premature three"))],
+            [_response(ToolCallPart("read-2", "ReadFile", {"value": "same.txt"}), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature four"))],
+            [_response(TextPart("premature five"))],
+        ]
+    )
+    loop = _loop(provider, (read,))
+    execution = loop.start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION, read.definition),
+    )
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.FAILED
+    assert result.termination_reason is TerminationReason.RUNAWAY_DETECTED
+    assert read.started == ["same.txt", "same.txt"]
+    assert len([event for event in events if isinstance(event, CompletionBlocked)]) == 5
+
+
+def test_t14_read_content_first_and_changed_digest_clear_final_block_evidence() -> None:
+    detector = _RunawayDetector()
+    for _ in range(3):
+        assert detector.record_final_block("task", "plan") is not _AnomalyDecision.STOP
+    assert detector.record_tool(
+        ToolCallPart("read-1", "ReadFile", {"value": "same.txt"}),
+        ToolResultPart(
+            "read-1",
+            "same",
+            False,
+            {"evidence": "read_content", "content_digest": "digest-a"},
+        ),
+    ) is _AnomalyDecision.NONE
+    for _ in range(2):
+        assert detector.record_final_block("task", "plan") is _AnomalyDecision.NONE
+
+    assert detector.record_final_block("task", "plan") is _AnomalyDecision.CORRECT
+    assert detector.record_tool(
+        ToolCallPart("read-2", "ReadFile", {"value": "same.txt"}),
+        ToolResultPart(
+            "read-2",
+            "changed",
+            False,
+            {"evidence": "read_content", "content_digest": "digest-b"},
+        ),
+    ) is _AnomalyDecision.NONE
+    assert detector.record_final_block("task", "plan") is _AnomalyDecision.NONE
+    assert detector.record_final_block("task", "plan") is _AnomalyDecision.NONE
+
+
+@pytest.mark.asyncio
+async def test_t14_two_hundred_semantically_changing_iterations_have_no_iteration_gate() -> None:
+    tool = RecordingTool("Work")
+    scripts = [
+        [
+            _response(
+                ToolCallPart(f"call-{index}", "Work", {"value": str(index)}),
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+        ]
+        for index in range(200)
+    ]
+    scripts.append([_response(TextPart("done"))])
+
+    execution = _start(_loop(ScriptedProvider(scripts), (tool,)))
+    _events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.termination_reason is TerminationReason.FINAL_ANSWER
+    assert result.iteration_count == 201
+    assert len(tool.started) == 200
+    assert not hasattr(TerminationReason, "MAX_ITERATIONS")
+
+
+@pytest.mark.asyncio
+async def test_t14_same_failure_corrects_once_then_stops_after_recurrence() -> None:
+    tool = RecordingTool("Work", output="same failure", error=True)
+    scripts = [
+        [
+            _response(
+                ToolCallPart(f"transport-{index}", "Work", {"value": "unchanged"}),
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+        ]
+        for index in range(5)
+    ]
+    provider = ScriptedProvider(scripts)
+    contexts: list[RuntimePromptContext] = []
+    execution = _start(_loop(provider, (tool,), runtime_contexts=contexts))
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.FAILED
+    assert result.termination_reason is TerminationReason.RUNAWAY_DETECTED
+    assert any(
+        context.one_shot_feedback is not None
+        and "Recent tool observations" in context.one_shot_feedback.text
+        for context in contexts
+    )
+    assert len(tool.started) == 5
+
+
+@pytest.mark.asyncio
+async def test_t14_short_cycle_corrects_once_then_stops_after_two_more_cycles() -> None:
+    tool = RecordingTool("Work")
+    scripts = [
+        [
+            _response(
+                ToolCallPart(f"call-{index}", "Work", {"value": value}),
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+        ]
+        for index, value in enumerate(("a", "b") * 5)
+    ]
+    provider = ScriptedProvider(scripts)
+    contexts: list[RuntimePromptContext] = []
+    execution = _start(_loop(provider, (tool,), runtime_contexts=contexts))
+
+    events, result, _segments = await _drive(execution)
+
+    assert result.status is RunStatus.FAILED
+    assert result.termination_reason is TerminationReason.RUNAWAY_DETECTED
+    assert any(
+        context.one_shot_feedback is not None
+        and "Recent tool observations" in context.one_shot_feedback.text
+        for context in contexts
+    )
+    assert len(tool.started) == 10
+
+
+def test_t14_new_valid_evidence_clears_suspicion_and_wait_is_not_a_repeat() -> None:
+    detector = _RunawayDetector()
+    failed_call = ToolCallPart("wire-1", "Work", {"value": "same"})
+    for index in range(2):
+        decision = detector.record_tool(
+            ToolCallPart(f"wire-{index}", "Work", {"value": "same"}),
+            ToolResultPart(f"wire-{index}", "failure", True),
+        )
+        assert decision is _AnomalyDecision.NONE
+    assert detector.record_tool(
+        failed_call,
+        ToolResultPart("wire-2", "failure", True),
+    ) is _AnomalyDecision.CORRECT
+
+    changed_result = ToolResultPart("wire-3", "new evidence", False)
+    assert detector.record_tool(
+        ToolCallPart("wire-3", "Work", {"value": "edited"}),
+        changed_result,
+    ) is _AnomalyDecision.NONE
+    assert detector.record_tool(
+        ToolCallPart("wire-4", "Work", {"value": "edited"}),
+        ToolResultPart("wire-4", "new evidence", False),
+    ) is _AnomalyDecision.NONE
+
+    for index in range(32):
+        call_id = f"wait-{index}"
+        assert detector.record_tool(
+            ToolCallPart(call_id, "Process", {"action": "read", "process_id": "p-1"}),
+            ToolResultPart(
+                call_id,
+                "",
+                False,
+                {"process_state": "running", "entries": []},
+            ),
+        ) is _AnomalyDecision.NONE
 
 
 @pytest.mark.asyncio

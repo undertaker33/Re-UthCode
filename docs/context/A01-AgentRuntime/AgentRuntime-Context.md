@@ -37,7 +37,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 | Provider 无关协议 | `src/uthcode/core/provider.py` | `ProviderPort`, `GenerationRequest`, `ProviderResponse`, `ProviderEvent`, `Message`, `ToolCallPart`, `ToolResultPart`, `Usage`, `CancellationToken`, `validated_provider_stream` |
 | System Prompt | `src/uthcode/core/prompt.py`、`src/uthcode/core/context.py` | `PromptSection`、`build_instruction_prefix`、`instruction_text_from_context_snapshot` |
 | Tool 抽象与执行 | `src/uthcode/core/tool.py` | `Tool`, `ToolRegistry`, `ToolExecutor`, `PreparedToolCall`, `ToolPreparation`, `ToolExecutionResult` |
-| ReAct Runtime | `src/uthcode/core/agent.py` | `AgentLoop`, `AgentTurnExecution`, `AgentExecutionSegment`, `AgentLoopConfig` |
+| ReAct Runtime | `src/uthcode/core/agent.py` | `AgentLoop`, `AgentTurnExecution`, `AgentExecutionSegment`, `_RunawayDetector` |
 | Application Tool 门面 | `src/uthcode/application/tools.py` | `ApplicationToolService`, `_SecretRedactor`, `describe_tool_call`, `_create_agent_loop` |
 | Turn 依赖快照与 Prompt 注入 | `src/uthcode/application/generation.py` | `_start_agent_turn`, `_prepare_request` |
 | Context 与请求准备 | `src/uthcode/application/context.py`, `src/uthcode/application/request_preparation.py` | `compose_generation_request`、Provider limits/count 与请求安全检查；Message→Transcript 转换直接复用 `core/history.py:transcript_entries_from_message` |
@@ -90,7 +90,9 @@ AgentRun.start_turn(user_input)
 - Tool 先 `prepare_call`，再权限判断，再 `execute_prepared`；审批恢复不得二次 preflight 或二次执行。
 - 单个 Tool 被拒绝或普通失败时，当前批次继续；错误作为 Tool Result 回给模型。
 - 工具成功/错误正文进入模型消息，但公开 Tool 事件只携带脱敏、截断摘要；执行中的 ToolProgress 只走 Application 安全投影，不进入模型消息。
-- 默认限制：`max_iterations=50`、`max_tool_calls_per_iteration=16`、`max_consecutive_unknown_tools=3`。
+- `[FACT]` `normal` 与 continuation 不再使用累计 `max_iterations` gate，也没有另设总 token/time fallback；`iteration_count`、Tool/Usage 统计、Context/I/O、取消与权限边界仍然保留。
+- `[FACT]` 有界 `_RunawayDetector` 只保存最近 24 个语义观察摘要（传输 `tool_call_id` 不参与判断）：相同失败、长度 1—4 的短周期和 unfinished final 阻断均在 3 次后先注入一次纠偏，纠偏后再次达到 5 次才停止并报告 `runaway_detected`；新有效结果会解除对应怀疑，合法 Process 空读不计入。
+- 默认控制限制：`max_tool_calls_per_iteration=16`、`max_consecutive_unknown_tools=3`。
 
 ## Provider 与 Tool 当前矩阵
 

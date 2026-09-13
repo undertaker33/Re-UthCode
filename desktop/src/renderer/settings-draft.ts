@@ -8,6 +8,7 @@ export interface ConfigurationWrite {
   providers?: Record<string, Record<string, unknown>>;
   models?: Record<string, Record<string, unknown>>;
   search?: Record<string, unknown>;
+  tool_limits?: Record<string, unknown>;
 }
 
 export type SettingsCategory = "providers" | "defaults" | "interface" | "about";
@@ -19,6 +20,7 @@ export function configurationRequest(value: ConfigurationWrite): ConfigurationWr
   if (value.providers) request.providers = Object.fromEntries(Object.entries(value.providers).map(([key, profile]) => [key, { ...profile }]));
   if (value.models) request.models = Object.fromEntries(Object.entries(value.models).map(([key, profile]) => [key, { ...profile }]));
   if (value.search) request.search = { ...value.search };
+  if (value.tool_limits) request.tool_limits = { ...value.tool_limits };
   return request;
 }
 
@@ -51,6 +53,9 @@ export function settingsSaveRequest(
       return next;
     })()
     : undefined;
+  const toolLimits = draft.tool_limits
+    ? { ...draft.tool_limits }
+    : undefined;
   return configurationRequest({
     ...draft,
     providers: Object.fromEntries(Object.entries(draft.providers ?? {}).map(([id, profile]) => {
@@ -70,6 +75,7 @@ export function settingsSaveRequest(
       }))
       : draft.models,
     search,
+    tool_limits: toolLimits,
   });
 }
 
@@ -124,12 +130,17 @@ export function sourceConfig(value: ConfigurationView | null): ConfigurationWrit
     ? { ...(searchValue as Record<string, unknown>) }
     : undefined;
   if (search) delete search.api_key;
+  const toolLimitsValue = value?.tool_limits;
+  const toolLimits = toolLimitsValue && typeof toolLimitsValue === "object"
+    ? { ...(toolLimitsValue as Record<string, unknown>) }
+    : undefined;
   return {
     default_model: defaultModel,
     default_permission_mode: value?.default_permission_mode === "auto" ? "auto" : "default",
     providers,
     models,
     ...(search ? { search } : {}),
+    ...(toolLimits ? { tool_limits: toolLimits } : {}),
   };
 }
 

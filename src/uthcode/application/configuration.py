@@ -106,6 +106,9 @@ _SEARCH_MAPPING_FIELDS = frozenset(
         "timeout_seconds",
     }
 )
+_TOOL_LIMITS_MAPPING_FIELDS = frozenset(
+    {"timeout_seconds", "output_bytes", "attachment_bytes"}
+)
 _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -285,6 +288,61 @@ class SearchConfiguration:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ToolLimitsConfiguration:
+    """User/project bounded limits applied to one Tool composition.
+
+    ``timeout_seconds`` is optional so the existing process contract keeps no
+    hidden lifetime when a user has not explicitly configured one.  The byte
+    limits tighten existing Integration caps and never expose internal
+    runaway-detection or Context constants.
+    """
+
+    timeout_seconds: float | None = None
+    output_bytes: int = 2 * 1024 * 1024
+    attachment_bytes: int = 16 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(float(self.timeout_seconds))
+            or self.timeout_seconds <= 0
+            or self.timeout_seconds > 600
+        ):
+            raise ConfigurationModelError(
+                "tool_limits.timeout_seconds must be between 0 and 600 or None"
+            )
+        for field_name, maximum in (
+            ("output_bytes", 16 * 1024 * 1024),
+            ("attachment_bytes", 64 * 1024 * 1024),
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1024:
+                raise ConfigurationModelError(
+                    f"tool_limits.{field_name} must be an integer of at least 1024"
+                )
+            if value > maximum:
+                raise ConfigurationModelError(
+                    f"tool_limits.{field_name} exceeds the safety limit"
+                )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "timeout_seconds": self.timeout_seconds,
+            "output_bytes": self.output_bytes,
+            "attachment_bytes": self.attachment_bytes,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            "ToolLimitsConfiguration("
+            f"timeout_seconds={self.timeout_seconds!r}, "
+            f"output_bytes={self.output_bytes!r}, "
+            f"attachment_bytes={self.attachment_bytes!r})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class UserProviderView:
     """Display-safe projection of one user Provider profile."""
@@ -383,6 +441,7 @@ class UserConfigurationView:
     providers: Mapping[str, UserProviderView] = MappingProxyType({})
     models: Mapping[str, UserModelView] = MappingProxyType({})
     search: Mapping[str, object] = MappingProxyType({})
+    tool_limits: Mapping[str, object] = MappingProxyType({})
     path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -413,6 +472,14 @@ class UserConfigurationView:
             else:
                 safe_search[key] = value
         object.__setattr__(self, "search", MappingProxyType(safe_search))
+        if not isinstance(self.tool_limits, Mapping):
+            raise TypeError("tool_limits must be a mapping")
+        safe_tool_limits: dict[str, object] = {}
+        for key, value in self.tool_limits.items():
+            if not isinstance(key, str):
+                raise TypeError("tool_limits keys must be strings")
+            safe_tool_limits[key] = value
+        object.__setattr__(self, "tool_limits", MappingProxyType(safe_tool_limits))
         if self.path is not None:
             object.__setattr__(self, "path", Path(self.path))
 
@@ -429,6 +496,7 @@ class UserConfigurationView:
                 for model_ref, profile in self.models.items()
             },
             "search": dict(self.search),
+            "tool_limits": dict(self.tool_limits),
         }
 
 
@@ -549,6 +617,7 @@ class UserConfigurationWriteRequest:
     providers: Mapping[str, object] | None = None
     models: Mapping[str, object] | None = None
     search: Mapping[str, object] | None = None
+    tool_limits: Mapping[str, object] | None = None
     provider_renames: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -575,6 +644,14 @@ class UserConfigurationWriteRequest:
                     value = SecretValue(value)
                 search_values[key] = value
             object.__setattr__(self, "search", _freeze_user_write_mapping(search_values, field="search"))
+        if self.tool_limits is not None:
+            if not isinstance(self.tool_limits, Mapping):
+                raise TypeError("tool_limits must be a mapping")
+            object.__setattr__(
+                self,
+                "tool_limits",
+                _freeze_user_write_mapping(self.tool_limits, field="tool_limits"),
+            )
         object.__setattr__(
             self,
             "provider_renames",
@@ -617,6 +694,11 @@ class UserConfigurationWriteRequest:
                     )
                 else:
                     safe_search[key] = value
+        safe_tool_limits = (
+            None
+            if self.tool_limits is None
+            else dict(self.tool_limits)
+        )
         mode = self.default_permission_mode
         if isinstance(mode, PermissionMode):
             mode = mode.value
@@ -626,6 +708,7 @@ class UserConfigurationWriteRequest:
             "providers": providers,
             "models": models,
             "search": safe_search,
+            "tool_limits": safe_tool_limits,
             "provider_renames": (
                 None
                 if self.provider_renames is None
@@ -641,6 +724,7 @@ class UserConfigurationWriteRequest:
             f"providers={None if self.providers is None else '<redacted>'!r}, "
             f"models={None if self.models is None else tuple(self.models)!r}, "
             f"search={None if self.search is None else '<redacted>'!r}, "
+            f"tool_limits={None if self.tool_limits is None else dict(self.tool_limits)!r}, "
             f"provider_renames={None if self.provider_renames is None else dict(self.provider_renames)!r})"
         )
 
@@ -663,6 +747,8 @@ class EffectiveConfig:
     sources: tuple[ConfigSource, ...] = ()
     default_permission_mode: PermissionMode = PermissionMode.DEFAULT
     search: SearchConfiguration | Mapping[str, object] | None = None
+    tool_limits: ToolLimitsConfiguration | Mapping[str, object] | None = None
+    field_sources: Mapping[str, ConfigSource | str | Path] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         _require_text(self.default_model, "default_model")
@@ -699,6 +785,27 @@ class EffectiveConfig:
         else:
             raise TypeError("search must be SearchConfiguration, mapping, or None")
         object.__setattr__(self, "search", search_config)
+        tool_limits_value = self.tool_limits
+        if tool_limits_value is None:
+            tool_limits_config = ToolLimitsConfiguration()
+        elif isinstance(tool_limits_value, ToolLimitsConfiguration):
+            tool_limits_config = tool_limits_value
+        elif isinstance(tool_limits_value, Mapping):
+            unsupported_tool_limits = [
+                key for key in tool_limits_value if key not in _TOOL_LIMITS_MAPPING_FIELDS
+            ]
+            if unsupported_tool_limits:
+                raise ConfigurationModelError(
+                    f"unsupported tool_limits field: {unsupported_tool_limits[0]!r}"
+                )
+            tool_limits_config = ToolLimitsConfiguration(
+                timeout_seconds=tool_limits_value.get("timeout_seconds"),
+                output_bytes=tool_limits_value.get("output_bytes", 2 * 1024 * 1024),
+                attachment_bytes=tool_limits_value.get("attachment_bytes", 16 * 1024 * 1024),
+            )
+        else:
+            raise TypeError("tool_limits must be ToolLimitsConfiguration, mapping, or None")
+        object.__setattr__(self, "tool_limits", tool_limits_config)
         if not isinstance(self.providers, Mapping):
             raise TypeError("providers must be a mapping")
         if not isinstance(self.models, Mapping):
@@ -785,9 +892,16 @@ class EffectiveConfig:
                 )
 
         source_values = tuple(_coerce_source(value) for value in self.sources)
+        if not isinstance(self.field_sources, Mapping):
+            raise TypeError("field_sources must be a mapping")
+        field_source_values = {
+            str(field): _coerce_source(source)
+            for field, source in self.field_sources.items()
+        }
         object.__setattr__(self, "providers", MappingProxyType(providers))
         object.__setattr__(self, "models", MappingProxyType(models))
         object.__setattr__(self, "sources", source_values)
+        object.__setattr__(self, "field_sources", MappingProxyType(field_source_values))
 
     @classmethod
     def from_mapping(
@@ -795,13 +909,21 @@ class EffectiveConfig:
         value: Mapping[str, Any],
         *,
         sources: Sequence[ConfigSource | str | Path] = (),
+        field_sources: Mapping[str, ConfigSource | str | Path] | None = None,
     ) -> EffectiveConfig:
         if not isinstance(value, Mapping):
             raise TypeError("EffectiveConfig requires a mapping")
         unsupported = [
             key
             for key in value
-            if key not in {"default_model", "providers", "models", "default_permission_mode", "search"}
+            if key not in {
+                "default_model",
+                "providers",
+                "models",
+                "default_permission_mode",
+                "search",
+                "tool_limits",
+            }
         ]
         if unsupported:
             raise ConfigurationModelError(
@@ -817,6 +939,8 @@ class EffectiveConfig:
             sources=tuple(sources),
             default_permission_mode=value.get("default_permission_mode", "default"),
             search=value.get("search"),
+            tool_limits=value.get("tool_limits"),
+            field_sources={} if field_sources is None else field_sources,
         )
 
     @classmethod
@@ -835,6 +959,7 @@ class EffectiveConfig:
         reasoning_effort: str | None = None,
         supports_images: bool | None = None,
         search: SearchConfiguration | Mapping[str, object] | None = None,
+        tool_limits: ToolLimitsConfiguration | Mapping[str, object] | None = None,
         source: ConfigSource | str | Path | None = None,
     ) -> EffectiveConfig:
         """Build a minimal valid configuration for an embedded caller."""
@@ -868,6 +993,7 @@ class EffectiveConfig:
             },
             sources=config_source,
             search=search,
+            tool_limits=tool_limits,
         )
 
     @property
@@ -891,6 +1017,7 @@ __all__ = [
     "ProviderKind",
     "ProviderProfile",
     "SearchConfiguration",
+    "ToolLimitsConfiguration",
     "UserConfigurationView",
     "UserConfigurationWriteRequest",
     "UserModelView",

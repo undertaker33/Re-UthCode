@@ -36,6 +36,8 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Bridge 请求接收仍串行，仅长时间手动压缩脱离该循环；切换 Session 不取消压缩，已停放的压缩运行时保留至终态。`/compact` 启动请求恢复使用普通 RPC 等待上限，不再靠免除 30 秒超时等待整个压缩。普通 RPC 超时只结束当前等待，迟到的合法响应不会把存活 Runtime 判为协议损坏；已超时请求的 ID 保留至响应到达或进程边界结束。关闭时取消活动操作、等待收尾，再关闭 writer；外层 PythonRuntime 保留有界 child 回收边界，重新启动不会自动重试旧压缩。
 - `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。保存当前可见 Session 有 active Turn 时被禁止，搜索设置也不能绕过这一边界。
 - `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入，保存仍服从 active Turn 禁止边界。
+- `[FACT]` Settings 同一配置出口还编辑 `tool_limits.timeout_seconds`、`output_bytes`、`attachment_bytes`；用户值与项目收紧值在配置层得到 configured/effective/source 投影，Renderer 同时显示 search、vision、tool limits、attachment limits 的实际来源。保存只在下一安全边界作用于当前和 background runtime，active/compact 快照沿该边界更新，ProcessSessionManager 中已启动进程继续使用捕获的旧启动参数与旧脱敏投影，项目收紧值不会反写用户配置。
+- `[FACT]` 产物链由 `artifact.describe/preview/open/reveal` 组成：Application 的 `ArtifactService` 校验存在性、工作目录或显式外部授权，Main 再校验注册项目/授权路径并执行真实 `shell.openPath` 或 `shell.showItemInFolder`。Renderer 的“授权外部文件”只触发 Main-owned 原生单文件 picker，Main 对选中文件复核并保留进程内单路径 grant；模型 URI、Renderer boolean 和持久化偏好都不能自动授予。图片只通过受控 preview 数据返回，Office 默认 open，可执行文件与不支持的 HTML/SVG 默认 reveal；Renderer 只消费 ArtifactDescriptor 卡片，不访问任意 fs/shell，缺失或不支持只生成局部反馈，不重跑 Agent。
 - `[FACT]` 普通 Session/Project navigation 与真正 `runtime.shutdown -> runtime.initialize` 生命周期分开显示：前者保留 operation gate 与 generation ownership，但不显示“正在重启”。`CustomSelect` 的 listbox 通过 `document.body` portal 进入 fixed overlay，按 trigger/viewport 几何上下放置，并在滚动、resize、键盘与 Escape 边界更新或关闭，因此不受 modal overflow 裁剪。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
 - `[FACT]` `desktop/src/renderer/state.ts` 在 Turn identity 门禁之前处理进程观察，以便已结束 Turn 的后台输出仍按 `project_key + session_id` 更新；每个 Session 的 process log 有界，`ChatTimeline` 显示状态/退出码、`process.read` 的续读按钮和 cursor-expired/终态淘汰事实，异步回包在 Session 切换后不会写入新 Session，输入文本不回显为日志。
@@ -71,7 +73,8 @@ visible Session A 有 active Turn
 | Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring、选择/粘贴/拖拽附件和仅附件发送；Todo 条置于输入区上方 | Command/Turn/Context/Session Attachment Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
-| Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference，active Turn 时禁止保存 | Configuration Application boundary + Renderer preference |
+| Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits、工具 timeout/output/attachment limits 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference，active Turn 时禁止保存 | Configuration Application boundary + Renderer preference |
+| Artifacts | 授权文件的描述、图片受控预览、系统打开或 Explorer 定位；外部文件需用户通过 Main picker 明确授权；缺失/不支持的局部反馈 | Application `ArtifactService` + Desktop Bridge/Main + Renderer ArtifactCard |
 
 ## 修改路由
 
@@ -101,6 +104,7 @@ Settings draft / 单根编辑器             -> desktop/src/renderer/SettingsVie
 | runtime ownership、迟到事件和终态收敛 | `desktop/tests/renderer-runtime-lifecycle.test.tsx`、`runtime-process.test.ts` |
 | 单根 Settings、返回焦点和秘密显示生命周期 | `desktop/tests/renderer-settings.test.tsx` |
 | Markdown 原文复制、历史分页和阅读位置 | `desktop/tests/renderer-chat.test.tsx` |
+| 产物卡片、受控图片预览和 Main 打开/定位边界 | `tests/test_desktop_artifacts.py`、`desktop/tests/preload.test.ts`、`desktop/tests/renderer-chat.test.tsx` |
 | 附件选择/粘贴/拖拽、预览/移除、仅附件发送和失败重发 | `desktop/tests/renderer-attachments.test.tsx`、`tests/test_desktop_bridge.py` |
 | 布局与临时 Focus Mode | `desktop/tests/renderer-state-ui.test.tsx`、`renderer.test.tsx` |
 | 冷 Session 准备、压缩取消及跨 Session 运行 | `tests/test_history_prepare_lifecycle.py`、`tests/test_desktop_bridge.py` |

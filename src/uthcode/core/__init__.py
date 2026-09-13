@@ -119,8 +119,6 @@ from .permission import (
 from .agent import (
     AgentExecutionSegment,
     AgentLoop,
-    AgentLoopConfig,
-    AgentLoopConfigError,
     AgentTurnExecution,
     AssistantMessageKind,
     RunSnapshot,
@@ -263,8 +261,6 @@ __all__ = [
     "AgentEventValue",
     "AgentExecutionSegment",
     "AgentLoop",
-    "AgentLoopConfig",
-    "AgentLoopConfigError",
     "AgentTurnExecution",
     "ASK_USER_TOOL_DEFINITION",
     "AssistantMessageCompleted",

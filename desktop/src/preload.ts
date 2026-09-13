@@ -106,6 +106,11 @@ export function installPreload(
       if (result !== null) requireJsonObject(result, "attachment clipboard response");
       return result as DesktopAttachmentInput | null;
     },
+    async authorizeExternalArtifact(): Promise<string | null> {
+      const result = await ipcRenderer.invoke("desktop.artifact.authorize-external");
+      if (result !== null) requireNonEmptyString(result, "authorized artifact path");
+      return result as string | null;
+    },
   });
   contextBridge.exposeInMainWorld("uthcode", api);
   return api;
