@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { LanguagePreference, ThemePreference } from "../desktop-api";
-import type { RendererState } from "./state";
+import type { ConfigurationLayer, RendererState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { useTranslation } from "./i18n";
 import { UiIcon } from "./UiIcon";
@@ -50,6 +50,17 @@ function generatedProviderId(draft: ConfigurationWrite): string {
   return id;
 }
 
+function settingText(value: unknown): string {
+  if (value === undefined || value === null) return "—";
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  return "—";
+}
+
+function effectiveLayer(configuration: RendererState["configuration"]): ConfigurationLayer | undefined {
+  return configuration?.effective ?? configuration ?? undefined;
+}
+
 export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeChange, onLanguageChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<ConfigurationWrite>(() => sourceConfig(state.configuration));
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
@@ -70,6 +81,12 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
   const { t } = useTranslation();
   const settingsBusy = state.settingsSaving;
   const settingsInteractionLocked = () => state.settingsSaving || settingsSaveStarted.current;
+  const effective = effectiveLayer(state.configuration);
+  const effectiveSearch = effective?.search ?? draft.search ?? {};
+  const effectiveLimits = effective?.tool_limits ?? draft.tool_limits ?? {};
+  const effectiveModelRef = typeof effective?.default_model === "string" ? effective.default_model : draft.default_model;
+  const effectiveModel = effectiveModelRef ? effective?.models?.[effectiveModelRef] : undefined;
+  const effectiveSource = state.configuration?.source ?? {};
 
   useEffect(() => {
     if (!state.configuration) return;
@@ -228,6 +245,13 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
         <section className={`settings-section${activeCategory === "defaults" ? "" : " settings-section--inactive"}`} id="settings-defaults" aria-labelledby="settings-defaults-title" aria-hidden={activeCategory !== "defaults" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">02</p><h2 id="settings-defaults-title">{t("defaults")}</h2></div></div>
           <div className="settings-row"><span className="settings-row__label">{t("permission")}</span><CustomSelect label={t("permission")} value={draft.default_permission_mode ?? "default"} options={[{ value: "default", label: t("default") }, { value: "auto", label: t("auto") }]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_permission_mode: value === "auto" ? "auto" : "default" })); }} disabled={settingsBusy} /></div>
           <div className="settings-row"><span className="settings-row__label">{t("defaultModel")}</span><CustomSelect label={t("defaultModel")} value={draft.default_model ?? ""} options={[{ value: "", label: "—" }, ...models.map(([ref, model]) => ({ value: ref, label: modelLabel(model, t("unnamedModel")) }))]} onChange={(value) => { if (!settingsInteractionLocked()) setDraft((current) => ({ ...current, default_model: value })); }} disabled={settingsBusy} /></div>
+          <div className="settings-effective" aria-label={t("effectiveSettings")}>
+            <p className="settings-row__group-label">{t("effectiveSettings")}</p>
+            <div className="settings-row"><span className="settings-row__label">{t("effectiveSearch")}</span><span className="settings-row__value">{t("webSearch")}: {settingText(effectiveSearch.enabled)} · {t("searchMaxResults")}: {settingText(effectiveSearch.max_results)} · {t("searchMaxBytes")}: {settingText(effectiveSearch.max_fetch_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.search ?? "default"}</small></span></div>
+            <div className="settings-row"><span className="settings-row__label">{t("effectiveVision")}</span><span className="settings-row__value">{settingText(effectiveModel?.supports_images)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.vision ?? "default"}</small></span></div>
+            <div className="settings-row"><span className="settings-row__label">{t("effectiveToolLimits")}</span><span className="settings-row__value">{t("toolOutputBytes")}: {settingText(effectiveLimits.output_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.tool_limits ?? "default"}</small></span></div>
+            <div className="settings-row"><span className="settings-row__label">{t("effectiveAttachmentLimits")}</span><span className="settings-row__value">{t("toolAttachmentBytes")}: {settingText(effectiveLimits.attachment_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.attachment_limits ?? "default"}</small></span></div>
+          </div>
           {(() => {
             const search = draft.search ?? {};
             const searchEnabled = search.enabled === true;
@@ -242,6 +266,27 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onThemeCha
               <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-max-results">{t("searchMaxResults")}</label><input id="settings-search-max-results" type="number" min={1} max={20} value={limitValue("max_results", 5)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1 && value <= 20) updateSearch("max_results", value); }} disabled={settingsBusy || state.activeTurn} /></div>
               <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-max-bytes">{t("searchMaxBytes")}</label><input id="settings-search-max-bytes" type="number" min={1024} max={16777216} value={limitValue("max_fetch_bytes", 2097152)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1024 && value <= 16777216) updateSearch("max_fetch_bytes", value); }} disabled={settingsBusy || state.activeTurn} /></div>
               <div className="settings-row"><label className="settings-row__label" htmlFor="settings-search-timeout">{t("searchTimeout")}</label><input id="settings-search-timeout" type="number" min={1} max={120} step={1} value={limitValue("timeout_seconds", 20)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1 && value <= 120) updateSearch("timeout_seconds", value); }} disabled={settingsBusy || state.activeTurn} /></div>
+            </div>;
+          })()}
+          {(() => {
+            const limits = draft.tool_limits ?? {};
+            const updateLimit = (field: string, value: unknown) => {
+              if (settingsInteractionLocked() || state.activeTurn) return;
+              setDraft((current) => ({
+                ...current,
+                tool_limits: { ...(current.tool_limits ?? {}), [field]: value },
+              }));
+            };
+            const numberValue = (field: string, fallback: number | string) => (
+              limits[field] === undefined || limits[field] === null
+                ? String(fallback)
+                : String(limits[field])
+            );
+            return <div className="settings-search" aria-label={t("toolLimits")}>
+              <p className="settings-row__group-label">{t("toolLimits")}</p>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-tool-timeout">{t("toolTimeout")}</label><input id="settings-tool-timeout" type="number" min={0.1} max={600} step={0.1} value={numberValue("timeout_seconds", "")} placeholder="—" onChange={(event) => { const raw = event.currentTarget.value; if (!raw.trim()) updateLimit("timeout_seconds", null); else { const value = Number(raw); if (Number.isFinite(value) && value > 0 && value <= 600) updateLimit("timeout_seconds", value); } }} disabled={settingsBusy || state.activeTurn} /></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-tool-output">{t("toolOutputBytes")}</label><input id="settings-tool-output" type="number" min={1024} max={16777216} step={1024} value={numberValue("output_bytes", 2097152)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value >= 1024 && value <= 16777216) updateLimit("output_bytes", value); }} disabled={settingsBusy || state.activeTurn} /></div>
+              <div className="settings-row"><label className="settings-row__label" htmlFor="settings-tool-attachment">{t("toolAttachmentBytes")}</label><input id="settings-tool-attachment" type="number" min={1} max={67108864} step={1024} value={numberValue("attachment_bytes", 16777216)} onChange={(event) => { const value = Number(event.currentTarget.value); if (Number.isInteger(value) && value > 0 && value <= 67108864) updateLimit("attachment_bytes", value); }} disabled={settingsBusy || state.activeTurn} /></div>
             </div>;
           })()}
         </section>

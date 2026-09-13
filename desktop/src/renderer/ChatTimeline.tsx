@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
 import type { ProcessLogEntry, ProcessReaderState, TimelineEntry, TodoItem } from "./state";
+import type { ArtifactDescriptor } from "../desktop-api";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon, type UiIconName } from "./UiIcon";
 import { renderMarkdown } from "./safe-markdown";
@@ -33,6 +34,11 @@ export interface ChatTimelineProps {
   onOpenSettings?: () => void;
   /** Narrow main-process clipboard adapter shared with Session ID copy. */
   onCopyText?: (text: string) => Promise<void>;
+  onOpenArtifact?: (path: string) => Promise<void>;
+  onDescribeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  onAuthorizeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  onRevealArtifact?: (path: string) => Promise<void>;
+  onPreviewArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
   /** Changes only when a Session/Project view is replaced, not on streaming. */
   sessionKey?: string;
   /** Request an older durable page when the reader reaches the top. */
@@ -117,10 +123,11 @@ function timelineContentFingerprint(entries: TimelineEntry[], notice: string | n
   });
 }
 
-export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
+  const [artifacts, setArtifacts] = useState<Record<string, ArtifactDescriptor>>({});
   const timelineRef = useRef<HTMLElement>(null);
   const followTail = useRef(true);
   const previousSessionKey = useRef<string | null>(null);
@@ -128,6 +135,30 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
   const previousHistoryRevision = useRef(historyRevision);
   const prependAnchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const contentFingerprint = timelineContentFingerprint(entries, JSON.stringify([notice, compactionNotice]), runtimeError, runtimeErrorVisible);
+
+  useEffect(() => {
+    setArtifacts({});
+  }, [sessionKey]);
+
+  const describeArtifact = async (path: string): Promise<ArtifactDescriptor | null> => {
+    const cached = artifacts[path];
+    if (cached) return cached;
+    const descriptor = await onDescribeArtifact?.(path);
+    if (descriptor) setArtifacts((current) => ({ ...current, [path]: descriptor }));
+    return descriptor ?? null;
+  };
+
+  const authorizeArtifact = async (path: string): Promise<ArtifactDescriptor | null> => {
+    const descriptor = await onAuthorizeArtifact?.(path);
+    if (descriptor) setArtifacts((current) => ({ ...current, [descriptor.path]: descriptor }));
+    return descriptor ?? null;
+  };
+
+  const previewArtifact = async (path: string): Promise<ArtifactDescriptor | null> => {
+    const descriptor = await onPreviewArtifact?.(path);
+    if (descriptor) setArtifacts((current) => ({ ...current, [path]: { ...current[path], ...descriptor } }));
+    return descriptor ?? null;
+  };
 
   useLayoutEffect(() => {
     const element = timelineRef.current;
@@ -284,7 +315,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
         const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
         return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
           <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small className="tool-status" data-status={status} data-error={entry.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null && <span className="tool-elapsed" aria-label={`${elapsed}s`}> · {elapsed}s</span>}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
-          <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText }) : renderMarkdown(entry.text, { onCopyText })}{renderAttachmentRows(entry, t)}</div>
+          <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, artifacts })}{renderAttachmentRows(entry, t)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
       {todo.length > 0 && <section className="todo-strip" tabIndex={0} aria-label={t("tasks")}><header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status} title={item.content} aria-label={`${item.content}: ${todoStatusLabel(item.status, t)}`}><span className="todo-status-icon" aria-hidden="true"><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span><span>{item.content}</span><span className="sr-only">{todoStatusLabel(item.status, t)}</span></li>)}</ul></section>}

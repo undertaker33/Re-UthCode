@@ -75,6 +75,8 @@ class LoadedConfigData:
     # keeps only immutable facts; the resolved SecretValue is never projected
     # by the loader's safe view.
     search: Mapping[str, object] = MappingProxyType({})
+    tool_limits: Mapping[str, object] = MappingProxyType({})
+    field_sources: Mapping[str, LoadedConfigSource] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         if not isinstance(self.default_model, str) or not self.default_model.strip():
@@ -84,6 +86,11 @@ class LoadedConfigData:
         if not isinstance(self.search, Mapping):
             raise TypeError("search must be a mapping")
         object.__setattr__(self, "search", _freeze(self.search, field="search"))
+        if not isinstance(self.tool_limits, Mapping):
+            raise TypeError("tool_limits must be a mapping")
+        object.__setattr__(self, "tool_limits", _freeze(self.tool_limits, field="tool_limits"))
+        if not isinstance(self.field_sources, Mapping):
+            raise TypeError("field_sources must be a mapping")
         object.__setattr__(
             self,
             "providers",
@@ -98,6 +105,13 @@ class LoadedConfigData:
         if not all(isinstance(source, LoadedConfigSource) for source in sources):
             raise TypeError("sources must contain LoadedConfigSource values")
         object.__setattr__(self, "sources", sources)
+        field_sources = dict(self.field_sources)
+        if not all(
+            isinstance(key, str) and isinstance(source, LoadedConfigSource)
+            for key, source in field_sources.items()
+        ):
+            raise TypeError("field_sources must map names to LoadedConfigSource values")
+        object.__setattr__(self, "field_sources", MappingProxyType(field_sources))
 
 
 __all__ = ["LoadedConfigData", "LoadedConfigSource"]

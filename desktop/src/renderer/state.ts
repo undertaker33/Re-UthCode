@@ -279,12 +279,22 @@ export interface CommandCandidate {
   matched_alias?: string | null;
 }
 
-export interface ConfigurationView {
+export interface ConfigurationLayer {
   default_model?: string;
   default_permission_mode?: string;
   providers?: Record<string, Record<string, JsonValue>>;
   models?: Record<string, Record<string, JsonValue>>;
   search?: Record<string, JsonValue>;
+  tool_limits?: Record<string, JsonValue>;
+}
+
+export interface ConfigurationView extends ConfigurationLayer {
+  /** Writable user values retained for the settings draft. */
+  configured?: ConfigurationLayer;
+  /** Workdir-merged values used at the next safe Application boundary. */
+  effective?: ConfigurationLayer;
+  /** Source layer for the values shown in the effective projection. */
+  source?: Record<string, string>;
 }
 
 export interface RendererState {

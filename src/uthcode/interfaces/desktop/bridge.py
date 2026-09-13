@@ -25,6 +25,7 @@ from uuid import uuid4
 
 from uthcode.application import (
     AgentEvent,
+    ArtifactError,
     AttachmentError,
     AttachmentReference,
     agent_event_from_dict,
@@ -115,6 +116,10 @@ _METHODS = frozenset(
         "attachment.import",
         "attachment.preview",
         "attachment.remove",
+        "artifact.describe",
+        "artifact.preview",
+        "artifact.open",
+        "artifact.reveal",
         "process.list",
         "process.read",
         "process.write",
@@ -282,6 +287,7 @@ _CONFIGURATION_OUTPUT_FIELDS = (
     "providers",
     "models",
     "search",
+    "tool_limits",
 )
 _PAUSE_OUTPUT_FIELDS = (
     "pause_id",
@@ -526,6 +532,87 @@ def _application_status(value: object) -> dict[str, object] | None:
 
 def _configuration(value: object) -> dict[str, object] | None:
     return _dto_fields(value, UserConfigurationView, _CONFIGURATION_OUTPUT_FIELDS)
+
+
+def _effective_configuration(value: object) -> dict[str, object] | None:
+    if type(value) is not EffectiveConfig:
+        return None
+    providers: dict[str, object] = {}
+    for profile_id, profile in value.providers.items():
+        kind = getattr(profile.kind, "value", profile.kind)
+        providers[profile_id] = {
+            "provider_profile_id": profile.provider_profile_id,
+            "kind": kind,
+            "base_url": profile.base_url,
+            "display_name": profile.display_name,
+            "api_key_configured": profile.api_key is not None,
+        }
+    models: dict[str, object] = {}
+    for model_ref, profile in value.models.items():
+        models[model_ref] = {
+            "model_ref": profile.model_ref,
+            "provider_profile_id": profile.provider_profile_id,
+            "remote_id": profile.remote_id,
+            "display_name": profile.display_name,
+            "context_window": profile.context_window,
+            "max_output_tokens": profile.max_output_tokens,
+            "reasoning_effort": profile.reasoning_effort,
+            "supports_images": profile.supports_images,
+        }
+    return {
+        "default_model": value.default_model,
+        "default_permission_mode": value.default_permission_mode.value,
+        "providers": providers,
+        "models": models,
+        "search": value.search.to_dict(),
+        "tool_limits": value.tool_limits.to_dict(),
+    }
+
+
+def _source_kind(value: EffectiveConfig, *fields: str) -> str:
+    for field in fields:
+        source = value.field_sources.get(field)
+        if source is not None:
+            return source.kind
+    return "default"
+
+
+def _configuration_source_projection(value: EffectiveConfig) -> dict[str, str]:
+    model_field = f"model.{value.default_model}.supports_images"
+    return {
+        "search": _source_kind(
+            value,
+            "search.enabled",
+            "search.max_results",
+            "search.max_fetch_bytes",
+            "search.timeout_seconds",
+        ),
+        "vision": _source_kind(value, model_field),
+        "tool_limits": _source_kind(
+            value,
+            "tool_limits.timeout_seconds",
+            "tool_limits.output_bytes",
+            "tool_limits.attachment_bytes",
+        ),
+        "attachment_limits": _source_kind(value, "tool_limits.attachment_bytes"),
+    }
+
+
+def _settings_configuration(
+    configured: object,
+    effective: object,
+) -> dict[str, object] | None:
+    configured_value = _configuration(configured)
+    if configured_value is None:
+        configured_value = {}
+    result: dict[str, object] = dict(configured_value)
+    result["configured"] = dict(configured_value)
+    if isinstance(effective, EffectiveConfig):
+        projected = _effective_configuration(effective)
+        if projected is not None:
+            result["effective"] = projected
+            result["source"] = _configuration_source_projection(effective)
+    return result
 
 
 def _strings(value: object, *, non_empty: bool = False) -> list[str] | None:
@@ -1452,6 +1539,8 @@ class DesktopBridge:
             return await self._attachment_preview(params)
         if method == "attachment.remove":
             return await self._attachment_remove(params)
+        if method in {"artifact.describe", "artifact.preview", "artifact.open", "artifact.reveal"}:
+            return await self._artifact_request(method, params)
         if method == "process.list":
             return await self._process_list(params)
         if method == "process.read":
@@ -1499,7 +1588,12 @@ class DesktopBridge:
                 raise BridgeError("configuration_required", "user configuration is not initialized") from None
             except ConfigurationError:
                 raise BridgeError("configuration_error", "user configuration is invalid") from None
-            return {"configuration": _configuration(view)}
+            return {
+                "configuration": _settings_configuration(
+                    view,
+                    self._load_settings_effective(),
+                )
+            }
         if method == "settings.reveal_api_key":
             return await self._settings_reveal_api_key(params)
         if method == "settings.save":
@@ -2573,6 +2667,44 @@ class DesktopBridge:
             raise BridgeError("attachment_error", "attachment could not be removed") from None
         return {"removed": True, "ref": ref, "session_id": session_id}
 
+    async def _artifact_request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        allowed = {"path", "authorized_external"}
+        if "path" not in params:
+            raise BridgeError("invalid_request", f"{method} is missing fields: ['path']")
+        extra = set(params) - allowed
+        if extra:
+            raise BridgeError("invalid_request", f"{method} has unknown fields: {sorted(extra)!r}")
+        path = _text_param(params, "path")
+        authorized_external = params.get("authorized_external", False)
+        if not isinstance(authorized_external, bool):
+            raise BridgeError("invalid_request", "authorized_external must be a boolean")
+        application = self._require_application()
+        try:
+            if method == "artifact.preview":
+                artifact = application.preview_artifact(
+                    path,
+                    authorized_external=authorized_external,
+                )
+            else:
+                artifact = application.describe_artifact(
+                    path,
+                    authorized_external=authorized_external,
+                )
+        except ArtifactError as exc:
+            raise BridgeError(exc.code, "artifact action is unavailable") from None
+        except (RuntimeError, ValueError, TypeError):
+            raise BridgeError("artifact_unavailable", "artifact action is unavailable") from None
+        if not isinstance(artifact, Mapping):
+            raise BridgeError("artifact_unavailable", "artifact descriptor is invalid")
+        return {
+            "artifact": _json_safe(dict(artifact)),
+            "action": method.removeprefix("artifact."),
+        }
+
     def _process_application(self) -> object:
         application = self._require_application()
         if self._current_compaction_operation() is not None:
@@ -3380,6 +3512,19 @@ class DesktopBridge:
         elif command == "help":
             result["code"] = "help_ready"
 
+    def _load_settings_effective(self) -> EffectiveConfig | None:
+        try:
+            configuration = (
+                self._config_loader(self._workdir)
+                if self._config_loader is not None
+                else load_effective_config(cwd=self._workdir, home=self._home)
+            )
+        except (ConfigurationInitializationRequired, ConfigurationError):
+            return None
+        except Exception:
+            return None
+        return configuration if isinstance(configuration, EffectiveConfig) else None
+
     async def _settings_save(self, params: Mapping[str, object]) -> dict[str, object]:
         configuration_fields = {
             "default_model",
@@ -3387,6 +3532,7 @@ class DesktopBridge:
             "providers",
             "models",
             "search",
+            "tool_limits",
             "provider_renames",
         }
         if "request" in params:
@@ -3447,7 +3593,12 @@ class DesktopBridge:
                     "configuration_error",
                     "configuration update could not be activated",
                 ) from None
-        return {"configuration": _configuration(view)}
+        return {
+            "configuration": _settings_configuration(
+                view,
+                self._load_settings_effective(),
+            )
+        }
 
     async def _settings_reveal_api_key(
         self,

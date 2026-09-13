@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from asyncio import CancelledError, sleep
+import hashlib
 import inspect
 import json
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -138,6 +140,16 @@ _UNFINISHED_TASKS_FEEDBACK = (
     "Known execution tasks remain unfinished. Continue the work or replace "
     "the complete task state before submitting a final answer."
 )
+_RUNAWAY_CORRECTION_FEEDBACK = (
+    "Recent tool observations show a repeated failure or short cycle. "
+    "Change the action, inspect new evidence, or update the authoritative task state "
+    "before continuing."
+)
+
+_DEFAULT_MAX_TOOL_CALLS_PER_ITERATION = 16
+_DEFAULT_MAX_CONSECUTIVE_UNKNOWN_TOOLS = 3
+_RUNAWAY_OBSERVATION_WINDOW = 24
+_TRANSPORT_SIGNATURE_KEYS = frozenset({"tool_call_id"})
 
 
 class _SegmentEventBuffer(list[AgentEvent]):
@@ -178,10 +190,6 @@ def _encode(value: object) -> object:
     raise TypeError(f"value of type {type(value).__name__} is not JSON-safe")
 
 
-class AgentLoopConfigError(ValueError):
-    """Invalid Agent policy configuration."""
-
-
 class PersistenceUnavailableError(RuntimeError):
     """A stable Application fact that closed Turn state is not durable."""
 
@@ -190,25 +198,273 @@ class _ResponseRejected(ValueError):
     """A response did not match the current continuation facts."""
 
 
-@dataclass(frozen=True, slots=True)
-class AgentLoopConfig:
-    """Business limits for one explicit Agent Loop."""
+def _require_positive_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
 
-    max_iterations: int = 50
-    max_tool_calls_per_iteration: int = 16
-    max_consecutive_unknown_tools: int = 3
 
-    def __post_init__(self) -> None:
-        for field_name in (
-            "max_iterations",
-            "max_tool_calls_per_iteration",
-            "max_consecutive_unknown_tools",
-        ):
-            value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{field_name} must be a positive integer")
-            if value <= 0:
-                raise AgentLoopConfigError(f"{field_name} must be a positive integer")
+def _signature_value(value: object) -> object:
+    """Return a stable, bounded-shape value for anomaly fingerprints.
+
+    The detector stores only digests, never action arguments or Tool output.
+    Transport identifiers are deliberately excluded while all other semantic
+    parameters remain part of the fingerprint.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _signature_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _TRANSPORT_SIGNATURE_KEYS
+        }
+    if isinstance(value, (tuple, list)):
+        return [_signature_value(item) for item in value]
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        return value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _signature_value(to_dict())
+        except Exception:
+            return type(value).__name__
+    return str(value)
+
+
+def _signature_digest(value: object) -> str:
+    payload = json.dumps(
+        _signature_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class _AnomalyDecision(str, Enum):
+    NONE = "none"
+    CORRECT = "correct"
+    STOP = "stop"
+
+
+class _RunawayDetector:
+    """Bounded evidence detector for repeated Tool/final-answer behaviour."""
+
+    __slots__ = (
+        "_observations",
+        "_last_success_by_action",
+        "_failure_key",
+        "_failure_count",
+        "_failure_corrected",
+        "_cycle_key",
+        "_cycle_repetitions",
+        "_cycle_corrected",
+        "_final_key",
+        "_final_count",
+        "_final_corrected",
+    )
+
+    def __init__(self) -> None:
+        self._observations: deque[tuple[str, str]] = deque(maxlen=_RUNAWAY_OBSERVATION_WINDOW)
+        self._last_success_by_action: dict[str, str] = {}
+        self._failure_key: str | None = None
+        self._failure_count = 0
+        self._failure_corrected = False
+        self._cycle_key: tuple[int, tuple[tuple[str, str], ...]] | None = None
+        self._cycle_repetitions = 0
+        self._cycle_corrected = False
+        self._final_key: str | None = None
+        self._final_count = 0
+        self._final_corrected = False
+
+    def reset_suspicion(self) -> None:
+        """Forget anomaly evidence after a new valid user/tool fact."""
+
+        self._observations.clear()
+        self._failure_key = None
+        self._failure_count = 0
+        self._failure_corrected = False
+        self._cycle_key = None
+        self._cycle_repetitions = 0
+        self._cycle_corrected = False
+        self._final_key = None
+        self._final_count = 0
+        self._final_corrected = False
+
+    @staticmethod
+    def _failure_signature(result: ToolResultPart) -> str:
+        metadata = result.metadata
+        failure = metadata.get("failure") if isinstance(metadata, Mapping) else None
+        if isinstance(failure, Mapping) and isinstance(failure.get("kind"), str):
+            return failure["kind"]
+        return _signature_digest(result)
+
+    @staticmethod
+    def _is_idle_process_read(call: ToolCallPart, result: ToolResultPart) -> bool:
+        if call.name != "Process" or result.is_error:
+            return False
+        action = call.arguments.get("action", call.arguments.get("operation"))
+        if action != "read":
+            return False
+        metadata = result.metadata
+        if metadata.get("process_state") != "running":
+            return False
+        entries = metadata.get("entries")
+        return isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, bytearray)) and not entries
+
+    @staticmethod
+    def _has_effective_evidence(call: ToolCallPart, result: ToolResultPart) -> bool:
+        """Recognize concrete progress facts that clear anomaly evidence.
+
+        A successful Tool result is not progress by itself.  The Integration
+        must mark a confirmed file change/read, or Process must expose output
+        or a terminal state.  This keeps model claims, heartbeats, and no-op
+        rewrites inside the existing suspicion window.
+        """
+
+        if result.is_error or not isinstance(result.metadata, Mapping):
+            return False
+        metadata = result.metadata
+        evidence = metadata.get("evidence")
+        if evidence == "read_content":
+            return isinstance(metadata.get("content_digest"), str)
+        if evidence == "file_change":
+            return metadata.get("changed") is True
+        if call.name != "Process":
+            return False
+        action = call.arguments.get("action", call.arguments.get("operation"))
+        if action != "read":
+            return False
+        entries = metadata.get("entries")
+        if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, bytearray)) and entries:
+            return True
+        process_state = metadata.get("process_state")
+        return isinstance(process_state, str) and process_state != "running"
+
+    @staticmethod
+    def _result_signature(result: ToolResultPart) -> str:
+        """Fingerprint a result while keeping repeated read content stable."""
+
+        metadata = result.metadata
+        if isinstance(metadata, Mapping) and metadata.get("evidence") == "read_content":
+            digest = metadata.get("content_digest")
+            if isinstance(digest, str):
+                return _signature_digest({"evidence": "read_content", "content_digest": digest})
+        return _signature_digest(result)
+
+    def _record_cycle(self, token: tuple[str, str]) -> _AnomalyDecision:
+        self._observations.append(token)
+        candidate: tuple[int, tuple[tuple[str, str], ...], int] | None = None
+        values = tuple(self._observations)
+        for length in range(1, 5):
+            if len(values) < length * 3:
+                continue
+            block = values[-length:]
+            repetitions = 1
+            while len(values) >= (repetitions + 1) * length and values[-(repetitions + 1) * length : -repetitions * length] == block:
+                repetitions += 1
+            if repetitions >= 3:
+                candidate = (length, block, repetitions)
+                break
+        if candidate is None:
+            self._cycle_key = None
+            self._cycle_repetitions = 0
+            self._cycle_corrected = False
+            return _AnomalyDecision.NONE
+        length, block, repetitions = candidate
+        # A repeated cycle may be observed at any phase boundary (for
+        # example ``a,b,a,b`` and ``b,a,b,a``).  Canonicalise rotations so a
+        # transport boundary does not reset the same semantic evidence.
+        rotations = tuple(block[offset:] + block[:offset] for offset in range(length))
+        key = (length, min(rotations))
+        if key != self._cycle_key:
+            self._cycle_key = key
+            self._cycle_repetitions = repetitions
+            self._cycle_corrected = False
+        elif repetitions > self._cycle_repetitions:
+            self._cycle_repetitions = repetitions
+        if self._cycle_repetitions >= 3 and not self._cycle_corrected:
+            self._cycle_corrected = True
+            return _AnomalyDecision.CORRECT
+        if self._cycle_repetitions >= 5 and self._cycle_corrected:
+            return _AnomalyDecision.STOP
+        return _AnomalyDecision.NONE
+
+    def record_tool(self, call: ToolCallPart, result: ToolResultPart) -> _AnomalyDecision:
+        """Record one closed Tool result and return the next control action."""
+
+        if self._is_idle_process_read(call, result):
+            return _AnomalyDecision.NONE
+
+        action_key = call.name + ":" + _signature_digest(call.arguments)
+        # Ignore transport-only result IDs alongside the call ID; result
+        # content and metadata remain semantic evidence.
+        result_key = self._result_signature(result)
+        token = (action_key, result_key)
+
+        if not result.is_error:
+            previous = self._last_success_by_action.get(action_key)
+            if self._has_effective_evidence(call, result):
+                metadata = result.metadata
+                is_read_content = (
+                    isinstance(metadata, Mapping)
+                    and metadata.get("evidence") == "read_content"
+                )
+                # A repeated ReadFile with the same confirmed content is only
+                # re-observation.  The first read and a changed digest are
+                # fresh facts; file changes and Process output/terminal facts
+                # retain their existing evidence semantics.
+                if not is_read_content or previous is None or previous != result_key:
+                    self.reset_suspicion()
+            # A changed result for an already observed action is new evidence
+            # and clears suspicion.  The first observation of another action
+            # remains part of the bounded cycle window so alternating actions
+            # can still reach the short-cycle threshold.
+            if previous is not None and previous != result_key:
+                self.reset_suspicion()
+            if previous is None and len(self._last_success_by_action) >= _RUNAWAY_OBSERVATION_WINDOW:
+                self._last_success_by_action.pop(next(iter(self._last_success_by_action)))
+            self._last_success_by_action[action_key] = result_key
+            self._failure_key = None
+            self._failure_count = 0
+            self._failure_corrected = False
+        else:
+            failure_key = action_key + ":" + self._failure_signature(result)
+            if failure_key == self._failure_key:
+                self._failure_count += 1
+            else:
+                self._failure_key = failure_key
+                self._failure_count = 1
+                self._failure_corrected = False
+            if self._failure_count >= 3 and not self._failure_corrected:
+                self._failure_corrected = True
+                self._record_cycle(token)
+                return _AnomalyDecision.CORRECT
+            if self._failure_count >= 5 and self._failure_corrected:
+                return _AnomalyDecision.STOP
+
+        cycle_decision = self._record_cycle(token)
+        if cycle_decision is _AnomalyDecision.STOP:
+            return cycle_decision
+        return cycle_decision
+
+    def record_final_block(self, task_signature: object, plan_signature: object) -> _AnomalyDecision:
+        key = _signature_digest({"task": task_signature, "plan": plan_signature})
+        if key == self._final_key:
+            self._final_count += 1
+        else:
+            self._final_key = key
+            self._final_count = 1
+            self._final_corrected = False
+        if self._final_count >= 3 and not self._final_corrected:
+            self._final_corrected = True
+            return _AnomalyDecision.CORRECT
+        if self._final_count >= 5 and self._final_corrected:
+            return _AnomalyDecision.STOP
+        return _AnomalyDecision.NONE
 
 
 class RunStatus(str, Enum):
@@ -822,7 +1078,8 @@ class AgentLoop:
         tool_executor: ToolExecutor,
         request_preparer: RequestPreparer,
         *,
-        config: AgentLoopConfig | None = None,
+        max_tool_calls_per_iteration: int = _DEFAULT_MAX_TOOL_CALLS_PER_ITERATION,
+        max_consecutive_unknown_tools: int = _DEFAULT_MAX_CONSECUTIVE_UNKNOWN_TOOLS,
         tool_call_describer: ToolCallDescriber | None = None,
         permission_resolver: PermissionResolver | None = None,
         session_grant_sink: SessionGrantSink | None = None,
@@ -838,10 +1095,14 @@ class AgentLoop:
             raise TypeError("tool_executor must be ToolExecutor")
         if not callable(request_preparer):
             raise TypeError("request_preparer must be callable")
-        if config is None:
-            config = AgentLoopConfig()
-        if not isinstance(config, AgentLoopConfig):
-            raise TypeError("config must be AgentLoopConfig")
+        self._max_tool_calls_per_iteration = _require_positive_int(
+            max_tool_calls_per_iteration,
+            "max_tool_calls_per_iteration",
+        )
+        self._max_consecutive_unknown_tools = _require_positive_int(
+            max_consecutive_unknown_tools,
+            "max_consecutive_unknown_tools",
+        )
         if tool_call_describer is not None and not callable(tool_call_describer):
             raise TypeError("tool_call_describer must be callable or None")
         if permission_resolver is not None and not callable(permission_resolver):
@@ -858,7 +1119,6 @@ class AgentLoop:
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
         self._request_preparer = request_preparer
-        self._config = config
         self._tool_call_describer = tool_call_describer
         self._permission_resolver = permission_resolver
         self._session_grant_sink = session_grant_sink
@@ -867,8 +1127,12 @@ class AgentLoop:
         self._tool_progress_projector = tool_progress_projector
 
     @property
-    def config(self) -> AgentLoopConfig:
-        return self._config
+    def max_tool_calls_per_iteration(self) -> int:
+        return self._max_tool_calls_per_iteration
+
+    @property
+    def max_consecutive_unknown_tools(self) -> int:
+        return self._max_consecutive_unknown_tools
 
     def start_turn(
         self,
@@ -953,6 +1217,7 @@ class AgentTurnExecution:
         "_pending_steering",
         "_steering_requested_emitted",
         "_overflow_retry_used",
+        "_runaway_detector",
     )
 
     def __init__(
@@ -987,6 +1252,7 @@ class AgentTurnExecution:
         self._pending_steering: SteeringRequest | None = None
         self._steering_requested_emitted = False
         self._overflow_retry_used = False
+        self._runaway_detector = _RunawayDetector()
 
     @property
     def state(self) -> RunState:
@@ -1196,7 +1462,13 @@ class AgentTurnExecution:
                         return self._cancel_segment(events)
                     if batch_status == "internal_error":
                         return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
-                    if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
+                    if batch_status == "runaway_detected":
+                        return self._fail_segment(
+                            events,
+                            TerminationReason.RUNAWAY_DETECTED,
+                            FailureReason.RUNAWAY_DETECTED,
+                        )
+                    if self._state.consecutive_unknown_tools >= self._loop.max_consecutive_unknown_tools:
                         return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
                     continue
 
@@ -1204,8 +1476,6 @@ class AgentTurnExecution:
                     iteration = continuation.iteration
                 else:
                     iteration = self._state.iteration_count + 1
-                if iteration > self._loop.config.max_iterations:
-                    return self._fail_segment(events, TerminationReason.MAX_ITERATIONS)
                 if self._state.iteration_count < iteration:
                     self._set_state(iteration_count=iteration)
                     self._append(
@@ -1424,10 +1694,18 @@ class AgentTurnExecution:
                     and self._state.behavior_mode is BehaviorMode.DEFAULT
                     and self._state.task_state.has_unfinished
                 ):
+                    final_decision = self._runaway_detector.record_final_block(
+                        self._state.task_state.to_json(),
+                        self._state.plan_state.to_json() if self._state.plan_state is not None else None,
+                    )
                     self._set_state(
                         runtime_feedback=RuntimeFeedback(
                             RuntimeFeedbackKind.COMPLETION_BLOCKED,
-                            _UNFINISHED_TASKS_FEEDBACK,
+                            (
+                                _RUNAWAY_CORRECTION_FEEDBACK
+                                if final_decision is _AnomalyDecision.CORRECT
+                                else _UNFINISHED_TASKS_FEEDBACK
+                            ),
                         )
                     )
                     self._append(
@@ -1440,6 +1718,12 @@ class AgentTurnExecution:
                         ),
                     )
                     self._continuation = None
+                    if final_decision is _AnomalyDecision.STOP:
+                        return self._fail_segment(
+                            events,
+                            TerminationReason.RUNAWAY_DETECTED,
+                            FailureReason.RUNAWAY_DETECTED,
+                        )
                     continue
 
                 for delta_text in buffered_text_deltas:
@@ -1487,7 +1771,7 @@ class AgentTurnExecution:
                             return self._cancel_segment(events)
                     return self._fail_segment(events, TerminationReason.MAX_OUTPUT_TOKENS)
 
-                if len(calls) > self._loop.config.max_tool_calls_per_iteration:
+                if len(calls) > self._loop.max_tool_calls_per_iteration:
                     self._begin_tool_batch(calls, iteration, provider_response.message, events)
                     self._batch_control_reason = "Error: tool call limit exceeded"
                     batch_status = await self._run_tool_batch(events, pause_signal)
@@ -1507,9 +1791,15 @@ class AgentTurnExecution:
                         TerminationReason.SIDE_EFFECT_UNKNOWN,
                         FailureReason.TOOL_SIDE_EFFECT_UNKNOWN,
                     )
+                if batch_status == "runaway_detected":
+                    return self._fail_segment(
+                        events,
+                        TerminationReason.RUNAWAY_DETECTED,
+                        FailureReason.RUNAWAY_DETECTED,
+                    )
                 if batch_status == "internal_error":
                     return self._fail_segment(events, TerminationReason.INTERNAL_ERROR)
-                if self._state.consecutive_unknown_tools >= self._loop.config.max_consecutive_unknown_tools:
+                if self._state.consecutive_unknown_tools >= self._loop.max_consecutive_unknown_tools:
                     return self._fail_segment(events, TerminationReason.CONSECUTIVE_UNKNOWN_TOOLS)
         except CancelledError:
             self._cancellation.cancel()
@@ -1559,6 +1849,7 @@ class AgentTurnExecution:
         request = self._pending_steering
         if request is None:
             return False
+        self._runaway_detector.reset_suspicion()
         self._emit_steering_requested(events)
         self._set_state(
             messages=self._state.messages
@@ -1775,6 +2066,7 @@ class AgentTurnExecution:
                 content=request.answers_to_json(response.answers),
                 is_error=False,
             )
+            self._runaway_detector.reset_suspicion()
             self._continuation = replace(
                 continuation,
                 completed_tool_results=continuation.completed_tool_results + (result,),
@@ -2387,6 +2679,72 @@ class AgentTurnExecution:
         )
         self._close_tool_batch(events, status="side_effect_unknown")
 
+    def _close_runaway_tools(self, events: list[AgentEvent]) -> None:
+        """Close the FIFO tail after bounded anomaly evidence requests a stop."""
+
+        continuation = self._continuation
+        if continuation is None or continuation.stage != "tool_batch":
+            return
+        results = list(continuation.completed_tool_results)
+        index = continuation.next_tool_index
+        batch_id = self._require_batch_id()
+        while index < len(continuation.tool_calls):
+            call = continuation.tool_calls[index]
+            known = (
+                call.name == ASK_USER_TOOL_DEFINITION.name and self._ask_enabled()
+            ) or (
+                call.name == TODO_WRITE_TOOL_DEFINITION.name and self._todo_enabled()
+            ) or call.name == PROPOSE_PLAN_TOOL_DEFINITION.name or self._loop._tool_registry.get(call.name) is not None
+            command = self._safe_command(call, known=known)
+            self._append(
+                events,
+                ToolStarted(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                ),
+            )
+            results.append(
+                ToolResultPart(
+                    call.tool_call_id,
+                    "Error: tool call not executed after runaway behaviour was detected",
+                    True,
+                    {
+                        "failure": {
+                            "kind": ToolFailureKind.NOT_EXECUTED.value,
+                            "retryable": False,
+                        },
+                        "side_effect": ToolSideEffect.NONE.value,
+                    },
+                )
+            )
+            self._append(
+                events,
+                ToolFinished(
+                    self._state.run_id,
+                    self._state.turn_id,
+                    continuation.iteration,
+                    batch_id,
+                    call.tool_call_id,
+                    call.name,
+                    command,
+                    "not_executed",
+                    True,
+                ),
+            )
+            index += 1
+        self._continuation = replace(
+            continuation,
+            completed_tool_results=tuple(results),
+            next_tool_index=index,
+            pending_pause=None,
+        )
+        self._close_tool_batch(events, status="runaway_detected")
+
     def _close_stale_tools_for_steering(self, events: list[AgentEvent]) -> None:
         """Close every not-yet-started call without executing stale side effects."""
 
@@ -2553,7 +2911,10 @@ class AgentTurnExecution:
                             controlled = True
                             status = "failed"
                         else:
+                            previous_task_state = self._state.task_state
                             self._set_state(task_state=task_state)
+                            if task_state != previous_task_state:
+                                self._runaway_detector.reset_suspicion()
                             self._append(
                                 events,
                                 TaskStateChanged(
@@ -2597,7 +2958,10 @@ class AgentTurnExecution:
                                 else self._state.plan_state.revision + 1
                             )
                             plan_state = PlanState(revision, plan_text)
+                            previous_plan_state = self._state.plan_state
                             self._set_state(plan_state=plan_state)
+                            if plan_state != previous_plan_state:
+                                self._runaway_detector.reset_suspicion()
                             self._append(
                                 events,
                                 PlanProposed(
@@ -2850,6 +3214,17 @@ class AgentTurnExecution:
             if status == "unknown":
                 self._close_unknown_side_effect_tools(events)
                 return "side_effect_unknown"
+            runaway_decision = self._runaway_detector.record_tool(call, result)
+            if runaway_decision is _AnomalyDecision.CORRECT:
+                self._set_state(
+                    runtime_feedback=RuntimeFeedback(
+                        RuntimeFeedbackKind.COMPLETION_BLOCKED,
+                        _RUNAWAY_CORRECTION_FEEDBACK,
+                    )
+                )
+            elif runaway_decision is _AnomalyDecision.STOP:
+                self._close_runaway_tools(events)
+                return "runaway_detected"
             await sleep(0)
             if self._cancellation.cancelled:
                 self._cancel_remaining_tools(events)
@@ -2870,8 +3245,6 @@ class AgentTurnExecution:
         self._close_tool_batch(events, status="failed" if control_reason is not None else "finished")
         if control_reason is None and pause_signal.cancelled and self._terminal_result is None:
             next_iteration = self._state.iteration_count + 1
-            if next_iteration > self._loop.config.max_iterations:
-                return "finished"
             self._set_provider_continuation(next_iteration)
             self._pause_user_segment(events, next_iteration)
             return "paused"
@@ -2917,6 +3290,8 @@ class AgentTurnExecution:
                 failure_reason = FailureReason.INTERNAL
             elif reason is TerminationReason.INVALID_PROVIDER_RESPONSE:
                 failure_reason = FailureReason.INVALID_PROVIDER_RESPONSE
+            elif reason is TerminationReason.RUNAWAY_DETECTED:
+                failure_reason = FailureReason.RUNAWAY_DETECTED
         self._set_terminal(RunStatus.FAILED, reason, None, failure_reason)
         self._append(
             events,
@@ -2993,8 +3368,6 @@ class AgentTurnExecution:
 __all__ = [
     "AgentExecutionSegment",
     "AgentLoop",
-    "AgentLoopConfig",
-    "AgentLoopConfigError",
     "AgentTurnExecution",
     "AssistantMessageKind",
     "ExecutionBoundary",

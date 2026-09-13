@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-import locale
 import os
 import re
 import shlex
@@ -39,10 +38,17 @@ from uthcode.integrations.permissions import (
     is_sensitive_resource,
 )
 
-from .process_sessions import ProcessSessionError, ProcessSessionManager
+from .process_sessions import (
+    ProcessSessionError,
+    ProcessSessionManager,
+    _windows_output_encodings,
+)
 
 
 _CANCELLED = "Error: command cancelled"
+_MIN_PROCESS_READ_WAIT_MS = 50
+_DEFAULT_PROCESS_READ_WAIT_MS = 1000
+_MAX_PROCESS_READ_WAIT_MS = 60000
 _REAP_TIMEOUT_SECONDS = 5.0
 _TERMINATION_GRACE_SECONDS = 0.25
 
@@ -1744,7 +1750,7 @@ class BashTool:
                 "command": {"type": "string"},
                 "yield_time_ms": {
                     "type": "integer",
-                    "minimum": 0,
+                    "minimum": _MIN_PROCESS_READ_WAIT_MS,
                     "maximum": 60000,
                     "default": 1000,
                 },
@@ -1768,10 +1774,22 @@ class BashTool:
         *,
         process_manager: ProcessSessionManager | None = None,
         session_provider: Callable[[], object | None] | None = None,
+        default_timeout_seconds: float | None = None,
     ) -> None:
         self._workdir = Path(workdir).expanduser().resolve(strict=False)
         self._process_manager = process_manager or ProcessSessionManager()
         self._session_provider = session_provider
+        if default_timeout_seconds is not None:
+            if (
+                isinstance(default_timeout_seconds, bool)
+                or not isinstance(default_timeout_seconds, (int, float))
+                or default_timeout_seconds <= 0
+                or default_timeout_seconds > 600
+            ):
+                raise ValueError("default_timeout_seconds must be between 0 and 600")
+            self._default_timeout_seconds = float(default_timeout_seconds)
+        else:
+            self._default_timeout_seconds = None
 
     @property
     def process_manager(self) -> ProcessSessionManager:
@@ -1816,8 +1834,11 @@ class BashTool:
         try:
             command = _text(arguments, "command")
             yield_time_ms = _yield_time(arguments.get("yield_time_ms", 1000))
-            timeout_value = arguments.get("timeout_seconds")
-            timeout_seconds = None if timeout_value is None else _timeout(timeout_value)
+            if "timeout_seconds" not in arguments:
+                timeout_seconds = self._default_timeout_seconds
+            else:
+                timeout_value = arguments.get("timeout_seconds")
+                timeout_seconds = None if timeout_value is None else _timeout(timeout_value)
             pty = arguments.get("pty", False)
             if not isinstance(pty, bool):
                 raise TypeError("pty must be a boolean")
@@ -1899,6 +1920,13 @@ class ProcessTool:
                 "operation": {"type": "string", "enum": ["list", "read", "write", "stop", "resize"]},
                 "process_id": {"type": "string"},
                 "cursor": {"type": "integer", "minimum": 0},
+                "wait_ms": {
+                    "type": "integer",
+                    "minimum": _MIN_PROCESS_READ_WAIT_MS,
+                    "maximum": _MAX_PROCESS_READ_WAIT_MS,
+                    "default": _DEFAULT_PROCESS_READ_WAIT_MS,
+                    "description": "For read, wait at most this long for new output or process termination.",
+                },
                 "input": {"type": "string"},
                 "data": {"type": "string"},
                 "eof": {"type": "boolean"},
@@ -1967,6 +1995,16 @@ class ProcessTool:
                 raise ProcessSessionError("Error: process_id is required", kind="invalid_input")
             if action == "read":
                 cursor = arguments.get("cursor", 0)
+                wait_ms = _process_wait_ms(arguments.get("wait_ms", _DEFAULT_PROCESS_READ_WAIT_MS))
+                managed = self._process_manager.get(process_id, session_id)
+                await _wait_for_process_observation(
+                    self._process_manager,
+                    managed,
+                    cancellation,
+                    wait_ms / 1000.0,
+                )
+                if cancellation.cancelled:
+                    return _error("Error: process operation cancelled")
                 read = self._process_manager.read(process_id, session_id, cursor)
                 return _process_read_result(read)
             if action == "write":
@@ -2032,6 +2070,7 @@ async def _wait_for_process_observation(
     session_id = getattr(managed, "session_id")
     deadline = asyncio.get_running_loop().time() + max(0.0, wait_seconds)
     initial_cursor = getattr(managed, "next_sequence", 0)
+    output_signal = getattr(managed, "output_signal", None)
     while getattr(managed, "state", "unknown") == "running":
         if cancellation.cancelled:
             return
@@ -2047,9 +2086,38 @@ async def _wait_for_process_observation(
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
             return
-        if asyncio.get_running_loop().time() >= deadline:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
             return
-        await asyncio.sleep(0.01)
+        if not isinstance(output_signal, asyncio.Event):
+            # Test doubles and older managed records may not expose the
+            # signal.  CancellationToken.wait still prevents a tight idle
+            # loop and keeps the bounded deadline authoritative.
+            try:
+                await asyncio.wait_for(cancellation.wait(), min(remaining, 0.05))
+            except asyncio.TimeoutError:
+                continue
+            return
+        output_signal.clear()
+        if getattr(managed, "next_sequence", 0) != initial_cursor:
+            continue
+        output_wait = asyncio.create_task(output_signal.wait())
+        cancellation_wait = asyncio.create_task(cancellation.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (output_wait, cancellation_wait),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in (output_wait, cancellation_wait):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(output_wait, cancellation_wait, return_exceptions=True)
+        if not done:
+            return
+        if cancellation.cancelled:
+            return
     return
 
 
@@ -2074,6 +2142,16 @@ def _process_action(arguments: Mapping[str, object]) -> str:
     if value not in {"list", "read", "write", "stop", "resize"}:
         raise ProcessSessionError("Error: action must be list, read, write, stop, or resize", kind="invalid_input")
     return str(value)
+
+
+def _process_wait_ms(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("wait_ms must be an integer")
+    if not _MIN_PROCESS_READ_WAIT_MS <= value <= _MAX_PROCESS_READ_WAIT_MS:
+        raise ValueError(
+            f"wait_ms must be between {_MIN_PROCESS_READ_WAIT_MS} and {_MAX_PROCESS_READ_WAIT_MS}"
+        )
+    return value
 
 
 def _failure_kind(value: str) -> ToolFailureKind:
@@ -2357,32 +2435,6 @@ def _decode_process_output(data: bytes) -> str:
             continue
 
     return data.decode("utf-8", errors="replace")
-
-
-def _windows_output_encodings() -> tuple[str, ...]:
-    """Return finite ANSI/OEM encodings reported by this Windows shell."""
-
-    encodings: list[str] = []
-    try:
-        kernel32 = ctypes.windll.kernel32
-        for function_name in ("GetConsoleOutputCP", "GetOEMCP", "GetACP"):
-            function = getattr(kernel32, function_name, None)
-            if function is None:
-                continue
-            function.restype = wintypes.UINT
-            code_page = int(function())
-            if code_page > 0:
-                encodings.append(f"cp{code_page}")
-    except (AttributeError, OSError, TypeError, ValueError):
-        pass
-
-    try:
-        system_encoding = locale.getencoding()
-    except (AttributeError, LookupError):
-        system_encoding = ""
-    if system_encoding:
-        encodings.append(system_encoding)
-    return tuple(encodings)
 
 
 def _text(arguments: Mapping[str, object], name: str) -> str:

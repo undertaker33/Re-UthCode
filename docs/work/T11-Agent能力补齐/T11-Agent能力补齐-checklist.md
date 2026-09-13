@@ -86,13 +86,13 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T14 异常纠偏与截停替代固定上限
 
-- [ ] A08（R10/R11/R24）：通过 `tests/test_tool_result_persistence.py`、`test_agent_loop.py` 增补 验证；通过条件：写成功保存失败不重做；unknown 副作用截停；未执行批尾也有对应结果；普通工具错误返回模型继续处理。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A22（R22—R25）：通过 `tests/test_agent_loop.py`、`test_agent_policy.py`；计划新增 `tests/test_runaway_detection.py` 验证；通过条件：正常脚本 Provider 连续至少 200 轮仍能完成；相同失败/短周期/完成阻断先纠偏后停止；编辑后重测、合法等待和人工重试不误停；无累计轮数 fallback。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A08（R10/R11/R24）：通过 `tests/test_tool_result_persistence.py`、`test_agent_loop.py` 增补 验证；通过条件：写成功保存失败不重做；unknown 副作用截停；未执行批尾也有对应结果；普通工具错误返回模型继续处理。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A22（R22—R25）：通过 `tests/test_agent_loop.py`、`test_agent_policy.py`；计划新增 `tests/test_runaway_detection.py` 验证；通过条件：正常脚本 Provider 连续至少 200 轮仍能完成；相同失败/短周期/完成阻断先纠偏后停止；编辑后重测、合法等待和人工重试不误停；无累计轮数 fallback。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] 核对 Tasks T14 的完成边界并记录对应代码/定向证据：脚本 Provider 至少 200 轮正常完成；失败/短周期/final 阻断正例、编辑重测/等待/人工输入反例通过；终态 runaway_detected 与取消区分。
 
 ## T15 Settings 配置完整性与生效边界
 
-- [ ] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] 核对 Tasks T15 的完成边界并记录对应代码/定向证据：用户/项目作用域和拒绝路径可测试；项目不能放宽限制；保存不半途换模型/端点或重启存活进程。
 
 ## T16 Desktop 产物打开与受控预览

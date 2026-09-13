@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -35,6 +35,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
       if (channel === "desktop.project.pick") return Promise.resolve("C:\\Projects\\UthCode");
       if (channel === "desktop.preference.read") return Promise.resolve({ theme: "system" });
       if (channel === "desktop.attachment.pick" || channel === "desktop.attachment.clipboard") return Promise.resolve(null);
+      if (channel === "desktop.artifact.authorize-external") return Promise.resolve(null);
       return Promise.resolve({ ok: true });
     },
     on(channel: string, listener: Listener) {
@@ -52,6 +53,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(exposed.name, "uthcode");
   assert.equal(exposed.api, api);
   assert.deepEqual(Object.keys(api).sort(), [
+    "authorizeExternalArtifact",
     "chooseAttachment",
     "closeShell",
     "copyText",
@@ -77,6 +79,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   await api.writePreference("pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]);
   assert.equal(await api.chooseAttachment(), null);
   assert.equal(await api.pasteAttachment(), null);
+  assert.equal(await api.authorizeExternalArtifact?.(), null);
 
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
@@ -89,6 +92,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     { channel: "desktop.preference.write", args: ["pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]] },
     { channel: "desktop.attachment.pick", args: [] },
     { channel: "desktop.attachment.clipboard", args: [] },
+    { channel: "desktop.artifact.authorize-external", args: [] },
   ]);
 
   const events: unknown[] = [];
@@ -363,6 +367,147 @@ test("Main gates project use to picker or persisted recent registrations", async
     removeHandlers();
     await rm(target, { recursive: true, force: true });
     await rm(persisted, { recursive: true, force: true });
+  }
+});
+
+test("Main routes authorized artifacts to open/reveal and rejects URI execution", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const project = await mkdtemp(join(tmpdir(), "uthcode-artifact-main-"));
+  const image = join(project, "preview.png");
+  const html = join(project, "unsafe.html");
+  await writeFile(image, "png-bytes");
+  await writeFile(html, "<script>throw new Error('should not run')</script>");
+  const opened: string[] = [];
+  const revealed: string[] = [];
+  const calls: string[] = [];
+  const runtime = {
+    start: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push(method);
+      const path = String(params.path);
+      const unsupported = path.endsWith(".html");
+      return {
+        artifact: {
+          path,
+          name: path.split(/[\\/]/u).pop() ?? path,
+          kind: unsupported ? "unsupported" : "image",
+          mime_type: unsupported ? "text/html" : "image/png",
+          size_bytes: 10,
+          default_action: unsupported ? "reveal" : "open",
+          preview_supported: !unsupported,
+        },
+        action: method.slice("artifact.".length),
+      };
+    },
+  };
+  const registeredProjects = new Set([project]);
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: { read: async () => ({}), write: async () => ({}) } as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    registeredProjects,
+    showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
+    openPath: (async (path: string) => { opened.push(path); return ""; }) as never,
+    showItemInFolder: ((path: string) => { revealed.push(path); }) as never,
+  });
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(runtimeRequest);
+  try {
+    const described = await runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: image } });
+    assert.equal((described as { artifact: { path: string } }).artifact.path, image);
+    await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: image } });
+    await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: html } });
+    await assert.rejects(
+      runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: "https://example.test/evil" } }),
+      /Artifact path is invalid/u,
+    );
+    assert.deepEqual(opened, [image]);
+    assert.deepEqual(revealed, [html]);
+    assert.deepEqual(calls, ["artifact.describe", "artifact.open", "artifact.open"]);
+  } finally {
+    removeHandlers();
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("Main registers one picker-selected external artifact in its production-owned grant", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const root = await mkdtemp(join(tmpdir(), "uthcode-external-artifact-main-"));
+  const external = join(root, "selected.txt");
+  const replacement = join(root, "replacement.txt");
+  await writeFile(external, "selected");
+  await writeFile(replacement, "replacement");
+  const opened: string[] = [];
+  const runtime = {
+    start: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => ({
+      artifact: {
+        path: String(params.path),
+        name: "selected.txt",
+        kind: "file",
+        mime_type: "text/plain",
+        size_bytes: 8,
+        default_action: "open",
+        preview_supported: method === "artifact.preview",
+      },
+    }),
+  };
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: { read: async () => ({}), write: async () => ({}) } as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    showOpenDialog: (async () => ({ canceled: false, filePaths: [external] })) as never,
+    openPath: (async (path: string) => { opened.push(path); return ""; }) as never,
+  });
+  const authorize = handlers.get(IPC_CHANNELS.authorizeExternalArtifact);
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(authorize && runtimeRequest);
+  try {
+    await assert.rejects(
+      runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: external } }),
+      /not authorized/u,
+    );
+    assert.equal(await authorize?.(trustedEvent), external);
+    const described = await runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: external } });
+    assert.equal((described as { artifact: { path: string } }).artifact.path, external);
+    await runtimeRequest?.(trustedEvent, { method: "artifact.preview", params: { path: external } });
+    await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: external } });
+    assert.deepEqual(opened, [external]);
+    await assert.rejects(
+      runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: replacement } }),
+      /not authorized/u,
+    );
+  } finally {
+    removeHandlers();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

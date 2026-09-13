@@ -620,12 +620,12 @@ class FailureReason(str, Enum):
     CONTEXT_UNRESOLVABLE = "context_unresolvable"
     PERSISTENCE_UNAVAILABLE = "persistence_unavailable"
     TOOL_SIDE_EFFECT_UNKNOWN = "tool_side_effect_unknown"
+    RUNAWAY_DETECTED = "runaway_detected"
     INTERNAL = "internal"
 
 
 class TerminationReason(str, Enum):
     FINAL_ANSWER = "final_answer"
-    MAX_ITERATIONS = "max_iterations"
     MAX_TOOL_CALLS = "max_tool_calls"
     CONSECUTIVE_UNKNOWN_TOOLS = "consecutive_unknown_tools"
     MAX_OUTPUT_TOKENS = "max_output_tokens"
@@ -633,6 +633,7 @@ class TerminationReason(str, Enum):
     INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
     USER_CANCELLED = "user_cancelled"
     SIDE_EFFECT_UNKNOWN = "side_effect_unknown"
+    RUNAWAY_DETECTED = "runaway_detected"
     INTERNAL_ERROR = "internal_error"
 
 

@@ -2595,6 +2595,156 @@ remote_id = "local"
 
 
 @pytest.mark.asyncio
+async def test_settings_save_tool_limits_round_trips_safe_view_and_reloads_next_turn(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "local"
+''',
+        encoding="utf-8",
+    )
+    bridge = DesktopBridge(application=_FakeApplication(), home=home)
+    saved = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-tool-limits-save",
+            "settings.save",
+            {
+                "tool_limits": {
+                    "timeout_seconds": 4.5,
+                    "output_bytes": 4096,
+                    "attachment_bytes": 8192,
+                }
+            },
+        )
+    )
+    assert saved.ok is True
+    assert saved.result is not None
+    assert saved.result["configuration"]["tool_limits"] == {
+        "timeout_seconds": 4.5,
+        "output_bytes": 4096,
+        "attachment_bytes": 8192,
+    }
+    rendered = user.read_text(encoding="utf-8")
+    assert "output_bytes = 4096" in rendered
+    assert "attachment_bytes = 8192" in rendered
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_get_separates_user_configured_effective_project_limits_and_sources(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "local"
+supports_images = true
+
+[search]
+enabled = true
+provider = "tavily"
+api_key = "settings-search"
+max_results = 8
+max_fetch_bytes = 8192
+timeout_seconds = 20.0
+
+[tool_limits]
+timeout_seconds = 30.0
+output_bytes = 16777216
+attachment_bytes = 16777216
+''',
+        encoding="utf-8",
+    )
+    project = tmp_path / "repo"
+    workdir = project / "child"
+    workdir.mkdir(parents=True)
+    (project / ".git").mkdir()
+    project_config = project / ".uthcode" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        '''[models."local/ref"]
+provider = "local"
+remote_id = "local"
+supports_images = false
+
+[search]
+enabled = false
+max_results = 2
+max_fetch_bytes = 4096
+timeout_seconds = 5.0
+
+[tool_limits]
+timeout_seconds = 5.0
+output_bytes = 4096
+attachment_bytes = 4096
+''',
+        encoding="utf-8",
+    )
+    bridge = DesktopBridge(
+        application=_FakeApplication(),
+        home=home,
+        workdir=workdir,
+    )
+
+    current = await bridge.handle_request(RequestEnvelope("settings-layered-get", "settings.get", {}))
+
+    assert current.ok is True and current.result is not None
+    configuration = current.result["configuration"]
+    assert isinstance(configuration, dict)
+    assert configuration["configured"]["tool_limits"]["attachment_bytes"] == 16777216
+    assert configuration["effective"]["tool_limits"]["attachment_bytes"] == 4096
+    assert configuration["effective"]["search"]["max_results"] == 2
+    assert configuration["effective"]["models"]["local/ref"]["supports_images"] is False
+    assert configuration["source"] == {
+        "search": "project",
+        "vision": "project",
+        "tool_limits": "project",
+        "attachment_limits": "project",
+    }
+
+    saved = await bridge.handle_request(
+        RequestEnvelope(
+            "settings-layered-save",
+            "settings.save",
+            {"tool_limits": {"output_bytes": 8192, "attachment_bytes": 16384}},
+        )
+    )
+
+    assert saved.ok is True and saved.result is not None
+    after = saved.result["configuration"]
+    assert isinstance(after, dict)
+    assert after["configured"]["tool_limits"] == {
+        "output_bytes": 8192,
+        "attachment_bytes": 16384,
+    }
+    assert after["effective"]["tool_limits"]["output_bytes"] == 4096
+    assert after["effective"]["tool_limits"]["attachment_bytes"] == 4096
+    rendered = user.read_text(encoding="utf-8")
+    assert "output_bytes = 8192" in rendered
+    assert "attachment_bytes = 16384" in rendered
+    assert "output_bytes = 4096" not in rendered
+    await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("expression", "environment_name", "environment_value"),
     [

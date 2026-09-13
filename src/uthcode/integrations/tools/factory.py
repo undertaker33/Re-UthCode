@@ -14,7 +14,7 @@ from .process_tools import BashTool, ProcessTool
 from .process_sessions import ProcessSessionManager
 from .search_tools import GlobTool, GrepTool
 from .patch_tools import ApplyPatchTool
-from .git_tools import GitWorkspaceTool
+from .git_tools import GitWorkspace, GitWorkspaceTool
 from .workspace import FileReadTracker, WorkspacePathResolver
 from .web_tools import FetchWebTool, TavilySearchTool
 
@@ -27,6 +27,7 @@ def create_default_tools(
     session_provider: Callable[[], object | None] | None = None,
     process_manager: ProcessSessionManager | None = None,
     search_configuration: Mapping[str, object] | object | None = None,
+    tool_limits: Mapping[str, object] | object | None = None,
     web_transport: object | None = None,
     redirect_authorizer: Callable[[str], object] | None = None,
 ) -> tuple[Tool, ...]:
@@ -46,6 +47,11 @@ def create_default_tools(
     manager = process_manager or ProcessSessionManager()
     web_max_bytes = _search_value(search_configuration, "max_fetch_bytes", 2 * 1024 * 1024)
     web_timeout = _search_value(search_configuration, "timeout_seconds", 20.0)
+    tool_timeout = _search_value(tool_limits, "timeout_seconds", None)
+    output_limit = int(_search_value(tool_limits, "output_bytes", 2 * 1024 * 1024))
+    attachment_limit = int(
+        _search_value(tool_limits, "attachment_bytes", 16 * 1024 * 1024)
+    )
 
     def read_asset(session_id: str, ref: str) -> bytes:
         reader = getattr(attachment_service, "read", None)
@@ -89,6 +95,7 @@ def create_default_tools(
             resolver.root,
             process_manager=manager,
             session_provider=session_provider,
+            default_timeout_seconds=tool_timeout,
         ),
     ]
     # Existing embedders that request the historical six-tool factory without
@@ -103,6 +110,7 @@ def create_default_tools(
                     asset_reference=asset_reference if attachment_service is not None else None,
                     session_provider=session_provider,
                     on_path_access=on_path_access,
+                    max_bytes=min(16 * 1024 * 1024, attachment_limit),
                 ),
                 ViewImageTool(
                     resolver,
@@ -111,10 +119,17 @@ def create_default_tools(
                     asset_writer=write_asset if attachment_service is not None else None,
                     session_provider=session_provider,
                     on_path_access=on_path_access,
+                    max_bytes=min(16 * 1024 * 1024, attachment_limit),
                 ),
                 ProcessTool(manager, session_provider=session_provider),
                 ApplyPatchTool(resolver, tracker, on_path_access=on_path_access),
-                GitWorkspaceTool(resolver.root),
+                GitWorkspaceTool(
+                    resolver.root,
+                    workspace=GitWorkspace(
+                        resolver.root,
+                        max_output_bytes=output_limit,
+                    ),
+                ),
                 FetchWebTool(
                     max_bytes=web_max_bytes,
                     timeout_seconds=web_timeout,

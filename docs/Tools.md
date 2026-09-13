@@ -35,7 +35,7 @@
 
 `Bash` 是唯一的进程启动入口。`yield_time_ms` 只控制本次 ToolCall 等待多久；`timeout_seconds` 是可选的进程总寿命上限，默认没有总寿命。短等待可返回仍在运行的 `process_id`，之后用 `Process` 的 `list`/`read` 获取有界增量和退出码。pipe 模式继续区分 stdout/stderr，PTY 模式提供单一 terminal 流及原生 stdin、EOF 和 resize。
 
-进程句柄绑定当前 Application/Session 和启动 Turn。成功 Turn 后服务进程继续存活，新的 Turn 可以续读或显式停止；取消、失败和异常只清理本 Turn 新建的进程，Session 关闭才清理全部进程。每个 Session 默认最多保留 32 个正常终态和 128 个过期事实，单进程 UTF-8 输出环默认 2 MiB；淘汰会保留 `expired`、最早游标和原因，避免短命令长期累积。`Process read` 使用单调游标，输出环超出容量时报告最早游标和过期状态；输出事件仍由 Application 统一做跨 chunk Secret 脱敏后路由到 Desktop，不能把后台日志当作新的 Turn 或 History 内容。stdin 是独立的执行输入授权，不能因启动命令已获批而自动获得后续输入权限。
+进程句柄绑定当前 Application/Session 和启动 Turn。成功 Turn 后服务进程继续存活，新的 Turn 可以续读或显式停止；取消、失败和异常只清理本 Turn 新建的进程，Session 关闭才清理全部进程。每个 Session 默认最多保留 32 个正常终态和 128 个过期事实，单进程 UTF-8 输出环默认 2 MiB；淘汰会保留 `expired`、最早游标和原因，避免短命令长期累积。`Process read` 使用单调游标，`wait_ms` 只能在 50—60000 毫秒内取值，默认 1000 毫秒；运行中无新输出时实际等待到新输出、终态或超时，不能用 `0` 绕过有界等待，取消会及时解除等待。输出环超出容量时报告最早游标和过期状态；输出事件仍由 Application 统一做跨 chunk Secret 脱敏后路由到 Desktop，不能把后台日志当作新的 Turn 或 History 内容。stdin 是独立的执行输入授权，不能因启动命令已获批而自动获得后续输入权限。
 
 ## Session 结果工具
 

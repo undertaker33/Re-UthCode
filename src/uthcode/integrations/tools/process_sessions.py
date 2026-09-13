@@ -9,12 +9,15 @@ so a stale or cross-Session process id cannot be used as a control capability.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import locale
 import os
 import signal
 import shlex
 import subprocess
 import sys
 import uuid
+from ctypes import wintypes
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -290,6 +293,9 @@ class ProcessSessionManager:
     def _finish_state(self, managed: _ManagedProcess) -> None:
         projector = managed.output_projector if managed.projection_bound else self._output_projector
         self._flush_output_projection(managed)
+        # Wake bounded Process.read calls even when the child exits without
+        # producing another output chunk.
+        managed.output_signal.set()
         self._emit(
             managed,
             event="process_state",
@@ -905,10 +911,44 @@ def _windows_pty_tokens(command: str) -> list[str]:
 
 
 def _decode(value: bytes) -> str:
+    encodings = ["utf-8"]
+    if os.name == "nt":
+        encodings.extend(_windows_output_encodings())
+    seen: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return value.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def _windows_output_encodings() -> tuple[str, ...]:
+    """Return finite ANSI/OEM encodings reported by this Windows shell."""
+    encodings: list[str] = []
     try:
-        return value.decode("utf-8")
-    except UnicodeDecodeError:
-        return value.decode("utf-8", errors="replace")
+        kernel32 = ctypes.windll.kernel32
+        for function_name in ("GetConsoleOutputCP", "GetOEMCP", "GetACP"):
+            function = getattr(kernel32, function_name, None)
+            if function is None:
+                continue
+            function.restype = wintypes.UINT
+            code_page = int(function())
+            if code_page > 0:
+                encodings.append(f"cp{code_page}")
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    try:
+        system_encoding = locale.getencoding()
+    except (AttributeError, LookupError):
+        system_encoding = ""
+    if system_encoding:
+        encodings.append(system_encoding)
+    return tuple(encodings)
 
 
 __all__ = ["ProcessOutput", "ProcessRead", "ProcessSessionError", "ProcessSessionManager"]
