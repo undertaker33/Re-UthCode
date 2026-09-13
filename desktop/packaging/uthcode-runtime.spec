@@ -53,7 +53,13 @@ if collect_dynamic_libs is not None:
 native_binaries.extend(
     _native_resources("winpty", {".dll", ".pyd", ".exe"}, "winpty")
 )
-hidden_imports = ["pypdfium2", "pypdfium2_raw", "uthcode.integrations.pdf_worker", "uthcode.integrations.tools.document_workers"]
+hidden_imports = [
+    "pypdfium2",
+    "pypdfium2_raw",
+    "trafilatura",
+    "uthcode.integrations.pdf_worker",
+    "uthcode.integrations.tools.document_workers",
+]
 try:
     if __import__("importlib.util").util.find_spec("winpty") is not None:
         hidden_imports.append("winpty")

@@ -293,6 +293,11 @@ class AgentRun:
         cancellation.run_id = self._state.run_id  # type: ignore[attr-defined]
         cancellation.turn_id = turn_id  # type: ignore[attr-defined]
         cancellation.session_id = self._turn_session_id  # type: ignore[attr-defined]
+        # Integration tools that discover new external targets during a Turn
+        # use this execution-scoped resolver to re-enter the same Permission
+        # evaluator and Session-grant store as Core preflight.
+        cancellation.permission_resolver = self._resolve_permission  # type: ignore[attr-defined]
+        cancellation.session_grant_sink = self._store_session_grant  # type: ignore[attr-defined]
         execution = self._application._start_agent_turn(
             self._state,
             user_input,

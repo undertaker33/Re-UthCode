@@ -67,6 +67,15 @@ class _ManagedProcess:
     pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_signal: asyncio.Event = field(default_factory=asyncio.Event)
     last_stream: str = "terminal"
+    # Projections are captured when the process starts.  A shared
+    # ProcessSessionManager can outlive a configuration reload and therefore
+    # must not project an existing child with a newer Application's secret
+    # set.  The command is materialized once; the stream projector is kept
+    # only for the lifetime in which more child output can arrive.
+    output_projector: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None
+    command_projector: Callable[[str], str] | None = None
+    projected_command: str | None = None
+    projection_bound: bool = False
 
     def append(self, stream: str, text: str, *, max_bytes: int) -> None:
         if not text:
@@ -202,7 +211,7 @@ class ProcessSessionManager:
         stream: str,
         text: str,
     ) -> str:
-        projector = self._output_projector
+        projector = managed.output_projector if managed.projection_bound else self._output_projector
         if projector is None:
             return text
         observation: dict[str, object] = {
@@ -251,17 +260,19 @@ class ProcessSessionManager:
         managed.last_stream = stream
         managed.append(stream, safe_text, max_bytes=self.max_output_bytes)
         managed.output_signal.set()
+        projector_bound = managed.output_projector if managed.projection_bound else self._output_projector
         self._emit(
             managed,
             event="process_output",
             sequence=start,
             stream=stream,
             text=safe_text,
-            projected=self._output_projector is not None,
+            projected=projector_bound is not None,
         )
 
     def _flush_output_projection(self, managed: _ManagedProcess) -> None:
-        if self._output_projector is None:
+        projector = managed.output_projector if managed.projection_bound else self._output_projector
+        if projector is None:
             return
         safe_text = self._project_output(
             managed,
@@ -277,13 +288,36 @@ class ProcessSessionManager:
         )
 
     def _finish_state(self, managed: _ManagedProcess) -> None:
+        projector = managed.output_projector if managed.projection_bound else self._output_projector
         self._flush_output_projection(managed)
         self._emit(
             managed,
             event="process_state",
-            projected=self._output_projector is not None,
+            projected=projector is not None,
         )
+        # The ring and the already projected command remain readable after a
+        # child exits.  Release the callback that closes over SecretValues as
+        # soon as no further child output can arrive.
+        if managed.projection_bound:
+            managed.output_projector = None
+            managed.command_projector = None
         self._evict_finished(managed.session_id, protected={managed.process_id})
+
+    def _bind_process_projection(self, managed: _ManagedProcess) -> None:
+        """Capture the current Application projection at process creation."""
+
+        managed.projection_bound = True
+        managed.output_projector = self._output_projector
+        managed.command_projector = self._command_projector
+        if managed.command_projector is None:
+            return
+        try:
+            projected = managed.command_projector(managed.command[:512])
+        except Exception:
+            projected = "<command unavailable>"
+        managed.projected_command = (
+            projected if isinstance(projected, str) else "<command unavailable>"
+        )
 
     async def start(
         self,
@@ -354,6 +388,7 @@ class ProcessSessionManager:
             control=started.control,
             turn_id=turn_id,
         )
+        self._bind_process_projection(managed)
         process = started.process
         if process.stdout is None or process.stderr is None:
             await self._terminate_managed(managed, unknown=True)
@@ -412,6 +447,7 @@ class ProcessSessionManager:
             pty=pty,
             turn_id=turn_id,
         )
+        self._bind_process_projection(managed)
         managed.pty_task = asyncio.create_task(self._pump_pty(managed))
         managed.watcher_task = asyncio.create_task(self._watch_pty(managed))
         return managed
@@ -520,8 +556,12 @@ class ProcessSessionManager:
 
     def _describe_with_projection(self, managed: _ManagedProcess) -> dict[str, object]:
         result = self.describe(managed)
-        projector = self._command_projector
         command = result.get("command")
+        if managed.projection_bound:
+            if managed.projected_command is not None:
+                result["command"] = managed.projected_command
+            return result
+        projector = self._command_projector
         if projector is not None and isinstance(command, str):
             try:
                 projected = projector(command)

@@ -21,6 +21,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `RunSnapshot` 是不含 conversation content 的安全投影；`TurnResult` 是稳定终态投影。
 - `[FACT]` `AgentEvent` 是 Interface/Application 的增量观察协议，不是第二份状态仓库。
 - `[FACT]` Tool 执行期间的 `ToolProgress` 由 `CancellationToken.report_progress()` 进入唯一 live `AgentEvent` 流；Application 负责归属、跨 chunk 有界尾部脱敏与限量。它不写入 `RunState`、Transcript、Tool Result 正文或 Provider history；无实时报告时，结果携带的 progress 只作完成边界的受控兜底。
+- `[FACT]` 联网工具结果只保存安全的来源、状态、内容类型和用量投影；搜索凭据不会进入 `AgentEvent`、Transcript、History、diagnostics 或 Session snapshot。大正文先由 Application 物化为当前 Session 的 opaque `ToolResultRead` ref，续读按有界页返回，不递归创建新的 ref。
 - `[FACT]` `RunState`、`RunSnapshot`、`TurnResult`、Event、交互协议有 JSON round-trip；failed `TurnResult`/`TurnFailed` 可携带 JSON-safe `FailureReason`，successful/cancelled 终态不伪造该字段；这只说明可序列化，不表示 Runtime checkpoint 已持久化。
 - `[FACT]` History 在请求准备、完整 Tool batch 和 terminal 边界持久化；按已确认 durability 推进 cursor。详细提交、半失败与恢复规则见下文 [History 持久化与恢复](#history-持久化与恢复)。
 - `[FACT]` `ApplicationContextService` 编译动态 Context Snapshot 并执行预算与 Gate。生产参数、诊断和冻结边界见下文 [Context 预算与诊断](#context-预算与诊断)。

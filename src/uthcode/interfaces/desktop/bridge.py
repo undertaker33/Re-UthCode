@@ -281,6 +281,7 @@ _CONFIGURATION_OUTPUT_FIELDS = (
     "default_permission_mode",
     "providers",
     "models",
+    "search",
 )
 _PAUSE_OUTPUT_FIELDS = (
     "pause_id",
@@ -2417,13 +2418,69 @@ class DesktopBridge:
         return value
 
     def _ensure_no_active(self, *, method: str) -> None:
-        if self._active_handle is not None or any(
+        if self._active_handle is not None or (
+            isinstance(self._turn_task, asyncio.Task)
+            and not self._turn_task.done()
+        ) or any(
             runtime.get("handle") is not None
+            or (
+                isinstance(runtime.get("task"), asyncio.Task)
+                and not runtime["task"].done()
+            )
             for runtime in self._background_runtimes.values()
         ):
             raise BridgeError("turn_active", f"{method} is unavailable during an active Turn")
-        if self._current_compaction_operation() is not None:
+        if self._any_compaction_operation_running():
             raise BridgeError("compaction_active", f"{method} is unavailable during compaction")
+
+    def _applications_for_configuration_reload(self) -> tuple[tuple[object, object | None], ...]:
+        """Return idle Applications in this configuration domain once each.
+
+        Session navigation keeps an independent Application/Run pair for
+        background Sessions.  A user configuration save is a safe-boundary
+        operation, so every such pair on the same workdir must see the new
+        Provider, Tool limits, permission default, and redactor before it is
+        selected again.  The Application and its runtime context remain the
+        same objects; only their reloadable composition changes.
+        """
+
+        target = self._workdir.resolve(strict=False)
+        candidates: list[tuple[object, object | None]] = []
+        seen: set[int] = set()
+
+        def add(runtime: Mapping[str, object]) -> None:
+            application = runtime.get("application")
+            if application is None or id(application) in seen:
+                return
+            context = getattr(application, "runtime_context", None)
+            owner_workdir = getattr(context, "workdir", None)
+            if not isinstance(owner_workdir, (str, Path)):
+                owner_workdir = runtime.get("project_key")
+            if not isinstance(owner_workdir, (str, Path)):
+                return
+            try:
+                if Path(owner_workdir).expanduser().resolve(strict=False) != target:
+                    return
+            except (OSError, RuntimeError, TypeError):
+                return
+            seen.add(id(application))
+            candidates.append((application, runtime.get("run")))
+
+        current_runtime: dict[str, object] = {
+            "application": self._application,
+            "run": self._run,
+            "project_key": str(self._workdir),
+        }
+        add(current_runtime)
+        for runtime in self._background_runtimes.values():
+            add(runtime)
+        return tuple(candidates)
+
+    @staticmethod
+    def _apply_permission_mode(run: object | None, mode: object) -> None:
+        set_mode = getattr(run, "set_permission_mode", None)
+        if callable(set_mode):
+            set_mode(mode)
 
     async def _attachment_session_id(self) -> str:
         application = self._application
@@ -3329,6 +3386,7 @@ class DesktopBridge:
             "default_permission_mode",
             "providers",
             "models",
+            "search",
             "provider_renames",
         }
         if "request" in params:
@@ -3359,6 +3417,36 @@ class DesktopBridge:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
         except Exception:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
+        applications = self._applications_for_configuration_reload()
+        if applications:
+            try:
+                configuration = (
+                    self._config_loader(self._workdir)
+                    if self._config_loader is not None
+                    else load_effective_config(cwd=self._workdir, home=self._home)
+                )
+                if not isinstance(configuration, EffectiveConfig):
+                    raise TypeError("configuration loader returned invalid data")
+                for application, run in applications:
+                    reload_configuration = getattr(application, "reload_configuration", None)
+                    if not callable(reload_configuration):
+                        continue
+                    reload_configuration(configuration)
+                    # Existing idle Runs keep their transcript/snapshot but
+                    # their next Turn must use the newly selected default
+                    # permission mode.  Active Turns are rejected above and
+                    # are therefore never mutated here.
+                    self._apply_permission_mode(run, configuration.default_permission_mode)
+            except (ConfigurationInitializationRequired, ConfigurationError):
+                raise BridgeError(
+                    "configuration_error",
+                    "configuration update could not be activated",
+                ) from None
+            except Exception:
+                raise BridgeError(
+                    "configuration_error",
+                    "configuration update could not be activated",
+                ) from None
         return {"configuration": _configuration(view)}
 
     async def _settings_reveal_api_key(

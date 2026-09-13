@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
+from uthcode.application.tools import ApplicationToolService
 from uthcode.core import (
     CancellationToken,
     PreparedToolCall,
@@ -15,6 +17,8 @@ from uthcode.core import (
 from uthcode.core.permission import Effect, ResourceScope
 from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
 from uthcode.integrations.tools.search_tools import GlobTool, GrepTool
+from uthcode.integrations.session_files import SessionFileStore
+from uthcode.integrations.tools.tool_result_read import ToolResultPolicy
 from uthcode.integrations.tools.workspace import WorkspacePathResolver
 
 
@@ -339,3 +343,144 @@ async def test_large_search_output_reaches_application_materialization_unchanged
     assert results[0].is_error is False
     assert len(results[0].content) > 10_000
     assert "[Output truncated" not in results[0].content
+
+
+@pytest.mark.asyncio
+async def test_search_applies_nested_ignore_hidden_binary_and_bound_cursor(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    (tmp_path / ".ignore").write_text("ignored-by-ignore.txt\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "ignored-by-ignore.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / ".visible.txt").write_text("needle\n", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ".gitignore").write_text("nested-ignored.txt\n", encoding="utf-8")
+    (nested / "nested-ignored.txt").write_text("needle\n", encoding="utf-8")
+    (nested / "first.txt").write_text("needle\n", encoding="utf-8")
+    (nested / "second.txt").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "binary.txt").write_bytes(b"needle\x00binary\n")
+
+    _, glob, grep = _search_tools(tmp_path)
+    default = await glob.execute(
+        {"pattern": "**/*.txt"}, cancellation=CancellationToken()  # type: ignore[arg-type]
+    )
+    hidden = await glob.execute(
+        {"pattern": "**/*.txt", "include_hidden": False},
+        cancellation=CancellationToken(),
+    )
+    included = await glob.execute(
+        {"pattern": "**/*.txt", "include_ignored": True},
+        cancellation=CancellationToken(),
+    )
+    assert default.content == ".visible.txt\nbinary.txt\nnested/first.txt\nnested/second.txt"
+    assert hidden.content == "binary.txt\nnested/first.txt\nnested/second.txt"
+    assert ".visible.txt" not in hidden.content
+    assert "ignored.txt" in included.content
+    assert "ignored-by-ignore.txt" in included.content
+    assert "nested/nested-ignored.txt" in included.content
+
+    first = await grep.execute(
+        {"pattern": "needle", "page_size": 1},
+        cancellation=CancellationToken(),
+    )
+    assert first.next_cursor
+    second = await grep.execute(
+        {"pattern": "needle", "page_size": 1, "cursor": first.next_cursor},
+        cancellation=CancellationToken(),
+    )
+    assert second.next_cursor
+    assert first.content != second.content
+    mismatch = await grep.execute(
+        {"pattern": "other", "page_size": 1, "cursor": first.next_cursor},
+        cancellation=CancellationToken(),
+    )
+    assert mismatch.is_error is True
+    assert "does not match" in mismatch.content
+    binary = await grep.execute(
+        {"pattern": "needle", "include": "binary.txt", "include_ignored": True},
+        cancellation=CancellationToken(),
+    )
+    assert binary.content == "No matches found."
+
+
+@pytest.mark.asyncio
+async def test_grep_reports_regex_timeout_as_a_controlled_failure(tmp_path: Path) -> None:
+    (tmp_path / "slow.txt").write_text("a" * 100_000 + "!\n", encoding="utf-8")
+    _, _, grep = _search_tools(tmp_path)
+    result = await grep.execute(
+        {"pattern": "(a+)+$", "timeout_ms": 1},
+        cancellation=CancellationToken(),
+    )
+    assert result.is_error is True
+    assert result.failure is not None and result.failure.kind == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_search_materializes_then_reads_through_application_tool_result_read(
+    tmp_path: Path,
+) -> None:
+    for index in range(5):
+        (tmp_path / f"result-{index}.txt").write_text("needle\n", encoding="utf-8")
+
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("search-session", project_key="search-project")
+    writer = store.open_writer("search-session", expected_project_key="search-project")
+    writer.__enter__()
+    session = type(
+        "ActiveSession",
+        (),
+        {
+            "session_id": "search-session",
+            "persist_tool_result": writer.persist_tool_result,
+            "read_tool_result": writer.read_tool_result,
+        },
+    )()
+    policy = ToolResultPolicy(
+        inline_threshold_bytes=4,
+        preview_limit_bytes=12,
+        single_result_hard_cap_bytes=4096,
+        session_quota_bytes=8192,
+        read_page_limit_bytes=512,
+        read_output_limit_bytes=4096,
+    )
+    service = ApplicationToolService(
+        (GrepTool(WorkspacePathResolver(tmp_path)),),
+        workdir=tmp_path,
+        session_provider=lambda: session,
+        tool_result_policy=policy,
+    )
+    try:
+        prepared = service.prepare_tool_call(
+            ToolCallPart("search-call", "Grep", {"pattern": "needle"}),
+            cancellation=CancellationToken(),
+        )
+        assert isinstance(prepared, PreparedToolCall)
+        outcome = await service.execute_prepared_tool(
+            prepared,
+            cancellation=CancellationToken(),
+        )
+        materialized = service.materialize_tool_result(outcome)
+        assert materialized.reference is not None
+        assert materialized.persistence_status.value == "externalized"
+
+        read_call = ToolCallPart(
+            "search-read",
+            "ToolResultRead",
+            {"ref": materialized.reference, "offset": 0, "limit": 64},
+        )
+        read_prepared = service.prepare_tool_call(
+            read_call,
+            cancellation=CancellationToken(),
+        )
+        assert isinstance(read_prepared, PreparedToolCall)
+        read_outcome = await service.execute_prepared_tool(
+            read_prepared,
+            cancellation=CancellationToken(),
+        )
+        read_materialized = service.materialize_tool_result(read_outcome)
+        page = json.loads(str(read_materialized.result.content))
+        assert page["ref"] == materialized.reference
+        assert page["content"]
+        assert read_materialized.persistence_status.value == "inline"
+    finally:
+        writer.close()

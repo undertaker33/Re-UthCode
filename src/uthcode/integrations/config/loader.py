@@ -49,7 +49,7 @@ class ConfigurationInitializationRequired(ConfigurationError):
         )
 
 
-_ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode"})
+_ROOT_FIELDS = frozenset({"default_model", "providers", "models", "default_permission_mode", "search"})
 _PROVIDER_FIELDS = frozenset({"kind", "base_url", "api_key", "display_name"})
 _MODEL_FIELDS = frozenset(
     {
@@ -61,6 +61,12 @@ _MODEL_FIELDS = frozenset(
         "reasoning_effort",
         "supports_images",
     }
+)
+_SEARCH_FIELDS = frozenset(
+    {"enabled", "provider", "api_key", "max_results", "max_fetch_bytes", "timeout_seconds"}
+)
+_PROJECT_SEARCH_FIELDS = frozenset(
+    {"enabled", "provider", "max_results", "max_fetch_bytes", "timeout_seconds"}
 )
 _SUPPORTED_PROVIDER_KINDS = frozenset(
     {"fake", "anthropic", "openai_responses", "openai_compat"}
@@ -351,11 +357,65 @@ def _validate_user_mapping(mapping: Mapping[str, Any], *, path: Path) -> None:
     _validate_root(mapping, path=path, project=False)
     _validate_provider_tables(mapping, path=path)
     _validate_model_tables(mapping, path=path, project=False)
+    _validate_search_table(mapping, path=path, project=False)
 
 
 def _validate_project_mapping(mapping: Mapping[str, Any], *, path: Path) -> None:
     _validate_root(mapping, path=path, project=True)
     _validate_model_tables(mapping, path=path, project=True)
+    _validate_search_table(mapping, path=path, project=True)
+
+
+def _validate_search_table(
+    mapping: Mapping[str, Any],
+    *,
+    path: Path,
+    project: bool,
+) -> None:
+    raw_search = mapping.get("search", {})
+    search = _require_table(raw_search, path=path, field="search")
+    allowed = _PROJECT_SEARCH_FIELDS if project else _SEARCH_FIELDS
+    _check_fields(search, allowed=allowed, path=path, prefix="search", project=project)
+    if "provider" in search:
+        provider = search.get("provider")
+        if not isinstance(provider, str) or provider.strip().lower() != "tavily":
+            raise ConfigurationError(
+                "search.provider must be tavily",
+                path=path,
+                field="search.provider",
+            )
+    if "api_key" in search and project:
+        raise ConfigurationError(
+            "project configuration cannot define search credentials",
+            path=path,
+            field="search.api_key",
+        )
+    enabled = search.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ConfigurationError("search.enabled must be a boolean", path=path, field="search.enabled")
+    for name in ("max_results", "max_fetch_bytes"):
+        value = search.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ConfigurationError(
+                f"search.{name} must be a positive integer",
+                path=path,
+                field=f"search.{name}",
+            )
+    if "max_results" in search and search["max_results"] > 20:
+        raise ConfigurationError("search.max_results must be at most 20", path=path, field="search.max_results")
+    if "max_fetch_bytes" in search and search["max_fetch_bytes"] > 16 * 1024 * 1024:
+        raise ConfigurationError("search.max_fetch_bytes exceeds the safety limit", path=path, field="search.max_fetch_bytes")
+    timeout = search.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 120
+    ):
+        raise ConfigurationError(
+            "search.timeout_seconds must be between 0 and 120",
+            path=path,
+            field="search.timeout_seconds",
+        )
+    if not project and "api_key" in search:
+        _validate_api_key_expression(search.get("api_key"), path=path, field="search.api_key")
 
 
 def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
@@ -365,6 +425,16 @@ def _safe_user_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("default_model", "default_permission_mode"):
         if key in mapping:
             result[key] = mapping[key]
+
+    raw_search = mapping.get("search", {})
+    if isinstance(raw_search, Mapping):
+        safe_search: dict[str, Any] = {}
+        for key in ("enabled", "provider", "max_results", "max_fetch_bytes", "timeout_seconds"):
+            if key in raw_search:
+                safe_search[key] = raw_search[key]
+        if "api_key" in raw_search:
+            safe_search["api_key_configured"] = bool(raw_search.get("api_key"))
+        result["search"] = safe_search
 
     raw_providers = mapping.get("providers", {})
     safe_providers: dict[str, dict[str, Any]] = {}
@@ -523,6 +593,7 @@ def validate_user_config_mapping(
         resolve_secrets=resolve_secrets,
     )
     models = _model_tables(mapping, path=target)
+    search = _search_table(mapping, path=target, resolve_secrets=resolve_secrets)
     selected_ref = mapping.get("default_model")
     if not providers and not models and _blank(selected_ref):
         raise ConfigurationInitializationRequired(target)
@@ -567,6 +638,7 @@ def validate_user_config_mapping(
         models=canonical_models,
         sources=(LoadedConfigSource("user", target),),
         default_permission_mode=default_permission_mode,
+        search=search,
     )
 
 
@@ -688,6 +760,33 @@ def _provider_profiles(
         if api_key is not None:
             raw["api_key"] = api_key
         result[profile_id] = raw
+    return result
+
+
+def _search_table(
+    mapping: Mapping[str, Any],
+    *,
+    path: Path,
+    resolve_secrets: bool = True,
+) -> dict[str, object]:
+    raw_search = _require_table(mapping.get("search", {}), path=path, field="search")
+    if not raw_search:
+        return {}
+    result: dict[str, object] = {
+        "enabled": raw_search.get("enabled", False),
+        "provider": raw_search.get("provider", "tavily"),
+        "max_results": raw_search.get("max_results", 5),
+        "max_fetch_bytes": raw_search.get("max_fetch_bytes", 2 * 1024 * 1024),
+        "timeout_seconds": raw_search.get("timeout_seconds", 20.0),
+    }
+    api_key_value = raw_search.get("api_key")
+    if resolve_secrets:
+        resolved = _resolve_api_key(api_key_value, path=path, field="search.api_key")
+        if resolved is not None:
+            result["api_key"] = resolved
+    elif api_key_value not in (None, ""):
+        _validate_api_key_expression(api_key_value, path=path, field="search.api_key")
+        result["api_key_configured"] = True
     return result
 
 
@@ -850,6 +949,42 @@ def _merge_models(
         current.update(raw_profile)
 
 
+def _merge_search(
+    target: dict[str, object],
+    overlay: Mapping[str, Any],
+    *,
+    path: Path,
+    user_search: Mapping[str, object],
+) -> None:
+    raw_search = _require_table(overlay.get("search", {}), path=path, field="search")
+    if not raw_search:
+        return
+    if "provider" in raw_search and str(raw_search["provider"]).strip().lower() != "tavily":
+        raise ConfigurationError("search.provider must be tavily", path=path, field="search.provider")
+    if "enabled" in raw_search and raw_search["enabled"] is True and user_search.get("enabled") is not True:
+        raise ConfigurationError(
+            "project search.enabled cannot enable an unconfigured user search service",
+            path=path,
+            field="search.enabled",
+        )
+    for name in ("max_results", "max_fetch_bytes", "timeout_seconds"):
+        if name not in raw_search:
+            continue
+        project_value = raw_search[name]
+        user_value = user_search.get(name)
+        if user_value is not None and project_value > user_value:
+            raise ConfigurationError(
+                f"project search.{name} cannot expand the user limit",
+                path=path,
+                field=f"search.{name}",
+            )
+        target[name] = project_value
+    if "enabled" in raw_search:
+        target["enabled"] = raw_search["enabled"]
+    # provider is a fixed identity, never a redirect/endpoint.
+    target["provider"] = "tavily"
+
+
 def load_config_data(
     *,
     cwd: str | os.PathLike[str] | Path | None = None,
@@ -890,7 +1025,9 @@ def load_config_data(
         )
     providers = _provider_profiles(user_mapping, path=user_path)
     models = _model_tables(user_mapping, path=user_path)
+    search = _search_table(user_mapping, path=user_path)
     user_models = {key: dict(value) for key, value in models.items()}
+    user_search = dict(search)
     selected_ref = user_mapping.get("default_model")
     if not providers and not models and _blank(selected_ref):
         raise ConfigurationInitializationRequired(user_path)
@@ -900,6 +1037,7 @@ def load_config_data(
         project_mapping = _read_mapping(path)
         _validate_project_mapping(project_mapping, path=path)
         _merge_models(models, project_mapping, path=path, user_models=user_models)
+        _merge_search(search, project_mapping, path=path, user_search=user_search)
         if "default_model" in project_mapping:
             selected_ref = project_mapping["default_model"]
         sources.append(LoadedConfigSource(kind, path))
@@ -928,6 +1066,7 @@ def load_config_data(
         models=canonical_models,
         sources=tuple(sources),
         default_permission_mode=default_permission_mode,
+        search=search,
     )
 
 

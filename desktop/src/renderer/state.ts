@@ -284,6 +284,7 @@ export interface ConfigurationView {
   default_permission_mode?: string;
   providers?: Record<string, Record<string, JsonValue>>;
   models?: Record<string, Record<string, JsonValue>>;
+  search?: Record<string, JsonValue>;
 }
 
 export interface RendererState {

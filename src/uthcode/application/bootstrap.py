@@ -27,7 +27,7 @@ from uthcode.integrations.instruction_files import (
 )
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.core.tool import Tool
-from uthcode.core.permission import PermissionMode
+from uthcode.core.permission import Effect, PermissionAction, PermissionMode, ResourceScope
 from uthcode.core.secrets import SecretValue
 
 from .configuration import (
@@ -114,6 +114,7 @@ def read_user_configuration(
         raise _map_integration_configuration_error(exc) from None
     providers_raw = raw.get("providers", {})
     models_raw = raw.get("models", {})
+    search_raw = raw.get("search", {})
     return UserConfigurationView(
         default_model=raw.get("default_model", ""),
         default_permission_mode=raw.get("default_permission_mode", "default"),
@@ -123,6 +124,7 @@ def read_user_configuration(
             else {}
         ),
         models=models_raw if isinstance(models_raw, Mapping) else {},
+        search=search_raw if isinstance(search_raw, Mapping) else {},
         path=path,
     )
 
@@ -185,6 +187,15 @@ def _user_write_payload(
             profile.pop("model_ref", None)
             models[model_ref] = profile
         payload["models"] = models
+    if request.search is not None:
+        payload["search"] = {
+            key: (
+                value.reveal()
+                if key == "api_key" and isinstance(value, SecretValue)
+                else value
+            )
+            for key, value in request.search.items()
+        }
     if request.provider_renames is not None:
         payload["provider_renames"] = dict(request.provider_renames)
     return payload
@@ -208,6 +219,7 @@ def write_user_configuration(
                 "default_permission_mode",
                 "providers",
                 "models",
+                "search",
                 "provider_renames",
             }
         ]
@@ -222,6 +234,7 @@ def write_user_configuration(
             default_permission_mode=request.get("default_permission_mode"),
             providers=request.get("providers"),
             models=request.get("models"),
+            search=request.get("search"),
             provider_renames=request.get("provider_renames"),
         )
     path = _user_config_path(home)
@@ -295,6 +308,22 @@ def _default_permission_writer(configuration: EffectiveConfig):
     return lambda mode: writer(path, mode.value)
 
 
+def _redirect_authorizer(url: str, cancellation: object | None = None) -> object:
+    """Route each Fetch redirect through the current AgentRun resolver."""
+
+    resolver = getattr(cancellation, "permission_resolver", None)
+    if not callable(resolver):
+        return False
+    action = PermissionAction(
+        tool="WebFetch",
+        action="redirect",
+        effect=Effect.EXTERNAL,
+        resource=url,
+        scope=ResourceScope.OUTSIDE,
+    )
+    return resolver(action)
+
+
 def create_application(
     config: EffectiveConfig,
     *,
@@ -303,6 +332,7 @@ def create_application(
     permission_writer=None,
     runtime_context: ApplicationRuntimeContext | None = None,
     tools: Sequence[Tool] | None = None,
+    web_transport: object | None = None,
     instruction_loader: InstructionLoader | None = None,
     storage_root: str | Path | None = None,
     session_store: SessionFileStore | None = None,
@@ -376,6 +406,9 @@ def create_application(
             attachment_service=attachment_service,
             session_provider=lambda: session_service.active_session,
             process_manager=process_manager,
+            search_configuration=config.search,
+            web_transport=web_transport,
+            redirect_authorizer=_redirect_authorizer,
         )
         if tools is None
         else tuple(tools)
@@ -385,10 +418,16 @@ def create_application(
         for profile in config.providers.values()
         if profile.api_key is not None
     )
+    if config.search.api_key is not None:
+        # Search credentials cross the same Application result/event boundary
+        # as Provider credentials.  Keep the opaque SecretValue in the
+        # redactor even though Tavily is the only current search adapter.
+        secret_values = (*secret_values, config.search.api_key)
     return UthCodeApplication(
         provider,
         configuration=config,
         provider_builder=builder,
+        tool_builder=create_default_tools,
         model_writer=writer,
         permission_writer=(permission_writer if permission_writer is not None else _default_permission_writer(config)),
         runtime_context=runtime_context,
@@ -425,6 +464,7 @@ def _effective_config_from_raw(data: LoadedConfigData) -> EffectiveConfig:
                 "providers": data.providers,
                 "models": data.models,
                 "default_permission_mode": data.default_permission_mode,
+                "search": data.search,
             },
             sources=sources,
         )

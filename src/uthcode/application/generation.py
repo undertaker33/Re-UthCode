@@ -75,7 +75,14 @@ from uthcode.core.compaction import (
     TimelineAgingEpoch,
     fine_timeline_usage,
 )
-from uthcode.core.permission import PermissionEvaluator, PermissionMode, RuleSet
+from uthcode.core.permission import (
+    Effect,
+    PermissionAction,
+    PermissionEvaluator,
+    PermissionMode,
+    ResourceScope,
+    RuleSet,
+)
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
@@ -112,6 +119,7 @@ ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
 PermissionWriter = Callable[[PermissionMode], object]
 PermissionRulesLoader = Callable[[], RuleSet]
+ToolBuilder = Callable[..., Sequence[object]]
 _ACTIVE_TIMELINE = object()
 
 
@@ -317,6 +325,7 @@ class UthCodeApplication:
         *,
         configuration: EffectiveConfig | None = None,
         provider_builder: ProviderBuilder | None = None,
+        tool_builder: ToolBuilder | None = None,
         model_writer: ModelWriter | None = None,
         permission_writer: PermissionWriter | None = None,
         runtime_context: ApplicationRuntimeContext | None = None,
@@ -342,6 +351,9 @@ class UthCodeApplication:
         if not isinstance(runtime_context, ApplicationRuntimeContext):
             raise TypeError("runtime_context must be ApplicationRuntimeContext")
         self._runtime_context = runtime_context
+        if tool_builder is not None and not callable(tool_builder):
+            raise TypeError("tool_builder must be callable or None")
+        self._tool_builder = tool_builder
         if tool_service is None:
             tool_service = ApplicationToolService(())
         if not isinstance(tool_service, ApplicationToolService):
@@ -637,6 +649,108 @@ class UthCodeApplication:
         """Return the Application's immutable, ordered Tool definitions."""
 
         return self._tool_service.definitions()
+
+    def reload_configuration(self, configuration: EffectiveConfig) -> None:
+        """Apply a saved configuration at the next safe Turn boundary.
+
+        The Session service, Context service, ProcessSessionManager, and its
+        live children stay owned by this Application.  Only the Provider,
+        default settings, and the Tool registry/redactor are replaced after
+        every new object has been composed successfully.
+        """
+
+        if not isinstance(configuration, EffectiveConfig):
+            raise TypeError("configuration must be an EffectiveConfig")
+        builder = self._provider_builder
+        if builder is None:
+            raise RuntimeError("configuration reload requires a Provider builder")
+        current_ref = self._current_model_ref
+        active = self._session_service.active_session if self._session_service is not None else None
+        model_ref = (
+            current_ref
+            if active is not None and current_ref in configuration.models
+            else configuration.default_model
+        )
+        model = configuration.models.get(model_ref)
+        if model is None:
+            raise RuntimeError("configuration reload selected an unavailable model")
+        profile = configuration.providers.get(model.provider_profile_id)
+        if profile is None:
+            raise RuntimeError("configuration reload selected an unavailable Provider")
+        provider = builder(profile, model)
+        if not isinstance(provider, ProviderPort):
+            raise TypeError("Provider builder must return a ProviderPort")
+
+        def authorize_redirect(url: str, cancellation: object | None = None) -> object:
+            resolver = getattr(cancellation, "permission_resolver", None)
+            if not callable(resolver):
+                return False
+            return resolver(
+                PermissionAction(
+                    tool="WebFetch",
+                    action="redirect",
+                    effect=Effect.EXTERNAL,
+                    resource=url,
+                    scope=ResourceScope.OUTSIDE,
+                )
+            )
+
+        manager = self._runtime_context.process_manager
+        if manager is None:
+            raise RuntimeError("configuration reload requires the existing process manager")
+        tool_builder = self._tool_builder
+        if tool_builder is None:
+            raise RuntimeError("configuration reload requires the existing Tool builder")
+        attachment_service = self._attachment_service
+        session_service = self._session_service
+        if attachment_service is None or session_service is None:
+            raise RuntimeError("configuration reload requires the existing Session services")
+        loader = self._instruction_loader
+        new_tools = tool_builder(
+            self._runtime_context.workdir,
+            on_path_access=(loader.activate_for_path if loader is not None else None),
+            attachment_service=attachment_service,
+            session_provider=lambda: session_service.active_session,
+            process_manager=manager,
+            search_configuration=configuration.search,
+            redirect_authorizer=authorize_redirect,
+        )
+        secret_values = tuple(
+            item.api_key
+            for item in configuration.providers.values()
+            if item.api_key is not None
+        )
+        if configuration.search.api_key is not None:
+            secret_values = (*secret_values, configuration.search.api_key)
+        new_service = ApplicationToolService(
+            new_tools,
+            workdir=self._runtime_context.workdir,
+            secret_values=secret_values,
+            session_provider=lambda: session_service.active_session,
+            tool_result_policy=self._tool_service._tool_result_policy,
+            history_read_policy=self._tool_service._history_read_policy,
+        )
+
+        # Commit only after provider and every Tool has been composed.  No
+        # Session, process, active Run state, or compact snapshot is replaced.
+        self._configure_provider_asset_resolver(provider)
+        self._provider = provider
+        self._configuration = configuration
+        self._tool_service = new_service
+        self._default_permission_mode = configuration.default_permission_mode
+        self._default_model_ref = configuration.default_model
+        self._current_model_ref = model_ref
+        self._last_provider_limits = None
+        self._last_provider_limits_model = None
+        self._last_provider_limits_provider = None
+        self._context_budget_snapshot = None
+        set_output_projector = getattr(manager, "set_output_projector", None)
+        if callable(set_output_projector):
+            set_output_projector(new_service.project_process_output)
+        set_command_projector = getattr(manager, "set_command_projector", None)
+        if callable(set_command_projector):
+            set_command_projector(new_service.project_process_command)
+        self._context_service.set_context_budget(self._context_budget_for_projection())
 
     def context_usage(self, snapshot=None):
         """Return the same dynamic usage projection for headless callers."""

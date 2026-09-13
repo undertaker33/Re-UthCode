@@ -15,6 +15,7 @@ from uthcode.integrations.config.writer import (
     write_user_default_permission_mode,
     write_user_default_model,
 )
+from uthcode.core.secrets import SecretValue
 
 
 def test_user_permission_default_loads_writes_and_rejects_unsafe_values(tmp_path: Path) -> None:
@@ -126,6 +127,107 @@ remote_id = "project-remote"
         LoadedConfigSource("project", project.resolve()),
         LoadedConfigSource("cli"),
     )
+
+
+def test_search_config_merges_user_project_limits_without_exposing_key(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "base/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."base/ref"]
+provider = "local"
+remote_id = "base"
+
+[search]
+enabled = true
+provider = "tavily"
+api_key = "search-loader-secret"
+max_results = 5
+max_fetch_bytes = 4096
+timeout_seconds = 20.0
+''',
+        encoding="utf-8",
+    )
+    root = tmp_path / "repo"
+    cwd = root / "child"
+    cwd.mkdir(parents=True)
+    (root / ".git").mkdir()
+    project = root / ".uthcode" / "config.toml"
+    project.parent.mkdir()
+    project.write_text(
+        '''[search]
+enabled = false
+max_results = 2
+max_fetch_bytes = 2048
+timeout_seconds = 5.0
+''',
+        encoding="utf-8",
+    )
+
+    data = load_config_data(cwd=cwd, home=home)
+    assert isinstance(data.search["api_key"], SecretValue)
+    assert "search-loader-secret" not in repr(data)
+    assert data.search["enabled"] is False
+    assert data.search["max_results"] == 2
+    assert data.search["max_fetch_bytes"] == 2048
+    assert data.search["timeout_seconds"] == 5.0
+    assert data.sources == (
+        LoadedConfigSource("user", user.resolve()),
+        LoadedConfigSource("project", project.resolve()),
+    )
+
+
+@pytest.mark.parametrize(
+    "project_search",
+    [
+        'api_key = "project-secret"',
+        'endpoint = "https://evil.example/search"',
+        "enabled = true",
+        "max_results = 6",
+    ],
+)
+def test_project_search_cannot_add_credentials_redirect_or_expand_user_service(
+    tmp_path: Path,
+    project_search: str,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "base/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."base/ref"]
+provider = "local"
+remote_id = "base"
+
+[search]
+enabled = false
+provider = "tavily"
+api_key = "user-secret"
+max_results = 5
+''',
+        encoding="utf-8",
+    )
+    root = tmp_path / "repo"
+    cwd = root / "child"
+    cwd.mkdir(parents=True)
+    (root / ".git").mkdir()
+    project = root / ".uthcode" / "config.toml"
+    project.parent.mkdir()
+    project.write_text(f"[search]\n{project_search}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError):
+        load_config_data(cwd=cwd, home=home)
 
 
 def test_loader_preserves_initialization_and_field_evidence(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from os import PathLike
 from pathlib import Path, PureWindowsPath
 
@@ -748,6 +749,11 @@ class ApplicationToolService:
 
         if not isinstance(outcome, ToolExecutionOutcome):
             raise TypeError("outcome must be a ToolExecutionOutcome")
+        # A Provider or external Tool may reflect a credential in either its
+        # textual result or structured details.  Sanitize before calculating
+        # persistence, metadata, or the visible ToolResult so the same safe
+        # value is used for inline messages and Session artifacts.
+        outcome = self._redact_execution_outcome(outcome)
         text_content = str(outcome.content)
         size_bytes = len(text_content.encode("utf-8"))
         execution_metadata = _execution_metadata(outcome)
@@ -857,6 +863,38 @@ class ApplicationToolService:
             reference=reference.ref,
             size_bytes=reference.size_bytes,
             sha256=reference.sha256,
+        )
+
+    def _redact_execution_outcome(
+        self,
+        outcome: ToolExecutionOutcome,
+    ) -> ToolExecutionOutcome:
+        content = outcome.content
+        if isinstance(content, ContentSequence):
+            parts = tuple(
+                TextPart(self._redactor.redact(part.text))
+                if isinstance(part, TextPart)
+                else part
+                for part in content.parts
+            )
+            content = ContentSequence(parts)
+        else:
+            content = ContentSequence(self._redactor.redact(str(content)))
+        details = _redact_value(outcome.details, self._redactor.redact)
+        progress = tuple(
+            replace(item, text=self._redactor.redact(item.text))
+            for item in outcome.progress
+        )
+        return replace(
+            outcome,
+            content=content,
+            details=details if isinstance(details, Mapping) else {},
+            progress=progress,
+            resource=(
+                self._redactor.redact(outcome.resource)
+                if outcome.resource is not None
+                else None
+            ),
         )
 
     def _persistence_failure(
@@ -987,6 +1025,30 @@ def _execution_metadata(outcome: ToolExecutionOutcome) -> dict[str, object]:
         metadata["exit_code"] = outcome.exit_code
     metadata.update(outcome.details)
     return metadata
+
+
+def _redact_value(value: object, redact: Callable[[str], str]) -> object:
+    """Recursively redact JSON-shaped Tool metadata without widening it."""
+
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, Mapping):
+        # Metadata is eventually projected as JSON.  Redact mapping keys as
+        # well as values so a reflected credential cannot escape through a
+        # Provider response such as ``{"<api-key>": "..."}``.  Converting
+        # non-string keys before redaction preserves JSON's string-key
+        # requirement for the projected object.
+        return {
+            redact(key if isinstance(key, str) else str(key)): _redact_value(item, redact)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item, redact) for item in value)
+    if isinstance(value, list):
+        return [_redact_value(item, redact) for item in value]
+    if isinstance(value, set):
+        return {_redact_value(item, redact) for item in value}
+    return value
 
 
 def _content_with_text(content: ContentSequence, replacement: str) -> ContentSequence:

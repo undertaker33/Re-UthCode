@@ -71,12 +71,19 @@ class LoadedConfigData:
     models: Mapping[str, Mapping[str, object]]
     sources: tuple[LoadedConfigSource, ...]
     default_permission_mode: str = "default"
+    # Search is deliberately a separate user-level table.  The parsed value
+    # keeps only immutable facts; the resolved SecretValue is never projected
+    # by the loader's safe view.
+    search: Mapping[str, object] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         if not isinstance(self.default_model, str) or not self.default_model.strip():
             raise ValueError("default_model must be a non-empty string")
         if self.default_permission_mode not in {"default", "auto"}:
             raise ValueError("default_permission_mode must be default or auto")
+        if not isinstance(self.search, Mapping):
+            raise TypeError("search must be a mapping")
+        object.__setattr__(self, "search", _freeze(self.search, field="search"))
         object.__setattr__(
             self,
             "providers",

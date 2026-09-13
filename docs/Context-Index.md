@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-09-12
+snapshot_date: 2026-09-13
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -96,9 +96,9 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 | --- | --- | --- | --- |
 | T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W06 Feedback 齐全，自动回归、Runtime/PyInstaller smoke、package/make、Installer 自动测试和 packaged Electron 中英文 CDP 视觉验收已有证据；冻结 Checklist 共 86 项，仍有 20 项未完成，覆盖 Project/Session、Composer/Slash、AskUser/Plan、Settings/主题、真实 Desktop/Installer/Feature Parity 与最终状态收口，其中部分旧验收语义已被 F02 新需求取代但不得回写冻结文件，保持 `not_implemented` |
 | F02 | Desktop GUI 交互与上下文缺陷修复 | `docs/work/F02-DesktopGUI交互与上下文缺陷修复/` | W01～W05 已实施；W06 的既有 `w06-rework-*` 16 份 packaged/CDP 报告记录完整交互矩阵历史证据，P3 收紧 ResizeObserver stderr allowlist 后另有定向报告；在合入 W03/W05 返工后又从当前源码重建 SHA-256 `6cf2fd8e9e79074554aeb072de713f8edf7696679a5b656f12ae25a0c7c32849` 的 packaged app，并以 `commands` flow 分别通过 en/zh-CN canonical Slash、typed `/compact` 与 typed `/status` 当前包集成验收，报告均无 console/renderer exception/unexplained stderr。完整 16 场未使用当前包重跑，W06 Checklist 仍保留人工、真实 Provider、干净 Windows 与视觉/可访问性未验证项，因此仍为 `not_implemented` |
-| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-09-12 W01（T01→T03）经三轮返工、Terra 第四轮审核通过；W02（T04→T06）经一轮返工、Terra 第二轮审核通过。W03（T07→T09）经总控一轮预审返工及 Terra 四轮返工、第五轮审核通过：四格式有界读取/PDF 页图、Bash/Process Session、Windows 原生 PTY/Job 回收、跨 Turn Application→Desktop 有界日志与授权控制链；A09/A11/A13/A14/A16 有当前实测，A10/A12（POSIX）/A15 packaged 与其余后续项仍未完成，具体命令和限制见 W03 Feedback。A02/T19 真实 Provider、Tavily、Windows packaged/native/manual 验收待用户配置或环境后补测；整包保持 `not_implemented`。 |
+| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-09-13 W01（T01→T03）经三轮返工、Terra 第四轮审核通过；W02（T04→T06）经一轮返工、Terra 第二轮审核通过。W03（T07→T09）经总控一轮预审返工及 Terra 四轮返工、第五轮审核通过：四格式有界读取/PDF 页图、Bash/Process Session、Windows 原生 PTY/Job 回收、跨 Turn Application→Desktop 有界日志与授权控制链。W04（T10→T13）经两轮返工、Terra 第三轮审核通过，已在当前源码接入可信用户级 Tavily basic 搜索配置、逐跳有界 WebFetch、Codex ApplyPatch、GitWorkspace 只读查询和 Glob/Grep 有界续读；A17/A19/A20/A21/A23 的本地自动化与 Application/Desktop 链路证据记录于 W04 Feedback，A18 真实 Tavily 仍待用户配置，T19/POSIX/packaged 等后续验收仍未完成。Checklist 仅勾选当前已验证项，整包保持 `not_implemented`。 |
 
-2026-09-12 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W03 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；WSL 无 conda 的 POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
+2026-09-13 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W04 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；用户尚未配置 Tavily，因此 A18 保持未勾选；WSL/POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
 
 ## 跨层最短链路
 

@@ -949,6 +949,7 @@ class AgentTurnExecution:
         "_session_grant_sink",
         "_pending_prepared_call",
         "_pending_permission_choice",
+        "_pending_permission_action",
         "_pending_steering",
         "_steering_requested_emitted",
         "_overflow_retry_used",
@@ -982,6 +983,7 @@ class AgentTurnExecution:
         self._session_grant_sink = session_grant_sink
         self._pending_prepared_call: PreparedToolCall | None = None
         self._pending_permission_choice: PermissionApprovalChoice | None = None
+        self._pending_permission_action: PermissionAction | None = None
         self._pending_steering: SteeringRequest | None = None
         self._steering_requested_emitted = False
         self._overflow_retry_used = False
@@ -2007,6 +2009,7 @@ class AgentTurnExecution:
         self._batch_control_reason = None
         self._pending_prepared_call = None
         self._pending_permission_choice = None
+        self._pending_permission_action = None
         self._set_state(tool_call_count=self._state.tool_call_count + len(calls))
         self._append(
             events,
@@ -2129,6 +2132,7 @@ class AgentTurnExecution:
             pending_input = True
         self._pending_prepared_call = None
         self._pending_permission_choice = None
+        self._pending_permission_action = None
         if pending_input and index < len(continuation.tool_calls):
             results.append(
                 self._append_cancelled_call(
@@ -2164,7 +2168,7 @@ class AgentTurnExecution:
         events: list[AgentEvent],
         iteration: int,
         batch_id: str,
-    ) -> tuple[ToolResultPart, bool, str]:
+    ) -> tuple[ToolResultPart, bool, str, PermissionAction | None]:
         """Execute exactly one already-prepared call and normalize failures."""
 
         call = prepared.call
@@ -2229,6 +2233,16 @@ class AgentTurnExecution:
                     for progress in outcome.progress:
                         publish_progress(progress)
                 flush_progress()
+            if outcome.permission_action is not None:
+                return (
+                    _controlled_tool_result(
+                        call,
+                        "Error: permission approval required before the next external target",
+                    ),
+                    True,
+                    "permission",
+                    outcome.permission_action,
+                )
             if self._loop._result_materializer is None:
                 result = outcome.result
             else:
@@ -2252,6 +2266,7 @@ class AgentTurnExecution:
                     ),
                     True,
                     "failed",
+                    None,
                 )
         except (GenerationCancelled, CancelledError):
             self._cancellation.cancel()
@@ -2259,6 +2274,7 @@ class AgentTurnExecution:
                 _controlled_tool_result(call, "Error: tool call cancelled"),
                 True,
                 "cancelled",
+                None,
             )
         except Exception:
             execution_status = "unknown" if outcome is None else outcome.status.value
@@ -2293,13 +2309,14 @@ class AgentTurnExecution:
                     )
                     else "failed"
                 ),
+                None,
             )
         if outcome is not None and (
             outcome.status.value == "unknown"
             or outcome.side_effect is ToolSideEffect.UNKNOWN
         ):
-            return result, False, "unknown"
-        return result, False, "failed" if result.is_error else "finished"
+            return result, False, "unknown", None
+        return result, False, "failed" if result.is_error else "finished", None
 
     def _close_unknown_side_effect_tools(
         self,
@@ -2470,6 +2487,7 @@ class AgentTurnExecution:
             if resumed_prepared is not None and resumed_prepared.call.tool_call_id != call.tool_call_id:
                 self._pending_prepared_call = None
                 self._pending_permission_choice = None
+                self._pending_permission_action = None
                 result = _controlled_tool_result(call, "Error: permission continuation mismatch")
                 controlled = True
                 status = "failed"
@@ -2604,23 +2622,76 @@ class AgentTurnExecution:
                             return "paused"
                 elif resumed_prepared is not None:
                     choice = self._pending_permission_choice
+                    pending_permission = self._pending_permission_action
                     self._pending_prepared_call = None
                     self._pending_permission_choice = None
+                    self._pending_permission_action = None
                     if choice is None:
                         result = _controlled_tool_result(call, "Error: permission response missing")
                         controlled = True
                         status = "failed"
                     elif choice is PermissionApprovalChoice.REJECT:
+                        if hasattr(self._cancellation, "_uthcode_web_pending_redirect"):
+                            delattr(self._cancellation, "_uthcode_web_pending_redirect")
                         result = _controlled_tool_result(call, "Error: permission rejected")
                         controlled = True
                         status = "denied"
                     else:
-                        result, controlled, status = await self._execute_prepared(
+                        if pending_permission is not None:
+                            self._cancellation._uthcode_web_approved_redirect = pending_permission  # type: ignore[attr-defined]
+                        result, controlled, status, next_permission = await self._execute_prepared(
                             resumed_prepared,
                             events=events,
                             iteration=continuation.iteration,
                             batch_id=batch_id,
                         )
+                        if next_permission is not None:
+                            if self._permission_resolver is None:
+                                result = _controlled_tool_result(call, "Error: permission check failed")
+                                controlled = True
+                                status = "failed"
+                            else:
+                                try:
+                                    next_decision = self._permission_resolver(next_permission)
+                                except Exception:
+                                    next_decision = None
+                                if not isinstance(next_decision, PermissionDecision) or next_decision.action != next_permission:
+                                    result = _controlled_tool_result(call, "Error: permission check failed")
+                                    controlled = True
+                                    status = "failed"
+                                elif next_decision.decision is Decision.DENY:
+                                    if hasattr(self._cancellation, "_uthcode_web_pending_redirect"):
+                                        delattr(self._cancellation, "_uthcode_web_pending_redirect")
+                                    result = _controlled_tool_result(call, "Error: permission denied")
+                                    controlled = True
+                                    status = "denied"
+                                elif next_decision.decision is Decision.ASK:
+                                    self._pending_prepared_call = resumed_prepared
+                                    self._pending_permission_action = next_permission
+                                    self._continuation = replace(
+                                        continuation,
+                                        completed_tool_results=tuple(results),
+                                        next_tool_index=index,
+                                        pending_pause=None,
+                                    )
+                                    self._pause_permission_segment(
+                                        events,
+                                        continuation.iteration,
+                                        call,
+                                        next_decision,
+                                    )
+                                    return "paused"
+                                else:
+                                    # A policy may have changed while the
+                                    # response was pending; consume one
+                                    # explicit approval before retrying.
+                                    self._cancellation._uthcode_web_approved_redirect = next_permission  # type: ignore[attr-defined]
+                                    result, controlled, status, _ = await self._execute_prepared(
+                                        resumed_prepared,
+                                        events=events,
+                                        iteration=continuation.iteration,
+                                        batch_id=batch_id,
+                                    )
                         if (
                             choice is PermissionApprovalChoice.SESSION
                             and not result.is_error
@@ -2629,6 +2700,8 @@ class AgentTurnExecution:
                         ):
                             try:
                                 self._session_grant_sink(resumed_prepared.action)
+                                if pending_permission is not None:
+                                    self._session_grant_sink(pending_permission)
                             except Exception:
                                 # The current approved call remains the
                                 # authoritative result; a failed in-memory
@@ -2682,12 +2755,51 @@ class AgentTurnExecution:
                                     controlled = True
                                     status = "failed"
                                 elif decision.decision is Decision.ALLOW:
-                                    result, controlled, status = await self._execute_prepared(
+                                    result, controlled, status, pending_permission = await self._execute_prepared(
                                         prepared_or_result,
                                         events=events,
                                         iteration=continuation.iteration,
                                         batch_id=batch_id,
                                     )
+                                    if pending_permission is not None:
+                                        try:
+                                            pending_decision = self._permission_resolver(pending_permission)
+                                        except Exception:
+                                            pending_decision = None
+                                        if not isinstance(pending_decision, PermissionDecision) or pending_decision.action != pending_permission:
+                                            result = _controlled_tool_result(call, "Error: permission check failed")
+                                            controlled = True
+                                            status = "failed"
+                                        elif pending_decision.decision is Decision.DENY:
+                                            if hasattr(self._cancellation, "_uthcode_web_pending_redirect"):
+                                                delattr(self._cancellation, "_uthcode_web_pending_redirect")
+                                            result = _controlled_tool_result(call, "Error: permission denied")
+                                            controlled = True
+                                            status = "denied"
+                                        elif pending_decision.decision is Decision.ASK:
+                                            self._pending_prepared_call = prepared_or_result
+                                            self._pending_permission_action = pending_permission
+                                            self._continuation = replace(
+                                                continuation,
+                                                completed_tool_results=tuple(results),
+                                                next_tool_index=index,
+                                                pending_pause=None,
+                                            )
+                                            self._pause_permission_segment(
+                                                events,
+                                                continuation.iteration,
+                                                call,
+                                                pending_decision,
+                                            )
+                                            return "paused"
+                                        else:
+                                            self._cancellation._uthcode_web_approved_redirect = pending_permission  # type: ignore[attr-defined]
+                                            result, controlled, status, _ = await self._execute_prepared(
+                                                prepared_or_result,
+                                                events=events,
+                                                iteration=continuation.iteration,
+                                                batch_id=batch_id,
+                                            )
                                 elif decision.decision is Decision.DENY:
                                     result = _controlled_tool_result(
                                         call,
@@ -2787,6 +2899,7 @@ class AgentTurnExecution:
         self._batch_control_reason = None
         self._pending_prepared_call = None
         self._pending_permission_choice = None
+        self._pending_permission_action = None
 
     def _complete_segment(self, events: list[AgentEvent], final_text: str) -> AgentExecutionSegment:
         self._set_terminal(RunStatus.COMPLETED, TerminationReason.FINAL_ANSWER, final_text)
@@ -2852,6 +2965,7 @@ class AgentTurnExecution:
         self._batch_control_reason = None
         self._pending_prepared_call = None
         self._pending_permission_choice = None
+        self._pending_permission_action = None
         self._pending_steering = None
         self._steering_requested_emitted = False
 

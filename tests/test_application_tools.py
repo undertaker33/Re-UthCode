@@ -4,7 +4,13 @@ from collections.abc import AsyncIterator, Iterable
 
 import pytest
 
-from uthcode.application import ApplicationRuntimeContext, EffectiveConfig, ProviderKind, create_application
+from uthcode.application import (
+    ApplicationRuntimeContext,
+    EffectiveConfig,
+    ProviderKind,
+    SearchConfiguration,
+    create_application,
+)
 from uthcode.application.tools import ApplicationToolService
 from uthcode.core.provider import (
     CancellationToken,
@@ -163,3 +169,23 @@ def test_projected_progress_preserves_whitespace_between_reports() -> None:
     assert "".join(event.text for event in (*first, *second, *flushed)) == (
         "ordinary alpha ordinary beta"
     )
+
+
+def test_formal_factory_composes_web_patch_and_git_tools_only_for_configured_search(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    enabled = create_default_tools(
+        tmp_path,
+        attachment_service=object(),
+        session_provider=lambda: None,
+        search_configuration=SearchConfiguration(enabled=True, api_key="search-secret"),
+    )
+    enabled_names = [tool.definition.name for tool in enabled]
+    assert {"ApplyPatch", "GitWorkspace", "WebFetch", "WebSearch"} <= set(enabled_names)
+
+    disabled = create_default_tools(
+        tmp_path,
+        attachment_service=object(),
+        session_provider=lambda: None,
+        search_configuration=SearchConfiguration(enabled=False, api_key="search-secret"),
+    )
+    assert "WebFetch" in {tool.definition.name for tool in disabled}
+    assert "WebSearch" not in {tool.definition.name for tool in disabled}

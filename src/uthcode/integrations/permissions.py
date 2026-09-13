@@ -115,6 +115,8 @@ def default_guard_rules() -> tuple[Rule, ...]:
             ("WriteFile", "write"),
             ("EditFile", "edit"),
             ("Grep", "grep"),
+            ("Glob", "glob"),
+            ("ApplyPatch", "apply"),
         )
     ]
     rules.append(

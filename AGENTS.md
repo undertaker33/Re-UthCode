@@ -58,7 +58,7 @@ interfaces -> application -> core
 - `Bash` 是当前 OS 用户权限下的 unsandboxed process execution，不得描述为 Sandbox。
 - Permission 固定支持 `default`、`auto`、`full_access`。`full_access` 跳过内置普通 Guard、普通 Policy 与 Strategy，但仍受用户/项目显式 Guard ASK/DENY 和灾难性 circuit breaker 约束；工具注册、参数校验、OS 权限和第三方权限始终有效，项目配置不得静默启用 `full_access`。
 - Permission Approval 是应用层授权，不是 OS Sandbox。Session Grant 只属于当前 `AgentRun`，不得自动持久化。
-- API key 只允许出现在用户级 `config.toml` 的 Provider `api_key` 字段，形式为 literal 或 `env:VARIABLE_NAME`；项目配置禁止 Provider、端点和一切凭据等价字段。解析后的值必须进入不可序列化、`repr` 脱敏的内部 `SecretValue`，只在 Provider SDK 构造边界显式取值，不得进入 Prompt、History、Event、日志、Journal、Snapshot、diagnostics 或 Eval artifact。Permission 动作规则与普通 `config.toml` 分离。
+- API key 只允许出现在用户级 `config.toml` 的 Provider `api_key` 或 `[search]` `api_key` 字段，形式为 literal 或 `env:VARIABLE_NAME`；项目配置禁止 Provider、端点和一切凭据等价字段。解析后的值必须进入不可序列化、`repr` 脱敏的内部 `SecretValue`，只在 Provider SDK 或搜索 HTTP 客户端构造边界显式取值，不得进入 Prompt、History、Event、日志、Journal、Snapshot、diagnostics 或 Eval artifact。Permission 动作规则与普通 `config.toml` 分离。联网搜索的 Tavily 端点、`search_depth=basic`、`include_answer=false` 由代码固定；项目配置只能禁用或收紧搜索上限，不能提供搜索凭据或重定向端点。
 
 ## 配置安全
 
