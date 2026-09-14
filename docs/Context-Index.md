@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-snapshot_date: 2026-09-13
+  snapshot_date: 2026-09-14
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -52,7 +52,7 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-09-12
+status_snapshot: 2026-09-14
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -99,6 +99,8 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 | T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-09-13 W01（T01→T03）经三轮返工、Terra 第四轮审核通过；W02（T04→T06）经一轮返工、Terra 第二轮审核通过。W03（T07→T09）经总控一轮预审返工及 Terra 四轮返工、第五轮审核通过：四格式有界读取/PDF 页图、Bash/Process Session、Windows 原生 PTY/Job 回收、跨 Turn Application→Desktop 有界日志与授权控制链。W04（T10→T13）经两轮返工、Terra 第三轮审核通过，已在当前源码接入可信用户级 Tavily basic 搜索配置、逐跳有界 WebFetch、Codex ApplyPatch、GitWorkspace 只读查询和 Glob/Grep 有界续读；W05（T14→T16）于 2026-09-14 经两轮返工、Terra 第三轮审核通过，已完成 Agent 异常截停、工具限制热 reload 和 Artifact Bridge/Main/Renderer 收口，Settings 已显示 configured/effective/source，外部 Artifact 使用 Main 原生 picker 的单路径进程内授权，A08/A22/A23 已有当前 Windows/Conda 自动化证据，A24 仍待人工点开产物。A18 真实 Tavily 仍待用户配置，T19/POSIX/packaged 等后续验收仍未完成。Checklist 仅勾选当前已验证项，整包保持 `not_implemented`。 |
 
 2026-09-13 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W05 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；用户尚未配置 Tavily，因此 A18 保持未勾选；人工产物操作、WSL/POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
+
+T11 W06 经一轮返工、Terra 第二轮审核通过，当前已加入 eval/swebench.py 的正式 Headless 外部实例适配与安全 trace，并有 A25 当前 Windows/Conda 定向证据；A26 官方 harness、A18 真实 Tavily、POSIX/packaged/人工 Desktop 仍未验收，T11 继续保持 not_implemented。
 
 ## 跨层最短链路
 

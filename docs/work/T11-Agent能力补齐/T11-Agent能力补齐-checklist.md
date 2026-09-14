@@ -102,14 +102,14 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T17 SWE-bench 预测与安全 Trace
 
-- [ ] A25（R21）：通过 计划新增 `tests/eval/test_swebench_adapter.py` 验证；通过条件：预测三字段和实际 diff、新文件正确；实例隔离，trace 不含秘密/图像字节/原生载荷；不获取 gold patch。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A25（R21）：通过 计划新增 `tests/eval/test_swebench_adapter.py` 验证；通过条件：预测三字段和实际 diff、新文件正确；实例隔离，trace 不含秘密/图像字节/原生载荷；不获取 gold patch。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T17 的完成边界并记录对应代码/定向证据：可导出官方可消费 JSONL；实际 harness 评分放 T19，resolved=false 如实报告，不要求必解。
+- [x] 核对 Tasks T17 的完成边界并记录对应代码/定向证据：可导出官方可消费 JSONL；实际 harness 评分放 T19，resolved=false 如实报告，不要求必解。
 
 ## T18 [接入主流程]
 
-- [ ] A27（四层边界与主链）：通过 `python -m pytest tests/test_architecture_boundaries.py tests/test_application.py tests/test_application_runs.py -q`，加上述受影响定向测试 验证；通过条件：所有新增工具从 Application/headless 可达；Core 无 SDK/OS/UI 依赖；无 Renderer 直连新工具。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T18 的完成边界并记录对应代码/定向证据：架构与 Application 定向验收通过，能力追踪无空项；只修前序范围内接缝。
+- [x] A27（四层边界与主链）：通过 `python -m pytest tests/test_architecture_boundaries.py tests/test_application.py tests/test_application_runs.py -q`，加上述受影响定向测试 验证；通过条件：所有新增工具从 Application/headless 可达；Core 无 SDK/OS/UI 依赖；无 Renderer 直连新工具。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T18 的完成边界并记录对应代码/定向证据：架构与 Application 定向验收通过，能力追踪无空项；只修前序范围内接缝。
 
 ## T19 [端到端验证]
 
@@ -124,5 +124,5 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T20 [遗留负担清理]
 
-- [ ] A29（文档与清理）：通过 定向搜索旧 max_iterations 执行 gate/旧结果路径；`npm run typecheck` 与相关 Desktop 测试；文档 UTF-8/fence/链接检查 验证；通过条件：无活动固定轮数上限、无旧协议双轨；全部必需文档/索引/欠账核对完成，历史记录不被当作需删除的运行逻辑。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T20 的完成边界并记录对应代码/定向证据：必要验证后停止；不新增兼容层/全局框架，不提交、不归档；所有必需验收仍未完成时如实报告，不能提前宣称整包完成。
+- [x] A29（文档与清理）：通过 定向搜索旧 max_iterations 执行 gate/旧结果路径；`npm run typecheck` 与相关 Desktop 测试；文档 UTF-8/fence/链接检查 验证；通过条件：无活动固定轮数上限、无旧协议双轨；全部必需文档/索引/欠账核对完成，历史记录不被当作需删除的运行逻辑。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T20 的完成边界并记录对应代码/定向证据：必要验证后停止；不新增兼容层/全局框架，不提交、不归档；所有必需验收仍未完成时如实报告，不能提前宣称整包完成。

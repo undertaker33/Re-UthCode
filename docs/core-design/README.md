@@ -40,6 +40,8 @@ A02 Control 与 A03 State 暂无独立教程文章，当前实现分别见 [Cont
 
 ## 为什么是四层
 
+仓库级外部评测也复用这条编排边界：eval.swebench.py 只负责把外部实例工作目录、题面和模型引用接到正式 Headless Application，并把实际工作区差异导出为预测；运行状态、工具和权限仍由 Application/Core 权威链路持有，官方评分器留在外部环境。
+
 先看一次最普通的 Coding Agent 任务。
 
 用户提出：

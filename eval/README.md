@@ -51,6 +51,40 @@ Profile workload 的 Provider 只根据已观察的 ToolResult、外部页边界
 
 由于 Fake 不伪造模型对 fixture 的修改，除 `plan-only` 的只读成功路径外，单题 Fake smoke 默认会如实产生 `agent_failure`/verifier failure；这不是 baseline 分数，而是用于验收失败归因、artifact 和 report 链路。真实模型运行或独立的 verifier gold/partial/forbidden 测试才用于评估任务正确性。
 
+## SWE-bench 预测适配
+
+`eval.swebench` 是一个手动、薄的外部适配器：它接收已经准备好的外部 Git 实例工作目录、题面和模型引用，复用 `eval/execution.py` 的正式 Headless `Application -> AgentRun -> Turn` 链。它不读取 gold patch，不安装或导入官方 SWE-bench harness，也不把评分器加入产品依赖。模型运行前会在实例仓库根执行 Git clean 检查；tracked、staged 或未被 `.gitignore` 忽略的 untracked 改动都会受控拒绝，Provider 不会被调用。用户实例内容不会被适配器清理或回滚。
+
+基线固定为 clean 检查时的 `HEAD`。运行结束后适配器用独立临时 `GIT_INDEX_FILE` 将当前工作区加入索引，再由真实 Git 生成 `--binary --full-index --find-renames` Patch；临时索引不会改动用户 index，Git 的正常 ignore、文本换行、binary、new/delete、rename、mode 和 symlink 语义都保留，未跟踪的新文件也会进入 Patch。评测运行时自动生成的 `.uthcode/permissions.toml` 只有在基线不存在时排除；基线中已有的同名业务文件不会被静默遗漏。输出 Patch 可用 `git apply --check --binary` 检查。symlink 是否可应用取决于当前平台 Git checkout 能力，Windows 无此能力时由测试如实跳过。home 和 artifacts 位于独立 Eval root 下。
+
+Fake Provider 可用来检查离线合同，但不会产生有意义的修复。需要真实模型时，先由用户配置 API key 环境变量，再显式同时提供 `--live` 和 `--live-authorized`；命令不会打印环境变量值之外的凭据来源：
+
+```powershell
+conda run --no-capture-output -n re-uthcode python -m eval.swebench `
+  --instance-id django__django-12345 `
+  --workdir C:\\swebench\\django__django-12345 `
+  --problem-file C:\\swebench\\django__django-12345.problem.txt `
+  --model-name-or-path your-provider/model-id `
+  --eval-root C:\\private-swebench-eval `
+  --predictions-path C:\\private-swebench-eval\\reports\\predictions.jsonl `
+  --provider-kind anthropic `
+  --api-key-env ANTHROPIC_API_KEY `
+  --live `
+  --live-authorized
+```
+
+适配器输出每行恰好包含 `instance_id`、`model_name_or_path` 和 `model_patch`，可以交给外部官方评分环境：
+
+```powershell
+python -m swebench.harness.run_evaluation `
+  --dataset_name princeton-nlp/SWE-bench_Lite `
+  --predictions_path C:\\private-swebench-eval\\reports\\predictions.jsonl `
+  --instance_ids django__django-12345 `
+  --run_id uthcode-w06
+```
+
+上面的评分命令属于单独、用户准备的外部环境；本仓库不声明它已安装或已执行。每次适配运行还写出安全 `trace.jsonl`：秘密、图片字节、原始 Provider/native payload 和二进制字段会被移除或脱敏，不能据此恢复完整模型请求。
+
 比较两个报告：
 
 ```powershell

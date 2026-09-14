@@ -402,6 +402,7 @@ def test_exec_cancels_turn_when_agent_pauses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    (tmp_path / "cli-workdir").mkdir()
     cancel_calls = 0
     original_cancel = TurnHandle.cancel
 

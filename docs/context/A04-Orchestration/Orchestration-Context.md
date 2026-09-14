@@ -30,6 +30,8 @@ explicit_absence: subagent + task decomposition + multi-agent scheduler
 
 ## 私有 Eval 手动链路
 
+- [FACT] eval/swebench.py 接收外部 Git 实例工作目录、题面和模型引用，先要求仓库根 clean，再复用 eval/execution.py 的正式 Headless Application；它以 clean 时的 HEAD 为基线，通过独立临时 GIT_INDEX_FILE 和真实 Git `--binary --find-renames` 生成可应用的三字段预测 JSONL，保留 binary、new/delete、rename、mode、换行和平台可用的 symlink 语义，不读取 gold patch。评测运行时自产且基线不存在的 `.uthcode/permissions.toml` 被排除，基线已有的同名业务文件不被遗漏；home/artifacts 与实例工作目录隔离，trace 在导出前移除秘密、图片字节和 Provider/native payload；官方评分器不属于产品依赖。
+
 - `[FACT]` `eval/runner.py` 是仓库级手动入口；它读取版本化任务，创建仓库外的专用 attempt 根，再通过 `uthcode.application` 公共导出交给 `eval/execution.py` 完成一个 Application/Run/Turn 和一条事件流。
 - `[FACT]` 离线 profile workload 只从真实 Application compaction request 的 Required coverage payload 复制 Turn identity 与 exact refs，再交给严格 multi-turn parser；它不内置标准答案、不伪造 refs，也不改变生产 Context authority。报告对 Provider cache、HistoryRead 等不存在的来源保留 `not_available` 与原因。
 - `[FACT]` verifier 作为独立离线子进程读取 attempt workspace；`eval/metrics.py` 与 `eval/reporting.py` 只消费公开事件、终态、verifier 和受控 diagnostics，报告并列保留六个维度，不生成总分。

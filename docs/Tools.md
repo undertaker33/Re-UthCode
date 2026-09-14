@@ -78,3 +78,7 @@ Plan Mode 中的 `Bash` 以及 `Process` 的只读查询可以准备；写入、
 `HistoryRead` 只接受当前 Session 的精确 opaque Transcript ref 和有界分页参数；它不搜索、不跨 Session，也不把原始历史递归外置。它与 `ToolResultRead` 使用独立的 ref namespace、权限资源和错误边界。
 
 > `Bash` 不是 OS Sandbox。即使工具对模型可见，具体调用仍需经过参数校验、运行模式限制和权限判断。
+
+## 仓库级 Eval 边界
+
+`eval/swebench.py` 是仓库级手动评测适配器，不是 `uthcode` Tool，也不会进入 Tool Registry、模型 Tool 列表或 Desktop 运行链。它要求外部 Git 实例根在运行前 clean，只把外部工作目录、题面和模型引用接到正式 Headless Application，并用真实 Git 生成实际差异预测 JSONL；官方评分器仍属于外部评测环境。
