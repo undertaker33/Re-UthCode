@@ -128,6 +128,8 @@ async def test_failed_turn_visible_content_and_stable_reason_survive_restart(
 
 
 def test_runtime_context_and_model_status_are_stable_values(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
     context = ApplicationRuntimeContext.from_system(
         workdir=tmp_path / "nested" / ".." / "project",
         platform_name="TestOS",

@@ -357,7 +357,11 @@ def _record_paths(attempt: AttemptPaths) -> dict[str, str]:
     }
 
 
-def _validate_attempt_paths(attempt: AttemptPaths) -> None:
+def _validate_attempt_paths(
+    attempt: AttemptPaths,
+    *,
+    allow_external_workspace: bool = False,
+) -> None:
     repo = attempt.repo_root.resolve(strict=False)
     if repo != attempt.repo_root or not repo.is_dir():
         raise EvalExecutionError("attempt repo_root must be a physical directory")
@@ -396,6 +400,15 @@ def _validate_attempt_paths(attempt: AttemptPaths) -> None:
     for name in ("workspace", "home", "artifacts"):
         path = getattr(attempt, name)
         resolved = path.resolve(strict=False)
+        if name == "workspace" and allow_external_workspace:
+            # SWE-bench instances are already materialized by the external
+            # harness.  Keep that repository as the Application workdir while
+            # retaining the Eval root for only home/artifact bookkeeping.
+            if resolved != path or resolved != repo or not path.is_dir():
+                raise EvalExecutionError(
+                    "external attempt workspace must be the physical Git repository root"
+                )
+            continue
         if resolved != path or resolved == root:
             raise EvalExecutionError(f"attempt {name} must be a physical child of the Eval root")
         try:
@@ -449,6 +462,7 @@ async def run_attempt(
     secret_values: Sequence[str] = (),
     candidate_variant: Mapping[str, object] | None = None,
     diagnostics_hook: DiagnosticsHook | None = None,
+    allow_external_workspace: bool = False,
 ) -> AttemptExecution:
     """Run exactly one Application Run/Turn and persist safe attempt artifacts.
 
@@ -461,7 +475,9 @@ async def run_attempt(
         raise TypeError("task must be TaskDefinition")
     if not isinstance(attempt, AttemptPaths):
         raise TypeError("attempt must be AttemptPaths")
-    _validate_attempt_paths(attempt)
+    if not isinstance(allow_external_workspace, bool):
+        raise TypeError("allow_external_workspace must be a boolean")
+    _validate_attempt_paths(attempt, allow_external_workspace=allow_external_workspace)
     if task.task_id != attempt.task_id:
         raise EvalExecutionError("task and attempt identifiers do not match")
     if not isinstance(instruction, str) or not instruction.strip():
@@ -498,6 +514,8 @@ async def run_attempt(
         for profile in config.providers.values()
         if profile.api_key is not None
     )
+    if config.search.api_key is not None:
+        configured_secret_values = (*configured_secret_values, config.search.api_key.reveal())
     effective_secret_values = tuple(dict.fromkeys((*secret_values, *configured_secret_values)))
     revision = _git_revision(attempt.repo_root)
     platform_fingerprint = _hash_payload({"system": platform.system(), "release": platform.release()})

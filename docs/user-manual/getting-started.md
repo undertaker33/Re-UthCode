@@ -31,6 +31,8 @@ display_name = "Offline Echo"
 
 ## 开始使用
 
+仓库外部评测使用同一 Headless Application 链，不通过 Desktop 或另一个 Agent 入口。准备好干净的外部 Git 实例工作目录和题面后，可按 [Eval 说明](../../eval/README.md#swe-bench-预测适配) 导出官方可消费的三字段 JSONL；运行前若发现 tracked、staged 或未被 `.gitignore` 忽略的 untracked 改动会受控拒绝，适配器不会清理或回滚用户文件。真实 Provider、凭据和官方评分环境必须由用户单独配置并授权。
+
 在需要操作的项目目录启动交互界面：
 
 ```powershell

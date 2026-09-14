@@ -794,7 +794,11 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     )
     assert _latest_message(second_request, "assistant").role == "assistant"
     tool_message = _latest_message(second_request, "tool")
-    assert tool_message.parts == (ToolResultPart("read-call", f"1\t{hidden_content}"),)
+    assert len(tool_message.parts) == 1
+    assert isinstance(tool_message.parts[0], ToolResultPart)
+    assert tool_message.parts[0].content == f"1\t{hidden_content}"
+    assert tool_message.parts[0].metadata["evidence"] == "read_content"
+    assert isinstance(tool_message.parts[0].metadata["content_digest"], str)
     assert result.final_text == "The note says exactly what was requested."
     assert "I have the result." not in (result.final_text or "")
 
@@ -1250,9 +1254,12 @@ async def test_tool_summary_failure_does_not_block_tool_execution(
 
     tool_finished = next(event for event in events if isinstance(event, ToolFinished))
     assert tool_finished.command == "<tool summary unavailable>"
-    assert _latest_message(provider.requests[1], "tool").parts == (
-        ToolResultPart("read-call", f"1\t{hidden_content}"),
-    )
+    tool_message = _latest_message(provider.requests[1], "tool")
+    assert len(tool_message.parts) == 1
+    assert isinstance(tool_message.parts[0], ToolResultPart)
+    assert tool_message.parts[0].content == f"1\t{hidden_content}"
+    assert tool_message.parts[0].metadata["evidence"] == "read_content"
+    assert isinstance(tool_message.parts[0].metadata["content_digest"], str)
 
 
 def test_headless_application_import_does_not_load_interfaces() -> None:

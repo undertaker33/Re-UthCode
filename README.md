@@ -6,6 +6,8 @@ UthCode 是一个面向本地项目的 AI 编程助手。它既可以在终端�
 
 ## 核心能力
 
+- eval.swebench 要求外部 Git 实例在运行前 clean，并通过同一 Headless Application 链和真实 Git 临时 index 导出保留 binary/rename 等语义的官方三字段预测 JSONL；评分器与真实 Provider 运行仍由用户单独准备和授权。
+
 - 阅读、搜索、创建和修改工作目录内的文件。
 - 通过 `Bash` 执行命令，并对工具操作进行权限判断和必要的用户确认。
 - 支持 Anthropic、OpenAI Responses 和 OpenAI-compatible 模型服务。
@@ -51,6 +53,8 @@ npm run make -- --platform=win32 --arch=x64
 产物位于 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`。当前仓库产物未签名，仅作为 development/release-candidate 使用，不代表公开发行或 SmartScreen 验收已完成。
 
 ## 文档导航
+
+- [私有 Eval 与 SWE-bench 预测说明](eval/README.md)
 
 - [文档中心](docs/README.md)
 - [快速上手](docs/user-manual/getting-started.md)

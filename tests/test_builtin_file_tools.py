@@ -196,7 +196,9 @@ async def test_read_file_returns_one_based_pages_and_records_state(tmp_path: Pat
         cancellation=CancellationToken(),
     )
 
-    assert result == type(result)("2\ttwo")
+    assert result.content == "2\ttwo"
+    assert result.details["evidence"] == "read_content"
+    assert isinstance(result.details["content_digest"], str)
     assert tracker.check(target) == (True, "")
 
 
