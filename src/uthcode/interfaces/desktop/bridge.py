@@ -55,6 +55,7 @@ from uthcode.application import (
     PermissionMode,
     PermissionModeSelected,
     PlanReviewResponse,
+    ProviderError,
     QuitInterface,
     RetryProviderResponse,
     RunSnapshot,
@@ -2978,6 +2979,24 @@ class DesktopBridge:
             user_input = MessageInput(tuple(parts))
         try:
             handle = start(user_input)
+        except ProviderError as error:
+            # Keep the model capability refusal actionable across the Desktop
+            # boundary while preserving the generic contract for every other
+            # start failure.  The Renderer uses this stable kind to explain
+            # that the selected model must explicitly support image input.
+            if (
+                error.code == "provider_configuration_error"
+                and error.message
+                in {
+                    "selected model does not explicitly support image input",
+                    "selected model does not explicitly support image input in Session history",
+                }
+            ):
+                raise BridgeError(
+                    "image_input_unsupported",
+                    "The selected model does not support image input",
+                ) from None
+            raise BridgeError("turn_error", "Turn could not be started") from None
         except Exception:
             raise BridgeError("turn_error", "Turn could not be started") from None
         if handle is None:

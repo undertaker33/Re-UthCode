@@ -231,6 +231,11 @@ function runtimeRequestKind(error: unknown): string {
   return typeof kind === "string" ? kind : "";
 }
 
+function runtimeBusinessErrorKind(value: unknown): string {
+  const payload = asObject(asObject(value).__uthcode_runtime_error);
+  return stringValue(payload.kind);
+}
+
 /**
  * Project every failed Desktop call to a renderer-owned localized message.
  *
@@ -1382,6 +1387,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           } : {}),
         });
       if (!isMounted() || (pendingStart && pendingTurnStart() !== pendingStart)) return;
+      if (!steering && runtimeBusinessErrorKind(result) === "image_input_unsupported") {
+        if (pendingStart) clearPendingTurnStart();
+        dispatch({ type: "notice", text: t("turnImageInputUnsupported") });
+        return;
+      }
       // Bridge `turn.start` returns a flat Run DTO; only `turn.steer` wraps
       // that DTO under `run`. Keep the shapes separate and require both
       // identity components before taking poll ownership.

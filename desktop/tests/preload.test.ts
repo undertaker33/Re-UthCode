@@ -15,7 +15,7 @@ import {
   isAllowedRendererUrl,
   registerIpcHandlers,
 } from "../src/main";
-import type { PythonRuntimeOptions } from "../src/python-runtime";
+import { RuntimeRequestError, type PythonRuntimeOptions } from "../src/python-runtime";
 
 type Listener = (...args: unknown[]) => void;
 
@@ -234,6 +234,60 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
   assert.equal(handlers.size, 0);
 });
 
+test("Main projects only the turn image refusal as a JSON business result", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const runtime = {
+    start: async () => undefined,
+    request: async (method: string) => {
+      throw new RuntimeRequestError(
+        method === "turn.start" ? "image_input_unsupported" : "turn_error",
+        "The selected model does not support image input",
+      );
+    },
+  };
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: { read: async () => ({}), write: async () => ({}) } as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
+    openPath: (async () => "") as never,
+  });
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(runtimeRequest);
+  try {
+    const result = await runtimeRequest?.(
+      trustedEvent,
+      { method: "turn.start", params: { prompt: "look", attachments: [{ ref: "asset-1", kind: "image" }] } },
+    );
+    assert.deepEqual(result, {
+      __uthcode_runtime_error: {
+        kind: "image_input_unsupported",
+        message: "The selected model does not support image input",
+      },
+    });
+    await assert.rejects(
+      runtimeRequest?.(trustedEvent, { method: "status.get", params: {} }),
+      RuntimeRequestError,
+    );
+  } finally {
+    removeHandlers();
+  }
+});
+
 test("Main gates project use to picker or persisted recent registrations", async () => {
   const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
   const fakeIpc = {
@@ -368,6 +422,44 @@ test("Main gates project use to picker or persisted recent registrations", async
     await rm(target, { recursive: true, force: true });
     await rm(persisted, { recursive: true, force: true });
   }
+});
+
+test("preload keeps the known turn image refusal as JSON for the Renderer", async () => {
+  const exposed: { api?: DesktopApi } = {};
+  const contextBridge = {
+    exposeInMainWorld(_name: string, api: DesktopApi) {
+      exposed.api = api;
+    },
+  };
+  const ipcRenderer = {
+    invoke(channel: string) {
+      assert.equal(channel, "desktop.runtime.request");
+      return Promise.resolve({
+        __uthcode_runtime_error: {
+          kind: "image_input_unsupported",
+          message: "The selected model does not support image input",
+        },
+      });
+    },
+    on() {
+      return this;
+    },
+    removeListener() {
+      return this;
+    },
+  };
+
+  installPreload(contextBridge, ipcRenderer);
+  const result = await exposed.api?.requestRuntime("turn.start", {
+    prompt: "look at this",
+    attachments: [{ ref: "asset-1", kind: "image" }],
+  });
+  assert.deepEqual(result, {
+    __uthcode_runtime_error: {
+      kind: "image_input_unsupported",
+      message: "The selected model does not support image input",
+    },
+  });
 });
 
 test("Main routes authorized artifacts to open/reveal and rejects URI execution", async () => {

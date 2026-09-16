@@ -612,6 +612,170 @@ async def test_real_application_attachment_import_and_attachment_only_turn_have_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "mime_type", "kind", "data_base64", "supports_images", "expected_error"),
+    (
+        ("note.txt", "text/plain", "file", "aGVsbG8=", None, None),
+        (
+            "pixel.png",
+            "image/png",
+            "image",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            True,
+            None,
+        ),
+        (
+            "pixel-disabled.png",
+            "image/png",
+            "image",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            None,
+            "image_input_unsupported",
+        ),
+    ),
+    ids=("file", "image-supported", "image-capability-unknown"),
+)
+async def test_real_application_bridge_attachment_send_paths(
+    tmp_path: Path,
+    name: str,
+    mime_type: str,
+    kind: str,
+    data_base64: str,
+    supports_images: bool | None,
+    expected_error: str | None,
+) -> None:
+    """Exercise text-plus-attachment and attachment-only starts end to end."""
+
+    provider = FakeProvider(
+        events=(_completed("attachment received"),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.desktop"),
+    )
+    configuration = EffectiveConfig(
+        default_model="fake/test",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/test": ModelProfile(
+                "fake/test",
+                "fake",
+                "test-model",
+                supports_images=supports_images,
+            ),
+        },
+    )
+    sessions = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=str(tmp_path.resolve()),
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=configuration,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path,
+            platform_name="test",
+            platform_release="1",
+            current_date="2026-09-16",
+        ),
+        session_service=sessions,
+        attachment_service=AttachmentService(sessions.store),
+    )
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+
+    async def import_attachment(request_id: str) -> dict[str, object]:
+        imported = await bridge.handle_request(
+            RequestEnvelope(
+                request_id,
+                "attachment.import",
+                {
+                    "name": name,
+                    "mime_type": mime_type,
+                    "data_base64": data_base64,
+                },
+            )
+        )
+        assert imported.ok is True
+        assert imported.result is not None
+        attachment = imported.result["attachment"]
+        assert isinstance(attachment, dict)
+        assert isinstance(attachment.get("ref"), str)
+        assert isinstance(attachment.get("asset_ref"), str)
+        return attachment
+
+    try:
+        attachment = await import_attachment("attachment-1")
+        first = await bridge.handle_request(
+            RequestEnvelope(
+                "turn-with-text",
+                "turn.start",
+                {
+                    "prompt": "describe this attachment",
+                    "attachments": [{"ref": attachment["ref"], "kind": kind}],
+                },
+            )
+        )
+        if expected_error is not None:
+            assert first.ok is False
+            assert first.error is not None
+            assert first.error.kind == expected_error
+            assert provider.recorded_requests == ()
+
+            # The failed start leaves the draft usable for an attachment-only
+            # retry; it must expose the same controlled capability refusal.
+            second = await bridge.handle_request(
+                RequestEnvelope(
+                    "turn-only-attachment",
+                    "turn.start",
+                    {"attachments": [{"ref": attachment["ref"], "kind": kind}]},
+                )
+            )
+            assert second.ok is False
+            assert second.error is not None
+            assert second.error.kind == expected_error
+            assert provider.recorded_requests == ()
+            return
+
+        assert first.ok is True
+        await bridge.wait_for_idle()
+        attachment_only = await import_attachment("attachment-2")
+        second = await bridge.handle_request(
+            RequestEnvelope(
+                "turn-only-attachment",
+                "turn.start",
+                {"attachments": [{"ref": attachment_only["ref"], "kind": kind}]},
+            )
+        )
+        assert second.ok is True
+        await bridge.wait_for_idle()
+        assert len(provider.recorded_requests) == 2
+        assert all(
+            any(
+                getattr(part, "asset_ref", None) == asset_ref
+                for message in request.messages
+                for part in message.parts
+            )
+            for request, asset_ref in zip(
+                provider.recorded_requests,
+                (attachment["asset_ref"], attachment_only["asset_ref"]),
+                strict=True,
+            )
+        )
+        assert any(
+            isinstance(part, TextPart)
+            for message in provider.recorded_requests[0].messages
+            for part in message.parts
+        )
+        # The second request includes the first turn as history; inspect its
+        # newly appended user message rather than treating history as input
+        # for the attachment-only retry.
+        assert not any(
+            isinstance(part, TextPart)
+            for part in provider.recorded_requests[1].messages[-1].parts
+        )
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_pending_pause_accepts_only_matching_typed_resume_and_duplicate_is_stale() -> None:
     application = _FakeApplication()
     bridge = DesktopBridge(application=application)

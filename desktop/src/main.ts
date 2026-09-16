@@ -426,6 +426,21 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       }
       return result;
     } catch (error) {
+      // Electron's invoke channel does not preserve custom Error fields.
+      // Project this one known turn-start business refusal as JSON so the
+      // Renderer can keep the stable image capability kind.
+      if (
+        payload.method === "turn.start"
+        && error instanceof RuntimeRequestError
+        && error.kind === "image_input_unsupported"
+      ) {
+        return {
+          __uthcode_runtime_error: {
+            kind: "image_input_unsupported",
+            message: "The selected model does not support image input",
+          },
+        };
+      }
       if (error instanceof RuntimeBoundaryError || error instanceof RuntimeRequestError) throw error;
       throw new MainBoundaryError("runtime_error", "Desktop Runtime request failed");
     }

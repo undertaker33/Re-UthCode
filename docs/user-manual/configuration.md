@@ -91,6 +91,8 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 
 Provider 表的键是稳定 Provider Profile ID，Model 的 `provider` 始终引用这个 ID。可选 `display_name` 只用于界面显示，修改或清空它不会改变 Model 引用；未配置时 Desktop 回退显示稳定 ID。模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
 
+模型的 `supports_images` 是三态能力声明：`true` 表示允许图片输入，`false` 或未知值按不支持处理。Desktop 发送含图片的消息时会在请求前明确提示所选模型不支持图片输入，并保留附件草稿；请在 Settings 中启用真实支持图片的模型或选择其他模型后重试。
+
 ### Context Window 与 Provider 限制
 
 `models.<model-ref>.context_window` 是用户显式配置的输入运行上限，必须是正整数。项目配置只能在用户配置已经存在该值时保持或收紧，不能补造缺失值或放大用户值。Provider 可以在运行时提供更小的可靠 `max_input_tokens`，最终请求使用两者中更紧的上限；`max_output_tokens` 和可选的 combined-context 限制分别校验，未知维度不会被猜测或伪造。
