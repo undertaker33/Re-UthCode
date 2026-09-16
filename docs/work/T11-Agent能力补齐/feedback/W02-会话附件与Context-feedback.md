@@ -91,3 +91,34 @@
 ## 总控审核收口
 
 Luna（max）完成首轮实施与一轮返工；Terra（high）第二轮审核通过，无新增 actionable finding。首轮图片 Gate/尺寸、Application 会话归属、异步导入归属、durable 原图保护及正常清理五项均已关闭。Reviewer 定向复跑附件与 Session 权威 28 passed、Renderer 附件 4 passed、架构 23 passed；冻结与 diff 检查通过。A07 既有文字样本重复打开不改 JSONL 字节，无需新增迁移器。最终返工受影响 Python 131 passed、Desktop 222 passed 和 typecheck 的 Worker 证据有效；首版全量 1536 passed、3 skipped 未作为最终版全量重跑结果。真实 Provider、Windows 原生和安装产物验收按既定安排保留未完成。
+
+## 用户附件发送缺陷补充（2026-09-16）
+
+用户报告带附件的消息无法发送。本次只修复当前 T06 发送链路的受控错误可达性，没有修改冻结需求、Spec、Tasks、Prompt 或 Checklist，也没有 Git 写操作。
+
+### 真实复现与根因
+
+- 通过真实 `UthCodeApplication → DesktopBridge → AgentRun → FakeProvider → Session` 路径验证，普通 `text/plain` 文件的文本+附件和仅附件均可提交；显式 `supports_images=true` 的模型图片两种形态也可提交并进入 Provider 请求。
+- 当前用户模型配置的 `supports_images` 为未知（`null`）。图片输入在 Application 预检阶段按合同拒绝，原 Bridge 把该 `ProviderConfigurationError` 与其他启动异常一起折叠为 `turn_error`；Python Runtime 虽已解析 `kind`，Electron `invoke` 直接抛出的自定义 Error 字段不能可靠跨 Main/preload/contextBridge 到达 Renderer，Renderer 因而只能显示通用失败。
+
+### 本次修复
+
+- Bridge 仅将两条已知图片能力预检拒绝映射为稳定的 `image_input_unsupported`，其他 Turn 启动失败继续使用通用 `turn_error`。
+- Main 仅对 `turn.start` 的该业务拒绝返回受控 JSON envelope；preload 原样传递 JSON，Renderer 在解析 Turn identity 前识别 envelope，显示中英文“所选模型不支持图片输入/在设置中启用图片能力或选择其他模型”提示，并保留附件草稿供重试。未把原始异常信息暴露给 Renderer。
+- 未自动修改或伪造 Provider 的 `supports_images` 能力；当前用户需在设置中启用真实支持图片的模型后再发送图片。未配置真实 Provider/Tavily，不把 fake Provider 结果写成真实服务验收。
+
+### 定向验证
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py -k 'real_application_bridge_attachment_send_paths or real_application_attachment_import_and_attachment_only_turn_have_one_durable_turn'`：4 passed；覆盖真实 Application/Bridge 的普通文件、支持图片模型和未知图片能力模型，包含文本+附件、仅附件、Provider 实际请求和拒绝零调用。
+- `npx tsx --test tests/preload.test.ts tests/renderer-attachments.test.tsx`（工作目录 `desktop`）：19 passed；覆盖 Main envelope、preload/contextBridge JSON 传递、Renderer 中英文提示、失败保留草稿与重试。
+- `npm run typecheck`（工作目录 `desktop`）：通过。
+- 本补充未请求凭据、未调用未配置服务、未改变附件 schema 或 W02 冻结范围；真实图片理解和用户配置后的 Provider 请求仍按既定安排待补测。
+
+### IPC 证据边界修正
+
+- 本补充记录的 Desktop `19 passed` 是离线 TypeScript 契约测试，使用受控 fake `ipc`/`contextBridge` fixture 验证 JSON envelope 形状和 preload→Renderer 传递；没有把它写成 packaged Electron 进程或 Windows 原生运行实测。
+- 受影响 Bridge 全测为 `80 passed`，架构边界为 `23 passed`；两项均使用 `re-uthcode` 环境执行。
+
+## 本次缺陷复审收口（2026-09-16）
+
+同一 Terra（high）复审已通过，无新增 actionable finding。复审采用当前源码和本补充证据：真实 Application/Bridge 附件路径 4 passed、Bridge 受影响全测 80 passed、架构边界 23 passed、Desktop Main/preload/Renderer 定向 19 passed、typecheck 通过；IPC 部分仍明确为离线契约 fixture，不宣称 packaged Electron 或 Windows 原生实测。

@@ -9,7 +9,7 @@ import type { DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, JsonVa
 import { App } from "../src/renderer/App";
 import { Composer } from "../src/renderer/Composer";
 import { createInitialState } from "../src/renderer/state";
-import { LanguageProvider } from "../src/renderer/i18n";
+import { LanguageProvider, resources } from "../src/renderer/i18n";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><div id=root></div></body></html>", { url: "http://localhost/" });
@@ -185,6 +185,84 @@ test("App keeps an imported attachment available for retry when turn.start fails
     assert.equal(turnStarts, 2);
     assert.equal(container.querySelector('[aria-label="Attachments"]'), null);
   });
+});
+
+test("App localizes the image capability refusal and keeps the attachment for retry", async () => {
+  assert.match(resources.en.turnImageInputUnsupported, /image input/u);
+  assert.match(resources["zh-CN"].turnImageInputUnsupported, /图片输入/u);
+
+  const runCase = async (language: "en" | "zh-CN", expectedNotice: string) => {
+    let turnStarts = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "turn.start") {
+          turnStarts += 1;
+          if (turnStarts === 1) {
+            return {
+              __uthcode_runtime_error: {
+                kind: "image_input_unsupported",
+                message: "The selected model does not support image input",
+              },
+            };
+          }
+          return { run_id: "run-image-retry", turn_id: "turn-image-retry", status: "running" };
+        }
+        return method === "status.get" ? { active_turn: false } : {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => {
+        const values: Record<string, unknown> = {
+          theme: "light",
+          language,
+          panelMode: "docked",
+          sidebarWidth: 286,
+          runtimePanelWidth: 318,
+          recentProjects: [],
+          projectAliases: {},
+          pinnedProjectKeys: [],
+          pinnedSessions: [],
+          expandedProjects: {},
+          selectedProjectKey: null,
+          selectedSessionId: null,
+        };
+        return values[key] as never;
+      },
+      writePreference: async () => ({}) as never,
+      chooseAttachment: async () => null,
+      pasteAttachment: async () => null,
+    };
+
+    await withRendererDom(async (_dom, container, root) => {
+      act(() => {
+        root.render(<App initialState={createInitialState({
+          language,
+          runtimeState: "ready",
+          composerAttachments: [attachment],
+        })} api={api} />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+      const send = container.querySelector<HTMLButtonElement>(".composer-send");
+      assert.ok(send);
+      act(() => { send!.click(); });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+      assert.equal(turnStarts, 1);
+      const attachmentsLabel = resources[language].attachments;
+      assert.ok(container.querySelector(`[aria-label="${attachmentsLabel}"]`), container.textContent ?? "");
+      assert.match(container.textContent ?? "", new RegExp(expectedNotice.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
+
+      act(() => { send!.click(); });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+      assert.equal(turnStarts, 2);
+      assert.equal(container.querySelector(`[aria-label="${attachmentsLabel}"]`), null);
+    });
+  };
+
+  await runCase("en", resources.en.turnImageInputUnsupported);
+  await runCase("zh-CN", resources["zh-CN"].turnImageInputUnsupported);
 });
 
 test("App drops an attachment import or preview that finishes after Session navigation", async () => {
