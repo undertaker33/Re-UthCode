@@ -15,7 +15,7 @@
 | `ReadDocument` | 有界读取 PDF、DOCX、XLSX、PPTX 的结构化内容 |
 | `ViewImage` | 读取图片或把 PDF 指定页渲染为模型可见的图片资产 |
 | `Process` | 查询或控制当前 Session 所属的 Bash 进程 |
-| `ApplyPatch` | 按 Codex patch 方言预检并原子提交文件增删改和移动 |
+| `ApplyPatch` | 按 Codex patch 方言预检，按文件原子提交增删改和移动 |
 | `GitWorkspace` | 以只读、无外部 diff 的方式查询 Git 工作区 |
 | `WebFetch` | 对公开 HTTP(S) 地址逐跳授权并有界抓取正文或 PDF |
 
@@ -30,6 +30,21 @@
 ### `ViewImage`
 
 `ViewImage` 可读取受当前 Session 所有的图片，或把 PDF 指定页渲染成 PNG 图片资产。PDF 页渲染与文本解析共用短生命周期私有宿主，取消会终止正在执行的宿主。渲染结果通过既有 Session 附件物化路径进入模型，并保留文件/页来源定位；图片尺寸、像素和字节有界。没有视觉能力的模型仍会收到明确的不可用能力结果，不会把文本描述伪装成图像输入。
+
+### `ApplyPatch`
+
+`ApplyPatch` 使用严格的 Codex patch 格式，而不是普通 unified diff。补丁必须以 `*** Begin Patch` 开始、以 `*** End Patch` 结束，中间使用 `*** Add File:`、`*** Update File:` 或 `*** Delete File:` 文件头。例如：
+
+```text
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-status=pending
++status=verified
+*** End Patch
+```
+
+格式错误或上下文不匹配时，按工具返回的原因修正补丁；不要为凑出旧上下文而先覆盖原文件。工具不会猜测修补非法格式。多个文件的实际成功、失败和未应用结果分别报告，重试前先核对已产生的副作用。
 
 ### `Bash` 与 `Process`
 

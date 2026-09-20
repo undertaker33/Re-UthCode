@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from uthcode.application.attachments import AttachmentService
 from uthcode.core.provider import CancellationToken, ImagePart, SourcePart
+from uthcode.integrations.attachment_files import AttachmentReference
+from uthcode.integrations.session_files import SessionFileStore
+from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.tools.image_tools import ViewImageTool
 from uthcode.integrations.tools.workspace import WorkspacePathResolver
-
 def _pdf_bytes() -> bytes:
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -59,6 +63,45 @@ async def test_view_image_and_pdf_page_use_session_asset_writer(tmp_path: Path) 
     assert source_part.page == 1
     assert written[0][2] == "image/png"
     assert written[1][2] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_factory_view_image_and_pdf_page_use_real_attachment_service(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    image_path = tmp_path / "factory.png"
+    Image.new("RGB", (32, 18), (12, 34, 56)).save(image_path)
+    pdf_path = tmp_path / "factory.pdf"
+    pdf_path.write_bytes(_pdf_bytes())
+    store = SessionFileStore(tmp_path / "sessions")
+    session = store.create_session(project_key=str(tmp_path.resolve()))
+    attachment_service = AttachmentService(store)
+    tools = create_default_tools(
+        tmp_path,
+        attachment_service=attachment_service,
+        session_provider=lambda: SimpleNamespace(session_id=session.session_id),
+    )
+    tool = next(item for item in tools if item.definition.name == "ViewImage")
+
+    image = await tool.execute({"path": "factory.png"}, cancellation=CancellationToken())
+    page = await tool.execute(
+        {"path": "factory.pdf", "page": 1}, cancellation=CancellationToken()
+    )
+
+    image_part = next(part for part in image.content.parts if isinstance(part, ImagePart))
+    page_part = next(part for part in page.content.parts if isinstance(part, ImagePart))
+    source_part = next(part for part in page.content.parts if isinstance(part, SourcePart))
+    assert image_part.asset_ref.startswith(f"attachment:{session.session_id}:")
+    assert page_part.asset_ref.startswith(f"attachment:{session.session_id}:")
+    assert source_part.page == 1
+    refs = attachment_service.files.list_references(session.session_id)
+    assert all(isinstance(reference, AttachmentReference) for reference in refs)
+    assert {reference.display_name for reference in refs} == {
+        "factory.png",
+        "factory-page-1.png",
+    }
 
 
 @pytest.mark.asyncio

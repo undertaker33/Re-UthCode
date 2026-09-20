@@ -23,7 +23,7 @@ async def test_bash_short_wait_cross_turn_read_and_cursor_expiry(tmp_path: Path)
     manager = ProcessSessionManager(max_output_bytes=32)
     tool = BashTool(tmp_path, process_manager=manager, session_provider=lambda: type("S", (), {"session_id": "s1"})())
     result = await tool.execute(
-        {"command": _python("import time,sys; print('a'*100, flush=True); time.sleep(.2); print('done', flush=True)"), "yield_time_ms": 20},
+        {"command": _python("import time,sys; print('a'*100, flush=True); time.sleep(.2); print('done', flush=True)"), "yield_time_ms": 50},
         cancellation=CancellationToken(),
     )
     assert result.process_id and result.process_state == "running"

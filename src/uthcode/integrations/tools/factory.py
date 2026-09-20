@@ -65,10 +65,18 @@ def create_default_tools(
             raise RuntimeError("attachment metadata unavailable")
         value = reference(session_id, ref)
         to_dict = getattr(value, "to_dict", None)
-        return dict(to_dict()) if callable(to_dict) else {
+        result = dict(to_dict()) if callable(to_dict) else {
             "display_name": getattr(value, "display_name", ref),
-            "asset_ref": getattr(value, "asset_ref", f"attachment:{session_id}:{ref}"),
         }
+        # Persisted attachment metadata intentionally omits the derived URI,
+        # while document/image tools need it to build a provider-resolvable
+        # ImagePart or SourcePart. Complete this projection at the tool edge.
+        result["asset_ref"] = getattr(
+            value,
+            "asset_ref",
+            f"attachment:{session_id}:{getattr(value, 'ref', ref)}",
+        )
+        return result
 
     def write_asset(display_name: str, content: bytes, mime_type: str, _source_ref: str) -> dict[str, object]:
         active = session_provider() if session_provider is not None else None
@@ -79,11 +87,16 @@ def create_default_tools(
         value = writer(session_id, content, display_name=display_name, mime_type=mime_type)
         to_dict = getattr(value, "to_dict", None)
         if callable(to_dict):
-            return dict(to_dict())
-        return {
-            "asset_ref": getattr(value, "asset_ref", ""),
-            "display_name": getattr(value, "display_name", display_name),
-        }
+            result = dict(to_dict())
+        else:
+            result = {"display_name": getattr(value, "display_name", display_name)}
+        result["asset_ref"] = getattr(
+            value,
+            "asset_ref",
+            f"attachment:{session_id}:{getattr(value, 'ref', '')}",
+        )
+        result.setdefault("display_name", getattr(value, "display_name", display_name))
+        return result
 
     base_tools: list[Tool] = [
         ReadFileTool(resolver, tracker, on_path_access=on_path_access),

@@ -2455,8 +2455,10 @@ def _timeout(value: object) -> int:
 def _yield_time(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("yield_time_ms must be an integer")
-    if not 0 <= value <= 60000:
-        raise ValueError("yield_time_ms must be between 0 and 60000")
+    if not _MIN_PROCESS_READ_WAIT_MS <= value <= 60000:
+        raise ValueError(
+            f"yield_time_ms must be between {_MIN_PROCESS_READ_WAIT_MS} and 60000"
+        )
     return value
 
 

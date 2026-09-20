@@ -77,7 +77,9 @@ def parse_patch(text: object) -> PatchPlan:
     if lines and lines[-1] == "":
         lines.pop()
     if not lines or lines[0] != _PATCH_BEGIN or lines[-1] != _PATCH_END:
-        raise PatchSyntaxError("Error: patch must start with Begin Patch and end with End Patch")
+        raise PatchSyntaxError(
+            "Error: patch must start with `*** Begin Patch` and end with `*** End Patch`"
+        )
     operations: list[PatchOperation] = []
     index = 1
     while index < len(lines) - 1:
@@ -164,7 +166,11 @@ class ApplyPatchTool:
 
     _definition = ToolDefinition(
         "ApplyPatch",
-        "Apply a Codex-style text patch after reading and authorizing every target.",
+        "Apply a strict Codex-style text patch after reading and authorizing every target. "
+        "The patch must start with `*** Begin Patch` and end with `*** End Patch`; "
+        "use `*** Add File: path`, `*** Update File: path`, `*** Delete File: path`, "
+        "optional `*** Move to: path`, and context hunks beginning with `@@`. "
+        "Example: `*** Begin Patch\\n*** Update File: notes.txt\\n@@\\n-old\\n+new\\n*** End Patch`.",
         {
             "type": "object",
             "properties": {"patch": {"type": "string", "minLength": 1}},

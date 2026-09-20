@@ -119,7 +119,7 @@ async def test_application_process_events_survive_tool_turn_and_redact_split_sec
     cancellation.session_id = "session-1"
     cancellation.turn_id = "turn-1"
     result = await bash.execute(
-        {"command": _python_command(source), "yield_time_ms": 20},
+        {"command": _python_command(source), "yield_time_ms": 50},
         cancellation=cancellation,
     )
 
@@ -174,7 +174,7 @@ async def test_application_routes_process_output_after_tool_call_and_turn_comple
                             "sys.stdout.write('secret-value\\n');sys.stdout.flush();"
                             "time.sleep(0.2)"
                         ),
-                        "yield_time_ms": 20,
+                        "yield_time_ms": 50,
                     },
                 ),
                 finish_reason=FinishReason.TOOL_CALLS,
