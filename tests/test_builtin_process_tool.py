@@ -751,6 +751,27 @@ async def test_bash_schema_rejects_timeout_outside_one_to_six_hundred(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_bash_rejects_yield_time_below_the_minimum_and_invalid_values(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry((BashTool(tmp_path),))
+    executor = ToolExecutor(registry)
+
+    results = await _execute_prepared_calls(
+        executor,
+        (
+            ToolCallPart("too-small", "Bash", {"command": "echo ok", "yield_time_ms": 20}),
+            ToolCallPart("too-large", "Bash", {"command": "echo ok", "yield_time_ms": 60001}),
+            ToolCallPart("wrong-type", "Bash", {"command": "echo ok", "yield_time_ms": "50"}),
+        ),
+        cancellation=CancellationToken(),
+    )
+
+    assert all(result.is_error for result in results)
+    assert all("invalid arguments" in result.content for result in results)
+
+
+@pytest.mark.asyncio
 async def test_bash_output_reaches_application_materialization_unchanged(tmp_path: Path) -> None:
     registry = ToolRegistry((BashTool(tmp_path),))
     executor = ToolExecutor(registry)

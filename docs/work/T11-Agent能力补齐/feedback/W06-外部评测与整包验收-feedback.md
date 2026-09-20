@@ -105,3 +105,40 @@ conda run --no-capture-output -n re-uthcode python -m pytest tests/test_architec
 Luna（max）完成 W06 与一轮返工，Terra（high）第二轮审核 PASS。标准 Git patch 可应用性与 clean baseline 两项 P1 均关闭。Reviewer 在临时 clone 验证 CRLF、二进制、新增删除、重命名、mode 和平台支持的 symlink，真实 index 保持不变；适配器复跑 5 passed in 7.17s，py_compile 通过。Worker 返工架构/Eval/W06 组合 105 passed，较窄 Eval/W06 82 passed；详细命令见返工记录。此前 package/make 成功仅代表标准构建和 smoke，不等同安装后人工验收。未再次宣称全量 pytest 通过。
 
 W01—W06 均完成代码实施与独立审核。A02/A10/A12/A15/A18/A24/A26/A28 及依赖它们的整包验收边界仍需真实 Provider/Tavily、POSIX、官方 harness 和人工安装环境，保持 Checklist 未完成与整包 not_implemented，不归档。用户已明确先完成代码、配置后再测真实服务。
+
+## 用户确认的验收缺陷修复与附件交互改造（2026-09-20，实施中）
+
+用户在只读自检和真实 Desktop 模型测试后明确批准追加修复计划，并要求实施。此次范围包括工具图片引用契约、附件增删布局报错、就近且可操作的错误提示、图片默认缩略图和双击缩放弹窗、文件右键菜单、Office/PDF 系统打开、Markdown/代码右侧只读画布、ApplyPatch 格式提示及已确认的权限状态投影缺陷。冻结的需求、Spec、Tasks、Prompt 和 Checklist 文字保持不变；本段不把新增验收要求回写冻结文件，也不宣称整包验收完成。
+
+自检确认：Qwen 可识别用户直接上传的图片，但正式工具工厂遗漏 `asset_ref` 使 ViewImage 图片/PDF 页图失败；附件高度变化可触发 ResizeObserver 警告及开发环境全屏遮罩，后端仍可继续；非视觉模型拒绝图片时草稿保留，但提示位于时间线上方，当前视口看不到。原会话的提示词重复注入尚未得到请求证据支持，本次新请求只观察到一条 system，不能据此排除历史问题。
+
+总控先补充兼容协议回归：两个相同 reasoning chunk 均保留，formal 内容和原生 carrier 各形成一次；再次发送历史只包含一条 system、一条对应 assistant，reasoning 内容保持两段而不是被去重或再次翻倍。不修改 Provider 去重逻辑。
+
+```text
+conda run --no-capture-output -n re-uthcode python -m pytest tests/test_context_compiler.py tests/test_openai_compat_integration.py -q
+新增测试前：34 passed, 1 skipped in 4.12s
+
+conda run --no-capture-output -n re-uthcode python -m pytest tests/test_openai_compat_integration.py -q
+新增并加强回归后：19 passed, 1 skipped in 2.24s
+```
+
+服务、Desktop 实施及独立审核仍在进行，实际提交、组合测试、当前构建和 Computer Use 复验结果在后续追加；此时不勾选未验证项目。
+
+### 工具组独立审核（2026-09-21）
+
+Luna 完成正式工厂图片引用、ApplyPatch 描述/错误中的严格标记、Bash 等待参数与公开下限对齐。Terra high 独立审核通过，确认本组不依赖尚在施工的预览/系统打开新 API，可以独立提交；原始附件和 PDF 页图由真实 AttachmentService 与正式工具工厂组合回归。总控补充的 compatible native/formal 回放回归同时通过。审核未发现需返工的工具组问题。
+
+Reviewer 实际执行：
+
+```text
+conda run --no-capture-output -n re-uthcode python -m pytest tests/test_image_tools.py tests/test_builtin_process_tool.py tests/test_process_sessions.py tests/test_process_application_lifecycle.py tests/test_openai_compat_integration.py
+186 passed, 1 skipped in 20.78s
+
+conda run --no-capture-output -n re-uthcode python -m pytest tests/test_patch_tool.py
+4 passed in 0.52s
+
+conda run --no-capture-output -n re-uthcode python -m pytest tests/test_application_tools.py tests/test_builtin_file_tools.py
+29 passed in 0.96s
+```
+
+本组不包含未完成的附件预览服务和 Desktop 界面改造。工具真实模型复验仍待后续总控 Computer Use，不将上述离线回归代替真实识图或整包验收。

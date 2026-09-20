@@ -254,6 +254,48 @@ async def test_chat_public_stream_maps_reasoning_text_indexed_tools_usage_and_or
 
 
 @pytest.mark.asyncio
+async def test_chat_repeated_reasoning_chunks_roundtrip_once_without_text_deduplication() -> None:
+    repeated = "A legitimate repeated reasoning sentence. "
+    client = _OpenAICompatClient([
+        _chunk(ChoiceDelta.model_construct(role="assistant", reasoning_content=repeated)),
+        _chunk(ChoiceDelta.model_construct(role="assistant", reasoning_content=repeated)),
+        _chunk(ChoiceDelta(role="assistant", content="answer")),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="stop"),
+    ])
+    provider = build_openai_compat_provider(
+        "deepseek-test", base_url="https://mock.invalid/v1", client=client
+    )
+    user = Message("user", (TextPart("question"),))
+    events = await _collect(provider, _request(user, system_prompt="one instruction"))
+    response = next(event.response for event in events if isinstance(event, GenerationCompleted))
+    reasoning = [part.text for part in response.message.parts if isinstance(part, ReasoningPart)]
+    assert reasoning == [repeated * 2]
+    assert sum(isinstance(event, ReasoningDelta) for event in events) == 2
+    assert [item.kind for item in response.message.native_items] == [
+        "reasoning_carrier", "assistant_text"
+    ]
+    completed_native = [event for event in events if isinstance(event, NativeItemCompleted)]
+    assert len(completed_native) == 2
+
+    client.stream = _AsyncStream([
+        _chunk(ChoiceDelta(role="assistant", content="next answer")),
+        _chunk(ChoiceDelta(role="assistant"), finish_reason="stop"),
+    ])
+    await _collect(provider, _request(
+        user, response.message, Message("user", (TextPart("continue"),)),
+        system_prompt="one instruction",
+    ))
+    messages = client.calls[-1]["messages"]
+    assert [message for message in messages if message["role"] == "system"] == [
+        {"role": "system", "content": "one instruction"}
+    ]
+    assistants = [message for message in messages if message["role"] == "assistant"]
+    assert len(assistants) == 1
+    assert assistants[0]["reasoning_content"] == repeated * 2
+    assert assistants[0]["content"] == "answer"
+
+
+@pytest.mark.asyncio
 async def test_chat_public_stream_preserves_interleaved_reasoning_and_text_segments() -> None:
     chunks = [
         _chunk(
