@@ -255,6 +255,7 @@ class CommandOutcome:
     ui_action: UiAction | None = None
     error: str | None = None
     invocation: CommandInvocation | None = None
+    error_code: str | None = None
 
     @classmethod
     def success_output(

@@ -11,7 +11,9 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
 import json
+import locale
 import mimetypes
 import os
 import re
@@ -26,6 +28,51 @@ from pathlib import Path
 
 ATTACHMENT_SCHEMA_VERSION = 1
 _REF_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+TEXT_PREVIEW_EXTENSIONS = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".css",
+        ".dart",
+        ".diff",
+        ".env",
+        ".go",
+        ".h",
+        ".hpp",
+        ".ini",
+        ".ipynb",
+        ".java",
+        ".js",
+        ".jsx",
+        ".json",
+        ".kt",
+        ".log",
+        ".lua",
+        ".m",
+        ".markdown",
+        ".md",
+        ".mm",
+        ".php",
+        ".pl",
+        ".py",
+        ".rb",
+        ".rs",
+        ".rst",
+        ".svelte",
+        ".sql",
+        ".swift",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".vue",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 class AttachmentError(RuntimeError):
@@ -56,6 +103,10 @@ class AttachmentPersistenceError(AttachmentError):
 
 class AttachmentIntegrityError(AttachmentError):
     code = "attachment_integrity_failed"
+
+
+class ImagePreviewLimitError(ValueError):
+    """Image dimensions would exceed the bounded preview decode policy."""
 
 
 def _now() -> str:
@@ -104,6 +155,25 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_copy(source: Path, target: Path) -> None:
+    """Copy one immutable attachment to a derived path atomically."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
     finally:
         try:
             temporary.unlink()
@@ -284,6 +354,214 @@ def _image_dimensions(data: bytes, mime_type: str) -> tuple[int | None, int | No
     return None, None
 
 
+def read_bounded_preview(path: Path, limit_bytes: int) -> tuple[bytes, bool]:
+    """Read a bounded prefix and report whether the source exceeds the limit."""
+
+    if isinstance(limit_bytes, bool) or not isinstance(limit_bytes, int) or limit_bytes <= 0:
+        raise ValueError("limit_bytes must be a positive integer")
+    size = path.stat().st_size
+    # A few extra bytes let strict decoders finish a UTF-8 code point at the
+    # boundary without reading the rest of a large attachment.
+    with path.open("rb") as handle:
+        data = handle.read(limit_bytes + 16)
+    return data, size > limit_bytes or size > len(data)
+
+
+def decode_preview_text(data: bytes) -> tuple[str, str]:
+    """Decode a text preview strictly, never replacing undecodable bytes."""
+
+    encodings = ["utf-8-sig"]
+    if data.startswith((b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encodings.extend(("utf-16", "utf-32"))
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        encodings.append(preferred)
+    try:
+        current = locale.getencoding()
+    except AttributeError:  # pragma: no cover - Python 3.11 fallback
+        current = preferred
+    if current:
+        encodings.append(current)
+    if os.name == "nt":
+        # Windows attachments commonly come from the active Chinese code
+        # page; keep this fallback platform-scoped so binary bytes are not
+        # silently accepted as text on POSIX hosts.
+        encodings.append("cp936")
+    seen: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            value = data.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+        if "\x00" in value:
+            continue
+        return value, encoding
+    raise UnicodeError("unsupported text encoding")
+
+
+def bounded_preview_text(
+    value: str,
+    limit_bytes: int,
+    *,
+    source_truncated: bool,
+) -> tuple[str, bool]:
+    if isinstance(limit_bytes, bool) or not isinstance(limit_bytes, int) or limit_bytes <= 0:
+        raise ValueError("limit_bytes must be a positive integer")
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit_bytes and not source_truncated:
+        return value, False
+    marker = "\n[truncated]"
+    marker_bytes = marker.encode("utf-8")
+    if limit_bytes <= len(marker_bytes):
+        return marker_bytes[:limit_bytes].decode("utf-8", errors="ignore"), True
+    clipped = encoded[: limit_bytes - len(marker_bytes)]
+    while clipped:
+        try:
+            return clipped.decode("utf-8") + marker, True
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    return marker[:limit_bytes], True
+
+
+def _is_text_attachment(reference: "AttachmentReference") -> bool:
+    return (
+        reference.mime_type.startswith("text/")
+        or Path(reference.display_name).suffix.lower() in TEXT_PREVIEW_EXTENSIONS
+    )
+
+
+def render_image_preview(
+    data: bytes,
+    mime_type: str,
+    *,
+    mode: str = "thumbnail",
+    max_edge: int | None = None,
+    max_bytes: int = 256 * 1024,
+    max_width: int = 8192,
+    max_height: int = 8192,
+    max_pixels: int = 50_000_000,
+) -> dict[str, object] | None:
+    """Encode a bounded image preview without changing the stored original.
+
+    ``thumbnail`` is capped at a 160px long edge for cards. ``full`` is a
+    separately requested, still bounded view capped at 2048px and 4 MiB by
+    default. Pillow is loaded lazily so attachment metadata and provider
+    resolution do not require image decoding.
+    """
+
+    if mode not in {"thumbnail", "full"}:
+        raise ValueError("image preview mode must be thumbnail or full")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    if (
+        isinstance(max_width, bool)
+        or not isinstance(max_width, int)
+        or max_width <= 0
+        or isinstance(max_height, bool)
+        or not isinstance(max_height, int)
+        or max_height <= 0
+        or isinstance(max_pixels, bool)
+        or not isinstance(max_pixels, int)
+        or max_pixels <= 0
+    ):
+        raise ValueError("image decode limits must be positive integers")
+    default_edge = 160 if mode == "thumbnail" else 2048
+    hard_edge = default_edge
+    if max_edge is not None:
+        if isinstance(max_edge, bool) or not isinstance(max_edge, int) or max_edge <= 0:
+            raise ValueError("max_edge must be a positive integer or None")
+        hard_edge = min(default_edge, max_edge)
+    hard_bytes = min(max_bytes, 256 * 1024 if mode == "thumbnail" else 4 * 1024 * 1024)
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            original_width, original_height = opened.size
+            if (
+                original_width <= 0
+                or original_height <= 0
+                or original_width > max_width
+                or original_height > max_height
+                or original_width * original_height > max_pixels
+            ):
+                raise ImagePreviewLimitError("image dimensions exceed the preview decode policy")
+            opened.load()
+            image = ImageOps.exif_transpose(opened).copy()
+            original_width, original_height = image.size
+            if (
+                original_width <= 0
+                or original_height <= 0
+                or original_width > max_width
+                or original_height > max_height
+                or original_width * original_height > max_pixels
+            ):
+                raise ImagePreviewLimitError("image dimensions exceed the preview decode policy")
+    except ImagePreviewLimitError:
+        raise
+    except Exception:
+        return None
+    if original_width <= 0 or original_height <= 0:
+        return None
+
+    image.thumbnail((hard_edge, hard_edge), Image.Resampling.LANCZOS)
+    has_alpha = "A" in image.getbands() or image.mode in {"P", "LA"}
+    output_mime = "image/png" if has_alpha else "image/jpeg"
+
+    def encode(current: object, *, quality: int = 85) -> bytes:
+        output = io.BytesIO()
+        if output_mime == "image/png":
+            png = current
+            if getattr(png, "mode", None) not in {"1", "L", "LA", "P", "RGB", "RGBA"}:
+                png = png.convert("RGBA")
+            png.save(output, format="PNG", optimize=True)
+        else:
+            rgb = current.convert("RGB") if getattr(current, "mode", None) != "RGB" else current
+            rgb.save(output, format="JPEG", quality=quality, optimize=True)
+        return output.getvalue()
+
+    payload = encode(image)
+    # High-noise PNGs can exceed the thumbnail budget even after scaling. Keep
+    # shrinking the derived image until the wire payload is bounded. A final
+    # opaque JPEG fallback handles pathological transparent PNGs without ever
+    # returning an unbounded data URL.
+    for _ in range(8):
+        if len(payload) <= hard_bytes or max(image.size) <= 1:
+            break
+        next_edge = max(1, int(max(image.size) * 0.8))
+        image.thumbnail((next_edge, next_edge), Image.Resampling.LANCZOS)
+        payload = encode(image)
+    if len(payload) > hard_bytes:
+        output_mime = "image/jpeg"
+        rgb = Image.new("RGB", image.size, "white")
+        if "A" in image.getbands():
+            rgb.paste(image.convert("RGBA"), mask=image.getchannel("A"))
+        else:
+            rgb.paste(image.convert("RGB"))
+        image = rgb
+        for quality in (80, 65, 50, 35):
+            payload = encode(image, quality=quality)
+            if len(payload) <= hard_bytes:
+                break
+    if len(payload) > hard_bytes:
+        return None
+    return {
+        "data": payload,
+        "mime_type": output_mime,
+        "width": int(image.width),
+        "height": int(image.height),
+        "original_width": original_width,
+        "original_height": original_height,
+        "scaled": image.size != (original_width, original_height),
+        "truncated": False,
+    }
+
+
 class AttachmentFileStore:
     """Atomic attachment file store rooted inside a Session directory."""
 
@@ -368,7 +646,13 @@ class AttachmentFileStore:
             raise AttachmentPersistenceError("could not durably persist attachment") from exc
         return metadata
 
-    def _resolve(self, session_id: str, ref: str) -> tuple[Path, AttachmentReference]:
+    def _resolve(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        verify_content: bool = True,
+    ) -> tuple[Path, AttachmentReference]:
         _validate_ref(ref)
         session_path = _safe_session_path(self._store, session_id)
         root = (session_path / "attachments").resolve(strict=False)
@@ -377,29 +661,108 @@ class AttachmentFileStore:
             raise AttachmentReferenceError("attachment ref escaped its Session")
         if not result_path.is_dir():
             raise AttachmentReferenceError("attachment ref is not present in this Session")
+        content_path = result_path / "content.bin"
         try:
             value = json.loads((result_path / "metadata.json").read_text(encoding="utf-8"))
             reference = AttachmentReference.from_dict(value)
-            data = (result_path / "content.bin").read_bytes()
+            if not content_path.is_file():
+                raise OSError("attachment content is not a file")
+            content_size = content_path.stat().st_size
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise AttachmentIntegrityError("attachment files are unreadable") from exc
         if reference.session_id != session_id or reference.ref != ref:
             raise AttachmentIntegrityError("attachment ownership metadata is invalid")
-        if len(data) != reference.size_bytes or hashlib.sha256(data).hexdigest() != reference.sha256:
+        if content_size != reference.size_bytes:
             raise AttachmentIntegrityError("attachment size or hash does not match metadata")
+        if verify_content:
+            try:
+                data = content_path.read_bytes()
+            except OSError as exc:
+                raise AttachmentIntegrityError("attachment content is unreadable") from exc
+            if hashlib.sha256(data).hexdigest() != reference.sha256:
+                raise AttachmentIntegrityError("attachment size or hash does not match metadata")
         if reference.mime_type.startswith("image/"):
             self.policy.validate_image_dimensions(reference.width, reference.height)
         return result_path, reference
 
+    def resolve(self, session_id: str, ref: str) -> tuple[Path, AttachmentReference]:
+        """Resolve one Session-owned ref to its stored path and metadata.
+
+        The caller must already have a Session identity. This method never
+        accepts a filesystem path or a provider/model URI, so it is suitable
+        for the Application boundary that prepares a later Main open/reveal.
+        """
+
+        return self._resolve(session_id, ref)
+
+    def _derived_bytes(self, root: Path) -> int:
+        total = 0
+        for path in root.glob("*/derived/**/*"):
+            if not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError as exc:
+                raise AttachmentPersistenceError(
+                    "could not inspect derived attachment quota"
+                ) from exc
+        return total
+
+    def _ensure_derived_capacity(self, target: Path, size_bytes: int) -> None:
+        root = target.parents[3]
+        try:
+            existing = target.stat().st_size if target.is_file() else 0
+        except OSError as exc:
+            raise AttachmentPersistenceError(
+                "could not inspect derived attachment quota"
+            ) from exc
+        projected = self._derived_bytes(root) - existing + size_bytes
+        if projected > self.policy.derived_quota_bytes:
+            raise AttachmentQuotaExceeded("derived attachment quota exceeded")
+
+    def materialize_open_path(self, session_id: str, ref: str) -> tuple[Path, AttachmentReference]:
+        """Return a derived path with a safe extension for system open/reveal.
+
+        The durable original remains ``content.bin``. The derived copy exists
+        only to give the operating system the submitted display-name suffix
+        when Main asks it to open or reveal an attachment.
+        """
+
+        source, reference = self.resolve(session_id, ref)
+        derived_root = source / "derived" / "open"
+        target = derived_root / reference.display_name
+        try:
+            # Rebuild on every request so a user-edited derived copy can never
+            # become the source for a later system open. If Windows still has
+            # the previous path open, use a fresh same-suffix path instead of
+            # reusing potentially modified bytes.
+            try:
+                self._ensure_derived_capacity(target, reference.size_bytes)
+                _atomic_copy(source / "content.bin", target)
+            except PermissionError:
+                original_name = Path(reference.display_name)
+                fallback_name = (
+                    f"{original_name.stem}.{uuid.uuid4().hex}"
+                    f"{original_name.suffix}"
+                )
+                target = derived_root / fallback_name
+                self._ensure_derived_capacity(target, reference.size_bytes)
+                _atomic_copy(source / "content.bin", target)
+        except OSError as exc:
+            raise AttachmentPersistenceError(
+                "could not materialize attachment for system open"
+            ) from exc
+        return target, reference
+
     def read(self, session_id: str, ref: str) -> bytes:
-        _path, _reference = self._resolve(session_id, ref)
+        _path, _reference = self.resolve(session_id, ref)
         try:
             return (_path / "content.bin").read_bytes()
         except OSError as exc:
             raise AttachmentIntegrityError("attachment content is unreadable") from exc
 
     def reference(self, session_id: str, ref: str) -> AttachmentReference:
-        return self._resolve(session_id, ref)[1]
+        return self.resolve(session_id, ref)[1]
 
     def mark_submitted(self, session_id: str, ref: str) -> AttachmentReference:
         path, reference = self._resolve(session_id, ref)
@@ -456,8 +819,14 @@ class AttachmentFileStore:
                 shutil.rmtree(item, ignore_errors=True)
                 removed_temp += 1
             elif item.name == "derived" and item.is_dir():
+                # Remove the legacy Session-level cache location as well.
                 shutil.rmtree(item, ignore_errors=True)
                 removed_derived += 1
+            elif item.is_dir():
+                derived = item / "derived"
+                if derived.is_dir():
+                    shutil.rmtree(derived, ignore_errors=True)
+                    removed_derived += 1
         return {"temporary": removed_temp, "derived": removed_derived}
 
     def list_references(self, session_id: str) -> tuple[AttachmentReference, ...]:
@@ -473,10 +842,28 @@ class AttachmentFileStore:
         values.sort(key=lambda item: (item.created_at, item.ref))
         return tuple(values)
 
-    def preview(self, session_id: str, ref: str) -> dict[str, object]:
-        """Return bounded metadata and a data URL preview for small images."""
+    def preview(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        mode: str = "thumbnail",
+        max_edge: int | None = None,
+    ) -> dict[str, object]:
+        """Return bounded metadata and an optional image data URL preview."""
 
-        reference = self.reference(session_id, ref)
+        if mode not in {"thumbnail", "full"}:
+            raise ValueError("image preview mode must be thumbnail or full")
+
+        # Preview only needs trusted metadata and a bounded prefix.  A full
+        # content hash/read here would defeat the preview limit for large
+        # images and text files; read() and system-open resolution keep the
+        # complete integrity check.
+        attachment_path, reference = self._resolve(
+            session_id,
+            ref,
+            verify_content=False,
+        )
         result: dict[str, object] = {
             "ref": reference.ref,
             "asset_ref": reference.asset_ref,
@@ -485,10 +872,94 @@ class AttachmentFileStore:
             "size_bytes": reference.size_bytes,
             "width": reference.width,
             "height": reference.height,
+            "preview_supported": reference.mime_type.startswith("image/")
+            or _is_text_attachment(reference),
+            "preview_kind": None,
+            "truncated": False,
         }
-        if reference.mime_type.startswith("image/") and reference.size_bytes <= self.policy.preview_limit_bytes:
-            encoded = base64.b64encode(self.read(session_id, ref)).decode("ascii")
-            result["data_url"] = f"data:{reference.mime_type};base64,{encoded}"
+        if reference.mime_type.startswith("image/"):
+            image_limit = self.policy.single_attachment_hard_cap_bytes
+            data, source_truncated = read_bounded_preview(
+                attachment_path / "content.bin",
+                image_limit,
+            )
+            if source_truncated:
+                raise AttachmentTooLarge("attachment image source exceeds the preview limit")
+            preview_limit = (
+                self.policy.preview_limit_bytes
+                if mode == "thumbnail"
+                else min(self.policy.single_attachment_hard_cap_bytes, 4 * 1024 * 1024)
+            )
+            try:
+                rendered = render_image_preview(
+                    data,
+                    reference.mime_type,
+                    mode=mode,
+                    max_edge=max_edge,
+                    max_width=self.policy.max_image_width,
+                    max_height=self.policy.max_image_height,
+                    max_pixels=self.policy.max_image_pixels,
+                    max_bytes=preview_limit,
+                )
+            except ImagePreviewLimitError as exc:
+                raise AttachmentImageTooLarge(
+                    "image dimensions exceed the preview policy"
+                ) from exc
+            if rendered is not None:
+                preview_mime = str(rendered["mime_type"])
+                result.update(
+                    {
+                        "data_url": f"data:{preview_mime};base64,{base64.b64encode(rendered['data']).decode('ascii')}",
+                        "preview_kind": mode,
+                        "preview_mime_type": preview_mime,
+                        "preview_width": rendered["width"],
+                        "preview_height": rendered["height"],
+                        "scaled": rendered["scaled"],
+                    }
+                )
+            elif len(data) <= preview_limit:
+                # Keep the old behavior for a small unsupported image payload;
+                # a malformed large original is never returned to the UI.
+                encoded = base64.b64encode(data).decode("ascii")
+                result.update(
+                    {
+                        "data_url": f"data:{reference.mime_type};base64,{encoded}",
+                        "preview_kind": mode,
+                        "preview_mime_type": reference.mime_type,
+                        "scaled": False,
+                    }
+                )
+            else:
+                result["preview_supported"] = False
+            return result
+
+        if _is_text_attachment(reference):
+            preview_limit = (
+                self.policy.preview_limit_bytes
+                if mode == "thumbnail"
+                else min(self.policy.single_attachment_hard_cap_bytes, 4 * 1024 * 1024)
+            )
+            try:
+                data, source_truncated = read_bounded_preview(
+                    attachment_path / "content.bin",
+                    preview_limit,
+                )
+                text, encoding = decode_preview_text(data)
+            except UnicodeError as exc:
+                raise AttachmentError("attachment text encoding is unsupported") from exc
+            text, truncated = bounded_preview_text(
+                text,
+                preview_limit,
+                source_truncated=source_truncated,
+            )
+            result.update(
+                {
+                    "preview_kind": "text",
+                    "text": text,
+                    "encoding": encoding,
+                    "truncated": truncated,
+                }
+            )
         return result
 
 
@@ -501,7 +972,13 @@ __all__ = [
     "AttachmentQuotaExceeded",
     "AttachmentPersistenceError",
     "AttachmentIntegrityError",
+    "TEXT_PREVIEW_EXTENSIONS",
+    "bounded_preview_text",
+    "decode_preview_text",
+    "read_bounded_preview",
+    "ImagePreviewLimitError",
     "AttachmentPolicy",
     "AttachmentReference",
     "AttachmentFileStore",
+    "render_image_preview",
 ]

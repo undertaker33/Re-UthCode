@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -607,6 +608,150 @@ async def test_real_application_attachment_import_and_attachment_only_turn_have_
         assert session.transcript.entries[0].kind.value == "user_message"
         assert session.transcript.entries[1].kind.value == "assistant_message"
         assert application.attachment_service.reference(session.session_id, ref).submitted is True
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_attachment_preview_modes_and_system_actions_are_ref_only(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        events=(_completed("attachment ready"),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.desktop"),
+    )
+    configuration = EffectiveConfig(
+        default_model="fake/vision",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/vision": ModelProfile(
+                "fake/vision",
+                "fake",
+                "vision-model",
+                supports_images=True,
+            ),
+        },
+    )
+    sessions = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=str(tmp_path.resolve()),
+        instruction_loader=None,
+    )
+    application = UthCodeApplication(
+        provider,
+        configuration=configuration,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path,
+            platform_name="test",
+            platform_release="1",
+            current_date="2026-09-21",
+        ),
+        session_service=sessions,
+        attachment_service=AttachmentService(sessions.store),
+    )
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+    try:
+        imported = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-open-import",
+                "attachment.import",
+                {
+                    "name": "report.final.PDF",
+                    "mime_type": "application/pdf",
+                    "data_base64": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+                },
+            )
+        )
+        assert imported.ok is True and imported.result is not None
+        attachment = imported.result["attachment"]
+        assert isinstance(attachment, dict)
+        ref = attachment["ref"]
+        assert isinstance(ref, str)
+
+        opened = await bridge.handle_request(
+            RequestEnvelope("attachment-open", "attachment.open", {"ref": ref})
+        )
+        revealed = await bridge.handle_request(
+            RequestEnvelope("attachment-reveal", "attachment.reveal", {"ref": ref})
+        )
+        for response in (opened, revealed):
+            assert response.ok is True and response.result is not None
+            descriptor = response.result["attachment"]
+            assert isinstance(descriptor, dict)
+            assert descriptor["source"] == "session_attachment"
+            assert descriptor["session_id"] == sessions.active_session.session_id  # type: ignore[union-attr]
+            assert descriptor["ref"] == ref
+            path = Path(str(descriptor["path"]))
+            assert path.name == "report.final.PDF"
+            assert path.read_bytes() == b"%PDF-1.7\n"
+
+        rejected_path = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-path-rejected",
+                "attachment.open",
+                {"ref": ref, "path": str(tmp_path / "outside.exe")},
+            )
+        )
+        assert rejected_path.ok is False
+        assert rejected_path.error is not None
+        assert rejected_path.error.kind == "invalid_request"
+
+        rejected_session = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-session-rejected",
+                "attachment.open",
+                {"ref": ref, "session_id": "foreign"},
+            )
+        )
+        assert rejected_session.ok is False
+        assert rejected_session.error is not None
+        assert rejected_session.error.kind == "invalid_request"
+
+        image = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-image-import",
+                "attachment.import",
+                {
+                    "name": "pixel.png",
+                    "mime_type": "image/png",
+                    "data_base64": "aW1hZ2UtYnl0ZXM=",
+                },
+            )
+        )
+        assert image.ok is True and image.result is not None
+        image_ref = image.result["attachment"]["ref"]
+        preview = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-full-preview",
+                "attachment.preview",
+                {"ref": image_ref, "mode": "full", "max_edge": 2048},
+            )
+        )
+        assert preview.ok is True and preview.result is not None
+        assert preview.result["attachment"]["preview_kind"] == "full"
+
+        artifact_path = tmp_path / "notes.md"
+        artifact_path.write_text("line\n" * 20, encoding="utf-8")
+        artifact_preview = await bridge.handle_request(
+            RequestEnvelope(
+                "artifact-full-preview",
+                "artifact.preview",
+                {"path": str(artifact_path), "mode": "full"},
+            )
+        )
+        assert artifact_preview.ok is True and artifact_preview.result is not None
+        assert artifact_preview.result["artifact"]["preview_kind"] == "text"
+        assert artifact_preview.result["artifact"]["truncated"] is False
+        invalid_artifact_mode = await bridge.handle_request(
+            RequestEnvelope(
+                "artifact-invalid-preview-mode",
+                "artifact.preview",
+                {"path": str(artifact_path), "mode": "card"},
+            )
+        )
+        assert invalid_artifact_mode.ok is False
+        assert invalid_artifact_mode.error is not None
+        assert invalid_artifact_mode.error.kind == "invalid_request"
     finally:
         await bridge.shutdown()
 
@@ -2686,6 +2831,18 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
     assert "raw-native-secret" not in repr(request)
     assert "raw-native-secret" not in json.dumps(result.to_dict())
     await bridge.shutdown()
+
+
+def test_command_result_projects_application_business_error_code() -> None:
+    result = DesktopBridge._command_result(
+        CommandOutcome(
+            OutcomeStatus.EXECUTION_ERROR,
+            error="模型切换失败",
+            error_code="image_input_unsupported",
+        )
+    )
+
+    assert result["code"] == "image_input_unsupported"
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,12 @@ from uthcode.integrations.attachment_files import (
     AttachmentFileStore,
     AttachmentPolicy,
     AttachmentReference,
+    ImagePreviewLimitError,
+    bounded_preview_text,
+    decode_preview_text,
+    read_bounded_preview,
+    render_image_preview,
+    TEXT_PREVIEW_EXTENSIONS,
 )
 
 
@@ -37,6 +43,7 @@ class ArtifactDescriptor:
     size_bytes: int
     default_action: str
     preview_supported: bool
+    preview_kind: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -47,11 +54,14 @@ class ArtifactDescriptor:
             "size_bytes": self.size_bytes,
             "default_action": self.default_action,
             "preview_supported": self.preview_supported,
+            "preview_kind": self.preview_kind,
         }
 
 
 class ArtifactService:
     """Validate local artifact references before a Desktop Main action."""
+
+    _IMAGE_SOURCE_LIMIT_BYTES = 16 * 1024 * 1024
 
     _OFFICE_EXTENSIONS = frozenset(
         {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf"}
@@ -60,13 +70,51 @@ class ArtifactService:
         {".exe", ".com", ".bat", ".cmd", ".ps1", ".sh", ".msi", ".vbs"}
     )
     _UNSUPPORTED_EXTENSIONS = frozenset({".html", ".htm", ".svg"})
+    _TEXT_EXTENSIONS = TEXT_PREVIEW_EXTENSIONS
     _SHELL_MARKERS = frozenset({";", "|", "&", "\r", "\n", "<", ">"})
 
-    def __init__(self, workdir: str | Path, *, preview_limit_bytes: int = 256 * 1024) -> None:
+    def __init__(
+        self,
+        workdir: str | Path,
+        *,
+        preview_limit_bytes: int = 256 * 1024,
+        full_preview_limit_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
         self.workdir = Path(workdir).expanduser().resolve(strict=False)
         if isinstance(preview_limit_bytes, bool) or not isinstance(preview_limit_bytes, int) or preview_limit_bytes <= 0:
             raise ValueError("preview_limit_bytes must be positive")
+        if (
+            isinstance(full_preview_limit_bytes, bool)
+            or not isinstance(full_preview_limit_bytes, int)
+            or full_preview_limit_bytes <= 0
+        ):
+            raise ValueError("full_preview_limit_bytes must be positive")
         self.preview_limit_bytes = preview_limit_bytes
+        self.full_preview_limit_bytes = full_preview_limit_bytes
+
+    @classmethod
+    def _classify(cls, name: str, mime_type: str) -> tuple[str, str, bool, str | None]:
+        extension = Path(name).suffix.lower()
+        if extension in cls._UNSUPPORTED_EXTENSIONS:
+            kind = "unsupported"
+            default_action = "reveal"
+        elif extension in cls._EXECUTABLE_EXTENSIONS:
+            kind = "executable"
+            default_action = "reveal"
+        elif mime_type.startswith("image/"):
+            kind = "image"
+            default_action = "open"
+        elif extension in cls._OFFICE_EXTENSIONS:
+            kind = "office"
+            default_action = "open"
+        elif mime_type.startswith("text/") or extension in cls._TEXT_EXTENSIONS:
+            kind = "text"
+            default_action = "open"
+        else:
+            kind = "file"
+            default_action = "open"
+        preview_kind = "image" if kind == "image" else "text" if kind == "text" else None
+        return kind, default_action, kind in {"image", "text"}, preview_kind
 
     def describe(
         self,
@@ -84,23 +132,10 @@ class ArtifactService:
             size = path.stat().st_size
         except OSError:
             raise ArtifactError("artifact metadata is unavailable") from None
-        extension = path.suffix.lower()
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        if extension in self._UNSUPPORTED_EXTENSIONS:
-            kind = "unsupported"
-            default_action = "reveal"
-        elif extension in self._EXECUTABLE_EXTENSIONS:
-            kind = "executable"
-            default_action = "reveal"
-        elif mime_type.startswith("image/"):
-            kind = "image"
-            default_action = "open"
-        elif extension in self._OFFICE_EXTENSIONS:
-            kind = "office"
-            default_action = "open"
-        else:
-            kind = "file"
-            default_action = "open"
+        kind, default_action, preview_supported, preview_kind = self._classify(
+            path.name, mime_type
+        )
         return ArtifactDescriptor(
             path=path,
             name=path.name,
@@ -108,7 +143,8 @@ class ArtifactService:
             mime_type=mime_type,
             size_bytes=size,
             default_action=default_action,
-            preview_supported=kind == "image" and size <= self.preview_limit_bytes,
+            preview_supported=preview_supported,
+            preview_kind=preview_kind,
         )
 
     def preview(
@@ -116,20 +152,92 @@ class ArtifactService:
         value: str | Path,
         *,
         authorized_external: bool = False,
+        mode: str = "thumbnail",
     ) -> dict[str, object]:
         descriptor = self.describe(value, authorized_external=authorized_external)
         if not descriptor.preview_supported:
             raise ArtifactError("artifact preview is unavailable", "artifact_preview_unavailable")
+        if mode not in {"thumbnail", "full"}:
+            raise ArtifactError("artifact preview mode is invalid", "artifact_invalid")
         try:
-            data = descriptor.path.read_bytes()
+            if descriptor.kind == "image":
+                if descriptor.size_bytes > self._IMAGE_SOURCE_LIMIT_BYTES:
+                    raise ArtifactError(
+                        "artifact image source exceeds the local limit",
+                        "artifact_preview_unavailable",
+                    )
+                with descriptor.path.open("rb") as handle:
+                    data = handle.read(self._IMAGE_SOURCE_LIMIT_BYTES + 1)
+                if len(data) > self._IMAGE_SOURCE_LIMIT_BYTES:
+                    raise ArtifactError(
+                        "artifact image source exceeds the local limit",
+                        "artifact_preview_unavailable",
+                    )
+                limit = self.preview_limit_bytes if mode == "thumbnail" else self.full_preview_limit_bytes
+                rendered = render_image_preview(
+                    data,
+                    descriptor.mime_type,
+                    mode=mode,
+                    max_edge=160 if mode == "thumbnail" else 2048,
+                    max_bytes=limit,
+                )
+                if rendered is None:
+                    if len(data) > limit:
+                        raise ArtifactError(
+                            "artifact image preview exceeds the local limit",
+                            "artifact_preview_unavailable",
+                        )
+                    return {
+                        **descriptor.to_dict(),
+                        "preview_kind": mode,
+                        "preview_mime_type": descriptor.mime_type,
+                        "preview_width": None,
+                        "preview_height": None,
+                        "scaled": False,
+                        "truncated": False,
+                        "data_url": f"data:{descriptor.mime_type};base64,{base64.b64encode(data).decode('ascii')}",
+                    }
+                preview_mime = str(rendered["mime_type"])
+                return {
+                    **descriptor.to_dict(),
+                    "preview_kind": mode,
+                    "preview_mime_type": preview_mime,
+                    "preview_width": rendered["width"],
+                    "preview_height": rendered["height"],
+                    "scaled": rendered["scaled"],
+                    "truncated": False,
+                    "data_url": f"data:{preview_mime};base64,{base64.b64encode(rendered['data']).decode('ascii')}",
+                }
+
+            limit = self.preview_limit_bytes if mode == "thumbnail" else self.full_preview_limit_bytes
+            data, source_truncated = read_bounded_preview(descriptor.path, limit)
+            text, encoding = decode_preview_text(data)
+            text, truncated = bounded_preview_text(
+                text,
+                limit,
+                source_truncated=source_truncated,
+            )
+            return {
+                **descriptor.to_dict(),
+                "preview_kind": "text",
+                "text": text,
+                "encoding": encoding,
+                "truncated": truncated,
+            }
+        except ArtifactError:
+            raise
+        except ImagePreviewLimitError:
+            raise ArtifactError(
+                "artifact image dimensions exceed the local limit",
+                "artifact_preview_unavailable",
+            ) from None
         except OSError:
             raise ArtifactError("artifact preview is unavailable", "artifact_preview_unavailable") from None
-        if len(data) > self.preview_limit_bytes:
-            raise ArtifactError("artifact preview exceeds the local limit", "artifact_preview_unavailable")
-        return {
-            **descriptor.to_dict(),
-            "data_url": f"data:{descriptor.mime_type};base64,{base64.b64encode(data).decode('ascii')}",
-        }
+        except UnicodeError:
+            raise ArtifactError(
+                "artifact text encoding is unsupported",
+                "artifact_preview_unavailable",
+            ) from None
 
     def _resolve(self, value: str | Path) -> Path:
         if isinstance(value, Path):
@@ -223,8 +331,58 @@ class AttachmentService:
     ) -> None:
         self.files.policy.validate_image_dimensions(width, height)
 
-    def preview(self, session_id: str, ref: str) -> dict[str, object]:
-        return self.files.preview(session_id, ref)
+    def resolve(self, session_id: str, ref: str) -> tuple[Path, AttachmentReference]:
+        """Resolve a Session-owned ref for a later authorized Main action."""
+
+        return self.files.resolve(session_id, ref)
+
+    def resolve_for_system(self, session_id: str, ref: str) -> tuple[Path, AttachmentReference]:
+        """Resolve a Session-owned ref to a safe, extension-bearing cache path."""
+
+        return self.files.materialize_open_path(session_id, ref)
+
+    def resolve_for_system_descriptor(self, session_id: str, ref: str) -> dict[str, object]:
+        """Build the minimal trusted DTO consumed by Desktop Main.
+
+        The caller supplies only the opaque ref and current Session identity.
+        The returned path is a service-created derived copy whose suffix comes
+        from the stored display name; it is never a renderer-supplied path.
+        """
+
+        path, reference = self.resolve_for_system(session_id, ref)
+        mime_type = reference.mime_type or mimetypes.guess_type(reference.display_name)[0]
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        kind, default_action, _preview_supported, _preview_kind = ArtifactService._classify(
+            reference.display_name, mime_type
+        )
+        return {
+            "source": "session_attachment",
+            "session_id": session_id,
+            "ref": reference.ref,
+            "asset_ref": reference.asset_ref,
+            "path": str(path),
+            # ``name``/``mime`` are the compact Main contract.  Keep the
+            # descriptive aliases for existing Renderer projections while
+            # both values continue to come from Session metadata.
+            "name": reference.display_name,
+            "mime": mime_type,
+            "display_name": reference.display_name,
+            "mime_type": mime_type,
+            "size_bytes": reference.size_bytes,
+            "kind": kind,
+            "default_action": default_action,
+        }
+
+    def preview(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        mode: str = "thumbnail",
+        max_edge: int | None = None,
+    ) -> dict[str, object]:
+        return self.files.preview(session_id, ref, mode=mode, max_edge=max_edge)
 
     def remove_draft(self, session_id: str, ref: str) -> None:
         self.files.remove_draft(session_id, ref)
