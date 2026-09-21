@@ -149,6 +149,16 @@ def test_runtime_context_and_model_status_are_stable_values(tmp_path: Path) -> N
     assert {model.model_ref for model in application.model_catalog()} == {"one/ref", "two/ref"}
     assert status.current_model == "one/ref"
     assert status.configuration_sources[0].path == tmp_path / "config.toml"
+    try:
+        environment = application._environment_sources(  # type: ignore[attr-defined]
+            "one/ref",
+            ProviderIdentity("local", "script", "remote-one"),
+        )
+        assert len(environment) == 1
+        assert "[显示名](artifact:相对路径)" in environment[0].content
+        assert "不扩大外部路径授权" in environment[0].content
+    finally:
+        application.close()
 
 
 def test_model_selection_is_atomic_at_the_application_boundary(tmp_path: Path) -> None:

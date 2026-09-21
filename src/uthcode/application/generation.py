@@ -116,6 +116,12 @@ from .compaction import summarize_compaction_epoch_with_provider as _summarize_c
 from uthcode.core.tool import PreparedToolCall, ToolExecutionOutcome
 
 
+class ImageInputUnsupportedError(ProviderConfigurationError):
+    """Stable Application business fact for a model/image capability refusal."""
+
+    code = "image_input_unsupported"
+
+
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
 ModelWriter = Callable[[str], object]
 PermissionWriter = Callable[[PermissionMode], object]
@@ -542,10 +548,12 @@ class UthCodeApplication:
         path: str,
         *,
         authorized_external: bool = False,
+        mode: str = "thumbnail",
     ) -> dict[str, object]:
         return self._artifact_service.preview(
             path,
             authorized_external=authorized_external,
+            mode=mode,
         )
 
     def _process_runtime(self):
@@ -638,7 +646,14 @@ class UthCodeApplication:
             mime_type=mime_type,
         )
 
-    def preview_attachment(self, ref: str, *, session_id: str | None = None) -> dict[str, object]:
+    def preview_attachment(
+        self,
+        ref: str,
+        *,
+        session_id: str | None = None,
+        mode: str = "thumbnail",
+        max_edge: int | None = None,
+    ) -> dict[str, object]:
         service = self._attachment_service
         active = self._active_session_id()
         requested = active if session_id is None else session_id
@@ -646,7 +661,30 @@ class UthCodeApplication:
             raise RuntimeError("durable Session attachments are not configured")
         if requested != active:
             raise ProviderConfigurationError("attachment Session does not own the active Application Session")
-        return service.preview(requested, ref)
+        return service.preview(requested, ref, mode=mode, max_edge=max_edge)
+
+    def resolve_attachment(
+        self,
+        ref: str,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Resolve one active-Session attachment for Main open/reveal.
+
+        The returned path is a derived, extension-bearing cache copy. Main
+        must accept it only from this exact attachment response, revalidate
+        the session attachment root and source/ref marker, and then invoke the
+        operating system; Renderer never receives authority to open it.
+        """
+
+        service = self._attachment_service
+        active = self._active_session_id()
+        requested = active if session_id is None else session_id
+        if service is None or active is None:
+            raise RuntimeError("durable Session attachments are not configured")
+        if requested != active:
+            raise ProviderConfigurationError("attachment Session does not own the active Application Session")
+        return service.resolve_for_system_descriptor(requested, ref)
 
     def remove_attachment(self, ref: str, *, session_id: str | None = None) -> None:
         service = self._attachment_service
@@ -1645,7 +1683,7 @@ class UthCodeApplication:
             return
         model = self.current_model
         if model is None or model.supports_images is not True:
-            raise ProviderConfigurationError(
+            raise ImageInputUnsupportedError(
                 "selected model does not explicitly support image input"
             )
 
@@ -1675,7 +1713,7 @@ class UthCodeApplication:
             covered_end = 0
         if not _transcript_has_images(entries, after_sequence=covered_end):
             return
-        raise ProviderConfigurationError(
+        raise ImageInputUnsupportedError(
             "selected model does not explicitly support image input in Session history"
         )
 
@@ -3921,6 +3959,7 @@ class UthCodeApplication:
                 f"- Provider 协议：{identity.protocol}",
                 f"- 远端模型：{identity.model}",
                 f"- 模型选择：{model_ref}",
+                "- 可交付产物：对已写入当前工作目录的正式文件，使用 Markdown [显示名](artifact:相对路径) 引用；相对路径不含空白且不要 URL 编码，该引用不扩大外部路径授权。",
             )
         )
         return (

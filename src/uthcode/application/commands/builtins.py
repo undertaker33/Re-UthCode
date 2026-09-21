@@ -99,7 +99,12 @@ async def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
         result = select_model(model_ref)
         if inspect.isawaitable(result):
             await result
-    except Exception:
+    except Exception as exc:
+        if getattr(exc, "code", None) == "image_input_unsupported":
+            raise CommandExecutionError(
+                _MODEL_SWITCH_FAILURE,
+                code="image_input_unsupported",
+            ) from None
         raise CommandExecutionError(_MODEL_SWITCH_FAILURE) from None
     return ModelSelected(model_ref)
 

@@ -38,6 +38,8 @@ from uthcode.core.provider import (
 )
 from uthcode.integrations.attachment_files import (
     AttachmentImageTooLarge,
+    AttachmentPolicy,
+    AttachmentQuotaExceeded,
     AttachmentReferenceError,
 )
 from uthcode.integrations import attachment_files
@@ -193,6 +195,143 @@ def test_application_attachment_copy_survives_source_change_and_restart_history(
         assert replay[0].attachments[0]["mime_type"] == "image/png"
     finally:
         application.close()
+
+
+def test_attachment_previews_are_bounded_and_system_resolution_keeps_original(
+    tmp_path: Path,
+) -> None:
+    import random
+
+    from PIL import Image
+
+    raw = random.Random(12345).randbytes(700 * 500 * 3)
+    source = tmp_path / "large.png"
+    Image.frombytes("RGB", (700, 500), raw).save(source, optimize=False)
+    application = _app_with_fake_provider(tmp_path)
+    session = application.new_session_for_command()
+    try:
+        imported = application.import_attachment(
+            source.read_bytes(),
+            display_name="report.final.PDF",
+            mime_type="application/pdf",
+        )
+        image = application.import_attachment(
+            source.read_bytes(),
+            display_name="large.png",
+            mime_type="image/png",
+        )
+        thumbnail = application.preview_attachment(image.ref, session_id=session.session_id)
+        full = application.preview_attachment(
+            image.ref,
+            session_id=session.session_id,
+            mode="full",
+        )
+        assert thumbnail["preview_kind"] == "thumbnail"
+        assert thumbnail["scaled"] is True
+        assert int(thumbnail["preview_width"]) <= 160
+        assert int(thumbnail["preview_height"]) <= 160
+        assert len(str(thumbnail["data_url"])) < 400_000
+        assert full["preview_kind"] == "full"
+        assert int(full["preview_width"]) <= 2048
+        assert len(str(full["data_url"])) < 6_000_000
+
+        resolved = application.resolve_attachment(imported.ref, session_id=session.session_id)
+        resolved_path = Path(str(resolved["path"]))
+        assert resolved["source"] == "session_attachment"
+        assert resolved["ref"] == imported.ref
+        assert resolved["name"] == "report.final.PDF"
+        assert resolved["mime"] == "application/pdf"
+        assert resolved["display_name"] == "report.final.PDF"
+        assert resolved_path.name == "report.final.PDF"
+        assert resolved_path.read_bytes() == source.read_bytes()
+        resolved_path.write_bytes(b"edited derived copy")
+        refreshed = application.resolve_attachment(imported.ref, session_id=session.session_id)
+        assert Path(str(refreshed["path"])).read_bytes() == source.read_bytes()
+        cleanup = application.attachment_service.cleanup(session.session_id)
+        assert cleanup["derived"] == 1
+        assert not resolved_path.exists()
+        original = (
+            application.session_service.store.session_path(session.session_id)
+            / "attachments"
+            / imported.ref
+            / "content.bin"
+        )
+        assert original.read_bytes() == source.read_bytes()
+        with pytest.raises(ProviderConfigurationError):
+            application.resolve_attachment(imported.ref, session_id="foreign-session")
+    finally:
+        application.close()
+
+
+def test_text_attachment_preview_uses_name_extension_and_stays_bounded(
+    tmp_path: Path,
+) -> None:
+    application = _app_with_fake_provider(tmp_path)
+    session = application.new_session_for_command()
+    try:
+        imported = application.import_attachment(
+            ("print('ok')\n" * 40_000).encode("utf-8"),
+            display_name="script.py",
+            mime_type="application/octet-stream",
+        )
+        preview = application.preview_attachment(
+            imported.ref,
+            session_id=session.session_id,
+        )
+        assert preview["preview_kind"] == "text"
+        assert "print('ok')" in str(preview["text"])
+        assert preview["truncated"] is True
+        assert len(str(preview["text"]).encode("utf-8")) <= application.attachment_service.policy.preview_limit_bytes  # type: ignore[union-attr]
+    finally:
+        application.close()
+
+
+def test_image_preview_rechecks_decoded_dimensions_after_import(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    application = _app_with_fake_provider(tmp_path)
+    session = application.new_session_for_command()
+    source = tmp_path / "oversized.png"
+    Image.new("1", (9_000, 9_000), 0).save(source, format="PNG", optimize=True)
+    try:
+        imported = application.import_attachment(
+            source.read_bytes(),
+            display_name="claimed.tiff",
+            mime_type="image/tiff",
+        )
+        with pytest.raises(AttachmentImageTooLarge):
+            application.preview_attachment(imported.ref, session_id=session.session_id)
+    finally:
+        application.close()
+
+
+def test_attachment_system_open_cache_obeys_derived_quota(tmp_path: Path) -> None:
+    store = SessionFileStore(tmp_path / "sessions")
+    session = store.create_session(project_key=str(tmp_path.resolve()))
+    from uthcode.application.attachments import AttachmentService
+
+    service = AttachmentService(
+        store,
+        policy=AttachmentPolicy(derived_quota_bytes=5),
+    )
+    first = service.import_bytes(
+        session.session_id,
+        b"123",
+        display_name="first.txt",
+        mime_type="text/plain",
+    )
+    second = service.import_bytes(
+        session.session_id,
+        b"456",
+        display_name="second.txt",
+        mime_type="text/plain",
+    )
+
+    service.resolve_for_system_descriptor(session.session_id, first.ref)
+    with pytest.raises(AttachmentQuotaExceeded):
+        service.resolve_for_system_descriptor(session.session_id, second.ref)
 
 
 def test_attachment_import_rejects_excessive_decoded_image_dimensions(tmp_path: Path) -> None:

@@ -199,6 +199,29 @@ async def test_unknown_handler_exception_is_redacted_from_outcome_and_repr() -> 
 
 
 @pytest.mark.asyncio
+async def test_model_switch_preserves_image_capability_business_code() -> None:
+    class _ImageUnsupported(Exception):
+        code = "image_input_unsupported"
+
+    class _Application:
+        def model_catalog(self) -> tuple[object, ...]:
+            return (type("Model", (), {"model_ref": "text/ref"})(),)
+
+        def select_model(self, _model_ref: str) -> None:
+            raise _ImageUnsupported("history contains images")
+
+    outcome = await CommandDispatcher(create_builtin_registry()).dispatch_text_async(
+        "/model text/ref",
+        application=_Application(),
+    )
+
+    assert outcome is not None
+    assert outcome.status is OutcomeStatus.EXECUTION_ERROR
+    assert outcome.error == "模型切换失败"
+    assert outcome.error_code == "image_input_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_builtin_registry_contains_one_model_canonical_and_real_ui_actions() -> None:
     registry = create_builtin_registry()
     dispatcher = CommandDispatcher(registry)

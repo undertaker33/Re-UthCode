@@ -122,3 +122,23 @@ Luna（max）完成首轮实施与一轮返工；Terra（high）第二轮审核�
 ## 本次缺陷复审收口（2026-09-16）
 
 同一 Terra（high）复审已通过，无新增 actionable finding。复审采用当前源码和本补充证据：真实 Application/Bridge 附件路径 4 passed、Bridge 受影响全测 80 passed、架构边界 23 passed、Desktop Main/preload/Renderer 定向 19 passed、typecheck 通过；IPC 部分仍明确为离线契约 fixture，不宣称 packaged Electron 或 Windows 原生实测。
+
+## 服务侧预览与模型错误码补充（2026-09-21）
+
+本轮恢复 T11 已批准修复计划，只写 Python 服务、相关测试和本 Feedback；冻结任务书、Spec、Tasks、Prompt、Checklist 以及 Desktop 工作区没有修改。实现继续沿用既有 Session 附件 schema、派生缓存和 Application 活跃 Session 边界。
+
+### 实际修复
+
+- AttachmentFileStore.preview() 现在按 MIME 或保存的 display_name 扩展名识别 Markdown、Python 及其他 code/plaintext；通过 Integration 共享的受限读取、严格解码和 UTF-8 截断函数返回 preview_kind=text、text、encoding、truncated。读取只取预算前缀，不整文件读完再截断，最终文本 UTF-8 字节数不超过预算。
+- 图片预览在 Pillow load() 前后检查实际宽度、高度和像素数，并继续受 thumbnail 160、full 2048 及编码 payload 上限约束；超出时返回既有附件业务错误。导入元数据无法覆盖真实解码尺寸。
+- attachment.open/attachment.reveal 继续只接收 opaque ref，由 Application 校验活跃 Session 归属；System DTO 现在明确提供 source=session_attachment、session_id、ref、asset_ref、派生 path、name、mime 和 default_action。系统打开使用带原始扩展名的派生副本，保留 content.bin 不变；派生 quota 和 Session 正常 cleanup 保持接通。
+- /model 遇到 Session 历史图片与目标模型能力不兼容时，Application 抛出稳定 image_input_unsupported，CommandOutcome/Bridge 保留该业务码，不再折叠成 generic command_failed。环境事实边界说明对当前工作目录中的正式文件使用 Markdown [显示名](artifact:相对路径) 引用，路径不含空白且不 URL 编码，并说明该引用不扩大外部授权；未把 Core 绑定 Desktop。
+
+### 定向验证
+
+- conda run --no-capture-output -n re-uthcode python -m pytest tests/test_attachments.py tests/test_desktop_artifacts.py tests/test_desktop_bridge.py tests/test_command_dispatcher.py tests/test_application_runtime.py tests/test_architecture_boundaries.py -q：150 passed in 14.98s。
+- 覆盖 .py + application/octet-stream 的 Session 附件文本预览和 UTF-8 字节预算、合法超像素图片在导入后预览时的解码尺寸拒绝、派生副本扩展名/原始 content.bin 保持、派生 quota、活跃 Session 拒绝、Artifact mode、Bridge 业务错误码和环境 artifact: 链接格式提示。
+
+### 未验证项与交接
+
+本轮未执行 Desktop/npm、Windows 原生 open/reveal、packaged 安装产物、真实 Provider/Tavily 或 Git 操作；这些继续由 UI worker、W06 和总控验收负责。Python 服务修改集已冻结，交 Terra 复审；如发现 finding，只在本 Python 写集内修复。

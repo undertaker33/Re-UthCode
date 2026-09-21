@@ -20,6 +20,10 @@ from .registry import CommandRegistry
 class CommandExecutionError(RuntimeError):
     """A safe, user-facing failure raised by an Application command handler."""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True, slots=True)
 class CommandContext:
@@ -94,6 +98,7 @@ class CommandDispatcher:
                 OutcomeStatus.EXECUTION_ERROR,
                 error=str(exc),
                 invocation=invocation,
+                error_code=exc.code,
             )
         except Exception:  # unknown failures must not expose exception text
             return CommandOutcome(

@@ -116,6 +116,8 @@ _METHODS = frozenset(
         "history.page",
         "attachment.import",
         "attachment.preview",
+        "attachment.open",
+        "attachment.reveal",
         "attachment.remove",
         "artifact.describe",
         "artifact.preview",
@@ -1538,6 +1540,8 @@ class DesktopBridge:
             return await self._attachment_import(params)
         if method == "attachment.preview":
             return await self._attachment_preview(params)
+        if method in {"attachment.open", "attachment.reveal"}:
+            return await self._attachment_system_request(method, params)
         if method == "attachment.remove":
             return await self._attachment_remove(params)
         if method in {"artifact.describe", "artifact.preview", "artifact.open", "artifact.reveal"}:
@@ -2641,18 +2645,82 @@ class DesktopBridge:
         return {"attachment": result}
 
     async def _attachment_preview(self, params: Mapping[str, object]) -> dict[str, object]:
-        _require_params(params, {"ref"}, method="attachment.preview")
+        allowed = {"ref", "mode", "max_edge"}
+        missing = {"ref"} - set(params)
+        extra = set(params) - allowed
+        if missing:
+            raise BridgeError(
+                "invalid_request",
+                f"attachment.preview is missing fields: {sorted(missing)!r}",
+            )
+        if extra:
+            raise BridgeError(
+                "invalid_request",
+                f"attachment.preview has unknown fields: {sorted(extra)!r}",
+            )
         ref = _text_param(params, "ref")
+        mode = params.get("mode", "thumbnail")
+        if not isinstance(mode, str) or mode not in {"thumbnail", "full"}:
+            raise BridgeError("invalid_request", "attachment preview mode is invalid")
+        max_edge = params.get("max_edge")
+        if max_edge is not None and (
+            isinstance(max_edge, bool)
+            or not isinstance(max_edge, int)
+            or not 1 <= max_edge <= 2048
+        ):
+            raise BridgeError("invalid_request", "attachment preview max_edge is invalid")
         session_id = await self._attachment_session_id()
         application = self._application
         assert application is not None
         try:
-            value = application.preview_attachment(ref, session_id=session_id)
+            value = application.preview_attachment(
+                ref,
+                session_id=session_id,
+                mode=mode,
+                max_edge=max_edge,
+            )
         except AttachmentError:
             raise BridgeError("attachment_error", "attachment preview is unavailable") from None
         except (RuntimeError, ValueError, TypeError):
             raise BridgeError("attachment_error", "attachment preview is unavailable") from None
         return {"attachment": value}
+
+    async def _attachment_system_request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Resolve a Session ref into a Main-consumable open/reveal DTO.
+
+        Renderer input is deliberately ref-only. The Application obtains the
+        current Session identity and materializes the extension-bearing cache
+        path; neither a path nor an authorization flag crosses this boundary.
+        Main must still validate the returned source marker and path before
+        invoking the operating system.
+        """
+
+        _require_params(params, {"ref"}, method=method)
+        ref = _text_param(params, "ref")
+        session_id = await self._attachment_session_id()
+        application = self._application
+        assert application is not None
+        try:
+            value = application.resolve_attachment(ref, session_id=session_id)
+        except AttachmentError:
+            raise BridgeError("attachment_error", "attachment is unavailable") from None
+        except (RuntimeError, ValueError, TypeError):
+            raise BridgeError("attachment_error", "attachment is unavailable") from None
+        if not isinstance(value, Mapping):
+            raise BridgeError("attachment_error", "attachment descriptor is invalid")
+        if (
+            value.get("source") != "session_attachment"
+            or value.get("session_id") != session_id
+            or value.get("ref") != ref
+            or not isinstance(value.get("path"), str)
+            or not value["path"].strip()
+        ):
+            raise BridgeError("attachment_error", "attachment descriptor is invalid")
+        return {"attachment": dict(value)}
 
     async def _attachment_remove(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"ref"}, method="attachment.remove")
@@ -2674,6 +2742,8 @@ class DesktopBridge:
         params: Mapping[str, object],
     ) -> dict[str, object]:
         allowed = {"path", "authorized_external"}
+        if method == "artifact.preview":
+            allowed.add("mode")
         if "path" not in params:
             raise BridgeError("invalid_request", f"{method} is missing fields: ['path']")
         extra = set(params) - allowed
@@ -2683,12 +2753,20 @@ class DesktopBridge:
         authorized_external = params.get("authorized_external", False)
         if not isinstance(authorized_external, bool):
             raise BridgeError("invalid_request", "authorized_external must be a boolean")
+        mode = params.get("mode", "thumbnail")
+        if method == "artifact.preview" and (
+            not isinstance(mode, str) or mode not in {"thumbnail", "full"}
+        ):
+            raise BridgeError("invalid_request", "artifact preview mode is invalid")
+        if method != "artifact.preview" and "mode" in params:
+            raise BridgeError("invalid_request", f"{method} has unknown fields: ['mode']")
         application = self._require_application()
         try:
             if method == "artifact.preview":
                 artifact = application.preview_artifact(
                     path,
                     authorized_external=authorized_external,
+                    mode=mode,
                 )
             else:
                 artifact = application.describe_artifact(
@@ -2985,12 +3063,15 @@ class DesktopBridge:
             # start failure.  The Renderer uses this stable kind to explain
             # that the selected model must explicitly support image input.
             if (
-                error.code == "provider_configuration_error"
-                and error.message
-                in {
-                    "selected model does not explicitly support image input",
-                    "selected model does not explicitly support image input in Session history",
-                }
+                error.code == "image_input_unsupported"
+                or (
+                    error.code == "provider_configuration_error"
+                    and error.message
+                    in {
+                        "selected model does not explicitly support image input",
+                        "selected model does not explicitly support image input in Session history",
+                    }
+                )
             ):
                 raise BridgeError(
                     "image_input_unsupported",
@@ -3422,7 +3503,7 @@ class DesktopBridge:
         elif status == OutcomeStatus.USAGE_ERROR.value:
             code = "command_usage_error"
         else:
-            code = "command_failed"
+            code = outcome.error_code or "command_failed"
         return {
             "command": command,
             "status": status,
