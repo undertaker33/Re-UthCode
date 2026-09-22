@@ -118,6 +118,7 @@ _METHODS = frozenset(
         "attachment.preview",
         "attachment.open",
         "attachment.reveal",
+        "attachment.copy_path",
         "attachment.remove",
         "artifact.describe",
         "artifact.preview",
@@ -1540,7 +1541,7 @@ class DesktopBridge:
             return await self._attachment_import(params)
         if method == "attachment.preview":
             return await self._attachment_preview(params)
-        if method in {"attachment.open", "attachment.reveal"}:
+        if method in {"attachment.open", "attachment.reveal", "attachment.copy_path"}:
             return await self._attachment_system_request(method, params)
         if method == "attachment.remove":
             return await self._attachment_remove(params)
@@ -2690,13 +2691,13 @@ class DesktopBridge:
         method: str,
         params: Mapping[str, object],
     ) -> dict[str, object]:
-        """Resolve a Session ref into a Main-consumable open/reveal DTO.
+        """Resolve a Session ref into a Main-consumable action DTO.
 
         Renderer input is deliberately ref-only. The Application obtains the
         current Session identity and materializes the extension-bearing cache
         path; neither a path nor an authorization flag crosses this boundary.
         Main must still validate the returned source marker and path before
-        invoking the operating system.
+        opening, revealing, or copying it.
         """
 
         _require_params(params, {"ref"}, method=method)

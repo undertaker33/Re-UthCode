@@ -674,13 +674,19 @@ async def test_attachment_preview_modes_and_system_actions_are_ref_only(
         revealed = await bridge.handle_request(
             RequestEnvelope("attachment-reveal", "attachment.reveal", {"ref": ref})
         )
-        for response in (opened, revealed):
+        copied = await bridge.handle_request(
+            RequestEnvelope("attachment-copy-path", "attachment.copy_path", {"ref": ref})
+        )
+        for response in (opened, revealed, copied):
             assert response.ok is True and response.result is not None
             descriptor = response.result["attachment"]
             assert isinstance(descriptor, dict)
             assert descriptor["source"] == "session_attachment"
             assert descriptor["session_id"] == sessions.active_session.session_id  # type: ignore[union-attr]
             assert descriptor["ref"] == ref
+            assert descriptor["asset_ref"] == f"attachment:{sessions.active_session.session_id}:{ref}"  # type: ignore[union-attr]
+            assert descriptor["name"] == "report.final.PDF"
+            assert descriptor["mime"] == "application/pdf"
             path = Path(str(descriptor["path"]))
             assert path.name == "report.final.PDF"
             assert path.read_bytes() == b"%PDF-1.7\n"
@@ -706,6 +712,17 @@ async def test_attachment_preview_modes_and_system_actions_are_ref_only(
         assert rejected_session.ok is False
         assert rejected_session.error is not None
         assert rejected_session.error.kind == "invalid_request"
+
+        rejected_copy_path = await bridge.handle_request(
+            RequestEnvelope(
+                "attachment-copy-path-rejected",
+                "attachment.copy_path",
+                {"ref": ref, "path": str(tmp_path / "outside.exe")},
+            )
+        )
+        assert rejected_copy_path.ok is False
+        assert rejected_copy_path.error is not None
+        assert rejected_copy_path.error.kind == "invalid_request"
 
         image = await bridge.handle_request(
             RequestEnvelope(

@@ -156,6 +156,7 @@ def test_runtime_context_and_model_status_are_stable_values(tmp_path: Path) -> N
         )
         assert len(environment) == 1
         assert "[显示名](artifact:相对路径)" in environment[0].content
+        assert "保留字符按界面协议 percent-encode" in environment[0].content
         assert "不扩大外部路径授权" in environment[0].content
     finally:
         application.close()

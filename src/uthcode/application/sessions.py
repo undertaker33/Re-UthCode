@@ -1342,7 +1342,25 @@ def _project_replay_units(
     plan_call_ids: set[str] = set()
     plans: dict[str, tuple[int, str, str, str | None]] = {}
     user_seen: set[str] = set()
+    user_message_kinds: dict[tuple[str, str], str] = {}
     legacy_message_ids: set[tuple[str, str, str]] = set()
+
+    def user_replay_kind(entry: TranscriptEntry) -> str:
+        """Keep every part of one user Message under its first replay kind."""
+
+        message_id = _entry_message_id(entry)
+        key = (entry.turn_id, message_id) if message_id is not None else None
+        if entry.kind is TranscriptKind.USER_STEERING:
+            kind = "steering"
+        elif key is not None and key in user_message_kinds:
+            kind = user_message_kinds[key]
+        else:
+            kind = "steering" if entry.turn_id in user_seen else "user"
+        if key is not None:
+            user_message_kinds[key] = kind
+        user_seen.add(entry.turn_id)
+        return kind
+
     for unit in units:
         if not isinstance(unit, SemanticUnit):
             raise TypeError("replay units must be SemanticUnit values")
@@ -1480,8 +1498,7 @@ def _project_replay_units(
                         TranscriptKind.USER_MESSAGE,
                         TranscriptKind.USER_STEERING,
                     ):
-                        attachment_kind = "steering" if entry.kind is TranscriptKind.USER_STEERING or entry.turn_id in user_seen else "user"
-                        user_seen.add(entry.turn_id)
+                        attachment_kind = user_replay_kind(entry)
                     elif entry.kind in {
                         TranscriptKind.ASSISTANT_MESSAGE,
                         TranscriptKind.FAILED_ASSISTANT_MESSAGE,
@@ -1512,13 +1529,7 @@ def _project_replay_units(
                 ):
                     if not isinstance(part, TextPart):
                         continue
-                    kind = (
-                        "steering"
-                        if entry.kind is TranscriptKind.USER_STEERING
-                        or entry.turn_id in user_seen
-                        else "user"
-                    )
-                    user_seen.add(entry.turn_id)
+                    kind = user_replay_kind(entry)
                 elif isinstance(part, ReasoningPart):
                     kind = "reasoning"
                 elif entry.kind in {

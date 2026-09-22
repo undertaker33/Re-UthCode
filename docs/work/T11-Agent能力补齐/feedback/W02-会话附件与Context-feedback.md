@@ -142,3 +142,28 @@ Luna（max）完成首轮实施与一轮返工；Terra（high）第二轮审核�
 ### 未验证项与交接
 
 本轮未执行 Desktop/npm、Windows 原生 open/reveal、packaged 安装产物、真实 Provider/Tavily 或 Git 操作；这些继续由 UI worker、W06 和总控验收负责。Python 服务修改集已冻结，交 Terra 复审；如发现 finding，只在本 Python 写集内修复。
+
+## 复制路径与 artifact 链接协议补充（2026-09-21）
+
+本轮按 UI worker 对齐后的 IPC 合同补充 Python Bridge，未修改 Desktop、冻结规则或 Git。附件复制路径使用明确的 attachment.copy_path 方法：Renderer 只发送 ref，Bridge 复用现有活跃 Session resolve 派生 DTO，Main 负责把 DTO 的 path 写入系统剪贴板；不读取 Renderer 文件系统，不借用 attachment.open/reveal 触发系统操作。
+
+attachment.copy_path 与 attachment.open/reveal 共用 source=session_attachment、session_id、ref、asset_ref、path、name、mime、default_action 校验和派生扩展名缓存，因此跨 Session ref、伪造 path 或额外参数都会在 Python Bridge 边界被拒绝。Main 的剪贴板执行和 UI 入口由 UI worker 负责。
+
+同时根据 UI parser 的实际协议更正模型环境提示：对已写入当前工作目录的正式文件使用 Markdown [显示名](artifact:相对路径)；普通相对路径直接写，空白和保留字符按界面协议 percent-encode，链接不扩大外部路径授权。此前同一 Feedback 的旧记录保持原样，本节记录当前事实。
+
+定向验证：conda run --no-capture-output -n re-uthcode python -m pytest tests/test_desktop_bridge.py tests/test_application_runtime.py tests/test_architecture_boundaries.py -q：115 passed in 10.45s；其中包含 attachment.copy_path ref-only DTO、伪造 path 拒绝、环境链接提示和架构边界回归。Python 补充完成后冻结，交 Terra 与 UI worker 联合审核。
+
+## 历史重放同一用户消息附件归属补充（2026-09-22）
+
+Terra 复核发现：当前 transcript writer 将同一用户 Message 的多个 part 按 `message_id` 分成多个 part-local entry；旧 replay 投影只用 `turn_id` 的 `user_seen` 判断首次用户消息，正文先投影后，图片会被误标为 `steering`，导致重启后的历史附件卡片脱离原用户消息。
+
+本轮只修改 `src/uthcode/application/sessions.py` 与 `tests/test_history_bridge.py`。replay 现在按 `(turn_id, message_id)` 记住已确定的用户消息 kind：同一消息的正文、图片及其他 part 保持首次 `user`/`steering` 归属；没有 message identity 的旧形状继续使用原 `user_seen` 回退，显式 `USER_STEERING` 仍保持 `steering`。新增真实 `SessionFileStore` 写入、关闭、新 Application resume、Desktop Bridge `history.page` 回归，验证正文和图片共享 message_id 且均为 `user`，真正后续 steering 仍为 `steering`。
+
+定向验证：
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_bridge.py::test_restarted_session_history_keeps_image_with_same_user_message -q`：1 passed in 1.33s。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_bridge.py -q`：4 passed in 1.06s。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_bridge.py tests/test_desktop_bridge.py tests/test_application_runtime.py tests/test_architecture_boundaries.py -q`：119 passed in 13.73s；覆盖本轮 copy_path ref-only DTO、artifact percent-encode 环境说明、历史恢复回归和架构边界。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_attachments.py tests/test_session_authority.py -q`：32 passed in 7.55s。
+
+本轮仍未执行 Desktop/npm、Windows 原生或 packaged 验收、真实 Provider/Tavily，也未执行 Git 写操作；Python 服务补充已冻结，交 Terra 复审。
