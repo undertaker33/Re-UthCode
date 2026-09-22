@@ -3959,7 +3959,7 @@ class UthCodeApplication:
                 f"- Provider 协议：{identity.protocol}",
                 f"- 远端模型：{identity.model}",
                 f"- 模型选择：{model_ref}",
-                "- 可交付产物：对已写入当前工作目录的正式文件，使用 Markdown [显示名](artifact:相对路径) 引用；相对路径不含空白且不要 URL 编码，该引用不扩大外部路径授权。",
+                "- 可交付产物：对已写入当前工作目录的正式文件，使用 Markdown [显示名](artifact:相对路径) 引用；空白和保留字符按界面协议 percent-encode，普通相对路径可直接写，该引用不扩大外部路径授权。",
             )
         )
         return (

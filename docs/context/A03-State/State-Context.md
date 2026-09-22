@@ -13,6 +13,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `RunState` 是单个 Run 当前 Turn 的权威、不可变 Core 状态。
 - `[FACT]` Transcript 新写入按单个 typed Message part 保存角色、连续 identity 和 part 顺序；`ReasoningPart` 与正式 `TextPart` 可独立重建，reasoning 永不成为 final 文本。旧 v3 full-message envelope 只读兼容，不原地迁移。
 - `[FACT]` Application 将已提交 Transcript 投影为按 durable sequence 排序的安全 replay record；回放包含 user、steering、reasoning、formal assistant、脱敏 Tool 终态，以及失败 Turn 中已公开的 reasoning/partial assistant 与稳定 `TerminationReason`/`FailureReason`。失败内容只用于 replay，不会作为有效 assistant 响应回灌 Provider；回放不包含 raw ToolResult、SDK exception、native payload、秘密或 pending interaction。
+- `[FACT]` 同一用户 Message 的多个 Transcript part 按 `(turn_id, message_id)` 保持一致的 user/steering 归属，避免正文先出现后把同条消息的图片误判为 steering；显式 USER_STEERING 保持原语义。Desktop 可按该消息 identity 将正文与附件组合显示，不能以文本去重改变历史。
 - `[FACT]` `ApplicationSessionService.read_history_page` 复用同一安全 replay 投影，默认读取最近 30 个完整 semantic unit，再通过不透明游标读取更早页。`SessionFileStore` 从 Transcript JSONL 尾部按块逆读，不先加载完整 Transcript，也不创建持久索引或缓存数据库；分页不拆开同一单元内的 ToolCall/ToolResult，不改变模型 Context 或完整 Session 恢复语义。
 - `[FACT]` 新提交的 Timeline checkpoint 同时保存提交时的 Transcript 序列位置。历史页按块逆读 Timeline，投影落在本页范围内的已提交压缩提示，稳定身份来自 transaction；提示排在该序列之后，重启可恢复，不进入 Provider 消息。不透明游标同时保留 Transcript 与 Timeline 的反读字节边界，旧页不重复扫描较新 Timeline。旧 checkpoint 没有发生位置时不按压缩覆盖范围猜测插入位置；未提交派生记录不产生成功提示。
 - `[FACT]` Session catalog 通过 metadata 与 Transcript 首条 user entry 生成导航行，不加载完整 replay；预览规范化空白并限制为 160 字符，手动标题优先，空 Session 保持空预览。历史增长不会要求为获取首条消息扫描后续内容。

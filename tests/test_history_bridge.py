@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ from uthcode.application import (
     SessionReplayRecord,
     UthCodeApplication,
 )
+from uthcode.core.history import TranscriptKind, transcript_entries_from_message
+from uthcode.core.provider import ImagePart, Message, TextPart
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.interfaces.desktop.bridge import DesktopBridge
@@ -95,6 +98,89 @@ async def test_history_page_is_exposed_as_a_safe_desktop_dto() -> None:
     )
     assert second.ok is True
     assert application.calls[-1] == ("session-1", "opaque-prev", 1)
+
+
+@pytest.mark.asyncio
+async def test_restarted_session_history_keeps_image_with_same_user_message(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    sessions = SessionFileStore(tmp_path / "sessions")
+    session_id = "image-history"
+    project_key = str(project.resolve())
+    sessions.create_session(session_id, project_key=project_key)
+
+    first = UthCodeApplication(
+        FakeProvider(),
+        session_service=ApplicationSessionService(
+            storage_root=sessions.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=sessions,
+        ),
+    )
+    try:
+        session = first.resume_session_for_command(session_id)
+        message_entries = transcript_entries_from_message(
+            session_id,
+            "turn-image",
+            1,
+            Message(
+                "user",
+                (
+                    TextPart("正文"),
+                    ImagePart("attachment:image-history:ref-image", "image/png", 1, 1),
+                ),
+            ),
+        )
+        steering_entries = transcript_entries_from_message(
+            session_id,
+            "turn-image",
+            3,
+            Message("user", (TextPart("后续引导"),)),
+        )
+        steering = replace(steering_entries[0], kind=TranscriptKind.USER_STEERING)
+        assert session.append_transcript((*message_entries, steering)).transcript_appended
+    finally:
+        first.close()
+
+    restarted = UthCodeApplication(
+        FakeProvider(),
+        session_service=ApplicationSessionService(
+            storage_root=sessions.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=SessionFileStore(sessions.root),
+        ),
+    )
+    bridge = DesktopBridge(restarted)
+    try:
+        resumed = restarted.resume_session_for_command(session_id)
+        assert resumed.session_id == session_id
+        response = await bridge.handle_request(
+            RequestEnvelope(
+                "history-image",
+                "history.page",
+                {"session_id": session_id, "page_size": 10},
+            )
+        )
+        assert response.ok is True
+        assert response.result is not None
+        records = response.result["records"]
+        assert isinstance(records, list)
+        user_records = [record for record in records if record.get("message_id") == "turn-image:1"]
+        assert [(record["kind"], record["text"]) for record in user_records] == [
+            ("user", "正文"),
+            ("user", ""),
+        ]
+        assert user_records[0]["message_id"] == user_records[1]["message_id"]
+        assert user_records[1]["attachments"][0]["asset_ref"] == "attachment:image-history:ref-image"
+        steering_records = [record for record in records if record.get("text") == "后续引导"]
+        assert len(steering_records) == 1
+        assert steering_records[0]["kind"] == "steering"
+    finally:
+        await bridge.shutdown()
 
 
 @pytest.mark.asyncio
