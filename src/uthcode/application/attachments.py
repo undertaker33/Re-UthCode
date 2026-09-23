@@ -5,7 +5,7 @@ from __future__ import annotations
 import mimetypes
 import base64
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -321,8 +321,18 @@ class AttachmentService:
     def policy(self) -> AttachmentPolicy:
         return self.files.policy
 
-    def reference(self, session_id: str, ref: str) -> AttachmentReference:
-        return self.files.reference(session_id, ref)
+    def reference(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        verify_content: bool = True,
+    ) -> AttachmentReference:
+        return self.files.reference(
+            session_id,
+            ref,
+            verify_content=verify_content,
+        )
 
     def validate_image_dimensions(
         self,
@@ -413,4 +423,98 @@ class AttachmentService:
         raise ValueError("kind must be image or file")
 
 
-__all__ = ["ArtifactDescriptor", "ArtifactError", "ArtifactService", "AttachmentService"]
+def project_history_attachment(
+    service: AttachmentService | None,
+    session_id: str,
+    attachment: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Project one Core attachment fact into safe, Session-backed history DTO."""
+
+    source = dict(attachment)
+    source.pop("data_url", None)
+    asset_ref = source.get("asset_ref")
+    if not isinstance(asset_ref, str) or not asset_ref.startswith("attachment:"):
+        # SourcePart may identify a non-Session source. It has no preview
+        # authority in this projection and remains a ref-only Core fact.
+        if source.get("type") == "source":
+            return source
+        return _unavailable_history_attachment(source, session_id)
+
+    parts = asset_ref.split(":", 2)
+    ref = (
+        parts[2]
+        if len(parts) == 3 and parts[1] == session_id and parts[2]
+        else None
+    )
+    if ref is None or service is None:
+        return _unavailable_history_attachment(source, session_id, ref=ref)
+    try:
+        reference = service.reference(session_id, ref, verify_content=False)
+    except AttachmentError:
+        return _unavailable_history_attachment(source, session_id, ref=ref)
+
+    source.update(
+        {
+            "ref": reference.ref,
+            "asset_ref": reference.asset_ref,
+            "display_name": reference.display_name,
+            "mime_type": reference.mime_type,
+            "size_bytes": reference.size_bytes,
+            "available": True,
+        }
+    )
+    if reference.width is None:
+        source.pop("width", None)
+    else:
+        source["width"] = reference.width
+    if reference.height is None:
+        source.pop("height", None)
+    else:
+        source["height"] = reference.height
+    return source
+
+
+def _unavailable_history_attachment(
+    source: Mapping[str, object],
+    session_id: str,
+    *,
+    ref: str | None = None,
+) -> Mapping[str, object]:
+    """Keep missing/corrupt attachments local without invented metadata."""
+
+    value: dict[str, object] = {
+        key: item
+        for key, item in source.items()
+        if key
+        in {
+            "type",
+            "asset_ref",
+            "mime_type",
+            "width",
+            "height",
+            "page",
+            "sheet",
+            "range",
+            "slide",
+            "paragraph",
+        }
+    }
+    asset_ref = value.get("asset_ref")
+    if ref is None and isinstance(asset_ref, str):
+        parts = asset_ref.split(":", 2)
+        if len(parts) == 3 and parts[0] == "attachment" and parts[1] == session_id and parts[2]:
+            ref = parts[2]
+    if ref is not None:
+        value["ref"] = ref
+    value["available"] = False
+    value["error_code"] = "attachment_unavailable"
+    return value
+
+
+__all__ = [
+    "ArtifactDescriptor",
+    "ArtifactError",
+    "ArtifactService",
+    "AttachmentService",
+    "project_history_attachment",
+]

@@ -86,7 +86,7 @@ from uthcode.core.permission import (
 
 from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
-from .attachments import ArtifactService, AttachmentService
+from .attachments import ArtifactService, AttachmentService, project_history_attachment
 from uthcode.integrations.attachment_files import AttachmentPolicy
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
@@ -1076,9 +1076,13 @@ class UthCodeApplication:
             return ()
         active = self._session_service.active_session
         if session_id is None:
-            return () if active is None else active.replay
+            return (
+                ()
+                if active is None
+                else self._project_replay_attachments(active.replay)
+            )
         if active is not None and active.session_id == session_id:
-            return active.replay
+            return self._project_replay_attachments(active.replay)
         snapshot = self._session_service.read_session(session_id)
         return self._build_session_replay(snapshot)
 
@@ -1093,11 +1097,15 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.read_history_page(
+        page = self._session_service.read_history_page(
             session_id,
             cursor=cursor,
             page_size=page_size,
             tool_summary=self._tool_service.describe_tool_call,
+        )
+        return replace(
+            page,
+            records=self._project_replay_attachments(page.records),
         )
 
     def _build_session_replay(self, snapshot) -> tuple[SessionReplayRecord, ...]:
@@ -1105,10 +1113,33 @@ class UthCodeApplication:
 
         if self._session_service is None:
             return ()
-        return self._session_service.project_replay_snapshot(
+        records = self._session_service.project_replay_snapshot(
             snapshot,
             tool_summary=self._tool_service.describe_tool_call,
         )
+        return self._project_replay_attachments(records)
+
+    def _project_replay_attachments(
+        self,
+        records: Sequence[SessionReplayRecord],
+    ) -> tuple[SessionReplayRecord, ...]:
+        """Resolve stored attachment metadata at the Application boundary."""
+
+        projected: list[SessionReplayRecord] = []
+        for record in records:
+            if not record.attachments:
+                projected.append(record)
+                continue
+            attachments = tuple(
+                project_history_attachment(
+                    self._attachment_service,
+                    record.session_id,
+                    attachment,
+                )
+                for attachment in record.attachments
+            )
+            projected.append(replace(record, attachments=attachments))
+        return tuple(projected)
 
     async def compact_session(
         self,
