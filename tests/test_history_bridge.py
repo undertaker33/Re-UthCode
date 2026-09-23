@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -9,13 +10,14 @@ from types import SimpleNamespace
 import pytest
 
 from uthcode.application import (
+    AttachmentService,
     ApplicationSessionService,
     SessionHistoryPage,
     SessionReplayRecord,
     UthCodeApplication,
 )
 from uthcode.core.history import TranscriptKind, transcript_entries_from_message
-from uthcode.core.provider import ImagePart, Message, TextPart
+from uthcode.core.provider import FilePart, ImagePart, Message, TextPart
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.interfaces.desktop.bridge import DesktopBridge
@@ -119,9 +121,27 @@ async def test_restarted_session_history_keeps_image_with_same_user_message(
             instruction_loader=None,
             store=sessions,
         ),
+        attachment_service=AttachmentService(sessions),
     )
     try:
         session = first.resume_session_for_command(session_id)
+        source_image = tmp_path / "actual-photo.png"
+        source_image.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+        )
+        image = first.import_attachment(
+            source_image.read_bytes(),
+            display_name=source_image.name,
+            mime_type="image/png",
+        )
+        source_image.unlink()
+        missing = first.import_attachment(
+            b"will be removed after submission",
+            display_name="missing-report.txt",
+            mime_type="text/plain",
+        )
         message_entries = transcript_entries_from_message(
             session_id,
             "turn-image",
@@ -130,14 +150,20 @@ async def test_restarted_session_history_keeps_image_with_same_user_message(
                 "user",
                 (
                     TextPart("正文"),
-                    ImagePart("attachment:image-history:ref-image", "image/png", 1, 1),
+                    ImagePart(image.asset_ref, image.mime_type, image.width, image.height),
+                    FilePart(
+                        missing.asset_ref,
+                        missing.display_name,
+                        missing.mime_type,
+                        missing.size_bytes,
+                    ),
                 ),
             ),
         )
         steering_entries = transcript_entries_from_message(
             session_id,
             "turn-image",
-            3,
+            4,
             Message("user", (TextPart("后续引导"),)),
         )
         steering = replace(steering_entries[0], kind=TranscriptKind.USER_STEERING)
@@ -145,19 +171,55 @@ async def test_restarted_session_history_keeps_image_with_same_user_message(
     finally:
         first.close()
 
+    missing_content = sessions.session_path(session_id) / "attachments" / missing.ref / "content.bin"
+    missing_content.unlink()
+
+    restarted_store = SessionFileStore(sessions.root)
     restarted = UthCodeApplication(
         FakeProvider(),
         session_service=ApplicationSessionService(
             storage_root=sessions.root,
             project_key=project_key,
             instruction_loader=None,
-            store=SessionFileStore(sessions.root),
+            store=restarted_store,
         ),
+        attachment_service=AttachmentService(restarted_store),
     )
     bridge = DesktopBridge(restarted)
     try:
         resumed = restarted.resume_session_for_command(session_id)
         assert resumed.session_id == session_id
+        replay_image = next(
+            record.attachments[0]
+            for record in resumed.replay
+            if record.message_id == "turn-image:1" and record.attachments
+        )
+        assert replay_image == {
+            "type": "image",
+            "asset_ref": image.asset_ref,
+            "mime_type": "image/png",
+            "width": image.width,
+            "height": image.height,
+            "ref": image.ref,
+            "display_name": "actual-photo.png",
+            "size_bytes": image.size_bytes,
+            "available": True,
+        }
+        replay_missing = next(
+            record.attachments[0]
+            for record in resumed.replay
+            if record.message_id == "turn-image:1"
+            and record.attachments
+            and record.attachments[0].get("asset_ref") == missing.asset_ref
+        )
+        assert replay_missing == {
+            "type": "file",
+            "asset_ref": missing.asset_ref,
+            "mime_type": "text/plain",
+            "ref": missing.ref,
+            "available": False,
+            "error_code": "attachment_unavailable",
+        }
         response = await bridge.handle_request(
             RequestEnvelope(
                 "history-image",
@@ -173,9 +235,24 @@ async def test_restarted_session_history_keeps_image_with_same_user_message(
         assert [(record["kind"], record["text"]) for record in user_records] == [
             ("user", "正文"),
             ("user", ""),
+            ("user", ""),
         ]
         assert user_records[0]["message_id"] == user_records[1]["message_id"]
-        assert user_records[1]["attachments"][0]["asset_ref"] == "attachment:image-history:ref-image"
+        image_record = next(
+            record
+            for record in user_records
+            if record.get("attachments", [{}])[0].get("asset_ref") == image.asset_ref
+        )
+        assert image_record["attachments"][0] == dict(replay_image)
+        assert "data_url" not in image_record["attachments"][0]
+        missing_record = next(
+            record
+            for record in user_records
+            if record.get("attachments", [{}])[0].get("asset_ref") == missing.asset_ref
+        )
+        assert missing_record["attachments"][0] == dict(replay_missing)
+        assert "display_name" not in missing_record["attachments"][0]
+        assert "size_bytes" not in missing_record["attachments"][0]
         steering_records = [record for record in records if record.get("text") == "后续引导"]
         assert len(steering_records) == 1
         assert steering_records[0]["kind"] == "steering"

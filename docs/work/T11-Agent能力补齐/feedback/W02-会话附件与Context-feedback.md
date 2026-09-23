@@ -167,3 +167,21 @@ Terra 复核发现：当前 transcript writer 将同一用户 Message 的多个 
 - `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_attachments.py tests/test_session_authority.py -q`：32 passed in 7.55s。
 
 本轮仍未执行 Desktop/npm、Windows 原生或 packaged 验收、真实 Provider/Tavily，也未执行 Git 写操作；Python 服务补充已冻结，交 Terra 复审。
+
+## 历史附件正式 DTO 缺陷补充（2026-09-23）
+
+复核发现，前一轮修正了同一用户消息内图片的 `kind` 归属，但正式历史 DTO 仍直接输出 `ImagePart.to_dict()`，仅有 `asset_ref`、MIME 与尺寸。Desktop 历史附件规范化还要求 Session `ref`、`display_name` 和 `size_bytes`，因此真实重启历史中的图片仍会被丢弃；此前的 UI fixture 手工补齐这些字段，未覆盖正式 Application 输出。
+
+本轮在 Application 附件投影中按记录所属 Session 验证 `attachment:<session_id>:<ref>`，从 AttachmentService 的 Session metadata 补齐 `ref`、`asset_ref`、文件名、MIME、大小和尺寸，并保留 Core part `type`、记录 `message_id`/part 顺序。历史 DTO 不包含 `data_url`；仅当界面显式调用 `attachment.preview` 时才返回预览字节。元数据读取仍核对 Session 所属、metadata、内容文件存在和字节数，不为历史卡片重读整份图片或重算 SHA-256。
+
+若单个附件文件缺失或损坏，历史记录保留该项的类型、可验证的 opaque ref 与原 asset_ref，并标记 `available: false`、`error_code: attachment_unavailable`；不猜测文件名或大小。其他附件和同消息正文继续正常投影，问题不会中断整个 Session 的 resume 或分页。
+
+新增回归使用真实 AttachmentService 导入图片与文本文件，通过 Session writer 持久化同一用户消息的正文、图片和文件，并记录单独的 `USER_STEERING`。关闭后删除其中一个文件副本，再由新 Application resume 并通过 Desktop Bridge `history.page` 读取；断言图片得到真实文件名、字节数、ref 与图片尺寸，缺失文件只出现局部不可用 DTO，正文及真正的 steering kind 均保留。
+
+定向验证：
+
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_history_bridge.py -q`：4 passed in 1.67s。
+- `conda run --no-capture-output -n re-uthcode python -m pytest tests/test_attachments.py tests/test_history_bridge.py tests/test_architecture_boundaries.py -q`：38 passed in 14.00s。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/skills/uth-utf8-guard/scripts/check_utf8_docs.py docs/work/T11-Agent能力补齐/feedback/W02-会话附件与Context-feedback.md`：`OK: 1 file(s) passed UTF-8 guard`。
+
+本轮只修改 Application 附件/历史投影、相关 Python 测试和本 Feedback；未修改冻结工作包文件、Desktop UI、根文档或 Git 状态。未运行 Desktop/npm、packaged/Windows 原生、真实 Provider/Tavily 或全量 Python 回归。

@@ -761,8 +761,25 @@ class AttachmentFileStore:
         except OSError as exc:
             raise AttachmentIntegrityError("attachment content is unreadable") from exc
 
-    def reference(self, session_id: str, ref: str) -> AttachmentReference:
-        return self.resolve(session_id, ref)[1]
+    def reference(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        verify_content: bool = True,
+    ) -> AttachmentReference:
+        """Return trusted Session metadata for one opaque attachment ref.
+
+        ``verify_content=False`` still requires readable metadata, a present
+        content file, and an exact size match, but avoids hashing the complete
+        attachment when a caller only needs its bounded descriptive metadata.
+        """
+
+        return self._resolve(
+            session_id,
+            ref,
+            verify_content=verify_content,
+        )[1]
 
     def mark_submitted(self, session_id: str, ref: str) -> AttachmentReference:
         path, reference = self._resolve(session_id, ref)
