@@ -5,6 +5,8 @@ import { CustomSelect } from "./CustomSelect";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { stateLabel } from "./RuntimePanel";
 import { UiIcon } from "./UiIcon";
+import { FileCard, type FilePreviewMode } from "./FileCard";
+import type { DocumentPreview } from "./DocumentPreviewPanel";
 
 /** Replace only the token currently being completed, preserving slash aliases. */
 export function applyCompletion(prefix: string, completion: string): string {
@@ -114,7 +116,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
+  state: Pick<RendererState, "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration" | "notice">;
   sessionPreparationStatus?: "preparing" | "ready" | "failed";
   onChange: (text: string) => void;
   onSubmit: (text: string, attachments: readonly DesktopAttachmentDraft[]) => void | Promise<void>;
@@ -127,15 +129,14 @@ export interface ComposerProps {
   onPasteAttachment: () => void | Promise<void>;
   onImportFile: (file: File) => void | Promise<void>;
   onRemoveAttachment: (ref: string) => void | Promise<void>;
+  onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>;
+  onOpenAttachment?: (ref: string) => void | Promise<void>;
+  onRevealAttachment?: (ref: string) => void | Promise<void>;
+  onCopyAttachmentPath?: (ref: string, assetRef?: string) => void | Promise<void>;
+  onOpenDocument?: (preview: DocumentPreview) => void;
 }
 
-function attachmentSizeLabel(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onCompactCancel, onDismissCompletion, onChooseAttachment, onPasteAttachment, onImportFile, onRemoveAttachment }: ComposerProps) {
+export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, onCommand, onPause, onCancel, onCompactCancel, onDismissCompletion, onChooseAttachment, onPasteAttachment, onImportFile, onRemoveAttachment, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument }: ComposerProps) {
   const { language, t } = useTranslation();
   const composerRef = useRef<HTMLElement>(null);
   const composing = useRef(false);
@@ -198,12 +199,28 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
     const element = composerRef.current;
     const parent = element?.parentElement;
     if (!element || !parent) return undefined;
-    const updateHeight = () => parent.style.setProperty("--composer-height", `${element.getBoundingClientRect().height}px`);
-    updateHeight();
+    let frame = 0;
+    const schedule = (callback: FrameRequestCallback) => typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame(callback) : window.setTimeout(() => callback(Date.now()), 0);
+    const cancel = (handle: number) => typeof window.cancelAnimationFrame === "function" ? window.cancelAnimationFrame(handle) : window.clearTimeout(handle);
+    const updateHeight = () => {
+      if (frame) return;
+      frame = schedule(() => {
+        frame = 0;
+        const nextHeight = `${element.getBoundingClientRect().height}px`;
+        if (parent.style.getPropertyValue("--composer-height") !== nextHeight) {
+          parent.style.setProperty("--composer-height", nextHeight);
+        }
+      });
+    };
+    const initialHeight = `${element.getBoundingClientRect().height}px`;
+    if (parent.style.getPropertyValue("--composer-height") !== initialHeight) {
+      parent.style.setProperty("--composer-height", initialHeight);
+    }
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateHeight);
     observer?.observe(element);
     return () => {
       observer?.disconnect();
+      if (frame) cancel(frame);
       parent.style.removeProperty("--composer-height");
     };
   }, []);
@@ -231,9 +248,20 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   };
 
   const handlePaste = (event: ReactClipboardEvent<HTMLElement>) => {
-    if (inputLocked || state.activeTurn || event.clipboardData.files.length === 0) return;
-    event.preventDefault();
-    Array.from(event.clipboardData.files).forEach((file) => { void onImportFile(file); });
+    if (inputLocked || state.activeTurn) return;
+    const files = Array.from(event.clipboardData.files);
+    if (files.length > 0) {
+      event.preventDefault();
+      files.forEach((file) => { void onImportFile(file); });
+      return;
+    }
+    const containsImage = Array.from(event.clipboardData.types).some((type) => type.toLowerCase().startsWith("image/"));
+    if (containsImage) {
+      // Some clipboard providers expose image MIME data without a File entry.
+      // Keep Main's image reader as a fallback and suppress accompanying text.
+      event.preventDefault();
+      void onPasteAttachment();
+    }
   };
 
   const chooseCompletion = (index: number) => {
@@ -287,6 +315,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
 
   return (
     <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (!inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
+      {state.notice && <p className="composer-notice" role="status" aria-live="polite">{state.notice}</p>}
       {state.todo.length > 0 && <section className="composer-todo todo-strip" tabIndex={0} aria-label={t("tasks")} data-iteration={state.todoIteration}>
         <header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{state.todo.length}</span></header>
         <ul>{state.todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>
@@ -297,6 +326,19 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
       {completionOpen && candidates.length > 0 && <div className="command-menu" role="listbox" aria-label={t("commandCompletion")}>
         {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display ?? candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
+      </div>}
+      {state.composerAttachments.length > 0 && <div className="composer-attachments" aria-label={t("attachments")}>
+        {state.composerAttachments.map((attachment) => <FileCard
+          key={attachment.ref}
+          asset={attachment}
+          draft
+          onPreview={onPreviewAttachment ? async (mode) => onPreviewAttachment(attachment.ref, mode) : undefined}
+          onOpen={onOpenAttachment ? () => onOpenAttachment(attachment.ref) : undefined}
+          onReveal={onRevealAttachment ? () => onRevealAttachment(attachment.ref) : undefined}
+          onCopyPath={onCopyAttachmentPath ? () => onCopyAttachmentPath(attachment.ref, attachment.asset_ref) : undefined}
+          onRemove={() => onRemoveAttachment(attachment.ref)}
+          onOpenDocument={onOpenDocument}
+        />)}
       </div>}
       <div className="composer-input">
         <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={runtimeRestarting ? t("runtimeRestarting") : pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} aria-describedby={runtimeRestarting ? "composer-state" : undefined} />
@@ -311,20 +353,10 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
           <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && state.composerAttachments.length === 0))} />
         </div>
       </div>
-      {state.composerAttachments.length > 0 && <div className="composer-attachments" aria-label={t("attachments")}>
-        {state.composerAttachments.map((attachment) => <article className="composer-attachment" key={attachment.ref}>
-          {attachment.data_url && attachment.mime_type.startsWith("image/")
-            ? <img src={attachment.data_url} alt={attachment.display_name} />
-            : <span className="composer-attachment__fallback" aria-hidden="true">{attachment.mime_type.startsWith("image/") ? "IMG" : "FILE"}</span>}
-          <span className="composer-attachment__meta"><strong>{attachment.display_name}</strong><small>{attachmentSizeLabel(attachment.size_bytes)}</small></span>
-          <button type="button" title={t("attachmentRemove")} aria-label={`${t("attachmentRemove")}: ${attachment.display_name}`} onClick={() => void onRemoveAttachment(attachment.ref)} disabled={inputLocked || state.activeTurn}><UiIcon name="trash" /></button>
-        </article>)}
-      </div>}
       <div className="composer-toolbar">
         <div className="composer-selectors">
           <div className="composer-attachment-actions">
-            <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" />{t("attachmentChoose")}</button>
-            <button type="button" title={t("attachmentPaste")} aria-label={t("attachmentPaste")} onClick={() => void onPasteAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="copy" />{t("attachmentPaste")}</button>
+            <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" /></button>
           </div>
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>

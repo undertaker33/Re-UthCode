@@ -1,6 +1,8 @@
 import { useState, type ElementType, type ReactNode } from "react";
 import { useTranslation } from "./i18n";
 import type { ArtifactDescriptor } from "../desktop-api";
+import { FileCard, fileExtension, fileKind, type FilePreviewMode } from "./FileCard";
+import type { DocumentPreview } from "./DocumentPreviewPanel";
 
 export interface MarkdownRenderOptions {
   /** Narrow Desktop clipboard adapter; never read from window/electron here. */
@@ -14,8 +16,12 @@ export interface MarkdownRenderOptions {
   authorizeArtifactLabel?: string;
   /** Reveal a previously validated local artifact in the system shell. */
   onRevealArtifact?: (path: string) => Promise<void>;
-  /** Request a controlled image preview for a formal artifact DTO. */
-  onPreviewArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  /** Request a controlled preview for a formal artifact DTO. */
+  onPreviewArtifact?: (path: string, mode?: FilePreviewMode) => Promise<ArtifactDescriptor | null>;
+  /** Open a read-only code/Markdown canvas owned by the Desktop shell. */
+  onOpenDocument?: (preview: DocumentPreview) => void;
+  /** Copy a validated artifact path through Main. */
+  onCopyPath?: (path: string) => Promise<void>;
   artifacts?: Readonly<Record<string, ArtifactDescriptor>>;
 }
 
@@ -29,70 +35,201 @@ export function safeHref(value: string): string | null {
   return null;
 }
 
-export function ArtifactCard({ artifact, onOpen, onReveal, onPreview }: { artifact: ArtifactDescriptor; onOpen?: () => Promise<void>; onReveal?: () => Promise<void>; onPreview?: () => Promise<void> }) {
-  const { t } = useTranslation();
-  const [busy, setBusy] = useState(false);
-  const run = async (action?: () => Promise<void>) => {
-    if (!action || busy) return;
-    setBusy(true);
-    try { await action(); } finally { setBusy(false); }
+export function ArtifactCard({ artifact, onOpen, onReveal, onPreview, onOpenDocument, onCopyPath, onAuthorize }: { artifact: ArtifactDescriptor; onOpen?: () => Promise<void>; onReveal?: () => Promise<void>; onPreview?: (mode?: FilePreviewMode) => Promise<ArtifactDescriptor | null | void>; onOpenDocument?: (preview: DocumentPreview) => void; onCopyPath?: () => Promise<void>; onAuthorize?: () => Promise<void> }) {
+  return <FileCard
+    asset={artifact}
+    className="artifact-card"
+    dataAttributes={{ "data-artifact-path": artifact.path, "data-artifact-kind": artifact.kind }}
+    onPreview={artifact.preview_supported && onPreview ? async (mode) => onPreview(mode) : undefined}
+    onOpen={onOpen}
+    onReveal={onReveal}
+    onCopyPath={onCopyPath}
+    onAuthorize={onAuthorize}
+    onOpenDocument={onOpenDocument}
+  />;
+}
+
+function artifactPlaceholder(path: string, label: string): ArtifactDescriptor {
+  const name = path.split(/[\\/]/u).filter(Boolean).at(-1) || label || "artifact";
+  const extension = fileExtension({ name });
+  const kind = fileKind({ name, mime_type: "application/octet-stream" });
+  const previewSupported = kind === "image" || kind === "markdown" || kind === "code" || kind === "text";
+  const mimeType = kind === "image"
+    ? ({ avif: "image/avif", bmp: "image/bmp", gif: "image/gif", ico: "image/x-icon", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp" } as Record<string, string>)[extension] ?? "image/*"
+    : kind === "markdown" ? "text/markdown"
+      : kind === "code" || kind === "text" ? "text/plain"
+        : "application/octet-stream";
+  return {
+    path,
+    name,
+    kind,
+    mime_type: mimeType,
+    size_bytes: 0,
+    default_action: "open",
+    preview_supported: previewSupported,
   };
-  return <span className="artifact-card" data-artifact-kind={artifact.kind} data-artifact-path={artifact.path} role="group">
-    {artifact.data_url && artifact.kind === "image" ? <img src={artifact.data_url} alt={artifact.name} loading="lazy" /> : null}
-    <span className="artifact-card__meta"><strong>{artifact.name}</strong><small>{artifact.mime_type} · {artifact.size_bytes.toLocaleString()} B</small></span>
-    <span className="artifact-card__actions">
-      {artifact.preview_supported && onPreview && <button type="button" onClick={() => void run(onPreview)} disabled={busy}>{t("artifactPreview")}</button>}
-      {onOpen && artifact.kind !== "executable" && <button type="button" onClick={() => void run(onOpen)} disabled={busy}>{t("artifactOpen")}</button>}
-      {onReveal && <button type="button" onClick={() => void run(onReveal)} disabled={busy}>{t("artifactReveal")}</button>}
-    </span>
-  </span>;
+}
+
+function UnresolvedArtifactCard({
+  path,
+  label,
+  artifact,
+  options,
+}: {
+  path: string;
+  label: string;
+  artifact?: ArtifactDescriptor;
+  options: MarkdownRenderOptions;
+}) {
+  const [resolved, setResolved] = useState<ArtifactDescriptor | null>(artifact ?? null);
+  const resolve = async (): Promise<ArtifactDescriptor> => {
+    if (resolved) return resolved;
+    const described = await options.onDescribeArtifact?.(path);
+    if (!described) {
+      const error = new Error("Artifact descriptor is unavailable") as Error & { kind?: string };
+      error.kind = "artifact_unavailable";
+      throw error;
+    }
+    setResolved(described);
+    return described;
+  };
+  const asset = resolved ?? artifactPlaceholder(path, label);
+  const open = options.onOpenArtifact || options.onDescribeArtifact
+    ? async () => { const described = await resolve(); await options.onOpenArtifact?.(described.path); }
+    : undefined;
+  const reveal = options.onRevealArtifact
+    ? async () => { const described = await resolve(); await options.onRevealArtifact?.(described.path); }
+    : undefined;
+  const preview = options.onPreviewArtifact
+    ? async (mode?: FilePreviewMode) => {
+      const described = await resolve();
+      return await options.onPreviewArtifact?.(described.path, mode) ?? described;
+    }
+    : undefined;
+  const authorize = options.onAuthorizeArtifact
+    ? async () => {
+      const described = await options.onAuthorizeArtifact?.(path);
+      if (described) setResolved(described);
+    }
+    : undefined;
+  return <ArtifactCard
+    artifact={asset}
+    onOpen={open}
+    onReveal={reveal}
+    onPreview={preview}
+    onAuthorize={authorize}
+    onOpenDocument={options.onOpenDocument}
+    onCopyPath={options.onCopyPath ? async () => options.onCopyPath?.(path) : undefined}
+  />;
+}
+
+interface InlineToken {
+  start: number;
+  end: number;
+  kind: "link" | "code" | "strong" | "em";
+  label?: string;
+  target?: string;
+}
+
+function decodeMarkdownTarget(value: string): string {
+  const trimmed = value.trim();
+  const enclosed = trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1) : trimmed;
+  const unescaped = enclosed.replace(/\\([\\()\[\]])/gu, "$1");
+  try {
+    return decodeURIComponent(unescaped);
+  } catch {
+    return unescaped;
+  }
+}
+
+function parseMarkdownLink(source: string, labelStart: number, targetStart: number): InlineToken | null {
+  let index = targetStart;
+  let depth = 0;
+  let targetEnd = -1;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+    } else if (character === ")") {
+      if (depth === 0) {
+        targetEnd = index;
+        break;
+      }
+      depth -= 1;
+    }
+    index += 1;
+  }
+  if (targetEnd < 0) return null;
+  const labelEnd = source.indexOf("]", labelStart + 1);
+  if (labelEnd < 0 || source[labelEnd + 1] !== "(") return null;
+  return {
+    start: labelStart,
+    end: targetEnd + 1,
+    kind: "link",
+    label: source.slice(labelStart + 1, labelEnd),
+    target: decodeMarkdownTarget(source.slice(targetStart, targetEnd)),
+  };
+}
+
+function nextInlineToken(source: string, from: number): InlineToken | null {
+  for (let index = from; index < source.length; index += 1) {
+    if (source[index] === "[") {
+      const labelEnd = source.indexOf("]", index + 1);
+      if (labelEnd >= 0 && source[labelEnd + 1] === "(") {
+        const link = parseMarkdownLink(source, index, labelEnd + 2);
+        if (link) return link;
+      }
+    }
+    if (source[index] === "`") {
+      const end = source.indexOf("`", index + 1);
+      if (end >= 0) return { start: index, end: end + 1, kind: "code" };
+    }
+    if (source.startsWith("**", index)) {
+      const end = source.indexOf("**", index + 2);
+      if (end > index + 2) return { start: index, end: end + 2, kind: "strong" };
+    }
+    if (source[index] === "*" && source[index + 1] !== "*") {
+      const end = source.indexOf("*", index + 1);
+      if (end > index + 1) return { start: index, end: end + 1, kind: "em" };
+    }
+  }
+  return null;
 }
 
 export function renderInline(source: string, options: MarkdownRenderOptions = {}): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const pattern = /(\[[^\]]+\]\(([^)\s]+)\)|`[^`]*`|\*\*[^*]+\*\*|\*[^*]+\*)/gu;
   let last = 0;
   let index = 0;
-  for (const match of source.matchAll(pattern)) {
-    const token = match[0];
-    const start = match.index ?? 0;
-    if (start > last) nodes.push(source.slice(last, start));
-    if (token.startsWith("[") && match[2]) {
-      const label = token.slice(1, token.indexOf("]("));
-      const target = match[2];
-      if (target.startsWith("artifact:") && (options.onDescribeArtifact || options.onOpenArtifact)) {
+  while (last < source.length) {
+    const token = nextInlineToken(source, last);
+    if (!token) {
+      nodes.push(source.slice(last));
+      break;
+    }
+    if (token.start > last) nodes.push(source.slice(last, token.start));
+    if (token.kind === "link") {
+      const target = token.target ?? "";
+      if (target.startsWith("artifact:") && (options.onDescribeArtifact || options.onOpenArtifact || options.artifacts?.[target.slice("artifact:".length)])) {
         const path = target.slice("artifact:".length);
-        const artifact = options.artifacts?.[path];
-        if (artifact) {
-          nodes.push(<ArtifactCard
-            key={`artifact-card-${index}`}
-            artifact={artifact}
-            onOpen={options.onOpenArtifact ? async () => { await options.onOpenArtifact?.(path); } : undefined}
-            onReveal={options.onRevealArtifact ? async () => { await options.onRevealArtifact?.(path); } : undefined}
-            onPreview={options.onPreviewArtifact ? async () => { await options.onPreviewArtifact?.(path); } : undefined}
-          />);
-        } else {
-          const describe = options.onDescribeArtifact ?? options.onOpenArtifact;
-          nodes.push(<span key={`artifact-${index}`} className="artifact-link-group">
-            <button type="button" className="artifact-link" onClick={() => void describe?.(path)}>{label}</button>
-            {options.onAuthorizeArtifact && <button type="button" className="artifact-authorize" onClick={() => void options.onAuthorizeArtifact?.(path)}>{options.authorizeArtifactLabel ?? "Authorize external file"}</button>}
-          </span>);
-        }
+        nodes.push(<UnresolvedArtifactCard key={`artifact-card-${index}`} path={path} label={token.label ?? path} artifact={options.artifacts?.[path]} options={options} />);
       } else {
         const href = safeHref(target);
-        nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{label}</a> : <span key={`link-${index}`}>{label}</span>);
+        nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{token.label}</a> : <span key={`link-${index}`}>{token.label}</span>);
       }
-    } else if (token.startsWith("`") && token.endsWith("`")) {
-      nodes.push(<code key={`code-${index}`}>{token.slice(1, -1)}</code>);
-    } else if (token.startsWith("**")) {
-      nodes.push(<strong key={`strong-${index}`}>{token.slice(2, -2)}</strong>);
-    } else if (token.startsWith("*")) {
-      nodes.push(<em key={`em-${index}`}>{token.slice(1, -1)}</em>);
+    } else if (token.kind === "code") {
+      nodes.push(<code key={`code-${index}`}>{source.slice(token.start + 1, token.end - 1)}</code>);
+    } else if (token.kind === "strong") {
+      nodes.push(<strong key={`strong-${index}`}>{source.slice(token.start + 2, token.end - 2)}</strong>);
+    } else {
+      nodes.push(<em key={`em-${index}`}>{source.slice(token.start + 1, token.end - 1)}</em>);
     }
-    last = start + token.length;
+    last = token.end;
     index += 1;
   }
-  if (last < source.length) nodes.push(source.slice(last));
   return nodes;
 }
 
@@ -252,7 +389,12 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
       paragraph.push(next);
       index += 1;
     }
-    blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part, options)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
+    const artifactOnly = paragraph.length === 1 && /^\s*\[[^\]]+\]\(artifact:[^)\s]+\)\s*$/u.test(paragraph[0] ?? "");
+    if (artifactOnly) {
+      blocks.push(<div key={`paragraph-${blockIndex}`} className="markdown-artifact-block">{renderInline(paragraph[0] ?? "", options)}</div>);
+    } else {
+      blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part, options)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
+    }
     blockIndex += 1;
   }
   return blocks;

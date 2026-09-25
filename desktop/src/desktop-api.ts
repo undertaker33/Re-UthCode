@@ -73,14 +73,34 @@ export interface DesktopAttachmentInput {
 
 /** Renderer-safe projection of one Session-owned imported attachment. */
 export interface DesktopAttachmentDraft {
+  type?: string;
+  available?: true;
   ref: string;
+  asset_ref?: string;
   display_name: string;
   mime_type: string;
   size_bytes: number;
   width?: number | null;
   height?: number | null;
+  preview_kind?: "thumbnail" | "full" | "text" | string;
+  text?: string;
+  truncated?: boolean;
   data_url?: string;
 }
+
+/** A Session attachment whose metadata store entry or retained bytes are unavailable. */
+export interface TimelineUnavailableAttachment {
+  type?: string;
+  ref?: string;
+  asset_ref: string;
+  available: false;
+  error_code: "attachment_unavailable";
+  mime_type?: string;
+  width?: number;
+  height?: number;
+}
+
+export type TimelineAttachment = DesktopAttachmentDraft | TimelineUnavailableAttachment;
 
 /** Application validated artifact metadata; the Renderer never receives fs or shell handles. */
 export interface ArtifactDescriptor {
@@ -91,6 +111,9 @@ export interface ArtifactDescriptor {
   size_bytes: number;
   default_action: "open" | "reveal" | string;
   preview_supported: boolean;
+  preview_kind?: "thumbnail" | "full" | "text" | string;
+  text?: string;
+  truncated?: boolean;
   data_url?: string;
 }
 
@@ -120,6 +143,9 @@ export const RUNTIME_METHODS = [
   "history.page",
   "attachment.import",
   "attachment.preview",
+  "attachment.open",
+  "attachment.reveal",
+  "attachment.copy_path",
   "attachment.remove",
   "artifact.describe",
   "artifact.preview",
@@ -163,6 +189,8 @@ export interface DesktopApi {
   closeShell(): Promise<void>;
   requestRuntime(method: RuntimeMethod, params: JsonObject): Promise<JsonValue>;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;
+  /** Report a fixed renderer boundary code without exposing error details. */
+  reportRendererDiagnostic?(boundary: string): Promise<void>;
   readPreference<K extends PreferenceKey>(key: K): Promise<DesktopPreferences[K]>;
   writePreference<K extends PreferenceKey>(
     key: K,

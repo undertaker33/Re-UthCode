@@ -1,9 +1,11 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
 import type { ProcessLogEntry, ProcessReaderState, TimelineEntry, TodoItem } from "./state";
-import type { ArtifactDescriptor } from "../desktop-api";
+import type { ArtifactDescriptor, DesktopAttachmentDraft, TimelineAttachment, TimelineUnavailableAttachment } from "../desktop-api";
 import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon, type UiIconName } from "./UiIcon";
 import { renderMarkdown } from "./safe-markdown";
+import { FileCard, type FilePreviewMode } from "./FileCard";
+import type { DocumentPreview } from "./DocumentPreviewPanel";
 
 /** Pixels from the end that still count as being at the bottom. */
 export const TIMELINE_NEAR_BOTTOM_THRESHOLD = 72;
@@ -38,7 +40,13 @@ export interface ChatTimelineProps {
   onDescribeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
   onAuthorizeArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
   onRevealArtifact?: (path: string) => Promise<void>;
-  onPreviewArtifact?: (path: string) => Promise<ArtifactDescriptor | null>;
+  onPreviewArtifact?: (path: string, mode?: FilePreviewMode) => Promise<ArtifactDescriptor | null>;
+  onCopyPath?: (path: string) => Promise<void>;
+  onOpenDocument?: (preview: DocumentPreview) => void;
+  onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>;
+  onOpenAttachment?: (ref: string) => Promise<void>;
+  onRevealAttachment?: (ref: string) => Promise<void>;
+  onCopyAttachmentPath?: (ref: string, assetRef?: string) => Promise<void>;
   /** Changes only when a Session/Project view is replaced, not on streaming. */
   sessionKey?: string;
   /** Request an older durable page when the reader reaches the top. */
@@ -102,15 +110,32 @@ function todoStatusLabel(status: TodoItem["status"], t: (key: TranslationKey) =>
   return status === "completed" ? t("completed") : status === "in_progress" ? t("inProgress") : t("pending");
 }
 
-function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => string) {
+function isUnavailableAttachment(attachment: TimelineAttachment): attachment is TimelineUnavailableAttachment {
+  return "available" in attachment && attachment.available === false;
+}
+
+function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => string, previews: Readonly<Record<string, DesktopAttachmentDraft>>, onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>, onOpenAttachment?: (ref: string) => Promise<void>, onRevealAttachment?: (ref: string) => Promise<void>, onCopyAttachmentPath?: (ref: string, assetRef?: string) => Promise<void>) {
   if (!entry.attachments || entry.attachments.length === 0) return null;
   return <div className="timeline-attachments" aria-label={t("attachments")}>
-    {entry.attachments.map((attachment) => <div className="timeline-attachment" key={`${entry.id}:${attachment.ref}`}>
-      {attachment.data_url && attachment.mime_type.startsWith("image/")
-        ? <img src={attachment.data_url} alt={attachment.display_name} loading="lazy" />
-        : <span className="timeline-attachment__fallback" aria-hidden="true">{attachment.mime_type.startsWith("image/") ? "IMG" : "FILE"}</span>}
-      <span><strong>{attachment.display_name}</strong><small>{attachment.size_bytes.toLocaleString()} B</small></span>
-    </div>)}
+    {entry.attachments.map((attachment, index) => {
+      const identity = attachment.ref ?? attachment.asset_ref ?? `${entry.id}:${index}`;
+      if (isUnavailableAttachment(attachment)) {
+        return <div className="timeline-attachment timeline-attachment--unavailable" key={`${entry.id}:${identity}`} role="note" aria-label={t("attachmentUnavailable")} data-attachment-unavailable="true">
+          <UiIcon name="warning" />
+          <span><strong>{t("attachmentUnavailable")}</strong><small>{attachment.mime_type || t("unavailable")}</small></span>
+        </div>;
+      }
+      const hydrated = { ...attachment, ...(previews[attachment.ref] ?? {}) };
+      return <div className="timeline-attachment" key={`${entry.id}:${attachment.ref}`}>
+        <FileCard
+          asset={hydrated}
+          onPreview={onPreviewAttachment ? async (mode) => onPreviewAttachment(attachment.ref, mode) : undefined}
+          onOpen={onOpenAttachment ? async () => onOpenAttachment(attachment.ref) : undefined}
+          onReveal={onRevealAttachment ? async () => onRevealAttachment(attachment.ref) : undefined}
+          onCopyPath={onCopyAttachmentPath ? async () => onCopyAttachmentPath(attachment.ref, hydrated.asset_ref) : undefined}
+        />
+      </div>;
+    })}
   </div>;
 }
 
@@ -123,22 +148,101 @@ function timelineContentFingerprint(entries: TimelineEntry[], notice: string | n
   });
 }
 
-export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
+function attachmentPreviewFingerprint(entries: TimelineEntry[]): string {
+  return entries
+    .flatMap((entry) => entry.attachments ?? [])
+    .filter((attachment): attachment is DesktopAttachmentDraft => !isUnavailableAttachment(attachment) && attachment.mime_type.startsWith("image/") && !attachment.data_url)
+    .map((attachment) => `${attachment.ref}:${attachment.mime_type}`)
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .join("|");
+}
+
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, onCopyPath, onOpenDocument, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
   const [artifacts, setArtifacts] = useState<Record<string, ArtifactDescriptor>>({});
+  const [attachmentPreviews, setAttachmentPreviews] = useState<Record<string, DesktopAttachmentDraft>>({});
   const timelineRef = useRef<HTMLElement>(null);
   const followTail = useRef(true);
   const previousSessionKey = useRef<string | null>(null);
   const previousContentFingerprint = useRef<string | null>(null);
   const previousHistoryRevision = useRef(historyRevision);
   const prependAnchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const attachmentPreviewOwner = useRef(sessionKey);
+  const requestedAttachmentPreviews = useRef(new Set<string>());
+  const hydratedAttachmentPreviews = useRef(new Set<string>());
   const contentFingerprint = timelineContentFingerprint(entries, JSON.stringify([notice, compactionNotice]), runtimeError, runtimeErrorVisible);
+  const attachmentCandidatesKey = attachmentPreviewFingerprint(entries);
 
   useEffect(() => {
+    attachmentPreviewOwner.current = sessionKey;
+    requestedAttachmentPreviews.current.clear();
+    hydratedAttachmentPreviews.current.clear();
     setArtifacts({});
+    setAttachmentPreviews({});
   }, [sessionKey]);
+
+  // History pages carry attachment metadata first. Hydrate only cards entering
+  // the visible timeline viewport and guard every response by this Session
+  // view so a late preview cannot paint into a newly selected Session.
+  useEffect(() => {
+    if (!onPreviewAttachment || !attachmentCandidatesKey) return undefined;
+    let cancelled = false;
+    const ownerSessionKey = sessionKey;
+    const pending = new Set<string>();
+    const candidates = new Map<string, DesktopAttachmentDraft>();
+    for (const entry of entries) {
+      for (const attachment of entry.attachments ?? []) {
+        if (!isUnavailableAttachment(attachment) && attachment.mime_type.startsWith("image/") && !attachment.data_url && !candidates.has(attachment.ref)) candidates.set(attachment.ref, attachment);
+      }
+    }
+    const load = (attachment: DesktopAttachmentDraft) => {
+      if (cancelled || requestedAttachmentPreviews.current.has(attachment.ref) || hydratedAttachmentPreviews.current.has(attachment.ref)) return;
+      requestedAttachmentPreviews.current.add(attachment.ref);
+      pending.add(attachment.ref);
+      void onPreviewAttachment(attachment.ref, "thumbnail").then((preview) => {
+        pending.delete(attachment.ref);
+        if (!cancelled && attachmentPreviewOwner.current === ownerSessionKey && preview) {
+          hydratedAttachmentPreviews.current.add(attachment.ref);
+          setAttachmentPreviews((current) => current[attachment.ref] ? current : { ...current, [attachment.ref]: { ...attachment, ...preview } });
+        } else if (!preview) {
+          requestedAttachmentPreviews.current.delete(attachment.ref);
+        }
+      }).catch(() => {
+        // A missing or expired thumbnail leaves the file fallback and can be
+        // retried if the card becomes visible again.
+        pending.delete(attachment.ref);
+        requestedAttachmentPreviews.current.delete(attachment.ref);
+      });
+    };
+    const observer = typeof IntersectionObserver === "undefined"
+      ? null
+      : new IntersectionObserver((observations) => {
+        for (const observation of observations) {
+          if (!observation.isIntersecting) continue;
+          const ref = (observation.target as HTMLElement).dataset.fileRef;
+          const attachment = ref ? candidates.get(ref) : undefined;
+          if (attachment) load(attachment);
+        }
+      }, { root: timelineRef.current, rootMargin: "160px" });
+    if (observer) {
+      for (const card of Array.from(timelineRef.current?.querySelectorAll<HTMLElement>(".file-card[data-file-ref]") ?? [])) {
+        const attachment = candidates.get(card.dataset.fileRef ?? "");
+        if (attachment) observer.observe(card);
+      }
+    } else {
+      // Embedded/test shells without IntersectionObserver have no visibility
+      // signal. Load every candidate rather than silently starving later
+      // history cards behind an arbitrary prefix limit.
+      for (const attachment of candidates.values()) load(attachment);
+    }
+    return () => {
+      cancelled = true;
+      for (const ref of pending) requestedAttachmentPreviews.current.delete(ref);
+      observer?.disconnect();
+    };
+  }, [attachmentCandidatesKey, onPreviewAttachment, sessionKey]);
 
   const describeArtifact = async (path: string): Promise<ArtifactDescriptor | null> => {
     const cached = artifacts[path];
@@ -154,8 +258,8 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
     return descriptor ?? null;
   };
 
-  const previewArtifact = async (path: string): Promise<ArtifactDescriptor | null> => {
-    const descriptor = await onPreviewArtifact?.(path);
+  const previewArtifact = async (path: string, mode?: FilePreviewMode): Promise<ArtifactDescriptor | null> => {
+    const descriptor = await onPreviewArtifact?.(path, mode);
     if (descriptor) setArtifacts((current) => ({ ...current, [path]: { ...current[path], ...descriptor } }));
     return descriptor ?? null;
   };
@@ -212,8 +316,22 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
   useEffect(() => {
     const element = timelineRef.current;
     if (!element) return undefined;
+    let frame = 0;
+    const schedule = (callback: FrameRequestCallback) => {
+      if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(callback);
+      // Test shells and older embedded documents may not expose rAF. There is
+      // no ResizeObserver delivery cycle there, so an immediate fallback keeps
+      // the existing scroll contract without queuing an unbounded timer.
+      callback(Date.now());
+      return 0;
+    };
+    const cancel = (handle: number) => typeof window.cancelAnimationFrame === "function" ? window.cancelAnimationFrame(handle) : window.clearTimeout(handle);
     const syncTail = () => {
-      if (followTail.current) scrollTimelineToBottom(element);
+      if (frame) return;
+      frame = schedule(() => {
+        frame = 0;
+        if (followTail.current) scrollTimelineToBottom(element);
+      });
     };
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncTail);
     observer?.observe(element);
@@ -222,6 +340,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
     window.addEventListener("resize", syncTail);
     return () => {
       observer?.disconnect();
+      if (frame) cancel(frame);
       window.removeEventListener("resize", syncTail);
     };
   }, []);
@@ -315,7 +434,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
         const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
         return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
           <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small className="tool-status" data-status={status} data-error={entry.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null && <span className="tool-elapsed" aria-label={`${elapsed}s`}> · {elapsed}s</span>}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
-          <div className="timeline-content">{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, artifacts })}{renderAttachmentRows(entry, t)}</div>
+          <div className="timeline-content">{entry.kind === "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{entry.kind !== "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
       {todo.length > 0 && <section className="todo-strip" tabIndex={0} aria-label={t("tasks")}><header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status} title={item.content} aria-label={`${item.content}: ${todoStatusLabel(item.status, t)}`}><span className="todo-status-icon" aria-hidden="true"><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span><span>{item.content}</span><span className="sr-only">{todoStatusLabel(item.status, t)}</span></li>)}</ul></section>}

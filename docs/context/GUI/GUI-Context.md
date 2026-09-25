@@ -75,7 +75,14 @@ visible Session A 有 active Turn
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
 | Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits、工具 timeout/output/attachment limits 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference，active Turn 时禁止保存 | Configuration Application boundary + Renderer preference |
-| Artifacts | 授权文件的描述、图片受控预览、系统打开或 Explorer 定位；外部文件需用户通过 Main picker 明确授权；缺失/不支持的局部反馈 | Application `ArtifactService` + Desktop Bridge/Main + Renderer ArtifactCard |
+| Artifacts | 授权文件的描述、图片受控预览、系统打开或 Explorer 定位；外部文件需用户通过 Main picker 明确授权；缺失/不支持的局部反馈 | Application `ArtifactService` + Desktop Bridge/Main + Renderer FileCard |
+
+## 附件与产物预览职责
+
+Session 附件由 Application `AttachmentService` 按 Session/ref 定位，产物由 `ArtifactService` 维持既有工作目录及外部单路径授权检查。预览通过 Bridge DTO 传入 Renderer，缩略图与按需大图分开请求；文本预览有界并携带截断状态。Renderer 不读取文件系统，也不直接调用 shell。系统打开和定位由 Main 消费受信描述后执行；模型写出普通路径不构成打开授权。
+
+`FileCard.tsx` 承担附件和产物的类型展示、菜单与图片模态交互；图片缩略图使用紧凑等比展示，不渲染名称、类型、大小等可见元数据，保留可访问名称。未发送附件有直接移除入口，已发送附件没有移除操作。Composer 以纯加号提供文件选择，文本右键菜单仅提供剪切、复制、粘贴、全选，与附件卡片菜单分离；`DocumentPreviewPanel.tsx` 承担只读文本、Markdown 渲染/源码和 Prism 语法高亮。图片模态独立于聊天排版，文本面板与 Runtime 共用右侧空间。文件预览状态属于 Interface，不进入 Agent RunState 或 Provider 请求。当前修复的最终界面和构建验收状态以 T11 原 W06 Feedback 为准，不将新增组件存在视为验收完成。
+局部渲染错误由 `RendererErrorBoundary` 隔离并提供恢复入口，错误事实通过 preload/Main 的允许边界名称进入既有 `runtime_diagnostic`，不把异常原文或 stack 传入界面诊断。附件卡片操作失败返回对应文件卡片提示；发送能力拦截在 Composer 附近说明原因并保留草稿。历史附件以消息 identity 组合展示，缩略图按可见范围请求，Session 切换后拒绝迟到结果。
 
 ## 修改路由
 

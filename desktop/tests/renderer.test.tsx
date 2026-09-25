@@ -1464,22 +1464,42 @@ test("App pages history independently across quick A→B→A navigation and dedu
     let eventListener: ((event: AgentEvent) => void) | null = null;
     let visibleSessionId = "session-a";
     const pendingHistory: Array<{ sessionId: string; resolve: (value: JsonObject) => void }> = [];
-    const historyResult = (sessionId: string, text: string): JsonObject => ({
-      session_id: sessionId,
-      records: [
-        { record_id: `${sessionId}:1:user:0`, session_id: sessionId, sequence: 1, turn_id: `turn-${sessionId.slice(-1)}`, kind: "user", text: `${text} prompt`, is_error: false },
-        { record_id: `${sessionId}:2:assistant:0`, session_id: sessionId, sequence: 2, turn_id: `turn-${sessionId.slice(-1)}`, kind: "assistant", message_id: `${sessionId}-live`, text: `${text} durable final`, is_error: false },
-      ],
-      next_cursor: null,
-      has_more: false,
-      unit_count: 1,
-    });
+    const previewCalls: Array<{ ref: string; mode: string }> = [];
+    const historyResult = (sessionId: string, text: string): JsonObject => {
+      const turnId = `turn-${sessionId.slice(-1)}`;
+      const messageId = `${sessionId}-user-message`;
+      const imageRef = `${sessionId}-image-ref`;
+      return {
+        session_id: sessionId,
+        records: [
+          { record_id: `${sessionId}:1:user:0`, session_id: sessionId, sequence: 1, turn_id: turnId, message_id: messageId, kind: "user", text: `${text} prompt`, attachments: [], is_error: false },
+          {
+            record_id: `${sessionId}:2:user:1`, session_id: sessionId, sequence: 2, turn_id: turnId, message_id: messageId, kind: "user", text: "", is_error: false,
+            attachments: [{ type: "image", ref: imageRef, asset_ref: `attachment:${sessionId}:${imageRef}`, display_name: "direct.png", mime_type: "image/png", size_bytes: 8, width: 2, height: 2, available: true }],
+          },
+          {
+            record_id: `${sessionId}:3:user:2`, session_id: sessionId, sequence: 3, turn_id: turnId, message_id: messageId, kind: "user", text: "", is_error: false,
+            attachments: [{ type: "file", asset_ref: `attachment:${sessionId}:missing-ref`, available: false, error_code: "attachment_unavailable", mime_type: "application/octet-stream" }],
+          },
+          { record_id: `${sessionId}:4:assistant:0`, session_id: sessionId, sequence: 4, turn_id: turnId, message_id: `${sessionId}-live`, kind: "assistant", text: `${text} durable final`, is_error: false },
+        ],
+        next_cursor: null,
+        has_more: false,
+        unit_count: 1,
+      };
+    };
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
       copyText: async () => undefined,
       closeShell: async () => undefined,
       requestRuntime: async (method, params) => {
+        if (method === "attachment.preview") {
+          const ref = typeof params.ref === "string" ? params.ref : "";
+          const mode = typeof params.mode === "string" ? params.mode : "";
+          previewCalls.push({ ref, mode });
+          return { attachment: { ref, display_name: "direct.png", mime_type: "image/png", size_bytes: 8, width: 2, height: 2, data_url: "data:image/png;base64,AAAA" } };
+        }
         if (method === "history.page") {
           return await new Promise<JsonObject>((resolve) => {
             pendingHistory.push({ sessionId: typeof params.session_id === "string" ? params.session_id : "", resolve });
@@ -1548,6 +1568,16 @@ test("App pages history independently across quick A→B→A navigation and dedu
     assert.match(timelineText, /A durable final/u);
     assert.doesNotMatch(timelineText, /B durable final/u);
     assert.equal(container.querySelectorAll(".timeline-entry--assistant").length, 1, "live and durable A assistant output share one row");
+    const userEntry = Array.from(container.querySelectorAll<HTMLElement>(".timeline-entry--user")).find((entry) => entry.textContent?.includes("A prompt"));
+    assert.ok(userEntry, "the multipart historical user message remains visible");
+    const imageCard = userEntry!.querySelector<HTMLElement>('.file-card[data-file-ref="session-a-image-ref"]');
+    assert.ok(imageCard, "the formal history image DTO survives normalization and both replay merges");
+    assert.equal(userEntry!.querySelectorAll('[data-attachment-unavailable="true"]').length, 1, "missing attachment bytes produce a visible unavailable card");
+    act(() => { imageCard!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    await flush();
+    assert.ok(previewCalls.some(({ ref }) => ref === "session-a-image-ref"), "preview receives the opaque AttachmentReference.ref");
+    assert.ok(previewCalls.every(({ ref }) => ref !== "missing-ref"), "unavailable attachments are never sent to preview");
+    assert.ok(userEntry!.querySelector('[role="dialog"] img[src^="data:image/png"]'), "the renderer applies the real attachment.preview response");
   });
 });
 
@@ -4151,7 +4181,10 @@ test("Prompt 4 timeline follows the tail only while near the bottom and re-arms 
 
       // The Composer's actual measured height is written to its parent and a
       // content-box change then drives the timeline observer.
-      act(() => { composerObserver()?.trigger(); });
+      await act(async () => {
+        composerObserver()?.trigger();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
       assert.equal(main?.style.getPropertyValue("--composer-height"), "120px");
       scrollHeight = 1240;
       act(() => { timelineObserver()?.trigger(); });
@@ -4173,7 +4206,10 @@ test("Prompt 4 timeline follows the tail only while near the bottom and re-arms 
       scrollTop = scrollHeight - clientHeight;
       act(() => { timeline?.dispatchEvent(new dom.window.Event("scroll", { bubbles: true })); });
       composerHeight = 168;
-      act(() => { composerObserver()?.trigger(); });
+      await act(async () => {
+        composerObserver()?.trigger();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
       assert.equal(main?.style.getPropertyValue("--composer-height"), "168px");
       scrollHeight = 1710;
       act(() => { timelineObserver()?.trigger(); });

@@ -1,4 +1,4 @@
-import type { DesktopAttachmentDraft, JsonValue } from "../desktop-api";
+import type { JsonValue, TimelineAttachment, TimelineUnavailableAttachment } from "../desktop-api";
 import type {
   CompactionState,
   CompactionStatusProjection,
@@ -179,6 +179,17 @@ export function sessionRuntimeFromSource(
     : pending
     ? "paused"
     : runStatus === "paused" ? "paused" : runStatus === "pausing" ? "pausing" : activeTurn ? "running" : fallback?.turnStatus ?? "idle";
+  const runPermission = permissionModeOf(run);
+  // A partial status projection may omit permission_mode, but only the same
+  // live Run may inherit the previous projection. New or unidentified Runs
+  // remain unknown until the Application publishes an authoritative value.
+  const currentRunId = runIdOf(run);
+  const fallbackRunId = runIdOf(fallback?.run);
+  const permissionMode = runPermission !== "unknown"
+    ? runPermission
+    : currentRunId && fallbackRunId === currentRunId
+      ? fallback?.permissionMode ?? "unknown"
+      : "unknown";
   return {
     timeline: fallback?.timeline?.length ? fallback.timeline : replay,
     todo,
@@ -191,7 +202,7 @@ export function sessionRuntimeFromSource(
         ? { lastProviderRequestUsage: fallback.lastProviderRequestUsage }
         : {}),
     compactionStatus: compactionValue !== undefined ? normalizeCompactionStatus(compactionValue, fallback?.compactionStatus) : fallback?.compactionStatus ?? { state: "idle", trigger: null, changed: null },
-    permissionMode: permissionModeOf(run),
+    permissionMode,
     activeTurn,
     terminalStatusPending: activeValue === false ? false : fallback?.terminalStatusPending ?? false,
     turnStatus,
@@ -245,9 +256,37 @@ export function messageReasoning(value: unknown): string {
     .join("");
 }
 
-function normalizeAttachment(value: unknown): DesktopAttachmentDraft | null {
+function isUnavailableAttachment(attachment: TimelineAttachment): attachment is TimelineUnavailableAttachment {
+  return "available" in attachment && attachment.available === false;
+}
+
+function attachmentIdentity(attachment: TimelineAttachment): string | null {
+  return attachment.asset_ref ?? attachment.ref ?? null;
+}
+
+function normalizeAttachment(value: unknown): TimelineAttachment | null {
   const source = asRecord(value);
+  if (source?.available === false) {
+    const assetRef = nonEmptyText(source.asset_ref);
+    if (!assetRef || source.error_code !== "attachment_unavailable") return null;
+    const type = nonEmptyText(source.type);
+    const ref = nonEmptyText(source.ref);
+    const mimeType = nonEmptyText(source.mime_type);
+    const width = typeof source.width === "number" && Number.isSafeInteger(source.width) && source.width > 0 ? source.width : null;
+    const height = typeof source.height === "number" && Number.isSafeInteger(source.height) && source.height > 0 ? source.height : null;
+    return {
+      ...(type ? { type } : {}),
+      ...(ref ? { ref } : {}),
+      asset_ref: assetRef,
+      available: false,
+      error_code: "attachment_unavailable",
+      ...(mimeType ? { mime_type: mimeType } : {}),
+      ...(width !== null ? { width } : {}),
+      ...(height !== null ? { height } : {}),
+    };
+  }
   const ref = nonEmptyText(source?.ref);
+  const type = nonEmptyText(source?.type);
   const displayName = nonEmptyText(source?.display_name) ?? nonEmptyText(source?.name);
   const mimeType = nonEmptyText(source?.mime_type);
   const size = typeof source?.size_bytes === "number" && Number.isSafeInteger(source.size_bytes) && source.size_bytes >= 0
@@ -257,24 +296,85 @@ function normalizeAttachment(value: unknown): DesktopAttachmentDraft | null {
   const width = typeof source?.width === "number" && Number.isSafeInteger(source.width) && source.width > 0 ? source.width : null;
   const height = typeof source?.height === "number" && Number.isSafeInteger(source.height) && source.height > 0 ? source.height : null;
   const dataUrl = typeof source?.data_url === "string" && /^data:[^,]+,/.test(source.data_url) ? source.data_url : undefined;
+  const assetRef = nonEmptyText(source?.asset_ref);
+  const previewKind = nonEmptyText(source?.preview_kind);
+  const previewText = typeof source?.text === "string" ? source.text : undefined;
   return {
+    ...(type ? { type } : {}),
+    ...(source?.available === true ? { available: true as const } : {}),
     ref,
+    ...(assetRef ? { asset_ref: assetRef } : {}),
     display_name: displayName,
     mime_type: mimeType,
     size_bytes: size,
     ...(width !== null ? { width } : {}),
     ...(height !== null ? { height } : {}),
+    ...(previewKind ? { preview_kind: previewKind } : {}),
+    ...(previewText !== undefined ? { text: previewText } : {}),
+    ...(source?.truncated === true ? { truncated: true } : {}),
     ...(dataUrl ? { data_url: dataUrl } : {}),
   };
 }
 
-export function normalizeAttachments(value: unknown): DesktopAttachmentDraft[] {
+export function normalizeAttachments(value: unknown): TimelineAttachment[] {
   if (!Array.isArray(value)) return [];
-  return value.map(normalizeAttachment).filter((item): item is DesktopAttachmentDraft => item !== null);
+  return value.map(normalizeAttachment).filter((item): item is TimelineAttachment => item !== null);
+}
+
+function mergeAttachmentLists(left: readonly TimelineAttachment[] | undefined, right: readonly TimelineAttachment[] | undefined): TimelineAttachment[] {
+  const result: TimelineAttachment[] = [];
+  const seen = new Map<string, number>();
+  for (const attachment of [...(left ?? []), ...(right ?? [])]) {
+    const identity = attachmentIdentity(attachment);
+    if (!identity) continue;
+    const existingIndex = seen.get(identity);
+    if (existingIndex !== undefined) {
+      if (isUnavailableAttachment(result[existingIndex]!) && !isUnavailableAttachment(attachment)) result[existingIndex] = { ...attachment };
+      continue;
+    }
+    seen.set(identity, result.length);
+    result.push({ ...attachment });
+  }
+  return result;
+}
+
+function mergeReplayText(left: string, right: string): string {
+  if (!left) return right;
+  if (!right || left === right) return left;
+  // A live/durable boundary may expose a complete text value after its
+  // prefix. Avoid duplicating that prefix while still retaining distinct
+  // text parts from one Message.
+  if (right.startsWith(left)) return right;
+  if (left.startsWith(right)) return left;
+  return left + right;
+}
+
+function mergeUserMessageParts(entries: TimelineEntry[]): TimelineEntry[] {
+  const merged: TimelineEntry[] = [];
+  for (const entry of entries) {
+    const previous = merged.at(-1);
+    if (previous
+      && previous.kind === "user"
+      && entry.kind === "user"
+      && previous.turnId
+      && previous.turnId === entry.turnId
+      && previous.messageId
+      && previous.messageId === entry.messageId) {
+      const attachments = mergeAttachmentLists(previous.attachments, entry.attachments);
+      merged[merged.length - 1] = {
+        ...previous,
+        text: mergeReplayText(previous.text, entry.text),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      };
+      continue;
+    }
+    merged.push({ ...entry, ...(entry.attachments ? { attachments: mergeAttachmentLists(entry.attachments, undefined) } : {}) });
+  }
+  return merged;
 }
 
 export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
-  return records
+  const timeline: TimelineEntry[] = records
     .map((value, index) => ({ value: asRecord(value), index }))
     .filter(({ value }) => value !== null)
     .sort((left, right) => {
@@ -323,6 +423,7 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
         sequence,
       };
     });
+  return mergeUserMessageParts(timeline);
 }
 
 /** Normalize a complete Desktop command response for reducer branches. */

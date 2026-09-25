@@ -83,6 +83,11 @@ export function installPreload(
         ipcRenderer.removeListener("desktop.runtime.event", wrapped);
       };
     },
+    async reportRendererDiagnostic(boundary: string): Promise<void> {
+      requireNonEmptyString(boundary, "renderer boundary");
+      if (boundary.length > 64) throw new TypeError("renderer boundary is invalid");
+      await ipcRenderer.invoke("desktop.renderer.diagnostic", boundary);
+    },
     async readPreference<K extends PreferenceKey>(key: K): Promise<DesktopPreferences[K]> {
       requirePreferenceKey(key);
       const value = await ipcRenderer.invoke("desktop.preference.read", key);

@@ -392,7 +392,10 @@ export function applySessionResumed(
     sessionViewRevision: stateWithCache.sessionViewRevision + 1,
     runtimeError: null,
     runtimeState: preserveRuntimeState ? stateWithCache.runtimeState : "ready",
-    notice: "Session resumed",
+    // Resuming a Session is navigation, not a user-facing success result.
+    // Keep durable failures and actionable local errors visible without
+    // leaving a stale success banner in the Composer after every resume.
+    notice: null,
     ...(restoredRuntime ? { sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: restoredRuntime } } : {}),
     ...(projectKey ? { projects: stateWithCache.projects.map((project) => project.projectKey === projectKey ? { ...project, sessions: project.sessions.map((session) => session.session_id === sessionId ? { ...session } : session) } : project) } : {}),
   };

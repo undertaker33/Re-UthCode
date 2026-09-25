@@ -130,3 +130,167 @@ Terra 复审唯一 P1 指出 `read_content + content_digest` 每次都无条件�
 ## 总控审核收口（2026-09-14）
 
 Luna（max）完成 W05 实施及两轮返工，Terra（high）第三轮审核 PASS。Process 实际有界等待、有效进展与重复读取的区别、Settings configured/effective/source、Main picker 外部产物授权四项问题均闭环。最终 Reviewer T14 正反例 8 passed、88 deselected；前轮 Process read 4 passed、Settings/config 2 passed、Desktop typecheck 与 Main/preload/Chat/Settings 5 项、Artifact/架构 27 passed 的证据有效。未把带 -k 的命令中被 deselect 的文件测试计作通过。Worker 首轮核心 108、配置相关 347、Desktop 定向 127 是分阶段结果，后续按具体修复运行受影响测试，没有宣称最终全量重跑。人工产物 A24、真实 Provider/Tavily、POSIX、packaged 与 T19 仍待验收；整包不标记完成、不归档。
+
+## T16 服务边界补充（2026-09-21）
+
+本轮只补 Python Application/Integration 与相关测试，并与 UI worker 对齐已有 IPC 形状；未修改 Desktop。artifact.preview 的 mode 继续由 Bridge 校验后转发到 Application，Office/PDF 保持系统打开路径，Markdown/code/plaintext 使用有界只读文本 DTO，图片使用有界 thumbnail/full DTO。
+
+Session attachment 的 open/reveal 仍由 ref 唯一寻址，服务端生成带正确扩展名的派生文件并返回正式 Main DTO；Renderer 不获得任意路径或 shell 权限。文本 preview 共用 Integration 有界读取实现，图片在 Pillow 解码边界校验尺寸/像素，派生缓存受 quota 和正常 Session cleanup 管理。
+
+Python 定向组合回归为 150 passed in 14.98s，另覆盖模型历史图片切换的 image_input_unsupported 业务码和模型可见 artifact: 链接格式提示。真实 packaged/native Main 操作仍未由本轮 Python worker 验证，交总控按 A24/A10 条件验收；本轮无 Git 写操作。
+
+
+## Desktop 收尾补充（2026-09-23）
+
+本轮继续在 W05 T16 的 Desktop 范围内收口；原始需求、Spec、Tasks、Prompt 和 Checklist 文字未改动，未修改 Python、根文档或其他 Worker 的记录。
+
+### 实际改动
+
+- Markdown/code 只读画布现在作为主窗口 Grid 的右侧列，占用被预览时 Runtime 原有的空间。聊天与 Composer 随画布打开、拖宽和关闭重新排版；docked、floating、hidden 与 Focus Mode 均使用明确的 Grid 列。屏幕宽度不超过 620 CSS px 时暂时隐藏 Sidebar，为聊天和画布保留空间，关闭画布后恢复。
+- 预览期间卸载 RuntimePanel 视图但保留 Application/Renderer 的 `panelMode` 状态；关闭画布后 Runtime 按原布局重新显示。画布宽度受当前视口、侧栏宽度与 240 px 会话最小宽度约束，窄屏可继续缩小到 220 px。
+- 将 App 的受控 `state.notice` 接入聊天时间线，使 Settings 保存、附件等局部操作的安全错误提示和 `/status` 命令结果实际可见；错误仍经既有本地化安全投影，不输出原生异常内容。
+- 增加历史图片预览回归：历史页增加新图片导致 IntersectionObserver effect 清理时，同一仍未完成附件请求可重新发起，旧请求迟到结果不会覆盖当前预览。当前实现的 effect cleanup 会释放 pending ref，本轮回归验证了该行为。
+- 更新 App 画布开关测试，覆盖 Grid 状态、运行时面板释放以及关闭后的布局恢复；调整 ResizeObserver 回归等待其生产实现的 setTimeout fallback 完成，并按辅助标签验证 `/status` 消息。
+
+### 修改文件
+
+- `desktop/src/renderer/App.tsx`
+- `desktop/src/renderer/DocumentPreviewPanel.tsx`
+- `desktop/src/renderer/app.css`
+- `desktop/tests/renderer-attachments.test.tsx`
+- `desktop/tests/renderer-chat.test.tsx`
+- `desktop/tests/renderer.test.tsx`
+- 本 W05 Feedback
+
+### 验证结果
+
+- `npm run typecheck`（工作目录 `desktop/`）：通过。
+- `npm test`（工作目录 `desktop/`，环境变量 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`）：`252 passed, 0 failed, 0 skipped`。离线 Desktop Runtime 集成测试使用既有 `re-uthcode` Conda 环境通过。
+- `npx tsx --test --test-name-pattern "App preserves imported Markdown preview" tests/renderer-attachments.test.tsx`：`1 passed`。
+- `npx tsx --test --test-name-pattern "ChatTimeline retries an in-flight" tests/renderer-chat.test.tsx`：`1 passed`。
+- `npx tsx --test --test-name-pattern "T08 App presents localized safe fallbacks" tests/renderer.test.tsx`、`npx tsx --test --test-name-pattern "T09 App consumes typed status params" tests/renderer.test.tsx`、`npx tsx --test --test-name-pattern "timeline follows the tail" tests/renderer.test.tsx`：各 `1 passed`。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/t11_check_frozen.py`：`PASS: 10 frozen files unchanged except permitted checklist completion marks`。
+
+完整 Desktop 自动测试与类型检查通过；本反馈未将其记作原生窗口人工验收。总控正在用当前开发窗口核对画布实际遮挡、聊天区宽度及关闭恢复，结果待其单独记录。A24 真实 Windows 文件关联/Explorer 点开、真实 Provider/Tavily、POSIX/WSL、packaged 安装与 T19 仍未验收，T11 整包状态不变。
+
+### UTF-8 guard
+
+- files checked：本轮追加的 W05 Feedback。
+- result：`conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/skills/uth-utf8-guard/scripts/check_utf8_docs.py "docs/work/T11-Agent能力补齐/feedback/W05-异常截停与Desktop收口-feedback.md"` 返回 `OK: 1 file(s) passed UTF-8 guard`。
+- repaired encoding issues：无。
+
+## Desktop 历史附件与图片预览收尾补充（2026-09-23）
+
+本轮继续处理 W05 Desktop 历史回放与图片预览；冻结的 task/spec/prompt/checklist 文字未改动，Python 服务由 W02 Worker 单独修改。
+
+### 实际改动
+
+- 正式 `history.page` DTO 的可用附件现在保留 `type`、`available:true`、稳定 `ref`、`asset_ref` 与实际文件 metadata，经 Renderer 归一化、同 message 合并与 reducer 合并后作为用户行附件显示；图片预览仍只发送不透明 `ref`。
+- 服务返回 `available:false` 时，时间线保留单独的本地化“附件不可用”占位，不构造虚假名称或大小，也不向 `attachment.preview` 发送不可用项。App history.page 集成用例覆盖同一 user message 的文本、多段 ImagePart 及不可用附件 shape。
+- 清除遗留 `.timeline-attachment img`、旧 Composer attachment 图片/卡片规则与旧 fallback class，避免祖先缩略图尺寸污染双击模态图；modal stage 图片明确按自身自然尺寸并限制在可用区域内。新增 CSS 回归断言禁止 attachment ancestor 重新限定 modal 后代图片。
+
+### 修改文件
+
+- `desktop/src/desktop-api.ts`
+- `desktop/src/renderer/App.tsx`
+- `desktop/src/renderer/ChatTimeline.tsx`
+- `desktop/src/renderer/FileCard.tsx`
+- `desktop/src/renderer/app.css`
+- `desktop/src/renderer/state-normalization.ts`
+- `desktop/src/renderer/state.ts`
+- `desktop/src/renderer/locales/en.ts`
+- `desktop/src/renderer/locales/zh-CN.ts`
+- `desktop/tests/renderer.test.tsx`
+- `desktop/tests/renderer-attachments.test.tsx`
+- 本 W05 Feedback
+
+### 验证结果
+
+- `npm run typecheck`（工作目录 `desktop/`）：通过。
+- `npx tsx --test --test-name-pattern "App pages history independently" tests/renderer.test.tsx`（工作目录 `desktop/`）：`1 passed`；正式 history.page 形状经过 Renderer 归一化、同 message 合并与 state merge，图片行触发带 opaque ref 的 preview，不可用项保留占位且不触发 preview。
+- `npx tsx --test --test-name-pattern "replay merges multipart user" tests/renderer-state.test.ts`（工作目录 `desktop/`）：`1 passed`。
+- `npx tsx --test --test-name-pattern "full image preview sizing" tests/renderer-attachments.test.tsx`（工作目录 `desktop/`）：`1 passed`。
+- `npm test`（工作目录 `desktop/`，环境变量 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`）：`253 passed, 0 failed, 0 cancelled, 0 skipped`，约 107.3 秒。离线 Desktop Runtime 集成与 T08 bundled Runtime smoke 均在此全量运行通过。
+- W02 Worker 报告 `tests/test_history_bridge.py tests/test_attachments.py tests/test_architecture_boundaries.py`：`38 passed / 14.00s`；本 Desktop Worker 未修改 Python。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/t11_check_frozen.py`：`PASS: 10 frozen files unchanged except permitted checklist completion marks`。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/skills/uth-utf8-guard/scripts/check_utf8_docs.py "docs/work/T11-Agent能力补齐/feedback/W05-异常截停与Desktop收口-feedback.md"`：`OK: 1 file(s) passed UTF-8 guard`。
+
+代码与自动测试已稳定，原生窗口中 history.page 恢复、画布布局及 100% 图片模态尺寸由总控继续复验；本反馈不将该人工复验提前记为通过。真实 Provider/Tavily、A24 原生 Windows 关联/Explorer、packaged 安装、POSIX/WSL 与 T19 仍未验收，T11 整包状态不变。
+
+## Python 语法颜色与画布窄列工具栏补充（2026-09-24）
+
+本轮按总控 9/24 构建产物验收修复两项 Desktop 表现；冻结的 task/spec/prompt/checklist 文字未改动，也未改 Python 服务或其他根文档。
+
+### 实际改动
+
+- 只读代码画布按 Prism 实际输出的 `.token.*` 类着色，覆盖关键字、字符串、数字、函数/内建、属性、运算符、标点和注释；色值使用主题变量，并为暗色、亮色及 system-light 提供可读的独立色板。删除不再匹配 Prism 输出的旧 `.syntax-*` 规则。
+- 文档画布可见时，聊天 `main` 按自身 inline-size 建立查询容器；聊天列不超过 720 px 时，Composer 将模型选择器移至第二行、发送操作固定在首行；列宽不超过 380 px 时附件按钮和权限选择器继续分行，避免依赖整个窗口宽度推断可用聊天宽度及按钮逐字竖排。
+- 增加实际 Python Prism 输出回归，确认注释、关键字、用户函数、内建名、运算符、数字与字符串 token 均产生 DOM 类，并检查 token 主题规则；另增加聊天列容器及窄列布局 CSS 契约回归。
+
+### 修改文件
+
+- `desktop/src/renderer/app.css`
+- `desktop/tests/renderer-attachments.test.tsx`
+- 本 W05 Feedback
+
+### 验证结果
+
+- `npx tsx --test tests/renderer-attachments.test.tsx`（工作目录 `desktop/`）：`15 passed, 0 failed`。
+- `npm run typecheck`（工作目录 `desktop/`）：通过。
+- `npm test`（工作目录 `desktop/`，执行前显式设置 `UTHCODE_PYTHON=C:\Users\93445\miniconda3\envs\re-uthcode\python.exe`）：`255 passed, 0 failed, 0 cancelled, 0 skipped`，约 53.5 秒；含新增两项回归以及离线 Desktop Runtime / packaged Runtime smoke 测试。
+- 总控的原生验收记录：`sample.xlsx` 双击后由系统 Excel 打开，工作表 `SHEET-5937` 的 `B2=42` 正确；PPT 文件触发系统“打开方式”选择器，已选择 PowerPoint 一次，启动结果仍由总控观察。本轮源码测试未代替画布高亮颜色与 1266×793 下 Composer 实际排版的构建产物目视复验。
+- 当前待总控标准重建后复核 Python token 的实际色彩、460 px 画布下 Composer 发送与附件控件不竖排，以及 PPT 启动结果。真实 Provider/Tavily、A24 Windows 关联/Explorer 全覆盖、POSIX/WSL 与 T19 仍未验收，T11 整包状态不变。
+
+### UTF-8 guard
+
+- files checked：本轮追加的 W05 Feedback。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/skills/uth-utf8-guard/scripts/check_utf8_docs.py "docs/work/T11-Agent能力补齐/feedback/W05-异常截停与Desktop收口-feedback.md"`：`OK: 1 file(s) passed UTF-8 guard`。
+- `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/t11_check_frozen.py`：`PASS: 10 frozen files unchanged except permitted checklist completion marks`。
+- repaired encoding issues：无。
+
+## 图片附件卡片与文本框菜单收尾（2026-09-24）
+
+本轮继续收敛 W05 的 Desktop 文件卡片和 Composer 输入交互；Spec、Tasks、Prompt、Checklist 均未修改。
+
+### 实际改动
+
+- 图片附件卡片使用 104 × 104 px 有界缩略图，不展示可见名称、类型或大小；文件名仍保留在卡片可访问名称和图片替代文本中。仅 Composer 草稿卡片提供直接移除 X，历史/已发送卡片没有移除入口，X 的双击不会触发卡片预览。
+- Composer 的附件选择入口收敛为纯加号。文本粘贴、文件粘贴和拖放继续走各自既有输入处理。
+- Electron Main 为文本框提供原生剪切、复制、粘贴和全选菜单，保留 Electron 对应编辑角色；菜单语言每次按 Desktop preference 读取，未能读取时回退到系统语言。
+
+### 修改文件
+
+- `desktop/src/main.ts`
+- `desktop/src/renderer/Composer.tsx`
+- `desktop/src/renderer/FileCard.tsx`
+- `desktop/src/renderer/UiIcon.tsx`
+- `desktop/src/renderer/app.css`
+- `desktop/tests/main-bundle.test.ts`
+- `desktop/tests/renderer-attachments.test.tsx`
+- 本 W05 Feedback
+
+### 验证结果
+
+- `npm run typecheck`（工作目录 `desktop/`）：通过。
+- `npx tsx --test tests/main-bundle.test.ts`（工作目录 `desktop/`）：`1 passed`。测试编译真实 Webpack Main 入口，确认只有 textarea 弹出菜单、剪切/复制/粘贴/全选角色正确，默认简体中文标签正确，并在持久偏好改为英文后读到英文标签。
+- `npx tsx --test tests/renderer-attachments.test.tsx`（工作目录 `desktop/`）：`16 passed, 0 failed`。覆盖纯加号入口、粘贴/拖放、104 px 图片卡片、可访问文件名、草稿移除与历史卡片无移除入口。
+- `$env:UTHCODE_PYTHON='C:/Users/93445/miniconda3/envs/re-uthcode/python.exe'; npm test`（工作目录 `desktop/`）：`256 passed, 0 failed, 0 cancelled, 0 skipped`，`duration_ms 81551.0371`；包含 packaged Runtime 构建 smoke。
+- 总控此前报告已用 Computer Use 在开发窗口确认图片缩略图尺寸、草稿 X 移除、Python 语法着色，以及 1266 × 793 窗口下 460 px 文档画布与 Composer 工具栏布局。本记录不把该开发窗口证据当作最终包内菜单验收。
+
+Main bundle 与定向 Renderer 检查均通过。完整测试中的构建 smoke 与总控的 package 曾并行写入同一 `.runtime` 输出目录；总控报告并行产物首次启动时 Runtime 状态失败，随后改为串行重包并复验。当前没有可读取的 UthCode Python stderr 持久日志或匹配的 Windows Application Error 事件；Main 仅把固定脱敏诊断投影到界面。最终包启动及包内中文菜单的人工复验由总控在串行重包后记录；A24 其余 Windows 文件关联、真实 Provider/Tavily、POSIX/WSL 与 T19 仍按现有工作包证据保持未验收，T11 整包状态不变。
+
+### UTF-8 guard
+
+- files checked：本轮追加的 W05 Feedback。
+- repaired encoding issues：无。
+
+### 串行重包后的总控复验补记（2026-09-24）
+
+总控在完整 Desktop 测试结束后串行重建最终包，消除了与 packaged Runtime smoke 同时写入 `.runtime` 的构建冲突。总控报告标准 `npm run package` 构建记录 24186 exit 0；随后 packaged Runtime 显示 ready，原有历史恢复正常。
+
+总控随后在最终包中用 Computer Use 实测中文原生菜单的剪切、复制、粘贴、全选四项；全选、剪切快捷键及粘贴菜单均正确恢复测试文本。按 Alt+PrintScreen 复制测试窗口图像后，用 Ctrl+V 从真实剪贴板导入图片，Composer 显示 104 px、无可见元数据的卡片；点击 X 后卡片移除、未打开图片 overlay、草稿清空且没有向模型发送消息。
+
+以上是总控提供的最终包原生窗口证据，不是测试桩或 Webpack bundle 模拟。该结果补齐了上一节留给总控的最终包及中文菜单复验；其他 T11 包级未验收项保持原状。
+### 验收环境口径澄清（2026-09-25）
+
+上节将总控的 104px 图片、草稿 X、Python 着色和窄列布局检查称为开发窗口，环境口径不准确：这些检查实际在标准 package 生成的 UthCode.exe 中完成。最终中文菜单和真实剪贴板检查另在串行重建的产物中完成；原 W06 Feedback 已分别记录，不扩大其余包级验收结论。
