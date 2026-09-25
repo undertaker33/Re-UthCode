@@ -46,6 +46,9 @@ const config: ForgeConfig = {
         },
         devContentSecurityPolicy:
           "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-src 'none'",
+        devServer: {
+          client: { overlay: false },
+        },
       },
     },
     new FusesPlugin({

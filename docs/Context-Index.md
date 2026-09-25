@@ -102,6 +102,13 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 
 T11 W06 经一轮返工、Terra 第二轮审核通过，当前已加入 eval/swebench.py 的正式 Headless 外部实例适配与安全 trace，并有 A25 当前 Windows/Conda 定向证据；A26 官方 harness、A18 真实 Tavily、POSIX/packaged/人工 Desktop 仍未验收，T11 继续保持 not_implemented。
 
+2026-09-21 T11 修复进展：用户已确认附件交互及已验证缺陷修复范围，冻结工作包文字保持不变。工具组经 Luna 实施与 Terra 审核后通过 PR #115 合并（`a422303`），修复正式工具图片 `asset_ref`、ApplyPatch 格式说明及进程参数下限。总控 Computer Use 已在当前 Windows 开发 Electron / Qwen compatible 中实际验证用户图片输入、本地 ViewImage、PDF 页图 ViewImage 和无需额外教授格式的 ApplyPatch；详细 Session/Turn、工具结果和定向测试记录见 W06 Feedback。附件服务组经 Luna 实施和 Terra 复审后已通过 PR #116 合并（`775f4a0`），服务定向测试 150 passed；Desktop UI、错误反馈及当前构建验收仍在实施，重复提示词历史结论仍未确定；其余协议、Tavily、POSIX 和官方 SWE 证据不因本轮自动通过，整包继续保持 `not_implemented`。
+2026-09-22 T11 服务补修经 Luna 实施、Terra 审核，通过 PR #117 合并（`b9f3eb5`）：同消息多 part 的历史附件归属、受控复制路径接口和产物链接编码说明已补齐，定向 119 passed、附件及 Session 权威回归 32 passed。Desktop 组合展示、错误诊断与真实窗口验收仍在进行，整包状态不变。
+
+2026-09-23 T11 历史附件正式 DTO 补修经 GPT-6 Luna 实施、GPT-6 Sol 审核，通过 PR #118 合并（`caec630`），Python 定向 38 passed；总控重启开发 Electron 已确认原 2.7 MB 图片历史缩略图恢复。Desktop 实现组通过独立代码审核，最新自动回归 253 passed，关键图片模态与 Markdown 画布 Computer Use 通过；当前构建与剩余文件类型交互仍在验收，整包继续保持 `not_implemented`。
+
+2026-09-24 T11 Desktop 附件交互增补已完成代码复审：图片紧凑缩略图隐藏元数据、草稿直接移除、纯加号附件入口和本地化四项编辑菜单；最终 Desktop 全量 256 passed，typecheck 通过，串行标准 package 与 Runtime smoke 通过。总控已实测图片导入和剪贴板粘贴后移除、中文编辑菜单、Python 高亮及窄列画布布局；其他包级未验收项与构建并行期间观察到的启动失败详见原 W06 Feedback，整包仍为 `not_implemented`。
+
 ## 跨层最短链路
 
 ```text

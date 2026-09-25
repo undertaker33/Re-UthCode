@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import webpack, { type Configuration } from "webpack";
 
+import { DesktopPreferencesStore } from "../src/desktop-preferences";
 import mainConfiguration from "../webpack.main.config";
 
 class FakeWebContents extends EventEmitter {
@@ -57,13 +58,17 @@ class FakeApp extends EventEmitter {
   readyCalls = 0;
   quitCalls = 0;
 
+  constructor(private readonly userDataPath = tmpdir()) {
+    super();
+  }
+
   whenReady(): Promise<void> {
     this.readyCalls += 1;
     return Promise.resolve();
   }
 
   getPath(_name: string): string {
-    return tmpdir();
+    return this.userDataPath;
   }
 
   quit(): void {
@@ -94,7 +99,8 @@ function compileMainBundle(outputPath: string): Promise<string> {
 
 test("compiled Webpack Main entry bootstraps and creates the secure window", async () => {
   const outputPath = await mkdtemp(join(tmpdir(), "uthcode-main-bundle-"));
-  const app = new FakeApp();
+  const app = new FakeApp(outputPath);
+  const shownMenus: Array<{ template: unknown; options: unknown }> = [];
   const ipcMain = {
     handle: (_channel: string, _handler: unknown) => undefined,
     removeHandler: (_channel: string) => undefined,
@@ -104,7 +110,10 @@ test("compiled Webpack Main entry bootstraps and creates the secure window", asy
     BrowserWindow: FakeBrowserWindow,
     dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
     ipcMain,
-    Menu: { setApplicationMenu: (_menu: unknown) => undefined },
+    Menu: {
+      setApplicationMenu: (_menu: unknown) => undefined,
+      buildFromTemplate: (template: unknown) => ({ popup: (options: unknown) => shownMenus.push({ template, options }) }),
+    },
     nativeTheme: { themeSource: "system", shouldUseDarkColors: true },
     shell: { openPath: async () => "" },
   };
@@ -139,6 +148,26 @@ test("compiled Webpack Main entry bootstraps and creates the secure window", asy
     assert.equal(window.options.backgroundColor, "#1d1d1f");
     assert.equal(electron.nativeTheme.themeSource, "system");
     assert.equal(window.loadedURL, "");
+    let prevented = false;
+    window.webContents.emit("context-menu", { preventDefault: () => { prevented = true; } }, { formControlType: "input-text", x: 12, y: 18 });
+    assert.equal(prevented, false);
+    assert.equal(shownMenus.length, 0);
+    window.webContents.emit("context-menu", { preventDefault: () => { prevented = true; } }, { formControlType: "text-area", x: 12, y: 18 });
+    assert.equal(prevented, true);
+    const menuDeadline = Date.now() + 2_000;
+    while (shownMenus.length < 1 && Date.now() < menuDeadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(shownMenus.length, 1);
+    assert.deepEqual((shownMenus[0]?.template as Array<{ role: string }>).map((item) => item.role), ["cut", "copy", "paste", "selectAll"]);
+    assert.deepEqual((shownMenus[0]?.template as Array<{ label: string }>).map((item) => item.label), ["剪切", "复制", "粘贴", "全选"]);
+    assert.deepEqual(shownMenus[0]?.options, { window, x: 12, y: 18 });
+
+    await new DesktopPreferencesStore(join(outputPath, "desktop-preferences.json")).write("language", "en");
+    prevented = false;
+    window.webContents.emit("context-menu", { preventDefault: () => { prevented = true; } }, { formControlType: "text-area", x: 20, y: 24 });
+    assert.equal(prevented, true);
+    while (shownMenus.length < 2 && Date.now() < menuDeadline + 2_000) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(shownMenus.length, 2);
+    assert.deepEqual((shownMenus[1]?.template as Array<{ label: string }>).map((item) => item.label), ["Cut", "Copy", "Paste", "Select All"]);
   } finally {
     moduleLoader._load = originalLoad;
     if (previousPython === undefined) delete process.env.UTHCODE_PYTHON;

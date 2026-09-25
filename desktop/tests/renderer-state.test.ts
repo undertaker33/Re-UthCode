@@ -43,6 +43,50 @@ test("T04 replay is ordered and session labels use title, preview, then short id
   assert.equal(sessionLabel({ session_id: "abcdef1234567890", preview: "" }), "abcdef12");
 });
 
+test("replay merges multipart user text and image records without merging steering", () => {
+  const timeline = replayToTimeline([
+    {
+      session_id: "session-1",
+      sequence: 1,
+      record_id: "user-text",
+      turn_id: "turn-1",
+      message_id: "message-1",
+      kind: "user",
+      text: "look at this",
+      attachments: [],
+      is_error: false,
+    },
+    {
+      session_id: "session-1",
+      sequence: 2,
+      record_id: "user-image",
+      turn_id: "turn-1",
+      message_id: "message-1",
+      kind: "user",
+      text: "",
+      attachments: [{ ref: "image-1", display_name: "diagram.png", mime_type: "image/png", size_bytes: 4, width: 10, height: 10 }],
+      is_error: false,
+    },
+    {
+      session_id: "session-1",
+      sequence: 3,
+      record_id: "steering-1",
+      turn_id: "turn-1",
+      message_id: "steering-1",
+      kind: "steering",
+      text: "continue",
+      attachments: [],
+      is_error: false,
+    },
+  ]);
+  assert.equal(timeline.filter((entry) => entry.kind === "user").length, 1);
+  assert.equal(timeline[0]?.kind, "user");
+  assert.equal(timeline[0]?.text, "look at this");
+  assert.deepEqual(timeline[0]?.attachments?.map((item) => item.ref), ["image-1"]);
+  assert.equal(timeline[1]?.kind, "steering");
+  assert.equal(timeline[1]?.text, "continue");
+});
+
 test("durable compaction rehydrates between the completed reply and the following user message", () => {
   const timeline = replayToTimeline([
     replayRecord(3, "user", "next prompt"),
@@ -355,6 +399,60 @@ test("delayed status from another project cannot overwrite the visible Session p
   assert.equal(delayed.run?.run_id, "visible-run");
   assert.equal(delayed.contextUsage.used_tokens, 12);
   assert.equal(delayed.sessionRuntime[sessionRuntimeKey(delayedProject, "shared-session")]?.timeline.length, 0, "the offscreen project must not seed its cache from visible timeline");
+});
+
+test("partial terminal status keeps same-Run permission and clears it for a new Run", () => {
+  const projectKey = "C:/Projects/permission-partial-status";
+  const sessionId = "session-a";
+  const key = sessionRuntimeKey(projectKey, sessionId);
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    permissionMode: "auto",
+    run: { run_id: "run-known", status: "running", permission_mode: "auto" },
+    activeTurn: true,
+    terminalStatusPending: true,
+    projects: [{ path: projectKey, projectKey, alias: "permissions", pinned: false, sessions: [{ session_id: sessionId, project_key: projectKey }], catalogFresh: true }],
+  });
+
+  state = reduceRendererState(state, {
+    type: "status_loaded",
+    result: { project_key: projectKey, session_id: sessionId, active_turn: false, session_state: { active_turn: false, run: { run_id: "run-known", status: "completed" } } },
+  });
+  assert.equal(state.activeTurn, false);
+  assert.equal(state.terminalStatusPending, false);
+  assert.equal(state.permissionMode, "auto", "a partial same-Run status must not erase the known selector");
+
+  const cached = state.sessionRuntime[key];
+  assert.equal(cached?.permissionMode, "auto");
+  const reentered = applyRuntimeSnapshot(createInitialState({ selectedProjectKey: projectKey, selectedSessionId: sessionId }), cached!);
+  assert.equal(reentered.permissionMode, "auto", "re-entering the cached Session keeps the same-Run selector");
+
+  state = reduceRendererState(state, {
+    type: "status_loaded",
+    result: { project_key: projectKey, session_id: sessionId, active_turn: true, session_state: { active_turn: true, run: { run_id: "run-new", status: "running" } } },
+  });
+  assert.equal(state.permissionMode, "unknown", "a new Run without an authoritative mode cannot inherit the previous Run");
+});
+
+test("accepted Turn keeps a known permission for the same Run but clears it for a new Run", () => {
+  let state = createInitialState({
+    permissionMode: "auto",
+    run: { run_id: "run-known", status: "completed", permission_mode: "auto" },
+  });
+  state = reduceRendererState(state, {
+    type: "turn_accepted",
+    run: { run_id: "run-known", turn_id: "turn-next", status: "running" },
+    steering: false,
+  });
+  assert.equal(state.permissionMode, "auto", "a partial same-Run accepted DTO must keep the known selector");
+
+  state = reduceRendererState(state, {
+    type: "turn_accepted",
+    run: { run_id: "run-new", turn_id: "turn-one", status: "running" },
+    steering: false,
+  });
+  assert.equal(state.permissionMode, "unknown", "a new Run without an authoritative mode starts unknown");
 });
 
 test("durable failure replay restores retained output and the failed Turn projection", () => {
@@ -767,6 +865,20 @@ test("T05 reducer keeps event order, replaces assistant preview, and settles too
   assert.equal(tools.length, 1);
   assert.equal(tools[0]?.status, "completed");
   assert.equal(state.timeline.find((entry) => entry.kind === "reasoning")?.streaming, false);
+});
+
+test("renderer boundary diagnostics keep only the fixed boundary code", () => {
+  let state = reduceRendererState(createInitialState(), {
+    type: "agent_event",
+    event: { type: "runtime_diagnostic", code: "renderer_boundary", boundary: "timeline" },
+  });
+  assert.deepEqual(state.diagnostics, ["Renderer boundary failed: timeline"]);
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: { type: "runtime_diagnostic", code: "renderer_boundary", boundary: "unknown", message: "secret renderer stack" },
+  });
+  assert.equal(state.diagnostics.at(-1), "Python Runtime emitted a diagnostic");
+  assert.doesNotMatch(JSON.stringify(state.diagnostics), /secret renderer stack/u);
 });
 
 test("T08 reducer rejects stale same-Run events from an older Turn", () => {

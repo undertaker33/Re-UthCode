@@ -1,4 +1,4 @@
-import type { AgentEvent, DesktopAttachmentDraft, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, DesktopAttachmentDraft, DesktopPreferences, DesktopApi, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference, TimelineAttachment } from "../desktop-api";
 import {
   DEFAULT_RUNTIME_PANEL_WIDTH,
   DEFAULT_SIDEBAR_WIDTH,
@@ -20,6 +20,7 @@ import {
   permissionModeOf,
   replayToTimeline,
   resultRecord,
+  runIdOf,
   runtimeStateFromProjection,
   sessionRuntimeFromSource,
 } from "./state-normalization";
@@ -207,7 +208,7 @@ export interface TimelineEntry {
   endedAt?: number;
   planRevision?: number;
   planState?: "draft" | "final" | "failed" | "cancelled";
-  attachments?: DesktopAttachmentDraft[];
+  attachments?: TimelineAttachment[];
 }
 
 export interface ProcessLogEntry {
@@ -529,6 +530,45 @@ function mergeTimelineEntries(
     }
     matched.add(index);
     const existing = result[index]!;
+    if (existing.kind === "user"
+      && candidate.kind === "user"
+      && existing.turnId
+      && existing.turnId === candidate.turnId
+      && existing.messageId
+      && existing.messageId === candidate.messageId) {
+      const attachments: TimelineAttachment[] = [];
+      const seenRefs = new Map<string, number>();
+      for (const attachment of [...(existing.attachments ?? []), ...(candidate.attachments ?? [])]) {
+        const identity = attachment.asset_ref ?? attachment.ref;
+        if (!identity) continue;
+        const existingIndex = seenRefs.get(identity);
+        if (existingIndex !== undefined) {
+          const previous = attachments[existingIndex]!;
+          const previousUnavailable = "available" in previous && previous.available === false;
+          const incomingUnavailable = "available" in attachment && attachment.available === false;
+          if (previousUnavailable && !incomingUnavailable) attachments[existingIndex] = { ...attachment };
+          continue;
+        }
+        seenRefs.set(identity, attachments.length);
+        attachments.push({ ...attachment });
+      }
+      const text = !existing.text
+        ? candidate.text
+        : !candidate.text || existing.text === candidate.text
+          ? existing.text
+          : candidate.text.startsWith(existing.text)
+            ? candidate.text
+            : existing.text.startsWith(candidate.text)
+              ? existing.text
+              : existing.text + candidate.text;
+      result[index] = {
+        ...existing,
+        ...(preferIncoming ? candidate : {}),
+        text,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      };
+      return;
+    }
     const incomingIsLive = candidate.streaming === true || candidate.sequence === undefined;
     const existingIsLive = existing.streaming === true || existing.sequence === undefined;
     const replace = preferIncoming || (incomingIsLive && !existingIsLive) || (existing.streaming && !candidate.streaming);
@@ -894,7 +934,15 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const allowed: RuntimeStateName[] = ["booting", "restarting", "ready", "configuration_required", "failed", "stopping", "stopped"];
     return { ...state, runtimeState: allowed.includes(runtimeState as RuntimeStateName) ? runtimeState as RuntimeStateName : state.runtimeState };
   }
-  if (type === "runtime_diagnostic") return { ...state, diagnostics: [...state.diagnostics, "Python Runtime emitted a diagnostic"].slice(-10) };
+  if (type === "runtime_diagnostic") {
+    const code = textValue(payload.code);
+    const boundary = textValue(payload.boundary);
+    const diagnostic = code === "renderer_boundary"
+      && /^(?:sidebar|timeline|composer|runtime-panel|document-preview)$/u.test(boundary)
+      ? `Renderer boundary failed: ${boundary}`
+      : "Python Runtime emitted a diagnostic";
+    return { ...state, diagnostics: [...state.diagnostics, diagnostic].slice(-10) };
+  }
   if (type === "turn_started") {
     const text = messageText(payload.message);
     const next: RendererState = {
@@ -1226,11 +1274,15 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         ? { ...state.sessionModels, [sessionId]: currentModelRef }
         : state.sessionModels;
       const statusKey = statusSessionId ? sessionRuntimeKey(statusProjectKey, statusSessionId) : null;
+      const statusFallback = statusKey
+        ? state.sessionRuntime[statusKey]
+          ?? (statusTargetsVisibleSession && statusSessionId === sessionId ? runtimeSnapshotFromState(state) : null)
+        : null;
       const hydrated = statusSessionId
         ? sessionRuntimeFromSource(
           source,
           statusTargetsVisibleSession && statusSessionId === sessionId ? state.timeline : [],
-          state.sessionRuntime[statusKey as string] ?? null,
+          statusFallback,
           normalizedProviderUsage,
         )
         : null;
@@ -1263,6 +1315,11 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           todo: visibleHydrated.todo,
           todoIteration: visibleHydrated.todoIteration,
           run: visibleHydrated.run ?? state.run,
+          // sessionRuntimeFromSource already preserves a partial status value
+          // only for the same Run identity. Write its result unconditionally
+          // so a genuinely new Run with no authoritative permission cannot
+          // inherit the previous Run's selector state.
+          permissionMode: visibleHydrated.permissionMode,
           activeTurn: visibleHydrated.activeTurn,
           terminalStatusPending: visibleHydrated.terminalStatusPending,
           turnStatus: visibleHydrated.turnStatus,
@@ -1478,7 +1535,17 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
     case "turn_accepted": {
       const acceptedRun = normalizeRun(action.run);
-      const next = { ...state, run: acceptedRun ?? state.run, permissionMode: acceptedRun ? permissionModeOf(acceptedRun) : state.permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
+      const acceptedPermission = permissionModeOf(acceptedRun);
+      const acceptedRunId = runIdOf(acceptedRun);
+      const currentRunId = runIdOf(state.run);
+      const permissionMode = acceptedPermission !== "unknown"
+        ? acceptedPermission
+        : acceptedRunId && acceptedRunId === currentRunId
+          ? state.permissionMode
+          : action.steering && !acceptedRunId
+          ? state.permissionMode
+          : "unknown";
+      const next = { ...state, run: acceptedRun ?? state.run, permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, turnId: next.run?.turn_id, status: "completed" }], nextStatusId: next.nextStatusId + 1 };
     }

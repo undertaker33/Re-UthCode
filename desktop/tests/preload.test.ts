@@ -61,6 +61,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     "openProjectInExplorer",
     "pasteAttachment",
     "readPreference",
+    "reportRendererDiagnostic",
     "requestRuntime",
     "subscribeAgentEvents",
     "writePreference",
@@ -80,6 +81,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   assert.equal(await api.chooseAttachment(), null);
   assert.equal(await api.pasteAttachment(), null);
   assert.equal(await api.authorizeExternalArtifact?.(), null);
+  await api.reportRendererDiagnostic?.("timeline");
 
   assert.deepEqual(calls, [
     { channel: "desktop.project.pick", args: [] },
@@ -93,6 +95,7 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     { channel: "desktop.attachment.pick", args: [] },
     { channel: "desktop.attachment.clipboard", args: [] },
     { channel: "desktop.artifact.authorize-external", args: [] },
+    { channel: "desktop.renderer.diagnostic", args: ["timeline"] },
   ]);
 
   const events: unknown[] = [];
@@ -176,7 +179,11 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
     },
   };
   const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
-  const webContents = { mainFrame };
+  const diagnosticEvents: unknown[][] = [];
+  const webContents = {
+    mainFrame,
+    send: (...args: unknown[]) => { diagnosticEvents.push(args); },
+  };
   const window = { webContents };
   const trustedEvent = { sender: webContents, senderFrame: mainFrame };
   const runtime = {
@@ -213,8 +220,9 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
   const explorer = handlers.get(IPC_CHANNELS.openProjectInExplorer);
   const copyText = handlers.get(IPC_CHANNELS.copyText);
   const closeShell = handlers.get(IPC_CHANNELS.closeShell);
+  const rendererDiagnostic = handlers.get(IPC_CHANNELS.rendererDiagnostic);
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
-  assert.ok(pick && explorer && copyText && closeShell && runtimeRequest);
+  assert.ok(pick && explorer && copyText && closeShell && rendererDiagnostic && runtimeRequest);
   await assert.rejects(closeShell?.({ sender: {}, senderFrame: mainFrame }), /not trusted/);
   await assert.rejects(
     runtimeRequest?.({ sender: {}, senderFrame: mainFrame }, { method: "status.get", params: {} }),
@@ -223,12 +231,18 @@ test("main IPC handlers validate the sender and gate Explorer to picker-register
   await assert.rejects(copyText?.({ sender: {}, senderFrame: mainFrame }, "session-1"), /not trusted/);
   await copyText?.(trustedEvent, "session-1");
   await assert.rejects(copyText?.(trustedEvent, 1), /Clipboard text is invalid/);
+  await rendererDiagnostic?.(trustedEvent, "timeline");
+  await assert.rejects(rendererDiagnostic?.(trustedEvent, "unknown-area"), /diagnostic is invalid/);
   await assert.rejects(explorer?.(trustedEvent, "C:\\Projects\\Other"), /selected before/);
   assert.equal(await pick?.(trustedEvent), "C:\\Projects\\UthCode");
   await explorer?.(trustedEvent, "C:\\Projects\\UthCode");
   await closeShell?.(trustedEvent);
   assert.deepEqual(opened, ["C:\\Projects\\UthCode"]);
   assert.deepEqual(copied, ["session-1"]);
+  assert.deepEqual(diagnosticEvents, [[
+    IPC_CHANNELS.runtimeEvent,
+    { type: "runtime_diagnostic", code: "renderer_boundary", boundary: "timeline" },
+  ]]);
   assert.equal(shellCloseCount, 1);
   removeHandlers();
   assert.equal(handlers.size, 0);
@@ -462,6 +476,41 @@ test("preload keeps the known turn image refusal as JSON for the Renderer", asyn
   });
 });
 
+test("preload keeps structured file action failures JSON-safe for the Renderer", async () => {
+  const exposed: { api?: DesktopApi } = {};
+  const contextBridge = {
+    exposeInMainWorld(_name: string, api: DesktopApi) {
+      exposed.api = api;
+    },
+  };
+  const ipcRenderer = {
+    invoke(channel: string) {
+      assert.equal(channel, "desktop.runtime.request");
+      return Promise.resolve({
+        __uthcode_runtime_error: {
+          kind: "attachment_not_found",
+          message: "Attachment file is unavailable",
+        },
+      });
+    },
+    on() {
+      return this;
+    },
+    removeListener() {
+      return this;
+    },
+  };
+
+  installPreload(contextBridge, ipcRenderer);
+  const result = await exposed.api?.requestRuntime("attachment.open", { ref: "0123456789abcdef" });
+  assert.deepEqual(result, {
+    __uthcode_runtime_error: {
+      kind: "attachment_not_found",
+      message: "Attachment file is unavailable",
+    },
+  });
+});
+
 test("Main routes authorized artifacts to open/reveal and rejects URI execution", async () => {
   const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
   const fakeIpc = {
@@ -478,16 +527,20 @@ test("Main routes authorized artifacts to open/reveal and rejects URI execution"
   const project = await mkdtemp(join(tmpdir(), "uthcode-artifact-main-"));
   const image = join(project, "preview.png");
   const html = join(project, "unsafe.html");
+  const invalid = join(project, "invalid.dat");
   await writeFile(image, "png-bytes");
   await writeFile(html, "<script>throw new Error('should not run')</script>");
+  await writeFile(invalid, "invalid descriptor fixture");
   const opened: string[] = [];
   const revealed: string[] = [];
+  const copied: string[] = [];
   const calls: string[] = [];
   const runtime = {
     start: async () => undefined,
     request: async (method: string, params: Record<string, unknown>) => {
       calls.push(method);
       const path = String(params.path);
+      if (path === invalid) return {};
       const unsupported = path.endsWith(".html");
       return {
         artifact: {
@@ -515,6 +568,7 @@ test("Main routes authorized artifacts to open/reveal and rejects URI execution"
     showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
     openPath: (async (path: string) => { opened.push(path); return ""; }) as never,
     showItemInFolder: ((path: string) => { revealed.push(path); }) as never,
+    writeClipboard: (path: string) => { copied.push(path); },
   });
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
   assert.ok(runtimeRequest);
@@ -523,16 +577,130 @@ test("Main routes authorized artifacts to open/reveal and rejects URI execution"
     assert.equal((described as { artifact: { path: string } }).artifact.path, image);
     await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: image } });
     await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: html } });
-    await assert.rejects(
-      runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: "https://example.test/evil" } }),
-      /Artifact path is invalid/u,
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: join(project, "missing.png") } }),
+      { __uthcode_runtime_error: { kind: "artifact_not_found", message: "Artifact file is unavailable" } },
+    );
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: invalid } }),
+      { __uthcode_runtime_error: { kind: "artifact_unavailable", message: "Artifact descriptor is invalid" } },
+    );
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: "https://example.test/evil" } }),
+      { __uthcode_runtime_error: { kind: "artifact_invalid", message: "Artifact descriptor is invalid" } },
     );
     assert.deepEqual(opened, [image]);
     assert.deepEqual(revealed, [html]);
-    assert.deepEqual(calls, ["artifact.describe", "artifact.open", "artifact.open"]);
+    assert.deepEqual(calls, ["artifact.describe", "artifact.open", "artifact.open", "artifact.open", "artifact.open"]);
   } finally {
     removeHandlers();
     await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("Main routes ref-only Session attachments through the trusted derived DTO", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const root = await mkdtemp(join(tmpdir(), "uthcode-attachment-main-"));
+  const sessionId = "session-attachment-1";
+  const ref = "0123456789abcdef";
+  const derived = join(root, sessionId, "attachments", ref, "derived", "open");
+  const target = join(derived, "report.final.PDF");
+  await mkdir(derived, { recursive: true });
+  await writeFile(target, "%PDF-1.7\n");
+  const opened: string[] = [];
+  const revealed: string[] = [];
+  const copied: string[] = [];
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let dto: Record<string, unknown> = {
+    source: "session_attachment",
+    session_id: sessionId,
+    ref,
+    asset_ref: `attachment:${sessionId}:${ref}`,
+    path: target,
+    display_name: "report.final.PDF",
+    mime_type: "application/pdf",
+    size_bytes: 9,
+    kind: "office",
+    default_action: "open",
+  };
+  const runtime = {
+    start: async () => undefined,
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params });
+      return { attachment: dto };
+    },
+  };
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences: { read: async () => ({}), write: async () => ({}) } as never,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    showOpenDialog: (async () => ({ canceled: true, filePaths: [] })) as never,
+    openPath: (async (path: string) => { opened.push(path); return ""; }) as never,
+    showItemInFolder: ((path: string) => { revealed.push(path); }) as never,
+    writeClipboard: (path: string) => { copied.push(path); },
+  });
+  const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
+  assert.ok(runtimeRequest);
+  try {
+    const openedResult = await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } });
+    const revealedResult = await runtimeRequest?.(trustedEvent, { method: "attachment.reveal", params: { ref } });
+    const copiedResult = await runtimeRequest?.(trustedEvent, { method: "attachment.copy_path", params: { ref } });
+    assert.equal((openedResult as { attachment: { ref: string } }).attachment.ref, ref);
+    assert.equal((revealedResult as { attachment: { asset_ref: string } }).attachment.asset_ref, `attachment:${sessionId}:${ref}`);
+    assert.equal((copiedResult as { attachment: { path: string } }).attachment.path, target);
+    assert.deepEqual(opened, [target]);
+    assert.deepEqual(revealed, [target]);
+    assert.deepEqual(copied, [target]);
+    assert.deepEqual(calls.map((call) => call.params), [{ ref }, { ref }, { ref }], "Renderer sends only the opaque ref");
+
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref, path: target, authorized: true } }),
+      { __uthcode_runtime_error: { kind: "attachment_invalid", message: "Attachment descriptor is invalid" } },
+    );
+
+    dto = { ...dto, source: "renderer_path" };
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } }),
+      { __uthcode_runtime_error: { kind: "attachment_invalid", message: "Attachment descriptor is invalid" } },
+    );
+    dto = { ...dto, source: "session_attachment", asset_ref: "attachment:wrong:wrong" };
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } }),
+      { __uthcode_runtime_error: { kind: "attachment_invalid", message: "Attachment descriptor is invalid" } },
+    );
+    dto = { ...dto, asset_ref: `attachment:${sessionId}:${ref}`, path: join(root, "outside.txt") };
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } }),
+      { __uthcode_runtime_error: { kind: "attachment_not_authorized", message: "Attachment is not authorized by Desktop" } },
+    );
+
+    dto = { ...dto, path: join(derived, "missing.pdf") };
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } }),
+      { __uthcode_runtime_error: { kind: "attachment_not_found", message: "Attachment file is unavailable" } },
+    );
+
+    dto = { ...dto, path: target, kind: "executable", default_action: "reveal" };
+    await runtimeRequest?.(trustedEvent, { method: "attachment.open", params: { ref } });
+    assert.deepEqual(opened, [target], "executables never invoke the system open action");
+    assert.deepEqual(revealed, [target, target]);
+  } finally {
+    removeHandlers();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -583,9 +751,13 @@ test("Main registers one picker-selected external artifact in its production-own
   const runtimeRequest = handlers.get(IPC_CHANNELS.runtimeRequest);
   assert.ok(authorize && runtimeRequest);
   try {
-    await assert.rejects(
-      runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: external } }),
-      /not authorized/u,
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: external } }),
+      { __uthcode_runtime_error: { kind: "artifact_not_authorized", message: "Artifact is not authorized by Desktop" } },
+    );
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: "https://example.test/file.txt" } }),
+      { __uthcode_runtime_error: { kind: "artifact_invalid", message: "Artifact descriptor is invalid" } },
     );
     assert.equal(await authorize?.(trustedEvent), external);
     const described = await runtimeRequest?.(trustedEvent, { method: "artifact.describe", params: { path: external } });
@@ -593,9 +765,9 @@ test("Main registers one picker-selected external artifact in its production-own
     await runtimeRequest?.(trustedEvent, { method: "artifact.preview", params: { path: external } });
     await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: external } });
     assert.deepEqual(opened, [external]);
-    await assert.rejects(
-      runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: replacement } }),
-      /not authorized/u,
+    assert.deepEqual(
+      await runtimeRequest?.(trustedEvent, { method: "artifact.open", params: { path: replacement } }),
+      { __uthcode_runtime_error: { kind: "artifact_not_authorized", message: "Artifact is not authorized by Desktop" } },
     );
   } finally {
     removeHandlers();

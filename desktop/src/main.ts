@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shel
 import type { IpcMainInvokeEvent } from "electron";
 import squirrelStartup from "electron-squirrel-startup";
 import { readFile, stat } from "node:fs/promises";
-import { basename, extname, isAbsolute, resolve, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, resolve, join } from "node:path";
 
 // Squirrel.Windows starts the app with a short-lived lifecycle argument while
 // installing, updating, or uninstalling.  Handle it before registering the
@@ -17,6 +17,7 @@ import {
   isRuntimeMethod,
   type AgentEvent,
   type DesktopPreferences,
+  type JsonObject,
   type PreferenceKey,
 } from "./desktop-api";
 import {
@@ -50,6 +51,7 @@ export const IPC_CHANNELS = Object.freeze({
   authorizeExternalArtifact: "desktop.artifact.authorize-external",
   closeShell: "desktop.shell.close",
   runtimeRequest: "desktop.runtime.request",
+  rendererDiagnostic: "desktop.renderer.diagnostic",
   runtimeEvent: "desktop.runtime.event",
   preferenceRead: "desktop.preference.read",
   preferenceWrite: "desktop.preference.write",
@@ -64,6 +66,8 @@ export class MainBoundaryError extends Error {
     this.kind = kind;
   }
 }
+
+const RENDERER_BOUNDARIES = new Set(["sidebar", "timeline", "composer", "runtime-panel", "document-preview"]);
 
 export function isAllowedRendererUrl(url: string, rendererEntry: string, isPackaged: boolean): boolean {
   if (typeof url !== "string" || typeof rendererEntry !== "string" || !rendererEntry) return false;
@@ -319,6 +323,20 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     closeShell();
   };
 
+  const onRendererDiagnostic = async (event: IpcMainInvokeEvent, value: unknown): Promise<void> => {
+    assertSender(event);
+    if (typeof value !== "string" || !RENDERER_BOUNDARIES.has(value)) {
+      throw new MainBoundaryError("invalid_renderer_diagnostic", "Renderer diagnostic is invalid");
+    }
+    // The boundary name is allowlisted above. Keep the diagnostic payload
+    // fixed and omit the caught Error, message, and component stack.
+    options.window.webContents.send(IPC_CHANNELS.runtimeEvent, {
+      type: "runtime_diagnostic",
+      code: "renderer_boundary",
+      boundary: value,
+    });
+  };
+
   const handleArtifactResult = async (result: unknown, method: string): Promise<unknown> => {
     if (!isJsonObject(result) || !isJsonObject(result.artifact) || typeof result.artifact.path !== "string") {
       throw new MainBoundaryError("artifact_unavailable", "Artifact descriptor is invalid");
@@ -349,6 +367,94 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     const failure = await openPath(target);
     if (failure) throw new MainBoundaryError("artifact_open_failed", "Artifact could not be opened");
     return result;
+  };
+
+  const handleAttachmentResult = async (result: unknown, method: string): Promise<unknown> => {
+    if (!isJsonObject(result) || !isJsonObject(result.attachment)) {
+      throw new MainBoundaryError("attachment_unavailable", "Attachment descriptor is invalid");
+    }
+    const attachment = result.attachment;
+    const source = attachment.source;
+    const sessionId = attachment.session_id;
+    const ref = attachment.ref;
+    const assetRef = attachment.asset_ref;
+    const rawPath = attachment.path;
+    // The Python Bridge is the only component allowed to resolve an attachment
+    // ref. Main accepts only the service-created derived open copy and never a
+    // Renderer-supplied path or authorization flag.
+    if (source !== "session_attachment"
+      || typeof sessionId !== "string"
+      || !/^[^\\/\u0000]+$/u.test(sessionId)
+      || typeof ref !== "string"
+      || !/^[A-Za-z0-9_-]{16,128}$/u.test(ref)
+      || typeof assetRef !== "string"
+      || assetRef !== `attachment:${sessionId}:${ref}`
+      || typeof rawPath !== "string"
+      || !isAbsolute(rawPath)
+      || /[\u0000\r\n;|&<>]/u.test(rawPath)) {
+      throw new MainBoundaryError("attachment_invalid", "Attachment descriptor is invalid");
+    }
+    const target = resolve(rawPath);
+    const openDirectory = dirname(target);
+    const derivedDirectory = dirname(openDirectory);
+    const refDirectory = dirname(derivedDirectory);
+    const attachmentsDirectory = dirname(refDirectory);
+    const sessionDirectory = dirname(attachmentsDirectory);
+    if (basename(openDirectory) !== "open"
+      || basename(derivedDirectory) !== "derived"
+      || basename(refDirectory) !== ref
+      || basename(attachmentsDirectory) !== "attachments"
+      || basename(sessionDirectory) !== sessionId) {
+      throw new MainBoundaryError("attachment_not_authorized", "Attachment path is not a trusted derived copy");
+    }
+    try {
+      const details = await stat(target);
+      if (!details.isFile()) throw new Error("not a file");
+    } catch {
+      throw new MainBoundaryError("attachment_not_found", "Attachment file is unavailable");
+    }
+    const kind = attachment.kind;
+    const action = method === "attachment.reveal"
+      || kind === "executable"
+      || kind === "unsupported"
+      || attachment.default_action === "reveal"
+      ? "reveal"
+      : "open";
+    if (method === "attachment.copy_path") {
+      writeClipboard(target);
+      return result;
+    }
+    if (action === "reveal") {
+      showItemInFolder(target);
+      return result;
+    }
+    const failure = await openPath(target);
+    if (failure) throw new MainBoundaryError("attachment_open_failed", "Attachment could not be opened");
+    return result;
+  };
+
+  const projectFileRuntimeError = (error: unknown, method: string): JsonObject | null => {
+    if (method !== "artifact.describe" && method !== "artifact.open" && method !== "artifact.reveal" && method !== "artifact.preview"
+      && method !== "attachment.open" && method !== "attachment.reveal" && method !== "attachment.copy_path") return null;
+    if (!(error instanceof MainBoundaryError) && !(error instanceof RuntimeRequestError)) return null;
+    const kind = error.kind;
+    const messages: Record<string, string> = {
+      artifact_invalid: "Artifact descriptor is invalid",
+      artifact_not_found: "Artifact file is unavailable",
+      artifact_not_authorized: "Artifact is not authorized by Desktop",
+      artifact_open_failed: "Artifact could not be opened",
+      artifact_unavailable: "Artifact descriptor is invalid",
+      artifact_error: "Artifact action failed",
+      attachment_invalid: "Attachment descriptor is invalid",
+      attachment_not_found: "Attachment file is unavailable",
+      attachment_not_authorized: "Attachment is not authorized by Desktop",
+      attachment_open_failed: "Attachment could not be opened",
+      attachment_unavailable: "Attachment descriptor is invalid",
+      attachment_error: "Attachment action failed",
+    };
+    const message = messages[kind];
+    if (!message) return null;
+    return { __uthcode_runtime_error: { kind, message } };
   };
 
   const onRuntimeRequest = async (
@@ -389,21 +495,39 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       // new projects must first pass through the Main folder picker.
       requestParams = { ...payload.params, path: projectPath };
     } else if (payload.method.startsWith("artifact.")) {
-      const rawPath = payload.params.path;
-      if (typeof rawPath !== "string" || !rawPath.trim() || /[\u0000\r\n;|&<>]/u.test(rawPath) || /^(?:[a-z][a-z0-9+.-]*):\/\//iu.test(rawPath)) {
-        throw new MainBoundaryError("artifact_invalid", "Artifact path is invalid");
+      try {
+        const rawPath = payload.params.path;
+        if (typeof rawPath !== "string" || !rawPath.trim() || /[\u0000\r\n;|&<>]/u.test(rawPath) || /^(?:[a-z][a-z0-9+.-]*):\/\//iu.test(rawPath)) {
+          throw new MainBoundaryError("artifact_invalid", "Artifact path is invalid");
+        }
+        const candidate = isAbsolute(rawPath) ? resolve(rawPath) : rawPath;
+        const insideRegisteredProject = isAbsolute(candidate) && Array.from(registeredProjects).some((root) => candidate === root || candidate.startsWith(`${root}${process.platform === "win32" ? "\\" : "/"}`));
+        const externalAuthorized = isAbsolute(candidate) && authorizedExternalArtifacts.has(candidate);
+        if (!insideRegisteredProject && !externalAuthorized && isAbsolute(candidate)) {
+          throw new MainBoundaryError("artifact_not_authorized", "Artifact is not authorized by Desktop");
+        }
+        requestParams = {
+          ...payload.params,
+          ...(isAbsolute(candidate) ? { path: candidate } : {}),
+          authorized_external: externalAuthorized,
+        };
+      } catch (error) {
+        const projectedFileError = projectFileRuntimeError(error, payload.method);
+        if (projectedFileError) return projectedFileError;
+        throw error;
       }
-      const candidate = isAbsolute(rawPath) ? resolve(rawPath) : rawPath;
-      const insideRegisteredProject = isAbsolute(candidate) && Array.from(registeredProjects).some((root) => candidate === root || candidate.startsWith(`${root}${process.platform === "win32" ? "\\" : "/"}`));
-      const externalAuthorized = isAbsolute(candidate) && authorizedExternalArtifacts.has(candidate);
-      if (!insideRegisteredProject && !externalAuthorized && isAbsolute(candidate)) {
-        throw new MainBoundaryError("artifact_not_authorized", "Artifact is not authorized by Desktop");
+    } else if (payload.method === "attachment.open" || payload.method === "attachment.reveal" || payload.method === "attachment.copy_path" || payload.method === "attachment.remove") {
+      // Keep the Renderer contract ref-only. The Bridge resolves the current
+      // Session-owned attachment and returns the trusted DTO consumed above.
+      try {
+        if (Object.keys(payload.params).some((key) => key !== "ref")) {
+          throw new MainBoundaryError("attachment_invalid", "Attachment request must contain only a ref");
+        }
+      } catch (error) {
+        const projectedFileError = projectFileRuntimeError(error, payload.method);
+        if (projectedFileError) return projectedFileError;
+        throw error;
       }
-      requestParams = {
-        ...payload.params,
-        ...(isAbsolute(candidate) ? { path: candidate } : {}),
-        authorized_external: externalAuthorized,
-      };
     }
     try {
       await options.runtime.start();
@@ -424,8 +548,13 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       if (payload.method.startsWith("artifact.")) {
         return await handleArtifactResult(result, payload.method);
       }
+      if (payload.method === "attachment.open" || payload.method === "attachment.reveal" || payload.method === "attachment.copy_path") {
+        return await handleAttachmentResult(result, payload.method);
+      }
       return result;
     } catch (error) {
+      const projectedFileError = projectFileRuntimeError(error, payload.method);
+      if (projectedFileError) return projectedFileError;
       // Electron's invoke channel does not preserve custom Error fields.
       // Project this one known turn-start business refusal as JSON so the
       // Renderer can keep the stable image capability kind.
@@ -441,7 +570,13 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
           },
         };
       }
-      if (error instanceof RuntimeBoundaryError || error instanceof RuntimeRequestError) throw error;
+      if (
+        error instanceof MainBoundaryError ||
+        error instanceof RuntimeBoundaryError ||
+        error instanceof RuntimeRequestError
+      ) {
+        throw error;
+      }
       throw new MainBoundaryError("runtime_error", "Desktop Runtime request failed");
     }
   };
@@ -476,6 +611,7 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
   ipc.handle(IPC_CHANNELS.clipboardAttachment, onClipboardAttachment);
   ipc.handle(IPC_CHANNELS.authorizeExternalArtifact, onAuthorizeExternalArtifact);
   ipc.handle(IPC_CHANNELS.closeShell, onCloseShell);
+  ipc.handle(IPC_CHANNELS.rendererDiagnostic, onRendererDiagnostic);
   ipc.handle(IPC_CHANNELS.runtimeRequest, onRuntimeRequest);
   ipc.handle(IPC_CHANNELS.preferenceRead, onReadPreference);
   ipc.handle(IPC_CHANNELS.preferenceWrite, onWritePreference);
@@ -604,6 +740,30 @@ function createMainWindow(): BrowserWindow {
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  window.webContents.on("context-menu", (event, params) => {
+    if (params.formControlType !== "text-area") return;
+    event.preventDefault();
+    const showEditorMenu = (language: DesktopPreferences["language"]) => {
+      if (window.isDestroyed()) return;
+      const labels = language === "zh-CN"
+        ? { cut: "剪切", copy: "复制", paste: "粘贴", selectAll: "全选" }
+        : { cut: "Cut", copy: "Copy", paste: "Paste", selectAll: "Select All" };
+      Menu.buildFromTemplate([
+        { label: labels.cut, role: "cut" },
+        { label: labels.copy, role: "copy" },
+        { label: labels.paste, role: "paste" },
+        { label: labels.selectAll, role: "selectAll" },
+      ]).popup({ window, x: params.x, y: params.y });
+    };
+    const preferenceStore = preferences;
+    if (!preferenceStore) {
+      showEditorMenu(app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en");
+      return;
+    }
+    void preferenceStore.read()
+      .then(({ language }) => showEditorMenu(language))
+      .catch(() => showEditorMenu(app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en"));
+  });
   window.on("close", (event) => {
     if (closing) return;
     event.preventDefault();

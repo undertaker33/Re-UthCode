@@ -11,6 +11,9 @@ import {
 import type { AgentEvent, ArtifactDescriptor, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
+import { type FilePreviewMode } from "./FileCard";
+import { DocumentPreviewPanel, type DocumentPreview, type DocumentPreviewOwner } from "./DocumentPreviewPanel";
+import { RendererErrorBoundary } from "./RendererErrorBoundary";
 import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
@@ -192,13 +195,23 @@ function attachmentDraftFromResult(value: unknown): DesktopAttachmentDraft | nul
   const width = typeof source.width === "number" && Number.isSafeInteger(source.width) && source.width > 0 ? source.width : null;
   const height = typeof source.height === "number" && Number.isSafeInteger(source.height) && source.height > 0 ? source.height : null;
   const dataUrl = typeof source.data_url === "string" && /^data:[^,]+,/.test(source.data_url) ? source.data_url : undefined;
+  const assetRef = stringValue(source.asset_ref);
+  const type = stringValue(source.type);
+  const previewKind = stringValue(source.preview_kind);
+  const previewText = typeof source.text === "string" ? source.text : undefined;
   return {
+    ...(type ? { type } : {}),
+    ...(source.available === true ? { available: true as const } : {}),
     ref,
+    ...(assetRef ? { asset_ref: assetRef } : {}),
     display_name: displayName,
     mime_type: mimeType,
     size_bytes: sizeBytes,
     ...(width !== null ? { width } : {}),
     ...(height !== null ? { height } : {}),
+    ...(previewKind ? { preview_kind: previewKind } : {}),
+    ...(previewText !== undefined ? { text: previewText } : {}),
+    ...(source.truncated === true ? { truncated: true } : {}),
     ...(dataUrl ? { data_url: dataUrl } : {}),
   };
 }
@@ -278,7 +291,9 @@ export function commandResultNotice(
     case "session_created":
       return localize("newSessionNotice");
     case "session_resumed":
-      return localize("sessionResumed");
+      // Session resume is navigation; do not leave a persistent success
+      // notice in the Composer after every ordinary Session selection.
+      return null;
     case "model_selected":
       return localize("commandModelSelected");
     case "behavior_mode_selected":
@@ -375,6 +390,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
   const [pendingProcessPermission, setPendingProcessPermission] = useState<PendingProcessPermission | null>(null);
+  const [documentPreview, setDocumentPreview] = useState<DocumentPreview | null>(null);
+  const [documentPreviewWidth, setDocumentPreviewWidth] = useState(460);
   const pendingProcessPermissionRef = useRef<PendingProcessPermission | null>(null);
   const processStopInFlightRef = useRef<string | null>(null);
   const processPermissionSubmitRef = useRef<string | null>(null);
@@ -387,7 +404,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
     if (!api) throw new Error(t("desktopApiUnavailable"));
-    return api.requestRuntime(method, params);
+    const result = await api.requestRuntime(method, params);
+    const businessKind = runtimeBusinessErrorKind(result);
+    if (businessKind && (method.startsWith("artifact.") || method.startsWith("attachment."))) {
+      const error = new Error("Desktop file action failed") as Error & { kind?: string };
+      error.kind = businessKind;
+      throw error;
+    }
+    return result;
   }, [api, t]);
   const lifecycle = useRuntimeLifecycle({ api, stateRef, dispatch });
   const {
@@ -1348,9 +1372,42 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await send("attachment.remove", { ref });
       dispatch({ type: "composer_attachment_removed", ref });
     } catch (error) {
-      if (isMounted()) dispatch({ type: "notice", text: safeErrorMessage(error, t("attachmentRemoveFailed")) });
+      // FileCard owns attachment action errors so the draft remains visible
+      // beside the action that failed.  Do not turn this local failure into a
+      // global timeline notice.
+      throw error;
     }
-  }, [api, isMounted, send, t]);
+  }, [api, send]);
+
+  const previewAttachment = useCallback(async (ref: string, mode: FilePreviewMode = "thumbnail"): Promise<DesktopAttachmentDraft | null> => {
+    if (!api || !ref) return null;
+    const owner = {
+      generation: runtimeGeneration(),
+      projectKey: stateRef.current.selectedProjectKey,
+      sessionId: stateRef.current.selectedSessionId,
+      viewRevision: stateRef.current.sessionViewRevision,
+    };
+    try {
+      const result = asObject(await send("attachment.preview", { ref, mode }));
+      const current = stateRef.current;
+      if (!isMounted() || runtimeGeneration() !== owner.generation || current.selectedProjectKey !== owner.projectKey || current.selectedSessionId !== owner.sessionId || current.sessionViewRevision !== owner.viewRevision) return null;
+      return attachmentDraftFromResult(asObject(result).attachment);
+    } catch (error) {
+      const current = stateRef.current;
+      if (!isMounted() || current.selectedProjectKey !== owner.projectKey || current.selectedSessionId !== owner.sessionId || current.sessionViewRevision !== owner.viewRevision) return null;
+      throw error;
+    }
+  }, [api, isMounted, runtimeGeneration, send]);
+
+  const openAttachment = useCallback(async (ref: string) => {
+    if (!api || !ref) return;
+    await send("attachment.open", { ref });
+  }, [api, send]);
+
+  const revealAttachment = useCallback(async (ref: string) => {
+    if (!api || !ref) return;
+    await send("attachment.reveal", { ref });
+  }, [api, send]);
 
   const submitComposer = useCallback(async (text: string, attachments: readonly DesktopAttachmentDraft[] = stateRef.current.composerAttachments) => {
     const isCompactionRunning = () => (stateRef.current.compactionStatus.state as string) === "running";
@@ -1657,6 +1714,14 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     await api.copyText(text);
   }, [api]);
 
+  const copyAttachmentPath = useCallback(async (ref: string) => {
+    // Attachment refs are opaque Session identities.  Ask the Bridge to
+    // resolve the current Session-owned derived copy and let Main write the
+    // trusted path to the clipboard; the Renderer never receives or copies a
+    // filesystem path for an attachment.
+    await send("attachment.copy_path", { ref });
+  }, [send]);
+
   const copySessionId = useCallback(async (session: SessionSummary) => {
     try {
       await copyText(session.session_id);
@@ -1667,18 +1732,26 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [copyText, t]);
 
   const openArtifact = useCallback(async (path: string) => {
-    try {
-      await send("artifact.open", { path });
-    } catch {
-      dispatch({ type: "notice", text: t("artifactOpenFailed") });
-    }
-  }, [send, t]);
+    await send("artifact.open", { path });
+  }, [send]);
 
   const artifactDescriptor = useCallback((value: unknown): ArtifactDescriptor | null => {
     const result = asObject(value);
     const artifact = asObject(result.artifact);
     if (typeof artifact.path !== "string" || typeof artifact.name !== "string" || typeof artifact.kind !== "string" || typeof artifact.mime_type !== "string" || typeof artifact.size_bytes !== "number" || typeof artifact.preview_supported !== "boolean") return null;
-    return artifact as unknown as ArtifactDescriptor;
+    return {
+      path: artifact.path,
+      name: artifact.name,
+      kind: artifact.kind,
+      mime_type: artifact.mime_type,
+      size_bytes: artifact.size_bytes,
+      default_action: typeof artifact.default_action === "string" ? artifact.default_action : "open",
+      preview_supported: artifact.preview_supported,
+      ...(typeof artifact.preview_kind === "string" ? { preview_kind: artifact.preview_kind } : {}),
+      ...(typeof artifact.text === "string" ? { text: artifact.text } : {}),
+      ...(artifact.truncated === true ? { truncated: true } : {}),
+      ...(typeof artifact.data_url === "string" && /^data:[^,]+,/.test(artifact.data_url) ? { data_url: artifact.data_url } : {}),
+    };
   }, []);
 
   const describeArtifact = useCallback(async (path: string): Promise<ArtifactDescriptor | null> => {
@@ -1687,10 +1760,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (!descriptor) throw new Error("invalid artifact descriptor");
       return descriptor;
     } catch {
-      dispatch({ type: "notice", text: t("artifactOpenFailed") });
       return null;
     }
-  }, [artifactDescriptor, send, t]);
+  }, [artifactDescriptor, send]);
 
   const authorizeExternalArtifact = useCallback(async (_path: string): Promise<ArtifactDescriptor | null> => {
     if (!api?.authorizeExternalArtifact) return null;
@@ -1701,29 +1773,51 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (!descriptor) throw new Error("invalid authorized artifact descriptor");
       return descriptor;
     } catch {
-      dispatch({ type: "notice", text: t("artifactOpenFailed") });
       return null;
     }
-  }, [api, artifactDescriptor, send, t]);
+  }, [api, artifactDescriptor, send]);
 
   const revealArtifact = useCallback(async (path: string) => {
-    try {
-      await send("artifact.reveal", { path });
-    } catch {
-      dispatch({ type: "notice", text: t("artifactOpenFailed") });
-    }
-  }, [send, t]);
+    await send("artifact.reveal", { path });
+  }, [send]);
 
-  const previewArtifact = useCallback(async (path: string): Promise<ArtifactDescriptor | null> => {
-    try {
-      const descriptor = artifactDescriptor(await send("artifact.preview", { path }));
-      if (!descriptor) throw new Error("invalid artifact preview");
-      return descriptor;
-    } catch {
-      dispatch({ type: "notice", text: t("artifactOpenFailed") });
-      return null;
-    }
-  }, [artifactDescriptor, send, t]);
+  const previewArtifact = useCallback(async (path: string, mode?: FilePreviewMode): Promise<ArtifactDescriptor | null> => {
+    const descriptor = artifactDescriptor(await send("artifact.preview", { path, mode: mode ?? "full" }));
+    if (!descriptor) throw new Error("invalid artifact preview");
+    return descriptor;
+  }, [artifactDescriptor, send]);
+
+  const documentPreviewMatchesCurrent = useCallback((preview: DocumentPreview | null): boolean => {
+    const owner = preview?.owner;
+    if (!owner) return false;
+    const current = stateRef.current;
+    return owner.generation === runtimeGeneration()
+      && owner.projectKey === current.selectedProjectKey
+      && owner.sessionId === current.selectedSessionId
+      && owner.viewRevision === current.sessionViewRevision;
+  }, [runtimeGeneration]);
+
+  const openDocumentPreview = useCallback((preview: DocumentPreview) => {
+    const current = stateRef.current;
+    const owner: DocumentPreviewOwner = {
+      generation: runtimeGeneration(),
+      projectKey: current.selectedProjectKey,
+      sessionId: current.selectedSessionId,
+      viewRevision: current.sessionViewRevision,
+    };
+    const onOpen = preview.onOpen;
+    setDocumentPreview({
+      ...preview,
+      owner,
+      onOpen: onOpen
+        ? async () => {
+          const currentPreview: DocumentPreview = { ...preview, owner };
+          if (!documentPreviewMatchesCurrent(currentPreview)) return;
+          await onOpen();
+        }
+        : undefined,
+    });
+  }, [documentPreviewMatchesCurrent, runtimeGeneration]);
 
   const removeProject = useCallback(async (project: ProjectState) => {
     const current = stateRef.current;
@@ -1918,6 +2012,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     if (document.activeElement === document.body) focusModeToggleRef.current?.focus();
   }, [state.focusMode]);
 
+  useEffect(() => {
+    if (!documentPreview || documentPreviewMatchesCurrent(documentPreview)) return;
+    setDocumentPreview(null);
+  }, [documentPreview, documentPreviewMatchesCurrent, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision]);
+
+  const visibleDocumentPreview = documentPreviewMatchesCurrent(documentPreview) ? documentPreview : null;
+  const documentPreviewVisible = state.view === "chat" && visibleDocumentPreview !== null;
+  const documentPreviewMinWidth = 220;
+  const documentSidebarWidth = state.focusMode || (documentPreviewVisible && viewportWidth <= 620)
+    ? 0
+    : narrowViewport
+      ? Math.max(112, Math.min(154, viewportWidth * 0.3))
+      : state.sidebarWidth;
+  const documentPreviewMaxWidth = Math.max(documentPreviewMinWidth, viewportWidth - documentSidebarWidth - CONVERSATION_MIN_WIDTH);
+  const effectiveDocumentPreviewWidth = Math.min(documentPreviewWidth, documentPreviewMaxWidth);
+
   const runtimeVisible = !state.focusMode && state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
   useLayoutEffect(() => {
     if (!runtimeVisible || !runtimeFocusHandoffRef.current) return;
@@ -1979,7 +2089,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <button ref={focusModeToggleRef} type="button" className="icon-button focus-mode-toggle" title={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-label={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-pressed={state.focusMode} onClick={() => setFocusMode(!state.focusMode)}><UiIcon name="focus" /><span className="sr-only">{state.focusMode ? t("exitFocusMode") : t("enterFocusMode")}</span></button>
         </div>
       </header>
-      <ChatTimeline
+       <RendererErrorBoundary name="timeline"><ChatTimeline
         entries={state.timeline}
         // TodoWrite is anchored to the composer; keep the timeline focused on
         // conversation and durable replay records.
@@ -2008,6 +2118,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         onAuthorizeArtifact={authorizeExternalArtifact}
         onRevealArtifact={revealArtifact}
         onPreviewArtifact={previewArtifact}
+        onCopyPath={copyText}
+        onOpenDocument={openDocumentPreview}
+        onPreviewAttachment={previewAttachment}
+        onOpenAttachment={openAttachment}
+        onRevealAttachment={revealAttachment}
+        onCopyAttachmentPath={copyAttachmentPath}
         onLoadOlder={loadOlderHistory}
         onRetryOlder={retryHistory}
         historyHasMore={visibleHistory?.hasMore ?? false}
@@ -2023,12 +2139,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           : {}}
         onReadProcess={readProcess}
         onStopProcess={stopProcess}
-        sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
-      />
+         sessionKey={`${state.selectedProjectKey ?? ""}:${state.selectedSessionId ?? ""}:${state.sessionViewRevision}`}
+       /></RendererErrorBoundary>
       {processPermissionInteraction
         ? <InteractionSurface key={interactionSurfaceKey(processPermissionInteraction)} interaction={processPermissionInteraction} onSubmit={submitProcessPermission} onCancel={cancelProcessPermission} showCancel />
         : state.pendingInteraction && <InteractionSurface key={interactionSurfaceKey(state.pendingInteraction)} interaction={state.pendingInteraction} onSubmit={sendInteraction} onCancel={cancelTurn} />}
-      <Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} onChooseAttachment={chooseAttachment} onPasteAttachment={pasteAttachment} onImportFile={importDroppedAttachment} onRemoveAttachment={removeAttachment} />
+      <RendererErrorBoundary name="composer"><Composer state={state} sessionPreparationStatus={visiblePreparation} onChange={(text) => { dispatch({ type: "composer_text", text }); void completeCommand(text); }} onDismissCompletion={() => dispatch({ type: "command_candidates", result: { candidates: [], argument_candidates: [] } })} onSubmit={submitComposer} onCommand={executeCommand} onPause={pauseTurn} onCancel={cancelTurn} onCompactCancel={cancelCompaction} onChooseAttachment={chooseAttachment} onPasteAttachment={pasteAttachment} onImportFile={importDroppedAttachment} onRemoveAttachment={removeAttachment} onPreviewAttachment={previewAttachment} onOpenAttachment={openAttachment} onRevealAttachment={revealAttachment} onCopyAttachmentPath={copyAttachmentPath} onOpenDocument={openDocumentPreview} /></RendererErrorBoundary>
     </>
   );
 
@@ -2043,14 +2159,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const shellStyle = {
     "--sidebar-width": narrowViewport ? "clamp(112px, 30vw, 154px)" : `${state.sidebarWidth}px`,
     "--runtime-width": narrowViewport ? "0px" : `${state.runtimePanelWidth}px`,
+    "--document-preview-width": `${effectiveDocumentPreviewWidth}px`,
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
-    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}`} style={shellStyle}>
-      {state.view === "chat" && !state.focusMode && <Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} />}
+    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}${documentPreviewVisible ? " document-preview-visible" : ""}`} style={shellStyle}>
+       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} /></RendererErrorBoundary>}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
-      {state.view === "chat" && !state.focusMode && <RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} />}
+       {state.view === "chat" && !state.focusMode && !documentPreviewVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
+       {documentPreviewVisible && visibleDocumentPreview && <RendererErrorBoundary name="document-preview"><DocumentPreviewPanel preview={visibleDocumentPreview} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onClose={() => setDocumentPreview(null)} /></RendererErrorBoundary>}
       {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}
-      {wideLayout && state.panelMode === "docked" && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
+      {wideLayout && state.panelMode === "docked" && !documentPreviewVisible && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
     </div>
   </LanguageProvider>;
 }
