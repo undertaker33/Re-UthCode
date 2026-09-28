@@ -1468,7 +1468,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         compactionStatus: { state: "idle", trigger: null, changed: null },
         ...(modelRef ? { currentModelRef: modelRef, sessionModels: { ...stateWithCache.sessionModels, [action.sessionId]: modelRef } } : {}),
         sessionViewRevision: stateWithCache.sessionViewRevision + 1,
-        notice: "New Session",
+        notice: null,
         runtimeError: null,
       };
       const key = sessionRuntimeKey(stateWithCache.selectedProjectKey, action.sessionId);

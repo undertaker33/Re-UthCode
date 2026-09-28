@@ -30,7 +30,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Settings 的 Provider→Model 编辑始终使用同一个 modal root、focus trap 和 return-focus owner。非秘密配置由 Settings 页面 draft 持有；reveal 值只存在 editor-local state，待写入的 replacement ref 只为失败重试保留，Save 仍经 Configuration Application 出口。Session ID 与 Markdown code fence 原文复制共用 `copyText`。
 - `[FACT]` Sidebar/Runtime panel 宽度由 Renderer layout state 管理，viewport/窄屏只做 presentation clamp，稳定 separator commit 才写 preference。Focus Mode 是 Renderer-only transient：隐藏 Sidebar/Runtime，退出时恢复进入前的 `panelMode`/宽度且不写 preference；`Last Provider Request Usage` 与 Current Context 数值始终分离。
 - `[FACT]` 侧栏历史容器只允许纵向滚动；会话按钮跨过悬停信息包装保持 flex 收缩，长标题省略而不挤出菜单按钮。项目整行（菜单和编辑输入除外）切换展开状态，选中子会话不阻止收起。侧栏移除缓存和项目归属行内标签，悬停卡片展示项目/会话名称及所属路径；Runtime 布局使用隐藏、浮动、停靠三个图标按钮，专注模式使用独立图标。
-- `[FACT]` Composer 不再展示就绪/运行中的通用状态文案；运行结束且用户未将焦点移至其他控件时恢复输入焦点。回复或压缩完成产生会话级未读标记，只有可见且获得焦点的窗口已显示聊天尾部才清除；清除标记不删除聊天内容。
+- `[FACT]` Composer 不显示通用运行状态，也不承载操作回执；打开 Picker、普通模型/模式/权限选择以及新建 Session 不触发提示。权限警告和命令错误以轻量图标与文字显示在聊天尾部；Runtime error 由可见的 Runtime panel 或聊天尾部单一呈现。Compact 命令结果不重复生成临时 notice，压缩状态和结果由聊天中的压缩提示及按提交位置排列的持久记录展示。运行结束且用户未将焦点移至其他控件时恢复输入焦点。回复或压缩完成产生会话级未读标记，只有可见且获得焦点的窗口已显示聊天尾部才清除；清除标记不删除聊天内容。
 - `[FACT]` 压缩进度是聊天中的单行提示，运行时带旋转与省略点动画。完成后的持久提示来自历史页，按实际提交位置排列，不固定在最新回复之后；刷新最近页保留已加载旧页和游标，不自动补载全部历史。失败、取消和无需变更的即时提示不被既有成功记录遮蔽。
 - `[BOUNDARY]` 现有 CDP/packaged acceptance 使用隔离 profile、DOM/keyboard/CDP 合成输入和 CSS viewport 观察；它可以证明 Renderer/Bridge/Application 投影与键盘/ARIA/布局合同，但不等同于 native pointer、Windows 原生缩放或人工视觉验收。未具备这些环境时不能把 synthetic viewport 或普通 mouse 对照写成 native input PASS。
 - `[FACT]` 手动 `/compact` 返回操作身份后由 Session 所属的后台任务执行，Bridge 通过带 `session_id`、`project_key`、`operation_id` 的 `compaction_operation` 通知投影进度和结果。Composer 锁定该 Session 的普通输入并提供显式取消入口，`compaction.cancel` 校验 Session/操作身份；状态区分 completed、no_change、cancelled、failed，另保留有效提交 `changed` 与安全 `reason`，Runtime 面板显示原因和提交说明。无需 Compact 的成功 no-op 不伪造一次成功压缩。
@@ -82,7 +82,7 @@ visible Session A 有 active Turn
 Session 附件由 Application `AttachmentService` 按 Session/ref 定位，产物由 `ArtifactService` 维持既有工作目录及外部单路径授权检查。预览通过 Bridge DTO 传入 Renderer，缩略图与按需大图分开请求；文本预览有界并携带截断状态。Renderer 不读取文件系统，也不直接调用 shell。系统打开和定位由 Main 消费受信描述后执行；模型写出普通路径不构成打开授权。
 
 `FileCard.tsx` 承担附件和产物的类型展示、菜单与图片模态交互；图片缩略图使用紧凑等比展示，不渲染名称、类型、大小等可见元数据，保留可访问名称。未发送附件有直接移除入口，已发送附件没有移除操作。Composer 以纯加号提供文件选择，文本右键菜单仅提供剪切、复制、粘贴、全选，与附件卡片菜单分离；`DocumentPreviewPanel.tsx` 承担只读文本、Markdown 渲染/源码和 Prism 语法高亮。图片模态独立于聊天排版，文本面板与 Runtime 共用右侧空间。文件预览状态属于 Interface，不进入 Agent RunState 或 Provider 请求。当前修复的最终界面和构建验收状态以 T11 原 W06 Feedback 为准，不将新增组件存在视为验收完成。
-局部渲染错误由 `RendererErrorBoundary` 隔离并提供恢复入口，错误事实通过 preload/Main 的允许边界名称进入既有 `runtime_diagnostic`，不把异常原文或 stack 传入界面诊断。附件卡片操作失败返回对应文件卡片提示；发送能力拦截在 Composer 附近说明原因并保留草稿。历史附件以消息 identity 组合展示，缩略图按可见范围请求，Session 切换后拒绝迟到结果。
+局部渲染错误由 `RendererErrorBoundary` 隔离并提供恢复入口，错误事实通过 preload/Main 的允许边界名称进入既有 `runtime_diagnostic`，不把异常原文或 stack 传入界面诊断。附件卡片操作失败返回对应文件卡片提示；发送能力拦截在聊天尾部说明原因并保留草稿；invalid_provider_response 失败条目显示本地化的内容不完整说明与重新发送或换模型建议，不向用户展示内部错误码。历史附件以消息 identity 组合展示，缩略图按可见范围请求，Session 切换后拒绝迟到结果。
 
 ## 修改路由
 

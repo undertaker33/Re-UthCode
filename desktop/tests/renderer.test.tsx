@@ -496,7 +496,7 @@ test("T06 Runtime error owns one accessible DOM entity across renderer modes", a
         for (const scenario of scenarios) {
           Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: scenario.width });
           const error = translate(language, "runtimeStartFailed");
-          const state = createInitialState({ language, theme, panelMode: scenario.panelMode, runtimeState: "configuration_required", runtimeError: error, notice: error });
+          const state = createInitialState({ language, theme, panelMode: scenario.panelMode, runtimeState: "configuration_required", runtimeError: error, notice: error, timeline: [{ id: "latest", kind: "assistant", text: "Latest response" }] });
           const stored: DesktopPreferences = { theme, language, windowBounds: { width: scenario.width, height: 800, maximized: false }, panelMode: scenario.panelMode, sidebarWidth: 286, runtimePanelWidth: 318, recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: null, selectedSessionId: null };
           const api: DesktopApi = { openProject: async () => null, openProjectInExplorer: async () => undefined, copyText: async () => undefined, closeShell: async () => undefined, requestRuntime: async () => ({}), subscribeAgentEvents: () => () => undefined, readPreference: async (key) => stored[key], writePreference: async () => stored };
           act(() => { root.render(<App key={`${theme}-${language}-${scenario.width}-${scenario.panelMode}-${renderIndex++}`} initialState={state} api={api} />); });
@@ -512,11 +512,15 @@ test("T06 Runtime error owns one accessible DOM entity across renderer modes", a
 
           const composer = container.querySelector<HTMLElement>(".composer");
           assert.ok(composer);
+          assert.equal(composer?.querySelector(".composer-notice"), null, "notices are not duplicated above the input");
           if (scenario.owner === "timeline") {
             const notice = container.querySelector<HTMLElement>(".timeline-runtime-error");
             assert.ok(notice);
             assert.equal(notice?.parentElement?.classList.contains("timeline"), true);
             assert.equal(notice?.getAttribute("role"), "alert");
+            const timelineChildren = Array.from(notice?.parentElement?.children ?? []);
+            const latestIndex = timelineChildren.findIndex((child) => child.classList.contains("timeline-entry--assistant"));
+            assert.ok(latestIndex >= 0 && timelineChildren.indexOf(notice!) > latestIndex, "Runtime error is placed after the latest conversation entry");
             const openSettings = notice?.querySelector<HTMLButtonElement>("button");
             assert.ok(openSettings, "configuration error keeps a reachable settings action");
             assert.equal(openSettings?.textContent, translate(language, "openSettings"));
@@ -1151,8 +1155,26 @@ test("T09 typed command results localize semantic codes and reject free-form out
   const typed = { command: "compact", status: "success", code: "compact_completed", params: {}, ui_action: null };
   assert.equal(isDesktopCommandResult(typed), true);
   assert.equal(isDesktopCommandResult({ ...typed, output: "native/private output" }), false);
-  assert.equal(commandResultNotice({ ...typed, output: "native/private output" }, (key) => translate("en", key)), "Compaction · completed");
-  assert.equal(commandResultNotice({ ...typed, code: "compact_no_change" }, (key) => translate("zh-CN", key)), "上下文压缩 · 无变化");
+  assert.equal(commandResultNotice({ ...typed, output: "native/private output" }, (key) => translate("en", key)), null);
+  assert.equal(commandResultNotice({ ...typed, code: "compact_no_change" }, (key) => translate("zh-CN", key)), null);
+
+  const localizeEn = (key: Parameters<typeof translate>[1]) => translate("en", key);
+  for (const code of [
+    "session_created",
+    "model_selected",
+    "behavior_mode_selected",
+    "model_picker_opened",
+    "permission_picker_opened",
+    "session_picker_opened",
+  ]) {
+    assert.equal(commandResultNotice({ ...typed, code }, localizeEn), null, `${code} is an ordinary action receipt`);
+  }
+  assert.equal(commandResultNotice({ ...typed, code: "permission_mode_selected", params: {} }, localizeEn), null);
+  assert.equal(
+    commandResultNotice({ ...typed, code: "permission_mode_selected", params: { warning: true } }, localizeEn),
+    "Full access selected; explicit safeguards still apply",
+  );
+  assert.equal(commandResultNotice({ ...typed, code: "command_failed", status: "error" }, localizeEn), "Command could not be executed. Try again.");
 
   const state = reduceRendererState(createInitialState(), {
     type: "command_result",
@@ -4643,6 +4665,60 @@ test("compaction timeline keeps chronological notices and shows running or faile
   assert.match(render("cancelled result", false, false), /cancelled result/u);
 });
 
+test("ChatTimeline places transient notices and Runtime errors after the latest conversation entry", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const entries = [
+      { id: "earlier", kind: "assistant" as const, text: "Earlier response", status: "completed" as const },
+      { id: "latest", kind: "assistant" as const, text: "Latest response", status: "completed" as const },
+    ];
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} notice="Command failed. Try again." runtimeError="Configuration is required." onOpenSettings={() => undefined} /></LanguageProvider>);
+    });
+
+    const timeline = container.querySelector<HTMLElement>(".timeline");
+    const children = Array.from(timeline?.children ?? []);
+    const latestIndex = children.findIndex((child) => child.textContent?.includes("Latest response"));
+    const runtimeError = container.querySelector<HTMLElement>(".timeline-runtime-error");
+    const notice = container.querySelector<HTMLElement>(".timeline-notice");
+    assert.ok(runtimeError && notice);
+    assert.ok(latestIndex >= 0 && children.indexOf(runtimeError!) > latestIndex);
+    assert.ok(children.indexOf(notice!) > children.indexOf(runtimeError!), "the current notice follows the Runtime error at the conversation tail");
+    assert.equal(runtimeError?.getAttribute("role"), "alert");
+    assert.equal(runtimeError?.querySelector(".timeline-notice__icon")?.getAttribute("aria-hidden"), "true");
+    assert.equal(runtimeError?.querySelector("button")?.textContent, "Open Settings");
+    assert.equal(notice?.getAttribute("role"), "status");
+    assert.equal(notice?.querySelector(".timeline-notice__icon")?.getAttribute("aria-hidden"), "true");
+  });
+});
+
+test("invalid Provider response failure shows localized guidance as a lightweight chat status", async () => {
+  const cases = [
+    ["en", "The model returned an incomplete response and could not complete the reply. You can send it again or choose a different model."],
+    ["zh-CN", "模型返回的内容不完整，未能完成回复。可重新发送，或选择其他模型。"],
+  ] as const;
+  for (const [language, expected] of cases) {
+    await withRendererDom(async (_dom, container, root) => {
+      const entries = [
+        { id: "partial", kind: "assistant" as const, text: "Partial reply" },
+        { id: "failed", kind: "status" as const, text: "Turn failed: invalid_provider_response", status: "failed" as const },
+      ];
+      act(() => {
+        root.render(<LanguageProvider value={language}><ChatTimeline entries={entries} todo={[]} /></LanguageProvider>);
+      });
+
+      const timeline = container.querySelector<HTMLElement>(".timeline");
+      const failure = container.querySelector<HTMLElement>(".timeline-notice--failure");
+      assert.ok(timeline && failure);
+      assert.equal(timeline?.lastElementChild, failure, "the failure remains at the conversation tail");
+      assert.equal(failure?.getAttribute("role"), "alert");
+      assert.equal(failure?.querySelector(".timeline-notice__icon")?.getAttribute("aria-hidden"), "true");
+      assert.equal(failure?.textContent, expected);
+      assert.equal(container.querySelector(".timeline-entry--status"), null, "this failure does not use the Runtime header or gray status rail");
+      assert.doesNotMatch(container.textContent ?? "", /invalid_provider_response/u);
+    });
+  }
+});
+
 test("Composer restores input after completion without stealing another control's focus", async () => {
   await withRendererDom(async (dom, container, root) => {
     Object.defineProperty(dom.window.document, "hasFocus", { configurable: true, value: () => true });
@@ -4731,7 +4807,9 @@ test("Prompt 4 theme and responsive CSS contracts cover context ring and compose
   assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.runtime-panel--floating\s*\{[^}]*width:\s*min\(304px, calc\(100vw - 16px\)\)/);
   assert.doesNotMatch(css, /@media \(max-width: 520px\)[\s\S]*?\.sidebar[^}]*display:\s*none/);
   assert.match(css, /\.runtime-panel--floating\s*\{[^}]*background:\s*var\(--surface\)[^}]*box-shadow:/);
-  assert.match(css, /\.timeline-runtime-error\s*\{[^}]*position:\s*sticky;[^}]*overflow:\s*auto;[^}]*background:\s*var\(--surface\)/s);
+  assert.match(css, /\.timeline-notice,\s*\.timeline-runtime-error\s*\{[^}]*display:\s*flex;[^}]*color:\s*var\(--muted\)/s);
+  assert.match(css, /\.timeline-notice__icon\s*\{[^}]*color:\s*var\(--faint\)/s);
+  assert.doesNotMatch(css, /\.timeline-runtime-error\s*\{[^}]*border-left:\s*3px solid var\(--danger\)/s);
   assert.match(css, /\.runtime-panel__error\s*\{[^}]*border-left:\s*3px solid var\(--danger\);[^}]*background:\s*var\(--surface\)/s);
   assert.match(css, /@media \(max-width: 520px\)[\s\S]*?\.timeline-runtime-error\s*\{[^}]*flex-wrap:\s*wrap/);
   assert.doesNotMatch(css, /\.configuration-banner\s*\{/u);
@@ -4740,6 +4818,6 @@ test("Prompt 4 theme and responsive CSS contracts cover context ring and compose
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?scroll-behavior:\s*auto[\s\S]*?transition-duration:\s*0\.01ms/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "dark" })} api={undefined} />), /theme-dark/);
   assert.match(renderLanguage("en", <App initialState={createInitialState({ theme: "light" })} api={undefined} />), /theme-light/);
-  assert.ok(contrastRatio("#f0f0f3", "#242427") >= 4.5, "dark Runtime error text remains readable on its opaque surface");
-  assert.ok(contrastRatio("#202027", "#ffffff") >= 4.5, "light Runtime error text remains readable on its opaque surface");
+  assert.ok(contrastRatio("#f0f0f3", "#242427") >= 4.5, "dark Runtime panel error text remains readable on its opaque surface");
+  assert.ok(contrastRatio("#202027", "#ffffff") >= 4.5, "light Runtime panel error text remains readable on its opaque surface");
 });

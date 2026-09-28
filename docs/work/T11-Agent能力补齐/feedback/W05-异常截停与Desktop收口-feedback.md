@@ -294,3 +294,27 @@ Main bundle 与定向 Renderer 检查均通过。完整测试中的构建 smoke 
 ### 验收环境口径澄清（2026-09-25）
 
 上节将总控的 104px 图片、草稿 X、Python 着色和窄列布局检查称为开发窗口，环境口径不准确：这些检查实际在标准 package 生成的 UthCode.exe 中完成。最终中文菜单和真实剪贴板检查另在串行重建的产物中完成；原 W06 Feedback 已分别记录，不扩大其余包级验收结论。
+
+## Renderer 操作提示收口（2026-09-28）
+
+普通 Picker 打开、模型/模式/权限选择及新建 Session 不再产生操作回执，Composer 不承载 notice；权限警告和命令错误移至聊天尾部轻量显示。Runtime error 保持单一展示，Compact 命令回执由现有压缩状态行和按提交位置排列的持久记录承载。新建 Session 清除旧 notice。
+
+本轮修改涉及 `desktop/src/renderer/{App.tsx,ChatTimeline.tsx,Composer.tsx,state.ts,app.css}` 与 `desktop/tests/renderer{.test.tsx,-state.test.ts}`。`npx tsx --test tests/renderer.test.tsx tests/renderer-state.test.ts`（`desktop/`）结果为 `155 passed, 0 failed, 0 skipped`；测试输出有两条 SidebarInfo 的 React `act(...)` 警告。`npm run typecheck`（`desktop/`）通过，`git diff --check` 通过。未执行人工窗口验收，待总控记录；本轮不改变 T11 包级状态。
+
+
+### 总控实测与 Anthropic 兼容补修（2026-09-28）
+
+修复前，总控在标准包中复现新会话创建失败；原 6362e7ed 会话仍可通过 compatible 配置返回 TEST-927。独立预检定位到默认 Anthropic 配置的 models.retrieve 返回 HTTP 404，并非 Messages 请求失败。Provider 现仅将该可选元数据接口的 404 视为限额未知，继续使用配置或默认预算；认证、限流、服务错误和超时继续抛出。真实短请求 count 探测成功，未改用户配置。
+
+标准 npm run package（构建记录 50313）及 Runtime smoke 通过。总控 CU 已用该包创建 Session 54c2b28a45984d228be1b01aef00ad97；首条消息返回 thinking 后出现 invalid_provider_response，尚未收到正文。阿里云官方文档明确其 thinking/signature_delta 签名固定为空字符串，当前适配器却拒绝空签名；随后补修接收与历史回放，显式空签名原样保留，缺失或非字符串继续拒绝。此补修尚未包含在 50313 包中，不能把前述新建成功记为完整生成验收通过。参考：https://help.aliyun.com/zh/model-studio/anthropic-api-messages。
+
+Renderer 对该精确失败状态补充中英文可操作说明，使用聊天内轻量提示行，不展示内部码。其最终定向测试 1 passed、typecheck 通过；此前完整 renderer.test.tsx 为 106 passed，之后仅删除过严的 isError 条件并重跑该定向用例。Python 定向 tests/test_anthropic_integration.py 与 tests/test_provider_model_limits.py 最终 41 passed、1 skipped；架构边界 23 passed（签名补修前执行，补修未改变依赖边界）。GPT-6 Sol / medium 对两组补修复审 PASS。当前仍待包含签名补修的最终包与两轮真实对话验收，T11 整包未验收项不变。
+
+
+### 最终包两轮真实调用验收（2026-09-28）
+
+标准 `npm run package`（构建记录 53289）exit 0，包含最终签名补修与错误展示改动；内置 Runtime ready/status/shutdown JSONL 及 prompt asset smoke 通过。产物为 `desktop/out/UthCode-win32-x64/UthCode.exe`。
+
+总控亲自通过 Computer Use 在该包中新建会话 fe660e7e，使用当前默认 Anthropic 协议的 qwen3.7-flash：第一轮收到 `NEW-928-OK`，同会话第二轮收到 `FOLLOWUP-928`，两轮均未调用工具。这补齐了新建、首次生成、含 thinking 历史回放的真实验证。恢复旧 54c2b28a 会话时，原失败记录显示为对话中的轻量中文原因与下一步提示，不再暴露内部错误码；Composer 上方无提示条。模型菜单打开并 Escape 关闭后没有新增操作回执，未修改模型配置。
+
+本轮修复和独立复审已通过，最终包关键路径通过；不据此扩大为 T11 全包通过。其他 Provider 视觉矩阵、Tavily、POSIX、官方 SWE 等此前未验收项保持原状。UTF-8 guard 检查本轮四份变动文档，通过，无编码修复。

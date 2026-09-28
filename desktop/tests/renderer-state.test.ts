@@ -119,9 +119,10 @@ test("T04 session transitions replace replay and keep new session empty", () => 
   });
   assert.equal(resumed.selectedSessionId, "two");
   assert.deepEqual(resumed.timeline.map((entry) => entry.text), ["restored"]);
-  const fresh = reduceRendererState(resumed, { type: "session_new", sessionId: "three", run: { run_id: "fresh-run", status: "idle" } });
+  const fresh = reduceRendererState({ ...resumed, notice: "An earlier Session error" }, { type: "session_new", sessionId: "three", run: { run_id: "fresh-run", status: "idle" } });
   assert.equal(fresh.selectedSessionId, "three");
   assert.deepEqual(fresh.timeline, []);
+  assert.equal(fresh.notice, null, "a new Session must not display an earlier notice or a New Session receipt");
   assert.equal(fresh.activeTurn, false);
   assert.equal(fresh.run?.run_id, "fresh-run");
 });
