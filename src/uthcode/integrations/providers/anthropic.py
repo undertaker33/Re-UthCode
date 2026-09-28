@@ -75,12 +75,15 @@ class _ContentBlockState:
     index: int
     kind: str
     text: str = ""
-    signature: str = ""
+    signature: str | None = None
     redacted_data: str = ""
     tool_call_id: str = ""
     tool_name: str = ""
     arguments: str = ""
     closed: bool = False
+
+
+_MISSING_SIGNATURE = object()
 
 
 def _field(value: object, name: str, default: object = None) -> object:
@@ -195,7 +198,7 @@ def _assistant_content(
                 content.append({"type": "redacted_thinking", "data": data})
                 continue
             signature = native.payload.get("signature")
-            if not isinstance(signature, str) or not signature:
+            if not isinstance(signature, str):
                 raise InvalidProviderResponseError(
                     "Anthropic thinking signature is invalid"
                 )
@@ -406,9 +409,14 @@ class AnthropicProvider:
         retrieve = getattr(models_api, "retrieve", None)
         if not callable(retrieve):
             return None
-        value = retrieve(model)
-        if inspect.isawaitable(value):
-            value = await value
+        try:
+            value = retrieve(model)
+            if inspect.isawaitable(value):
+                value = await value
+        except APIStatusError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
         max_input = _positive_optional_int(
             _field(value, "max_input_tokens"),
         )
@@ -575,9 +583,16 @@ class AnthropicProvider:
                         state.text = _text(_field(block, "text", ""), "text block")
                     elif kind == "thinking":
                         state.text = _text(_field(block, "thinking", ""), "thinking block")
-                        state.signature = _text(
-                            _field(block, "signature", ""), "thinking signature"
+                        signature = _field(
+                            block,
+                            "signature",
+                            _MISSING_SIGNATURE,
                         )
+                        if signature is not _MISSING_SIGNATURE:
+                            state.signature = _text(
+                                signature,
+                                "thinking signature",
+                            )
                     elif kind == "redacted_thinking":
                         state.redacted_data = _text(
                             _field(block, "data", ""), "redacted thinking data"
@@ -641,7 +656,7 @@ class AnthropicProvider:
                         signature = _text(
                             _field(delta, "signature"), "thinking signature delta"
                         )
-                        state.signature += signature
+                        state.signature = (state.signature or "") + signature
                     elif delta_type == "input_json_delta":
                         partial = _text(
                             _field(delta, "partial_json"), "tool arguments delta"
@@ -674,9 +689,10 @@ class AnthropicProvider:
                         )
                     state.closed = True
                     if state.kind == "thinking":
-                        if not state.signature:
+                        signature = state.signature
+                        if signature is None:
                             raise InvalidProviderResponseError(
-                                "Anthropic thinking block has no signature"
+                                "Anthropic thinking block has no signature field"
                             )
                         part: TextPart | ReasoningPart | ToolCallPart = ReasoningPart(state.text)
                         item = NativeItem(
@@ -688,7 +704,7 @@ class AnthropicProvider:
                             payload={
                                 "type": "thinking",
                                 "thinking": state.text,
-                                "signature": state.signature,
+                                "signature": signature,
                             },
                         )
                     elif state.kind == "redacted_thinking":

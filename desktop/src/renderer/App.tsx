@@ -279,37 +279,31 @@ export function commandResultNotice(
     case "help_ready":
       return localize("commandHelp");
     case "compact_started":
-      return `${localize("compaction")} · ${localize("running")}`;
     case "compact_completed":
-      return `${localize("compaction")} · ${localize("completed")}`;
     case "compact_no_change":
-      return `${localize("compaction")} · ${localize("noChange")}`;
     case "compact_cancelled":
-      return `${localize("compaction")} · ${localize("cancelled")}`;
     case "compact_failed":
-      return `${localize("compaction")} · ${localize("failed")}`;
+      // Compaction status and its durable timeline row own these outcomes.
+      return null;
     case "session_created":
-      return localize("newSessionNotice");
+      return null;
     case "session_resumed":
       // Session resume is navigation; do not leave a persistent success
       // notice in the Composer after every ordinary Session selection.
       return null;
     case "model_selected":
-      return localize("commandModelSelected");
     case "behavior_mode_selected":
-      return localize("commandModeSelected");
+      return null;
     case "permission_mode_selected": {
       const params = asObject(source.params);
       return params.warning === true
         ? localize("commandPermissionWarning")
-        : localize("commandPermissionSelected");
+        : null;
     }
     case "model_picker_opened":
-      return localize("chooseModel");
     case "permission_picker_opened":
-      return localize("permission");
     case "session_picker_opened":
-      return localize("session");
+      return null;
     case "transcript_cleared":
       return null;
     case "command_unavailable":
@@ -2098,7 +2092,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           state.notice,
           state.runtimeState === "restarting" ? t("runtimeRestarting") : null,
           state.terminalStatusPending ? t("terminalStatusPending") : null,
-        ].filter(Boolean))].join(" · ") || null}
+        ].filter((text) => Boolean(text) && text !== state.runtimeError))].join(" · ") || null}
         onLatestSeen={markLatestSeen}
         compactionAnchor={activity?.compactionAnchor}
         compactionRunning={displayedCompaction.state === "running"}

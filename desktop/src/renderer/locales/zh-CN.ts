@@ -18,4 +18,5 @@ export const zhCN = {
   completionBlockedLabel: "无法完成", unfinishedTasks: "个未完成任务",
   commandDescriptionModel: "查看或切换当前模型", commandDescriptionStatus: "显示当前 Application 状态", commandDescriptionCompact: "压缩上下文", commandDescriptionPlan: "进入规划模式", commandDescriptionNew: "创建新会话", commandDescriptionDo: "进入默认执行模式", commandCompleted: "命令已完成", commandHelp: "命令帮助", commandModelSelected: "模型已选择", commandModeSelected: "模式已切换", commandPermissionSelected: "权限已选择", commandPermissionWarning: "已选择完全访问；显式安全约束仍然生效",
   codeBlock: "代码块", copyCode: "复制代码", copiedCode: "代码已复制", copyCodeFailed: "无法复制代码", newMessages: "新消息", jumpToLatest: "回到底部", loadOlder: "加载更早记录", sessionPreparing: "正在准备会话…", sessionPreparationFailed: "会话准备失败，请重新选择后重试。",
+  incompleteProviderResponse: "模型返回的内容不完整，未能完成回复。可重新发送，或选择其他模型。",
 } as const;

@@ -88,6 +88,7 @@ function localText(value: string, t: (key: TranslationKey) => string): string {
   }
   if (value.startsWith("Turn failed: ")) {
     const reason = value.slice("Turn failed: ".length);
+    if (reason === "invalid_provider_response") return t("incompleteProviderResponse");
     return `${t("turnFailed")}: ${reason === "runtime error" ? t("runtimeError") : reason}`;
   }
   return value;
@@ -396,16 +397,11 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
 
   return (
     <section ref={timelineRef} className="timeline" aria-label={t("chatTimeline")} data-session-key={sessionKey} onScroll={onScroll}>
-      {runtimeError && !runtimeErrorVisible && <div className="timeline-runtime-error" data-runtime-error-owner="timeline" role="alert">
-        <span>{runtimeError}</span>
-        {onOpenSettings && <button type="button" onClick={onOpenSettings}>{t("openSettings")}</button>}
-      </div>}
       {preparationStatus === "preparing" && <p className="timeline-preparation" role="status">{t("sessionPreparing")}</p>}
       {preparationStatus === "failed" && <p className="timeline-preparation timeline-preparation--failed" role="alert">{t("sessionPreparationFailed")}</p>}
       {historyError && <div className="timeline-history-error" role="alert"><span>{historyError}</span>{onRetryOlder && <button type="button" onClick={retryOlder}>{t("retry")}</button>}</div>}
       {historyLoading && <p className="timeline-history-loading" role="status">{t("loadOlder")}…</p>}
       {historyHasMore && !historyLoading && onLoadOlder && entries.length > 0 && <button type="button" className="timeline-load-older" onClick={() => { const element = timelineRef.current; if (element) prependAnchor.current = { scrollHeight: element.scrollHeight, scrollTop: element.scrollTop }; onLoadOlder(); }}>{t("loadOlder")}</button>}
-      {visibleNotice && <p id="composer-state" className="timeline-notice" role="status">{localText(visibleNotice, t)}</p>}
       {showNewMessages && <button type="button" className="timeline-new-messages" data-new-messages="true" aria-label={t("jumpToLatest")} title={t("jumpToLatest")} onClick={jumpToLatest}>{t("newMessages")}</button>}
       {entries.length === 0 && <div className="timeline-empty"><span>U</span><p>{t("emptyConversation")}</p></div>}
       {processLogs.length > 0 && <details className="timeline-process-log" data-process-log="true">
@@ -430,6 +426,12 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
       {compactionAnchor === null && !historyHasMore && compactionLine}
       {entries.map((entry, index) => {
         if (entry.kind === "compaction") return <Fragment key={entry.id}><p className="timeline-compaction" role="status">{t("contextCompacted")}</p>{index === compactionIndex && compactionLine}</Fragment>;
+        if (entry.kind === "status" && entry.status === "failed" && entry.text === "Turn failed: invalid_provider_response") {
+          return <Fragment key={entry.id}><p className="timeline-notice timeline-notice--failure" role="alert">
+            <span className="timeline-notice__icon" aria-hidden="true"><UiIcon name="status" /></span>
+            <span>{localText(entry.text, t)}</span>
+          </p>{index === compactionIndex && compactionLine}</Fragment>;
+        }
         const status = entry.status || "running";
         const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
         return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
@@ -437,6 +439,15 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
           <div className="timeline-content">{entry.kind === "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{entry.kind !== "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
+      {runtimeError && !runtimeErrorVisible && <div className="timeline-runtime-error" data-runtime-error-owner="timeline" role="alert">
+        <span className="timeline-notice__icon" aria-hidden="true"><UiIcon name="status" /></span>
+        <span>{runtimeError}</span>
+        {onOpenSettings && <button type="button" onClick={onOpenSettings}>{t("openSettings")}</button>}
+      </div>}
+      {visibleNotice && <p className="timeline-notice" role="status">
+        <span className="timeline-notice__icon" aria-hidden="true"><UiIcon name="status" /></span>
+        <span>{localText(visibleNotice, t)}</span>
+      </p>}
       {todo.length > 0 && <section className="todo-strip" tabIndex={0} aria-label={t("tasks")}><header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{todo.filter((item) => item.status === "completed").length}/{todo.length}</span></header><ul>{todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status} title={item.content} aria-label={`${item.content}: ${todoStatusLabel(item.status, t)}`}><span className="todo-status-icon" aria-hidden="true"><UiIcon name={item.status === "completed" ? "check" : item.status === "in_progress" ? "status" : "todo"} /></span><span>{item.content}</span><span className="sr-only">{todoStatusLabel(item.status, t)}</span></li>)}</ul></section>}
     </section>
   );
