@@ -40,6 +40,7 @@ from uthcode.core.provider import (
     GenerationRequest,
     InvalidProviderResponseError,
     Message,
+    NativeItem,
     NativeItemCompleted,
     NetworkError,
     ProviderConfigurationError,
@@ -228,6 +229,69 @@ def _rich_events() -> list[object]:
                     "cache_read_input_tokens": 3,
                     "cache_creation_input_tokens": 1,
                 },
+            ),
+            BetaRawMessageStopEvent(type="message_stop"),
+        ]
+    )
+    return events
+
+
+def _thinking_signature_events(
+    *,
+    at_start: bool,
+    in_delta: bool,
+) -> list[object]:
+    events = _events(include_stop=False)[:1]
+    thinking_block: dict[str, object] = {"type": "thinking", "thinking": ""}
+    if at_start:
+        thinking_block["signature"] = ""
+        block_start: object = BetaRawContentBlockStartEvent(
+            type="content_block_start",
+            index=0,
+            content_block=thinking_block,
+        )
+    else:
+        block_start = SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=thinking_block,
+        )
+    events.extend(
+        [
+            block_start,
+            BetaRawContentBlockDeltaEvent(
+                type="content_block_delta",
+                index=0,
+                delta={"type": "thinking_delta", "thinking": "plan"},
+            ),
+        ]
+    )
+    if in_delta:
+        events.append(
+            BetaRawContentBlockDeltaEvent(
+                type="content_block_delta",
+                index=0,
+                delta={"type": "signature_delta", "signature": ""},
+            )
+        )
+    events.extend(
+        [
+            BetaRawContentBlockStopEvent(type="content_block_stop", index=0),
+            BetaRawContentBlockStartEvent(
+                type="content_block_start",
+                index=1,
+                content_block={"type": "text", "text": ""},
+            ),
+            BetaRawContentBlockDeltaEvent(
+                type="content_block_delta",
+                index=1,
+                delta={"type": "text_delta", "text": "answer"},
+            ),
+            BetaRawContentBlockStopEvent(type="content_block_stop", index=1),
+            BetaRawMessageDeltaEvent(
+                type="message_delta",
+                delta={"stop_reason": "end_turn"},
+                usage={"input_tokens": 0, "output_tokens": 1},
             ),
             BetaRawMessageStopEvent(type="message_stop"),
         ]
@@ -523,6 +587,33 @@ async def test_anthropic_preserves_thinking_redaction_tool_order_and_native_item
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("at_start", "in_delta"), ((True, False), (False, True)))
+async def test_anthropic_stream_accepts_present_empty_thinking_signature(
+    at_start: bool,
+    in_delta: bool,
+) -> None:
+    client = _AnthropicClient(
+        _thinking_signature_events(at_start=at_start, in_delta=in_delta)
+    )
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    events = await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+    response = next(event.response for event in events if isinstance(event, GenerationCompleted))
+
+    assert response.message.parts == (ReasoningPart("plan"), TextPart("answer"))
+    assert response.native_items[0].payload["signature"] == ""
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_rejects_thinking_without_signature_field() -> None:
+    client = _AnthropicClient(_thinking_signature_events(at_start=False, in_delta=False))
+    provider = build_anthropic_provider("claude-test", client=client)
+
+    with pytest.raises(InvalidProviderResponseError):
+        await _collect(provider, _request(Message("user", (TextPart("hi"),))))
+
+
+@pytest.mark.asyncio
 async def test_anthropic_same_identity_replays_native_history_and_other_identity_falls_back() -> None:
     client = _AnthropicClient(_rich_events())
     provider = build_anthropic_provider("claude-test", client=client)
@@ -570,6 +661,76 @@ async def test_anthropic_same_identity_replays_native_history_and_other_identity
         if block["type"] == "text"
     ] == ["answer"]
     assert not any(block["type"] == "redacted_thinking" for block in other_assistant["content"])
+
+
+@pytest.mark.asyncio
+async def test_anthropic_replays_empty_thinking_signature_after_message_serialization() -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+    original = Message(
+        "assistant",
+        (ReasoningPart("plan"),),
+        native_items=(
+            NativeItem(
+                provider="anthropic",
+                protocol="messages",
+                model="claude-test",
+                sequence_index=0,
+                kind="thinking",
+                payload={
+                    "type": "thinking",
+                    "thinking": "plan",
+                    "signature": "",
+                },
+            ),
+        ),
+    )
+    replayed = Message.from_dict(original.to_dict())
+
+    await _collect(provider, _request(replayed))
+
+    assistant = next(
+        message for message in client.calls[-1]["messages"] if message["role"] == "assistant"
+    )
+    assert assistant["content"][0] == {
+        "type": "thinking",
+        "thinking": "plan",
+        "signature": "",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"type": "thinking", "thinking": "plan"},
+        {"type": "thinking", "thinking": "plan", "signature": 7},
+    ),
+)
+async def test_anthropic_replay_rejects_missing_or_non_string_thinking_signature(
+    payload: dict[str, object],
+) -> None:
+    client = _AnthropicClient(_events())
+    provider = build_anthropic_provider("claude-test", client=client)
+    assistant = Message(
+        "assistant",
+        (ReasoningPart("plan"),),
+        native_items=(
+            NativeItem(
+                provider="anthropic",
+                protocol="messages",
+                model="claude-test",
+                sequence_index=0,
+                kind="thinking",
+                payload=payload,
+            ),
+        ),
+    )
+
+    with pytest.raises(InvalidProviderResponseError):
+        await _collect(provider, _request(assistant))
+
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

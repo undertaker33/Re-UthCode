@@ -12,6 +12,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 
 - `[FACT]` `core/agent.py` 实现显式、集中、顺序可读的 ReAct Agent Loop；没有图节点、边、Reducer 或 Runtime DSL。
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
+- `[FACT]` Anthropic Integration 的可选 `models.retrieve` 探测遇 HTTP 404 返回未知限额，由 Application 沿用配置或默认预算；其他 SDK 状态错误和超时继续上抛，不切换 Provider 或模型。该规则不影响正式 Messages 生成或 token count 请求。Anthropic thinking 签名保留字段存在性：显式空字符串可接收并原样回放，完全缺失或非字符串仍拒绝；不伪造签名，不把 reasoning 当成正式正文。
 - `[FACT]` 正式 Application 的基础 Integration 工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`、`ReadDocument`、`ViewImage`、`Process`、`ApplyPatch`、`GitWorkspace`、`WebFetch`；启用可信用户级搜索配置时再加入 `WebSearch`。这些工具都通过同一 Tool Registry 进入 Agent Loop，`ApplyPatch` 在 PLAN 隐藏，其余只读定义按 planning access 过滤。
 - `[FACT]` `ReadDocument` 对 PDF、DOCX、XLSX、PPTX 返回带页/段落/sheet/range/slide 定位的有界结构；`ViewImage` 通过 Session-owned attachment ref 返回图片或 PDF 页图。公式文本与缓存值分开保留，不执行 XLSX 重算；解析损坏、加密、超限和取消返回受控 Tool error。PDFium 文本解析和 PDF 页渲染在短生命周期私有宿主执行，取消会终止宿主；开发入口直接使用 `uthcode.integrations.pdf_worker`，frozen 入口使用 `--uthcode-pdf-worker`。
 - `[FACT]` `Bash` 是唯一进程启动入口；`yield_time_ms` 只限制当前 ToolCall 等待，显式 `timeout_seconds` 才限制进程总寿命，默认无总寿命。`Process` 按 Session 读取有界输出、写 stdin/EOF、停止和 PTY resize，进程完成后可继续由 Application 事件路由观察。
