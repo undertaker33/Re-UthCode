@@ -52,12 +52,25 @@ class ViewImageTool:
 
     _definition = ToolDefinition(
         "ViewImage",
-        "Read a local image or render one PDF page as an image for the visual model.",
+        "Read a local image or render one PDF page as an image for the visual model. Provide "
+        "exactly one of path or asset_ref. For a Session attachment, copy its complete asset_ref "
+        "exactly as shown, including the attachment: prefix; do not substitute its display filename "
+        "or reconstruct a path. Images already included with the current user message can be "
+        "observed directly and do not need to be reopened with this tool.",
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "asset_ref": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "Local image or PDF path; use this or asset_ref, never both.",
+                },
+                "asset_ref": {
+                    "type": "string",
+                    "description": (
+                        "Complete current-Session attachment reference copied verbatim, including "
+                        "the attachment: prefix; use this or path, never both."
+                    ),
+                },
                 "page": {"type": "integer", "minimum": 1},
                 "max_width": {"type": "integer", "minimum": 1, "maximum": 8192},
                 "max_height": {"type": "integer", "minimum": 1, "maximum": 8192},
