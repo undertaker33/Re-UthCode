@@ -101,3 +101,64 @@ async def test_read_document_rejects_damage_limit_and_cancel(tmp_path: Path) -> 
     assert "damaged or encrypted" in str(broken.content)
     assert oversized.is_error and oversized.failure is not None
     assert cancelled.failure is not None and cancelled.failure.kind == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_factory_reads_submitted_excel_attachment_after_source_changes_and_is_deleted(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from openpyxl import Workbook
+
+    from uthcode.application.attachments import AttachmentService
+    from uthcode.integrations.session_files import SessionFileStore
+    from uthcode.integrations.tools.factory import create_default_tools
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "source.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Inputs"
+    sheet["A1"] = "submitted snapshot"
+    workbook.save(source)
+
+    store = SessionFileStore(tmp_path / "sessions")
+    session = store.create_session(project_key=str(workspace.resolve()))
+    attachments = AttachmentService(store)
+    imported = attachments.import_path(session.session_id, source)
+    attachments.mark_submitted(session.session_id, (imported.ref,))
+
+    source.write_bytes(b"source changed after import")
+    source.unlink()
+
+    tools = create_default_tools(
+        workspace,
+        attachment_service=attachments,
+        session_provider=lambda: SimpleNamespace(session_id=session.session_id),
+    )
+    reader = next(tool for tool in tools if tool.definition.name == "ReadDocument")
+    result = await reader.execute(
+        {"asset_ref": imported.asset_ref, "sheet": "Inputs", "range": "A1"},
+        cancellation=CancellationToken(),
+    )
+    foreign_session = store.create_session(project_key=str(workspace.resolve()))
+    foreign = await reader.execute(
+        {
+            "asset_ref": f"attachment:{foreign_session.session_id}:{imported.ref}",
+            "sheet": "Inputs",
+            "range": "A1",
+        },
+        cancellation=CancellationToken(),
+    )
+
+    assert imported.asset_ref.startswith(f"attachment:{session.session_id}:")
+    assert result.is_error is False
+    assert "submitted snapshot" in _text(result)
+    assert isinstance(result.content, ContentSequence)
+    source_part = next(part for part in result.content.parts if isinstance(part, SourcePart))
+    assert source_part.source == imported.asset_ref
+    assert attachments.reference(session.session_id, imported.ref).submitted is True
+    assert foreign.failure is not None
+    assert foreign.failure.kind == "permission_denied"

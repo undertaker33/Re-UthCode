@@ -98,12 +98,25 @@ class ReadDocumentTool:
 
     _definition = ToolDefinition(
         "ReadDocument",
-        "Read bounded text and structure from a PDF, DOCX, XLSX, or PPTX with source locations.",
+        "Read bounded text and structure from a PDF, DOCX, XLSX, or PPTX with source locations. "
+        "Provide exactly one of path or asset_ref. For a Session attachment, copy its complete "
+        "asset_ref exactly as shown, including the attachment: prefix; do not substitute its display "
+        "filename or reconstruct a path. This tool reads document text and structure, not image "
+        "content. Images already included with the current user message can be observed directly.",
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "asset_ref": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "File path to a document; use this or asset_ref, never both.",
+                },
+                "asset_ref": {
+                    "type": "string",
+                    "description": (
+                        "Complete current-Session attachment reference copied verbatim, including "
+                        "the attachment: prefix; use this or path, never both."
+                    ),
+                },
                 "page": {"type": "integer", "minimum": 1},
                 "sheet": {"type": "string"},
                 "range": {"type": "string"},
@@ -362,8 +375,8 @@ class ReadDocumentTool:
             for name in sheets:
                 formula_sheet = formulas[name]
                 cached_sheet = cached[name]
-                iterator = formula_sheet[range_ref] if range_ref else formula_sheet.iter_rows(max_row=_DEFAULT_MAX_ROWS)
-                cached_iterator = cached_sheet[range_ref] if range_ref else cached_sheet.iter_rows(max_row=_DEFAULT_MAX_ROWS)
+                iterator = _xlsx_rows(formula_sheet, range_ref)
+                cached_iterator = _xlsx_rows(cached_sheet, range_ref)
                 for formula_row, cached_row in zip(iterator, cached_iterator):
                     for formula_cell, cached_cell in zip(formula_row, cached_row):
                         if cancellation.cancelled:
@@ -425,6 +438,17 @@ class ReadDocumentTool:
         if truncated:
             value += "\n[truncated]"
         return (TextPart(value), SourcePart(source_ref, slide=slides[0] if len(slides) == 1 else None))
+
+
+def _xlsx_rows(sheet: Any, range_ref: str | None) -> Any:
+    if range_ref is None:
+        return sheet.iter_rows(max_row=_DEFAULT_MAX_ROWS)
+    selected = sheet[range_ref]
+    if isinstance(selected, tuple):
+        if selected and isinstance(selected[0], tuple):
+            return selected
+        return (selected,)
+    return ((selected,),)
 
 
 def _cell_value_text(formula_value: object, cached_value: object) -> str:

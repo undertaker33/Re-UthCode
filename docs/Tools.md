@@ -6,14 +6,14 @@
 
 | Tool | 用途 |
 | --- | --- |
-| `ReadFile` | 读取工作目录内的文件 |
+| `ReadFile` | 读取 UTF-8 文本文件，文件路径仍按权限判断 |
 | `WriteFile` | 创建或覆盖文件 |
 | `EditFile` | 对已读取文件进行精确替换 |
 | `Glob` | 按路径模式查找文件 |
 | `Grep` | 搜索文件内容 |
 | `Bash` | 以当前操作系统用户权限执行命令 |
-| `ReadDocument` | 有界读取 PDF、DOCX、XLSX、PPTX 的结构化内容 |
-| `ViewImage` | 读取图片或把 PDF 指定页渲染为模型可见的图片资产 |
+| `ReadDocument` | 有界读取 PDF、DOCX、XLSX、PPTX 的结构化内容，可读取当前 Session 附件 |
+| `ViewImage` | 读取图片或把 PDF 指定页渲染为模型可见的图片资产，可读取当前 Session 附件 |
 | `Process` | 查询或控制当前 Session 所属的 Bash 进程 |
 | `ApplyPatch` | 按 Codex patch 方言预检，按文件原子提交增删改和移动 |
 | `GitWorkspace` | 以只读、无外部 diff 的方式查询 Git 工作区 |
@@ -21,15 +21,17 @@
 
 这 12 个 Tool 进入普通 Tool Registry，执行前会完成参数准备、路径或命令分析以及权限判断。`ReadDocument`、`ViewImage`、`Process`、`GitWorkspace` 和 `WebFetch` 的只读定义在 Plan Mode 可见；`Process` 的 `write`、`resize`、`stop` 操作仍分别进入输入、写入或破坏性权限判断，`ApplyPatch` 在 Plan Mode 隐藏。
 
+`ReadFile` 只读取 UTF-8 文本，不解析 PDF、Office 文档或图片；文档使用 `ReadDocument`，图片使用 `ViewImage`。路径读取仍经过既有权限判断，外部路径需要相应授权。已经随当前用户消息提交的图片可直接观察，无需把显示文件名猜成路径。
+
 启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 
 ### `ReadDocument`
 
-`ReadDocument` 接受工作目录内路径或当前 Session 已拥有的 `asset_ref`，并按格式返回带定位的结构化内容：PDF 按页，DOCX 按顺序段落/表格，XLSX 按 sheet/range，PPTX 按 slide/shape/table。结果有页、字符和字节预算；损坏、加密、不支持格式、超限和取消都会返回受控错误。XLSX 的公式文本与已有缓存值分别保留，工具不执行公式重算。PDFium 的文本解析在短生命周期私有 PDF 宿主内执行；取消会终止该宿主，不依赖等待仍在 native 调用中的线程。开发运行时直接启动 `uthcode.integrations.pdf_worker` 私有模块，frozen 运行时使用打包的 `--uthcode-pdf-worker` 入口。
+`ReadDocument` 每次调用必须只提供 `path` 或 `asset_ref` 之一。路径读取仍经过既有权限判断，包含已获准的外部路径；附件读取必须逐字复制当前 Session 提供的完整 `asset_ref`，包括 `attachment:` 前缀及 Session/ref 部分。不要用附件显示文件名替代 `asset_ref`，也不要猜测、补全或修补引用。工具按格式返回带定位的结构化内容：PDF 按页，DOCX 按顺序段落/表格，XLSX 按 sheet/range，PPTX 按 slide/shape/table。结果有页、字符和字节预算；损坏、加密、不支持格式、超限和取消都会返回受控错误。XLSX 的公式文本与已有缓存值分别保留，工具不执行公式重算。该工具只提取文档文字和结构，不返回文档内图片像素。PDFium 的文本解析在短生命周期私有 PDF 宿主内执行；取消会终止该宿主，不依赖等待仍在 native 调用中的线程。开发运行时直接启动 `uthcode.integrations.pdf_worker` 私有模块，frozen 运行时使用打包的 `--uthcode-pdf-worker` 入口。
 
 ### `ViewImage`
 
-`ViewImage` 可读取受当前 Session 所有的图片，或把 PDF 指定页渲染成 PNG 图片资产。PDF 页渲染与文本解析共用短生命周期私有宿主，取消会终止正在执行的宿主。渲染结果通过既有 Session 附件物化路径进入模型，并保留文件/页来源定位；图片尺寸、像素和字节有界。没有视觉能力的模型仍会收到明确的不可用能力结果，不会把文本描述伪装成图像输入。
+`ViewImage` 每次调用必须只提供 `path` 或 `asset_ref` 之一。路径读取仍经过既有权限判断，外部路径需要相应授权。附件引用必须逐字复制完整 `asset_ref`，包括 `attachment:` 前缀；不使用显示文件名替代，也不猜测或修补引用。已经随当前用户消息提交的图片可以直接观察，无需再次调用本工具。其他受当前 Session 所有的图片可按路径或附件引用读取；PDF 可按指定页渲染成 PNG 图片资产。PDF 页渲染与文本解析共用短生命周期私有宿主，取消会终止正在执行的宿主。渲染结果通过既有 Session 附件物化路径进入模型，并保留文件/页来源定位；图片尺寸、像素和字节有界。没有视觉能力的模型仍会收到明确的不可用能力结果，不会把文本描述伪装成图像输入。
 
 ### `ApplyPatch`
 

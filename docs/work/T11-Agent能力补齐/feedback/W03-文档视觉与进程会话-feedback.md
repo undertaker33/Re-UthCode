@@ -156,3 +156,19 @@ Terra 第四轮指出，上一轮 Feedback 将“卸载释放”写成已覆盖�
 Luna（max）完成 W03 首轮实施、总控 PDF 私有宿主预审返工，以及 Terra（high）四轮审核返工；Terra 第五轮最终审核 PASS，无剩余实质 finding。六项首轮问题（进程权限链、统一脱敏、Renderer 续读、Windows PTY 稳定性、终态资源淘汰、PDF 限长读取）和后续 Stop 授权交互、取消/导航/晚到回包/卸载审批记录回收均已关闭。最终 Reviewer 对 Stop 授权与 root unmount release 复跑 2 passed，TypeScript、冻结和 diff 检查通过；前轮 Reviewer 文档/图片/进程定向 12 passed、Renderer 53 passed、Windows PTY 连续 8/8 passed、Bridge 74 passed 与生命周期 3 passed 的证据仍有效。
 
 最终 Worker Renderer 104 passed、typecheck，以及前轮受影响 Python 229 passed、文档图片 5 passed、架构 23 passed 的分阶段证据见上文；Desktop 226 passed 为第2轮全量结果，后续 UI/Bridge 修复使用受影响定向回归，没有宣称最终代码全量重跑。旧 PTY 单次通过与第4轮卸载覆盖声明已由追加记录纠正。真实 Provider/Tavily、POSIX PTY、Windows 安装产物人工验收仍待条件补齐，整包不标记完成，不归档。
+
+## 返工第6轮（2026-10-03，附件引用与外部文档读取）
+
+本轮处理 T07 的两个实测问题，并修复定向回归暴露的单格 XLSX 读取缺陷。没有修改冻结文件或 Desktop 文件。
+
+- ReadDocument、ViewImage 的模型说明现在要求 `path` 与 `asset_ref` 只选其一；附件必须逐字使用包含 `attachment:` 前缀的完整当前 Session 引用，不以显示文件名替代路径，也不猜测修补引用。ReadFile 说明明确限于 UTF-8 文本；随当前用户消息提交的图片可直接观察。
+- `InstructionLoader.activate_for_path` 对物理路径在项目根外的已授权文件不再尝试激活项目目录指令；Tool 的 OUTSIDE 权限分类不变，显式 `load_for_path` 仍拒绝越过 project trusted root。正式工具工厂回归覆盖 ReadDocument 外部 XLSX 与 ViewImage 外部 PNG。
+- A1 单格区域原先从 openpyxl 读取出单个 `ReadOnlyCell`，实现却把选择结果一律当二维行序列遍历，导致 `ReadOnlyCell is not iterable` 并被包装成参数错误。本轮将标量单元格选择规范为一行一格，保留 A1 单格回归。
+- 通过真实 `AttachmentService` 与 `create_default_tools` 导入并标记已提交 XLSX 副本；源文件改写并删除后，使用完整附件引用仍读到提交时内容。错误 Session 的引用继续返回 `permission_denied`。
+
+### 返工第6轮实测结果
+
+- `& 'C:\Users\93445\miniconda3\envs\re-uthcode\python.exe' -m pytest tests/test_builtin_file_tools.py tests/test_document_tools.py tests/test_image_tools.py tests/test_project_instructions.py -q`：`41 passed in 5.64s`，覆盖 ReadFile、四格式文档、A1、真实附件副本、图片和指令边界。
+- 总控执行 `tests/test_architecture_boundaries.py -q`：`23 passed in 11.61s`。
+- `python.exe C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py docs/Tools.md docs/context/A01-AgentRuntime/AgentRuntime-Context.md docs/work/T11-Agent能力补齐/feedback/W03-文档视觉与进程会话-feedback.md`：`OK: 3 file(s) passed UTF-8 guard`。
+- A09 保持已完成；Windows packaged 四格式与 PDF 页图人工验收 A10 仍未验证。没有修改 Checklist、冻结文件、Desktop 文件或 Git 状态。

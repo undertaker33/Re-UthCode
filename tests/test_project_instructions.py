@@ -456,6 +456,69 @@ async def test_unexpected_instruction_callback_error_is_not_swallowed(
     assert target.read_text(encoding="utf-8") == "print('ok')\n"
 
 
+@pytest.mark.asyncio
+async def test_tool_factory_reads_authorized_external_documents_without_activating_instructions(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from openpyxl import Workbook
+    from PIL import Image
+
+    from uthcode.application.attachments import AttachmentService
+    from uthcode.core.permission import ResourceScope
+    from uthcode.core.provider import ImagePart
+    from uthcode.integrations.session_files import SessionFileStore
+
+    loader, _user_root, project_root = _loader(tmp_path)
+    loader.load_session()
+    outside = tmp_path / "downloads"
+    outside.mkdir()
+    external_document = outside / "external.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["A1"] = "authorized external content"
+    workbook.save(external_document)
+    external_image = outside / "external.png"
+    Image.new("RGB", (4, 3), (20, 40, 60)).save(external_image)
+
+    store = SessionFileStore(tmp_path / "sessions")
+    session = store.create_session(project_key=str(project_root.resolve()))
+    attachments = AttachmentService(store)
+    tools = create_default_tools(
+        project_root,
+        attachment_service=attachments,
+        session_provider=lambda: SimpleNamespace(session_id=session.session_id),
+        on_path_access=loader.activate_for_path,
+    )
+    reader = next(tool for tool in tools if tool.definition.name == "ReadDocument")
+    viewer = next(tool for tool in tools if tool.definition.name == "ViewImage")
+    document_preparation = reader.preflight(
+        {"path": str(external_document), "sheet": "Data", "range": "A1"}
+    )
+    image_preparation = viewer.preflight({"path": str(external_image)})
+
+    document_result = await reader.execute(
+        document_preparation.execution_arguments,
+        cancellation=CancellationToken(),
+    )
+    image_result = await viewer.execute(
+        image_preparation.execution_arguments,
+        cancellation=CancellationToken(),
+    )
+
+    assert document_preparation.action.scope is ResourceScope.OUTSIDE
+    assert image_preparation.action.scope is ResourceScope.OUTSIDE
+    assert document_result.is_error is False
+    assert "authorized external content" in str(document_result.content)
+    assert image_result.is_error is False
+    assert any(isinstance(part, ImagePart) for part in image_result.content.parts)
+    assert loader.activated_directory_scopes == ()
+    with pytest.raises(InstructionPathRejectedError):
+        loader.load_for_path(external_document)
+
+
 def test_loader_rejects_parent_and_symlink_instruction_references(tmp_path: Path) -> None:
     loader, _user_root, project_root = _loader(tmp_path)
     outside = tmp_path / "outside.md"

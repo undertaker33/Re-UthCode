@@ -21,7 +21,9 @@ class ReadFileTool:
 
     _definition = ToolDefinition(
         "ReadFile",
-        "Read a UTF-8 text file from the workspace with one-based line numbers.",
+        "Read a UTF-8 text file from the workspace with one-based line numbers. This tool reads "
+        "text only; use ReadDocument for PDF, DOCX, XLSX, or PPTX files and ViewImage for local "
+        "images. Images already included with the current user message can be observed directly.",
         {
             "type": "object",
             "properties": {

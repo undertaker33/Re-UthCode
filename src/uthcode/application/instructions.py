@@ -482,9 +482,24 @@ class InstructionLoader:
         target_path: str | Path,
         *,
         strict: bool = False,
-    ) -> InstructionLoadResult:
+    ) -> InstructionLoadResult | None:
         """Tool callback spelling for lazy Read/Edit directory activation."""
 
+        if not self._session_loaded:
+            self.load_session(strict=strict)
+        candidate = Path(target_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return self.load_for_path(target_path, strict=strict)
+        try:
+            resolved.relative_to(self.project_root)
+        except ValueError:
+            # External files still pass through the Tool's ordinary permission
+            # checks. They have no project directory scope to activate.
+            return None
         return self.load_for_path(target_path, strict=strict)
 
     def rebuild_from_metadata(
