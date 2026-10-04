@@ -103,7 +103,7 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 ## T17 SWE-bench 预测与安全 Trace
 
 - [x] A25（R21）：通过 计划新增 `tests/eval/test_swebench_adapter.py` 验证；通过条件：预测三字段和实际 diff、新文件正确；实例隔离，trace 不含秘密/图像字节/原生载荷；不获取 gold patch。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] 核对 Tasks T17 的完成边界并记录对应代码/定向证据：可导出官方可消费 JSONL；实际 harness 评分放 T19，resolved=false 如实报告，不要求必解。
 
 ## T18 [接入主流程]
@@ -118,7 +118,7 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 - [ ] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A15（R14—R16，Windows 实机）：通过 标准 `npm run package` / `npm run make`（依现有 scripts）后人工操作 验证；通过条件：安装产物中 PTY、中文/ANSI 日志、stdin、停止和关闭有效；不是 CDP 布局测试代替原生进程验证。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A28（R28，联合真实端到端）：通过 Windows Desktop 输入截图+文档→Agent 定位并 Patch→运行失败测试→读日志修复→重跑→查看图片→点击交付物 验证；通过条件：每个观察与修改来自正式工具结果，Desktop 可折叠日志并打开产物；需要模型理解的步骤有真实 Provider 证据。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] 核对 Tasks T19 的完成边界并记录对应代码/定向证据：记录端点/模型/SDK、安全命令和精确结果。缺凭据/平台/Docker 只保留对应未完成项，不能用 Mock、CDP 布局或评分环境缺失冒充完成；有效已有证据可复用。
 

@@ -100,7 +100,7 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 
 2026-09-13 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W05 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；用户尚未配置 Tavily，因此 A18 保持未勾选；人工产物操作、WSL/POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
 
-T11 W06 经一轮返工、Terra 第二轮审核通过，当前已加入 eval/swebench.py 的正式 Headless 外部实例适配与安全 trace，并有 A25 当前 Windows/Conda 定向证据；A26 官方 harness、A18 真实 Tavily、POSIX/packaged/人工 Desktop 仍未验收，T11 继续保持 not_implemented。
+T11 W06 经一轮返工、Terra 第二轮审核通过，当前已加入 eval/swebench.py 的正式 Headless 外部实例适配与安全 trace，并有 A25 当前 Windows/Conda 定向证据；A26 于 2026-10-04 经真实正式 Headless 预测和官方 harness 完成评分（resolved=false）；A18 真实 Tavily、POSIX/packaged/人工 Desktop 仍未验收，T11 继续保持 not_implemented。
 
 2026-09-21 T11 修复进展：用户已确认附件交互及已验证缺陷修复范围，冻结工作包文字保持不变。工具组经 Luna 实施与 Terra 审核后通过 PR #115 合并（`a422303`），修复正式工具图片 `asset_ref`、ApplyPatch 格式说明及进程参数下限。总控 Computer Use 已在当前 Windows 开发 Electron / Qwen compatible 中实际验证用户图片输入、本地 ViewImage、PDF 页图 ViewImage 和无需额外教授格式的 ApplyPatch；详细 Session/Turn、工具结果和定向测试记录见 W06 Feedback。附件服务组经 Luna 实施和 Terra 复审后已通过 PR #116 合并（`775f4a0`），服务定向测试 150 passed；Desktop UI、错误反馈及当前构建验收仍在实施，重复提示词历史结论仍未确定；其余协议、Tavily、POSIX 和官方 SWE 证据不因本轮自动通过，整包继续保持 `not_implemented`。
 2026-09-22 T11 服务补修经 Luna 实施、Terra 审核，通过 PR #117 合并（`b9f3eb5`）：同消息多 part 的历史附件归属、受控复制路径接口和产物链接编码说明已补齐，定向 119 passed、附件及 Session 权威回归 32 passed。Desktop 组合展示、错误诊断与真实窗口验收仍在进行，整包状态不变。
@@ -145,3 +145,5 @@ desktop/src/renderer/App.tsx
 - `[FACT]` Agent Loop 的固定顺序已接入 PLAN 非 READ Tool 边界与 unfinished-task 完成阻断；普通 PLAN final 正常完成，正式 Plan Review 仅由 `ProposePlan` 控制 ToolCall 触发；不提供动态注册。
 - `[ABSENT]` 动态 Hook registry、第三方 Hook plugin 生命周期、Skill、MCP、Worktree、Subagent、Multi-Agent、通用任务调度器。
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。
+
+2026-10-04 T11 A26 验收：真实 qwen3.7-flash / compatible / OpenAI SDK 2.53.0，经正式 Headless 为 astropy__astropy-12907 生成预测；首次 Bash 权限阻断取消/空 patch 的官方报告不计评分，保留证据后在新 clean checkout 收紧为七个正式文件/补丁/Git 工具完成第二次尝试。独立官方 swebench 4.1.0 Linux 镜像实际评分 1 例，patch 成功应用，5 passed、10 failed，resolved=false、errors=0；该结果满足 A26 的完成评分条件，不表示单例解决或全工具自动运行通过。两处 A26 补勾，现剩 16 行、11 组，精确命令、模型/端点/SDK、两轮记录及本机 artifacts 见原 W06 本轮追加；其余验收等待用户准备，整包仍 not_implemented，未归档。
