@@ -205,7 +205,7 @@ implemented:
 
 `eval/swebench.py` 接收外部 clean Git 实例、题面和模型引用，经 `eval/execution.py` 复用正式 Application/AgentRun/Turn，导出实际基线 diff 的三字段预测和安全 trace。官方 harness 独立评分，不进入产品依赖。Eval 的 auto 权限暂停会触发取消，不会自动批准无人响应的 ASK；一次 Run 可包含正常的多次 ReAct Provider 请求。
 
-2026-10-04 已完成真实 Lite 单例的正式预测与官方 Linux 评分，resolved=false；首次权限阻断空预测未实际评分，后续通过既有 tools/application_factory seam 收紧为七个正式文件/补丁/Git 工具，在新的工作区完成单次重跑，保留同一指令加载器、工具限制和权限链。该证据不证明默认全工具无需人工批准；结果与操作限制见 [W06 记录](../../work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)，入口说明见 [Eval 使用说明](../../../eval/README.md)。
+2026-10-04 已完成真实 Lite 同题单例的正式预测与官方 Linux 评分：Qwen resolved=false，同受限外部工具条件下 DeepSeek Pro resolved=true；首次权限阻断空预测未实际评分，后续通过既有 tools/application_factory seam 收紧为七个正式文件/补丁/Git 工具，在新的工作区完成单次重跑，保留同一指令加载器、工具限制和权限链。该证据不证明默认全工具无需人工批准；结果与操作限制见 [W06 记录](../../work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)，入口说明见 [Eval 使用说明](../../../eval/README.md)。
 
 ## 不属于当前编排层
 

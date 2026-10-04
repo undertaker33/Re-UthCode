@@ -83,7 +83,7 @@ python -m swebench.harness.run_evaluation `
   --run_id uthcode-w06
 ```
 
-上面的评分命令属于单独的外部环境；本仓库不把评分器加入产品依赖。2026-10-04 已使用官方 swebench 4.1.0 在独立 Linux 容器为真实 Lite 实例完成评分，resolved=false；首次权限阻断空预测与受限工具重跑的限制、完整命令和报告见 [W06 真实评分记录](../docs/work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)。这不代表任意实例或默认全工具无人交互运行均通过。每次适配运行还写出安全 `trace.jsonl`：秘密、图片字节、原始 Provider/native payload 和二进制字段会被移除或脱敏，不能据此恢复完整模型请求。
+上面的评分命令属于单独的外部环境；本仓库不把评分器加入产品依赖。2026-10-04 已使用官方 swebench 4.1.0 在独立 Linux 容器为真实 Lite 同题实例完成评分，Qwen resolved=false、同受限工具条件下 DeepSeek Pro resolved=true；首次权限阻断、受限运行和单次模型比较的限制、完整命令和报告见 [W06 真实评分记录](../docs/work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)。这不代表任意实例或默认全工具无人交互运行均通过。每次适配运行还写出安全 `trace.jsonl`：秘密、图片字节、原始 Provider/native payload 和二进制字段会被移除或脱敏，不能据此恢复完整模型请求。
 
 比较两个报告：
 
