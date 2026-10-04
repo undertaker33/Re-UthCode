@@ -321,3 +321,35 @@ python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench
 本机证据根为 `D:\uthcode-audits\t11-swe-20261004-ff513aad`：首次 prediction/summary/trace 位于 evaluation；第二次三字段预测为 restricted-evaluation/reports/astropy__astropy-12907.jsonl，安全 trace 为 restricted-evaluation/artifacts/t11-swe-bench-lite/astropy__astropy-12907/t11-2-no-bash/trace.jsonl；官方总报告为 harness/qwen3.7-flash.uthcode-t11-20261004-ff513aad-no-bash.json，逐例 report.json/test_output.txt 位于 harness/logs/run_evaluation/uthcode-t11-20261004-ff513aad-no-bash/qwen3.7-flash/astropy__astropy-12907/；精确命令/exit/耗时见 harness/harness-restricted-status.json。文件保留供复核，不包含凭据。
 
 A26 的两处引用具备真实正式预测及官方完成评分证据，可以勾选；该条件不要求单例必解。其余未验证项没有扩大结论，剩 16 个未勾选行、11 组要求。T11 继续 not_implemented，不归档；其他用户配置/安装环境验收等用户准备好后继续。产品代码没有改动，不重新跑 Desktop 或构建旧包充当本次 SWE 证据。
+
+
+### 同条件 DeepSeek Pro 单次比较（2026-10-04）
+
+用户要求换 DeepSeek 重跑一次。原 Luna/max 基于已审核的受限驱动准备 run_deepseek_swebench_prediction.py，原 Sol/medium 独立审核 PASS；从已有可信 __uthcode_model_2 选择 deepseek-v4-pro，仅在进程内 replace EffectiveConfig.default_model，不写用户默认模型或凭据。模型/协议/端点/SDK为 deepseek-v4-pro / openai_compat / https://api.deepseek.com / OpenAI 2.53.0。
+
+仍为 astropy__astropy-12907、原 base commit d16bfe05a744909de4b27f5875fe0d4ed41ce607、原题面、同七项正式外部工具、auto 权限与 1200s 上限；两个模型的显式 context_window/max_output_tokens/reasoning_effort 均为 null，沿各自现有配置和 Provider 语义。新 clean checkout 与独立 deepseek-evaluation/t11-3-deepseek 保留旧结果；模型没有接收 Qwen 补丁、失败诊断、gold/test_patch。七项只指外部文件/补丁/Git 工具，Core 控制工具继续按行为模式暴露；Qwen 实际调用过 TodoWrite，本次 DeepSeek 未调用 Core 控制工具，summary 的静态名称列表不表示 DEFAULT 下全部可见。
+
+实际执行一次（无自动重跑）：
+
+```powershell
+conda run --no-capture-output -n re-uthcode python 'D:\uthcode-audits\t11-swe-20261004-ff513aad\inputs\run_deepseek_swebench_prediction.py' --input 'D:\uthcode-audits\t11-swe-20261004-ff513aad\inputs\selected-input.json' --workdir 'D:\uthcode-audits\t11-swe-20261004-ff513aad\workspaces\astropy__astropy-12907-deepseek' --run-authorized
+```
+
+正式 Run exit 0，completed/final_answer，16 iterations/17 tool calls；duration=97.703s，driver=100.804s，prediction=31423 UTF-8 bytes；input/output/total tokens=172422/7935/180357，cache_read=162176。只读忽略行尾差异后的实际修改为 separable.py 一行赋值修正及 test_separable.py 新增 14 行回归；Windows 行尾变化使原始 diff 字节数较大，不把该字节数当语义修改规模。DeepSeek 最终回复明确缺少测试执行工具、未实际运行测试，没有把推断结果冒充测试通过。
+
+同一官方 swebench 4.1.0 / Python 3.11.17 / Docker SDK 7.2.0、同一官方实例镜像进行独立评分：
+
+```bash
+python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path /audit/predictions-deepseek.jsonl --instance_ids astropy__astropy-12907 --run_id uthcode-t11-20261004-ff513aad-deepseek-pro --max_workers 1
+```
+
+官方命令 exit 0、123.506s，patch_successfully_applied=true，completed=1、resolved=1、unresolved=0、empty_patch=0、errors=0；FAIL_TO_PASS 2/2、PASS_TO_PASS 13/13，pytest 15 passed、0 failed，0.43s。
+
+| 同题单次受限运行 | 官方测试 | resolved | Agent耗时 | total tokens |
+| --- | --- | --- | --- | --- |
+| qwen3.7-flash / t11-2-no-bash | 5 passed / 10 failed | false | 247.703s | 273308 |
+| deepseek-v4-pro / t11-3-deepseek | 15 passed / 0 failed | true | 97.703s | 180357 |
+
+本机证据根仍为 D:\uthcode-audits\t11-swe-20261004-ff513aad：DeepSeek prediction/summary 在 deepseek-evaluation/reports/astropy__astropy-12907.jsonl 与 .summary.json，安全 trace 在 deepseek-evaluation/artifacts/t11-swe-bench-lite/astropy__astropy-12907/t11-3-deepseek/trace.jsonl；官方总报告为 harness/deepseek-v4-pro.uthcode-t11-20261004-ff513aad-deepseek-pro.json，逐例 report.json/test_output.txt 在 harness/logs/run_evaluation/uthcode-t11-20261004-ff513aad-deepseek-pro/deepseek-v4-pro/astropy__astropy-12907/，实际评分命令/exit/耗时在 harness/harness-deepseek-status.json。
+
+本实例支持模型修复判断差异是 Qwen 失败的重要因素：两者同样没有模型侧测试执行，DeepSeek 的实际补丁仍通过独立官方评分；测试反馈缺失不能独自解释 Qwen 的逻辑错误。单题各一次不能推导总体能力排名或完整 Agent 测试闭环已通过。没有继续刷题、扩大权限、修改产品源码或其他冻结勾选；T11 仍有 16 个未完成行、11 组要求，保持 not_implemented、不归档。

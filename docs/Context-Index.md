@@ -147,3 +147,5 @@ desktop/src/renderer/App.tsx
 - `[ABSENT]` 旧 API、旧数据结构、旧行为的兼容层；新增兼容入口默认不允许。
 
 2026-10-04 T11 A26 验收：真实 qwen3.7-flash / compatible / OpenAI SDK 2.53.0，经正式 Headless 为 astropy__astropy-12907 生成预测；首次 Bash 权限阻断取消/空 patch 的官方报告不计评分，保留证据后在新 clean checkout 收紧为七个正式文件/补丁/Git 工具完成第二次尝试。独立官方 swebench 4.1.0 Linux 镜像实际评分 1 例，patch 成功应用，5 passed、10 failed，resolved=false、errors=0；该结果满足 A26 的完成评分条件，不表示单例解决或全工具自动运行通过。两处 A26 补勾，现剩 16 行、11 组，精确命令、模型/端点/SDK、两轮记录及本机 artifacts 见原 W06 本轮追加；其余验收等待用户准备，整包仍 not_implemented，未归档。
+
+2026-10-04 T11 模型单例比较：用户要求 DeepSeek 重跑一次，保持 Qwen 受限运行的题面/基线/七项外部工具/auto/1200s，只在内存选择可信 deepseek-v4-pro，未写用户默认。正式 Run 97.703s、180357 tokens，官方同一 Linux 镜像评分 15 passed、0 failed、resolved=true、errors=0；Qwen 原结果 5 passed、10 failed、resolved=false 保留。该实例支持模型修复判断差异，不能推导总体模型排名或模型侧执行测试闭环通过；完整命令/端点/SDK和报告见 W06 最新追加，剩余16行/11组与整包not_implemented状态不变。
