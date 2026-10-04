@@ -93,7 +93,7 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 ## T15 Settings 配置完整性与生效边界
 
 - [x] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T15 的完成边界并记录对应代码/定向证据：用户/项目作用域和拒绝路径可测试；项目不能放宽限制；保存不半途换模型/端点或重启存活进程。
+- [x] 核对 Tasks T15 的完成边界并记录对应代码/定向证据：用户/项目作用域和拒绝路径可测试；项目不能放宽限制；保存不半途换模型/端点或重启存活进程。
 
 ## T16 Desktop 产物打开与受控预览
 

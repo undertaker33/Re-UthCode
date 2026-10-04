@@ -318,3 +318,9 @@ Renderer 对该精确失败状态补充中英文可操作说明，使用聊天�
 总控亲自通过 Computer Use 在该包中新建会话 fe660e7e，使用当前默认 Anthropic 协议的 qwen3.7-flash：第一轮收到 `NEW-928-OK`，同会话第二轮收到 `FOLLOWUP-928`，两轮均未调用工具。这补齐了新建、首次生成、含 thinking 历史回放的真实验证。恢复旧 54c2b28a 会话时，原失败记录显示为对话中的轻量中文原因与下一步提示，不再暴露内部错误码；Composer 上方无提示条。模型菜单打开并 Escape 关闭后没有新增操作回执，未修改模型配置。
 
 本轮修复和独立复审已通过，最终包关键路径通过；不据此扩大为 T11 全包通过。其他 Provider 视觉矩阵、Tavily、POSIX、官方 SWE 等此前未验收项保持原状。UTF-8 guard 检查本轮四份变动文档，通过，无编码修复。
+
+## T15 历史证据复用核对（2026-10-04）
+
+GPT-6.1 Sol / medium 独立只读核对 T15 完成边界，确认可复用本文件的有效历史证据：最终收口的配置组合 347 passed in 21.71s、ProcessSessions 与 W04 reload 10 passed in 6.25s、Desktop 设置相关 127 passed 与 typecheck，以及后续项目只收紧、configured/effective/source 定向与 Terra 最终审核。对应测试覆盖用户/项目秘密作用域和凭据/端点重定向拒绝、项目数值限制不可放宽、活动请求保留原模型快照、settings.save 活动 Turn 拒绝、当前及后台下一安全边界 reload、存活进程 manager/process_id/running 不变。
+
+从 W05 收口提交 998b000 到本轮，相关配置和 Settings 门禁没有变化；本轮消息身份与 Renderer 修复不影响这些证据。当前 Bridge 在写配置及 reload 前统一拒绝当前、后台活动 Turn 和 Compact，因此模型/端点不可半途切换；这是现有门禁与模型快照测试共同支撑的结论，不虚称新增单独端点实跑。未重复执行这些历史测试。总控仅将冻结 Checklist 的 T15 完成边界从未勾选改为完成，正文保持原样。T14 人工输入发生在异常怀疑/纠偏之后的精确反例证据仍不充分；A24 与 T16 的原生产物交互仍待验证。

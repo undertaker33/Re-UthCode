@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
-import type { DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, JsonValue } from "../src/desktop-api";
+import type { AgentEvent, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, JsonValue } from "../src/desktop-api";
 import { App } from "../src/renderer/App";
 import { Composer } from "../src/renderer/Composer";
 import { DocumentPreviewPanel } from "../src/renderer/DocumentPreviewPanel";
@@ -154,12 +154,11 @@ test("Composer routes choose, file drop/paste, image fallback, text paste, remov
   await withRendererDom(async (dom, container, root) => {
     act(() => { root.render(renderComposer(undefined, callbacks)); });
     const choose = container.querySelector<HTMLButtonElement>('button[aria-label="Attach"]');
-    const pasteButton = container.querySelector<HTMLButtonElement>('button[aria-label="Paste"]');
     const remove = container.querySelector<HTMLButtonElement>('button[aria-label^="Remove attachment"]');
     const send = container.querySelector<HTMLButtonElement>('button[aria-label="Send"]');
     const composer = container.querySelector<HTMLElement>(".composer");
     assert.ok(choose && remove && send && composer);
-    assert.equal(pasteButton, null);
+    assert.equal(container.querySelectorAll('button[aria-label="Paste"]').length, 0);
 
     act(() => { choose.click(); });
     assert.equal(callbacks.chosen, 1);
@@ -208,14 +207,14 @@ test("image cards keep names accessible, show only a bounded thumbnail, and expo
     for (const card of cards) {
       assert.match(card.getAttribute("aria-label") ?? "", /private-name\.png/u);
       assert.equal(card.getAttribute("title"), null);
-      assert.equal(card.querySelector(".file-card__meta"), null);
+      assert.equal(card.querySelectorAll(".file-card__meta").length, 0);
       assert.equal(card.querySelector("img")?.getAttribute("alt"), "private-name.png");
       assert.ok(card.classList.contains("file-card--image-preview"));
     }
     const remove = cards[0].querySelector<HTMLButtonElement>(".file-card__remove-button");
     assert.ok(remove);
     assert.equal(remove.getAttribute("aria-label"), "Remove attachment: private-name.png");
-    assert.equal(cards[1].querySelector(".file-card__remove-button"), null);
+    assert.equal(cards[1].querySelectorAll(".file-card__remove-button").length, 0);
     act(() => { remove.dispatchEvent(new dom.window.MouseEvent("dblclick", { bubbles: true, cancelable: true })); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     assert.deepEqual(previews, []);
@@ -268,7 +267,7 @@ test("App preserves imported Markdown preview text and opens its document panel"
     const shell = container.querySelector<HTMLElement>(".app-shell");
     assert.ok(shell?.classList.contains("document-preview-visible"));
     assert.equal(shell?.style.getPropertyValue("--document-preview-width"), "460px");
-    assert.equal(container.querySelector("#runtime-panel"), null, "the document canvas takes the Runtime panel's right grid slot while open");
+    assert.equal(container.querySelectorAll("#runtime-panel").length, 0, "the document canvas takes the Runtime panel's right grid slot while open");
     const source = [...container.querySelectorAll<HTMLButtonElement>(".document-preview-panel__actions button")].find((button) => button.textContent === "View source");
     assert.ok(source);
     act(() => { source!.click(); });
@@ -276,7 +275,7 @@ test("App preserves imported Markdown preview text and opens its document panel"
     const close = container.querySelector<HTMLButtonElement>('[aria-label="Close file preview"]');
     assert.ok(close);
     act(() => { close!.click(); });
-    assert.equal(container.querySelector(".document-preview-panel"), null);
+    assert.equal(container.querySelectorAll(".document-preview-panel").length, 0);
     assert.equal(shell?.classList.contains("document-preview-visible"), false);
     assert.ok(container.querySelector("#runtime-panel"), "closing restores the existing Runtime layout mode");
   });
@@ -501,15 +500,206 @@ test("App keeps an imported attachment available for retry when turn.start fails
     act(() => { send!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     assert.equal(calls.filter((method) => method === "turn.start").length, 1);
-    assert.ok(container.querySelector('[aria-label="Attachments"]'));
+    assert.equal(container.querySelectorAll(".composer-attachments .file-card[data-file-ref='att-1']").length, 1);
     const imageCard = container.querySelector<HTMLElement>(".composer-attachments .file-card[data-file-kind='image']");
     assert.equal(imageCard?.getAttribute("aria-label"), "diagram.png · image");
     assert.equal(imageCard?.querySelector("img")?.getAttribute("alt"), "diagram.png");
-    assert.equal(imageCard?.querySelector(".file-card__meta"), null);
+    assert.equal(imageCard?.querySelectorAll(".file-card__meta").length ?? 0, 0);
     act(() => { send!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     assert.equal(turnStarts, 2);
-    assert.equal(container.querySelector('[aria-label="Attachments"]'), null);
+    assert.equal(container.querySelectorAll(".composer-attachments .file-card[data-file-ref='att-1']").length, 0);
+    assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 1);
+  });
+});
+
+test("App moves a sent attachment into the user row and merges the empty-text authoritative message id", async () => {
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "turn.start") return { run_id: "run-attachment-app", turn_id: "turn-attachment-app", status: "running" };
+      if (method === "status.get") return { active_turn: false };
+      return {};
+    },
+    subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {},
+        selectedProjectKey: null, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async () => ({}) as never,
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={createInitialState({ language: "en", runtimeState: "ready", composerAttachments: [attachment] })} api={api} />); });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await flush();
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(send);
+    act(() => { send.click(); });
+    await flush();
+    assert.deepEqual(calls.find((call) => call.method === "turn.start")?.params, {
+      prompt: "",
+      attachments: [{ ref: "att-1", kind: "image" }],
+    });
+    assert.equal(container.querySelectorAll(".composer-attachments").length, 0);
+    assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1);
+    assert.ok(container.querySelector(".timeline-entry--user .timeline-attachments"));
+    assert.ok(eventListener);
+    act(() => { eventListener!({
+      type: "turn_started",
+      run_id: "run-attachment-app",
+      turn_id: "turn-attachment-app",
+      message_id: "authoritative-attachment-message",
+      message: { role: "user", parts: [] },
+    }); });
+    await flush();
+    const userRows = container.querySelectorAll<HTMLElement>(".timeline-entry--user");
+    assert.equal(userRows.length, 1);
+    assert.ok(userRows[0]?.querySelector(".timeline-attachments"));
+  });
+});
+
+test("App keeps a first-turn live tool row in order after new-session navigation and durable history recovery", async () => {
+  const projectPath = "C:/first-turn-navigation";
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const userMessageId = "d95b5ac8e07d4ba28e67ca0b59842ba1";
+  const reasoningBeforeId = "74d2ae9ca7904b43a839e2fb95f3c00d";
+  const assistantMessageId = "589fe4955b8f45cc9ed85faec24fe2d1";
+  const reasoningAfterId = assistantMessageId;
+  const durableRecords = [
+    { record_id: "session-a:1:user::0", session_id: "session-a", sequence: 1, turn_id: "turn-a", message_id: userMessageId, kind: "user", text: "Read sample.xlsx" },
+    { record_id: "session-a:3:assistant::0", session_id: "session-a", sequence: 3, turn_id: "turn-a", message_id: reasoningBeforeId, kind: "reasoning", text: "I will inspect the workbook." },
+    { record_id: "tool-record", session_id: "session-a", sequence: 5, run_id: "run-a", turn_id: "turn-a", tool_call_id: "call-a", kind: "tool", tool_name: "ReadDocument", text: "ReadDocument", status: "succeeded", is_error: false },
+    { record_id: "session-a:6:assistant::0", session_id: "session-a", sequence: 6, turn_id: "turn-a", message_id: reasoningAfterId, kind: "reasoning", text: "The workbook is readable." },
+    { record_id: "session-a:7:assistant::1", session_id: "session-a", sequence: 7, turn_id: "turn-a", message_id: assistantMessageId, kind: "assistant", text: "The workbook has one sheet." },
+  ];
+  const catalog = [
+    { session_id: "session-a", title: "First session", preview: "Read sample.xlsx" },
+    { session_id: "session-b", title: "Other session", preview: "Other conversation" },
+  ];
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "runtime.initialize") return { run: null };
+      if (method === "settings.get") return { configuration: {} };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: catalog };
+      if (method === "session.new") return { session_id: "session-a", run: null };
+      if (method === "turn.start") return { run_id: "run-a", turn_id: "turn-a", status: "running" };
+      if (method === "session.resume") {
+        const sessionId = String(params.session_id ?? "");
+        return {
+          session_id: sessionId,
+          replay: [],
+          run: sessionId === "session-a"
+            ? { run_id: "run-a", turn_id: "turn-a", status: "completed" }
+            : null,
+        };
+      }
+      if (method === "history.page") {
+        const sessionId = String(params.session_id ?? "");
+        return { session_id: sessionId, records: sessionId === "session-a" ? durableRecords : [], next_cursor: null, has_more: false };
+      }
+      return {};
+    },
+    subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: projectPath, alias: "First-turn project", pinned: false }],
+        projectAliases: { [projectPath]: "First-turn project" }, pinnedProjectKeys: [], pinnedSessions: [],
+        expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async () => ({}) as never,
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  const state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: "Read sample.xlsx",
+    projects: [{
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "First-turn project",
+      pinned: false,
+      sessions: [catalog[1]!],
+      catalogFresh: true,
+    }],
+    selectedProjectKey: projectPath,
+    expandedProjects: { [projectPath]: true },
+  });
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const flush = async () => {
+      await act(async () => {
+        for (let index = 0; index < 6; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    };
+    const sessionButton = (label: string) => [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes(label));
+    await flush();
+    const newChat = container.querySelector<HTMLButtonElement>('button[title="New chat"]');
+    assert.ok(newChat);
+    act(() => { newChat.click(); });
+    await flush();
+    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 0);
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(send);
+    act(() => { send.click(); });
+    await flush();
+    assert.ok(calls.some((call) => call.method === "turn.start"));
+    assert.ok(eventListener);
+    const publish = (event: Record<string, unknown>) => eventListener!(event as AgentEvent);
+    act(() => {
+      publish({ type: "turn_started", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: userMessageId, message: { role: "user", parts: [{ type: "text", text: "Read sample.xlsx" }] } });
+      publish({ type: "reasoning_started", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: reasoningBeforeId });
+      publish({ type: "reasoning_delta", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: reasoningBeforeId, text: "I will inspect the workbook." });
+      publish({ type: "assistant_message_completed", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: reasoningBeforeId, kind: "progress", message: { role: "assistant", parts: [{ type: "reasoning", text: "I will inspect the workbook." }, { type: "tool_call", tool_call_id: "call-a", name: "ReadDocument", arguments: { path: "sample.xlsx" } }] } });
+      publish({ type: "tool_started", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, batch_id: "batch-a", tool_call_id: "call-a", tool_name: "ReadDocument", command: "sample.xlsx" });
+      publish({ type: "tool_finished", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, batch_id: "batch-a", tool_call_id: "call-a", tool_name: "ReadDocument", command: "sample.xlsx", status: "succeeded", is_error: false });
+      publish({ type: "reasoning_started", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: reasoningAfterId });
+      publish({ type: "reasoning_delta", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: reasoningAfterId, text: "The workbook is readable." });
+      publish({ type: "assistant_message_completed", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, message_id: assistantMessageId, message: { role: "assistant", parts: [{ type: "text", text: "The workbook has one sheet." }] } });
+      publish({ type: "turn_completed", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, final_text: "The workbook has one sheet." });
+    });
+    await flush();
+    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1, "the live first-turn tool row is visible before navigation");
+
+    const otherSession = sessionButton("Other session");
+    assert.ok(otherSession);
+    act(() => { otherSession.click(); });
+    await flush();
+    const firstSession = sessionButton("First session");
+    assert.ok(firstSession);
+    act(() => { firstSession.click(); });
+    await flush();
+
+    const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
+    const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
+    assert.deepEqual(kinds, ["user", "reasoning", "tool", "reasoning", "assistant"]);
+    assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--tool")).length, 1);
+    assert.match(rows[2]?.textContent ?? "", /ReadDocument/u);
+    assert.equal(calls.filter((call) => call.method === "history.page" && call.params.session_id === "session-a").length, 1);
+    assert.ok(calls.filter((call) => call.method === "session.resume" && call.params.session_id === "session-a").every(() => true));
   });
 });
 
@@ -576,14 +766,14 @@ test("App localizes the image capability refusal and keeps the attachment for re
       act(() => { send!.click(); });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
       assert.equal(turnStarts, 1);
-      const attachmentsLabel = resources[language].attachments;
-      assert.ok(container.querySelector(`[aria-label="${attachmentsLabel}"]`), container.textContent ?? "");
+      assert.equal(container.querySelectorAll(".composer-attachments .file-card[data-file-ref='att-1']").length, 1, container.textContent ?? "");
       assert.match(container.textContent ?? "", new RegExp(expectedNotice.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
 
       act(() => { send!.click(); });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
       assert.equal(turnStarts, 2);
-      assert.equal(container.querySelector(`[aria-label="${attachmentsLabel}"]`), null);
+      assert.equal(container.querySelectorAll(".composer-attachments .file-card[data-file-ref='att-1']").length, 0);
+      assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 1);
     });
   };
 
@@ -660,6 +850,6 @@ test("App drops an attachment import or preview that finishes after Session navi
     await flush();
     act(() => { resolvePreview!({ attachment: { ref: "late-attachment", display_name: "late.png", mime_type: "image/png", size_bytes: 2 } }); });
     await flush();
-    assert.equal(container.querySelector('[aria-label="Attachments"]'), null);
+    assert.equal(container.querySelectorAll(".composer-attachments").length, 0);
   });
 });

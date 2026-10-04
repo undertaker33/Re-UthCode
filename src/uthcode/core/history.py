@@ -589,11 +589,18 @@ class Timeline:
         return result
 
 
-def transcript_entries_from_message(session_id: str, turn_id: str, sequence_start: int, message: Message) -> tuple[TranscriptEntry, ...]:
+def transcript_entries_from_message(
+    session_id: str,
+    turn_id: str,
+    sequence_start: int,
+    message: Message,
+    *,
+    message_id: str | None = None,
+) -> tuple[TranscriptEntry, ...]:
     entries: list[TranscriptEntry] = []
     sequence = sequence_start
     unit_id = turn_id
-    message_id = f"{turn_id}:{sequence_start}"
+    durable_message_id = message_id or f"{turn_id}:{sequence_start}"
     parts = message.parts or (TextPart(""),)
     for part_index, part in enumerate(parts):
         if isinstance(part, ToolCallPart):
@@ -604,7 +611,7 @@ def transcript_entries_from_message(session_id: str, turn_id: str, sequence_star
             kind = TranscriptKind.USER_MESSAGE if message.role == "user" else TranscriptKind.ASSISTANT_MESSAGE
         payload: dict[str, Any] = {
             "role": message.role,
-            "message_id": message_id,
+            "message_id": durable_message_id,
             "message_part_index": part_index,
             "part": part.to_dict() if hasattr(part, "to_dict") else {"text": str(part)},
         }
@@ -626,6 +633,7 @@ def transcript_entries_for_failed_turn(
     sequence_start: int,
     *,
     visible_message: Message | None,
+    message_id: str | None = None,
     termination_reason: TerminationReason,
     failure_reason: FailureReason | None,
 ) -> tuple[TranscriptEntry, ...]:
@@ -646,7 +654,7 @@ def transcript_entries_for_failed_turn(
     entries: list[TranscriptEntry] = []
     sequence = sequence_start
     if visible_message is not None:
-        message_id = f"{turn_id}:failed:{sequence_start}"
+        durable_message_id = message_id or f"{turn_id}:failed:{sequence_start}"
         for part_index, part in enumerate(visible_message.parts):
             if not isinstance(part, (TextPart, ReasoningPart)):
                 raise TypeError("failed Turn visible message contains an unsupported part")
@@ -658,7 +666,7 @@ def transcript_entries_for_failed_turn(
                     TranscriptKind.FAILED_ASSISTANT_MESSAGE,
                     {
                         "role": "assistant",
-                        "message_id": message_id,
+                        "message_id": durable_message_id,
                         "message_part_index": part_index,
                         "part": part.to_dict(),
                     },

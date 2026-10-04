@@ -229,10 +229,12 @@ test("history pages merge with live output, dedupe stable identities, and ignore
 
 test("history merge preserves distinct same-turn assistant parts and messages", () => {
   const projectKey = "C:/Projects/history-identities";
+  const sharedMessageId = "74d2ae9ca7904b43a839e2fb95f3c00d";
+  const nextMessageId = "589fe4955b8f45cc9ed85faec24fe2d1";
   const base = createInitialState({
     selectedProjectKey: projectKey,
     selectedSessionId: "session-a",
-    timeline: [{ id: "live-assistant", kind: "assistant", text: "streaming prefix", turnId: "turn-1", messageId: "message-1", streaming: true }],
+    timeline: [{ id: "live-assistant", kind: "assistant", text: "streaming prefix", turnId: "turn-1", messageId: sharedMessageId, streaming: true }],
   });
   const result = reduceRendererState(base, {
     type: "history_page_loaded",
@@ -242,9 +244,9 @@ test("history merge preserves distinct same-turn assistant parts and messages", 
     result: {
       session_id: "session-a",
       records: [
-        { record_id: "session-a:1:assistant::0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: "message-1", text: "part one", is_error: false },
-        { record_id: "session-a:1:assistant::1", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: "message-1", text: "part two", is_error: false },
-        { record_id: "session-a:2:assistant::0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", message_id: "message-2", text: "independent message", is_error: false },
+        { record_id: "session-a:1:assistant::0", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: sharedMessageId, text: "part one", is_error: false },
+        { record_id: "session-a:1:assistant::1", session_id: "session-a", sequence: 1, turn_id: "turn-1", kind: "assistant", message_id: sharedMessageId, text: "part two", is_error: false },
+        { record_id: "session-a:2:assistant::0", session_id: "session-a", sequence: 2, turn_id: "turn-1", kind: "assistant", message_id: nextMessageId, text: "independent message", is_error: false },
       ],
       next_cursor: null,
       has_more: false,
@@ -254,6 +256,91 @@ test("history merge preserves distinct same-turn assistant parts and messages", 
   assert.equal(result.timeline.filter((entry) => entry.kind === "assistant").length, 3);
   assert.deepEqual(result.timeline.map((entry) => entry.text), ["part one", "part two", "independent message"]);
   assert.equal(result.sessionHistory[sessionRuntimeKey(projectKey, "session-a")]?.records.length, 3);
+});
+
+test("late history replaces only its closed message while active output and later pages remain", () => {
+  const projectKey = "C:/Projects/history-active-prefix";
+  const sessionId = "session-a";
+  const turnId = "turn-active";
+  const runId = "run-active";
+  const closedMessageId = "74d2ae9ca7904b43a839e2fb95f3c00d";
+  const activeMessageId = "589fe4955b8f45cc9ed85faec24fe2d1";
+  const callId = "call-closed-prefix";
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    activeTurn: true,
+    turnStatus: "running",
+    run: { run_id: runId, turn_id: turnId, status: "running" },
+    timeline: [
+      { id: `reasoning:${runId}:${turnId}:${closedMessageId}:1`, kind: "reasoning", text: "repeated thought", runId, turnId, messageId: closedMessageId, status: "completed", streaming: false },
+      { id: `tool:${runId}:${turnId}:${callId}`, kind: "tool", text: "ReadDocument", runId, turnId, toolCallId: callId, status: "running", streaming: false },
+      { id: `assistant:${runId}:${turnId}:${activeMessageId}`, kind: "assistant", text: "active prefix", runId, turnId, messageId: activeMessageId, status: "streaming", streaming: true },
+    ],
+  });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: {
+      session_id: sessionId,
+      records: [
+        { record_id: "session-a:10:user:0", session_id: sessionId, sequence: 10, turn_id: turnId, kind: "user", message_id: "d95b5ac8e07d4ba28e67ca0b59842ba1", text: "inspect", is_error: false },
+        { record_id: "session-a:11:reasoning:0", session_id: sessionId, sequence: 11, turn_id: turnId, kind: "reasoning", message_id: closedMessageId, text: "repeated thought", is_error: false },
+        { record_id: "session-a:12:reasoning:1", session_id: sessionId, sequence: 12, turn_id: turnId, kind: "reasoning", message_id: closedMessageId, text: "repeated thought", is_error: false },
+        { record_id: "session-a:13:tool:call-closed-prefix", session_id: sessionId, sequence: 13, turn_id: turnId, kind: "tool", tool_call_id: callId, text: "ReadDocument", status: "succeeded", is_error: false },
+      ],
+      next_cursor: "older-page",
+      has_more: true,
+      unit_count: 1,
+    },
+  });
+  assert.deepEqual(state.timeline.map((entry) => entry.kind), ["user", "reasoning", "reasoning", "tool", "assistant"]);
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "reasoning").map((entry) => entry.text), ["repeated thought", "repeated thought"]);
+  assert.equal(state.timeline.filter((entry) => entry.kind === "tool").length, 1);
+  assert.equal(state.timeline.at(-1)?.text, "active prefix");
+
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: { type: "reasoning_delta", run_id: runId, turn_id: turnId, message_id: closedMessageId, text: "late duplicate" },
+  });
+  assert.equal(state.timeline.filter((entry) => entry.kind === "reasoning" && entry.messageId === closedMessageId).length, 2);
+  assert.equal(state.timeline.some((entry) => entry.text.includes("late duplicate")), false, "a late live event for the durable closed message is ignored");
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: { type: "tool_started", run_id: runId, turn_id: turnId, batch_id: "batch-closed", tool_call_id: callId, tool_name: "ReadDocument" },
+  });
+  assert.equal(state.timeline.filter((entry) => entry.kind === "tool").length, 1, "the late live ToolCall does not duplicate its durable record");
+  state = reduceRendererState(state, {
+    type: "agent_event",
+    event: { type: "assistant_message_delta", run_id: runId, turn_id: turnId, message_id: activeMessageId, text: " continues" },
+  });
+  assert.equal(state.timeline.at(-1)?.text, "active prefix continues", "a later unpersisted message keeps accepting live output");
+
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    result: {
+      session_id: sessionId,
+      records: [
+        { record_id: "session-a:1:user:old", session_id: sessionId, sequence: 1, turn_id: "turn-older", kind: "user", text: "older turn", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  assert.deepEqual(state.timeline.map((entry) => entry.text), [
+    "older turn",
+    "inspect",
+    "repeated thought",
+    "repeated thought",
+    "ReadDocument",
+    "active prefix continues",
+  ]);
+  assert.equal(state.timeline.at(-1)?.turnId, turnId, "paging an older Turn leaves the active Turn tail in place");
 });
 
 test("preparing Session resume keeps its history timeline and marks ready only after the boundary", () => {
@@ -868,6 +955,44 @@ test("T05 reducer keeps event order, replaces assistant preview, and settles too
   assert.equal(state.timeline.find((entry) => entry.kind === "reasoning")?.streaming, false);
 });
 
+test("accepted attachment drafts merge into the authoritative user message for text and attachment-only Turns", () => {
+  const attachment = {
+    ref: "attachment-ref",
+    display_name: "sample.xlsx",
+    mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    size_bytes: 42,
+  };
+  for (const text of ["summarize this", ""]) {
+    let state = reduceRendererState(createInitialState({
+      composerAttachments: [{ ...attachment, data_url: "data:application/octet-stream;base64,secret-preview" }],
+    }), {
+      type: "turn_accepted",
+      run: { run_id: "run-attachment", turn_id: text ? "turn-with-text" : "turn-attachment-only", status: "running" },
+      steering: false,
+      text,
+      attachments: [attachment],
+    });
+    state = reduceRendererState(state, {
+      type: "agent_event",
+      event: {
+        type: "turn_started",
+        run_id: "run-attachment",
+        turn_id: text ? "turn-with-text" : "turn-attachment-only",
+        message_id: text ? "message-with-text" : "message-attachment-only",
+        message: { role: "user", parts: text ? [{ type: "text", text }] : [] },
+      },
+    });
+    const users = state.timeline.filter((entry) => entry.kind === "user");
+    assert.equal(users.length, 1);
+    assert.equal(users[0]?.id, `user:${text ? "message-with-text" : "message-attachment-only"}`);
+    assert.equal(users[0]?.messageId, text ? "message-with-text" : "message-attachment-only");
+    assert.equal(users[0]?.text, text);
+    assert.deepEqual(users[0]?.attachments?.map((item) => item.ref), ["attachment-ref"]);
+    assert.doesNotMatch(JSON.stringify(users[0]), /secret-preview/u);
+    assert.deepEqual(state.composerAttachments, []);
+  }
+});
+
 test("renderer boundary diagnostics keep only the fixed boundary code", () => {
   let state = reduceRendererState(createInitialState(), {
     type: "agent_event",
@@ -1367,4 +1492,123 @@ test("refreshing recent compaction history preserves the older-page cursor and l
   assert.equal(state.sessionHistory[key]?.nextCursor, "older-cursor");
   assert.deepEqual(state.sessionHistory[key]?.records.map(entry => entry.id), ["old", "new", "compact"]);
   assert.deepEqual(state.timeline.map(entry => entry.id), ["old", "new", "compact"]);
+});
+
+test("assistant completion never consumes a different streaming message identity", () => {
+  let state = createInitialState({
+    run: { run_id: "run-identity", turn_id: "turn-identity", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload as AgentEvent });
+  state = reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-identity", turn_id: "turn-identity", message_id: "message-streaming", text: "existing stream" }));
+  state = reduceRendererState(state, event({
+    type: "assistant_message_completed",
+    run_id: "run-identity",
+    turn_id: "turn-identity",
+    message_id: "message-tool-only",
+    message: { role: "assistant", parts: [{ type: "tool_call", call_id: "call-only", tool_name: "Bash", arguments: {} }] },
+  }));
+  state = reduceRendererState(state, event({
+    type: "assistant_message_completed",
+    run_id: "run-identity",
+    turn_id: "turn-identity",
+    message_id: "message-final",
+    message: { role: "assistant", parts: [{ type: "text", text: "separate final message" }] },
+  }));
+
+  const assistant = state.timeline.filter((entry) => entry.kind === "assistant");
+  assert.deepEqual(assistant.map((entry) => ({ messageId: entry.messageId, text: entry.text, streaming: entry.streaming })), [
+    { messageId: "message-streaming", text: "existing stream", streaming: true },
+    { messageId: "message-final", text: "separate final message", streaming: false },
+  ]);
+});
+
+test("late assistant completion and terminal text preserve durable multipart rows", () => {
+  const projectKey = "C:/durable-parts";
+  const sessionId = "session-parts";
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    run: { run_id: "run-parts", turn_id: "turn-parts", status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: {
+      session_id: sessionId,
+      records: [
+        { record_id: "part-one", sequence: 1, turn_id: "turn-parts", message_id: "message-parts", kind: "assistant", text: "part one" },
+        { record_id: "part-two", sequence: 2, turn_id: "turn-parts", message_id: "message-parts", kind: "assistant", text: "part two" },
+      ],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  const completion = { type: "agent_event" as const, event: {
+    type: "assistant_message_completed",
+    run_id: "run-parts",
+    turn_id: "turn-parts",
+    message_id: "message-parts",
+    message: { role: "assistant", parts: [{ type: "text", text: "part onepart two" }] },
+  } as AgentEvent };
+  state = reduceRendererState(state, completion);
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_completed", run_id: "run-parts", turn_id: "turn-parts", final_text: "part onepart two" } });
+
+  const assistant = state.timeline.filter((entry) => entry.kind === "assistant");
+  assert.deepEqual(assistant.map((entry) => ({ id: entry.id, sequence: entry.sequence, text: entry.text })), [
+    { id: "part-one", sequence: 1, text: "part one" },
+    { id: "part-two", sequence: 2, text: "part two" },
+  ]);
+});
+
+test("late durable steering identity is ignored and pending steering identities are scoped to their turn", () => {
+  const projectKey = "C:/steering-identity";
+  const sessionId = "session-steering";
+  const run = { run_id: "run-steering", turn_id: "turn-steering", status: "running" };
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    run,
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: {
+      session_id: sessionId,
+      records: [{ record_id: "durable-steering", sequence: 1, turn_id: "turn-steering", message_id: "steering-old", kind: "steering", text: "previous input" }],
+      next_cursor: null,
+      has_more: false,
+      unit_count: 1,
+    },
+  });
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "user_steering_applied", run_id: "run-steering", turn_id: "turn-steering", steering_id: "steering-old" } });
+  assert.deepEqual(state.pendingSteeringMessageIds, {}, "a page that already contains this durable ID must not queue it again");
+  state = reduceRendererState(state, { type: "turn_accepted", run, steering: true, text: "new input" });
+  const newInput = state.timeline.find((entry) => entry.kind === "steering" && entry.text === "new input");
+  assert.equal(newInput?.messageId, undefined, "the old durable ID must not be attached to the next input");
+
+  state = reduceRendererState(state, { type: "clear_timeline" });
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "user_steering_applied", run_id: "run-steering", turn_id: "turn-steering", steering_id: "orphan-failed" } });
+  assert.deepEqual(state.pendingSteeringMessageIds[JSON.stringify(["run-steering", "turn-steering"])], ["orphan-failed"]);
+  state = reduceRendererState(state, { type: "steering_submission_failed", runId: "run-steering", turnId: "turn-steering" });
+  assert.deepEqual(state.pendingSteeringMessageIds, {}, "a failed steering request clears its turn's pending identity");
+
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "user_steering_applied", run_id: "run-steering", turn_id: "turn-steering", steering_id: "orphan-terminal" } });
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "turn_completed", run_id: "run-steering", turn_id: "turn-steering" } });
+  assert.deepEqual(state.pendingSteeringMessageIds, {}, "terminal completion clears unbound identities for that turn");
+
+  let cleared = createInitialState({ run, activeTurn: true, turnStatus: "running" });
+  cleared = reduceRendererState(cleared, { type: "agent_event", event: { type: "user_steering_applied", run_id: "run-steering", turn_id: "turn-steering", steering_id: "orphan-clear" } });
+  cleared = reduceRendererState(cleared, { type: "clear_timeline" });
+  assert.deepEqual(cleared.pendingSteeringMessageIds, {}, "clearing the transcript discards pending identities too");
 });

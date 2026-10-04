@@ -1899,7 +1899,9 @@ class UthCodeApplication:
         *,
         session_id: str | None,
         turn_id: str,
+        message_ids: Sequence[str | None] = (),
         failed_visible_message: Message | None = None,
+        failed_visible_message_id: str | None = None,
         termination_reason: TerminationReason | None = None,
         failure_reason: FailureReason | None = None,
     ) -> TranscriptPersistenceOutcome:
@@ -1953,16 +1955,36 @@ class UthCodeApplication:
             )
             self._record_transcript_persistence(outcome)
             return outcome
+        message_id_values = tuple(message_ids)
+        if not message_id_values and messages:
+            message_id_values = (None,) * len(messages)
+        if len(message_id_values) != len(messages) or any(
+            value is not None and (not isinstance(value, str) or not value.strip())
+            for value in message_id_values
+        ):
+            outcome = TranscriptPersistenceOutcome(
+                False,
+                False,
+                "invalid_message",
+                0,
+                transcript_metadata_synced=False,
+                transcript_reload_succeeded=False,
+                transcript_durability="not_durable",
+                failure_stages=("invalid_message",),
+            )
+            self._record_transcript_persistence(outcome)
+            return outcome
 
         entries: list[TranscriptEntry] = []
         try:
             sequence = active.transcript.last_sequence + 1
-            for message in messages:
+            for index, message in enumerate(messages):
                 converted = transcript_entries_from_message(
                     active.session_id,
                     turn_id,
                     sequence,
                     message,
+                    message_id=message_id_values[index],
                 )
                 entries.extend(converted)
                 sequence += len(converted)
@@ -1972,6 +1994,7 @@ class UthCodeApplication:
                     turn_id,
                     sequence,
                     visible_message=failed_visible_message,
+                    message_id=failed_visible_message_id,
                     termination_reason=termination_reason,
                     failure_reason=failure_reason,
                 )

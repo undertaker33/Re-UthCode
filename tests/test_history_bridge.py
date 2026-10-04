@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -17,11 +18,60 @@ from uthcode.application import (
     UthCodeApplication,
 )
 from uthcode.core.history import TranscriptKind, transcript_entries_from_message
-from uthcode.core.provider import FilePart, ImagePart, Message, TextPart
+from uthcode.core.provider import (
+    CancellationToken,
+    FilePart,
+    FinishReason,
+    GenerationCompleted,
+    GenerationRequest,
+    ImagePart,
+    Message,
+    ModelLimits,
+    ProviderEvent,
+    ProviderError,
+    ProviderIdentity,
+    ProviderResponse,
+    ReasoningPart,
+    ReasoningDelta as ProviderReasoningDelta,
+    TextDelta,
+    TextPart,
+    ToolCallPart,
+)
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import SessionFileStore
 from uthcode.interfaces.desktop.bridge import DesktopBridge
 from uthcode.interfaces.desktop.protocol import RequestEnvelope
+
+
+class _IdentityScriptProvider:
+    def __init__(self, scripts: tuple[tuple[ProviderEvent, ...], ...]) -> None:
+        self.identity = ProviderIdentity("fake", "identity", "identity-test")
+        self.scripts = scripts
+        self.requests: list[GenerationRequest] = []
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(max_input_tokens=256_000, source="test.history_identity")
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        script = self.scripts[min(len(self.requests) - 1, len(self.scripts) - 1)]
+        for event in script:
+            cancellation.raise_if_cancelled()
+            yield event
+
+
+def _provider_response(*parts: object, finish_reason: FinishReason = FinishReason.STOP) -> GenerationCompleted:
+    return GenerationCompleted(
+        ProviderResponse(
+            message=Message("assistant", tuple(parts)),
+            finish_reason=finish_reason,
+        )
+    )
 
 
 class _HistoryApplication:
@@ -100,6 +150,265 @@ async def test_history_page_is_exposed_as_a_safe_desktop_dto() -> None:
     )
     assert second.ok is True
     assert application.calls[-1] == ("session-1", "opaque-prev", 1)
+
+
+@pytest.mark.asyncio
+async def test_live_event_message_ids_survive_run_persistence_and_history_page(
+    tmp_path: Path,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-message-identity", project_key=project_key)
+    first_tool = _provider_response(
+        ReasoningPart("first reasoning"),
+        ToolCallPart(
+            "call-identity",
+            "TodoWrite",
+            {"todos": [{"content": "check identity", "status": "completed"}]},
+        ),
+        finish_reason=FinishReason.TOOL_CALLS,
+    )
+    provider = _IdentityScriptProvider(
+        (
+            (ProviderReasoningDelta("first reasoning"), first_tool),
+            (ProviderReasoningDelta("second reasoning"), _provider_response(ReasoningPart("second reasoning"), TextPart("answer"))),
+            (ProviderReasoningDelta("new turn reasoning"), _provider_response(ReasoningPart("new turn reasoning"), TextPart("next answer"))),
+        )
+    )
+    application = UthCodeApplication(
+        provider,  # type: ignore[arg-type]
+        session_service=ApplicationSessionService(
+            storage_root=store.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=store,
+        ),
+    )
+    application.resume_session_for_command("session-message-identity")
+    bridge = DesktopBridge(application)
+    try:
+        started = await bridge.handle_request(
+            RequestEnvelope("identity-turn-one", "turn.start", {"prompt": "inspect"})
+        )
+        assert started.ok is True
+        await bridge.wait_for_idle()
+        first_events = [
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event"
+        ]
+        first_page = await bridge.handle_request(
+            RequestEnvelope(
+                "identity-page-one",
+                "history.page",
+                {"session_id": "session-message-identity", "page_size": 30},
+            )
+        )
+        assert first_page.ok is True and first_page.result is not None
+        first_records = first_page.result["records"]
+        assert isinstance(first_records, list)
+        first_turn_started = next(event for event in first_events if event["type"] == "turn_started")
+        first_assistants = [
+            event["message_id"]
+            for event in first_events
+            if event["type"] == "assistant_message_completed"
+        ]
+        assert len(first_assistants) == 2
+        assert [record["kind"] for record in first_records] == [
+            "user",
+            "reasoning",
+            "tool",
+            "reasoning",
+            "assistant",
+        ]
+        assert [
+            record["message_id"]
+            for record in first_records
+            if record["kind"] in {"user", "reasoning", "assistant"}
+        ] == [
+            first_turn_started["message_id"],
+            first_assistants[0],
+            first_assistants[1],
+            first_assistants[1],
+        ]
+        assert first_records[2]["tool_call_id"] == "call-identity"
+        assert all(
+            isinstance(message_id, str) and len(message_id) == 32
+            for message_id in [first_turn_started["message_id"], *first_assistants]
+        )
+
+        second = await bridge.handle_request(
+            RequestEnvelope("identity-turn-two", "turn.start", {"prompt": "next"})
+        )
+        assert second.ok is True
+        await bridge.wait_for_idle()
+        second_events = [
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event"
+        ]
+        second_page = await bridge.handle_request(
+            RequestEnvelope(
+                "identity-page-two",
+                "history.page",
+                {"session_id": "session-message-identity", "page_size": 30},
+            )
+        )
+        assert second_page.ok is True and second_page.result is not None
+        all_records = second_page.result["records"]
+        assert isinstance(all_records, list)
+        second_turn_started = next(event for event in second_events if event["type"] == "turn_started")
+        second_assistant = next(
+            event["message_id"]
+            for event in second_events
+            if event["type"] == "assistant_message_completed"
+        )
+        second_turn_id = second_turn_started["turn_id"]
+        second_turn_records = [record for record in all_records if record["turn_id"] == second_turn_id]
+        assert [record["kind"] for record in second_turn_records] == ["user", "reasoning", "assistant"]
+        assert [record["message_id"] for record in second_turn_records] == [
+            second_turn_started["message_id"],
+            second_assistant,
+            second_assistant,
+        ]
+        assert len({record["message_id"] for record in second_turn_records}) == 2
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_visible_tail_keeps_its_live_message_identity_in_history(
+    tmp_path: Path,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-failed-identity", project_key=project_key)
+    application = UthCodeApplication(
+        FakeProvider(
+            events=(ProviderReasoningDelta("visible reasoning"), TextDelta("unfinished answer")),
+            error=ProviderError("provider failed after visible output"),
+            model_limits=ModelLimits(max_input_tokens=256_000, source="test.history_identity"),
+        ),
+        session_service=ApplicationSessionService(
+            storage_root=store.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=store,
+        ),
+    )
+    application.resume_session_for_command("session-failed-identity")
+    bridge = DesktopBridge(application)
+    try:
+        started = await bridge.handle_request(
+            RequestEnvelope("failed-identity-turn", "turn.start", {"prompt": "fail visibly"})
+        )
+        assert started.ok is True
+        await bridge.wait_for_idle()
+        events = [
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event"
+        ]
+        live_ids = {
+            event["message_id"]
+            for event in events
+            if event["type"] in {"reasoning_delta", "assistant_message_delta"}
+        }
+        assert len(live_ids) == 1
+        assert not any(event["type"] == "assistant_message_completed" for event in events)
+        page = await bridge.handle_request(
+            RequestEnvelope(
+                "failed-identity-page",
+                "history.page",
+                {"session_id": "session-failed-identity", "page_size": 30},
+            )
+        )
+        assert page.ok is True and page.result is not None
+        records = page.result["records"]
+        assert isinstance(records, list)
+        visible_records = [record for record in records if record["kind"] in {"reasoning", "assistant"}]
+        assert [(record["kind"], record["message_id"]) for record in visible_records] == [
+            ("reasoning", next(iter(live_ids))),
+            ("assistant", next(iter(live_ids))),
+        ]
+        assert any(record["kind"] == "failure" for record in records)
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_assistant_batch_retry_keeps_frozen_event_message_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-pending-message-identity", project_key=project_key)
+    provider = _IdentityScriptProvider(
+        (
+            (
+                ProviderReasoningDelta("prepare the tool"),
+                _provider_response(
+                    ToolCallPart(
+                        "call-persist-identity",
+                        "TodoWrite",
+                            {"todos": [{"content": "keep identity", "status": "completed"}]},
+                    ),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                ),
+            ),
+            _provider_response(TextPart("unreached")),
+        )
+    )
+    application = UthCodeApplication(
+        provider,  # type: ignore[arg-type]
+        session_service=ApplicationSessionService(
+            storage_root=store.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=store,
+        ),
+    )
+    application.resume_session_for_command("session-pending-message-identity")
+    real_persist = application._persist_run_messages
+    attempts: list[tuple[tuple[Message, ...], tuple[str | None, ...], object]] = []
+
+    def fail_closed_assistant_once(messages, *, session_id, turn_id, **metadata):  # type: ignore[no-untyped-def]
+        attempts.append((tuple(messages), tuple(metadata["message_ids"]), metadata.get("termination_reason")))
+        if len(attempts) == 2:
+            return SimpleNamespace(
+                persisted_message_count=0,
+                terminal_failure_appended=False,
+                transcript_durability="not_durable",
+            )
+        return real_persist(messages, session_id=session_id, turn_id=turn_id, **metadata)
+
+    monkeypatch.setattr(application, "_persist_run_messages", fail_closed_assistant_once)
+    handle = application.create_run().start_turn("use the todo tool")
+    events = [event async for event in handle.events()]
+    result = await handle.result()
+
+    user_message_id = next(event.message_id for event in events if event.event_type == "turn_started")
+    assistant_message_id = next(
+        event.message_id
+        for event in events
+        if event.event_type == "assistant_message_completed"
+    )
+    assert result.status.value != "completed"
+    assert result.failure_reason.value == "persistence_unavailable"
+    assert len(provider.requests) == 1
+    assert len(attempts) == 3
+    assert attempts[0][1] == (user_message_id,)
+    assert attempts[1][0] == attempts[2][0]
+    assert attempts[1][1] == attempts[2][1]
+    assert attempts[1][1][0] == assistant_message_id
+    assert attempts[1][2] is None and attempts[2][2] is not None, "the terminal retry extends the pending batch without changing its captured message identity"
+    page = application.session_history_page("session-pending-message-identity", page_size=30)
+    assert any(record.kind == "tool" and record.tool_call_id == "call-persist-identity" for record in page.records)
+    transcript = store.read_session("session-pending-message-identity").transcript
+    tool_calls = [entry for entry in transcript.entries if entry.kind is TranscriptKind.TOOL_CALL]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].payload["message_id"] == assistant_message_id
 
 
 @pytest.mark.asyncio

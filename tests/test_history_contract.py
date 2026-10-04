@@ -87,6 +87,18 @@ def test_application_message_conversion_preserves_complete_message_identity() ->
     ]
     assert all("message" not in entry.payload for entry in entries)
 
+    event_entries = transcript_entries_from_message(
+        "session-1",
+        "turn-1",
+        3,
+        message,
+        message_id="agent-event-uuid",
+    )
+    assert [entry.payload["message_id"] for entry in event_entries] == [
+        "agent-event-uuid",
+        "agent-event-uuid",
+    ]
+
 
 def test_application_message_conversion_keeps_each_reasoning_carrier_local() -> None:
     reasoning_native = NativeItem(

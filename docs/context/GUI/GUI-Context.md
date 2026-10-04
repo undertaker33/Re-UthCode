@@ -21,7 +21,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成且没有 Session-owned 活进程的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application 及其进程。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
 - `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
-- `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
+- `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿，并立即将安全附件元数据投影到用户消息正文上方；TurnStarted 补齐消息身份时保留附件。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
 - `[FACT]` 含图片的 `turn.start` 若当前模型 `supports_images` 为 `false` 或未知，会在 Application 预检阶段受控拒绝；Desktop 通过 JSON 业务结果显示本地化设置提示并保留附件草稿，选择支持图片的模型后可重试。
 - `[FACT]` Renderer 的附件导入/预览在跨 IPC await 前捕获 `project_key`、Session、`sessionViewRevision` 和运行代次 owner；返回后只向仍拥有该视图的 Composer 写入草稿或错误，切换 Session 不会把迟到结果污染新 Session，首次惰性创建 Session 仍可正常接收结果。
 - `[FACT]` `/model` 参数补全向用户显示 Model 的 `display_name`，但执行值仍为规范的 logical Model Profile ID。Settings 中 Provider 的可选 `display_name` 也只用于列表和弹窗标题，缺失时回退稳定 Provider Profile ID；修改显示名不会改变 Model 引用。Composer 的模型、权限选择器在 active Turn、pending interaction、Compact 或 runtime restart 时禁用，避免绕过 Application 边界。
@@ -60,7 +60,7 @@ visible Session A 有 active Turn
 - 同一 Session 同时最多一个 active Turn，仍遵守 `AgentRun` 的独占约束；在该 Session 可见时，普通输入是 Steering，暂停/恢复/取消仍指向同一 Turn。
 - 普通侧栏与 Slash 导航保留 Session-owned Run 的事件接收，不把停放的 Run 当作已失效 Run；真正清空工作区时清除显示缓存并拒绝已知旧 Run 的迟到事件。目录刷新省略运行状态时保留已有 running/waiting 等投影；带身份的 status 只更新匹配 Project/Session 的投影，不覆盖另一可见会话。
 - 活跃会话的补充 status 轮询为 single-flight，导航或重启操作占用期间跳过，不积压等待任务。Desktop catalog 读取元数据，并从 Transcript 头部读取到首条完整用户记录生成单行预览，不为每个目录项重建完整历史；侧栏优先显示手动标题，否则显示首条用户消息预览。聊天默认显示最近 30 个完整交互单元，向上接近顶部再读取更早页，不自动补载全部历史。
-- 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录使用稳定身份并与当前实时投影合并；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。游标同时保存 Transcript 与 Timeline 字节边界，翻旧页不会重复扫描更新的 Timeline；压缩完成记录从 Timeline 投影，并按对应的 Transcript 提交位置插入聊天。
+- 分页请求按 Session 保持 single-flight，并校验导航/请求身份；失败只显示局部重试，不清空已显示内容。旧页前插保留阅读位置，持久记录按消息身份与实时投影合并，并保留不同持久 part 的独立记录；已提交记录优先于迟到的同消息实时封口，未持久化的活动内容继续显示。历史页与实时缓存同步合并结果；完整运行时恢复仍由 Application 执行，分页不裁剪模型上下文。游标同时保存 Transcript 与 Timeline 字节边界，翻旧页不会重复扫描更新的 Timeline；压缩完成记录从 Timeline 投影，并按对应的 Transcript 提交位置插入聊天。
 - Session rename/move 是 Application 的持久元数据操作。Bridge 在任一已保存 runtime 仍有 active Turn 时拒绝这些变更，避免修改与运行中的 Session 边界竞争。
 - 进程内的 per-Session runtime 是导航连续性机制，不是 Session v3 持久格式的一部分。Runtime crash/protocol error 仍与 Provider/Turn 的正式失败投影分离。
 

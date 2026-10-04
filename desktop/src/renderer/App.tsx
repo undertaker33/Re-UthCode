@@ -8,7 +8,7 @@ import {
   SIDEBAR_WIDTH_MAX,
   SIDEBAR_WIDTH_MIN,
 } from "../desktop-api";
-import type { AgentEvent, ArtifactDescriptor, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference } from "../desktop-api";
+import type { AgentEvent, ArtifactDescriptor, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, DesktopPreferences, JsonObject, JsonValue, LanguagePreference, PanelModePreference, ThemePreference, TimelineAttachment } from "../desktop-api";
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { type FilePreviewMode } from "./FileCard";
@@ -213,6 +213,18 @@ function attachmentDraftFromResult(value: unknown): DesktopAttachmentDraft | nul
     ...(previewText !== undefined ? { text: previewText } : {}),
     ...(source.truncated === true ? { truncated: true } : {}),
     ...(dataUrl ? { data_url: dataUrl } : {}),
+  };
+}
+
+function timelineAttachmentFromDraft(attachment: DesktopAttachmentDraft): TimelineAttachment {
+  return {
+    ref: attachment.ref,
+    ...(attachment.asset_ref ? { asset_ref: attachment.asset_ref } : {}),
+    display_name: attachment.display_name,
+    mime_type: attachment.mime_type,
+    size_bytes: attachment.size_bytes,
+    ...(attachment.width !== undefined && attachment.width !== null ? { width: attachment.width } : {}),
+    ...(attachment.height !== undefined && attachment.height !== null ? { height: attachment.height } : {}),
   };
 }
 
@@ -1424,6 +1436,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       return;
     }
     const steering = stateRef.current.activeTurn;
+    const steeringIdentity = steering ? identityFromRun(stateRef.current.run) : null;
+    const clearPendingSteeringIdentity = () => {
+      if (steering && steeringIdentity && hasCompleteTurnIdentity(steeringIdentity)) {
+        dispatch({ type: "steering_submission_failed", runId: steeringIdentity.runId, turnId: steeringIdentity.turnId });
+      }
+    };
     const pendingStart = steering ? null : beginPendingTurnStart();
     try {
       const result = steering
@@ -1450,6 +1468,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const acceptedIdentity = identityFromRun(acceptedRun);
       if (!hasCompleteTurnIdentity(acceptedIdentity)) {
         if (pendingStart) clearPendingTurnStart();
+        clearPendingSteeringIdentity();
         dispatch({ type: "notice", text: t("turnStartFailed") });
         return;
       }
@@ -1459,13 +1478,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       // an arbitrary turn_started event cannot do this job safely.
       setLatestTurnIdentity(acceptedIdentity);
       cancelTerminalStatusPoll();
-      dispatch({ type: "turn_accepted", run: acceptedRun, steering, text });
+      dispatch({
+        type: "turn_accepted",
+        run: acceptedRun,
+        steering,
+        text,
+        ...(!steering && selectedAttachments.length > 0
+          ? { attachments: selectedAttachments.map(timelineAttachmentFromDraft) }
+          : {}),
+      });
       // Replaying after the accepted action preserves the exact stdout order
       // while the reducer queue applies turn_accepted before its events.
       bufferedEvents.forEach(processAgentEvent);
     } catch (error) {
       if (!isMounted() || (pendingStart && pendingTurnStart() !== pendingStart)) return;
       if (pendingStart) clearPendingTurnStart();
+      clearPendingSteeringIdentity();
       dispatch({ type: "notice", text: safeErrorMessage(error, t("turnStartFailed")) });
     }
   }, [api, beginPendingTurnStart, cancelTerminalStatusPoll, clearPendingTurnStart, executeCommand, finishPendingTurnStart, hasOwner, isMounted, pendingTurnStart, processAgentEvent, send, setLatestTurnIdentity, t, waitForRuntimeUserAccess]);

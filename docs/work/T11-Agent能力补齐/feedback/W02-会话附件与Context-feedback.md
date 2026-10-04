@@ -185,3 +185,13 @@ Terra 复核发现：当前 transcript writer 将同一用户 Message 的多个 
 - `conda run --no-capture-output -n re-uthcode python C:/Users/93445/.codex/skills/uth-utf8-guard/scripts/check_utf8_docs.py docs/work/T11-Agent能力补齐/feedback/W02-会话附件与Context-feedback.md`：`OK: 1 file(s) passed UTF-8 guard`。
 
 本轮只修改 Application 附件/历史投影、相关 Python 测试和本 Feedback；未修改冻结工作包文件、Desktop UI、根文档或 Git 状态。未运行 Desktop/npm、packaged/Windows 原生、真实 Provider/Tavily 或全量 Python 回归。
+
+## 实时与持久消息身份收口（2026-10-04）
+
+本轮沿用既有实现，由 GPT-6 Luna / max 实施、GPT-6.1 Sol / medium 独立复审。根因是实时 user/assistant 使用 UUID，原 Transcript 使用 turn:sequence 身份，首次切回新 Session 后两套投影不能按 message_id 合并。Application 将 TurnStarted、AssistantMessageCompleted、UserSteeringApplied 的真实 UUID 绑定到 RunState 消息索引，交现有 Transcript payload.message_id 持久化；待提交批次冻结身份用于失败重试，已提交绑定释放。未新增领域 Message 字段或存储格式；无事件身份的调用方及旧数据继续既有派生身份，不做文本去重或整 Turn 替换。
+
+Renderer 保留同一 UUID 的 distinct part、合法 reasoning、未持久化活动尾部和后续新 Turn。复审发现的三项 P1 已交原 Worker 修复并通过原 Reviewer 复审：完成事件不覆盖不同 UUID 的 streaming；迟到 turn_completed 不把 durable multipart 改成聚合全文；已持久化 steering 的迟到身份幂等忽略，待绑定队列在失败、终态、导航和清空边界清理。
+
+正式 AgentRun → SessionFileStore → DesktopBridge/history.page 回归使用真实动态 UUID，不以手工相同身份 fixture 冒充生产者修复。总控在 re-uthcode 执行 python -m pytest tests/test_application_runs.py tests/test_history_contract.py tests/test_history_bridge.py tests/test_t09_1_context_protocol_e2e.py -q：110 passed in 18.17s，exit 0；架构边界 23 passed in 9.87s。Renderer state 55/55、附件 18/18、首轮导航 1/1、typecheck exit 0；完整 Desktop 265 passed 的最终记录见 W06。
+
+总控亲自使用最终 make 产物：新 Session 815bed2249f1400ab38a13da21767594 的图+Excel 首轮完成后切到空白 eeda37b0f1014e8780ef3e55f5b81b82 再返回，只显示 user、reasoning、ReadDocument、reasoning、assistant 一组；关闭客户端并重启后同组顺序、正文和双附件仍在。Session 3a5562d2004a4ba18a4b907613caaf35 纯图片提交先被无视觉模型拒绝，草稿保留，切回 Qwen 后直接重试成功，只有一个用户行。身份持久化与附件投影缺陷已具备当前产物证据；尚未证实的模型请求重复注入与本次显示重复分别处理，不删合法 reasoning。
