@@ -172,3 +172,12 @@ Luna（max）完成 W03 首轮实施、总控 PDF 私有宿主预审返工，以
 - 总控执行 `tests/test_architecture_boundaries.py -q`：`23 passed in 11.61s`。
 - `python.exe C:\Users\93445\.codex\skills\uth-utf8-guard\scripts\check_utf8_docs.py docs/Tools.md docs/context/A01-AgentRuntime/AgentRuntime-Context.md docs/work/T11-Agent能力补齐/feedback/W03-文档视觉与进程会话-feedback.md`：`OK: 3 file(s) passed UTF-8 guard`。
 - A09 保持已完成；Windows packaged 四格式与 PDF 页图人工验收 A10 仍未验证。没有修改 Checklist、冻结文件、Desktop 文件或 Git 状态。
+
+### 第6轮最终复验补充（2026-10-03）
+
+在进一步明确 `ReadFile` 仅按路径读取 UTF-8 文本且继续受权限判断后，重新运行三类 Tool 及指令边界回归：`& 'C:\Users\93445\miniconda3\envs\re-uthcode\python.exe' -m pytest tests/test_builtin_file_tools.py tests/test_document_tools.py tests/test_image_tools.py tests/test_project_instructions.py -q`：`41 passed in 3.60s`。
+
+
+### 2026-10-04 当前工作区文档工具回归
+
+总控使用既有 re-uthcode Conda Python 实跑 `python -m pytest tests/test_builtin_file_tools.py tests/test_document_tools.py tests/test_image_tools.py tests/test_project_instructions.py -q`：41 passed in 4.44s，退出码 0。`python -m pytest tests/test_architecture_boundaries.py -q`：23 passed in 9.87s，退出码 0。此记录确认当前源码定向回归；尚未构建本轮新 Windows 包，不将旧包或前序实机证据写成本轮新包通过。
