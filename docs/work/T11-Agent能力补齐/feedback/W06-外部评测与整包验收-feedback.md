@@ -290,3 +290,34 @@ Checklist 只补勾 T15 的充分有效证据，冻结正文不改，T11 整包�
 ### 活动生成中的附件投影补充观察（2026-10-04）
 
 为补充前两次短请求完成过快的观察限制，总控在上述空白 Session eeda37b0f1014e8780ef3e55f5b81b82 导入同 PNG，发送约 2000 字图片解释请求，明确不调用工具或修改文件。首次接受后的下一原生观察仍在生成：输入区显示“向当前轮次发送引导”，截图有暂停/取消，assistant 仅输出至错误/跳过段落；无障碍用户 article 849 下已有图片 article 853，输入区正文与附件草稿均已清空，无移除附件按钮。因此当前最终新包已有“生成结束前用户附件卡片存在”的真实原生 UIA 证据；不声称截图量化了接受瞬间的毫秒延迟，精确即时 reducer 投影仍由 App 测试支撑。后续观察模型正常完成。该补充不改动此前阶段记录，不扩大为整包通过。
+
+
+### 真实 SWE-bench Lite 正式预测与官方评分（2026-10-04）
+
+用户本轮指定先执行 Docker/SWE-bench 验收，其余环境准备后再通知。Docker 当前为 Linux/amd64，Server 29.2.1、20 CPU、约 15.43 GiB；只创建本轮外部评分容器，没有重装、清理用户镜像或修改产品 Conda 环境。产品仍使用既有 re-uthcode Python 3.12.13。评分器独立在 Python 3.11.17 容器，Docker SDK 7.2.0；官方 swebench 5.0.2 要求的新 image/eval_script 数据列不适用于冻结数据集的旧 schema，因此使用官方 4.1.0，不改冻结数据集名、命令或产品依赖。
+
+实例按 test split 第一行选取：`astropy__astropy-12907`，repo `astropy/astropy`，base commit `d16bfe05a744909de4b27f5875fe0d4ed41ce607`，version 4.3；HF 数据修订 `6ec7bb89b9342f664a54a6e0a6ea6501d3437cc2`。模型输入只读取 instance_id/repo/base_commit/problem_statement/version 五列，不读取 gold patch/test_patch；官方评分器单独加载测试数据。两个工作区均在仓库外，调用前 HEAD 精确且 Git clean；源代码仓库未参与解题补丁生成。外部驱动分别经原 GPT-6 Luna/max 实施、原 GPT-6.1 Sol/medium 独立审核 PASS，模型补丁仅由正式工具执行产生，不由实施 worker 手写答案。
+
+第一尝试 t11-1 保留完整证据：真实 Qwen 完成 12 iterations/12 tool calls 后，用 Bash 读取实例 core.py，权限分类为 unknown、auto mode_fallback，正式 Eval 对 permission_required pause 自动取消。不是用户主动取消，也不是 Runtime 异常。finish_category=blocked_by_permission，duration=75.469s，model_patch_bytes=0，token total=123094。官方 run_id `uthcode-t11-20261004-ff513aad` 的命令 exit 0、13.414s，但 completed=0、empty_patch=1；官方过滤空补丁，没有实际评分，因此该轮不计 A26 通过。
+
+第二尝试使用新的 clean checkout、独立 restricted-evaluation 和 t11-2-no-bash，保留首轮文件。为补救无人交互的 Bash 权限阻断，外部驱动通过已有 application_factory/tools seam 仅提供正式 ReadFile/WriteFile/EditFile/Glob/Grep/ApplyPatch/GitWorkspace 七工具，保留同一 InstructionLoader.activate_for_path、有效 tool_limits、真实 SDK 和 auto 权限链；没有扩大权限、修改产品或自动批准 ASK。仍经 run_swebench_instance -> run_attempt -> create_application/create_run/start_turn，1200 秒上限，无后续刷题重试。模型未在该受限环境执行测试，测试交官方 Linux 环境。
+
+实际模型为 qwen3.7-flash，openai_compat，端点 https://dashscope.aliyuncs.com/compatible-mode/v1，OpenAI SDK 2.53.0。第二轮 exit 0，finish_category=success、Turn completed/final_answer，19 iterations/19 tool calls，duration=247.703s（driver=250.879s），真实 diff 32990 UTF-8 bytes；input/output/total tokens=254828/18480/273308，cache_read=145792。此 success 仅为 Agent Turn 完成，不代表题目解决。
+
+正式预测命令（已有 Conda 环境，驱动在仓库外）：
+
+```powershell
+conda run --no-capture-output -n re-uthcode python 'D:\uthcode-audits\t11-swe-20261004-ff513aad\inputs\run_restricted_swebench_prediction.py' --input 'D:\uthcode-audits\t11-swe-20261004-ff513aad\inputs\selected-input.json' --workdir 'D:\uthcode-audits\t11-swe-20261004-ff513aad\workspaces\astropy__astropy-12907-no-bash' --run-authorized
+```
+
+官方评分命令（独立 Linux 容器）：
+
+```bash
+python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path /audit/predictions-restricted.jsonl --instance_ids astropy__astropy-12907 --run_id uthcode-t11-20261004-ff513aad-no-bash --max_workers 1
+```
+
+使用官方 `swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest` 镜像。评分 exit 0、101.462s；submitted=1、completed=1、unresolved=1、resolved=0、empty_patch=0、errors=0。实例 report.json 确认 patch_exists=true、patch_successfully_applied=true、resolved=false。官方 pytest 为 5 passed、10 failed、0.40s：FAIL_TO_PASS 两项均失败，PASS_TO_PASS 五项成功、八项失败，test_cstack 与多个 separability_matrix 用例出现 AssertionError，属于模型补丁未通过正确性/回归测试，不是镜像缺失或评分环境失败。未修补答案后重测，也未把 final_answer 当正确性证据。
+
+本机证据根为 `D:\uthcode-audits\t11-swe-20261004-ff513aad`：首次 prediction/summary/trace 位于 evaluation；第二次三字段预测为 restricted-evaluation/reports/astropy__astropy-12907.jsonl，安全 trace 为 restricted-evaluation/artifacts/t11-swe-bench-lite/astropy__astropy-12907/t11-2-no-bash/trace.jsonl；官方总报告为 harness/qwen3.7-flash.uthcode-t11-20261004-ff513aad-no-bash.json，逐例 report.json/test_output.txt 位于 harness/logs/run_evaluation/uthcode-t11-20261004-ff513aad-no-bash/qwen3.7-flash/astropy__astropy-12907/；精确命令/exit/耗时见 harness/harness-restricted-status.json。文件保留供复核，不包含凭据。
+
+A26 的两处引用具备真实正式预测及官方完成评分证据，可以勾选；该条件不要求单例必解。其余未验证项没有扩大结论，剩 16 个未勾选行、11 组要求。T11 继续 not_implemented，不归档；其他用户配置/安装环境验收等用户准备好后继续。产品代码没有改动，不重新跑 Desktop 或构建旧包充当本次 SWE 证据。
