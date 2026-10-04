@@ -25,8 +25,10 @@ from uthcode.core.agent_events import (
     FailureReason,
     ReasoningDelta,
     TerminationReason,
+    TurnStarted,
     TurnPaused,
     TurnResumed,
+    UserSteeringApplied,
     UsageUpdated,
 )
 from uthcode.core.interaction import (
@@ -74,9 +76,11 @@ class _PendingPersistenceBatch:
     session_id: str | None
     turn_id: str
     messages: tuple[Message, ...]
+    message_ids: tuple[str | None, ...]
     blocked: bool = False
     terminal: bool = False
     failed_visible_message: Message | None = None
+    failed_visible_message_id: str | None = None
     termination_reason: TerminationReason | None = None
     failure_reason: FailureReason | None = None
 
@@ -150,6 +154,7 @@ class AgentRun:
         "_last_flush_committed_terminal",
         "_turn_message_start",
         "_turn_session_id",
+        "_message_ids_by_index",
     )
 
     def __init__(
@@ -178,6 +183,7 @@ class AgentRun:
         self._last_flush_committed_terminal = False
         self._turn_message_start: int | None = None
         self._turn_session_id: str | None = None
+        self._message_ids_by_index: dict[int, str] = {}
 
     @property
     def permission_mode(self) -> PermissionMode:
@@ -323,9 +329,11 @@ class AgentRun:
         session_id: str | None,
         turn_id: str,
         messages: Sequence[Message],
+        message_ids: Sequence[str | None] = (),
         blocked: bool = False,
         terminal: bool = False,
         failed_visible_message: Message | None = None,
+        failed_visible_message_id: str | None = None,
         termination_reason: TerminationReason | None = None,
         failure_reason: FailureReason | None = None,
     ) -> None:
@@ -334,6 +342,11 @@ class AgentRun:
         if session_id is None:
             return
         values = tuple(messages)
+        message_id_values = tuple(message_ids)
+        if not message_id_values and values:
+            message_id_values = (None,) * len(values)
+        if len(message_id_values) != len(values):
+            raise ValueError("pending message IDs must match the message batch")
         if not values and termination_reason is None:
             return
         for index, batch in enumerate(self._pending_persistence_batches):
@@ -341,8 +354,10 @@ class AgentRun:
                 continue
             if (
                 batch.messages == values
+                and batch.message_ids == message_id_values
                 and batch.termination_reason == termination_reason
                 and batch.failed_visible_message == failed_visible_message
+                and batch.failed_visible_message_id == failed_visible_message_id
                 and (batch.blocked or not blocked)
             ):
                 if terminal and not batch.terminal:
@@ -354,14 +369,20 @@ class AgentRun:
             if (
                 len(batch.messages) <= len(values)
                 and values[: len(batch.messages)] == batch.messages
+                and message_id_values[: len(batch.message_ids)] == batch.message_ids
             ):
                 self._pending_persistence_batches[index] = replace(
                     batch,
                     messages=values,
+                    message_ids=message_id_values,
                     blocked=batch.blocked or blocked,
                     terminal=batch.terminal or terminal,
                     failed_visible_message=(
                         failed_visible_message or batch.failed_visible_message
+                    ),
+                    failed_visible_message_id=(
+                        failed_visible_message_id
+                        or batch.failed_visible_message_id
                     ),
                     termination_reason=termination_reason or batch.termination_reason,
                     failure_reason=failure_reason or batch.failure_reason,
@@ -372,9 +393,11 @@ class AgentRun:
                 session_id=session_id,
                 turn_id=turn_id,
                 messages=values,
+                message_ids=message_id_values,
                 blocked=blocked,
                 terminal=terminal,
                 failed_visible_message=failed_visible_message,
+                failed_visible_message_id=failed_visible_message_id,
                 termination_reason=termination_reason,
                 failure_reason=failure_reason,
             )
@@ -393,6 +416,8 @@ class AgentRun:
                 session_id=batch.session_id,
                 turn_id=batch.turn_id,
                 failed_visible_message=batch.failed_visible_message,
+                message_ids=batch.message_ids,
+                failed_visible_message_id=batch.failed_visible_message_id,
                 termination_reason=batch.termination_reason,
                 failure_reason=batch.failure_reason,
             )
@@ -404,6 +429,11 @@ class AgentRun:
                 )
             )
             if batch_committed:
+                for index in range(
+                    self._persisted_message_count,
+                    self._persisted_message_count + outcome.persisted_message_count,
+                ):
+                    self._message_ids_by_index.pop(index, None)
                 self._persisted_message_count += outcome.persisted_message_count
                 del self._pending_persistence_batches[0]
                 if batch.terminal:
@@ -436,26 +466,42 @@ class AgentRun:
         if not self._flush_pending_persistence():
             return self._persisted_message_count
         values = tuple(messages)
-        pending = values[self._persisted_message_count :]
+        message_start = self._persisted_message_count
+        pending = values[message_start:]
         if not pending:
             return self._persisted_message_count
+        message_ids = self._message_ids_for_range(message_start, len(values))
         outcome = self._application._persist_run_messages(
             pending,
             session_id=self._turn_session_id,
             turn_id=turn_id,
+            message_ids=message_ids,
         )
         if outcome.persisted_message_count:
+            for index in range(
+                message_start,
+                message_start + outcome.persisted_message_count,
+            ):
+                self._message_ids_by_index.pop(index, None)
             self._persisted_message_count += outcome.persisted_message_count
             return self._persisted_message_count
         self._queue_pending_persistence_batch(
             session_id=self._turn_session_id,
             turn_id=turn_id,
             messages=pending,
+            message_ids=message_ids,
             blocked=(
                 getattr(outcome, "transcript_durability", None) == "unknown"
             ),
         )
         return self._persisted_message_count
+
+    def _message_ids_for_range(
+        self,
+        start: int,
+        stop: int,
+    ) -> tuple[str | None, ...]:
+        return tuple(self._message_ids_by_index.get(index) for index in range(start, stop))
 
     def snapshot(self) -> RunSnapshot:
         """Return a safe snapshot without exposing conversation content."""
@@ -493,13 +539,23 @@ class AgentRun:
                 self._persisted_message_count
                 - (turn_message_start or 0),
             )
+            pending_start = turn_message_start + persisted_in_turn
             self._queue_pending_persistence_batch(
                 session_id=turn_session_id,
                 turn_id=result.turn_id,
                 messages=current_messages[persisted_in_turn:],
+                message_ids=self._message_ids_for_range(
+                    pending_start,
+                    turn_message_start + len(current_messages),
+                ),
                 terminal=True,
                 failed_visible_message=(
                     handle._driver.failed_visible_message()
+                    if result.status is RunStatus.FAILED
+                    else None
+                ),
+                failed_visible_message_id=(
+                    handle._driver.failed_visible_message_id()
                     if result.status is RunStatus.FAILED
                     else None
                 ),
@@ -517,6 +573,7 @@ class AgentRun:
                 messages=(),
                 terminal=True,
                 failed_visible_message=handle._driver.failed_visible_message(),
+                failed_visible_message_id=handle._driver.failed_visible_message_id(),
                 termination_reason=result.termination_reason,
                 failure_reason=result.failure_reason,
             )
@@ -695,6 +752,12 @@ class _TurnDriver:
                 baseline=self._usage_baseline,
             )
             self._usage_baseline = event.usage
+        if isinstance(event, TurnStarted):
+            self._bind_message_id(event.message_id)
+        elif isinstance(event, AssistantMessageCompleted):
+            self._bind_message_id(event.message_id)
+        elif isinstance(event, UserSteeringApplied):
+            self._bind_message_id(event.steering_id)
         if isinstance(event, (ReasoningDelta, AssistantMessageDelta)):
             if self._open_visible_message_id != event.message_id:
                 self._open_visible_message_id = event.message_id
@@ -724,6 +787,20 @@ class _TurnDriver:
         if not self._failed_visible_parts:
             return None
         return Message("assistant", tuple(self._failed_visible_parts))
+
+    def failed_visible_message_id(self) -> str | None:
+        if not self._failed_visible_parts:
+            return None
+        return self._open_visible_message_id
+
+    def _bind_message_id(self, message_id: str) -> None:
+        index = len(self.execution.state.messages) - 1
+        if index < 0:
+            raise RuntimeError("Core emitted a message identity without a Run message")
+        existing = self._run._message_ids_by_index.get(index)
+        if existing is not None and existing != message_id:
+            raise RuntimeError("Core emitted conflicting identities for one Run message")
+        self._run._message_ids_by_index[index] = message_id
 
     async def _drive(self) -> None:
         response: PauseResponse | None = None

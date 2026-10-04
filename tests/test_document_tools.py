@@ -104,7 +104,7 @@ async def test_read_document_rejects_damage_limit_and_cancel(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_factory_reads_submitted_excel_attachment_after_source_changes_and_is_deleted(
+async def test_factory_reads_submitted_excel_attachment_after_source_file_is_changed_and_deleted(
     tmp_path: Path,
 ) -> None:
     from types import SimpleNamespace

@@ -21,7 +21,7 @@
 
 这 12 个 Tool 进入普通 Tool Registry，执行前会完成参数准备、路径或命令分析以及权限判断。`ReadDocument`、`ViewImage`、`Process`、`GitWorkspace` 和 `WebFetch` 的只读定义在 Plan Mode 可见；`Process` 的 `write`、`resize`、`stop` 操作仍分别进入输入、写入或破坏性权限判断，`ApplyPatch` 在 Plan Mode 隐藏。
 
-`ReadFile` 只读取 UTF-8 文本，不解析 PDF、Office 文档或图片；文档使用 `ReadDocument`，图片使用 `ViewImage`。路径读取仍经过既有权限判断，外部路径需要相应授权。已经随当前用户消息提交的图片可直接观察，无需把显示文件名猜成路径。
+`ReadFile` 按路径读取 UTF-8 文本，不接受附件 `asset_ref`，不解析 PDF、Office 文档或图片；文档使用 `ReadDocument`，图片使用 `ViewImage`。路径读取仍经过既有权限判断，外部路径需要相应授权。已经随当前用户消息提交的图片可直接观察，无需把显示文件名猜成路径。
 
 启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 

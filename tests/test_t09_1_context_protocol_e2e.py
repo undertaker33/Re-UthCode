@@ -18,7 +18,7 @@ from uthcode.core.history import transcript_entries_from_message
 from uthcode.application.context import ApplicationContextService
 from uthcode.application.sessions import ApplicationSessionService
 from uthcode.core.compaction import CompactionEpoch, CompactionResult, ContextCompactor
-from uthcode.core.agent_events import FailureReason
+from uthcode.core.agent_events import FailureReason, TurnStarted
 from uthcode.core.context import (
     ContextBudget,
     account_generation_request,
@@ -1470,10 +1470,10 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
     application = UthCodeApplication(provider, session_service=session_service)
     application.create_session("w05-persistence-retry-session")
     real_persist = application._persist_run_messages
-    calls: list[tuple[tuple[Message, ...], str | None, str]] = []
+    calls: list[tuple[tuple[Message, ...], str | None, str, tuple[str | None, ...]]] = []
 
     def flaky_persist(messages, *, session_id, turn_id, **terminal):  # type: ignore[no-untyped-def]
-        calls.append((tuple(messages), session_id, turn_id))
+        calls.append((tuple(messages), session_id, turn_id, tuple(terminal["message_ids"])))
         if len(calls) == 1:
             return SimpleNamespace(
                 persisted_message_count=0,
@@ -1487,7 +1487,9 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
         )
 
     monkeypatch.setattr(application, "_persist_run_messages", flaky_persist)
-    result = await application.create_run().start_turn("retry this closed fact").result()
+    handle = application.create_run().start_turn("retry this closed fact")
+    events = [event async for event in handle.events()]
+    result = await handle.result()
 
     assert result.status.value != "completed"
     assert result.failure_reason is FailureReason.PERSISTENCE_UNAVAILABLE
@@ -1495,6 +1497,8 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
     assert len(calls) == 2
     assert calls[0][1:] == calls[1][1:]
     assert calls[0][0] == calls[1][0]
+    user_message_id = next(event.message_id for event in events if isinstance(event, TurnStarted))
+    assert calls[0][3] == calls[1][3] == (user_message_id,)
     assert application.diagnostics()["history_persistence"]["status"] == "committed"  # type: ignore[index]
 
 
@@ -1509,7 +1513,7 @@ async def test_w05_unknown_transcript_durability_quarantines_session_and_blocks_
     application = UthCodeApplication(provider, session_service=session_service)
     session = application.create_session("w05-persistence-unknown-session")
 
-    def unknown_persist(messages, *, session_id, turn_id):  # type: ignore[no-untyped-def]
+    def unknown_persist(messages, *, session_id, turn_id, **_identity):  # type: ignore[no-untyped-def]
         del messages, session_id, turn_id
         session._quarantine_unknown_durability()
         return SimpleNamespace(

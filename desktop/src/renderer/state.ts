@@ -10,7 +10,6 @@ import {
 import {
   asRecord,
   contextUsageAtBoundary,
-  messageReasoning,
   messageText,
   normalizeCompactionStatus,
   normalizeContextUsage,
@@ -332,6 +331,8 @@ export interface RendererState {
   /** A Session rename/move RPC is the single in-flight mutation authority. */
   sessionMutationBusy: boolean;
   sessionActivity?: Record<string, { unread: boolean; revision: number; compaction?: CompactionStatusProjection; compactionAnchor?: Pick<TimelineEntry, "id" | "messageId" | "kind"> | null }>;
+  /** Applied steering identities can race their accepted input projection. */
+  pendingSteeringMessageIds: Record<string, string[]>;
   turnStatus: "idle" | "running" | "pausing" | "paused" | "completed" | "failed" | "cancelled";
   pendingInteraction: PendingInteraction | null;
   completionBlocked: string | null;
@@ -405,6 +406,7 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   sessionRuntime: {},
   sessionHistory: {},
   sessionPreparation: {},
+  pendingSteeringMessageIds: {},
   modelCandidates: [],
   modelPickerOpen: false,
   activeTurn: false,
@@ -463,6 +465,9 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
       }]))
       : {},
     sessionPreparation: overrides.sessionPreparation ? { ...overrides.sessionPreparation } : {},
+    pendingSteeringMessageIds: overrides.pendingSteeringMessageIds
+      ? Object.fromEntries(Object.entries(overrides.pendingSteeringMessageIds).map(([key, values]) => [key, [...values]]))
+      : {},
     processLogs: overrides.processLogs
       ? Object.fromEntries(Object.entries(overrides.processLogs).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry }))]))
       : {},
@@ -495,6 +500,12 @@ function emptySessionHistory(): SessionHistoryState {
 function sameTimelineIdentity(left: TimelineEntry, right: TimelineEntry): boolean {
   if (left.id === right.id) return true;
   if (left.kind !== right.kind || !left.turnId || !right.turnId || left.turnId !== right.turnId) return false;
+  if (left.kind === "user"
+    && (!left.messageId || !right.messageId || left.messageId === right.messageId)
+    && (left.id === `user:${left.turnId}` || right.id === `user:${right.turnId}`)) return true;
+  // A stable message ID joins a live row to its durable projection. Distinct
+  // live messages and distinct durable parts keep their own identities.
+  if ((left.sequence === undefined) === (right.sequence === undefined)) return false;
   if ((left.kind === "tool" || left.kind === "plan") && left.toolCallId && right.toolCallId) {
     return left.toolCallId === right.toolCallId;
   }
@@ -504,6 +515,38 @@ function sameTimelineIdentity(left: TimelineEntry, right: TimelineEntry): boolea
   // live event do not carry the same stable id, preserve both rather than
   // guessing from kind/text/Turn and dropping a real record.
   return false;
+}
+
+function mergeTimelineAttachments(...sources: (readonly TimelineAttachment[] | undefined)[]): TimelineAttachment[] {
+  const attachments: TimelineAttachment[] = [];
+  const seenRefs = new Map<string, number>();
+  for (const attachment of sources.flatMap((source) => source ?? [])) {
+    const identity = attachment.asset_ref ?? attachment.ref;
+    if (!identity) continue;
+    const existingIndex = seenRefs.get(identity);
+    if (existingIndex !== undefined) {
+      const previous = attachments[existingIndex]!;
+      const previousUnavailable = "available" in previous && previous.available === false;
+      const incomingUnavailable = "available" in attachment && attachment.available === false;
+      if (previousUnavailable && !incomingUnavailable) attachments[existingIndex] = { ...attachment };
+      continue;
+    }
+    seenRefs.set(identity, attachments.length);
+    attachments.push({ ...attachment });
+  }
+  return attachments;
+}
+
+function steeringMessageKey(runId: string, turnId: string): string {
+  return JSON.stringify([runId, turnId]);
+}
+
+function pendingSteeringWithoutTurn(state: RendererState, runId: string, turnId: string): Record<string, string[]> {
+  const key = steeringMessageKey(runId, turnId);
+  if (!state.pendingSteeringMessageIds[key]) return state.pendingSteeringMessageIds;
+  const pending = { ...state.pendingSteeringMessageIds };
+  delete pending[key];
+  return pending;
 }
 
 function mergeTimelineEntries(
@@ -517,6 +560,24 @@ function mergeTimelineEntries(
     // Stable record ids are safe to match repeatedly: a retried page may
     // contain the same record more than once and must remain idempotent.
     const exactIndex = result.findIndex((entry) => entry.id === candidate.id);
+    if (exactIndex < 0 && candidate.sequence === undefined) {
+      const durableIndex = result.findIndex((entry) =>
+        entry.sequence !== undefined && sameTimelineIdentity(entry, candidate));
+      if (durableIndex >= 0) {
+        const durable = result[durableIndex]!;
+        if (durable.kind === "user" && candidate.kind === "user") {
+          const attachments = mergeTimelineAttachments(durable.attachments, candidate.attachments);
+          result[durableIndex] = {
+            ...durable,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          };
+        }
+        // A page record with the same source identity is authoritative. In
+        // particular, a late closed event must not replace just the first of
+        // several durable parts that share one message ID.
+        return;
+      }
+    }
     const index = exactIndex >= 0
       ? exactIndex
       : result.findIndex((entry, entryIndex) => !matched.has(entryIndex) && sameTimelineIdentity(entry, candidate));
@@ -533,37 +594,14 @@ function mergeTimelineEntries(
     if (existing.kind === "user"
       && candidate.kind === "user"
       && existing.turnId
-      && existing.turnId === candidate.turnId
-      && existing.messageId
-      && existing.messageId === candidate.messageId) {
-      const attachments: TimelineAttachment[] = [];
-      const seenRefs = new Map<string, number>();
-      for (const attachment of [...(existing.attachments ?? []), ...(candidate.attachments ?? [])]) {
-        const identity = attachment.asset_ref ?? attachment.ref;
-        if (!identity) continue;
-        const existingIndex = seenRefs.get(identity);
-        if (existingIndex !== undefined) {
-          const previous = attachments[existingIndex]!;
-          const previousUnavailable = "available" in previous && previous.available === false;
-          const incomingUnavailable = "available" in attachment && attachment.available === false;
-          if (previousUnavailable && !incomingUnavailable) attachments[existingIndex] = { ...attachment };
-          continue;
-        }
-        seenRefs.set(identity, attachments.length);
-        attachments.push({ ...attachment });
-      }
-      const text = !existing.text
-        ? candidate.text
-        : !candidate.text || existing.text === candidate.text
-          ? existing.text
-          : candidate.text.startsWith(existing.text)
-            ? candidate.text
-            : existing.text.startsWith(candidate.text)
-              ? existing.text
-              : existing.text + candidate.text;
+      && existing.turnId === candidate.turnId) {
+      const attachments = mergeTimelineAttachments(existing.attachments, candidate.attachments);
+      const text = preferIncoming ? candidate.text : existing.text || candidate.text;
       result[index] = {
         ...existing,
         ...(preferIncoming ? candidate : {}),
+        ...(candidate.messageId ? { id: candidate.id, messageId: candidate.messageId } : {}),
+        ...(candidate.runId ? { runId: candidate.runId } : {}),
         text,
         ...(attachments.length > 0 ? { attachments } : {}),
       };
@@ -603,6 +641,24 @@ function applyLiveContextDelta(state: RendererState, text: string): RendererStat
 
 function eventId(prefix: string, event: Record<string, JsonValue>): string {
   return `${prefix}:${textValue(event.run_id)}:${textValue(event.turn_id)}:${textValue(event.message_id) || textValue(event.tool_call_id) || textValue(event.batch_id)}`;
+}
+
+function reasoningSegmentId(event: Record<string, JsonValue>): string {
+  const segment = positiveInteger(event.segment_index);
+  return `${eventId("reasoning", event)}:${segment ?? 1}`;
+}
+
+function hasDurableTimelineIdentity(
+  state: RendererState,
+  kind: TimelineKind,
+  turnId: string,
+  identity: string,
+): boolean {
+  return state.timeline.some((entry) =>
+    entry.sequence !== undefined
+    && entry.kind === kind
+    && entry.turnId === turnId
+    && (kind === "tool" ? entry.toolCallId === identity : entry.messageId === identity));
 }
 
 function updateTimelineEntry(state: RendererState, id: string, update: (entry: TimelineEntry) => TimelineEntry): RendererState {
@@ -662,10 +718,7 @@ function updateAssistantFinal(state: RendererState, event: Record<string, JsonVa
     if (state.timeline[current]?.status === "completed" && !state.timeline[current]?.streaming) return state;
     return updateTimelineEntry(state, id, (entry) => ({ ...entry, text, status: "completed", streaming: false }));
   }
-  const previousAssistant = [...state.timeline].reverse().find((entry) => entry.kind === "assistant" && entry.turnId === textValue(event.turn_id) && entry.streaming);
-  if (previousAssistant) {
-    return updateTimelineEntry(state, previousAssistant.id, (entry) => ({ ...entry, text, messageId: messageId || entry.messageId, status: "completed", streaming: false }));
-  }
+  if (!text) return state;
   return {
     ...state,
     timeline: [...state.timeline, { id, kind: "assistant", text, turnId: textValue(event.turn_id), messageId: messageId || undefined, status: "completed", streaming: false }],
@@ -957,31 +1010,57 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
       notice: null,
       pendingInteraction: null,
     };
-    if (!text) return next;
-    const id = `user:${textValue(payload.message_id) || turnId}`;
-    return next.timeline.some((entry) => entry.id === id) ? next : { ...next, timeline: [...next.timeline, { id, kind: "user", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "completed" }] };
+    const messageId = textValue(payload.message_id) || undefined;
+    const id = `user:${messageId || turnId}`;
+    if (!text && !state.timeline.some((entry) => entry.kind === "user" && entry.turnId === turnId && (entry.attachments?.length ?? 0) > 0)) return next;
+    return {
+      ...next,
+      timeline: mergeTimelineEntries(state.timeline, [{ id, kind: "user", text, runId: eventRunId ?? undefined, turnId, messageId, status: "completed" }]),
+    };
   }
   if (type === "reasoning_started") {
-    const id = eventId("reasoning", payload);
+    const id = reasoningSegmentId(payload);
+    if (hasDurableTimelineIdentity(state, "reasoning", turnId, textValue(payload.message_id))) return state;
     if (state.timeline.some((entry) => entry.id === id)) return state;
     return { ...state, timeline: [...state.timeline, { id, kind: "reasoning", text: "", turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_delta") {
-    const id = eventId("reasoning", payload);
+    const messageId = textValue(payload.message_id);
+    if (hasDurableTimelineIdentity(state, "reasoning", turnId, messageId)) return state;
     const text = textValue(payload.text);
     const withEstimate = applyLiveContextDelta(state, text);
-    const existing = withEstimate.timeline.find((entry) => entry.id === id);
+    const existing = [...withEstimate.timeline].reverse().find((entry) =>
+      entry.kind === "reasoning"
+      && entry.turnId === turnId
+      && entry.messageId === messageId
+      && entry.streaming);
     if (existing) {
       if (!existing.streaming) return state;
-      return updateTimelineEntry(withEstimate, id, (entry) => ({ ...entry, text: entry.text + text, streaming: true }));
+      return updateTimelineEntry(withEstimate, existing.id, (entry) => ({ ...entry, text: entry.text + text, streaming: true }));
     }
-    return { ...withEstimate, timeline: [...withEstimate.timeline, { id, kind: "reasoning", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
+    if (withEstimate.timeline.some((entry) =>
+      entry.kind === "reasoning"
+      && entry.turnId === turnId
+      && entry.messageId === messageId)) return state;
+    const id = eventId("reasoning", payload);
+    return { ...withEstimate, timeline: [...withEstimate.timeline, { id, kind: "reasoning", text, turnId, messageId: messageId || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_finished") {
-    const id = eventId("reasoning", payload);
+    const id = reasoningSegmentId(payload);
+    if (!state.timeline.some((entry) => entry.id === id)) {
+      const messageId = textValue(payload.message_id);
+      const open = [...state.timeline].reverse().find((entry) =>
+        entry.kind === "reasoning"
+        && entry.turnId === turnId
+        && entry.messageId === messageId
+        && entry.streaming);
+      if (open) return updateTimelineEntry(state, open.id, (entry) => ({ ...entry, streaming: false, status: "completed" }));
+    }
     return updateTimelineEntry(state, id, (entry) => ({ ...entry, streaming: false, status: "completed" }));
   }
   if (type === "assistant_message_delta") {
+    const messageId = textValue(payload.message_id);
+    if (hasDurableTimelineIdentity(state, "assistant", turnId, messageId)) return state;
     const id = eventId("assistant", payload);
     const text = textValue(payload.text);
     const estimated = applyLiveContextDelta(state, text);
@@ -994,21 +1073,41 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     return { ...reasoningClosed, timeline: [...reasoningClosed.timeline, { id, kind: "assistant", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "assistant_message_completed") {
-    let next = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
+    const messageId = textValue(payload.message_id);
+    const hasDurableAssistant = hasDurableTimelineIdentity(state, "assistant", turnId, messageId);
+    const hasDurableReasoning = hasDurableTimelineIdentity(state, "reasoning", turnId, messageId);
+    let next = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.messageId === messageId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     const text = messageText(payload.message);
-    const reasoning = messageReasoning(payload.message);
-    if (reasoning && !next.timeline.some((entry) => entry.turnId === turnId && entry.kind === "reasoning" && entry.text === reasoning)) {
-      next = { ...next, timeline: [...next.timeline, { id: `reasoning:${textValue(payload.run_id)}:${turnId}:${textValue(payload.message_id)}:complete`, kind: "reasoning", text: reasoning, turnId, messageId: textValue(payload.message_id) || undefined, status: "completed", streaming: false }] };
+    const hasLiveReasoning = next.timeline.some((entry) =>
+      entry.turnId === turnId && entry.kind === "reasoning" && entry.messageId === messageId);
+    const message = asRecord(payload.message);
+    const reasoningParts = Array.isArray(message?.parts)
+      ? message.parts.map((part) => asRecord(part)).filter((part) => part?.type === "reasoning")
+      : [];
+    if (!hasLiveReasoning && !hasDurableReasoning && reasoningParts.length > 0) {
+      const completedReasoning = reasoningParts.map((part, index) => ({
+        id: `reasoning:${textValue(payload.run_id)}:${turnId}:${messageId}:complete:${index}`,
+        kind: "reasoning" as const,
+        text: textValue(part?.text),
+        turnId,
+        messageId: messageId || undefined,
+        status: "completed" as const,
+        streaming: false,
+      }));
+      next = { ...next, timeline: [...next.timeline, ...completedReasoning] };
     }
+    if (hasDurableAssistant) return next;
     return updateAssistantFinal(next, payload, text);
   }
   if (type === "tool_started") {
+    if (hasDurableTimelineIdentity(state, "tool", turnId, textValue(payload.tool_call_id))) return state;
     const id = eventId("tool", payload);
     const closedReasoning = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     if (closedReasoning.timeline.some((entry) => entry.id === id)) return closedReasoning;
     return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, startedAt: Date.now() }] };
   }
   if (type === "tool_finished") {
+    if (hasDurableTimelineIdentity(state, "tool", turnId, textValue(payload.tool_call_id))) return state;
     const id = eventId("tool", payload);
     const rawStatus = textValue(payload.status).toLowerCase();
     const cancelled = rawStatus === "cancelled" || rawStatus === "canceled" || textValue(payload.termination_reason) === "user_cancelled";
@@ -1089,7 +1188,32 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     return appendStatus({ ...state, completionBlocked: reason }, reason);
   }
   if (type === "user_steering_requested") return appendStatus(state, "Steering requested", "info");
-  if (type === "user_steering_applied") return appendStatus(state, "Steering applied", "completed");
+  if (type === "user_steering_applied") {
+    const steeringId = nonEmptyText(payload.steering_id);
+    if (!steeringId || !eventRunId || !turnId) return appendStatus(state, "Steering applied", "completed");
+    if (hasDurableTimelineIdentity(state, "steering", turnId, steeringId)
+      || state.timeline.some((entry) =>
+        entry.kind === "steering"
+        && (!entry.runId || entry.runId === eventRunId)
+        && entry.turnId === turnId
+        && entry.messageId === steeringId)) return state;
+    const pendingKey = steeringMessageKey(eventRunId, turnId);
+    const placeholderIndex = state.timeline.findIndex((entry) =>
+      entry.kind === "steering"
+      && entry.runId === eventRunId
+      && entry.turnId === turnId
+      && !entry.messageId);
+    if (placeholderIndex >= 0) {
+      const timeline = [...state.timeline];
+      timeline[placeholderIndex] = { ...timeline[placeholderIndex]!, messageId: steeringId };
+      return appendStatus({ ...state, timeline }, "Steering applied", "completed");
+    }
+    const pendingSteeringMessageIds = {
+      ...state.pendingSteeringMessageIds,
+      [pendingKey]: [...(state.pendingSteeringMessageIds[pendingKey] ?? []), steeringId],
+    };
+    return appendStatus({ ...state, pendingSteeringMessageIds }, "Steering applied", "completed");
+  }
   if (type === "turn_pausing") return appendStatus({ ...state, turnStatus: "pausing" }, "Pausing…", "info");
   if (type === "user_input_requested") {
     return { ...state, pendingInteraction: { kind: "user_input_required", pauseId: textValue(payload.pause_id), runId: textValue(payload.run_id), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, request: asRecord(payload.request) ?? undefined, reason: "user_input_required" }, turnStatus: "paused", activeTurn: true, terminalStatusPending: false };
@@ -1117,18 +1241,32 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
   if (type === "behavior_mode_changed") return { ...state, run: { ...(state.run ?? {}), behavior_mode: textValue(payload.behavior_mode) } };
   if (type === "turn_completed") {
     const runId = eventRunId ?? textValue(payload.run_id);
+    const hadLiveAssistantPreview = state.timeline.some((entry) =>
+      entry.kind === "assistant"
+      && entry.turnId === turnId
+      && (!entry.runId || entry.runId === runId)
+      && entry.sequence === undefined
+      && entry.streaming);
     const timeline = settlePlanEntries(state, runId, turnId, "completed").timeline
       .map((entry) => entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "reasoning" && entry.streaming
         ? { ...entry, streaming: false, status: "completed" as TimelineStatus }
         : entry)
       .filter((entry) => !(entry.turnId === turnId && (!entry.runId || entry.runId === runId) && entry.kind === "assistant" && entry.streaming));
-    let next = { ...state, timeline };
+    let next = {
+      ...state,
+      timeline,
+      pendingSteeringMessageIds: pendingSteeringWithoutTurn(state, runId, turnId),
+    };
     next = { ...next, activeTurn: true, terminalStatusPending: true, turnStatus: "completed", pendingInteraction: null, completionBlocked: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: "completed", termination_reason: "final_answer" } };
     const finalText = textValue(payload.final_text);
     if (finalText) {
-      const lastAssistant = [...next.timeline].reverse().find((entry) => entry.kind === "assistant" && entry.turnId === turnId);
-      if (lastAssistant) next = updateTimelineEntry(next, lastAssistant.id, (entry) => ({ ...entry, text: finalText, status: "completed", streaming: false }));
-      else next = { ...next, timeline: [...next.timeline, { id: `assistant:final:${runId}:${turnId}`, kind: "assistant", text: finalText, runId, turnId, status: "completed", streaming: false }] };
+      const alreadyProjected = next.timeline.some((entry) =>
+        entry.kind === "assistant"
+        && entry.turnId === turnId
+        && (!entry.runId || entry.runId === runId));
+      if (hadLiveAssistantPreview || !alreadyProjected) {
+        next = { ...next, timeline: [...next.timeline, { id: `assistant:final:${runId}:${turnId}`, kind: "assistant", text: finalText, runId, turnId, status: "completed", streaming: false }] };
+      }
     }
     return next;
   }
@@ -1137,7 +1275,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const runId = eventRunId ?? textValue(payload.run_id);
     const next = settleTerminalTurn(state, runId, turnId, failed ? "failed" : "cancelled");
     const reason = failed ? `Turn failed: ${textValue(payload.failure_reason) || textValue(payload.termination_reason) || "runtime error"}` : "Turn cancelled";
-    return appendStatus({ ...next, activeTurn: true, terminalStatusPending: true, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled");
+    return appendStatus({ ...next, pendingSteeringMessageIds: pendingSteeringWithoutTurn(state, runId, turnId), activeTurn: true, terminalStatusPending: true, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled");
   }
   return state;
 }
@@ -1168,7 +1306,8 @@ export type RendererAction =
   | { type: "session_mutation_busy"; value: boolean }
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
-  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string }
+  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string; attachments?: TimelineAttachment[] }
+  | { type: "steering_submission_failed"; runId: string; turnId: string }
   | { type: "composer_attachment_added"; attachment: DesktopAttachmentDraft }
   | { type: "composer_attachment_removed"; ref: string }
   | { type: "composer_attachments_cleared" }
@@ -1342,6 +1481,12 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       const history = stateWithCache.sessionHistory[key];
       const cached = stateWithCache.sessionRuntime[key];
       const target = cached ? applyRuntimeSnapshot(emptyRuntimeBoundary(stateWithCache), cached) : emptyRuntimeBoundary(stateWithCache);
+      const timeline = history
+        ? mergeTimelineEntries(history.records, target.timeline)
+        : target.timeline;
+      const sessionRuntime = cached
+        ? { ...stateWithCache.sessionRuntime, [key]: { ...cached, timeline: timeline.map((entry) => ({ ...entry })) } }
+        : stateWithCache.sessionRuntime;
       return {
         ...target,
         selectedProjectKey: action.projectKey,
@@ -1350,9 +1495,11 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         // runtime may already have live/uncommitted output for this Session.
         // Keep both projections and let the stable identity merge collapse a
         // durable record with its live counterpart.
-        timeline: history
-          ? mergeTimelineEntries(history.records, target.timeline)
-          : target.timeline,
+        timeline,
+        ...(state.selectedProjectKey !== action.projectKey || state.selectedSessionId !== action.sessionId
+          ? { pendingSteeringMessageIds: {} }
+          : {}),
+        sessionRuntime,
         sessionPreparation: { ...stateWithCache.sessionPreparation, [key]: "preparing" },
         sessionViewRevision: stateWithCache.sessionViewRevision + 1,
         runtimeError: null,
@@ -1391,10 +1538,15 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       const targetVisible = state.selectedProjectKey === action.projectKey && state.selectedSessionId === action.sessionId;
       const cachedRuntime = state.sessionRuntime[key];
       const visibleBase = targetVisible ? state.timeline : cachedRuntime?.timeline ?? [];
+      const timeline = mergeTimelineEntries(visibleBase, incoming, true);
+      const sessionRuntime = cachedRuntime
+        ? { ...state.sessionRuntime, [key]: { ...cachedRuntime, timeline: timeline.map((entry) => ({ ...entry })) } }
+        : state.sessionRuntime;
       return {
         ...state,
         sessionHistory: { ...state.sessionHistory, [key]: nextHistory },
-        ...(targetVisible ? { timeline: mergeTimelineEntries(visibleBase, incoming, true) } : {}),
+        sessionRuntime,
+        ...(targetVisible ? { timeline } : {}),
       };
     }
     case "history_page_error": {
@@ -1456,6 +1608,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         ...permissionUnknownAtRunBoundary(stateWithCache, action.run, action.preserveSessionRuntime !== true),
         selectedSessionId: action.sessionId,
         timeline: [],
+        pendingSteeringMessageIds: {},
         composerAttachments: [],
         todo: [],
         todoIteration: 0,
@@ -1545,9 +1698,42 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           : action.steering && !acceptedRunId
           ? state.permissionMode
           : "unknown";
-      const next = { ...state, run: acceptedRun ?? state.run, permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
+      const turnId = nonEmptyText(acceptedRun?.turn_id);
+      const attachments = action.attachments ?? [];
+      const acceptedSteeringKey = acceptedRunId && turnId
+        && action.steering && action.text?.trim()
+        ? steeringMessageKey(acceptedRunId, turnId)
+        : null;
+      const pendingSteeringMessageIds = { ...state.pendingSteeringMessageIds };
+      const pendingSteeringQueue = acceptedSteeringKey
+        ? pendingSteeringMessageIds[acceptedSteeringKey]
+        : undefined;
+      const pendingSteeringId = pendingSteeringQueue?.[0];
+      if (acceptedSteeringKey && pendingSteeringQueue) {
+        if (pendingSteeringQueue.length > 1) {
+          pendingSteeringMessageIds[acceptedSteeringKey] = pendingSteeringQueue.slice(1);
+        } else {
+          delete pendingSteeringMessageIds[acceptedSteeringKey];
+        }
+      }
+      const timeline = !action.steering && turnId && attachments.length > 0
+        ? mergeTimelineEntries(state.timeline, [{
+          id: `user:${turnId}`,
+          kind: "user",
+          text: action.text ?? "",
+          runId: runIdOf(acceptedRun) ?? undefined,
+          turnId,
+          status: "completed",
+          attachments: attachments.map((attachment) => ({ ...attachment })),
+        }])
+        : state.timeline;
+      const next = { ...state, timeline, pendingSteeringMessageIds, run: acceptedRun ?? state.run, permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
       if (!action.steering || !action.text?.trim()) return next;
-      return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, turnId: next.run?.turn_id, status: "completed" }], nextStatusId: next.nextStatusId + 1 };
+      return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, runId: next.run?.run_id, turnId: next.run?.turn_id, ...(pendingSteeringId ? { messageId: pendingSteeringId } : {}), status: "completed" }], nextStatusId: next.nextStatusId + 1 };
+    }
+    case "steering_submission_failed": {
+      const pendingSteeringMessageIds = pendingSteeringWithoutTurn(state, action.runId, action.turnId);
+      return pendingSteeringMessageIds === state.pendingSteeringMessageIds ? state : { ...state, pendingSteeringMessageIds };
     }
     case "composer_attachment_added": {
       if (state.composerAttachments.some((attachment) => attachment.ref === action.attachment.ref)) return state;
@@ -1623,9 +1809,9 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         const next = actionValue.restored === true
           ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params), true)
           : { ...permissionUnknownAtRunBoundary(state, run, false), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
-        return { ...next, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
+        return { ...next, pendingSteeringMessageIds: {}, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
       }
-      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], commandOutput: notice, composerText: "" };
+      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], pendingSteeringMessageIds: {}, commandOutput: notice, composerText: "" };
       if (actionValue?.type === "behavior_mode_selected" || actionValue?.type === "permission_mode_selected" || actionValue?.type === "model_selected") {
         const projectedRun = normalizeRun(params?.run);
         const projectedPermission = permissionModeOf(projectedRun);
@@ -1661,7 +1847,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     case "session_result_seen":
       return state;
     case "clear_timeline":
-      return { ...state, timeline: [] };
+      return { ...state, timeline: [], pendingSteeringMessageIds: {} };
     case "workspace_cleared":
       {
         const invalidatedRunIds = [
@@ -1674,6 +1860,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           selectedProjectKey: null,
           selectedSessionId: null,
           timeline: [],
+          pendingSteeringMessageIds: {},
           todo: [],
           todoIteration: 0,
           run: null,

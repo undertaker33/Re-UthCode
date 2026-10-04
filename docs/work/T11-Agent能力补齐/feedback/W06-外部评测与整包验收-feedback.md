@@ -228,3 +228,65 @@ GPT-6 Luna / max 删除被替代的附件祖先 img 固定尺寸规则及旧 fal
 总控曾把 npm test 与 npm run package 并行执行，但 windows-packaging.test.ts 会调用同一 build-python-runtime.mjs 写共享构建目录；该轮 package 返回成功后，实际客户端 Runtime 启动失败。退出后无持久 stderr 可确认具体丢失文件，因此不把共享目录冲突推断写成已证实的精确异常根因。测试结束后独立串行执行标准 npm run package（exit 0，Runtime smoke 与 Forge 通过），再由总控 Computer Use 启动产物，Runtime 就绪、原历史、模型与权限状态均正常恢复。
 
 串行重建产物中，中文文本右键菜单仅有“剪切、复制、粘贴、全选”。总控输入未发送的菜单验收文字，经菜单全选、剪切快捷键和菜单粘贴，文字及草稿状态正常更新；随后清空测试文字。使用系统快捷键复制测试窗口图像到剪贴板，Ctrl+V 实际导入紧凑图片缩略图，未插入伴随文字；点击“×”移除成功，没有全屏错误遮罩，未发送模型请求。用户本轮增补的输入区操作已具备实际窗口证据，包级剩余验收仍保持未完成。
+
+### 附件读取修复及会话切换重复投影定位（2026-10-03）
+
+工具与读取服务修复经 Luna / max 实施、Sol / medium 独立审核无阻断 finding，定向 Python 41 passed、架构边界 23 passed。提交 `7ab6960` 经 PR #121 合并为 `5f1ebda`。外部文件仍通过原权限分类，只跳过不适用的项目目录指令激活；附件副本回归和 Excel A1 单格修复见 W03 本轮记录。随后三处工具说明、文档缩进与测试名称整理另待提交；此处不宣称新包或真实模型已验证这些后端修改。
+
+总控在仍为上一版的 packaged Electron 中亲自 Computer Use 复现：已恢复的 `6de47b20261840e6a788bfa50d0e26a0` 新增一次 ReadDocument 后切换会话，记录保持正常；新建 `0175b8a994a5422fb07af6513dbf881b`，导入测试 sample.xlsx 并发送仅一次 ReadDocument 的请求，读取成功，返回 A1=SHEET-5937、B2=42，但发送后的用户行不显示附件。切到 `57f0b0bf3d1640b88dc8b3837184c752` 再返回，底部工具行不见。
+
+完整无障碍文章列表进一步确认：记录并未删除，界面显示“有附件 user、reasoning、tool、reasoning、assistant”后，又显示“无附件 user、reasoning、空 assistant、reasoning、assistant”。工具行被合并到前半部，后半部保留重复实时投影。源码同时确认实时消息使用 UUID，而持久化消息身份由 turn_id 与起始 sequence 生成；以 message_id 匹配两者不能合并，tool_call_id 则一致。该证据已交原 Desktop Worker 修复和 Reviewer 审核，不以文本去重，不把此显示重复直接认定为模型请求重复注入。真实窗口已退出，修复后新包复验仍待完成。
+
+### 附件测试失败格式化 OOM 修复（2026-10-04）
+
+用户独立诊断确认，重试成功后旧测试仍要求整个页面没有 Attachments，实际命中正确的消息附件 DIV；Node 断言失败格式化会展开 React DOM 内部对象图并引发巨大分配。本轮由 GPT-6 Luna / max 只修改 renderer-attachments.test.tsx：失败后确认 Composer 中 att-1 数量为 1；成功后确认草稿数量为 0、用户消息中附件数量为 1。同文件直接 DOM/null 比较改为数量标量，保留 getAttribute 等标量检查。未修改 Runtime、产品行为、配置或冻结文字。GPT-6.1 Sol / medium 独立只读审核 PASS，无 finding。
+
+总控在 desktop/ 使用 Node v24.15.0、NODE_OPTIONS=--max-old-space-size=256、node --import tsx --test --test-isolation=none，外部监测设置 60 秒、768 MiB 私有内存、1 MiB 输出限制（仅测试进程，未修改项目配置）：
+
+- --test-name-pattern="App keeps an imported attachment available for retry|App localizes the image capability refusal|App moves a sent attachment" tests/renderer-attachments.test.tsx：3 passed、0 failed、0 cancelled、0 skipped；Node duration_ms 1287.212，退出码 0，外部耗时 1.374 秒，私有内存采样峰值 229.3 MiB，无限制触发。能力拒绝用例内部同时覆盖 en/zh-CN。
+- tests/renderer-attachments.test.tsx 完整文件：18 passed、0 failed、0 cancelled、0 skipped；Node duration_ms 1461.3266，退出码 0，外部耗时 1.547 秒，私有内存采样峰值 201.2 MiB，无限制触发。
+- NODE_OPTIONS=--max-old-space-size=512; npm run typecheck：退出码 0。
+
+以上为磁盘修复后的真实测试结果，不是内存中替换断言的对照实验；不支持据此断言 Agent Runtime 正常运行有持续内存泄漏。完整文件中的旧导航测试仍使用相同 live/durable message_id，因此不能把其通过作为会话重复投影根因修复证据。此次阶段未执行全量 Desktop、标准构建、真实 Provider 或窗口验收；会话身份合并修复继续交原 Worker，后续最终收口另行记录。
+
+### 四项修复最终审核、回归和串行构建（2026-10-04）
+
+附件发送后的安全 ref/元数据立即投影到用户行，成功清除 Composer，失败保留草稿；纯附件与正文+附件均接入 turn_started 权威消息身份，timeline 不携带大图 data_url。实时/历史身份根因修复与三项审核返工见本轮 W02 追加。GPT-6 Luna / max 实施、GPT-6.1 Sol / medium 最终独立审核 PASS，无剩余实质 finding。旧附件断言 OOM 修复仍保留产品附件展示，测试失败输出使用标量。ReadDocument/ViewImage 完整附件引用、项目外物理路径不激活项目指令、Excel 单格等后端修复已由 PR #121 合并，未提交的小范围说明与测试整理也已审核。
+
+最终实际验证（Python 使用 C:/Users/93445/miniconda3/envs/re-uthcode/python.exe，Desktop 在 desktop/）：
+
+- python -m pytest tests/test_builtin_file_tools.py tests/test_document_tools.py tests/test_image_tools.py tests/test_project_instructions.py -q：41 passed in 4.44s，exit 0。
+- python -m pytest tests/test_architecture_boundaries.py -q：23 passed in 9.87s，exit 0。
+- python -m pytest tests/test_application_runs.py tests/test_history_contract.py tests/test_history_bridge.py tests/test_t09_1_context_protocol_e2e.py -q：110 passed in 18.17s，exit 0。
+- NODE_OPTIONS=--max-old-space-size=256，node --import tsx --test --test-isolation=none --test-concurrency=1：renderer-state.test.ts 55/55、renderer-attachments.test.tsx 18/18、首轮 App 导航定向 1/1。NODE_OPTIONS=--max-old-space-size=512，npm run typecheck：exit 0。256 MiB typecheck 曾因堆上限不足退出，未将其当作产品泄漏或通过证据。
+- NODE_OPTIONS=--max-old-space-size=512，npm test：265 passed、0 failed、0 cancelled、0 skipped、0 todo；duration_ms 99313.8063，exit 0，外部耗时 100.052 秒，进程树私有内存采样峰值 2243.5 MiB。外部 600 秒/4 GiB/8 MiB 输出限制未触发。
+- 上述全量结束后串行标准 npm run package：exit 0，102.715 秒，进程树采样峰值 1787.1 MiB；随后 npm run make：exit 0，217.776 秒，峰值 1753.2 MiB。两个构建的 PyInstaller Runtime smoke 均通过 ready/status/shutdown JSONL 及 importlib.resources prompt asset。构建使用既有 Conda Python，NODE_OPTIONS=--max-old-space-size=1024，外部 1200 秒/6 GiB/16 MiB 输出限制未触发。第一次 package 的宿主丢失退出结果，只作为中间记录；以上 package 是为取得可确认结果而串行复跑的最终一次，不虚报丢失结果。
+
+最终 make 新包：D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/UthCode.exe（244440576 B，2026-10-04 16:23:15）；安装产物 D:/project/Re-UthCode/desktop/out/make/squirrel.windows/x64/UthCode Setup.exe 已生成。本轮实际启动的是最终 make 目录中的客户端，不是 9 月旧包；没有执行安装或干净 Windows 安装环境验收。
+
+### 总控原生真实窗口验收（2026-10-04）
+
+总控本人使用当前 computer-use skill 的 @oai/sky 原生接口，无 CDP 或子代理代验收。最终客户端在测试目录 C:/Users/93445/AppData/Local/Temp/uthcode-t11-audit-9_etvcqh 创建 Session 815bed2249f1400ab38a13da21767594，导入用户指定原 PNG（2,823,713 B）与 sample.xlsx（A1=SHEET-5937、B2=42），发送仅一次 ReadDocument、限定 A1:B2 并解释图的请求。真实 qwen3.7-flash / openai_compat / https://dashscope.aliyuncs.com/compatible-mode/v1 / openai 2.53.0 成功识别图片 FIFO、error、skipped、cancelled 闭合语义；正式 Transcript 仅一项 ReadDocument，参数为 asset_ref=attachment:815bed2249f1400ab38a13da21767594:9c113feaca2d4d82a2c46e067a6914ba、range=A1:B2，结果 A1=SHEET-5937、B2=42。没有猜文件名路径或搜索用户原表。
+
+发送后的用户正文顶部保留 PNG 与 Excel 两个卡片，Composer 草稿清空。首次切到空白 Session 再返回，以及完整退出重启，均只显示 user、reasoning、tool、reasoning、assistant 一组，无重复用户行或空 assistant；工具位于两段合法 reasoning 之间。磁盘用户 UUID 为 1ef7491c185b453c948090509a04c39f，两个 assistant UUID 为 b4dd72a799fb4f3f9554e40b47649ba9、359c60b36d16437c9e12f2def4657110，同消息 part 共享身份。原 PNG 卡片双击，100% 原图完整适应预览弹窗；关闭正常。
+
+另建 Session 3a5562d2004a4ba18a4b907613caaf35，正文为空，仅导入同 PNG：选 deepseek-v4-flash 后发送被 image capability 预检拒绝，对话区显示“所选模型不支持图片输入，请选择支持图片的模型。附件草稿已保留。”，输入区图片和移除按钮保留，未产生用户消息。切回原 Qwen 配置直接重试，模型成功解释图，输入区附件清空、消息区保留单一用户附件。用户默认模型最终重新核实为 __uthcode_model_3。两次发送的首个即刻截图尚为异步前一状态，下一观察已完成生成，因此真实窗口证明成功后卡片留存与无重复；“接受后、生成完成前即时投影”的精确时点由 App 定向测试支撑，不虚称已捕获该活动时点截图。新包直接项目外物理路径授权后的交互未另行实测，相关 OUTSIDE 分类、授权和指令激活修复由正式工厂 41 项回归支撑。
+
+### 剩余验收去重及证据边界（2026-10-04）
+
+交接时 19 个未勾选行实际为 13 组要求：A02/A10/A12/A15/A18/A26 各重复两次，共 12 行；另 T08/T14/T15/T16/T19 完成边界及 A24/A28 共 7 行。原 Sol 核对 W05 历史证据及当前不受影响逻辑后，T15 完成边界可完整复用并补勾；现剩 18 行、12 组要求，不是 18 个独立缺陷。
+
+- A02：兼容协议的本轮真实用户图及既有本地/PDF 工具图证据可复用部分；仍缺三协议完整 SDK 请求与内容理解证据，当前没有 Responses 配置。已有 anthropic Qwen 配置不等于已完成该协议视觉验收。
+- A10：本轮 packaged XLSX 真实读取和标准构建可作部分证据；PDF/DOCX/PPTX 正式读取、PDF 页图实际入模、干净 Windows/安装环境无开发隐式依赖仍缺，不能把旧系统应用启动当读取完成。Office 认证由用户自行处理。
+- A12/T08/A15：既有 Windows PTY 自动化证据可复用不受本轮影响部分；POSIX isatty/输入/EOF/resize/取消与最终安装产物原生 PTY、中文/ANSI 日志、stdin/停止/关闭仍需验收。已有 WSL Ubuntu 与 docker-desktop，无需重装。
+- A18：已有失败 fixture 可复用不受影响部分；真实 Tavily→静态页/PDF、URL/来源/用量尚缺，用户只需在用户配置或环境引用中配置搜索凭据，不在聊天发送密钥。
+- T14：200 轮与失败/短周期/final/编辑重测/等待历史证据可复用；异常怀疑/纠偏之后人工输入的精确反例仍需核实，不能以普通 AskUser/steering 代替。
+- A24/T16：已有 Main/preload/chat 自动化可复用；最终原生 Artifact 打开/定位、图片、缺失局部反馈、可执行仅定位与恶意 URI 不执行仍缺。附件预览不等同 Artifact 验收。
+- A26：正式 Headless 预测与官方 SWE-bench Lite harness 实例评分尚未完成。环境预查 docker info 的 Linux engine 管道不存在；用户先启动 Docker Desktop 并等待 Linux engine 就绪，不要求重装，不把环境失败当评分通过。
+- A28/T19：截图+文档→定位 Patch→失败测试→读日志修复→重跑→图片→交付物联合链仍需完整真实模型与正式工具结果，以上分段证据不能自动代替。
+
+Checklist 只补勾 T15 的充分有效证据，冻结正文不改，T11 整包仍为 not_implemented，不归档。用户后续最小配合为配置可视觉的 Responses 模型和 Tavily 凭据、启动现有 Docker Linux engine、提供干净 Windows/安装验证条件，出现 Office 认证时自行完成；其余可在这些条件满足后复用有效证据开展定向验收。
+
+### 活动生成中的附件投影补充观察（2026-10-04）
+
+为补充前两次短请求完成过快的观察限制，总控在上述空白 Session eeda37b0f1014e8780ef3e55f5b81b82 导入同 PNG，发送约 2000 字图片解释请求，明确不调用工具或修改文件。首次接受后的下一原生观察仍在生成：输入区显示“向当前轮次发送引导”，截图有暂停/取消，assistant 仅输出至错误/跳过段落；无障碍用户 article 849 下已有图片 article 853，输入区正文与附件草稿均已清空，无移除附件按钮。因此当前最终新包已有“生成结束前用户附件卡片存在”的真实原生 UIA 证据；不声称截图量化了接受瞬间的毫秒延迟，精确即时 reducer 投影仍由 App 测试支撑。后续观察模型正常完成。该补充不改动此前阶段记录，不扩大为整包通过。
