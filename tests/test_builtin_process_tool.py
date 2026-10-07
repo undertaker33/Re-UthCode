@@ -50,6 +50,19 @@ def _python_command(source: str) -> str:
     return " ".join(shlex.quote(value) for value in values)
 
 
+def _nested_root_delete_wrapper_command() -> str:
+    if sys.platform == "win32":
+        return (
+            'bash -c "sh -c '
+            "'zsh -c \\\"bash -c \\\'rm -rf /\\\'\\\"'\""
+        )
+
+    payload = "rm -rf /"
+    for program in reversed(("bash", "sh", "zsh", "bash")):
+        payload = f"{program} -c {shlex.quote(payload)}"
+    return payload
+
+
 async def _execute_prepared_calls(
     executor: ToolExecutor,
     calls: tuple[ToolCallPart, ...],
@@ -404,7 +417,14 @@ def test_bash_circuit_breaker_negative_matrix(tmp_path: Path, command: str) -> N
     [
         ('bash -c "rm -rf /"', CircuitBreaker.FILESYSTEM_ROOT_DELETE),
         ("sh -c 'rm -rf ~'", CircuitBreaker.HOME_DELETE),
-        ('cmd /c "rd /s /q C:\\\\"', CircuitBreaker.FILESYSTEM_ROOT_DELETE),
+        pytest.param(
+            'cmd /c "rd /s /q C:\\\\"',
+            CircuitBreaker.FILESYSTEM_ROOT_DELETE,
+            marks=pytest.mark.skipif(
+                sys.platform != "win32",
+                reason="cmd.exe /c uses Windows-only command and argv syntax",
+            ),
+        ),
         (
             'powershell -Command "Remove-Item -Recurse -Force $env:USERPROFILE"',
             CircuitBreaker.HOME_DELETE,
@@ -452,6 +472,8 @@ def test_bash_circuit_breakers_inspect_supported_nested_execution(
 def test_bash_circuit_breakers_preserve_nested_wrapper_quotes(
     tmp_path: Path, command: str
 ) -> None:
+    if sys.platform != "win32" and "zsh -c" in command:
+        command = _nested_root_delete_wrapper_command()
     action = BashTool(tmp_path).preflight({"command": command}).action
     assert CircuitBreaker.FILESYSTEM_ROOT_DELETE in action.circuit_breakers
     decision = PermissionEvaluator(RuleSet(default_guard_rules())).evaluate(
