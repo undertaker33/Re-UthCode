@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -298,11 +299,14 @@ class EditFileTool:
             return _error("Error: old_string must not be empty")
 
         try:
-            content = path.read_text(encoding="utf-8")
+            original_bytes = path.read_bytes()
+            original_text = original_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             return _error(f"Error: failed to read file: {exc}")
         except OSError as exc:
             return _error(f"Error: failed to read file: {exc}")
+
+        content = _normalize_newlines(original_text)
 
         count = content.count(old_string)
         if count == 0:
@@ -317,7 +321,14 @@ class EditFileTool:
             return _cancelled()
         try:
             new_string = _text(arguments, "new_string")
-            path.write_text(content.replace(old_string, new_string, 1), encoding="utf-8")
+            match_start = content.index(old_string)
+            match_end = match_start + len(old_string)
+            raw_start = _raw_offset_for_normalized(original_text, match_start)
+            raw_end = _raw_offset_for_normalized(original_text, match_end)
+            newline = _replacement_newline(original_text, raw_start, raw_end)
+            replacement = _normalize_newlines(new_string).replace("\n", newline)
+            updated = original_text[:raw_start] + replacement + original_text[raw_end:]
+            path.write_bytes(updated.encode("utf-8"))
         except OSError as exc:
             return _error(f"Error: failed to write file: {exc}")
 
@@ -330,7 +341,7 @@ class EditFileTool:
             f"Successfully edited {self._resolver.display(path)}",
             details={
                 "evidence": "file_change",
-                "changed": _content_digest(content) != after_digest,
+                "changed": _bytes_digest(original_bytes) != after_digest,
                 "content_digest": after_digest,
             },
         )
@@ -363,6 +374,51 @@ def _content_digest(content: str) -> str:
 
 def _bytes_digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _normalize_newlines(content: str) -> str:
+    """Match text-mode reads by mapping all universal newline forms to LF."""
+
+    return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _raw_offset_for_normalized(content: str, offset: int) -> int:
+    """Map one text-mode offset to raw text without allocating an offset table."""
+
+    raw_offset = 0
+    normalized_offset = 0
+    while normalized_offset < offset:
+        if (
+            content[raw_offset] == "\r"
+            and raw_offset + 1 < len(content)
+            and content[raw_offset + 1] == "\n"
+        ):
+            raw_offset += 2
+        else:
+            raw_offset += 1
+        normalized_offset += 1
+    return raw_offset
+
+
+def _replacement_newline(
+    original: str,
+    raw_start: int,
+    raw_end: int,
+) -> str:
+    matched = _first_newline(original, raw_start, raw_end)
+    if matched is not None:
+        return matched
+    return _first_newline(original, 0, len(original)) or os.linesep
+
+
+def _first_newline(content: str, start: int, end: int) -> str | None:
+    cr = content.find("\r", start, end)
+    lf = content.find("\n", start, end)
+    if cr < 0 and lf < 0:
+        return None
+    if cr >= 0 and (lf < 0 or cr < lf):
+        return "\r\n" if cr + 1 < end and content[cr + 1] == "\n" else "\r"
+    return "\n"
 
 
 def _notify_path_access(
