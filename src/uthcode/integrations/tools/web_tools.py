@@ -14,7 +14,7 @@ import ipaddress
 import json
 import re
 import socket
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -364,7 +364,7 @@ class TavilySearchTool:
         domains = arguments.get("domains")
         if domains is not None and (
             isinstance(domains, (str, bytes, bytearray))
-            or not isinstance(domains, (list, tuple))
+            or not isinstance(domains, Sequence)
             or len(domains) > 20
             or not all(isinstance(item, str) and item.strip() for item in domains)
         ):
