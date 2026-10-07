@@ -11,13 +11,14 @@ from uthcode.integrations.tools.document_workers import PDF_WORKER_FLAG, pdf_wor
 from uthcode.integrations.tools.workspace import WorkspacePathResolver
 
 
-def _pdf_bytes() -> bytes:
+def _pdf_bytes(text: bytes = b"PDF hello") -> bytes:
+    content = b"BT /F1 18 Tf 72 100 Td (" + text + b") Tj ET\n"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length 42 >>\nstream\nBT /F1 18 Tf 72 100 Td (PDF hello) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n" + content + b"endstream",
     ]
     output = bytearray(b"%PDF-1.4\n")
     offsets = [0]
@@ -47,6 +48,23 @@ def test_pdf_worker_command_keeps_headless_and_frozen_entrypoints(monkeypatch: p
 
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert pdf_worker_command() == (sys.executable, PDF_WORKER_FLAG)
+
+
+@pytest.mark.asyncio
+async def test_read_document_pdf_worker_protocol_is_utf8_with_ascii_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "unicode.pdf").write_bytes(_pdf_bytes(b"caf\xe9"))
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+
+    result = await ReadDocumentTool(WorkspacePathResolver(tmp_path)).execute(
+        {"path": "unicode.pdf", "page": 1},
+        cancellation=CancellationToken(),
+    )
+
+    assert result.is_error is False
+    assert "café" in _text(result)
 
 
 @pytest.mark.asyncio
