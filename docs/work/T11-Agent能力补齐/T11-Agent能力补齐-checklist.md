@@ -50,9 +50,9 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 ## T08 进程会话与原生 PTY
 
 - [x] A11（R12/R13/R25）：通过 `tests/test_builtin_process_tool.py` 增补；计划新增 `tests/test_process_sessions.py` 验证；通过条件：短等待返回 process_id/running；后续读到增量和退出码；等待无输出不被判死；不同 Session ID 控制被拒绝。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] A14（R11/R15）：通过 既有 descendant 终止用例扩展 PTY 验证；通过条件：timeout/cancel/异常截停后本 Turn 进程及后代不继续写 marker；此前 Turn 保留服务按规则存活；shutdown 全部回收；确认失败明确 unknown。证据记录于 W03 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T08 的完成边界并记录对应代码/定向证据：短等待返回 running，后续有增量/退出码；原生 isatty、输入/EOF/resize 可测试；取消能解阻塞读并确认回收或报告 unknown。
+- [x] 核对 Tasks T08 的完成边界并记录对应代码/定向证据：短等待返回 running，后续有增量/退出码；原生 isatty、输入/EOF/resize 可测试；取消能解阻塞读并确认回收或报告 unknown。
 
 ## T09 进程生命周期与 Desktop 有界日志
 
@@ -65,7 +65,7 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 ## T10 搜索、抓取与可信搜索配置
 
 - [x] A17（R07/R08/R20）：通过 计划新增 `tests/test_web_tools.py`；配置相关测试 验证；通过条件：无配置/认证/限额/429/取消有分类；Key 不进入事件/trace；项目 search 凭据/重定向硬失败；不自动升级收费模式。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] A23（R20）：通过 `tests/test_config_contract.py`、`test_config_loader_integration.py`、`test_configuration.py`；Desktop settings 用例 验证；通过条件：搜索/模型能力/工具配置保存/校验/来源正确；后台 active Turn 也受快照保护；存活进程不因保存重启。证据记录于 W04 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] 核对 Tasks T10 的完成边界并记录对应代码/定向证据：正式配置到工具集合按 Turn 快照；来源可继续读取；不发会话全文、不带浏览器 Cookie、不启动浏览器；真实服务调用由 T19 验证。
 
@@ -88,7 +88,7 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 - [x] A08（R10/R11/R24）：通过 `tests/test_tool_result_persistence.py`、`test_agent_loop.py` 增补 验证；通过条件：写成功保存失败不重做；unknown 副作用截停；未执行批尾也有对应结果；普通工具错误返回模型继续处理。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] A22（R22—R25）：通过 `tests/test_agent_loop.py`、`test_agent_policy.py`；计划新增 `tests/test_runaway_detection.py` 验证；通过条件：正常脚本 Provider 连续至少 200 轮仍能完成；相同失败/短周期/完成阻断先纠偏后停止；编辑后重测、合法等待和人工重试不误停；无累计轮数 fallback。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T14 的完成边界并记录对应代码/定向证据：脚本 Provider 至少 200 轮正常完成；失败/短周期/final 阻断正例、编辑重测/等待/人工输入反例通过；终态 runaway_detected 与取消区分。
+- [x] 核对 Tasks T14 的完成边界并记录对应代码/定向证据：脚本 Provider 至少 200 轮正常完成；失败/短周期/final 阻断正例、编辑重测/等待/人工输入反例通过；终态 runaway_detected 与取消区分。
 
 ## T15 Settings 配置完整性与生效边界
 
@@ -97,8 +97,8 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 ## T16 Desktop 产物打开与受控预览
 
-- [ ] A24（R27）：通过 Desktop Main/preload/chat 定向用例 + 人工点开产物 验证；通过条件：已授权文件可打开/定位、图片可看；缺失文件局部报错；可执行文件默认定位；恶意 URI 不执行命令。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] 核对 Tasks T16 的完成边界并记录对应代码/定向证据：授权文件打开定位和图片预览可用；恶意 URI 不执行命令；保持 Renderer 无任意 fs/shell。
+- [x] A24（R27）：通过 Desktop Main/preload/chat 定向用例 + 人工点开产物 验证；通过条件：已授权文件可打开/定位、图片可看；缺失文件局部报错；可执行文件默认定位；恶意 URI 不执行命令。证据记录于 W05 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] 核对 Tasks T16 的完成边界并记录对应代码/定向证据：授权文件打开定位和图片预览可用；恶意 URI 不执行命令；保持 Renderer 无任意 fs/shell。
 
 ## T17 SWE-bench 预测与安全 Trace
 
@@ -115,9 +115,9 @@ Python 命令在仓库根的 `re-uthcode` 环境执行，按下述路径使用 `
 
 - [ ] A02（R03/R06，三协议真实入模）：通过 既有三个 Provider integration 测试 + 人工真实 Provider 验收 验证；通过条件：检查实际 SDK 请求并让模型分别回答用户图和工具图中的不同内容；记录具体模型/端点/SDK；不以只返回路径或 Mock 冒充通过。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A10（R05/R06，实际打包依赖）：通过 Windows packaged 手动读取四格式与渲染 PDF 页 验证；通过条件：原生 PDF/图片依赖在安装产物可用，无开发机隐式依赖；当前视觉模型能收到渲染页。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A12（R14）：通过 Windows + POSIX 定向 PTY 测试 验证；通过条件：子进程 isatty 为真、交互输入/EOF/resize 有效；PTY 单流标记准确，pipe 仍区分 stderr；输入不可自动重放。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A15（R14—R16，Windows 实机）：通过 标准 `npm run package` / `npm run make`（依现有 scripts）后人工操作 验证；通过条件：安装产物中 PTY、中文/ANSI 日志、stdin、停止和关闭有效；不是 CDP 布局测试代替原生进程验证。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
-- [ ] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
+- [x] A18（R07/R09）：通过 实际 Tavily 查询→Fetch 一个公开静态页与 PDF；本地 HTTP fixture 测失败 验证；通过条件：有真实 URL/来源/用量和后续正文读取；重定向、正文超限、登录/动态页限制准确；取消关闭读取；不记录凭据。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [x] A26（R21，外部可消费）：通过 一条真实 SWE-bench Lite 实例，经正式 Headless；官方 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <预测文件> --instance_ids <实际实例> --run_id <新运行标识>` 验证；通过条件：生成预测并由官方 harness 完成评分，记录 resolved 与失败原因；不要求单例必解，不把评分环境缺失当成功。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] A28（R28，联合真实端到端）：通过 Windows Desktop 输入截图+文档→Agent 定位并 Patch→运行失败测试→读日志修复→重跑→查看图片→点击交付物 验证；通过条件：每个观察与修改来自正式工具结果，Desktop 可折叠日志并打开产物；需要模型理解的步骤有真实 Provider 证据。证据记录于 W06 Feedback；前序有效实测可引用，尚未实测不得勾选。
 - [ ] 核对 Tasks T19 的完成边界并记录对应代码/定向证据：记录端点/模型/SDK、安全命令和精确结果。缺凭据/平台/Docker 只保留对应未完成项，不能用 Mock、CDP 布局或评分环境缺失冒充完成；有效已有证据可复用。

@@ -41,6 +41,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` Desktop Renderer 以 `project_key + session_id` 缓存每个 Session 的 timeline、Todo、Run、interaction、Context/Compact 和终态投影，支持后台 Turn 事件在不可见时继续更新。该缓存仅是 Interface state，Session Transcript/Timeline/metadata 仍是唯一持久语义来源。
 - `[FACT]` ProcessSessionManager 持有 Session-owned 活进程及默认 2 MiB 的有界 UTF-8 输出环；每个 Session 默认保留 32 个正常终态和 128 个 `expired` 淘汰事实。`read` 通过单调 cursor 返回增量、最早位置和 cursor 过期事实，淘汰后仍可读取明确的过期原因。进程在 ToolCall/Turn 完成后仍可发布 `process_output`/`process_state`，Application 统一按 Session/process identity 做跨 chunk Secret 脱敏，再由 Desktop/Renderer 更新日志；这些事件不进入 RunState、Transcript、History 或 Provider Context。
 - `[FACT]` Turn 终态的清理边界是本 Turn 新建进程；成功 Turn 保留服务进程并允许下一 Turn 读取/控制，取消/失败只清理本 Turn，Session/Application shutdown 才清理全部进程。UI 日志和 Bridge outbox 都有界，游标过期要求从 `process.read` 重新读取当前环。
+- `[FACT]` Desktop 的不同 Session Application 使用独立 ProcessSessionManager；持久 Session 服务可共享，已关闭 manager 不参与该 Session 的冷恢复。再次恢复由正式工厂创建新 manager，后台仍存活的 runtime 则保留自己的原 manager；持久历史恢复不重放进程或输入。
 - `[BOUNDARY]` Session v3 持久化 metadata（schema 3）、Transcript、Timeline、Tool Result ref、writer lock 和 Instruction State；record envelope 仍为 schema 2。v1/v2 明确 incompatible，不迁移、不双读；不提供跨进程 Runtime checkpoint、持久 Memory 或 retrieval。
 
 ## History 持久化与恢复

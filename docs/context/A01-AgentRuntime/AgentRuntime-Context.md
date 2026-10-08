@@ -97,6 +97,12 @@ AgentRun.start_turn(user_input)
 
 ## Provider 与 Tool 当前矩阵
 
+`EditFile` 继续在文本模式的归一化视图中唯一匹配旧文本，写回以两个匹配边界定位原始区间并保留区间之外的换行字节。实现不为每个字符建立偏移数组；替换换行样式按匹配区间、原文件、平台的顺序选择。`ProcessSessionManager` 在 POSIX PTY 输入边界编码 UTF-8 字节，Windows PTY 保持文本接口，pipe 的输入编码语义不变。
+
+`WebSearch.domains` 接受正式 `ToolCallPart.arguments` 归一化后的 JSON 数组只读序列，继续限制最多 20 个字符串；字符串本身不作为数组接受。进入 Tavily HTTP 边界前投影为普通列表，固定端点、basic 深度、权限与用户级秘密边界不变。
+
+PDF 私有 worker 的 stdout 协议显式写入 UTF-8 字节，与父进程的 UTF-8 解码一致，避免 Windows 子进程继承本地文本编码后因 PDF 中的非 ASCII 内容异常退出。协议字段、取消与输出上限保持既有语义。
+
 ```text
 provider.kind:
   fake              -> integrations/providers/fake.py
