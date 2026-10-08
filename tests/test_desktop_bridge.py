@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,7 @@ from uthcode.application import (
     UserQuestion,
     Usage,
     UthCodeApplication,
+    create_application,
 )
 from uthcode.core.agent_events import (
     AssistantMessageDelta,
@@ -73,7 +75,7 @@ from uthcode.core.agent_events import (
     TurnPaused,
     agent_event_from_dict as core_agent_event_from_dict,
 )
-from uthcode.core.provider import ModelLimits
+from uthcode.core.provider import FinishReason, ModelLimits, ToolCallPart
 from uthcode.core.permission import Effect, ResourceScope, RuleSet
 from uthcode.application import ToolResultPart
 from uthcode.integrations.providers.fake import FakeProvider
@@ -88,6 +90,45 @@ def _completed(text: str = "done") -> GenerationCompleted:
             usage=Usage(),
         )
     )
+
+
+class _SessionProcessLifecycleProvider:
+    """Script one real Bash Tool call without contacting a model service."""
+
+    identity = ProviderIdentity("test", "scripted", "desktop-session-lifecycle")
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self.requests = 0
+
+    def resolve_model_limits(self, _model: str) -> ModelLimits:
+        return ModelLimits(
+            max_input_tokens=256_000,
+            source="test.desktop_session_lifecycle",
+        )
+
+    async def stream(self, _request, *, cancellation):
+        self.requests += 1
+        cancellation.raise_if_cancelled()
+        if self.requests == 1:
+            yield GenerationCompleted(
+                ProviderResponse(
+                    message=Message(
+                        "assistant",
+                        (
+                            ToolCallPart(
+                                "session-runtime-bash",
+                                "Bash",
+                                {"command": self.command, "yield_time_ms": 1000},
+                            ),
+                        ),
+                    ),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    usage=Usage(),
+                )
+            )
+            return
+        yield _completed("process finished")
 
 
 def _application(*events: object) -> UthCodeApplication:
@@ -2848,6 +2889,116 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
     assert "raw-native-secret" not in repr(request)
     assert "raw-native-secret" not in json.dumps(result.to_dict())
     await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cold_resumed_session_gets_a_fresh_process_manager_and_runs_bash(
+    tmp_path: Path,
+) -> None:
+    source = "print('session-manager-reopened')"
+    command = (
+        subprocess.list2cmdline([sys.executable, "-c", source])
+        if os.name == "nt"
+        else f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+    )
+    configuration = EffectiveConfig(
+        default_model="fake/session-lifecycle",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/session-lifecycle": ModelProfile(
+                "fake/session-lifecycle", "fake", "session-lifecycle"
+            ),
+        },
+    )
+
+    def provider_builder(_profile, _model):
+        return _SessionProcessLifecycleProvider(command)
+
+    application = create_application(
+        configuration,
+        provider_builder=provider_builder,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    session_a = application.ensure_session()
+    assert session_a is not None
+    session_a_id = session_a.session_id
+    manager_a = application.runtime_context.process_manager
+    assert manager_a is not None
+    bridge = DesktopBridge(
+        application=application,
+        config_loader=lambda _workdir: configuration,
+        home=tmp_path,
+        workdir=tmp_path,
+    )
+
+    try:
+        created = await bridge.handle_request(
+            RequestEnvelope("lifecycle-new-session", "session.new", {})
+        )
+        assert created.ok is True and created.result is not None
+        session_b_id = created.result["session_id"]
+        assert isinstance(session_b_id, str) and session_b_id != session_a_id
+        manager_b = bridge.application.runtime_context.process_manager
+        assert manager_b is not None
+
+        # Creating B reclaims idle A and preserves shutdown_session's terminal
+        # semantics for that manager/session pair.
+        await asyncio.sleep(0)
+        assert session_a_id in manager_a._closed_sessions
+
+        preparing = await bridge.handle_request(
+            RequestEnvelope(
+                "lifecycle-cold-resume-a",
+                "session.resume",
+                {"session_id": session_a_id},
+            )
+        )
+        assert preparing.ok is True
+        runtime_a2 = bridge._background_runtimes[session_a_id]
+        preparation_task = runtime_a2.get("task")
+        assert isinstance(preparation_task, asyncio.Task)
+        await preparation_task
+
+        resumed = await bridge.handle_request(
+            RequestEnvelope(
+                "lifecycle-activate-a",
+                "session.resume",
+                {"session_id": session_a_id},
+            )
+        )
+        assert resumed.ok is True
+        application_a2 = bridge.application
+        assert application_a2 is runtime_a2["application"]
+        manager_a2 = application_a2.runtime_context.process_manager
+        assert manager_a2 is not None
+
+        run = bridge.run
+        assert run is not None
+        run.set_permission_mode(PermissionMode.FULL_ACCESS)
+        started = await bridge.handle_request(
+            RequestEnvelope(
+                "lifecycle-run-bash",
+                "turn.start",
+                {"prompt": "run the local process lifecycle check"},
+            )
+        )
+        assert started.ok is True
+        await bridge.wait_for_idle()
+
+        processes = manager_a2.list(session_a_id)
+        assert len(processes) == 1
+        assert processes[0]["state"] == "exited"
+        assert processes[0]["exit_code"] == 0
+        read = manager_a2.read(str(processes[0]["process_id"]), session_a_id)
+        assert "session-manager-reopened" in "".join(
+            entry.text for entry in read.entries
+        )
+        assert manager_a is not manager_b
+        assert manager_a2 is not manager_a
+        assert manager_a2 is not manager_b
+    finally:
+        await bridge.shutdown()
 
 
 def test_command_result_projects_application_business_error_code() -> None:
