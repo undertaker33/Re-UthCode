@@ -577,6 +577,149 @@ test("durable failure replay restores retained output and the failed Turn projec
   assert.equal(resumed.projects[0]?.sessions[0]?.runtime_status, "failed");
 });
 
+test("live terminal failures merge with durable history across navigation and paging", () => {
+  const projectKey = "C:/failure-identity";
+  const sessionId = "session-failure";
+  const runId = "run-failure";
+  const turnId = "turn-failure";
+  const failureRecord = (recordId = "durable-failure") => ({
+    record_id: recordId,
+    session_id: sessionId,
+    sequence: 4,
+    turn_id: turnId,
+    kind: "failure",
+    termination_reason: "provider_error",
+    failure_reason: "provider_request",
+    is_error: true,
+  });
+  const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload as AgentEvent });
+  const failedStatusCount = (state: RendererState) => state.timeline.filter((entry) => entry.kind === "status" && entry.status === "failed").length;
+
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    run: { run_id: runId, turn_id: turnId, status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  state = reduceRendererState(state, event({ type: "turn_pausing", run_id: runId, turn_id: turnId }));
+  const earlierLiveStatusId = state.timeline.at(-1)?.id;
+  state = reduceRendererState(state, event({
+    type: "turn_failed",
+    run_id: runId,
+    turn_id: turnId,
+    termination_reason: "provider_error",
+    failure_reason: "provider_request",
+  }));
+  const liveFailureId = state.timeline.find((entry) => entry.kind === "status" && entry.status === "failed")?.id;
+  assert.ok(liveFailureId);
+
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: { session_id: sessionId, records: [failureRecord()], next_cursor: "older", has_more: true },
+  });
+  assert.equal(failedStatusCount(state), 1, "the durable failure joins its live terminal notification");
+  assert.equal(state.timeline.some((entry) => entry.id === earlierLiveStatusId), true, "an ordinary same-Turn status remains visible");
+
+  state = reduceRendererState(state, { type: "history_page_started", projectKey, sessionId: "session-other" });
+  state = reduceRendererState(state, { type: "history_page_started", projectKey, sessionId });
+  assert.equal(failedStatusCount(state), 1, "returning to a Session does not duplicate its failure notification");
+
+  state = reduceRendererState(state, {
+    type: "turn_accepted",
+    run: { run_id: "run-next", turn_id: "turn-next", status: "running" },
+    steering: false,
+  });
+  state = reduceRendererState(state, event({ type: "turn_pausing", run_id: "run-next", turn_id: "turn-next" }));
+  const laterLiveStatusId = state.timeline.at(-1)?.id;
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    result: { session_id: sessionId, records: [failureRecord("overlapping-page-failure")], next_cursor: null, has_more: false },
+  });
+  assert.equal(failedStatusCount(state), 1, "an overlapping history page keeps one failure row");
+  assert.equal(state.sessionHistory[sessionRuntimeKey(projectKey, sessionId)]?.records.filter((entry) => entry.kind === "status" && entry.status === "failed").length, 1);
+  assert.equal(state.timeline.some((entry) => entry.id === laterLiveStatusId), true, "a later live status is not consumed by failure merging");
+
+  let durableFirst = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    run: { run_id: runId, turn_id: turnId, status: "running" },
+    activeTurn: true,
+    turnStatus: "running",
+  });
+  durableFirst = reduceRendererState(durableFirst, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: { session_id: sessionId, records: [failureRecord()], next_cursor: null, has_more: false },
+  });
+  durableFirst = reduceRendererState(durableFirst, event({
+    type: "turn_failed",
+    run_id: runId,
+    turn_id: turnId,
+    termination_reason: "provider_error",
+    failure_reason: "provider_request",
+  }));
+  assert.equal(failedStatusCount(durableFirst), 1, "a late live terminal event reuses a failure row already loaded from history");
+});
+
+test("terminal failure identity keeps distinct Turns and unidentifiable failures separate", () => {
+  const projectKey = "C:/failure-identity-scope";
+  const sessionId = "session-failure-scope";
+  const failure = (recordId: string, sequence: number, turnId?: string) => ({
+    record_id: recordId,
+    session_id: sessionId,
+    sequence,
+    ...(turnId ? { turn_id: turnId } : {}),
+    kind: "failure",
+    termination_reason: "provider_error",
+    failure_reason: "provider_request",
+    is_error: true,
+  });
+  let state = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: sessionId });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: {
+      session_id: sessionId,
+      records: [failure("turn-one-failure", 1, "turn-one"), failure("turn-two-failure", 2, "turn-two")],
+      next_cursor: null,
+      has_more: false,
+    },
+  });
+  const identifiedFailures = state.timeline.filter((entry) => entry.kind === "status" && entry.status === "failed");
+  assert.equal(identifiedFailures.length, 2, "the same failure reason in different Turns remains two records");
+  assert.notEqual(identifiedFailures[0]?.id, identifiedFailures[1]?.id);
+
+  const event = { type: "agent_event" as const, event: {
+    type: "turn_failed",
+    failure_reason: "provider_request",
+    termination_reason: "provider_error",
+  } as AgentEvent };
+  let missingIdentity = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: sessionId });
+  missingIdentity = reduceRendererState(missingIdentity, event);
+  missingIdentity = reduceRendererState(missingIdentity, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    replace: true,
+    result: { session_id: sessionId, records: [failure("unbound-durable-failure", 1)], next_cursor: null, has_more: false },
+  });
+  assert.equal(
+    missingIdentity.timeline.filter((entry) => entry.kind === "status" && entry.status === "failed").length,
+    2,
+    "a missing Turn identity must not cause a live failure to consume an unrelated durable row",
+  );
+});
+
 test("background Agent events are cached per Session and restored with Todo/pause state", () => {
   let state = applyProjectOpened(createInitialState(), {
     project: { path: "C:/Projects/background" },

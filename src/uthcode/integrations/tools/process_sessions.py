@@ -646,7 +646,8 @@ class ProcessSessionManager:
                 async with managed.pty_write_lock:
                     before = managed.next_sequence
                     if data:
-                        await asyncio.to_thread(managed.pty.write, data)
+                        pty_input: str | bytes = data if os.name == "nt" else data.encode("utf-8")
+                        await asyncio.to_thread(managed.pty.write, pty_input)
                         await self._wait_for_pty_flush(managed, before, 0.75)
                     if eof:
                         await self._close_pty_input(managed)
@@ -694,9 +695,10 @@ class ProcessSessionManager:
                 # Ctrl-Z followed by Enter is the closest portable EOF for a
                 # Windows console.  A caller can still stop a process if the
                 # command ignores it.
-                await asyncio.to_thread(pty.write, "\x1a\r\n")
+                eof_input: str | bytes = "\x1a\r\n"
             else:
-                await asyncio.to_thread(pty.write, "\x04")
+                eof_input = b"\x04"
+            await asyncio.to_thread(pty.write, eof_input)
             managed.writer_closed = True
         except (OSError, EOFError) as exc:
             raise ProcessSessionError("Error: PTY EOF could not be delivered", kind="process_failed") from exc

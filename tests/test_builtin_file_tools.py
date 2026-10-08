@@ -464,6 +464,62 @@ async def test_edit_requires_unique_nonempty_old_string_and_refreshes_tracker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "old_string", "new_string", "expected"),
+    [
+        (
+            "before\nafter\n",
+            "before\nafter",
+            "first\r\nsecond\nthird",
+            "first\nsecond\nthird\n",
+        ),
+        (
+            "before\r\nafter\r\n",
+            "before\nafter",
+            "first\r\nsecond\nthird",
+            "first\r\nsecond\r\nthird\r\n",
+        ),
+        (
+            "before\r\nstay\nTARGET\rafter",
+            "TARGET",
+            "first\nsecond",
+            "before\r\nstay\nfirst\r\nsecond\rafter",
+        ),
+        (
+            "before\rTARGET\rafter",
+            "TARGET",
+            "first\nsecond",
+            "before\rfirst\rsecond\rafter",
+        ),
+    ],
+)
+async def test_edit_preserves_file_newlines_and_does_not_expand_crlf(
+    tmp_path: Path,
+    source: str,
+    old_string: str,
+    new_string: str,
+    expected: str,
+) -> None:
+    target = tmp_path / "file.txt"
+    target.write_bytes(source.encode("utf-8"))
+    _, _, read, _, edit = _tools(tmp_path)
+    cancellation = CancellationToken()
+    await read.execute({"path": "file.txt"}, cancellation=cancellation)  # type: ignore[arg-type]
+
+    result = await edit.execute(
+        {
+            "path": "file.txt",
+            "old_string": old_string,
+            "new_string": new_string,
+        },  # type: ignore[arg-type]
+        cancellation=cancellation,
+    )
+
+    assert result.is_error is False
+    assert target.read_bytes() == expected.encode("utf-8")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["change", "delete", "replace"])
 async def test_edit_rejects_external_file_state_before_side_effect(
     tmp_path: Path,

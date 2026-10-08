@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from uthcode.application.configuration import SearchConfiguration
-from uthcode.core import CancellationToken
+from uthcode.core import CancellationToken, ToolCallPart
 from uthcode.integrations.tools.web_tools import FetchWebTool, TavilySearchTool
 
 
@@ -40,7 +40,12 @@ async def test_tavily_uses_fixed_basic_request_and_redacts_answer(tmp_path: Path
         SearchConfiguration(enabled=True, api_key="secret-value"),
         transport=httpx.MockTransport(handler),
     )
-    result = await tool.execute({"query": "hello"}, cancellation=CancellationToken())  # type: ignore[arg-type]
+    provider_call = ToolCallPart(
+        "search-domains",
+        "WebSearch",
+        {"query": "hello", "domains": ["example.com"]},
+    )
+    result = await tool.execute(provider_call.arguments, cancellation=CancellationToken())
     assert result.is_error is False
     payload = seen["payload"]
     assert payload["search_depth"] == "basic"
@@ -48,6 +53,7 @@ async def test_tavily_uses_fixed_basic_request_and_redacts_answer(tmp_path: Path
     assert payload["include_answer"] is False
     assert payload["include_usage"] is True
     assert payload["max_results"] == 5
+    assert payload["include_domains"] == ["example.com"]
     assert "secret-value" not in str(result.content)
     assert "should not be projected" not in str(result.content)
 
@@ -98,23 +104,28 @@ async def test_tavily_unconfigured_and_response_limit_are_controlled() -> None:
 
 @pytest.mark.asyncio
 async def test_tavily_cancellation_closes_pending_request() -> None:
+    started = asyncio.Event()
+
     async def delayed(request: httpx.Request) -> httpx.Response:
+        started.set()
         await asyncio.sleep(1)
         return httpx.Response(200, json={"results": []}, request=request)
 
     token = CancellationToken()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(delayed))
     tool = TavilySearchTool(
         SearchConfiguration(enabled=True, api_key="secret-value"),
-        transport=httpx.MockTransport(delayed),
+        client_factory=lambda **_kwargs: client,
     )
     task = asyncio.create_task(
         tool.execute({"query": "hello"}, cancellation=token)  # type: ignore[arg-type]
     )
-    await asyncio.sleep(0.01)
+    await started.wait()
     token.cancel()
     result = await task
     assert result.is_error is True
     assert result.failure is not None and result.failure.kind == "cancelled"
+    assert client.is_closed is True
 
 
 @pytest.mark.asyncio
@@ -160,19 +171,24 @@ async def test_fetch_rechecks_each_redirect_and_bounds_body(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_fetch_cancellation_and_login_pages_are_controlled() -> None:
+    started = asyncio.Event()
+
     async def delayed(request: httpx.Request) -> httpx.Response:
+        started.set()
         await asyncio.sleep(1)
         return httpx.Response(200, text="late", request=request)
 
     token = CancellationToken()
-    tool = FetchWebTool(transport=httpx.MockTransport(delayed))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(delayed))
+    tool = FetchWebTool(client_factory=lambda **_kwargs: client)
     task = asyncio.create_task(tool.execute({"url": "https://example.com"}, cancellation=token))  # type: ignore[arg-type]
-    await asyncio.sleep(0.01)
+    await started.wait()
     token.cancel()
     cancelled = await task
     assert cancelled.is_error is True
     assert cancelled.failure is not None
     assert cancelled.failure.kind == "cancelled"
+    assert client.is_closed is True
 
     login = FetchWebTool(
         transport=httpx.MockTransport(
@@ -183,3 +199,32 @@ async def test_fetch_cancellation_and_login_pages_are_controlled() -> None:
     assert result.is_error is True
     assert result.failure is not None
     assert result.failure.kind == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_treat_client_rendered_script_as_page_text() -> None:
+    html = (
+        '<!doctype html><html><body><div id="root"></div>'
+        '<script>document.getElementById("root").textContent = "rendered only in browser";</script>'
+        "</body></html>"
+    )
+    tool = FetchWebTool(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=html,
+                request=request,
+            )
+        )
+    )
+
+    result = await tool.execute(
+        {"url": "https://example.com/client-rendered"},
+        cancellation=CancellationToken(),  # type: ignore[arg-type]
+    )
+
+    assert result.is_error is True
+    assert result.failure is not None and result.failure.kind == "unsupported"
+    assert "rendered only in browser" not in str(result.content)
+    assert "document.getElementById" not in str(result.content)

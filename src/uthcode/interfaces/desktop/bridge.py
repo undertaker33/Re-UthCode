@@ -13,6 +13,7 @@ import asyncio
 import base64
 import binascii
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from enum import Enum
 import inspect
 import json
@@ -1058,12 +1059,17 @@ class DesktopBridge:
         context = getattr(current, "runtime_context", None)
         builder = getattr(current, "_provider_builder", None)
         writer = getattr(current, "_model_writer", None)
+        runtime_context = (
+            replace(context, workdir=target_workdir, process_manager=None)
+            if isinstance(context, ApplicationRuntimeContext)
+            else ApplicationRuntimeContext.from_system(workdir=target_workdir)
+        )
         try:
             return create_application(
                 config,
                 provider_builder=builder if callable(builder) else None,
                 model_writer=writer if callable(writer) else None,
-                runtime_context=context if isinstance(context, ApplicationRuntimeContext) else ApplicationRuntimeContext.from_system(workdir=target_workdir),
+                runtime_context=runtime_context,
                 session_store=store,
             )
         except Exception:

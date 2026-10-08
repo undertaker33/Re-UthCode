@@ -353,3 +353,110 @@ python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench
 本机证据根仍为 D:\uthcode-audits\t11-swe-20261004-ff513aad：DeepSeek prediction/summary 在 deepseek-evaluation/reports/astropy__astropy-12907.jsonl 与 .summary.json，安全 trace 在 deepseek-evaluation/artifacts/t11-swe-bench-lite/astropy__astropy-12907/t11-3-deepseek/trace.jsonl；官方总报告为 harness/deepseek-v4-pro.uthcode-t11-20261004-ff513aad-deepseek-pro.json，逐例 report.json/test_output.txt 在 harness/logs/run_evaluation/uthcode-t11-20261004-ff513aad-deepseek-pro/deepseek-v4-pro/astropy__astropy-12907/，实际评分命令/exit/耗时在 harness/harness-deepseek-status.json。
 
 本实例支持模型修复判断差异是 Qwen 失败的重要因素：两者同样没有模型侧测试执行，DeepSeek 的实际补丁仍通过独立官方评分；测试反馈缺失不能独自解释 Qwen 的逻辑错误。单题各一次不能推导总体能力排名或完整 Agent 测试闭环已通过。没有继续刷题、扩大权限、修改产品源码或其他冻结勾选；T11 仍有 16 个未完成行、11 组要求，保持 not_implemented、不归档。
+
+### Tavily 就绪后的增量收尾（2026-10-07）
+
+用户授权完成剩余任务，继续既有分支与原 Worker/Reviewer，不重拆工作包。原 GPT-6 Luna / max 实施、原 GPT-6.1 Sol / medium 独立审核当前源码 PASS，finding 均交原 Worker 修复后复审：EditFile 保留匹配区间外行尾；POSIX PTY 输入/EOF 转 UTF-8 bytes；WebSearch 接受正式 ToolCallPart 的不可变数组；PDF worker 显式 UTF-8 bytes 输出；长期 prompt 要求区分真实验证、失败、未运行且允许复用有效历史证据。源码按上述功能分别提交，没有修改 Desktop 产品源码，没有文本去重、删除合法 reasoning、重构 Agent Loop 或把自然语言声明当正确性判据。
+
+新增真实验收见原 W01/W03/W04/W05 的末尾：Windows PTY 165 passed / 1 skipped / 19.44s，Linux 原生 PTY（Docker --init）163 passed / 3 skipped / 14.81s，T14 纠偏后真实 AskUser/steering 反例及相关组合 90 passed / 3.40s，Web/文件/Application/架构组合 116 passed / 11.79s，最终 PDF/图片/架构组合 31 passed / 7.72s。真实 Tavily 两次成功查询各报告 credits=1，失败 IANA 查询用量未知；实际 W3C 静态页与 PDF Fetch HTTP 200，修复后同 Session ToolResultRead/ReadDocument 正文续读通过、没有再发 HTTP。初始导入错误、domains invalid_input、网络错误、PDF 编码失败均保留，未写为第一次整轮成功。
+
+总控在 desktop/ 使用有界外部监测执行 `npm test`：首轮 264 passed / 1 cancelled，exit 1，Runtime build 用例超过内部 120 秒，未算全量通过；源码收敛后的第二轮 265 passed / 0 failed / 0 cancelled，Node 94.243s、外部 95.201s，exit 0。`npm run typecheck` exit 0，9.004s。Main/preload/chat 定向 27 passed / 0 failed，Node 4877.9586ms、exit 0。测试进程 V8 heap 上限 512 MiB、外部进程树内存/时间/输出有界，未修改项目测试运行配置。第二轮 Runtime 编译期间 Web 源码落盘，随后总控单独串行标准 `npm run build:runtime` 收敛；新增 PDF 修复后再次以最终输入重建，exit 0 / 76.989s，ready/status/shutdown JSONL 与 prompt asset smoke 通过。最终内置 Runtime 位于 `desktop/.runtime/uthcode-runtime/`；没有并行 npm test 与 package/make。
+
+原 A12 两处、T08 边界、T14 边界、A18 两处共 6 行具备充分证据，已仅改 completion mark。当前剩 10 个未勾选行、7 组要求：A02×2、A10×2、A15×2、A24、T16、A28、T19 边界。A02 的 Anthropic/Qwen 用户图与正式 ViewImage 工具图已实测，另有有效 compatible 历史证据；Responses profile 尚缺，因此三协议整体仍不勾。视觉外部审计驱动未先审、运行后才补审且发现 SDK 构造外额外 secret reveal 的流程偏差已在 W01 如实记录，修订版复审 PASS、未重发请求；没有凭据/base64泄漏证据，不把修订脚本虚称重新实跑。
+
+总控实际打开了旧 packaged UthCode 窗口并切到独立验收 fixture，但本轮 Computer Use 在浏览器动作前被工具保护停止，原因原文为“could not determine the current browser URL on Windows with enough confidence to enforce policy”。此后停止全部窗口输入，没有用其他 UI 自动化或终端关闭窗口绕过保护。已向用户请求手动关闭当前旧包以释放标准输出目录，记录时仍有旧 UthCode 进程、未收到已关闭回答；未执行本轮新的 package/make，也未把旧 `desktop/out/UthCode-win32-x64/UthCode.exe` 写成最终新包。A10/A15 安装产物与 A24/T16/A28 原生人工证据保持未验证。
+
+独立验收 fixture 位于 `D:/uthcode-audits/t11-closeout-20261007/desktop-fixture`，包含四种小文档、已知失败测试及图片/交付物入口；PNG 是合成图，不是已完成的真实截图，浏览器截图步骤未成功，不计 A28。后续最小用户配合是关闭旧测试窗口、配置用户级可信 Responses 视觉模型（不在聊天提供密钥），并准备不依赖开发机 Conda 的干净 Windows 安装验证环境；实际 Desktop 联合链需在工具恢复后的新轮亲自执行。
+
+为补齐单题结论过窄的模型校准，已准备两条不同 repo/缺陷的新 Lite 五列输入及四份同 base clean checkout，仓库外进行 Qwen/DeepSeek 各一次的配对正式 Headless 预测和独立官方评分。模型输入仍仅 instance_id/repo/base_commit/problem_statement/version，不读 gold/test_patch；本节记录时未发起这四次模型请求，结果后续追加，不把旧 astropy 单例当新校准。评分隔离与未刷题边界沿原有效方案。
+
+Tools、用户手册、A01 当前事实、核心设计与 Context-Index 已同步；未出现新的后置能力欠账，不改 OutstandingDebtList。需求、Spec、Tasks、工作包 Prompt 与 Checklist 正文冻结，Feedback 仅原文件末尾追加。源码修复增量交付与整包状态分开，T11 继续 not_implemented、未归档。审计证据根为 `D:/uthcode-audits/t11-closeout-20261007`，UTF-8/fence/冻结及 Git 最终状态另按实际收口记录。
+
+### 续跑构建、真实截图与四次配对预测（2026-10-07）
+
+前节记录后的用户继续恢复了原生窗口控制。总控正常关闭空闲旧测试窗口，在官方浏览器接口打开本机独立 fixture 页面并实际截图为 `desktop-fixture/actual-meter-screenshot.png`（31951 bytes）：可见 SCREEN-6372、输入 -4、区间 0..10、实际 -4、预期 0。它是合成验收 fixture 的真实浏览器渲染截图，不是生产界面截图，也不同于前述手工生成的 preview.png；尚未完成截图加文档送入新包的联合链，因此不补勾 A28。其后一次原生窗口查询被工具报告用户物理 Esc 停止，总控结束该轮窗口操作；再次用户继续后才重新查询和尝试启动，不复用停止前的状态。
+
+标准 `npm run package` 首次因外部 512 MiB V8 heap 上限在 Webpack 编译中 exit 134 / 129.169s；只调整仓库外构建监测上限至 2048 MiB 后，package exit 0 / 131.393s，随后 make exit 0 / 273.731s，均有外部 4 GiB 进程树/900 秒/16 MiB 输出边界。新应用与安装包实际路径、原始失败和最终日志见 W03 本次追加。未安装、未完成真实窗口操作；原生启动接口将新路径误定位到 `D:/project/UthCode`，无窗口可接管，已请用户手动启动最终 exe。构建成功不能代替 A10/A15/A24/T16/A28。
+
+模型校准协调命令为 `conda run --no-capture-output -n re-uthcode python D:/uthcode-audits/t11-closeout-20261007/calibration/driver/run_model_calibration.py --run-authorized`，实际 exit 0 / 365.266s，四个子进程均 exit 0、completed / final_answer。Django 与 scikit-learn 分别使用原五列输入及同 base 独立 clean checkout；顺序是 Django Qwen→DeepSeek→scikit-learn Qwen→DeepSeek，各一次，没有补跑。实际 SDK 为 OpenAI 2.53.0；Qwen `qwen3.7-flash` 使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`，DeepSeek `deepseek-v4-pro` 使用 `https://api.deepseek.com`，后者仅在内存选择，不写回用户默认配置。
+
+| 实例 / 模型 | iterations / Tool calls | Agent 秒数 | Input / output tokens | patch bytes |
+| --- | ---: | ---: | ---: | ---: |
+| django__django-11179 / Qwen | 15 / 14 | 107.203 | 109041 / 2770 | 674 |
+| django__django-11179 / DeepSeek | 11 / 11 | 69.656 | 67001 / 2313 | 674 |
+| scikit-learn__scikit-learn-13497 / Qwen | 6 / 5 | 81.860 | 27657 / 4647 | 0 |
+| scikit-learn__scikit-learn-13497 / DeepSeek | 16 / 21 | 85.813 | 146888 / 6368 | 2153 |
+
+正式 factory 外部工具严格为 ReadFile、Glob、Grep、EditFile、WriteFile、ApplyPatch、GitWorkspace，原 auto 与 1200 秒运行限制，没有 Bash、测试执行、联网搜索或模型侧官方评分反馈。原 Worker 与总控只读安全摘要，没有读取预测补丁/trace/gold。独立 Sol 实核四次配置、唯一 attempt、目录及 stopped=true、无重跑记录 PASS；字节数相同不证明补丁内容相同或正确，空补丁也不算题目通过。安全汇总为 `calibration/calibration-run-summary.json`，具体四条子命令及预测路径为 `calibration/model-run-evidence.md`。官方隔离评分已实际启动，本记录时尚无完成结果，随后按真实结果追加，不将四次运行完成写成四题通过，不据此模型排名。
+
+### 配对预测的官方评分结果（2026-10-07）
+
+评分环境为隔离 Linux 容器，Python 3.11.17、swebench 4.1.0、datasets 5.0.1、Docker SDK 7.2.0；与宿主 re-uthcode 产品环境分离。仅只读挂载四份预测，不挂用户配置、模型工作目录或模型输入 Parquet，评分过程由官方 harness 独立加载冻结 Lite 数据及所需评分信息；未将评分反馈交回模型，没有修改预测或重跑。每项实际执行 `python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite --predictions_path <对应只读预测> --instance_ids <对应实例> --run_id <下表唯一标识> --max_workers 1`，具体完整 argv、stdout、exit 与秒数保存在 `calibration/harness/runs/<run_id>/`。
+
+| run_id | exit / 秒数 | 实际官方结果 |
+| --- | --- | --- |
+| uthcode-t11-cal-20261007-django-11179-qwen | 0 / 356.913 | patch applied；resolved=true；FAIL_TO_PASS 1/1、PASS_TO_PASS 40/40 |
+| uthcode-t11-cal-20261007-django-11179-deepseek | 0 / 163.772 | patch applied；resolved=true；FAIL_TO_PASS 1/1、PASS_TO_PASS 40/40 |
+| uthcode-t11-cal-20261007-sklearn-13497-qwen | 0 / 12.348 | empty patches=1、completed=0、resolved=0；No instances to run；未执行实例测试、无逐例 report |
+| uthcode-t11-cal-20261007-sklearn-13497-deepseek | 0 / 202.367 | patch applied；resolved=false；FAIL_TO_PASS 0/1，test_mutual_info_options 失败；PASS_TO_PASS 7/7 |
+
+Django 两项真实测试输出为 Ran 42 tests、OK（skipped=1），不能写为 42 passed；scikit-learn DeepSeek 的 pytest 为 1 failed / 7 passed / 0.80s。评分外层容器 exit 0 后 --rm 自动清除，仅移除本任务容器，没有全局清理。独立 Sol / medium 复核四个唯一 run_id 的 status、官方 report 与日志 PASS，未读取预测 patch/trace/gold；总汇总为 `calibration/harness/score-summary.json`。结论严格为四个官方命令结束、2 resolved / 1 unresolved / 1 empty，不是四个实例 completed 或四项通过。
+
+加上原 astropy 配对，现有三个实例仅支持具体任务诊断：Django 双方通过，scikit-learn 双方没有解决（原因分别为空预测和目标测试失败），原 astropy 为 Qwen 未解决、DeepSeek 解决。样本很小、工具限制下没有模型侧测试执行，不推导整体模型排名；本轮未扩大次数或刷到通过。实际测试反馈闭环仍由 A28 新包联合链验证，不能用独立官方评分冒充 Agent 自己跑过测试。
+
+
+## 2026-10-07 原生联合链失败与局部交互证据
+
+总控已自行通过 Explorer 打开正确新包，无需用户额外手动启动。真实新 Session `a812fa5fea9c47c9af45b8b5357ab7b5` 提交 `actual-meter-screenshot.png` 和需求 DOCX 后，卡片保留在用户消息中；Qwen compatible 实际分析异常并完成 ReadDocument/Glob，之后发生 provider_request 失败。首次切到新 Session 再返回时用户、附件与工具组未重复，但终态失败通知从一条变为两条。原 Luna 已在 Renderer 三文件补充失败专用 Turn 身份及真实回放回归：定向 3 passed、完整 renderer-state 57 passed、typecheck exit 0，待独立 Sol 审核及重建后的窗口复验，不把旧包视为该修复通过。
+
+同 Session 的 Anthropic Qwen 续跑遇到 Bash `Session process runtime is closed`。用户手动审批后仍未实际执行 pytest；模型改动 fixture 并生成 result.txt，但仅查看旧 preview.png。模型最终明确记录测试未运行，因此 A28/T19 保持未完成。总控在原生窗口双击 result.txt 卡片，实际打开应用内文本画布并看到报告内容；这是局部产物打开证据，不覆盖定位、缺失文件、可执行文件、恶意 URI 或整组 A24/T16。默认模型已通过 UI 恢复为验收前的 `__uthcode_model_3`，并从正式配置出口确认。所有失败、旧输入和模型生成文件保留，未重置 fixture 或自动重复模型请求。
+
+
+## 2026-10-07 原生 finding 根因确认与审核进展
+
+Renderer 终态失败身份补修已由原 Sol 独立复审 PASS，无 finding。此前“待审核”段记录的是当时进度；新包重建和原生复验仍待完成，不能由源码审核替代。
+
+原 Luna 只读定位确认 Bash 拒绝来自 Session runtime 生命周期：Bridge clone 原样复用 RuntimeContext 中的 ProcessSessionManager；回收闲置旧 Application 时 shutdown_session 将 Session 永久标记关闭，之后冷恢复又取得同一 manager，start 命中 closed-session guard。Run 终态仅 cleanup 本 Turn 进程，模型切换不关闭 manager，因此不能归因模型能力或切换 Provider。最小补修限定为每个 Session Application clone 由工厂创建自身 manager，并补真实 A→B→回收 A→冷恢复 A→正式 Bash 的回归；实施与独立复审尚在进行。
+
+总控原生右键 result.txt 卡片选择“定位”，Explorer 实际选中本轮生成的 result.txt；应用内文本画布打开与定位已观察到。缺失文件、可执行文件和恶意 URI 尚未复验，因此 A24/T16 不补勾。默认模型已恢复，原生正常关闭验收应用后确认本仓库包及其 Runtime 进程均已退出。另建 `D:/uthcode-audits/t11-closeout-20261007/desktop-fixture-retry`，保留旧失败项目，原测试逐字节复制，复验输入不提供 result.txt 或 preview.png，避免旧交付物被误用。
+
+
+## 2026-10-07 原生阻断 finding 源码修复复审完成
+
+终态失败通知身份与 Session 冷恢复 manager 隔离两项已由原 Luna 分别完成、原 Sol 独立审核 PASS 无 finding。Renderer 定向 3 passed、完整状态文件 57 passed、typecheck exit 0；真实冷恢复正式 Bash 单项 1 passed，Bridge/process/配置与存活进程/架构定向 124 passed、1 skipped。具体命令和早期失败保留于原 W03/W05 新追加。总控开始以外部时间/进程树内存/输出限额执行完整 Desktop；构建与全量测试串行，当前尚未宣称新增修复的新包或 A28 通过。
+
+旧空测试 Session 前缀 2507e01c 的启动 catalog 症状只读核实：schema 3、模型引用与项目目录存在，未证明缺配置，也未证明与进程 manager 缺陷同源。之后正式新 Session 可实际工作；该初次症状未获得稳定复现或原始异常类型，不据此增加无证据修复或宣称根因解决。
+
+
+## 2026-10-07 两项 Session 补修后的完整 Desktop 与标准构建
+
+总控在两项补修均获独立 Sol 审核 PASS 后，串行执行完整 Desktop、标准 package 和 make；实际输入为 HEAD 99b33a3 加三项 Renderer 文件及 Bridge/回归两文件的已审核改动。`npm test`：267 passed、0 failed、0 cancelled、0 skipped，Node 计时 94539.2011ms，外部计时 95.785s、exit 0。`npm run package`：130.017s、exit 0；`npm run make`：240.795s、exit 0。构建日志确认 bundled Runtime ready/status/shutdown JSONL 与 importlib.resources prompt asset smoke 通过。没有与全量测试并行构建；测试仍使用外部 512 MiB V8 heap，构建使用外部 2048 MiB heap，进程树限额 4 GiB，未修改项目配置。
+
+当前应用为 `D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/UthCode.exe`（244440576 bytes，21:09:00.847）；安装入口为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`（204669952 bytes，21:10:55.941）。精确日志与状态为 `D:/uthcode-audits/t11-closeout-20261007/desktop-full-after-session-fixes.*`、`package-after-session-fixes-2g.*`、`make-after-session-fixes-2g.*`。此前五项修复包与失败构建日志保留，不能替代本次两项 Session 补修的产物。
+
+总控原生打开本次新应用，确认实际窗口进程路径；原失败 Session 重启加载后只显示一条失败提示，附件与工具历史仍存在。另在独立 retry fixture 新建 A、建立 B 回收 A、返回 A 冷恢复，再通过真实 Qwen Anthropic 配置提交截图和 DOCX。截图分析、正式附件 ReadDocument 和报告 ApplyPatch 已成功，Bash 首个测试调用停在用户权限审批，尚未执行。因此本记录不宣称 A15/A28 通过；干净 Windows 安装、Responses 视觉与剩余产物交互仍待真实证据。
+
+
+## 2026-10-07 新包审批信息观察（测试尚未执行）
+
+当前新 Session 的原生审批窗只展示 Bash / EXECUTE / mode_fallback，不展示实际 command。原 Luna 只读核实：permission request 的现有安全投影未携带 Bash arguments，Renderer 仅渲染 tool/action/reason；完整未执行 ToolCall 尚在 Core continuation 内存中，未提交到 transcript，timeline 文件为零条。不能由磁盘记录复原或猜测本次完整命令。总控已明确向用户说明信息缺口，请用户自行决定允许一次或拒绝；没有代点审批、绕过权限、执行测试命令或将未知执行结果写为通过。该观察作为验收限制保留，不擅自扩大冻结任务内容。
+
+
+## 2026-10-08 新包真实模型续验与原生产物交互
+
+昨日待审批调用后来实际执行并完成，不能继续将该 Run 写为尚未运行。总控今日确认应用原已关闭，通过原生 Explorer 打开最终新包，核实窗口进程来自本仓库 out/UthCode-win32-x64。独立 Session 08f013fe2dd14ad9a1a8ba0a22883fb5 的正式 transcript 首轮 Turn 80a0770a890a4a5a82d0e5b4d7ba8943（seq 1–123）native 元数据一致为 anthropic/messages/qwen3.7-flash；开始前总控实际选择并核实模型引用为 __uthcode_model_1。Run 后恢复为 __uthcode_model_3，不能用当前 metadata 倒推首轮模型。首轮 SDK/端点未持久化、未采集网络包，不宣称审查过其实际 SDK 请求。已有三协议独立视觉证据与缺失 Responses 条件继续分开记录。
+
+截图 SCREEN-6372 被真实模型正确识别为输入 -4/当前 -4/期望 0；需求 DOCX-7421 使用完整附件引用读取。首个绝对路径 ApplyPatch 被受控拒绝，随后相对 meter.py 新增 report 成功；后续 EditFile 修复原 bound。首个真实 pytest 进程 a936a0743612420bbaf3def8ec4af165（Bash 43/44、Process.read 55/56）exit 1，但已保留的读回不含计数；详细失败进程 7a826e6eb19640a2b2c9535a37e8651f（49/50、58/59）为 1 failed/2 passed、0.11s、exit 1。含 || echo 的外壳退出 0 不作为测试成功。修复后进程 78e38ebb0038431d9ed75b5a7f46bfc1（71/72、80/81）实际 3 passed、0 failed、0.02s、exit 0。原与 retry 的 test_meter.py 均 181 bytes，逐字节一致。没有再现 Session process runtime is closed。
+
+实际生成 result.txt 617 bytes、preview.png 15431 bytes/800×500，创建时间为2026-10-07 22:14:30；ViewImage 108/109 读取新图，ReadFile 111 读取新报告。摘要是脚本写入，不能替代正式 pytest ToolResult；三个原测试只覆盖 bound，不虚称覆盖新增 report。预览是 Pillow 合成画布，并非对原截图执行图像编辑。首次内联生成虽外壳 exit 0，但目标文件未出现；随后 WriteFile 临时生成脚本、显式 cd 后 Bash 执行生成成功，临时脚本已删除，失败记录保留。安全结构化证据为 D:/uthcode-audits/t11-closeout-20261007/native-retry-formal-evidence.json。
+
+总控今日原生双击 result.txt，在应用画布显示真实617字节报告；双击 preview.png 在100%预览显示当前输出0和FIXED；双击 executable artifact-probe.cmd，Explorer 只选中该29字节文件，没有打开终端或执行。正式 artifact:missing.txt 卡片双击后显示局部“文件引用无效，请重新选择文件”，工作区继续可用。javascript: 安全样例渲染为不可点击文本；未打开或执行 URI。与既有 Main/preload/chat 27 passed 定向证据及最终267项全量一致，可补勾 A24/T16，保持 Renderer 无任意 fs/shell。
+
+重启已恢复附件、正文和工具历史；原生 A→B→A 返回前后均90篇无障碍文章，用户行仅1条，两附件保留，23条选定文档/补丁/Bash/Process/ViewImage工具行数量及相对顺序完全一致。证据为 native-retry-navigation-20261008.json，以及 native-retry-report-open-20261008.png、native-retry-preview-open-20261008.png、native-retry-executable-locate-20261008.png、native-retry-missing-local-error-20261008.png。补充无工具链接请求真实完成，默认模型已恢复3。
+
+A28 的主要真实链路已经完成，但重启前未现场观察临时进程日志折叠；总控仅为该缺口请求单次重跑已有小测试，不改文件、不安装依赖。当前新增调用停在人工 Bash 审批，尚未执行或补勾 A28。A02 Responses、A10/A15 干净安装产物和 T19 整体验收仍未完成；不归档，不将安装包生成写成干净 Windows 实机通过。
+
+
+### 2026-10-08 三协议证据表述澄清（独立复审修正）
+
+上一追加段中的“三协议独立视觉证据”指三协议目标验收矩阵，并非三协议均已实测。当前有效真实证据仅覆盖原记录的 OpenAI compatible 与本轮 Anthropic messages；OpenAI Responses 尚无配置及真实入模证据，A02两处均保持未勾选。不修改历史记录，也不将当前配置快照冒充首轮 SDK 请求抓取。

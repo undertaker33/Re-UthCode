@@ -20,6 +20,11 @@ import type {
 } from "./state";
 import { nonEmptyText, numberText, positiveInteger, textValue } from "./text-normalization";
 
+/** Stable identity shared by a live and durable terminal failure projection. */
+export function terminalFailureTimelineId(turnId: string): string {
+  return `terminal-failure:${JSON.stringify(turnId)}`;
+}
+
 /** Convert an untrusted Desktop JSON value to a non-array record. */
 export function asRecord(value: unknown): Record<string, JsonValue> | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
@@ -393,6 +398,8 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
           ? kind
           : "status";
       const sequence = typeof source.sequence === "number" ? source.sequence : index + 1;
+      const runId = nonEmptyText(source.run_id);
+      const turnId = nonEmptyText(source.turn_id);
       const attachments = normalizeAttachments(source.attachments);
       const statusValue = source.status;
       const terminalStatus: TimelineStatus = statusValue === "failed" || statusValue === "error" || statusValue === "rejected"
@@ -401,14 +408,16 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
           ? "cancelled"
           : "completed";
       return {
-        id: nonEmptyText(source.record_id)
+        id: failedTurn && turnId
+          ? terminalFailureTimelineId(turnId)
+          : nonEmptyText(source.record_id)
           ?? `replay:${textValue(source.session_id)}:${sequence}:${normalizedKind}:${textValue(source.tool_call_id)}`,
         kind: normalizedKind,
         text: failedTurn
           ? `Turn failed: ${textValue(source.failure_reason) || textValue(source.termination_reason) || "runtime error"}`
           : textValue(source.text),
-        runId: nonEmptyText(source.run_id) ?? undefined,
-        turnId: nonEmptyText(source.turn_id) ?? undefined,
+        runId: runId ?? undefined,
+        turnId: turnId ?? undefined,
         messageId: nonEmptyText(source.message_id) ?? undefined,
         iteration: positiveInteger(source.iteration) ?? undefined,
         toolCallId: nonEmptyText(source.tool_call_id) ?? undefined,

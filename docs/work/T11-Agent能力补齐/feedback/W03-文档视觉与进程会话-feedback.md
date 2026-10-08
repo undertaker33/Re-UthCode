@@ -181,3 +181,66 @@ Luna（max）完成 W03 首轮实施、总控 PDF 私有宿主预审返工，以
 ### 2026-10-04 当前工作区文档工具回归
 
 总控使用既有 re-uthcode Conda Python 实跑 `python -m pytest tests/test_builtin_file_tools.py tests/test_document_tools.py tests/test_image_tools.py tests/test_project_instructions.py -q`：41 passed in 4.44s，退出码 0。`python -m pytest tests/test_architecture_boundaries.py -q`：23 passed in 9.87s，退出码 0。此记录确认当前源码定向回归；尚未构建本轮新 Windows 包，不将旧包或前序实机证据写成本轮新包通过。
+
+### Windows / POSIX PTY 收尾验收（2026-10-07）
+
+原 GPT-6 Luna / max 实施，独立 GPT-6.1 Sol / medium 复审 PASS。真实 Linux PTY 首轮暴露 `PtyProcess.write` 的 bytes 接口被传入 str；最小修复仅将 POSIX 交互输入编码为 UTF-8、EOF 使用字节，Windows winpty 继续接收 string，pipe 路径未改变。新增测试验证原生 isatty、24×80→40×100 resize、中文交互输入、EOF、尾读不重放、PTY 单流以及取消后 reader task 和进程退出；既有 pipe stderr 与 running/增量/退出码覆盖继续保留。
+
+最终 Windows 命令为 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_process_sessions.py tests/test_builtin_process_tool.py tests/test_process_application_lifecycle.py -q`：165 passed、1 skipped，19.44s，exit 0。Linux 使用 Docker Linux engine 29.2.1、官方 python:3.12-slim 与正常 `--init`，按当前 pyproject 安装依赖，仅作外部 POSIX 验收，不替换宿主 Conda 环境；容器中命令为 `python -m pytest -p no:cacheprovider -q tests/test_process_sessions.py tests/test_builtin_process_tool.py tests/test_process_application_lifecycle.py`：163 passed、3 skipped，14.81s（外部计时 15.662s），exit 0。跳过的是平台专属用例，不是遗漏失败结果。
+
+首轮 POSIX bytes 失败及普通 PID 1 容器的 157 passed / 7 failed / 2 skipped 均保留。五项回收失败在同镜像 `--init` 下单独 5 passed / 6.46s，证明该组差异来自孤儿进程回收环境；未据此改动产品回收或 unknown 语义。两项分类 fixture 分别含 Windows cmd.exe 引用方式和在 POSIX 内层语法无效的嵌套命令；仅调整平台限定、以逐层 shlex.quote 保留四层 shell 的根目录删除拒绝覆盖，未改 classifier。证据位于 `D:/uthcode-audits/t11-closeout-20261007/process/`，包含失败原始日志、平台诊断及最终整组日志。
+
+A12 两处引用与 T08 完成边界具备证据，可勾选。A10、A15 的安装产物与原生 Desktop 人工验证没有因此完成；本轮尚未生成新 Windows 包，不将旧包写成本轮最终产物。
+
+### 真实抓取 PDF 的 Windows 编码修复（2026-10-07）
+
+W04 的正式 WebFetch 已实际下载 W3C `handout2007a.pdf`（HTTP 200、128572 bytes、Session 固定副本），随后 ReadDocument 返回受控 `PDF reader worker failed / unavailable`。原 Luna 本地使用同一副本和正式 pdf_worker_command 复现子进程 returncode 1 / UnicodeEncodeError；pypdfium2 可导入，PDF 不是损坏或依赖缺失。父进程固定按 UTF-8 解码，但子进程用继承的 Windows 文本编码写 stdout，无法表示部分 PDF 字符。
+
+最小修复只将 PDF worker 响应与 newline 显式编码为 UTF-8 bytes 写入 stdout.buffer；父协议、字段、取消和输出上限不变。新增回归使用实际含 café 的 WinAnsi PDF，在子进程强制 PYTHONIOENCODING=ascii 后通过完整 ReadDocument→子进程链读取；旧代码为 1 failed / 4 deselected，修后同定向命令为 1 passed / 4 deselected，均 0.79s（Worker 实际终端报告，没有另存日志，不虚称 Reviewer 独立复跑）。独立 Sol / medium 复审 PASS。Worker 文档/图片/架构组合 31 passed / 8.57s；总控最终同命令 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_document_tools.py tests/test_image_tools.py tests/test_architecture_boundaries.py -q`：31 passed / 7.72s、exit 0。
+
+含此补丁的标准 `npm run build:runtime` 已由总控串行重建，exit 0、76.989s；ready/status/shutdown JSONL 与 prompt asset smoke 通过，输出为 `desktop/.runtime/uthcode-runtime/`。此前 74.671s 的 Runtime 构建不含该 PDF 修复，保留为前序证据；两者均不是本轮新的 Electron package/make 或干净 Windows 安装验收，A10/A15 不补勾。W04 同 Session 仅本地续读的结果另行追加，不重复联网获取该 PDF。
+
+### 最终 Windows 标准打包（2026-10-07，续跑）
+
+用户继续后，总控通过恢复的原生 Computer Use 确认旧测试窗口没有活动 Turn，正常关闭窗口并确认旧 UthCode 进程退出，随后串行执行标准构建。第一次 `npm run package` 使用与测试相同的外部 512 MiB V8 heap 保护，Webpack 编译阶段报告 `Reached heap limit / JavaScript heap out of memory`：exit 134、129.169s、进程树 private memory 峰值 869298176 bytes；不是成功打包，也不是正常 Agent Runtime 持续泄漏的证据。保留 `package-final.*` 原始日志。
+
+只在仓库外监测脚本中将本次构建的 V8 heap 上限设为 2048 MiB，仍限制进程树 4 GiB、900 秒和输出 16 MiB，未修改项目配置或扩大测试堆上限。再次标准 `npm run package`：exit 0、131.393s、private memory 峰值 1910669312 bytes；随后标准 `npm run make`：exit 0、273.731s、峰值 2193756160 bytes。两次均包含当前最终 Python 输入的 PyInstaller 构建，没有与 npm test 或另一 Runtime 构建并行。
+
+最终应用为 `D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/UthCode.exe`，安装入口为 `D:/project/Re-UthCode/desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`（204669952 bytes），同目录含 RELEASES 与完整 nupkg。证据为 `D:/uthcode-audits/t11-closeout-20261007/package-final-2g.*` 和 `make-final-2g.*`。安装包生成不等于已安装或人工通过：原生接口两次将明确新应用路径解析到登记的 `D:/project/UthCode`，刷新没有运行窗口，已请求用户手动打开最终应用；本记录时 A10/A15 仍未勾选。
+
+
+## 2026-10-07 原生新包续验：进程入口失败，保留待修复
+
+总控通过原生 Explorer 打开本仓库 `desktop/out/UthCode-win32-x64/UthCode.exe`，窗口身份确认来自 Re-UthCode 产物；此前直接启动误命中另一仓库的记录保留。新 Session `a812fa5fea9c47c9af45b8b5357ab7b5` 已实际提交测试界面截图和需求 DOCX，Qwen compatible 正确分析截图，并以正式附件引用完成 ReadDocument 和 Glob，随后 Provider 请求失败。已保存的安全失败投影只给出 provider_request，不能据此进一步判定 SDK/HTTP 根因。
+
+在同一 Session 切换为已有 Anthropic Qwen 配置继续后，Bash 多次返回 `failed to start command: Error: Session process runtime is closed`；用户亲自处理权限审批后仍未获得测试执行结果。ApplyPatch 实际新增报告函数、修复 fixture 函数，WriteFile 生成 result.txt，ViewImage 查看已有旧 preview.png；pytest 未实际运行，新预览图未生成。模型最终明确标记测试未运行，不能用手工计算或预期 3/3 替代正式测试结果。该轮不满足 A15/A28，进程生命周期 finding 已交原 Luna 只读定位，尚未宣称修复。
+
+
+## 2026-10-07 原生 finding 根因确认与审核进展
+
+Renderer 终态失败身份补修已由原 Sol 独立复审 PASS，无 finding。此前“待审核”段记录的是当时进度；新包重建和原生复验仍待完成，不能由源码审核替代。
+
+原 Luna 只读定位确认 Bash 拒绝来自 Session runtime 生命周期：Bridge clone 原样复用 RuntimeContext 中的 ProcessSessionManager；回收闲置旧 Application 时 shutdown_session 将 Session 永久标记关闭，之后冷恢复又取得同一 manager，start 命中 closed-session guard。Run 终态仅 cleanup 本 Turn 进程，模型切换不关闭 manager，因此不能归因模型能力或切换 Provider。最小补修限定为每个 Session Application clone 由工厂创建自身 manager，并补真实 A→B→回收 A→冷恢复 A→正式 Bash 的回归；实施与独立复审尚在进行。
+
+总控原生右键 result.txt 卡片选择“定位”，Explorer 实际选中本轮生成的 result.txt；应用内文本画布打开与定位已观察到。缺失文件、可执行文件和恶意 URI 尚未复验，因此 A24/T16 不补勾。默认模型已恢复，原生正常关闭验收应用后确认本仓库包及其 Runtime 进程均已退出。另建 `D:/uthcode-audits/t11-closeout-20261007/desktop-fixture-retry`，保留旧失败项目，原测试逐字节复制，复验输入不提供 result.txt 或 preview.png，避免旧交付物被误用。
+
+
+## 2026-10-07 Session 冷恢复进程补修：源码与定向复审通过
+
+原 Luna 在 `interfaces/desktop/bridge.py` 的 Session Application clone 复制 RuntimeContext 时仅重置 process_manager，由既有工厂创建新实例，保留目标工作目录及共享持久服务。存活 runtime 的导航、模型和配置刷新继续保留原 manager；未放宽 shutdown_session 的关闭语义，未重放旧进程或输入。真实 Application/Bridge 回归创建 A、创建 B 触发 A 回收，确认原 A manager 仍关闭，再冷恢复 A，经正式 Run→Bash 启动短命 Python 命令并断言 exited/0 和输出标记；三个 manager 独立，finally 清理。
+
+实际命令：`conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py::test_cold_resumed_session_gets_a_fresh_process_manager_and_runs_bash`，1 passed，1.69s；`conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py tests/test_process_application_lifecycle.py tests/test_process_sessions.py tests/test_w04_review_fixes.py tests/test_architecture_boundaries.py`，124 passed、1 skipped，20.67s，exit 0。首次辅助类位置错误导致 SyntaxError，随后已修正；失败不作为通过证据。原 Sol 独立审核两文件及 GUI/State 事实新增段 PASS，无 finding。完整 Desktop 和修复后的新包/原生复验仍在进行。
+
+
+## 2026-10-07 两项 Session 补修后的完整 Desktop 与标准构建
+
+总控在两项补修均获独立 Sol 审核 PASS 后，串行执行完整 Desktop、标准 package 和 make；实际输入为 HEAD 99b33a3 加三项 Renderer 文件及 Bridge/回归两文件的已审核改动。`npm test`：267 passed、0 failed、0 cancelled、0 skipped，Node 计时 94539.2011ms，外部计时 95.785s、exit 0。`npm run package`：130.017s、exit 0；`npm run make`：240.795s、exit 0。构建日志确认 bundled Runtime ready/status/shutdown JSONL 与 importlib.resources prompt asset smoke 通过。没有与全量测试并行构建；测试仍使用外部 512 MiB V8 heap，构建使用外部 2048 MiB heap，进程树限额 4 GiB，未修改项目配置。
+
+当前应用为 `D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/UthCode.exe`（244440576 bytes，21:09:00.847）；安装入口为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`（204669952 bytes，21:10:55.941）。精确日志与状态为 `D:/uthcode-audits/t11-closeout-20261007/desktop-full-after-session-fixes.*`、`package-after-session-fixes-2g.*`、`make-after-session-fixes-2g.*`。此前五项修复包与失败构建日志保留，不能替代本次两项 Session 补修的产物。
+
+总控原生打开本次新应用，确认实际窗口进程路径；原失败 Session 重启加载后只显示一条失败提示，附件与工具历史仍存在。另在独立 retry fixture 新建 A、建立 B 回收 A、返回 A 冷恢复，再通过真实 Qwen Anthropic 配置提交截图和 DOCX。截图分析、正式附件 ReadDocument 和报告 ApplyPatch 已成功，Bash 首个测试调用停在用户权限审批，尚未执行。因此本记录不宣称 A15/A28 通过；干净 Windows 安装、Responses 视觉与剩余产物交互仍待真实证据。
+
+
+## 2026-10-08 冷恢复补修的新包实际执行证据
+
+最终新包独立 Session 的 Bash 已实际启动 pytest，先 exit 1（详细失败1 failed/2 passed、0.11s），修复 fixture 后 exit 0（3 passed、0.02s），未再现 runtime is closed。测试逐字节未变，重启与切换返回保留附件及工具顺序。模型/Turn归属、原始失败与正式结果对应、生成文件及总控原生观察集中记录于 W06“2026-10-08 新包真实模型续验与原生产物交互”，外部 native-retry-formal-evidence.json 可核对。A10/A15 的干净安装验收没有因此完成。

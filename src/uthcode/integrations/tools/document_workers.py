@@ -256,8 +256,10 @@ def pdf_worker_main() -> None:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-    sys.stdout.write(encoded_response + "\n")
-    sys.stdout.flush()
+    # The parent reads this protocol as UTF-8 bytes.  A Windows child can
+    # otherwise inherit a legacy text encoding that cannot represent PDF text.
+    sys.stdout.buffer.write((encoded_response + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 def _encode_worker_response(

@@ -124,3 +124,23 @@ Terra 第二轮指出的 3 项运行时闭环已经逐项补齐；本节只追�
 ## 总控审核收口
 
 Luna（max）完成 W04 实施与两轮返工；Terra（high）第三轮审核 PASS，无剩余实质 finding。首轮八项权限/限量/脱敏/配置/Windows 冲突问题与后续后台配置同步、JSON key 脱敏、活进程旧 Secret 生命周期均关闭。Reviewer 最终复跑 W04 因果链 6 passed，以及进程/会话/历史/Desktop 组合 113 passed；前轮工具与重定向证据继续有效。Worker 最终受影响回归 107 passed、82 passed，架构 23 passed，compileall、UTF-8、冻结和 diff 检查通过。Desktop 229 passed 为首轮全量，后续修复按受影响 Python/Bridge 生命周期定向验证，没有宣称最终全量重跑。A18/T19 和既有真实 Provider、POSIX、安装产物人工验收仍保留未完成，整包不标记完成、不归档。
+
+### 行尾保留与正式搜索参数接缝（2026-10-07）
+
+原 GPT-6 Luna / max 实施，GPT-6.1 Sol / medium 独立复审 PASS。`EditFile` 在归一化文本视图唯一匹配旧文本，只映射匹配区间两个边界，再替换原始字节区间；保留区间外 LF、CRLF、CR 和混合换行，替换文本按匹配区间→文件→平台选择样式，不产生 CRCRLF。不改变已读取版本与写权限语义。Reviewer 指出早期逐字符偏移数组额外内存过大，该临时方案已移除并复审，不作为最终实现。四类行尾的字节回归包含在 `tests/test_builtin_file_tools.py`：27 passed，1.12s。
+
+用户已配置 Tavily，安全检查仅记录 enabled/api_key_configured，不输出秘密。正式 Application 驱动首个启动因事件类型导入路径错误 exit 1，尚未创建 Application 或发请求；修正外部驱动导入并通过 import 检查后，首轮正式 ToolCall 的 `domains` 又因 Core JsonPayload 将数组归一为 FrozenList 被工具的 list/tuple 检查拒绝。两次 invalid_input 都发生在 HTTP 前，不记搜索用量。产品最小修复接受排除 str/bytes 的 Sequence，仍校验数量和字符串成员，HTTP 投影为 list；回归直接使用真实 ToolCallPart.arguments，未放宽端点或权限。
+
+Web fixture 增补取消后 AsyncClient 已关闭的观察和空 root + script 动态页受控 unsupported，保留重定向逐跳授权、超限、登录页及取消覆盖。Worker 最终 WebTools 8 passed / 1.58s、builtin search 17 passed / 1.10s。总控执行 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_builtin_file_tools.py tests/test_web_tools.py tests/test_application_tools.py tests/test_application_runs.py tests/test_architecture_boundaries.py -q`：116 passed，11.79s，exit 0。源码修复已通过复审；真实 A18 链路结果另行追加，不把这些 fixture 或受控 Turn 完成冒充联网闭环。
+
+### A18 真实 Tavily、静态页与 PDF 闭环（2026-10-07）
+
+本节经原 Luna / max 实施、Sol / medium 独立审核真实报告 PASS。正式配置来自用户级 search，固定端点 `https://api.tavily.com/search`、basic、include_answer=false，httpx 0.28.1；驱动使用 ScriptedProvider 发正式 Application ToolCall、ToolExecutor 与 typed PermissionApprovalResponse.ONCE，不调用外部模型、不直接调用工具 execute 或替代 HTTP 客户端、不写全局授权。真实网络服务不是 Mock。失败记录与后续证据分目录保留，没有自动重试或查询刷到成功。
+
+修复 FrozenList 后的首轮 `application-run-20261007-seqfix`：IANA 查询受控 network_error、usage 不可观测；W3C 查询成功，5 个真实 URL、credits=1，但没有可用 PDF URL，未抓取，exit 1 / partial_or_failed。随后预先规划不同方案：复用该轮返回的 W3C 静态 URL，只新增一次针对 W3C PDF 的查询，按实际返回结果选择 `https://www.w3.org/WAI/flyer/handout2007a.pdf`，不重复 IANA 请求。
+
+后续正式网络命令为 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe D:/uthcode-audits/t11-closeout-20261007/web-tools/run_tavily_application_audit.py --workdir D:/project/Re-UthCode --output D:/uthcode-audits/t11-closeout-20261007/web-tools/application-run-20261007-followup`。真实新增查询成功，5 个 URL、credits=1；WebFetch [W3C Reflow](https://www.w3.org/WAI/WCAG21/Understanding/reflow.html) 与 [W3C PDF flyer](https://www.w3.org/WAI/flyer/handout2007a.pdf) 均 HTTP 200，PDF MIME application/pdf、Session 副本 128572 bytes。静态正文 31113 bytes 被正式 ToolResult ref 外置；初版审计脚本直接解析占位文本导致摘要 source/content 为空，不是产品缺少正文。该轮 PDF 后续解析遇到 W03 已记录的 Windows UnicodeEncodeError，故该次 exit 1 / partial_or_failed；未改写为整轮通过。两次成功搜索各报告 1 credit，失败查询用量未知，不宣称完整累计消费恰为 2。
+
+PDF worker 修复与独立复审后，仅恢复同 Session `e4541d63d1b244d3aef2704a22514af8`，不重搜、不重新下载：`C:/Users/93445/miniconda3/envs/re-uthcode/python.exe D:/uthcode-audits/t11-closeout-20261007/web-tools/run_tavily_session_readback.py --run-authorized`，exit 0 / passed，1.245s，网络请求与外部模型请求均 0。正式 ToolResultRead 读取静态正文 offset 0→4096 / total 31113，含 HTTP 200 来源与 Reflow 标题；正式 ReadDocument 使用已下载的完整附件引用，第一页 1947 字符、SourcePart.page=1，两条 ToolFinished 均 finished/is_error=false。没有旁路读取保存的正文文件冒充工具结果。
+
+真实网络及本地续读报告分别在 `D:/uthcode-audits/t11-closeout-20261007/web-tools/application-run-20261007-followup/application-audit.json` 与 `application-run-20261007-local-readback/local-readback.json`，初始 invalid_input、IANA network_error 与 PDF 编码失败记录保留。结合当前 8 项 Web 测试中的重定向、超限、登录/动态空页限制与取消关闭客户端覆盖，A18 的两处引用可以补勾。该结论是正式工具真实搜索/抓取/正文链，不代表任意模型都能自主正确选用搜索工具，也不表示 T11 整包完成。

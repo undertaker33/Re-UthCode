@@ -25,6 +25,10 @@
 
 启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 
+### `EditFile`
+
+`EditFile` 要求先读取文件并确认读取后的版本没有变化，`old_string` 必须非空且唯一匹配。匹配沿用文本读取的换行归一化视图；写回只替换命中的原始文本区间，未命中的 LF、CRLF 或 CR 换行保持原样。替换文本的换行采用命中区间的首个换行样式，没有时使用原文件的首个样式。文件没有换行时使用当前平台样式，避免 Windows 局部编辑使整份文件产生行尾差异。
+
 ### `ReadDocument`
 
 `ReadDocument` 每次调用必须只提供 `path` 或 `asset_ref` 之一。路径读取仍经过既有权限判断，包含已获准的外部路径；附件读取必须逐字复制当前 Session 提供的完整 `asset_ref`，包括 `attachment:` 前缀及 Session/ref 部分。不要用附件显示文件名替代 `asset_ref`，也不要猜测、补全或修补引用。工具按格式返回带定位的结构化内容：PDF 按页，DOCX 按顺序段落/表格，XLSX 按 sheet/range，PPTX 按 slide/shape/table。结果有页、字符和字节预算；损坏、加密、不支持格式、超限和取消都会返回受控错误。XLSX 的公式文本与已有缓存值分别保留，工具不执行公式重算。该工具只提取文档文字和结构，不返回文档内图片像素。PDFium 的文本解析在短生命周期私有 PDF 宿主内执行；取消会终止该宿主，不依赖等待仍在 native 调用中的线程。开发运行时直接启动 `uthcode.integrations.pdf_worker` 私有模块，frozen 运行时使用打包的 `--uthcode-pdf-worker` 入口。
@@ -51,6 +55,8 @@
 ### `Bash` 与 `Process`
 
 `Bash` 是唯一的进程启动入口。`yield_time_ms` 只控制本次 ToolCall 等待多久；`timeout_seconds` 是可选的进程总寿命上限，默认没有总寿命。短等待可返回仍在运行的 `process_id`，之后用 `Process` 的 `list`/`read` 获取有界增量和退出码。pipe 模式继续区分 stdout/stderr，PTY 模式提供单一 terminal 流及原生 stdin、EOF 和 resize。
+
+`Process write` 接受文字输入，在 POSIX PTY 适配边界编码为 UTF-8 字节，Windows PTY 使用原生文本接口；EOF 也按对应平台的底层接口送出。输入只发送本次提供的内容，不在等待、续读或恢复时自动重放。
 
 进程句柄绑定当前 Application/Session 和启动 Turn。成功 Turn 后服务进程继续存活，新的 Turn 可以续读或显式停止；取消、失败和异常只清理本 Turn 新建的进程，Session 关闭才清理全部进程。每个 Session 默认最多保留 32 个正常终态和 128 个过期事实，单进程 UTF-8 输出环默认 2 MiB；淘汰会保留 `expired`、最早游标和原因，避免短命令长期累积。`Process read` 使用单调游标，`wait_ms` 只能在 50—60000 毫秒内取值，默认 1000 毫秒；运行中无新输出时实际等待到新输出、终态或超时，不能用 `0` 绕过有界等待，取消会及时解除等待。输出环超出容量时报告最早游标和过期状态；输出事件仍由 Application 统一做跨 chunk Secret 脱敏后路由到 Desktop，不能把后台日志当作新的 Turn 或 History 内容。stdin 是独立的执行输入授权，不能因启动命令已获批而自动获得后续输入权限。
 

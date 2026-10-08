@@ -22,6 +22,7 @@ import {
   runIdOf,
   runtimeStateFromProjection,
   sessionRuntimeFromSource,
+  terminalFailureTimelineId,
 } from "./state-normalization";
 import { nonEmptyText, numberText, positiveInteger, textValue } from "./text-normalization";
 import {
@@ -477,11 +478,24 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
   };
 }
 
-function appendStatus(state: RendererState, text: string, status: TimelineStatus = "info"): RendererState {
-  const id = `status:${state.nextStatusId}`;
+function appendStatus(
+  state: RendererState,
+  text: string,
+  status: TimelineStatus = "info",
+  identity?: Pick<TimelineEntry, "id" | "runId" | "turnId">,
+): RendererState {
+  if (identity && state.timeline.some((entry) => entry.id === identity.id)) return state;
+  const id = identity?.id ?? `status:${state.nextStatusId}`;
   return {
     ...state,
-    timeline: [...state.timeline, { id, kind: "status", text, status }],
+    timeline: [...state.timeline, {
+      id,
+      kind: "status",
+      text,
+      status,
+      ...(identity?.runId ? { runId: identity.runId } : {}),
+      ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+    }],
     nextStatusId: state.nextStatusId + 1,
   };
 }
@@ -1275,7 +1289,10 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const runId = eventRunId ?? textValue(payload.run_id);
     const next = settleTerminalTurn(state, runId, turnId, failed ? "failed" : "cancelled");
     const reason = failed ? `Turn failed: ${textValue(payload.failure_reason) || textValue(payload.termination_reason) || "runtime error"}` : "Turn cancelled";
-    return appendStatus({ ...next, pendingSteeringMessageIds: pendingSteeringWithoutTurn(state, runId, turnId), activeTurn: true, terminalStatusPending: true, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled");
+    const terminalFailureIdentity = failed && turnId
+      ? { id: terminalFailureTimelineId(turnId), ...(eventRunId ? { runId: eventRunId } : {}), turnId }
+      : undefined;
+    return appendStatus({ ...next, pendingSteeringMessageIds: pendingSteeringWithoutTurn(state, runId, turnId), activeTurn: true, terminalStatusPending: true, turnStatus: failed ? "failed" : "cancelled", pendingInteraction: null, run: { ...(next.run ?? {}), run_id: runId, turn_id: turnId, status: failed ? "failed" : "cancelled", termination_reason: textValue(payload.termination_reason) || (failed ? "internal_error" : "user_cancelled") } }, reason, failed ? "failed" : "cancelled", terminalFailureIdentity);
   }
   return state;
 }

@@ -104,3 +104,13 @@ Terra 第 3 轮指出普通进度空白丢失：进度路径复用 `_single_line
 Terra（high）共完成四轮审核：首轮发现进度主链、非文本物化、失败元数据及文档缺口；第二轮发现长 Secret 泄漏；第三轮确认长 Secret 修复并发现分块空白丢失；第四轮确认全部修复，无新增 finding，四项进度回归为 4 passed。上述轮次为最终准确对应，前文轮次误述保留为历史。原 Luna（max）Worker 完成三轮返工后停止修改。
 
 总控检查：六份改动文档 UTF-8/fence 通过，十份冻结文件检查通过，git diff --check 通过。全量 1524 passed、3 skipped 为首版实现证据；返工后采用所列受影响定向证据，不将旧全量结果当作最终版本重跑结果。真实 Provider A02 依用户“做完我配了再测”保持未完成；W01 工程审核通过，不表示 T11 整包完成。
+
+### Anthropic 用户图与工具图真实入模（2026-10-07）
+
+原 GPT-6 Luna / max 使用正式 Application、AttachmentService 与官方 Anthropic SDK 执行两条真实 Run；模型 qwen3.7-flash，协议 anthropic，用户级端点 `https://dashscope.aliyuncs.com/apps/anthropic`，实际请求路径 `/apps/anthropic/v1/messages`，Anthropic SDK 0.120.2 / httpx 0.28.1 / Windows 11 / Python 3.12.13。命令为 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe D:/uthcode-audits/t11-closeout-20261007/vision/run_anthropic_qwen_live.py`，exit 0。审计 fixture 是两张不同的合成校验 PNG，经真实网络送入模型，不是 Mock 或仅返回路径；模型文件名不含预期标识。
+
+用户图通过正式附件输入，模型回答三角形与 PINEAPPLE-17；工具图通过一次真实 ViewImage 的完整 Session 引用读取，模型回答 COBALT-42 与青色形状。两 Run completed/final_answer，三次真实 messages POST 均 HTTP 200（用户图一请求，工具图含工具结果回填两请求）。只读 HTTP hook 记录序列化 image block 的类型、MIME、字节数和 SHA 匹配，确认用户/工具图片真实进入相应 SDK 请求；不保存 base64、秘密或凭据 header 值。附带元数据 GET 404 不阻断 Messages，既有可选 models 元数据兼容逻辑生效。
+
+流程偏差明确保留：此审计驱动在调用前只做语法检查，未按总控要求先独立审查；运行结束后才由 GPT-6.1 Sol / medium 补审。Reviewer 发现用于额外检查返回文本的 `api_key.reveal()` 位于 SDK 构造边界外；原审计响应及日志经核实只有合成图答案，没有凭据泄露。该额外取值已从外部驱动移除，后续摘要只记录预期内容布尔值，修订脚本语法检查和复审 PASS；没有重发模型请求，也没有将修订脚本称作重新实跑通过。原安全响应、请求摘要与 exit 记录保留在 `D:/uthcode-audits/t11-closeout-20261007/vision/`。
+
+本轮补齐 Anthropic 真实视觉部分，既有 openai_compat 图片证据需按有效性复用；安全配置检查未发现 Responses profile，用户尚未提供对应可信视觉配置。因此 A02 两处三协议整体框保持未勾，不把两种协议冒充三种。

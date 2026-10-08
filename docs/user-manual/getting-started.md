@@ -98,3 +98,5 @@ npm run make -- --platform=win32 --arch=x64
 安装包输出在 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`。当前构建未签名，仅用于 development/release-candidate 验收；首次配置仍按上面的用户级配置说明完成。
 
 > UthCode 的 `Bash` 工具不是 OS Sandbox，命令以当前操作系统用户权限执行。
+
+代码修改后的测试状态以实际执行结果为准。完成说明应区分已修改、尚未运行测试、测试失败和测试通过，并提供已执行的命令与结果；写好了测试代码不等于测试已经通过。工具不可用或需要授权时，未执行的检查会保持待验证。局部 `EditFile` 编辑会保留未修改部分的原始换行，减少 Windows 环境下无关的整文件差异。

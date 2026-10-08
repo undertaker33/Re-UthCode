@@ -324,3 +324,34 @@ Renderer 对该精确失败状态补充中英文可操作说明，使用聊天�
 GPT-6.1 Sol / medium 独立只读核对 T15 完成边界，确认可复用本文件的有效历史证据：最终收口的配置组合 347 passed in 21.71s、ProcessSessions 与 W04 reload 10 passed in 6.25s、Desktop 设置相关 127 passed 与 typecheck，以及后续项目只收紧、configured/effective/source 定向与 Terra 最终审核。对应测试覆盖用户/项目秘密作用域和凭据/端点重定向拒绝、项目数值限制不可放宽、活动请求保留原模型快照、settings.save 活动 Turn 拒绝、当前及后台下一安全边界 reload、存活进程 manager/process_id/running 不变。
 
 从 W05 收口提交 998b000 到本轮，相关配置和 Settings 门禁没有变化；本轮消息身份与 Renderer 修复不影响这些证据。当前 Bridge 在写配置及 reload 前统一拒绝当前、后台活动 Turn 和 Compact，因此模型/端点不可半途切换；这是现有门禁与模型快照测试共同支撑的结论，不虚称新增单独端点实跑。未重复执行这些历史测试。总控仅将冻结 Checklist 的 T15 完成边界从未勾选改为完成，正文保持原样。T14 人工输入发生在异常怀疑/纠偏之后的精确反例证据仍不充分；A24 与 T16 的原生产物交互仍待验证。
+
+### T14 精确反例与验证表述补齐（2026-10-07）
+
+原 GPT-6 Luna / max 补入真实 Core Loop 的 AskUser 回答与 steering request/apply 组合：先发生三次 premature final 并实际收到 CORRECT，再接受用户输入、继续两次 premature final、最终完成，断言纠偏反馈已进入后续 Provider 请求。不是直接调用 detector reset 的替代测试。独立 GPT-6.1 Sol / medium 复审 PASS；没有修改 Core 控制机制、终态或固定轮数门禁。
+
+Worker 定向 `python -m pytest tests/test_agent_loop.py -k 't14_' -q`：10 passed / 65 deselected，0.83s，包含 200 个变化轮次、失败/短周期/final 阻断正例及编辑重测、等待、真实用户输入反例。总控最终 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_agent_loop.py tests/test_agent_policy.py tests/test_project_instructions.py -q`：90 passed，3.40s，exit 0；既有取消与 runaway_detected 分离覆盖有效。首次误用 Checklist 中计划新增但不存在的 `tests/test_runaway_detection.py` 导致 no tests ran / exit 1，纠正为上述实际路径后才获得通过结果，未把未执行算作通过。
+
+长期 coding_agent prompt 增补验证状态表述：区分修改、成功、失败与未运行，只有对当前代码/上下文仍有效的真实命令和成功结果才能写为通过，允许复用有效历史证据。没有引入自然语言正确性裁判，也不将 Tool 或 Turn completed 自动当作测试通过。Reviewer 要求修正“仅限本次”措辞并删除只复述新增文案的测试，两项均已关闭；既有真实 prompt 加载/顺序回归保留。用户手册、当前事实、Tools 与核心设计同步。
+
+T14 完成边界可补勾；A24/T16 的人工打开、定位、预览和恶意 URI 原生操作仍未验证。自动 Main/preload/chat 组合本轮另有 27 passed（4877.9586ms、exit 0），不能代替人工操作。
+
+
+## 2026-10-07 终态失败提示合并补修
+
+原 Luna 修改 `state.ts`、`state-normalization.ts` 和既有 renderer-state 测试。真实 turn_failed 与 durable failure replay 使用非空 turn_id 的专用稳定身份；当前历史 DTO 无 run_id，不扩大合同。缺 Turn 身份时保留各自记录；不同 Turn 的同类失败、普通状态、reasoning 和后续实时内容不合并、不删除。回归覆盖 live→history→切离/返回→重叠分页、history→late live、不同 Turn、缺身份与普通状态保留。
+
+在 desktop 工作目录、测试进程 V8 堆上限 512 MiB 下，实际命令 `node --import tsx --test --test-isolation=none --test-name-pattern 'durable failure replay|live terminal failures|terminal failure identity' tests/renderer-state.test.ts`：3 passed、0 failed，0.81s，exit 0；完整同文件命令去除筛选：57 passed、0 failed，0.38s，exit 0；`npm run typecheck -- --pretty false`：exit 0，5.65s。日志位于 TEMP 的 renderer-terminal-failure-identity.test.log、renderer-state-terminal-failure-full.test.log、renderer-terminal-failure-typecheck.log。原 Sol 独立复审 PASS 无 finding；完整 Desktop、新包构建和原生切换/重启复验待后续结果，未用旧包冒充补修通过。
+
+
+## 2026-10-07 两项 Session 补修后的完整 Desktop 与标准构建
+
+总控在两项补修均获独立 Sol 审核 PASS 后，串行执行完整 Desktop、标准 package 和 make；实际输入为 HEAD 99b33a3 加三项 Renderer 文件及 Bridge/回归两文件的已审核改动。`npm test`：267 passed、0 failed、0 cancelled、0 skipped，Node 计时 94539.2011ms，外部计时 95.785s、exit 0。`npm run package`：130.017s、exit 0；`npm run make`：240.795s、exit 0。构建日志确认 bundled Runtime ready/status/shutdown JSONL 与 importlib.resources prompt asset smoke 通过。没有与全量测试并行构建；测试仍使用外部 512 MiB V8 heap，构建使用外部 2048 MiB heap，进程树限额 4 GiB，未修改项目配置。
+
+当前应用为 `D:/project/Re-UthCode/desktop/out/UthCode-win32-x64/UthCode.exe`（244440576 bytes，21:09:00.847）；安装入口为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`（204669952 bytes，21:10:55.941）。精确日志与状态为 `D:/uthcode-audits/t11-closeout-20261007/desktop-full-after-session-fixes.*`、`package-after-session-fixes-2g.*`、`make-after-session-fixes-2g.*`。此前五项修复包与失败构建日志保留，不能替代本次两项 Session 补修的产物。
+
+总控原生打开本次新应用，确认实际窗口进程路径；原失败 Session 重启加载后只显示一条失败提示，附件与工具历史仍存在。另在独立 retry fixture 新建 A、建立 B 回收 A、返回 A 冷恢复，再通过真实 Qwen Anthropic 配置提交截图和 DOCX。截图分析、正式附件 ReadDocument 和报告 ApplyPatch 已成功，Bash 首个测试调用停在用户权限审批，尚未执行。因此本记录不宣称 A15/A28 通过；干净 Windows 安装、Responses 视觉与剩余产物交互仍待真实证据。
+
+
+## 2026-10-08 A24/T16 原生补验
+
+总控亲自使用最终新包，双击真实生成的 result.txt 在画布打开；PNG可预览；可执行 artifact-probe.cmd 默认仅由 Explorer 定位并选中；缺失 artifact:missing.txt 只在卡片内显示文件引用无效，工作区仍可用；javascript: URI渲染为不可点击文本，未执行。与已审核 Main/preload/chat27项和最终Desktop267项回归相符，A24/T16可勾选。精确新包、Session、截图和早期失败证据集中见 W06“2026-10-08 新包真实模型续验与原生产物交互”。

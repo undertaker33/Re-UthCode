@@ -96,6 +96,95 @@ async def test_windows_pty_isatty_stdin_eof_and_resize(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_posix_pty_isatty_input_eof_resize_and_no_replay(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("native POSIX PTY contract")
+    manager = ProcessSessionManager()
+    command = _python(
+        "import os,sys; sys.stdin.reconfigure(encoding='utf-8'); "
+        "size=os.get_terminal_size(1); "
+        "print(f'TTY:{os.isatty(0)}:{os.isatty(1)} SIZE:{size.lines}x{size.columns}', flush=True); "
+        "print('READY', flush=True); "
+        "line=sys.stdin.readline(); print('RECEIVED:'+line.strip(), flush=True); "
+        "size=os.get_terminal_size(1); print(f'RESIZE:{size.lines}x{size.columns}', flush=True); "
+        "tail=sys.stdin.read(); print('TAIL:'+repr(tail), flush=True); "
+        "print('PTY_STDERR', file=sys.stderr, flush=True)"
+    )
+    process = await manager.start(
+        session_id="s1",
+        command=command,
+        cwd=tmp_path,
+        pty=True,
+        rows=24,
+        cols=80,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        output = ""
+        while "READY" not in output and loop.time() < deadline:
+            read = manager.read(process.process_id, "s1", 0)
+            output = "".join(entry.text for entry in read.entries)
+            await asyncio.sleep(0.01)
+        assert "READY" in output
+        assert "TTY:True:True SIZE:24x80" in output
+        assert all(entry.stream == "terminal" for entry in read.entries)
+
+        await manager.resize(process.process_id, "s1", 40, 100)
+        await manager.write(process.process_id, "s1", "T11-PTY-一次\n")
+        deadline = loop.time() + 3.0
+        while "RECEIVED:T11-PTY-一次" not in output and loop.time() < deadline:
+            read = manager.read(process.process_id, "s1", 0)
+            output = "".join(entry.text for entry in read.entries)
+            await asyncio.sleep(0.01)
+        assert "RECEIVED:T11-PTY-一次" in output
+        assert "RESIZE:40x100" in output
+
+        await manager.write(process.process_id, "s1", "", eof=True)
+        deadline = loop.time() + 3.0
+        while process.state == "running" and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        read = manager.read(process.process_id, "s1", 0)
+        output = "".join(entry.text for entry in read.entries)
+        assert process.state == "exited"
+        assert "TAIL:''" in output
+        assert "PTY_STDERR" in output
+        assert all(entry.stream == "terminal" for entry in read.entries)
+    finally:
+        await manager.shutdown_session("s1")
+
+
+@pytest.mark.asyncio
+async def test_pty_turn_cancellation_unblocks_reader_and_reaps_child(tmp_path: Path) -> None:
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("import time; print('READY', flush=True); time.sleep(30)"),
+        cwd=tmp_path,
+        pty=True,
+        turn_id="turn-cancel",
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        output = ""
+        while "READY" not in output and loop.time() < deadline:
+            output = "".join(entry.text for entry in manager.read(process.process_id, "s1", 0).entries)
+            await asyncio.sleep(0.01)
+        assert "READY" in output
+        reader_task = process.pty_task
+        assert reader_task is not None and not reader_task.done()
+
+        await manager.shutdown_turn("s1", "turn-cancel")
+
+        assert process.state == "exited"
+        assert process.pty is not None and not process.pty.isalive()
+        await asyncio.wait_for(asyncio.shield(reader_task), timeout=2.0)
+    finally:
+        await manager.shutdown_session("s1")
+
+
+@pytest.mark.asyncio
 async def test_turn_cleanup_stops_only_the_cancelled_turn_and_session_shutdown_clears_all(
     tmp_path: Path,
 ) -> None:

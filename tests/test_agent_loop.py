@@ -2493,6 +2493,131 @@ async def test_t14_formal_loop_edit_evidence_resets_final_block_before_retest() 
 
 
 @pytest.mark.asyncio
+async def test_t14_real_ask_user_answer_resets_repeated_final_block_suspicion() -> None:
+    pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
+    completed = {"todos": [{"content": "verify", "status": "completed"}]}
+    ask = _ask_request()
+    provider = ScriptedProvider(
+        [
+            [_response(ToolCallPart("todo-pending", "TodoWrite", pending), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature one"))],
+            [_response(TextPart("premature two"))],
+            [_response(TextPart("premature three"))],
+            [_response(ToolCallPart("ask-reset", "AskUserQuestion", ask.to_dict()), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("premature four"))],
+            [_response(TextPart("premature five"))],
+            [_response(ToolCallPart("todo-completed", "TodoWrite", completed), finish_reason=FinishReason.TOOL_CALLS)],
+            [_response(TextPart("done"))],
+        ]
+    )
+    captured: list[RuntimePromptContext] = []
+    execution = _loop(provider, runtime_contexts=captured).start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(ASK_USER_TOOL_DEFINITION, TODO_WRITE_TOOL_DEFINITION),
+    )
+
+    events, result, _segments = await _drive(
+        execution,
+        response_for_pause=_resume_response,
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.termination_reason is TerminationReason.FINAL_ANSWER
+    assert result.final_text == "done"
+    assert provider.call_count == 9
+    blocked = [event for event in events if isinstance(event, CompletionBlocked)]
+    assert len(blocked) == 5
+    assert all(event.unfinished_count == 1 for event in blocked)
+    pauses = [event for event in events if isinstance(event, TurnPaused)]
+    assert len(pauses) == 1
+    assert pauses[0].pause.kind is PauseKind.USER_INPUT_REQUIRED
+    requested = [event for event in events if isinstance(event, UserInputRequested)]
+    assert len(requested) == 1 and requested[0].tool_call_id == "ask-reset"
+    ask_result = next(
+        part
+        for message in provider.requests[5].messages
+        for part in message.parts
+        if isinstance(part, ToolResultPart) and part.tool_call_id == "ask-reset"
+    )
+    assert json.loads(str(ask_result.content)) == {"answers": {"answer": ["Ada"]}}
+    assert captured[4].one_shot_feedback is not None
+    assert captured[4].one_shot_feedback.kind is RuntimeFeedbackKind.COMPLETION_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_t14_real_steering_applied_resets_repeated_final_block_suspicion() -> None:
+    pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
+    completed = {"todos": [{"content": "verify", "status": "completed"}]}
+
+    class SteeringGatedProvider(ScriptedProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    [_response(ToolCallPart("todo-pending", "TodoWrite", pending), finish_reason=FinishReason.TOOL_CALLS)],
+                    [_response(TextPart("premature one"))],
+                    [_response(TextPart("premature two"))],
+                    [_response(TextPart("premature three"))],
+                    [_response(TextPart("discarded provider answer"))],
+                    [_response(TextPart("premature four"))],
+                    [_response(TextPart("premature five"))],
+                    [_response(ToolCallPart("todo-completed", "TodoWrite", completed), finish_reason=FinishReason.TOOL_CALLS)],
+                    [_response(TextPart("done"))],
+                ]
+            )
+            self.steering_attempt_entered = asyncio.Event()
+            self.release_steering_attempt = asyncio.Event()
+
+        async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken):
+            if self.call_count == 4:
+                self.requests.append(request)
+                self.steering_attempt_entered.set()
+                # This scripted Provider deliberately returns its in-flight
+                # response after the real steering cancellation signal. Core
+                # must discard that attempt and apply the queued user input.
+                await self.release_steering_attempt.wait()
+                for event in self.scripts[4]:
+                    yield event
+                self.call_count += 1
+                return
+            async for event in super().stream(request, cancellation=cancellation):
+                yield event
+
+    provider = SteeringGatedProvider()
+    captured: list[RuntimePromptContext] = []
+    execution = _loop(provider, runtime_contexts=captured).start_turn(
+        RunState.initial("run-1"),
+        "work",
+        turn_id="turn-1",
+        tool_definitions=(TODO_WRITE_TOOL_DEFINITION,),
+    )
+    run_task = asyncio.create_task(_drive(execution))
+    await asyncio.wait_for(provider.steering_attempt_entered.wait(), timeout=1)
+    request = SteeringRequest("steer-t14", "run-1", "turn-1", "also verify documentation")
+
+    assert execution.request_steering(request) is True
+    provider.release_steering_attempt.set()
+    events, result, _segments = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.termination_reason is TerminationReason.FINAL_ANSWER
+    assert result.final_text == "done"
+    assert provider.call_count == 9
+    blocked = [event for event in events if isinstance(event, CompletionBlocked)]
+    assert len(blocked) == 5
+    requested = [event for event in events if isinstance(event, UserSteeringRequested)]
+    applied = [event for event in events if isinstance(event, UserSteeringApplied)]
+    assert [event.steering_id for event in requested] == ["steer-t14"]
+    assert [event.steering_id for event in applied] == ["steer-t14"]
+    assert TextPart("also verify documentation") in provider.requests[5].messages[-1].parts
+    assert captured[4].one_shot_feedback is not None
+    assert captured[4].one_shot_feedback.kind is RuntimeFeedbackKind.COMPLETION_BLOCKED
+    assert captured[5].one_shot_feedback is not None
+    assert captured[5].one_shot_feedback.kind is RuntimeFeedbackKind.USER_STEERING
+
+
+@pytest.mark.asyncio
 async def test_t14_formal_loop_repeated_read_same_digest_keeps_final_block_evidence() -> None:
     pending = {"todos": [{"content": "verify", "status": "in_progress"}]}
     read = RecordingTool(
