@@ -285,6 +285,84 @@ test("ChatTimeline renders bounded Session process observations separately from 
   assert.match(markup, /\[status\] exited/u);
 });
 
+test("ChatTimeline projects process logs as safe text with CR line updates across chunks", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const processLogs = [
+      { processId: "process-ansi", sequence: 1, stream: "terminal" as const, text: "\u001b[31" },
+      { processId: "process-ansi", sequence: 2, stream: "status" as const, text: "", state: "running" },
+      { processId: "process-ansi", sequence: 3, stream: "terminal" as const, text: "m进度 10%\r" },
+      { processId: "process-ansi", sequence: 4, stream: "terminal" as const, text: "\u001b]8;;https://example.invalid" },
+      { processId: "process-ansi", sequence: 5, stream: "terminal" as const, text: "\u0007进度 100%\u001b]8;;\u001b\\\n完成\r" },
+      { processId: "process-ansi", sequence: 6, stream: "terminal" as const, text: "\n" },
+    ];
+    const render = (logs: typeof processLogs) => root.render(<LanguageProvider value="en"><ChatTimeline entries={[]} todo={[]} processLogs={logs} sessionKey="process-session" /></LanguageProvider>);
+    act(() => render(processLogs.slice(0, 4)));
+
+    const process = container.querySelector('[data-process-owner="process-ansi"]');
+    assert.ok(process);
+    const output = process.querySelector<HTMLPreElement>('pre[data-process-id="process-ansi"][data-process-sequence="3"]');
+    assert.ok(output);
+    assert.equal(output.textContent, "进度 10%");
+    assert.equal(process.textContent?.includes("https://example.invalid"), false);
+    act(() => render(processLogs));
+    const outputRows = Array.from(process.querySelectorAll<HTMLPreElement>("pre[data-process-id]"));
+    assert.equal(outputRows.map((row) => row.textContent).join(""), "[status] running进度 100%\n完成\n");
+    assert.equal(process.textContent?.includes("\u001b"), false);
+    assert.equal(process.textContent?.includes("https://example.invalid"), false);
+    assert.equal(process.getAttribute("data-process-session"), "process-session");
+    assert.equal(outputRows[0]?.textContent, "[status] running");
+  });
+});
+
+test("ChatTimeline keeps interleaved process stream and status rows in sequence order", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const processLogs = [
+      { processId: "process-mixed", sequence: 1, stream: "stdout" as const, text: "before" },
+      { processId: "process-mixed", sequence: 2, stream: "status" as const, text: "", state: "stopping" },
+      { processId: "process-mixed", sequence: 3, stream: "stderr" as const, text: "after" },
+      { processId: "process-mixed", sequence: 4, stream: "status" as const, text: "", state: "exited" },
+      { processId: "process-mixed", sequence: 5, stream: "stdout" as const, text: "later" },
+    ];
+    act(() => root.render(<LanguageProvider value="en"><ChatTimeline entries={[]} todo={[]} processLogs={processLogs} sessionKey="mixed-session" /></LanguageProvider>));
+
+    const process = container.querySelector('[data-process-owner="process-mixed"]');
+    assert.ok(process);
+    const rows = Array.from(process.querySelectorAll<HTMLPreElement>("pre[data-process-id]"));
+    assert.deepEqual(rows.map((row) => [row.getAttribute("data-process-sequence"), row.textContent]), [
+      ["1", "before"],
+      ["2", "[status] stopping"],
+      ["3", "after"],
+      ["4", "[status] exited"],
+      ["5", "later"],
+    ]);
+  });
+});
+
+test("ChatTimeline waits for split CSI sequences before projecting process text", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const processLogs = [
+      { processId: "process-sgr", sequence: 1, stream: "terminal" as const, text: "hello\u001b[1;" },
+      { processId: "process-private-csi", sequence: 1, stream: "terminal" as const, text: "hello\u001b[?" },
+      { processId: "process-sgr", sequence: 2, stream: "terminal" as const, text: "31mworld" },
+      { processId: "process-private-csi", sequence: 2, stream: "terminal" as const, text: "25lworld" },
+    ];
+    const render = (logs: typeof processLogs) => root.render(<LanguageProvider value="en"><ChatTimeline entries={[]} todo={[]} processLogs={logs} sessionKey="csi-session" /></LanguageProvider>);
+    act(() => render(processLogs.slice(0, 2)));
+
+    const sgrProcess = container.querySelector('[data-process-owner="process-sgr"]');
+    const privateProcess = container.querySelector('[data-process-owner="process-private-csi"]');
+    assert.ok(sgrProcess);
+    assert.ok(privateProcess);
+    const outputText = (element: Element) => Array.from(element.querySelectorAll("pre[data-process-id]")).map((row) => row.textContent).join("");
+    assert.equal(outputText(sgrProcess), "hello");
+    assert.equal(outputText(privateProcess), "hello");
+
+    act(() => render(processLogs));
+    assert.equal(outputText(sgrProcess), "helloworld");
+    assert.equal(outputText(privateProcess), "helloworld");
+  });
+});
+
 test("ChatTimeline exposes process.read continuation and terminal facts", () => {
   const reads: Array<[string, number]> = [];
   const stopped: string[] = [];

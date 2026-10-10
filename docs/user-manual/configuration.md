@@ -59,6 +59,8 @@ timeout_seconds = 20.0
 
 Desktop Settings 的 Search 区域保存启用状态、固定 provider、key 输入和三个上限字段。key 输入只在 editor-local 草稿和受控配置写入通道存在，安全设置回读只显示是否已配置；当前可见 Session 有 active Turn 时，整次设置保存会被拒绝，既有运行时不会因保存而重启。
 
+保存其他设置而未编辑搜索 key 时，会保留已有的 literal 或 `env:` 引用；主动清空 key 输入框并保存才会删除它。关闭搜索保留已配置的 key，但不向模型提供 `WebSearch`；只打开启用开关而未配置 key，也不会提供该工具。
+
 工具执行的单次等待、输出和附件上限位于 `[tool_limits]`。这些字段只允许用户配置；项目配置可以进一步收紧，不能放大用户值。`timeout_seconds` 省略或写为 `null` 时不增加隐藏的进程总寿命限制，`output_bytes` 和 `attachment_bytes` 分别约束单次工具输出与单个附件：
 
 ```toml
@@ -87,11 +89,17 @@ $env:MY_PROVIDER_API_KEY = "your-api-key"
 | `openai_compat` | OpenAI-compatible API，需要 `base_url` |
 | `fake` | 离线体验和测试 |
 
+使用 `openai_responses` 时，`base_url` 填服务的 API 根地址，例如 `https://your-provider.example/v1`，不要附加 `/responses`；SDK 会在请求时拼接该资源路径。模型的显示名与远端 `remote_id` 分别配置。
+
 用户配置中的 `default_permission_mode` 只能是 `default` 或 `auto`；`full_access` 只能在当前运行中选择。项目配置可以选择用户已信任的 Provider、模型和非敏感模型参数，但不能定义 Provider、修改端点或密钥来源，也不能设置默认权限模式。
 
 Provider 表的键是稳定 Provider Profile ID，Model 的 `provider` 始终引用这个 ID。可选 `display_name` 只用于界面显示，修改或清空它不会改变 Model 引用；未配置时 Desktop 回退显示稳定 ID。模型表的键是逻辑 Model Profile ID，仅用于 `/model`、TUI 和 `/status`。`remote_id` 才会发送给远端；远端模型名称由 Provider 最终校验，不根据名称子串推断。`reasoning_effort` 可省略（省略时请求不带 reasoning），或使用 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；当前只对 OpenAI Responses 和 OpenAI-compatible 的非 `none` 值启用映射，无法支持的 Provider 会在配置/构造阶段失败。
 
 模型的 `supports_images` 是三态能力声明：`true` 表示允许图片输入，`false` 或未知值按不支持处理。Desktop 发送含图片的消息时会在请求前明确提示所选模型不支持图片输入，并保留附件草稿；请在 Settings 中启用真实支持图片的模型或选择其他模型后重试。
+
+兼容 Responses 端点的图片能力还取决于具体接口实现。用户上传图片可以识别，不代表端点同时支持 `ViewImage` 等工具返回的图片内容；`supports_images` 是模型声明，不能代替真实的用户图和工具图验证。百炼当前文档将 `function_call_output.output` 声明为字符串，与 OpenAI 原生图片工具结果格式存在差异；具体端点的工具图能力仍需实测。
+
+DeepSeek 的 `deepseek-flash` 已在 UthCode 正式 Application 路径完成 Responses 用户图和 `ViewImage` 工具图实测。配置组合为 `kind = "openai_responses"`、`base_url = "https://api.deepseek.com/"`、模型 `remote_id = "deepseek-flash"` 和 `supports_images = true`；密钥仍只放在用户级 Provider 配置或其环境变量引用中。这是该端点、模型与 OpenAI SDK 2.53.0 的具体结果，不代表所有兼容端点均支持图片工具结果。
 
 ### Context Window 与 Provider 限制
 

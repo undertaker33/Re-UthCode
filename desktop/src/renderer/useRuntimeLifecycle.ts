@@ -58,7 +58,7 @@ export interface RuntimeLifecycle {
   beginPendingTurnStart: () => PendingTurnStart;
   pendingTurnStart: () => PendingTurnStart | null;
   bufferPendingTurnEvent: (event: AgentEvent) => boolean;
-  finishPendingTurnStart: (pending: PendingTurnStart, identity: RuntimeIdentity) => AgentEvent[];
+  finishPendingTurnStart: (pending: PendingTurnStart) => AgentEvent[];
   clearPendingTurnStart: () => void;
 }
 
@@ -364,9 +364,9 @@ export function useRuntimeLifecycle(options: RuntimeLifecycleOptions): RuntimeLi
     pending.events.push(event);
     return true;
   }, []);
-  const finishPendingTurnStart = useCallback((pending: PendingTurnStart, identity: RuntimeIdentity): AgentEvent[] => {
+  const finishPendingTurnStart = useCallback((pending: PendingTurnStart): AgentEvent[] => {
     if (pendingTurnStartRef.current !== pending) return [];
-    const buffered = pending.events.filter((event) => eventMatchesIdentity(event, identity));
+    const buffered = [...pending.events];
     pendingTurnStartRef.current = null;
     return buffered;
   }, []);

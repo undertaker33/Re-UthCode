@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import shlex
 import subprocess
 import sys
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from uthcode.application.tools import ApplicationToolService
 from uthcode.core import (
     CancellationToken,
     PreparedToolCall,
@@ -19,6 +22,7 @@ from uthcode.core import (
     ToolResultPart,
 )
 from uthcode.core.command_security import safe_bash_command_summary
+from uthcode.core.provider import GenerationRequest, Message, ProviderIdentity
 from uthcode.core.permission import (
     CircuitBreaker,
     Decision,
@@ -28,7 +32,13 @@ from uthcode.core.permission import (
     ResourceScope,
     RuleSet,
 )
-from uthcode.core.tool import ToolPlanningAccess, ToolPlanningMetadata
+from uthcode.core.tool import (
+    ToolPlanningAccess,
+    ToolPlanningMetadata,
+    ToolResultPersistenceStatus,
+)
+from uthcode.integrations.providers.openai_compat import _request_messages
+from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.integrations.tools.process_tools import (
     BashTool,
     _completed_result,
@@ -36,8 +46,13 @@ from uthcode.integrations.tools.process_tools import (
     _windows_output_encodings,
     classify_bash_command,
 )
+from uthcode.integrations.tools.process_sessions import ProcessSessionManager
 from uthcode.integrations.tools import process_tools
 from uthcode.integrations.permissions import default_guard_rules
+from uthcode.integrations.tools.tool_result_read import (
+    ToolResultPolicy,
+    ToolResultReference,
+)
 
 
 _DESCENDANT_DELAY_SECONDS = 2.0
@@ -638,7 +653,9 @@ async def test_bash_reports_empty_output(tmp_path: Path) -> None:
     )
 
     assert result.is_error is False
-    assert result.content == "(no output)"
+    assert "state=exited" in result.content
+    assert "exit_code=0" in result.content
+    assert result.content.endswith("(no output)")
 
 
 @pytest.mark.asyncio
@@ -813,3 +830,185 @@ async def test_bash_output_reaches_application_materialization_unchanged(tmp_pat
     assert results[0].is_error is False
     assert len(results[0].content) > 10_000
     assert "[Output truncated" not in results[0].content
+
+
+@pytest.mark.asyncio
+async def test_process_handle_is_provider_visible_through_formal_materialization(
+    tmp_path: Path,
+) -> None:
+    class ResultSession:
+        session_id = "process-status-session"
+
+        def __init__(self) -> None:
+            self.persisted: list[str] = []
+
+        def persist_tool_result(
+            self,
+            content: str,
+            *,
+            policy: ToolResultPolicy,
+        ) -> ToolResultReference:
+            del policy
+            self.persisted.append(content)
+            encoded = content.encode("utf-8")
+            return ToolResultReference(
+                ref=f"process-output-ref-{len(self.persisted):04d}",
+                session_id=self.session_id,
+                size_bytes=len(encoded),
+                sha256=hashlib.sha256(encoded).hexdigest(),
+            )
+
+    session = ResultSession()
+    process_manager = ProcessSessionManager(max_output_bytes=4096)
+    result_policy = ToolResultPolicy(
+        inline_threshold_bytes=128,
+        preview_limit_bytes=512,
+        single_result_hard_cap_bytes=4096,
+        session_quota_bytes=8192,
+        read_page_limit_bytes=1024,
+        read_output_limit_bytes=1024,
+    )
+    service = ApplicationToolService(
+        create_default_tools(
+            tmp_path,
+            process_manager=process_manager,
+            session_provider=lambda: session,
+        ),
+        workdir=tmp_path,
+        session_provider=lambda: session,
+        tool_result_policy=result_policy,
+    )
+    identity = ProviderIdentity(
+        provider="openai_compat",
+        protocol="openai-chat-completions",
+        model="process-status-test",
+    )
+
+    async def execute_and_materialize(call: ToolCallPart):
+        prepared = service.prepare_tool_call(
+            call,
+            cancellation=CancellationToken(),
+        )
+        assert isinstance(prepared, PreparedToolCall)
+        outcome = await service.execute_prepared_tool(
+            prepared,
+            cancellation=CancellationToken(),
+        )
+        return outcome, service.materialize_tool_result(outcome)
+
+    def provider_tool_text(
+        call: ToolCallPart,
+        result: ToolResultPart,
+    ) -> str:
+        request = GenerationRequest(
+            messages=(
+                Message("assistant", (call,)),
+                Message("tool", (result,)),
+            ),
+            model="process-status-test",
+        )
+        serialized = _request_messages(request, identity)
+        return str(serialized[-1]["content"])
+
+    status_pattern = re.compile(
+        r"^Process status: process_id=([^;]+); state=([a-z]+); "
+        r"next_cursor=(\d+)(?:; exit_code=(-?\d+))?$",
+        re.MULTILINE,
+    )
+
+    command = _python_command(
+        "import sys; print('READY-' + ('x' * 700), flush=True); "
+        "value = sys.stdin.readline(); print('GOT:' + value.strip(), flush=True)"
+    )
+    start_call = ToolCallPart(
+        "process-status-start",
+        "Bash",
+        {
+            "command": command,
+            "pty": True,
+            "yield_time_ms": 1000,
+        },
+    )
+
+    try:
+        start_outcome, start_materialized = await execute_and_materialize(start_call)
+        assert start_outcome.is_error is False
+        assert start_materialized.persistence_status is ToolResultPersistenceStatus.EXTERNALIZED
+        start_text = provider_tool_text(start_call, start_materialized.result)
+        start_match = status_pattern.search(start_text)
+        assert start_match is not None
+        process_id = start_match.group(1)
+        assert start_match.group(2) == "running"
+        assert start_materialized.result.metadata["process_id"] == process_id
+        assert start_text.index("Process status:") < start_text.index("READY-")
+
+        running_read_call = ToolCallPart(
+            "process-status-read-running",
+            "Process",
+            {
+                "action": "read",
+                "process_id": process_id,
+                "cursor": 0,
+                "wait_ms": 100,
+            },
+        )
+        running_read, running_materialized = await execute_and_materialize(
+            running_read_call
+        )
+        running_text = provider_tool_text(
+            running_read_call,
+            running_materialized.result,
+        )
+        running_match = status_pattern.search(running_text)
+        assert running_match is not None
+        assert running_match.group(1) == process_id
+        assert running_match.group(2) == "running"
+        assert running_text.index("Process status:") < running_text.index("READY-")
+
+        line_ending = "\r" if sys.platform == "win32" else "\n"
+        write_call = ToolCallPart(
+            "process-status-write",
+            "Process",
+            {
+                "action": "write",
+                "process_id": process_id,
+                "input": f"process-status-probe{line_ending}",
+            },
+        )
+        write_outcome, _ = await execute_and_materialize(write_call)
+        assert write_outcome.is_error is False
+        assert write_outcome.process_id == process_id
+
+        exited_outcome = None
+        exited_text = ""
+        exited_match = None
+        for attempt in range(10):
+            read_call = ToolCallPart(
+                f"process-status-read-exit-{attempt}",
+                "Process",
+                {
+                    "action": "read",
+                    "process_id": process_id,
+                    "cursor": 0,
+                    "wait_ms": 1000,
+                },
+            )
+            read_outcome, read_materialized = await execute_and_materialize(read_call)
+            exited_text = provider_tool_text(read_call, read_materialized.result)
+            exited_match = status_pattern.search(exited_text)
+            assert exited_match is not None
+            assert exited_match.group(1) == process_id
+            if read_outcome.process_state == "exited":
+                exited_outcome = read_outcome
+                break
+            await asyncio.sleep(0.05)
+
+        assert exited_outcome is not None
+        assert exited_outcome.exit_code == 0
+        assert exited_match is not None
+        assert exited_match.group(2) == "exited"
+        assert exited_match.group(4) == "0"
+        assert exited_text.index("Process status:") < exited_text.index("READY-")
+        assert session.persisted
+    finally:
+        await process_manager.shutdown()

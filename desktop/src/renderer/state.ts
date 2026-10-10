@@ -154,7 +154,9 @@ export interface CompactionStatusProjection {
 export interface SessionSummary {
   session_id: string;
   project_key?: string;
+  created_at?: string;
   last_used_at?: string;
+  last_user_message_at?: string | null;
   title?: string | null;
   preview?: string;
   timeline_checkpoint_id?: string | null;
@@ -1323,7 +1325,7 @@ export type RendererAction =
   | { type: "session_mutation_busy"; value: boolean }
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
-  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string; attachments?: TimelineAttachment[] }
+  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string; attachments?: TimelineAttachment[]; sessionId?: string }
   | { type: "steering_submission_failed"; runId: string; turnId: string }
   | { type: "composer_attachment_added"; attachment: DesktopAttachmentDraft }
   | { type: "composer_attachment_removed"; ref: string }
@@ -1745,6 +1747,11 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         }])
         : state.timeline;
       const next = { ...state, timeline, pendingSteeringMessageIds, run: acceptedRun ?? state.run, permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
+      const acceptedSessionId = !state.selectedSessionId ? nonEmptyText(action.sessionId) : null;
+      if (acceptedSessionId) {
+        next.selectedSessionId = acceptedSessionId;
+        next.sessionViewRevision = state.sessionViewRevision + 1;
+      }
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, runId: next.run?.run_id, turnId: next.run?.turn_id, ...(pendingSteeringId ? { messageId: pendingSteeringId } : {}), status: "completed" }], nextStatusId: next.nextStatusId + 1 };
     }

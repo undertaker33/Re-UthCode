@@ -175,7 +175,9 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
   return {
     session_id: sessionId,
     project_key: nonEmptyText(source?.project_key) ?? fallbackProjectKey,
+    created_at: textValue(source?.created_at),
     last_used_at: textValue(source?.last_used_at),
+    last_user_message_at: textValue(source?.last_user_message_at) || null,
     title: source?.title === null ? null : textValue(source?.title) || null,
     preview: textValue(source?.preview),
     timeline_checkpoint_id: typeof source?.timeline_checkpoint_id === "string" ? source.timeline_checkpoint_id : null,

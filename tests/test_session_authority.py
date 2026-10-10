@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -273,7 +274,71 @@ def test_metadata_catalog_keeps_empty_session_preview_empty(tmp_path: Path) -> N
     assert catalog[0].preview == ""
 
 
-def test_metadata_catalog_head_read_does_not_grow_with_appended_history(
+def test_application_catalog_can_read_registered_project_and_uses_latest_user_timestamp(
+    tmp_path: Path,
+) -> None:
+    source, target, store = _paths(tmp_path)
+    source_key = str(source.resolve())
+    target_key = str(target.resolve())
+    store.create_session("source-session", project_key=source_key)
+    store.create_session("target-session", project_key=target_key)
+    target_entries = (
+        replace(
+            _user_transcript("target-session", "first input")[0],
+            turn_id="turn-1",
+            semantic_unit_id="turn-1",
+            created_at="2026-10-01T00:00:00+00:00",
+        ),
+        TranscriptEntry(
+            "target-session",
+            2,
+            "turn-2",
+            TranscriptKind.ASSISTANT_MESSAGE,
+            {"text": "assistant-only semantic unit"},
+            created_at="2026-10-02T00:00:00+00:00",
+            semantic_unit_id="turn-2",
+        ),
+        replace(
+            _user_transcript("target-session", "latest steering")[0],
+            sequence=3,
+            turn_id="turn-3",
+            kind=TranscriptKind.USER_STEERING,
+            semantic_unit_id="turn-3",
+            created_at="2026-10-03T00:00:00+00:00",
+        ),
+        TranscriptEntry(
+            "target-session",
+            4,
+            "turn-4",
+            TranscriptKind.ASSISTANT_MESSAGE,
+            {"text": "latest assistant-only semantic unit"},
+            created_at="2026-10-04T00:00:00+00:00",
+            semantic_unit_id="turn-4",
+        ),
+    )
+    with store.open_writer("target-session", expected_project_key=target_key) as writer:
+        assert writer.append_transcript(target_entries).transcript_appended is True
+
+    application, _service = _real_application(store, source_key)
+    try:
+        catalog = application.session_catalog_metadata(project_key=target_key)
+        assert [entry.session_id for entry in catalog] == ["target-session"]
+        assert catalog[0].created_at
+        assert catalog[0].last_user_message_at == "2026-10-03T00:00:00+00:00"
+
+        # A normal read/resume changes last_used_at but is not a user message
+        # and must not manufacture a new Recent timestamp.
+        with store.open_writer("target-session", expected_project_key=target_key) as writer:
+            writer.touch()
+        refreshed = application.session_catalog_metadata(project_key=target_key)
+        assert refreshed[0].last_user_message_at == "2026-10-03T00:00:00+00:00"
+        source_catalog = application.session_catalog_metadata(project_key=source_key)
+        assert [entry.session_id for entry in source_catalog] == ["source-session"]
+    finally:
+        application.close()
+
+
+def test_first_user_preview_read_does_not_grow_with_appended_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -335,9 +400,13 @@ def test_metadata_catalog_head_read_does_not_grow_with_appended_history(
         instruction_loader=None,
         store=store,
     )
-    first_catalog = service.list_catalog_metadata()
+    first_entry = store.read_first_user_entry(
+        session_id,
+        expected_project_key=project_key,
+    )
     first_bytes = sum(reads)
-    assert first_catalog[0].preview == "首条请求"
+    assert first_entry is not None
+    assert first_entry.kind == TranscriptKind.USER_MESSAGE
     assert first_bytes > 0
 
     with store.open_writer(session_id, expected_project_key=project_key) as writer:
@@ -356,10 +425,17 @@ def test_metadata_catalog_head_read_does_not_grow_with_appended_history(
         assert writer.append_transcript(appended).transcript_appended is True
 
     reads.clear()
-    second_catalog = service.list_catalog_metadata()
+    second_entry = store.read_first_user_entry(
+        session_id,
+        expected_project_key=project_key,
+    )
     second_bytes = sum(reads)
-    assert second_catalog[0].preview == "首条请求"
+    assert second_entry is not None
+    assert second_entry.kind == TranscriptKind.USER_MESSAGE
     assert second_bytes == first_bytes
+
+    catalog = service.list_catalog_metadata()
+    assert catalog[0].preview == "首条请求"
 
 
 def test_metadata_catalog_reads_first_user_message_longer_than_read_block(

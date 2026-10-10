@@ -16,6 +16,7 @@ import signal
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from ctypes import wintypes
 from collections import deque
@@ -23,6 +24,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
+
+
+_PTY_PUMP_CLEANUP_TIMEOUT_SECONDS = 1.0
+_PTY_OUTPUT_EOF_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass(frozen=True, slots=True)
 class ProcessOutput:
@@ -68,8 +74,11 @@ class _ManagedProcess:
     timeout_seconds: float | None = None
     timed_out: bool = False
     pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pty_finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_signal: asyncio.Event = field(default_factory=asyncio.Event)
     last_stream: str = "terminal"
+    pty_eof: bool = False
+    pty_stop_requested: bool = False
     # Projections are captured when the process starts.  A shared
     # ProcessSessionManager can outlive a configuration reload and therefore
     # must not project an existing child with a newer Application's secret
@@ -431,16 +440,18 @@ class ProcessSessionManager:
                     argv = ["cmd.exe", "/d", "/c", *_windows_pty_tokens(command)]
                 except ValueError:
                     argv = ["cmd.exe", "/d", "/c", command]
+                pty = _spawn_windows_pty(PtyProcess, argv, cwd, rows, cols)
             else:
                 argv = ["/bin/sh", "-lc", command]
-            pty = PtyProcess.spawn(argv, cwd=str(cwd), dimensions=(rows, cols))
-        except TypeError:
-            # Older pywinpty releases use ``dimensions`` only after spawn.
-            pty = PtyProcess.spawn(argv, cwd=str(cwd))
-            try:
-                pty.set_size(rows, cols)
-            except Exception:
-                pass
+                try:
+                    pty = PtyProcess.spawn(argv, cwd=str(cwd), dimensions=(rows, cols))
+                except TypeError:
+                    # Older POSIX ptyprocess releases set dimensions after spawn.
+                    pty = PtyProcess.spawn(argv, cwd=str(cwd))
+                    try:
+                        pty.set_size(rows, cols)
+                    except Exception:
+                        pass
         except Exception as exc:
             raise ProcessSessionError("Error: PTY process could not be started", kind="process_failed") from exc
         managed = _ManagedProcess(
@@ -478,11 +489,18 @@ class ProcessSessionManager:
                 try:
                     data = await asyncio.to_thread(pty.read, 4096)
                 except EOFError:
+                    managed.pty_eof = True
                     return
                 except (OSError, ValueError):
                     return
                 if not data:
-                    return
+                    if _pty_output_eof(pty):
+                        managed.pty_eof = True
+                        return
+                    # The nonblocking native read returns empty while idle.
+                    # Keep the pump alive for later output.
+                    await asyncio.sleep(0.005)
+                    continue
                 if isinstance(data, bytes):
                     text = _decode(data)
                 else:
@@ -514,16 +532,44 @@ class ProcessSessionManager:
             while True:
                 alive = await asyncio.to_thread(pty.isalive)
                 if not alive:
-                    if managed.pty_task is not None:
-                        try:
-                            await asyncio.wait_for(asyncio.shield(managed.pty_task), 5.0)
-                        except Exception:
-                            pass
-                    status = getattr(pty, "exitstatus", None)
-                    managed.exit_code = status if isinstance(status, int) else None
-                    managed.state = "exited"
-                    self._cancel_timeout_task(managed)
-                    self._finish_state(managed)
+                    async with managed.pty_finalize_lock:
+                        if managed.pty_stop_requested or managed.state != "running":
+                            return
+                        reader_finished = managed.pty_task is None or managed.pty_task.done()
+                        if managed.pty_task is not None and not reader_finished:
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(managed.pty_task),
+                                    _PTY_OUTPUT_EOF_TIMEOUT_SECONDS,
+                                )
+                                reader_finished = True
+                            except Exception:
+                                reader_finished = False
+                        # A concurrent stop owns PTY finalization and gets one
+                        # chance to observe the real output EOF before close.
+                        if managed.pty_stop_requested:
+                            return
+                        # Adapter cleanup after a timeout cannot manufacture
+                        # output completion.
+                        adapter_closed = await asyncio.to_thread(managed.control.close)
+                        if not reader_finished and managed.pty_task is not None:
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(managed.pty_task),
+                                    _PTY_PUMP_CLEANUP_TIMEOUT_SECONDS,
+                                )
+                            except Exception:
+                                pass
+                        status = getattr(pty, "exitstatus", None)
+                        managed.exit_code = status if isinstance(status, int) else None
+                        reader_stopped = managed.control.reader_stopped()
+                        managed.state = (
+                            "exited"
+                            if managed.pty_eof and reader_finished and adapter_closed and reader_stopped
+                            else "unknown"
+                        )
+                        self._cancel_timeout_task(managed)
+                        self._finish_state(managed)
                     return
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
@@ -733,18 +779,81 @@ class ProcessSessionManager:
 
     async def _terminate_managed(self, managed: _ManagedProcess, *, unknown: bool = False) -> bool:
         if managed.state != "running":
+            if (
+                os.name == "nt"
+                and managed.pty is not None
+                and managed.state == "exited"
+                and not managed.control.stop_confirmed
+            ):
+                # A naturally completed PTY no longer has a safe live PID
+                # target. Do not issue taskkill against a potentially reused
+                # PID or claim that its former process tree was stopped.
+                managed.state = "unknown"
+                self._finish_state(managed)
+                return False
             return managed.state == "exited"
         try:
             if managed.pty is not None:
-                terminate = getattr(managed.pty, "terminate", None)
-                if callable(terminate):
-                    await asyncio.to_thread(terminate)
-                if managed.watcher_task is not None:
+                managed.pty_stop_requested = True
+                async with managed.pty_finalize_lock:
+                    if managed.state != "running":
+                        if (
+                            os.name == "nt"
+                            and managed.state == "exited"
+                            and not managed.control.stop_confirmed
+                        ):
+                            managed.state = "unknown"
+                            self._finish_state(managed)
+                            return False
+                        return managed.state == "exited"
+                    tree_terminated = await managed.control.terminate(managed.pty)
+                    reader_task = managed.pty_task
+                    reader_finished = reader_task is None
+                    if reader_task is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(reader_task),
+                                _PTY_OUTPUT_EOF_TIMEOUT_SECONDS,
+                            )
+                            reader_finished = True
+                        except Exception:
+                            reader_finished = False
+                    # Snapshot the real EOF after the output pump has had a
+                    # bounded chance to consume the native EOF signal.
+                    # Adapter close below is cleanup only.
+                    output_eof = managed.pty_eof
+                    adapter_closed = await asyncio.to_thread(managed.control.close)
+                    if reader_task is not None and not reader_task.done():
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(reader_task),
+                                _PTY_PUMP_CLEANUP_TIMEOUT_SECONDS,
+                            )
+                        except Exception:
+                            pass
+                    reader_finished = reader_finished and (reader_task is None or reader_task.done())
+                    reader_stopped = managed.control.reader_stopped()
+                    alive = await asyncio.to_thread(_pty_is_alive, managed.pty)
+                    confirmed = (
+                        tree_terminated
+                        and not unknown
+                        and alive is False
+                        and output_eof
+                        and reader_finished
+                        and reader_stopped
+                        and adapter_closed
+                    )
+                    managed.control.stop_confirmed = confirmed
+                    managed.state = "exited" if confirmed else "unknown"
+                    status = getattr(managed.pty, "exitstatus", None)
+                    managed.exit_code = status if isinstance(status, int) else managed.exit_code
+                watcher_task = managed.watcher_task
+                if watcher_task is not None and watcher_task is not asyncio.current_task() and not watcher_task.done():
                     try:
-                        await asyncio.wait_for(asyncio.shield(managed.watcher_task), 5.0)
+                        await asyncio.wait_for(asyncio.shield(watcher_task), timeout=1.0)
                     except Exception:
-                        pass
-                managed.state = "exited" if not unknown else "unknown"
+                        watcher_task.cancel()
+                        await asyncio.gather(watcher_task, return_exceptions=True)
                 self._finish_state(managed)
                 self._cancel_timeout_task(managed)
                 return managed.state == "exited"
@@ -872,8 +981,29 @@ class ProcessSessionManager:
 class _PtyControl:
     def __init__(self, pty: Any) -> None:
         self.pty = pty
+        self.stop_confirmed = False
 
     async def terminate(self, _process: object) -> bool:
+        if os.name == "nt":
+            confirmed = await asyncio.to_thread(_terminate_windows_pty_tree, self.pty)
+            if confirmed:
+                self.stop_confirmed = True
+                return True
+            # Preserve the old direct-root fallback when the tree operation
+            # could not be confirmed, but keep the overall result unknown.
+            if _pty_is_alive(self.pty):
+                terminate = getattr(self.pty, "terminate", None)
+                if callable(terminate):
+                    try:
+                        await asyncio.to_thread(terminate, force=True)
+                    except TypeError:
+                        try:
+                            await asyncio.to_thread(terminate)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            return False
         terminate = getattr(self.pty, "terminate", None)
         if not callable(terminate):
             return False
@@ -883,13 +1013,168 @@ class _PtyControl:
             return False
         return True
 
-    def close(self) -> None:
+    def reader_stopped(self) -> bool:
+        if os.name != "nt":
+            return True
+        reader = getattr(self.pty, "_thread", None)
+        return reader is None or not reader.is_alive()
+
+    def close(self) -> bool:
+        if os.name == "nt":
+            return _close_windows_pty_adapter(self.pty)
         close = getattr(self.pty, "close", None)
         if callable(close):
             try:
                 close()
             except Exception:
-                pass
+                return False
+        return True
+
+
+def _spawn_windows_pty(pty_process_type: Any, argv: list[str], cwd: Path, rows: int, cols: int) -> Any:
+    """Use pywinpty's WinPTY backend and its native nonblocking API directly.
+
+    The high-level PyWinPTY 2.x reader proxies output through a private socket
+    and encodes idle reads as a byte sentinel. Its ConPTY backend can also hold
+    a native read across process-tree termination. The native WinPTY backend
+    supports direct nonblocking reads, which preserve output framing and let
+    ``iseof`` distinguish idle from EOF.
+    """
+    from winpty import Backend, WinptyError
+
+    class _DirectPtyProcess(pty_process_type):
+        def __init__(self, pty: Any) -> None:
+            self.pty = pty
+            self.pid = pty.pid
+            self.read_blocking = False
+            self.closed = False
+            self.flag_eof = False
+
+        def read(self, size: int = 1024) -> bytes:
+            try:
+                data = self.pty.read(size, blocking=False)
+            except WinptyError as exc:
+                try:
+                    native_eof = bool(self.pty.iseof())
+                    process_alive = bool(self.pty.isalive())
+                except Exception:
+                    native_eof = False
+                    process_alive = True
+                if native_eof and not process_alive:
+                    self.flag_eof = True
+                    raise EOFError("PTY output is closed") from exc
+                if native_eof and process_alive:
+                    return b""
+                raise
+            if not data and self.pty.iseof() and not self.pty.isalive():
+                self.flag_eof = True
+                raise EOFError("PTY output is closed")
+            return data
+
+        def write(self, data: str) -> int:
+            if not self.isalive():
+                raise EOFError("PTY process is closed")
+            return self.pty.write(data)
+
+        def close(self, force: bool = False) -> None:
+            # The native PTY object is released with this adapter when the
+            # completed process record is evicted; stopping is owned by the
+            # process-tree controller, not by pywinpty's root-only close.
+            self.closed = True
+
+    return _DirectPtyProcess.spawn(
+        argv,
+        cwd=str(cwd),
+        env=os.environ.copy(),
+        dimensions=(rows, cols),
+        backend=Backend.WinPTY,
+    )
+
+
+def _pty_is_alive(pty: Any) -> bool | None:
+    isalive = getattr(pty, "isalive", None)
+    if not callable(isalive):
+        return None
+    try:
+        return bool(isalive())
+    except Exception:
+        return None
+
+
+def _pty_output_eof(pty: Any) -> bool:
+    """Return whether the direct PTY adapter observed actual output EOF."""
+
+    flag_eof = getattr(pty, "flag_eof", None)
+    if isinstance(flag_eof, bool):
+        return flag_eof
+    eof = getattr(pty, "eof", None)
+    if callable(eof):
+        try:
+            return bool(eof())
+        except Exception:
+            return False
+    return False
+
+
+def _terminate_windows_pty_tree(pty: Any) -> bool:
+    """Kill a still-live PTY root and its active descendants using taskkill."""
+
+    alive = _pty_is_alive(pty)
+    if alive is not True:
+        # Never target a numeric PID after the PTY says its original process
+        # has exited or its state cannot be read; Windows may reuse that PID.
+        return False
+    process_id = getattr(pty, "pid", None)
+    if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id <= 0:
+        return False
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        return False
+    taskkill = Path(system_root) / "System32" / "taskkill.exe"
+    if not taskkill.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+
+    deadline = time.monotonic() + 2.0
+    while True:
+        alive = _pty_is_alive(pty)
+        if alive is False:
+            return True
+        if alive is None:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _close_windows_pty_adapter(pty: Any) -> bool:
+    """Release the direct PTY adapter without terminating its process root."""
+
+    close = getattr(pty, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            return False
+    try:
+        pty.closed = True
+    except Exception:
+        pass
+    reader = getattr(pty, "_thread", None)
+    return reader is None or not reader.is_alive()
 
 
 def _windows_pty_tokens(command: str) -> list[str]:

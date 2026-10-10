@@ -941,12 +941,15 @@ class UthCodeApplication:
             return ()
         return self._session_service.list_catalog()
 
-    def session_catalog_metadata(self) -> tuple[SessionCatalogEntry, ...]:
+    def session_catalog_metadata(
+        self,
+        project_key: str | None = None,
+    ) -> tuple[SessionCatalogEntry, ...]:
         """Return Session Picker rows without loading every transcript."""
 
         if self._session_service is None:
             return ()
-        return self._session_service.list_catalog_metadata()
+        return self._session_service.list_catalog_metadata(project_key=project_key)
 
     def new_session_for_command(self) -> ApplicationSession:
         """Create and commit a fresh Session only after staging succeeds."""
@@ -3345,25 +3348,14 @@ class UthCodeApplication:
         ) -> GenerationRequest:
             nonlocal limits_ready, frozen_provider_limits, frozen_budget
             nonlocal validate_candidate_for_compaction
-            if not limits_ready:
-                frozen_provider_limits = await _resolve_model_limits_async(
-                    provider,
-                    remote_model_id,
-                )
-                self._last_provider_limits = frozen_provider_limits
-                self._last_provider_limits_model = remote_model_id
-                self._last_provider_limits_provider = provider
-                frozen_budget = resolve_context_budget(
-                    configured_input_limit=configured_input_limit,
-                    provider_limits=frozen_provider_limits,
-                    requested_output_reserve=max_output_tokens,
-                )
-                compaction_note["retained_target"] = frozen_budget.retained_target
-                limits_ready = True
             process_messages = messages[process_message_start:]
             authoritative_gate_after_compaction: dict[str, object] | None = None
             authoritative_low_water_reached = False
             if persist_closed_messages is not None:
+                # Flush the durable conversation boundary before any async
+                # Provider capability lookup. The live user-entry event has
+                # already attempted this synchronously after its message ID
+                # was bound; this is the existing retry path for that write.
                 persisted_cursor = persist_closed_messages(messages, turn_id)
                 if persisted_cursor is not None:
                     if (
@@ -3383,6 +3375,21 @@ class UthCodeApplication:
                     # The Context service removes its durable copy before
                     # merging this process-local projection.
                     process_messages = messages[process_message_start:]
+            if not limits_ready:
+                frozen_provider_limits = await _resolve_model_limits_async(
+                    provider,
+                    remote_model_id,
+                )
+                self._last_provider_limits = frozen_provider_limits
+                self._last_provider_limits_model = remote_model_id
+                self._last_provider_limits_provider = provider
+                frozen_budget = resolve_context_budget(
+                    configured_input_limit=configured_input_limit,
+                    provider_limits=frozen_provider_limits,
+                    requested_output_reserve=max_output_tokens,
+                )
+                compaction_note["retained_target"] = frozen_budget.retained_target
+                limits_ready = True
 
             def compose(
                 provider_count: ContextCountEstimate | int | None,

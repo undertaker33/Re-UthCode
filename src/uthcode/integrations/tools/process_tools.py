@@ -1927,8 +1927,24 @@ class ProcessTool:
                     "default": _DEFAULT_PROCESS_READ_WAIT_MS,
                     "description": "For read, wait at most this long for new output or process termination.",
                 },
-                "input": {"type": "string"},
-                "data": {"type": "string"},
+                "input": {
+                    "type": "string",
+                    "description": (
+                        "Write raw text to the process; no Enter or line ending is added. "
+                        "For a Windows cmd.exe PTY, send an actual carriage return "
+                        "(\\r, U+000D), commonly CRLF. Literal backslash-r/backslash-n "
+                        "characters are not Enter."
+                    ),
+                },
+                "data": {
+                    "type": "string",
+                    "description": (
+                        "Write raw text to the process; no Enter or line ending is added. "
+                        "For a Windows cmd.exe PTY, send an actual carriage return "
+                        "(\\r, U+000D), commonly CRLF. Literal backslash-r/backslash-n "
+                        "characters are not Enter."
+                    ),
+                },
                 "eof": {"type": "boolean"},
                 "rows": {"type": "integer", "minimum": 1, "maximum": 4096},
                 "cols": {"type": "integer", "minimum": 1, "maximum": 4096},
@@ -2163,21 +2179,31 @@ def _failure_kind(value: str) -> ToolFailureKind:
 
 def _process_result(read: object, managed: object) -> ToolExecutionResult:
     entries = getattr(read, "entries")
-    sections: list[str] = []
+    sections = [
+        _process_status_summary(
+            getattr(managed, "process_id"),
+            getattr(read, "state"),
+            getattr(read, "next_cursor"),
+            getattr(read, "exit_code"),
+        )
+    ]
     streams: dict[str, list[str]] = {"stdout": [], "stderr": [], "terminal": []}
     for entry in entries:
         streams.setdefault(entry.stream, []).append(entry.text)
+    output_sections: list[str] = []
     if getattr(managed, "pty", None) is not None:
-        sections.extend(streams.get("terminal", []))
+        output_sections.extend(streams.get("terminal", []))
     else:
         if streams.get("stdout"):
-            sections.append(f"STDOUT:\n{''.join(streams['stdout']).rstrip()}")
+            output_sections.append(f"STDOUT:\n{''.join(streams['stdout']).rstrip()}")
         if streams.get("stderr"):
-            sections.append(f"STDERR:\n{''.join(streams['stderr']).rstrip()}")
-    if not sections:
-        sections.append("(no output)" if getattr(read, "state") == "exited" else "(no new output)")
+            output_sections.append(f"STDERR:\n{''.join(streams['stderr']).rstrip()}")
     if getattr(read, "cursor_expired"):
-        sections.insert(0, f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+        sections.append(f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+    if not output_sections:
+        output_sections.append(
+            "(no output)" if getattr(read, "state") == "exited" else "(no new output)"
+        )
     state = getattr(read, "state")
     exit_code = getattr(read, "exit_code")
     timed_out = getattr(managed, "timed_out", False) is True
@@ -2188,7 +2214,8 @@ def _process_result(read: object, managed: object) -> ToolExecutionResult:
             if isinstance(timeout_seconds, (int, float))
             else "Error: command timed out"
         )
-        sections.insert(0, timeout_text)
+        sections.append(timeout_text)
+    sections.extend(output_sections)
     if state == "exited" and exit_code not in (None, 0):
         sections.append(f"Exit code: {exit_code}")
     failed = timed_out or (state == "exited" and exit_code not in (None, 0))
@@ -2221,11 +2248,20 @@ def _process_result(read: object, managed: object) -> ToolExecutionResult:
 
 def _process_read_result(read: object) -> ToolExecutionResult:
     entries = getattr(read, "entries")
-    sections = [f"[{entry.stream}] {entry.text}" for entry in entries]
-    if not sections:
-        sections.append("(no new output)")
+    sections = [
+        _process_status_summary(
+            getattr(read, "process_id"),
+            getattr(read, "state"),
+            getattr(read, "next_cursor"),
+            getattr(read, "exit_code"),
+        )
+    ]
     if getattr(read, "cursor_expired"):
-        sections.insert(0, f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+        sections.append(f"Cursor expired; earliest_cursor={getattr(read, 'earliest_cursor')}")
+    output_sections = [f"[{entry.stream}] {entry.text}" for entry in entries]
+    if not output_sections:
+        output_sections.append("(no new output)")
+    sections.extend(output_sections)
     state = getattr(read, "state")
     exit_code = getattr(read, "exit_code")
     if state == "exited" and exit_code not in (None, 0):
@@ -2254,6 +2290,23 @@ def _process_read_result(read: object) -> ToolExecutionResult:
             "expiration_reason": getattr(read, "expiration_reason", None),
         },
     )
+
+
+def _process_status_summary(
+    process_id: str,
+    state: str,
+    next_cursor: int,
+    exit_code: int | None,
+) -> str:
+    """Expose the bounded process handle facts needed for later Process calls."""
+
+    summary = (
+        f"Process status: process_id={process_id}; state={state}; "
+        f"next_cursor={next_cursor}"
+    )
+    if exit_code is not None:
+        summary += f"; exit_code={exit_code}"
+    return summary
 
 
 def _process_failure(

@@ -1474,7 +1474,11 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
 
     def flaky_persist(messages, *, session_id, turn_id, **terminal):  # type: ignore[no-untyped-def]
         calls.append((tuple(messages), session_id, turn_id, tuple(terminal["message_ids"])))
-        if len(calls) == 1:
+        # Fail both the event-boundary write and the prepare retry. With the
+        # durable retry moved before Provider limit discovery, a single
+        # transient failure would now reach the unrelated context-budget
+        # gate before this test exercised persistent append failure.
+        if len(calls) <= 2:
             return SimpleNamespace(
                 persisted_message_count=0,
                 transcript_durability="not_durable",
@@ -1488,17 +1492,25 @@ async def test_w05_transcript_append_failure_retries_same_batch_identity_in_fifo
 
     monkeypatch.setattr(application, "_persist_run_messages", flaky_persist)
     handle = application.create_run().start_turn("retry this closed fact")
-    events = [event async for event in handle.events()]
+    event_status_at_delivery: list[str] = []
+    events = []
+    async for event in handle.events():
+        events.append(event)
+        if isinstance(event, TurnStarted):
+            event_status_at_delivery.append(
+                str(application.diagnostics()["history_persistence"]["status"])
+            )
     result = await handle.result()
 
     assert result.status.value != "completed"
     assert result.failure_reason is FailureReason.PERSISTENCE_UNAVAILABLE
     assert len(provider.requests) == 0
-    assert len(calls) == 2
-    assert calls[0][1:] == calls[1][1:]
-    assert calls[0][0] == calls[1][0]
+    assert len(calls) == 3
+    assert calls[0][1:] == calls[1][1:] == calls[2][1:]
+    assert calls[0][0] == calls[1][0] == calls[2][0]
     user_message_id = next(event.message_id for event in events if isinstance(event, TurnStarted))
-    assert calls[0][3] == calls[1][3] == (user_message_id,)
+    assert calls[0][3] == calls[1][3] == calls[2][3] == (user_message_id,)
+    assert event_status_at_delivery == ["committed"]
     assert application.diagnostics()["history_persistence"]["status"] == "committed"  # type: ignore[index]
 
 
@@ -2446,7 +2458,7 @@ async def test_hard_unsafe_ordinary_request_never_streams_to_provider(tmp_path) 
         configuration=EffectiveConfig.single_model(
             "configured/ref",
             remote_id="frozen-model",
-            context_window=1_000,
+            context_window=900,
             max_output_tokens=256,
         ),
         session_service=session_service,

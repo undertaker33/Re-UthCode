@@ -304,6 +304,19 @@ class AgentRun:
         # evaluator and Session-grant store as Core preflight.
         cancellation.permission_resolver = self._resolve_permission  # type: ignore[attr-defined]
         cancellation.session_grant_sink = self._store_session_grant  # type: ignore[attr-defined]
+
+        driver_ref: list[_TurnDriver | None] = [None]
+
+        def persist_closed_messages(
+            messages: Sequence[Message],
+            persisted_turn_id: str,
+        ) -> int | None:
+            cursor = self._persist_closed_messages(messages, persisted_turn_id)
+            driver = driver_ref[0]
+            if driver is not None:
+                driver._release_events_when_persisted(cursor, len(messages))
+            return cursor
+
         execution = self._application._start_agent_turn(
             self._state,
             user_input,
@@ -313,11 +326,12 @@ class AgentRun:
             permission_resolver=self._resolve_permission,
             session_grant_sink=self._store_session_grant,
             process_message_start=self._persisted_message_count,
-            persist_closed_messages=self._persist_closed_messages,
+            persist_closed_messages=persist_closed_messages,
         )
         self._state = execution.state
         self._turn_message_start = message_start
-        driver = _TurnDriver(self, execution)
+        driver = _TurnDriver(self, execution, persist_closed_messages)
+        driver_ref[0] = driver
         handle = TurnHandle(self, driver)
         driver.attach(handle)
         self._active_turn = handle
@@ -621,11 +635,20 @@ class _TurnDriver:
         "_open_visible_message_id",
         "_failed_visible_parts",
         "_usage_baseline",
+        "_persist_closed_messages",
+        "_deferred_events",
+        "_delivery_deferred",
     )
 
-    def __init__(self, run: AgentRun, execution: AgentTurnExecution) -> None:
+    def __init__(
+        self,
+        run: AgentRun,
+        execution: AgentTurnExecution,
+        persist_closed_messages: Callable[[Sequence[Message], str], int | None],
+    ) -> None:
         self._run = run
         self.execution = execution
+        self._persist_closed_messages = persist_closed_messages
         self._queue: asyncio.Queue[object] | None = None
         self._result_future: asyncio.Future[TurnResult] | None = None
         self._result_value: TurnResult | None = None
@@ -640,6 +663,8 @@ class _TurnDriver:
         self._open_visible_message_id: str | None = None
         self._failed_visible_parts: list[ReasoningPart | TextPart] = []
         self._usage_baseline: Usage | None = None
+        self._deferred_events: list[AgentEvent] = []
+        self._delivery_deferred = False
 
     def attach(self, handle: TurnHandle) -> None:
         if self._handle is not None:
@@ -779,7 +804,49 @@ class _TurnDriver:
                 raise RuntimeError("Application received more than one pending pause")
             self._pending_pause = event.pause
             self._response_waiter = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait(event)
+            if self._delivery_deferred:
+                # A pause needs a consumer response to continue. If a prior
+                # Transcript write did not succeed, expose the buffered live
+                # facts at this boundary without claiming durability.
+                self._deferred_events.append(event)
+                self._release_deferred_events()
+                return
+        if isinstance(event, (TurnStarted, UserSteeringApplied)):
+            # Bind the actual Core message UUID first, then persist that user
+            # entry before publishing it. The renderer uses this event to read
+            # Project catalog timestamps while the following Provider work
+            # may remain in flight for an arbitrary time.
+            self._delivery_deferred = True
+            self._deferred_events.append(event)
+            messages = self.execution.state.messages
+            cursor = self._persist_closed_messages(messages, event.turn_id)
+            self._release_events_when_persisted(cursor, len(messages))
+            return
+        if self._delivery_deferred:
+            self._deferred_events.append(event)
+        else:
+            self._queue.put_nowait(event)
+
+    def _release_events_when_persisted(
+        self,
+        cursor: int | None,
+        message_count: int,
+    ) -> None:
+        if cursor is None or (
+            isinstance(cursor, int)
+            and not isinstance(cursor, bool)
+            and cursor == message_count
+        ):
+            self._release_deferred_events()
+
+    def _release_deferred_events(self) -> None:
+        if not self._delivery_deferred:
+            return
+        self._delivery_deferred = False
+        assert self._queue is not None
+        for event in self._deferred_events:
+            self._queue.put_nowait(event)
+        self._deferred_events.clear()
 
     def failed_visible_message(self) -> Message | None:
         """Return only uncommitted text that was already publicly emitted."""
@@ -919,17 +986,24 @@ class _TurnDriver:
                     # The terminal result remains authoritative; an unknown
                     # process state is surfaced by the Process/Bridge facts.
                     pass
-        if self._result_value is None:
-            self._result_value = result
-            if self._result_future is None:
-                self._result_future = asyncio.get_running_loop().create_future()
-            if not self._result_future.done():
-                self._result_future.set_result(result)
-            handle = self._handle
-            if handle is not None:
-                self._run._complete_turn(handle, result)
-        self._clear_pause_coordination()
-        self._close_event_stream()
+        handle = self._handle
+        try:
+            if self._result_value is None:
+                self._result_value = result
+                if self._result_future is None:
+                    self._result_future = asyncio.get_running_loop().create_future()
+                if not self._result_future.done():
+                    self._result_future.set_result(result)
+                if handle is not None:
+                    self._run._complete_turn(handle, result)
+        finally:
+            # Terminal completion retries the pending Transcript FIFO. If it
+            # commits the deferred user entry, publish only after that commit
+            # so the consumer's catalog read can observe its timestamp. On a
+            # final write failure, still release the live events and terminal.
+            self._release_deferred_events()
+            self._clear_pause_coordination()
+            self._close_event_stream()
 
     async def _finish_unexpected(self) -> None:
         try:
@@ -942,6 +1016,7 @@ class _TurnDriver:
             await self._finish_terminal(segment.result)
         else:
             self._clear_pause_coordination()
+            self._release_deferred_events()
             self._close_event_stream()
 
 

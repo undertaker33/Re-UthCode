@@ -124,6 +124,7 @@ class _OutputState:
     name: str | None = None
     arguments: str = ""
     text_by_index: dict[int, str] = field(default_factory=dict)
+    reasoning_content_by_index: dict[int, str] = field(default_factory=dict)
     summary_by_index: dict[int, str] = field(default_factory=dict)
     added: bool = False
     done: bool = False
@@ -307,6 +308,52 @@ def _summary_part_text(value: object) -> str:
     if not isinstance(text, str):
         raise InvalidProviderResponseError("Responses reasoning summary part text is invalid")
     return text
+
+
+def _reasoning_content_parts(value: object) -> dict[int, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise InvalidProviderResponseError("Responses reasoning content must be a sequence")
+    parts: dict[int, str] = {}
+    for index, item in enumerate(value):
+        if _field(item, "type") != "reasoning_text":
+            raise InvalidProviderResponseError(
+                "Responses reasoning content part is invalid"
+            )
+        text = _field(item, "text")
+        if not isinstance(text, str):
+            raise InvalidProviderResponseError(
+                "Responses reasoning content text is invalid"
+            )
+        parts[index] = text
+    return parts
+
+
+def _merge_streamed_reasoning_content(
+    payload: dict[str, object], state: _OutputState
+) -> dict[str, object]:
+    if not state.reasoning_content_by_index:
+        return payload
+    content = _reasoning_content_parts(payload.get("content"))
+    for index, streamed_text in state.reasoning_content_by_index.items():
+        snapshot_text = content.get(index)
+        if snapshot_text is not None and snapshot_text != streamed_text:
+            raise InvalidProviderResponseError(
+                "Responses reasoning content conflicts with deltas"
+            )
+        if snapshot_text is None:
+            content[index] = streamed_text
+    merged = dict(payload)
+    merged["content"] = [
+        {"type": "reasoning_text", "text": content[index]}
+        for index in sorted(content)
+    ]
+    return merged
+
+
+def _joined_indexed_text(values: Mapping[int, str]) -> str:
+    return "".join(values[index] for index in sorted(values))
 
 
 def _item_text(payload: Mapping[str, object], field_name: str) -> str:
@@ -715,6 +762,8 @@ class OpenAIResponsesProvider:
                         kind=item_type,
                     )
                     snapshot = _item_payload(item)
+                    if item_type == "reasoning":
+                        snapshot = _merge_streamed_reasoning_content(snapshot, state)
                     if state.native_payload is not None and state.native_payload != snapshot:
                         raise InvalidProviderResponseError(
                             "Responses output item snapshots conflict"
@@ -899,6 +948,59 @@ class OpenAIResponsesProvider:
                             "Responses completed reasoning text conflicts with deltas"
                         )
                     state.summary_by_index[summary_index] = text
+                elif event_type == "response.reasoning_text.delta":
+                    item_id = _field(event, "item_id")
+                    output_index = _required_index(
+                        _field(event, "output_index"), "output index"
+                    )
+                    content_index = _required_index(
+                        _field(event, "content_index"), "content index"
+                    )
+                    delta = _field(event, "delta")
+                    if not isinstance(delta, str):
+                        raise InvalidProviderResponseError(
+                            "Responses reasoning content delta is invalid"
+                        )
+                    state = _state_for(
+                        states_by_index,
+                        states_by_id,
+                        states_by_call,
+                        output_index=output_index,
+                        item_id=item_id,
+                        kind="reasoning",
+                    )
+                    state.reasoning_content_by_index[content_index] = (
+                        state.reasoning_content_by_index.get(content_index, "") + delta
+                    )
+                    if delta:
+                        yield ReasoningDelta(delta)
+                elif event_type == "response.reasoning_text.done":
+                    item_id = _field(event, "item_id")
+                    output_index = _required_index(
+                        _field(event, "output_index"), "output index"
+                    )
+                    content_index = _required_index(
+                        _field(event, "content_index"), "content index"
+                    )
+                    text = _field(event, "text")
+                    if not isinstance(text, str):
+                        raise InvalidProviderResponseError(
+                            "Responses completed reasoning content is invalid"
+                        )
+                    state = _state_for(
+                        states_by_index,
+                        states_by_id,
+                        states_by_call,
+                        output_index=output_index,
+                        item_id=item_id,
+                        kind="reasoning",
+                    )
+                    accumulated = state.reasoning_content_by_index.get(content_index, "")
+                    if accumulated and accumulated != text:
+                        raise InvalidProviderResponseError(
+                            "Responses completed reasoning content conflicts with deltas"
+                        )
+                    state.reasoning_content_by_index[content_index] = text
                 elif event_type == "response.function_call_arguments.delta":
                     item_id = _field(event, "item_id")
                     output_index = _required_index(
@@ -1001,6 +1103,8 @@ class OpenAIResponsesProvider:
                                 call_id=payload.get("call_id"),
                                 kind=item_type,
                             )
+                            if item_type == "reasoning":
+                                payload = _merge_streamed_reasoning_content(payload, state)
                             if state.native_payload is not None and state.native_payload != payload:
                                 raise InvalidProviderResponseError(
                                     "Responses terminal output conflicts with item"
@@ -1060,12 +1164,16 @@ class OpenAIResponsesProvider:
                         )
                     parts.append(TextPart(text))
                 elif state.kind == "reasoning":
-                    text = _item_text(payload, "summary")
-                    if not text:
-                        text = "".join(
-                            state.summary_by_index[index]
-                            for index in sorted(state.summary_by_index)
-                        )
+                    content_text = _joined_indexed_text(
+                        _reasoning_content_parts(payload.get("content"))
+                        or state.reasoning_content_by_index
+                    )
+                    summary_text = _item_text(payload, "summary")
+                    if not summary_text:
+                        summary_text = _joined_indexed_text(state.summary_by_index)
+                    text = "\n".join(
+                        value for value in (content_text, summary_text) if value
+                    )
                     parts.append(ReasoningPart(text))
                 elif state.kind == "function_call":
                     call_id = state.call_id or _optional_text(payload.get("call_id"))
