@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Sequence
 
-from uthcode.prompt_assets import read_public_coding_prompt
+from uthcode.prompt_assets import (
+    read_public_coding_prompt,
+    read_public_general_prompt,
+)
 
 from .provider import ToolDefinition
 from .planning import BehaviorMode, PlanState, RuntimeFeedback, TaskState
@@ -417,6 +420,19 @@ def public_prompt_source() -> ContextBlock:
     )
 
 
+def public_general_prompt_source() -> ContextBlock:
+    """Return the packaged public prompt for the General Application mode."""
+
+    return ContextBlock(
+        source_kind=ContextSourceKind.PUBLIC_PROMPT,
+        authority=ContextAuthority.PUBLIC_PROMPT,
+        stability=ContextStability.STABLE,
+        scope=ContextScope.GLOBAL,
+        provenance="package:uthcode/prompt_assets/general_assistant.md",
+        content=read_public_general_prompt(),
+    )
+
+
 _CORE_RUNTIME_CONTRACT = (
     "Core 维护 provider-independent 的运行契约：只接受经过验证的 UthCode 数据，"
     "保持唯一状态写入者、严格结果配对和可观测事实；动态运行事实不改变稳定指令前缀。"
@@ -636,4 +652,5 @@ __all__ = [
     "estimate_tool_schema_tokens",
     "instruction_prefix_fingerprint",
     "public_prompt_source",
+    "public_general_prompt_source",
 ]

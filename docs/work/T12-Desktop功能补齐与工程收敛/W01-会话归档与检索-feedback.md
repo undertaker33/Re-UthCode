@@ -68,3 +68,6 @@ Checklist 已勾选本 Worker 有定向证据的 T01 两项与 T02 A02。T02 A01
 原 Worker 使用 GPT-6 Luna / max；独立 Reviewer 使用 GPT-6.1 Sol / medium。首轮两项 P2 经原 Worker 返工 1 后，由同一 Reviewer 复审通过，未发现补修引入的具体新问题。
 
 Reviewer 在 `re-uthcode` / Python 3.12.13 执行 `python -m pytest tests/test_session_authority.py -k 'search_title_hit_skips_metadata or application_search_cancellation_stops' -q`：`3 passed, 33 deselected in 1.15s`；`git diff --check` 退出码 0。未重复执行 Worker 的 72 用例套件，未运行 Desktop/E2E。当前代码交付满足 W01 实施边界，登记权威与运行态门禁保留后续联调验收。
+## 总控 Git 交付记录
+
+W01 实施提交 `26fa799d9a02b1ff454390e3702c1d6b50518f0e` 已在 `T11-Agent能力补齐` 推送；[PR #127](https://github.com/undertaker33/Re-UthCode/pull/127) 合入 `main`，合并提交 `e74b70942c6c167c53f775da04ae31a7ddb21faf`。合并后将当前 T11 fast-forward 到此提交并推送，核对本地 T11、远端 T11/main 三者一致，工作区干净；首份提交包含原工作包/参考资产及本轮 W01 源码与证据，共 21 文件，暂存和 PR 范围未发现无关文件。无新文件夹，未归档。

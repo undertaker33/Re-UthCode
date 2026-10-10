@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from uthcode.application import (
+    ApplicationMode,
     ApplicationSessionService,
     ApplicationRuntimeContext,
     ConfigSource,
@@ -13,6 +14,7 @@ from uthcode.application import (
     ModelProfile,
     ProviderKind,
     ProviderProfile,
+    SessionOperationError,
     UthCodeApplication,
     create_application,
 )
@@ -424,3 +426,78 @@ async def test_active_turn_keeps_its_provider_and_model_snapshot(tmp_path: Path)
 
     assert (await run.start_turn("second").result()).final_text == "remote-two"
     assert second.recorded_requests[-1].model == "remote-two"
+
+
+@pytest.mark.asyncio
+async def test_general_application_is_tool_free_across_create_reload_and_recovery(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "coding-project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("coding-only instruction", encoding="utf-8")
+    storage_root = tmp_path / "sessions"
+    config = _config(tmp_path)
+    context = ApplicationRuntimeContext.from_system(workdir=project)
+
+    application = create_application(
+        config,
+        provider_builder=_builder,
+        runtime_context=context,
+        storage_root=storage_root,
+        application_mode=ApplicationMode.GENERAL,
+    )
+    assert application.application_mode is ApplicationMode.GENERAL
+    assert application.session_service is not None
+    assert application.session_service.project_key == "uthcode:general"
+    assert application.instruction_loader is not None
+    assert application.instruction_loader.project_root is None
+    assert application.tool_definitions() == ()
+    assert application._agent_tool_definitions() == ()
+    session = application.create_session("general-session")
+    assert session.project_key == "uthcode:general"
+
+    first_result = await application.create_run().start_turn("hello").result()
+    assert first_result.final_text == "remote-one"
+    first_request = application.provider.recorded_requests[-1]
+    assert first_request.tools == ()
+    assert "日常文本交流" in first_request.system_prompt
+    assert "coding-only instruction" not in first_request.system_prompt
+    assert str(project) not in first_request.system_prompt
+
+    application.reload_configuration(config)
+    assert application.tool_definitions() == ()
+    second_result = await application.create_run().start_turn("again").result()
+    assert second_result.final_text == "remote-one"
+    assert application.provider.recorded_requests[-1].tools == ()
+    application.close()
+
+    recovered = create_application(
+        config,
+        provider_builder=_builder,
+        runtime_context=context,
+        storage_root=storage_root,
+        application_mode="general",
+    )
+    resumed = recovered.resume_session("general-session")
+    assert resumed.project_key == "uthcode:general"
+    assert recovered.tool_definitions() == ()
+    restart_result = await recovered.create_run().start_turn("after restart").result()
+    assert restart_result.final_text == "remote-one"
+    restart_request = recovered.provider.recorded_requests[-1]
+    assert restart_request.tools == ()
+    assert "日常文本交流" in restart_request.system_prompt
+    assert "coding-only instruction" not in restart_request.system_prompt
+    recovered.close()
+
+    coding = create_application(
+        config,
+        provider_builder=_builder,
+        runtime_context=context,
+        storage_root=storage_root,
+    )
+    assert coding.tool_definitions()
+    assert coding.instruction_loader is not None
+    assert coding.instruction_loader.project_root == project.resolve()
+    with pytest.raises(SessionOperationError):
+        coding.resume_session("general-session")
+    coding.close()

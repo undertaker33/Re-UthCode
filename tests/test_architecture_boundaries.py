@@ -116,12 +116,18 @@ def test_core_and_application_have_only_allowed_dependency_edges() -> None:
                     }
                 )
         if source_path.name == "generation.py":
-            allowed_integration_imports.add("uthcode.integrations.attachment_files")
+            allowed_integration_imports.update(
+                {
+                    "uthcode.integrations.attachment_files",
+                    "uthcode.integrations.tools.git_tools",
+                }
+            )
         if source_path.name == "sessions.py":
             allowed_integration_imports.update(
                 {
                     "uthcode.integrations.session_files",
                     "uthcode.integrations.attachment_files",
+                        "uthcode.integrations.tools.tool_result_read",
                 }
             )
         if source_path.name == "attachments.py":
@@ -404,7 +410,24 @@ def test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path() -> None
     generation = (SRC / "application" / "generation.py").read_text(encoding="utf-8")
     assert "AskUserQuestion is reserved for the Application Agent path" in application_tools
     assert "async def execute_calls" not in application_tools
-    assert "ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)" in generation
+    generation_tree = ast.parse(generation)
+    helper = next(
+        node
+        for node in ast.walk(generation_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_agent_tool_definitions"
+    )
+    general_mode = helper.body[0]
+    assert isinstance(general_mode, ast.If)
+    assert ast.unparse(general_mode.test) == (
+        "self._application_mode is ApplicationMode.GENERAL"
+    )
+    assert ast.unparse(general_mode.body[0]) == "return ()"
+    coding_tools = ast.unparse(helper.body[-1])
+    assert "self._tool_service.definitions()" in coding_tools
+    assert "ASK_USER_TOOL_DEFINITION" in coding_tools
+    assert "TODO_WRITE_TOOL_DEFINITION" in coding_tools
+    assert "PROPOSE_PLAN_TOOL_DEFINITION" in coding_tools
 
 
 def test_protocol_wire_fields_stay_in_their_physical_modules() -> None:

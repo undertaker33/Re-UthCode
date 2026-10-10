@@ -5,7 +5,8 @@ from __future__ import annotations
 import heapq
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PureWindowsPath
 from threading import Lock
 
 from uthcode.core.agent_events import FailureReason, TerminationReason
@@ -44,6 +45,7 @@ from uthcode.integrations.session_files import (
     normalize_session_title,
 )
 from uthcode.integrations.attachment_files import AttachmentError, AttachmentReference
+from uthcode.integrations.tools.tool_result_read import ToolResultError, ToolResultReference
 
 from .instructions import InstructionError, InstructionLoader, InstructionStateMetadata
 
@@ -106,6 +108,13 @@ class SessionReplayRecord:
     status: str | None = None
     is_error: bool = False
     created_at: str | None = None
+    assistant_kind: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    output_ref: str | None = None
+    output_preview: str | None = None
+    output_preview_truncated: bool = False
+    file_changes: tuple[Mapping[str, object], ...] = ()
     title: str | None = None
     termination_reason: str | None = None
     failure_reason: str | None = None
@@ -136,6 +145,11 @@ class SessionReplayRecord:
             (self.tool_call_id, "tool_call_id"),
             (self.status, "status"),
             (self.created_at, "created_at"),
+            (self.assistant_kind, "assistant_kind"),
+            (self.started_at, "started_at"),
+            (self.completed_at, "completed_at"),
+            (self.output_ref, "output_ref"),
+            (self.output_preview, "output_preview"),
             (self.termination_reason, "termination_reason"),
             (self.failure_reason, "failure_reason"),
             (self.message_id, "message_id"),
@@ -148,12 +162,28 @@ class SessionReplayRecord:
             raise ValueError("replay tool_call_id must be non-empty when provided")
         if self.status is not None and self.status not in _REPLAY_TOOL_STATUSES:
             raise ValueError("unsupported replay tool status")
+        if self.assistant_kind is not None and self.assistant_kind not in {
+            "progress",
+            "final",
+            "incomplete",
+        }:
+            raise ValueError("unsupported assistant replay kind")
+        if self.assistant_kind is not None and self.kind != "assistant":
+            raise ValueError("assistant_kind is valid only for assistant replay records")
         if self.termination_reason is not None:
             TerminationReason(self.termination_reason)
         if self.failure_reason is not None:
             FailureReason(self.failure_reason)
         if self.message_id is not None and not self.message_id.strip():
             raise ValueError("replay message_id must be non-empty when provided")
+        for value, field_name in (
+            (self.started_at, "started_at"),
+            (self.completed_at, "completed_at"),
+            (self.output_ref, "output_ref"),
+            (self.output_preview, "output_preview"),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"replay {field_name} must be non-empty when provided")
         if not isinstance(self.attachments, tuple):
             object.__setattr__(self, "attachments", tuple(self.attachments))
         normalized_attachments: list[Mapping[str, object]] = []
@@ -168,6 +198,63 @@ class SessionReplayRecord:
             raise TypeError("replay is_error must be a boolean")
         if self.title is not None:
             object.__setattr__(self, "title", normalize_session_title(self.title))
+        if self.output_preview is not None and len(self.output_preview) > 1024:
+            raise ValueError("replay output_preview must not exceed 1024 characters")
+        if not isinstance(self.output_preview_truncated, bool):
+            raise TypeError("replay output_preview_truncated must be a boolean")
+        if self.output_preview_truncated and self.output_preview is None:
+            raise ValueError("truncated replay output requires preview text")
+        if not isinstance(self.file_changes, tuple):
+            object.__setattr__(self, "file_changes", tuple(self.file_changes))
+        changes: list[Mapping[str, object]] = []
+        for change in self.file_changes:
+            if not isinstance(change, Mapping) or not all(
+                isinstance(key, str) for key in change
+            ):
+                raise TypeError("replay file_changes must contain mappings with string keys")
+            value = dict(change)
+            tool_name = value.get("tool_name")
+            status = value.get("status")
+            if tool_name in {"WriteFile", "EditFile"}:
+                if (
+                    set(value) != {"tool_name", "path", "status"}
+                    or not isinstance(value.get("path"), str)
+                    or status != "changed"
+                ):
+                    raise ValueError("replay file change is invalid")
+                safe_path = _safe_workspace_relative_path(value["path"])
+                if safe_path is None or safe_path != value["path"]:
+                    raise ValueError("replay file change path is invalid")
+            elif tool_name == "ApplyPatch":
+                paths = value.get("applied_paths")
+                if (
+                    set(value)
+                    != {
+                        "tool_name",
+                        "status",
+                        "applied_paths",
+                        "failed_count",
+                        "not_applied_count",
+                    }
+                    or status not in {"applied", "partial"}
+                    or isinstance(paths, (str, bytes, bytearray))
+                    or not isinstance(paths, Sequence)
+                    or not all(
+                        isinstance(path, str)
+                        and _safe_workspace_relative_path(path) == path
+                        for path in paths
+                    )
+                ):
+                    raise ValueError("replay patch change is invalid")
+                for count_name in ("failed_count", "not_applied_count"):
+                    count = value.get(count_name)
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                        raise ValueError("replay patch counts must be non-negative integers")
+                value["applied_paths"] = tuple(paths)
+            else:
+                raise ValueError("replay file change tool is unsupported")
+            changes.append(value)
+        object.__setattr__(self, "file_changes", tuple(changes))
         if self.part_index is not None and (
             isinstance(self.part_index, bool)
             or not isinstance(self.part_index, int)
@@ -191,6 +278,11 @@ class SessionReplayRecord:
             "tool_call_id",
             "status",
             "created_at",
+            "assistant_kind",
+            "started_at",
+            "completed_at",
+            "output_ref",
+            "output_preview",
             "title",
             "termination_reason",
             "failure_reason",
@@ -199,6 +291,20 @@ class SessionReplayRecord:
             field_value = getattr(self, field_name)
             if field_value is not None:
                 value[field_name] = field_value
+        if self.output_preview_truncated:
+            value["output_preview_truncated"] = True
+        if self.file_changes:
+            value["file_changes"] = [
+                {
+                    **dict(change),
+                    **(
+                        {"applied_paths": list(change["applied_paths"])}
+                        if isinstance(change.get("applied_paths"), tuple)
+                        else {}
+                    ),
+                }
+                for change in self.file_changes
+            ]
         if self.attachments:
             value["attachments"] = [dict(item) for item in self.attachments]
         return value
@@ -326,6 +432,16 @@ class SessionSearchHit:
             raise TypeError("search hit archived must be a boolean")
         if len(self.snippet) > SESSION_SEARCH_SNIPPET_LENGTH:
             raise ValueError("search hit snippet exceeds its limit")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "project_key": self.project_key,
+            "title": self.title,
+            "snippet": self.snippet,
+            "archived": self.archived,
+            "last_used_at": self.last_used_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -810,19 +926,30 @@ class ApplicationSessionService:
         except OSError as exc:
             raise SessionOperationError("storage", session_id=session_id) from exc
 
-    def set_session_archived(self, session_id: str, archived: bool) -> SessionMutation:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        project_key: str | None = None,
+    ) -> SessionMutation:
         """Set the durable archive state through the Session's single writer."""
 
         if not isinstance(archived, bool):
             raise TypeError("archived must be a boolean")
+        expected_project_key = self.project_key if project_key is None else project_key
+        if not isinstance(expected_project_key, str) or not expected_project_key.strip():
+            raise ValueError("project_key must be a non-empty owner key")
         active = self._active
         try:
             if active is not None and active.session_id == session_id:
+                if active.project_key != expected_project_key:
+                    raise SessionOperationError("unknown", session_id=session_id)
                 metadata = active._writer.update_archived(archived)
             else:
                 with self.store.open_writer(
                     session_id,
-                    expected_project_key=self.project_key,
+                    expected_project_key=expected_project_key,
                 ) as writer:
                     metadata = writer.update_archived(archived)
             return _session_mutation(metadata, archived=metadata.archived)
@@ -1561,6 +1688,56 @@ def _entry_message_id(entry: TranscriptEntry) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _externalized_tool_result_ref(part: ToolResultPart, session_id: str) -> str | None:
+    """Expose only a validated opaque reference from durable result metadata."""
+
+    metadata = part.metadata
+    if not isinstance(metadata, Mapping) or metadata.get("persistence_status") != "externalized":
+        return None
+    try:
+        reference = ToolResultReference(
+            ref=metadata.get("ref"),  # type: ignore[arg-type]
+            session_id=session_id,
+            size_bytes=metadata.get("size_bytes"),  # type: ignore[arg-type]
+            sha256=metadata.get("sha256"),  # type: ignore[arg-type]
+        )
+    except (ToolResultError, TypeError, ValueError):
+        return None
+    return reference.ref
+
+
+def _inline_tool_output_preview(part: ToolResultPart) -> tuple[str | None, bool]:
+    """Expose only explicitly materialized, redacted inline text."""
+
+    metadata = part.metadata
+    if not isinstance(metadata, Mapping) or metadata.get("persistence_status") != "inline":
+        return None, False
+    text = "\n".join(
+        item.text for item in part.content.parts if isinstance(item, TextPart)
+    )
+    if not text:
+        return None, False
+    if len(text) > 1024:
+        return text[:1023] + "…", True
+    return text, False
+
+
+def _tool_observation_timestamp(
+    part: ToolResultPart,
+    field_name: str,
+) -> str | None:
+    value = part.metadata.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        observed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return None
+    return value
+
+
 def _attachment_refs_from_entries(
     entries: Sequence[TranscriptEntry],
     session_id: str,
@@ -1613,6 +1790,80 @@ def _attachment_projection(part: object) -> Mapping[str, object] | None:
     return None
 
 
+def _safe_workspace_relative_path(value: object) -> str | None:
+    """Keep only relative, traversal-free paths for historical summaries."""
+
+    if not isinstance(value, str) or not value or any(
+        character in value for character in ("\x00", "\r", "\n")
+    ):
+        return None
+    normalized = value.replace("\\", "/")
+    if normalized.startswith("/") or PureWindowsPath(value).drive:
+        return None
+    parts = normalized.split("/")
+    if any(part == ".." for part in parts):
+        return None
+    clean = tuple(part for part in parts if part not in {"", "."})
+    return "/".join(clean) if clean else None
+
+
+def _tool_file_changes(
+    tool_name: str,
+    tool_path: str | None,
+    result: ToolResultPart,
+) -> tuple[Mapping[str, object], ...]:
+    """Summarize only formal file Tool result facts, never arguments or prose alone."""
+
+    metadata = result.metadata
+    if tool_name in {"WriteFile", "EditFile"}:
+        digest = metadata.get("content_digest")
+        if (
+            result.is_error
+            or metadata.get("evidence") != "file_change"
+            or metadata.get("execution_status") != "succeeded"
+            or metadata.get("changed") is not True
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return ()
+        path = _safe_workspace_relative_path(tool_path)
+        if path is None:
+            return ()
+        return ({"tool_name": tool_name, "path": path, "status": "changed"},)
+
+    if tool_name != "ApplyPatch":
+        return ()
+    if metadata.get("side_effect") not in {"applied", "partial"}:
+        return ()
+    applied = metadata.get("applied")
+    failed = metadata.get("failed")
+    not_applied = metadata.get("not_applied")
+    if any(
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or not all(isinstance(path, str) for path in value)
+        for value in (applied, failed, not_applied)
+    ):
+        return ()
+    applied_paths = [
+        path
+        for raw_path in applied  # type: ignore[union-attr]
+        if (path := _safe_workspace_relative_path(raw_path)) is not None
+    ]
+    if not applied_paths and metadata.get("side_effect") != "partial":
+        return ()
+    return (
+        {
+            "tool_name": "ApplyPatch",
+            "status": "partial" if metadata.get("side_effect") == "partial" else "applied",
+            "applied_paths": applied_paths,
+            "failed_count": len(failed),  # type: ignore[arg-type]
+            "not_applied_count": len(not_applied),  # type: ignore[arg-type]
+        },
+    )
+
+
 def _project_replay(
     snapshot: SessionSnapshot,
     *,
@@ -1638,7 +1889,7 @@ def _project_replay_units(
     """Project a bounded set of complete units without loading a snapshot."""
 
     records: list[SessionReplayRecord] = []
-    calls: dict[str, tuple[str, str]] = {}
+    calls: dict[str, tuple[str, str, str | None, str | None]] = {}
     plan_call_ids: set[str] = set()
     plans: dict[str, tuple[int, str, str, str | None]] = {}
     user_seen: set[str] = set()
@@ -1664,6 +1915,20 @@ def _project_replay_units(
     for unit in units:
         if not isinstance(unit, SemanticUnit):
             raise TypeError("replay units must be SemanticUnit values")
+        progress_message_ids: set[str] = set()
+        for entry in unit.entries:
+            message_id = _entry_message_id(entry)
+            if message_id is None:
+                continue
+            try:
+                parts = _entry_parts(entry)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if any(
+                isinstance(part, ToolCallPart) and part.name != "ProposePlan"
+                for part in parts
+            ):
+                progress_message_ids.add(message_id)
         for entry in unit.entries:
             if entry.kind is TranscriptKind.TURN_FAILURE:
                 termination_reason = entry.payload.get("termination_reason")
@@ -1735,6 +2000,10 @@ def _project_replay_units(
                     calls[part.tool_call_id] = (
                         part.name,
                         _bounded_replay_text(summary),
+                        _entry_message_id(entry),
+                        _safe_workspace_relative_path(part.arguments.get("path"))
+                        if part.name in {"WriteFile", "EditFile"}
+                        else None,
                     )
                     continue
                 if isinstance(part, ToolResultPart):
@@ -1764,11 +2033,12 @@ def _project_replay_units(
                                 )
                             )
                         continue
-                    name, summary = calls.pop(
+                    name, summary, call_message_id, tool_path = calls.pop(
                         part.tool_call_id,
-                        ("Tool", "Tool completed"),
+                        ("Tool", "Tool completed", None, None),
                     )
                     status, is_error = _replay_tool_status(part)
+                    output_preview, output_preview_truncated = _inline_tool_output_preview(part)
                     records.append(
                         SessionReplayRecord(
                             session_id=session_id,
@@ -1781,8 +2051,20 @@ def _project_replay_units(
                             status=status,
                             is_error=is_error,
                             created_at=entry.created_at,
+                            started_at=_tool_observation_timestamp(
+                                part,
+                                "observed_started_at",
+                            ),
+                            completed_at=_tool_observation_timestamp(
+                                part,
+                                "observed_completed_at",
+                            ),
+                            output_ref=_externalized_tool_result_ref(part, session_id),
+                            output_preview=output_preview,
+                            output_preview_truncated=output_preview_truncated,
+                            file_changes=_tool_file_changes(name, tool_path, part),
                             title=title,
-                            message_id=_entry_message_id(entry),
+                            message_id=call_message_id or _entry_message_id(entry),
                             attachments=tuple(
                                 _attachment_projection(item)
                                 for item in part.content
@@ -1814,6 +2096,15 @@ def _project_replay_units(
                             kind=attachment_kind,
                             text="",
                             created_at=entry.created_at,
+                            assistant_kind=(
+                                "incomplete"
+                                if entry.kind is TranscriptKind.FAILED_ASSISTANT_MESSAGE
+                                else (
+                                    "progress"
+                                    if _entry_message_id(entry) in progress_message_ids
+                                    else "final"
+                                )
+                            ) if attachment_kind == "assistant" else None,
                             title=title,
                             message_id=_entry_message_id(entry),
                             attachments=(attachment,),
@@ -1847,6 +2138,15 @@ def _project_replay_units(
                         kind=kind,
                         text=part.text,
                         created_at=entry.created_at,
+                        assistant_kind=(
+                            "incomplete"
+                            if entry.kind is TranscriptKind.FAILED_ASSISTANT_MESSAGE
+                            else (
+                                "progress"
+                                if _entry_message_id(entry) in progress_message_ids
+                                else "final"
+                            )
+                        ) if kind == "assistant" else None,
                         title=title,
                         message_id=_entry_message_id(entry),
                         part_index=part_index,

@@ -78,30 +78,30 @@ Worker：W01；行为：R01–R03；原验收：A01–A02。验证入口参见 T
 
 Worker：W02；行为：R08–R11；原验收：A07–A10。验证入口参见 Tasks 同编号步骤。
 
-- [ ] 不选 Coding Project 即可创建/持久恢复 General Session；跨 mode 引用拒绝，旧无标签 Session 仍归 Coding；Prompt、Instruction 指纹和可信配置未继承项目内容（A07、A09）。
-- [ ] 检查首次创建、配置刷新、恢复后的实际请求及工具可见性：General 默认工具为空且无 Coding 指令，Coding 工具/权限及 Headless 正常与关键失败路径保持（A10）；记录架构测试结果。
+- [x] 不选 Coding Project 即可创建/持久恢复 General Session；跨 mode 引用拒绝，旧无标签 Session 仍归 Coding；Prompt、Instruction 指纹和可信配置未继承项目内容（A07、A09）。
+- [x] 检查首次创建、配置刷新、恢复后的实际请求及工具可见性：General 默认工具为空且无 Coding 指令，Coding 工具/权限及 Headless 正常与关键失败路径保持（A10）；记录架构测试结果。
 
 ### T04 Session 与 General Desktop 协议接入
 
 Worker：W02；行为：R01–R11；原验收：A01–A07、A09–A10。验证入口参见 Tasks 同编号步骤。
 
-- [ ] 空闲目标可归档且无关 Turn 保持；目标 active、paused、pending interaction、compact 均受控拒绝，重复请求幂等且不取消任务（A03）。
-- [ ] 移除再登记同一 Project 后归档/内容仍在；跨 mode/未知 project 引用拒绝，搜索取消及迟到响应按请求/操作身份隔离，不篡改 Bridge 当前 owner；无任意路径读取。Renderer 选择隔离另验 T07（A02、A04）。
-- [ ] 从正式 RPC 创建/恢复 General 并切回 Coding，Coding 后台 Turn/event owner 不变；Main/preload 精确白名单、参数负例及已有 IPC 来源检查通过（A07、A09–A10）。
+- [x] 空闲目标可归档且无关 Turn 保持；目标 active、paused、pending interaction、compact 均受控拒绝，重复请求幂等且不取消任务（A03）。
+- [x] 移除再登记同一 Project 后归档/内容仍在；跨 mode/未知 project 引用拒绝，搜索取消及迟到响应按请求/操作身份隔离，不篡改 Bridge 当前 owner；无任意路径读取。Renderer 选择隔离另验 T07（A02、A04）。
+- [x] 从正式 RPC 创建/恢复 General 并切回 Coding，Coding 后台 Turn/event owner 不变；Main/preload 精确白名单、参数负例及已有 IPC 来源检查通过（A07、A09–A10）。
 
 ### T05 过程回放与安全明细来源
 
 Worker：W02；行为：R12–R14；原验收：A11–A13。验证入口参见 Tasks 同编号步骤。
 
-- [ ] live/replay 保持 Message/Turn/ToolCall 归属和公开进度/最终正文区分；旧无时间记录为 unavailable，terminal 后计时不继续增加（A11–A12）。
-- [ ] 工具输出续读有界脱敏且绑定所属 Session/ref；超限、缺失、旧记录有局部不可用说明；ToolProgress 不进入 Transcript/RunState/Provider request（A13）。
+- [x] live/replay 保持 Message/Turn/ToolCall 归属和公开进度/最终正文区分；旧无时间记录为 unavailable，terminal 后计时不继续增加（A11–A12）。
+- [x] 工具输出续读有界脱敏且绑定所属 Session/ref；超限、缺失、旧记录有局部不可用说明；ToolProgress 不进入 Transcript/RunState/Provider request（A13）。
 
 ### T06 变更摘要与当前只读 Diff 出口
 
 Worker：W02；行为：R15–R16；原验收：A14–A16。验证入口参见 Tasks 同编号步骤。
 
-- [ ] 真实受控 Git 工作区内修改/新增/删除/重命名及非 Git 场景，当前 diff 路径、红绿行来源和有界状态准确；untracked 无虚构增删统计（A14）。
-- [ ] 历史摘要只来自可核实正式写入或观察；单一 git status、Bash 文字、模型声明、并发外部修改不被归到确定 Turn；没有历史快照时不产生历史完整 Diff（A14）。
+- [x] 真实受控 Git 工作区内修改/新增/删除/重命名及非 Git 场景，当前 diff 路径、红绿行来源和有界状态准确；untracked 无虚构增删统计（A14）。
+- [x] 历史摘要只来自可核实正式写入或观察；单一 git status、Bash 文字、模型声明、并发外部修改不被归到确定 Turn；没有历史快照时不产生历史完整 Diff（A14）。
 - [ ] 工作区之外预览需原有单文件授权，工具 ref 与 Session 隔离；文件/图片/Markdown/日志丢失或拒绝均为局部反馈（A15）；packaged 操作留 T15 验收（A16）。
 
 ### T07 双模式导航与搜索归档界面

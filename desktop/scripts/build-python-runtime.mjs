@@ -10,6 +10,13 @@ const outputRoot = join(desktopRoot, ".runtime");
 const workRoot = join(desktopRoot, "packaging", ".build");
 const runtimeRoot = join(outputRoot, "uthcode-runtime");
 const runtimeExecutable = join(runtimeRoot, "uthcode-desktop-runtime.exe");
+const generalPromptAsset = join(
+  runtimeRoot,
+  "_internal",
+  "uthcode",
+  "prompt_assets",
+  "general_assistant.md",
+);
 const condaEnvironment = "re-uthcode";
 const smokeTimeoutMs = 15_000;
 const smokeConfig = `default_model = "fake/ref"
@@ -93,6 +100,13 @@ async function smokeBundledRuntime({ command = runtimeExecutable, args = [] } = 
       ["t08-initialize", "runtime.initialize", { workdir: repoRoot }],
       ["t08-session", "session.new", {}],
       ["t08-status", "status.get", {}],
+      [
+        "t08-general-initialize",
+        "runtime.initialize",
+        { mode: "general", catalog_project_keys: ["uthcode:general"] },
+      ],
+      ["t08-general-session", "session.new", {}],
+      ["t08-general-status", "status.get", {}],
       ["t08-shutdown", "runtime.shutdown", {}],
     ];
     for (const [id, method, params] of requests) {
@@ -129,25 +143,48 @@ async function smokeBundledRuntime({ command = runtimeExecutable, args = [] } = 
       }
       responses.set(envelope.id, envelope);
     }
-    const expectedIds = ["t08-initialize", "t08-session", "t08-status", "t08-shutdown"];
+    const expectedIds = [
+      "t08-initialize",
+      "t08-session",
+      "t08-status",
+      "t08-general-initialize",
+      "t08-general-session",
+      "t08-general-status",
+      "t08-shutdown",
+    ];
     if (responses.size !== expectedIds.length || expectedIds.some((id) => !responses.has(id))) {
       throw new Error("Runtime smoke response correlation did not match the request set");
     }
     assertSmokeResponse(responses, "t08-initialize", "initialize");
     assertSmokeResponse(responses, "t08-session", "session.new");
-    const status = assertSmokeResponse(responses, "t08-status", "status");
+    const codingStatus = assertSmokeResponse(responses, "t08-status", "Coding status");
+    assertSmokeResponse(responses, "t08-general-initialize", "General initialize");
+    assertSmokeResponse(responses, "t08-general-session", "General session.new");
+    const generalStatus = assertSmokeResponse(responses, "t08-general-status", "General status");
     assertSmokeResponse(responses, "t08-shutdown", "shutdown");
-    const applicationStatus = status.result?.application;
-    const contextStatus = applicationStatus?.context_status;
-    if (
-      contextStatus?.available !== true ||
-      contextStatus.source !== "context_compiler" ||
-      typeof applicationStatus?.stable_prefix_fingerprint !== "string" ||
-      applicationStatus.stable_prefix_fingerprint.length === 0
-    ) {
-      throw new Error("Runtime smoke did not compile an Application context from the bundled prompt asset");
+    const codingApplicationStatus = codingStatus.result?.application;
+    const generalApplicationStatus = generalStatus.result?.application;
+    for (const [label, applicationStatus] of [
+      ["Coding", codingApplicationStatus],
+      ["General", generalApplicationStatus],
+    ]) {
+      const contextStatus = applicationStatus?.context_status;
+      if (
+        contextStatus?.available !== true ||
+        contextStatus.source !== "context_compiler" ||
+        typeof applicationStatus?.stable_prefix_fingerprint !== "string" ||
+        applicationStatus.stable_prefix_fingerprint.length === 0
+      ) {
+        throw new Error(`Runtime smoke did not compile the ${label} Application context from bundled prompt assets`);
+      }
     }
-    console.log("Bundled Runtime smoke passed: ready/status/shutdown JSONL and importlib.resources prompt asset");
+    if (
+      codingApplicationStatus.stable_prefix_fingerprint ===
+      generalApplicationStatus.stable_prefix_fingerprint
+    ) {
+      throw new Error("Runtime smoke did not load distinct Coding and General prompt contexts");
+    }
+    console.log("Bundled Runtime checks passed: Coding and General initialize/session/status/shutdown JSONL with distinct prompt contexts");
   } finally {
     if (!child.killed) child.kill();
     await rm(smokeHome, { recursive: true, force: true });
@@ -205,6 +242,7 @@ if (process.env.UTHCODE_TEST_SMOKE_ONLY === "1") {
   } else {
     await assertFile(runtimeExecutable, "bundled Runtime executable");
     await assertDirectory(join(runtimeRoot, "_internal"), "bundled Runtime support directory");
+    await assertFile(generalPromptAsset, "bundled General prompt asset");
     console.log(`PyInstaller onedir ready: ${runtimeRoot}`);
     await smokeBundledRuntime();
   }

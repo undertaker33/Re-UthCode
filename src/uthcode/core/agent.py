@@ -972,6 +972,21 @@ def _controlled_tool_result(call: ToolCallPart, reason: str) -> ToolResultPart:
     )
 
 
+def _safe_inline_tool_output_preview(result: ToolResultPart) -> tuple[str | None, bool]:
+    """Project bounded text only after Application marks it safely inline."""
+
+    if result.metadata.get("persistence_status") != "inline":
+        return None, False
+    text = "\n".join(
+        part.text for part in result.content.parts if isinstance(part, TextPart)
+    )
+    if not text:
+        return None, False
+    if len(text) > 1024:
+        return text[:1023] + "…", True
+    return text, False
+
+
 class ExecutionBoundary(str, Enum):
     PAUSED = "paused"
     TERMINAL = "terminal"
@@ -3190,6 +3205,7 @@ class AgentTurnExecution:
             if not controlled and status != "unknown":
                 status = "failed" if result.is_error else "finished"
             results.append(result)
+            output_preview, output_preview_truncated = _safe_inline_tool_output_preview(result)
             self._append(
                 events,
                 ToolFinished(
@@ -3202,6 +3218,8 @@ class AgentTurnExecution:
                     command,
                     status,
                     result.is_error,
+                    output_preview,
+                    output_preview_truncated,
                 ),
             )
             index += 1

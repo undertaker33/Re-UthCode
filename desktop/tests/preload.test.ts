@@ -75,6 +75,12 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
   await api.copyText("session-1");
   await api.closeShell();
   await api.requestRuntime("status.get", {});
+  await api.requestRuntime("general.open", {});
+  await api.requestRuntime("session.search", { query: "public text", max_results: 20 });
+  await api.requestRuntime("session.search.cancel", { operation_id: "search-1" });
+  await api.requestRuntime("session.archive", { session_id: "session-1", project_key: "uthcode:general", archived: true });
+  await api.requestRuntime("workspace.diff", { project_key: "C:\\Projects\\UthCode", path: "src\\uthcode\\core\\agent.py" });
+  await api.requestRuntime("workspace.diff.cancel", { operation_id: "diff-1" });
   await api.readPreference("theme");
   await api.writePreference("theme", "dark");
   await api.writePreference("pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]);
@@ -89,6 +95,12 @@ test("preload exposes only the narrow typed API and never the raw IPC event", as
     { channel: "desktop.clipboard.copy-text", args: ["session-1"] },
     { channel: "desktop.shell.close", args: [] },
     { channel: "desktop.runtime.request", args: [{ method: "status.get", params: {} }] },
+    { channel: "desktop.runtime.request", args: [{ method: "general.open", params: {} }] },
+    { channel: "desktop.runtime.request", args: [{ method: "session.search", params: { query: "public text", max_results: 20 } }] },
+    { channel: "desktop.runtime.request", args: [{ method: "session.search.cancel", params: { operation_id: "search-1" } }] },
+    { channel: "desktop.runtime.request", args: [{ method: "session.archive", params: { session_id: "session-1", project_key: "uthcode:general", archived: true } }] },
+    { channel: "desktop.runtime.request", args: [{ method: "workspace.diff", params: { project_key: "C:\\Projects\\UthCode", path: "src\\uthcode\\core\\agent.py" } }] },
+    { channel: "desktop.runtime.request", args: [{ method: "workspace.diff.cancel", params: { operation_id: "diff-1" } }] },
     { channel: "desktop.preference.read", args: ["theme"] },
     { channel: "desktop.preference.write", args: ["theme", "dark"] },
     { channel: "desktop.preference.write", args: ["pinnedSessions", [{ projectKey: "C:\\Projects\\UthCode", sessionId: "session-1" }]] },
@@ -397,9 +409,163 @@ test("Main gates project use to picker or persisted recent registrations", async
       "catalog reads require Main's existing project registration",
     );
     assert.deepEqual(calls.slice(0, 2), [
-      { method: "project.open", params: { path: target, catalog_project_keys: [target] } },
+      { method: "project.open", params: { path: target, catalog_project_keys: [target, "uthcode:general"] } },
       { method: "session.move", params: { session_id: "s", target_project_key: target } },
     ]);
+
+    await runtimeRequest?.(trustedEvent, { method: "general.open", params: {} });
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "session.search", params: { query: "public text", catalog_project_keys: [persisted] } },
+    );
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "project.sessions", params: { project_key: "uthcode:general", archived: true } },
+    );
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "session.archive", params: { session_id: "s", project_key: `${target}/.`, archived: true } },
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "session.archive", params: { session_id: "s", project_key: persisted, archived: true } },
+      ),
+      /trusted Desktop history/u,
+      "archive owner must come from Main's registered project authority",
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "session.search", params: { query: "x", arbitrary_path: persisted } },
+      ),
+      /parameters are invalid/u,
+      "search RPC rejects unknown fields",
+    );
+    assert.deepEqual(calls.slice(2, 6), [
+      { method: "general.open", params: { catalog_project_keys: [target, "uthcode:general"] } },
+      { method: "session.search", params: { query: "public text", catalog_project_keys: [target, "uthcode:general"] } },
+      { method: "project.sessions", params: { project_key: "uthcode:general", archived: true } },
+      { method: "session.archive", params: { session_id: "s", project_key: target, archived: true } },
+    ]);
+    await runtimeRequest?.(
+      trustedEvent,
+      {
+        method: "tool_result.read",
+        params: {
+          session_id: "s",
+          project_key: `${target}/.`,
+          ref: "opaque-tool-result-ref",
+          offset: 8,
+          limit: 32,
+        },
+      },
+    );
+    assert.deepEqual(calls[6], {
+      method: "tool_result.read",
+      params: {
+        session_id: "s",
+        project_key: target,
+        ref: "opaque-tool-result-ref",
+        offset: 8,
+        limit: 32,
+      },
+    });
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        {
+          method: "tool_result.read",
+          params: { session_id: "s", project_key: persisted, ref: "opaque-tool-result-ref" },
+        },
+      ),
+      /trusted Desktop history/u,
+      "Tool Result reads require Main's existing project registration",
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        {
+          method: "tool_result.read",
+          params: { session_id: "s", project_key: target, ref: "opaque-tool-result-ref", limit: 65537 },
+        },
+      ),
+      /Tool Result read request is invalid/u,
+      "Tool Result page size is bounded before runtime IPC",
+    );
+
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "workspace.diff", params: { project_key: `${target}/.`, path: "src\\file.py" } },
+    );
+    assert.deepEqual(calls[7], {
+      method: "workspace.diff",
+      params: {
+        project_key: target,
+        path: "src\\file.py",
+        catalog_project_keys: [target, "uthcode:general"],
+      },
+    });
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "workspace.diff.cancel", params: { operation_id: "diff-1" } },
+    );
+    assert.deepEqual(calls[8], {
+      method: "workspace.diff.cancel",
+      params: { operation_id: "diff-1" },
+    });
+    await runtimeRequest?.(
+      trustedEvent,
+      { method: "project.sessions", params: { project_key: "uthcode:general", archived: true } },
+    );
+    await runtimeRequest?.(
+      trustedEvent,
+      {
+        method: "session.archive",
+        params: { session_id: "general-session", project_key: "uthcode:general", archived: false },
+      },
+    );
+    assert.deepEqual(calls.slice(9, 11), [
+      {
+        method: "project.sessions",
+        params: { project_key: "uthcode:general", archived: true },
+      },
+      {
+        method: "session.archive",
+        params: { session_id: "general-session", project_key: "uthcode:general", archived: false },
+      },
+    ]);
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "workspace.diff.cancel", params: { operation_id: "" } },
+      ),
+      /Workspace diff operation is invalid/u,
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "workspace.diff", params: { project_key: persisted } },
+      ),
+      /trusted Desktop history/u,
+      "workspace diff owner must come from Main's registered project authority",
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "workspace.diff", params: { project_key: "uthcode:general" } },
+      ),
+      /registered Coding Project/u,
+      "workspace diff is Coding-only",
+    );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "workspace.diff", params: { project_key: target, path: "bad\npath" } },
+      ),
+      /Workspace diff path is invalid/u,
+      "workspace diff rejects control characters before runtime IPC",
+    );
 
     const injectedRegistered = await writePreference(
       trustedEvent,
@@ -435,8 +601,8 @@ test("Main gates project use to picker or persisted recent registrations", async
       { method: "project.open", params: { path: persisted } },
     );
     assert.deepEqual(calls.slice(-2), [
-      { method: "runtime.initialize", params: { workdir: persisted, catalog_project_keys: [persisted] } },
-      { method: "project.open", params: { path: persisted, catalog_project_keys: [persisted] } },
+      { method: "runtime.initialize", params: { workdir: persisted, catalog_project_keys: [persisted, "uthcode:general"] } },
+      { method: "project.open", params: { path: persisted, catalog_project_keys: [persisted, "uthcode:general"] } },
     ]);
     assert.equal(registeredProjects.has(persisted), true);
   } finally {

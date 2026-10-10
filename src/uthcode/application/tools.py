@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from os import PathLike
 from pathlib import Path, PureWindowsPath
 
@@ -102,6 +102,30 @@ def tool_result_policy_for_output_limit(output_bytes: int) -> ToolResultPolicy:
         read_page_limit_bytes=min(defaults.read_page_limit_bytes, output_bytes),
         read_output_limit_bytes=min(defaults.read_output_limit_bytes, output_bytes),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultReadPage:
+    """Application-owned projection of one bounded, Session-scoped result page."""
+
+    ref: str
+    content: str
+    offset: int
+    next_offset: int
+    total_bytes: int
+    sha256: str
+    eof: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ref": self.ref,
+            "content": self.content,
+            "offset": self.offset,
+            "next_offset": self.next_offset,
+            "total_bytes": self.total_bytes,
+            "sha256": self.sha256,
+            "eof": self.eof,
+        }
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)(?P<prefix>\bAuthorization\s*[:=]\s*)"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s,;\"']+"
@@ -349,6 +373,11 @@ class ApplicationToolService:
         """Return the immutable, registration-ordered public definitions."""
 
         return self._registry.definitions()
+
+    def redact_public_text(self, value: str) -> str:
+        """Redact configured and ambient credentials from one public string."""
+
+        return self._redactor.redact(value)
 
     def ensure_tool(self, tool: Tool) -> None:
         """Add one Application-composed Tool to the existing registry.
@@ -781,9 +810,19 @@ class ApplicationToolService:
         # externalize the only reader for an externalized result.
         if outcome.tool_name in {"ToolResultRead", "HistoryRead"} or size_bytes <= self._tool_result_policy.inline_threshold_bytes:
             self._record_materialization("inline", size_bytes)
+            inline_result = ToolResultPart(
+                outcome.tool_call_id,
+                outcome.content,
+                outcome.is_error,
+                {
+                    **execution_metadata,
+                    "persistence_status": ToolResultPersistenceStatus.INLINE.value,
+                    "size_bytes": size_bytes,
+                },
+            )
             return ToolResultMaterialization(
                 execution=outcome,
-                result=outcome.result,
+                result=inline_result,
                 persistence_status=ToolResultPersistenceStatus.INLINE,
                 size_bytes=size_bytes,
             )
@@ -981,6 +1020,32 @@ class ApplicationToolService:
         if not isinstance(page, ToolResultPage):
             raise ToolResultError("Session returned an invalid Tool Result page")
         return page
+
+    def read_tool_result_page(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> ToolResultReadPage:
+        """Read one validated Session result page without exposing storage paths."""
+
+        effective_limit = (
+            self._tool_result_policy.read_page_limit_bytes
+            if limit is None
+            else limit
+        )
+        page = self._read_tool_result_page(session_id, ref, offset, effective_limit)
+        return ToolResultReadPage(
+            ref=page.ref,
+            content=page.content,
+            offset=page.offset,
+            next_offset=page.next_offset,
+            total_bytes=page.total_bytes,
+            sha256=page.sha256,
+            eof=page.eof,
+        )
 
     def _read_history_page(
         self,

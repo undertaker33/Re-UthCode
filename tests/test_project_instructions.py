@@ -24,10 +24,12 @@ from uthcode.core.prompt import (
     ToolDefinitionSource,
     build_instruction_prefix,
     core_runtime_contract_source,
+    public_general_prompt_source,
     public_prompt_source,
 )
 from uthcode.core.provider import ToolDefinition
 from uthcode.prompt_assets import read_public_coding_prompt
+from uthcode.prompt_assets import read_public_general_prompt
 from uthcode.integrations.instruction_files import InstructionFileReader
 from uthcode.integrations.tools.factory import create_default_tools
 from uthcode.core.provider import CancellationToken
@@ -526,7 +528,6 @@ def test_loader_rejects_parent_and_symlink_instruction_references(tmp_path: Path
     (project_root / "AGENTS.md").write_text('@include("../outside.md")', encoding="utf-8")
     with pytest.raises(InstructionPathRejectedError):
         loader.load_session()
-
     target = project_root / "target.md"
     target.write_text("target", encoding="utf-8")
     link = project_root / "link.md"
@@ -537,3 +538,43 @@ def test_loader_rejects_parent_and_symlink_instruction_references(tmp_path: Path
     (project_root / "AGENTS.md").write_text('@include("link.md")', encoding="utf-8")
     with pytest.raises(InstructionPathRejectedError):
         loader.load_session()
+
+
+def test_general_instruction_loader_omits_project_and_directory_scopes(
+    tmp_path: Path,
+) -> None:
+    user_root = tmp_path / "home" / ".uthcode"
+    project_root = tmp_path / "project"
+    nested = project_root / "nested"
+    user_root.mkdir(parents=True)
+    nested.mkdir(parents=True)
+    (user_root / "AGENTS.md").write_text("shared user instruction", encoding="utf-8")
+    (project_root / "AGENTS.md").write_text("coding project instruction", encoding="utf-8")
+    (nested / "AGENTS.md").write_text("coding directory instruction", encoding="utf-8")
+
+    general_prompt = public_general_prompt_source()
+    general = InstructionLoader(
+        user_root=user_root,
+        project_root=None,
+        public_prompt=general_prompt,
+        reader=InstructionFileReader(),
+    )
+    general.load_session()
+    coding = InstructionLoader(
+        user_root=user_root,
+        project_root=project_root,
+        reader=InstructionFileReader(),
+    )
+    coding.load_for_path(nested)
+
+    assert general.public_prompt == general_prompt
+    assert general.project_root is None
+    assert [block.content for block in general.blocks] == ["shared user instruction"]
+    assert "coding project instruction" not in general.render_prompt()
+    assert "coding directory instruction" not in general.render_prompt()
+    assert general.stable_prefix_fingerprint != coding.stable_prefix_fingerprint
+    assert general.activate_for_path(nested / "main.py") is None
+    assert general.activated_directory_scopes == ()
+    with pytest.raises(InstructionPathRejectedError):
+        general.load_for_path(nested)
+    assert read_public_general_prompt() in general_prompt.content

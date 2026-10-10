@@ -84,7 +84,7 @@ class TranscriptEntry:
     turn_id: str
     kind: TranscriptKind
     payload: JsonPayload
-    created_at: str = field(default_factory=_now)
+    created_at: str | None = field(default_factory=_now)
     commit_boundary: bool = True
     semantic_unit_id: str | None = None
     schema_version: int = TRANSCRIPT_SCHEMA_VERSION
@@ -97,6 +97,10 @@ class TranscriptEntry:
         object.__setattr__(self, "kind", TranscriptKind(self.kind))
         if not isinstance(self.payload, Mapping):
             raise TypeError("TranscriptEntry payload must be a mapping")
+        if self.created_at is not None and (
+            not isinstance(self.created_at, str) or not self.created_at.strip()
+        ):
+            raise TypeError("TranscriptEntry created_at must be a non-empty string or None")
         object.__setattr__(self, "payload", JsonPayload(self.payload))
 
     def to_dict(self) -> dict[str, Any]:
@@ -114,13 +118,18 @@ class TranscriptEntry:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TranscriptEntry":
+        created_at = data.get("created_at")
         return cls(
             session_id=str(data["session_id"]),
             sequence=int(data["sequence"]),
             turn_id=str(data["turn_id"]),
             kind=TranscriptKind(data["kind"]),
             payload=dict(data.get("payload", {})),
-            created_at=str(data.get("created_at") or _now()),
+            created_at=(
+                created_at
+                if isinstance(created_at, str) and created_at.strip()
+                else None
+            ),
             commit_boundary=bool(data.get("commit_boundary", True)),
             semantic_unit_id=data.get("semantic_unit_id"),
             schema_version=int(data.get("schema_version", TRANSCRIPT_SCHEMA_VERSION)),

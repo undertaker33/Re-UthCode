@@ -18,11 +18,18 @@ REPO_ROOT = SPEC_ROOT.parent.parent
 SOURCE_ROOT = REPO_ROOT / "src"
 ENTRY_POINT = SOURCE_ROOT / "uthcode" / "interfaces" / "desktop" / "__main__.py"
 PROMPT_ASSET = SOURCE_ROOT / "uthcode" / "prompt_assets" / "coding_agent.md"
+GENERAL_PROMPT_ASSET = (
+    SOURCE_ROOT / "uthcode" / "prompt_assets" / "general_assistant.md"
+)
 
 if not ENTRY_POINT.is_file():
     raise FileNotFoundError(f"Desktop Runtime entry point is missing: {ENTRY_POINT}")
 if not PROMPT_ASSET.is_file():
     raise FileNotFoundError(f"Desktop Runtime prompt asset is missing: {PROMPT_ASSET}")
+if not GENERAL_PROMPT_ASSET.is_file():
+    raise FileNotFoundError(
+        f"Desktop Runtime General prompt asset is missing: {GENERAL_PROMPT_ASSET}"
+    )
 
 
 def _native_resources(package_name: str, suffixes: set[str], target: str) -> list[tuple[str, str]]:
@@ -71,7 +78,10 @@ analysis = Analysis(
     [str(ENTRY_POINT)],
     pathex=[str(SOURCE_ROOT)],
     binaries=native_binaries,
-    datas=[(str(PROMPT_ASSET), "uthcode/prompt_assets")],
+    datas=[
+        (str(PROMPT_ASSET), "uthcode/prompt_assets"),
+        (str(GENERAL_PROMPT_ASSET), "uthcode/prompt_assets"),
+    ],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

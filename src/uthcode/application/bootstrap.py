@@ -30,11 +30,14 @@ from uthcode.integrations.session_files import SessionFileStore
 from uthcode.core.tool import Tool
 from uthcode.core.permission import Effect, PermissionAction, PermissionMode, ResourceScope
 from uthcode.core.secrets import SecretValue
+from uthcode.core.prompt import public_general_prompt_source, public_prompt_source
 
 from .configuration import (
+    ApplicationMode,
     ConfigurationModelError,
     ConfigSource,
     EffectiveConfig,
+    GENERAL_SESSION_OWNER_KEY,
     LaunchOptions,
     ModelProfile,
     ProviderKind,
@@ -51,6 +54,7 @@ from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .tools import ApplicationToolService
 from .tools import tool_result_policy_for_output_limit
+from .context import ApplicationContextService
 
 
 class ConfigurationError(ValueError):
@@ -346,6 +350,7 @@ def create_application(
     instruction_loader: InstructionLoader | None = None,
     storage_root: str | Path | None = None,
     session_store: SessionFileStore | None = None,
+    application_mode: ApplicationMode | str = ApplicationMode.CODING,
 ) -> UthCodeApplication:
     """Build a Headless Application from one EffectiveConfig."""
 
@@ -356,6 +361,12 @@ def create_application(
     elif not isinstance(runtime_context, ApplicationRuntimeContext):
         raise TypeError("runtime_context must be ApplicationRuntimeContext")
     builder = _default_builder() if provider_builder is None else provider_builder
+    mode = ApplicationMode.coerce(application_mode)
+    prompt_source = (
+        public_general_prompt_source()
+        if mode is ApplicationMode.GENERAL
+        else public_prompt_source()
+    )
 
     provider = builder(
         config.providers[config.current_model.provider_profile_id],
@@ -368,9 +379,20 @@ def create_application(
     if loader is None:
         loader = InstructionLoader(
             user_root=_instruction_user_root(config),
-            project_root=discover_project_root(runtime_context.workdir),
+            project_root=(
+                discover_project_root(runtime_context.workdir)
+                if mode is ApplicationMode.CODING
+                else None
+            ),
+            public_prompt=prompt_source,
             reader=InstructionFileReader(),
         )
+    elif mode is ApplicationMode.GENERAL and (
+        loader.project_root is not None or loader.public_prompt != prompt_source
+    ):
+        raise ValueError("General mode requires a user-only InstructionLoader and General prompt")
+    elif mode is ApplicationMode.CODING and loader.project_root is None:
+        raise ValueError("Coding mode requires a trusted Project instruction root")
     if session_store is not None and not isinstance(session_store, SessionFileStore):
         raise TypeError("session_store must be SessionFileStore or None")
     if session_store is not None and storage_root is not None:
@@ -381,7 +403,11 @@ def create_application(
             if storage_root is not None
             else Path.home() / ".uthcode" / "sessions"
         ),
-        project_key=str(loader.project_root),
+        project_key=(
+            str(loader.project_root)
+            if mode is ApplicationMode.CODING
+            else GENERAL_SESSION_OWNER_KEY
+        ),
         instruction_loader=loader,
         store=session_store,
     )
@@ -421,21 +447,31 @@ def create_application(
                 return None
 
         set_asset_resolver(resolve_asset)
-    tool_values = (
-        create_default_tools(
-            runtime_context.workdir,
-            on_path_access=loader.activate_for_path,
-            attachment_service=attachment_service,
-            session_provider=lambda: session_service.active_session,
-            process_manager=process_manager,
-            search_configuration=config.search,
-            tool_limits=config.tool_limits,
-            web_transport=web_transport,
-            redirect_authorizer=_redirect_authorizer,
+    if mode is ApplicationMode.GENERAL:
+        supplied_tools = () if tools is None else tuple(tools)
+        if supplied_tools:
+            raise ValueError("General mode cannot be composed with Tools")
+        tool_values: tuple[Tool, ...] = ()
+        tool_builder = None
+        session_provider = None
+    else:
+        tool_values = (
+            create_default_tools(
+                runtime_context.workdir,
+                on_path_access=loader.activate_for_path,
+                attachment_service=attachment_service,
+                session_provider=lambda: session_service.active_session,
+                process_manager=process_manager,
+                search_configuration=config.search,
+                tool_limits=config.tool_limits,
+                web_transport=web_transport,
+                redirect_authorizer=_redirect_authorizer,
+            )
+            if tools is None
+            else tuple(tools)
         )
-        if tools is None
-        else tuple(tools)
-    )
+        tool_builder = create_default_tools
+        session_provider = lambda: session_service.active_session
     secret_values = tuple(
         profile.api_key
         for profile in config.providers.values()
@@ -450,7 +486,7 @@ def create_application(
         provider,
         configuration=config,
         provider_builder=builder,
-        tool_builder=create_default_tools,
+        tool_builder=tool_builder,
         model_writer=writer,
         permission_writer=(permission_writer if permission_writer is not None else _default_permission_writer(config)),
         runtime_context=runtime_context,
@@ -458,18 +494,22 @@ def create_application(
             tool_values,
             workdir=runtime_context.workdir,
             secret_values=secret_values,
-            session_provider=lambda: session_service.active_session,
+            session_provider=session_provider,
             tool_result_policy=tool_result_policy_for_output_limit(
                 config.tool_limits.output_bytes,
             ),
         ),
         permission_rules_loader=(
-            lambda: load_permission_rules(cwd=runtime_context.workdir)
+            (lambda: load_permission_rules(cwd=runtime_context.workdir))
+            if mode is ApplicationMode.CODING
+            else None
         ),
         instruction_loader=loader,
+        context_service=ApplicationContextService(prompt_source=prompt_source),
         session_service=session_service,
         attachment_service=attachment_service,
         artifact_service=artifact_service,
+        application_mode=mode,
     )
 
 
@@ -512,6 +552,7 @@ def load_effective_config(
     cwd: str | PathLike[str] | None = None,
     home: str | PathLike[str] | None = None,
     model: str | None = None,
+    include_project_configs: bool = True,
 ) -> EffectiveConfig:
     """Load configuration through the Integration boundary."""
 
@@ -530,6 +571,7 @@ def load_effective_config(
             cwd=launch.cwd,
             home=launch.home,
             model=launch.model,
+            include_project_configs=include_project_configs,
         )
     except IntegrationConfigurationInitializationRequired as exc:
         raise ConfigurationInitializationRequired(exc.template_path) from None

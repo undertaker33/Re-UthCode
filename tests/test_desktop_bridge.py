@@ -26,6 +26,7 @@ from uthcode.application import (
     ConfigSource,
     CompactionResult,
     CancellationToken,
+    ApplicationMode,
     EffectiveConfig,
     GenerationCompleted,
     Message,
@@ -45,6 +46,7 @@ from uthcode.application import (
     ProviderResponse,
     ProviderKind,
     ProviderProfile,
+    SearchConfiguration,
     ProviderIdentity,
     QuestionKind,
     RetryProviderResponse,
@@ -52,7 +54,11 @@ from uthcode.application import (
     RunSnapshot,
     RunStatus,
     SessionCatalogEntry,
+    SessionMutation,
     SessionReplayRecord,
+    SessionSearchHit,
+    SessionSearchResult,
+    ToolResultReadPage,
     FailureReason,
     OutcomeStatus,
     TerminationReason,
@@ -69,19 +75,24 @@ from uthcode.application import (
     create_application,
 )
 from uthcode.core.agent_events import (
+    AssistantMessageCompleted,
+    AssistantMessageKind,
     AssistantMessageDelta,
     TaskStateChanged,
     ToolFinished,
+    ToolProgress,
+    ToolStarted,
     TurnFailed,
     TurnPaused,
     agent_event_from_dict as core_agent_event_from_dict,
 )
 from uthcode.core.provider import FinishReason, ModelLimits, ToolCallPart
+from uthcode.core.secrets import SecretValue
 from uthcode.core.permission import Effect, ResourceScope, RuleSet
 from uthcode.application import ToolResultPart
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.interfaces.desktop.bridge import DesktopBridge
-from uthcode.interfaces.desktop.protocol import RequestEnvelope, encode_envelope
+from uthcode.interfaces.desktop.protocol import AgentEventEnvelope, RequestEnvelope, encode_envelope
 
 
 def _completed(text: str = "done") -> GenerationCompleted:
@@ -1117,7 +1128,7 @@ async def test_background_session_events_keep_session_state_and_typed_pause_iden
         "completion": bridge._completion,
         "closed": False,
         "status": "running",
-        "project_key": "C:/background",
+            "project_key": "C:/fake",
     }
     bridge._background_runtimes["session-a"] = runtime
     task = asyncio.create_task(
@@ -1275,7 +1286,7 @@ async def test_session_resume_navigation_reclaims_an_idle_background_runtime() -
         "completion": bridge._completion,
         "closed": False,
         "status": "idle",
-        "project_key": "C:/background",
+        "project_key": str(Path("C:/fake").resolve()),
     }
 
     result = await bridge.handle_request(
@@ -2489,6 +2500,270 @@ def test_event_projection_delegates_round_trip_validation_to_core_parser(
     assert seen == [event.to_dict()]
 
 
+def test_tool_progress_event_projects_only_the_bounded_public_observation() -> None:
+    event = ToolProgress(
+        "run-progress",
+        "turn-progress",
+        1,
+        "batch-progress",
+        "call-progress",
+        "Bash",
+        "stdout",
+        "reading output",
+        current=3,
+        total=8,
+        stream="stdout",
+    )
+
+    projected = bridge_module._event(event)
+
+    assert projected is not None
+    assert projected["type"] == "tool_progress"
+    assert projected["stage"] == "stdout"
+    assert projected["text"] == "reading output"
+    assert projected["current"] == 3
+    assert projected["total"] == 8
+    assert projected["stream"] == "stdout"
+    assert set(projected).issubset(bridge_module._EVENT_OUTPUT_FIELDS)
+
+    assistant = AssistantMessageCompleted(
+        "run-progress",
+        "turn-progress",
+        "message-final",
+        1,
+        AssistantMessageKind.FINAL,
+        Message("assistant", (TextPart("final answer"),)),
+    )
+    assistant_projection = bridge_module._event(assistant)
+    assert assistant_projection is not None
+    assert assistant_projection["kind"] == "final"
+
+
+def test_tool_finished_projects_only_explicit_bounded_output_preview() -> None:
+    event = ToolFinished(
+        "run-preview",
+        "turn-preview",
+        1,
+        "batch-preview",
+        "call-preview",
+        "Bash",
+        "echo safe",
+        "finished",
+        False,
+        "safe inline output…",
+        True,
+    )
+
+    projected = bridge_module._event(event)
+
+    assert projected is not None
+    assert projected["output_preview"] == "safe inline output…"
+    assert projected["output_preview_truncated"] is True
+    assert "tool_result" not in projected
+    assert set(projected).issubset(bridge_module._EVENT_OUTPUT_FIELDS)
+    decoded = core_agent_event_from_dict(projected)
+    assert isinstance(decoded, ToolFinished)
+    assert decoded.output_preview_truncated is True
+
+    legacy = event.to_dict()
+    legacy.pop("output_preview")
+    legacy.pop("output_preview_truncated")
+    parsed_legacy = core_agent_event_from_dict(legacy)
+    assert isinstance(parsed_legacy, ToolFinished)
+    assert parsed_legacy.output_preview is None
+    assert parsed_legacy.output_preview_truncated is False
+
+
+def test_replay_projection_preserves_preview_truncation_and_opaque_ref() -> None:
+    record = SessionReplayRecord(
+        session_id="session-preview",
+        sequence=1,
+        turn_id="turn-preview",
+        kind="tool",
+        text="Bash completed",
+        tool_name="Bash",
+        tool_call_id="call-preview",
+        output_ref="opaque-preview-reference",
+        output_preview="bounded output…",
+        output_preview_truncated=True,
+        file_changes=(
+            {"tool_name": "WriteFile", "path": "notes.txt", "status": "changed"},
+            {
+                "tool_name": "ApplyPatch",
+                "status": "partial",
+                "applied_paths": ("src/created.py",),
+                "failed_count": 1,
+                "not_applied_count": 0,
+            },
+        ),
+    )
+
+    projected = bridge_module._replay_values((record,))
+
+    assert projected == [
+        {
+            "session_id": "session-preview",
+            "sequence": 1,
+            "turn_id": "turn-preview",
+            "kind": "tool",
+            "text": "Bash completed",
+            "is_error": False,
+            "tool_name": "Bash",
+            "tool_call_id": "call-preview",
+            "output_ref": "opaque-preview-reference",
+            "output_preview": "bounded output…",
+            "output_preview_truncated": True,
+            "file_changes": [
+                {"tool_name": "WriteFile", "path": "notes.txt", "status": "changed"},
+                {
+                    "tool_name": "ApplyPatch",
+                    "status": "partial",
+                    "applied_paths": ["src/created.py"],
+                    "failed_count": 1,
+                    "not_applied_count": 0,
+                },
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_read_requires_registered_owner_and_returns_bounded_safe_page(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path.resolve()
+    other_project = (tmp_path / "other-project")
+    other_project.mkdir()
+
+    class ResultApplication(_FakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_service = SimpleNamespace(project_key=str(project))
+            self.application_mode = ApplicationMode.CODING
+            self.read_calls: list[tuple[object, ...]] = []
+
+        def read_tool_result_page(
+            self,
+            session_id: str,
+            ref: str,
+            *,
+            offset: int = 0,
+            limit: int | None = None,
+        ) -> ToolResultReadPage:
+            self.read_calls.append((session_id, ref, offset, limit))
+            if ref != "opaque-tool-result-ref":
+                raise RuntimeError("private storage detail must not cross Desktop")
+            return ToolResultReadPage(
+                ref=ref,
+                content="bounded output",
+                offset=offset,
+                next_offset=offset + len("bounded output"),
+                total_bytes=128,
+                sha256="a" * 64,
+                eof=False,
+            )
+
+    application = ResultApplication()
+    bridge = DesktopBridge(application=application, workdir=project)
+    request = await bridge.handle_request(
+        RequestEnvelope(
+            "tool-result-read",
+            "tool_result.read",
+            {
+                "session_id": "session-1",
+                "project_key": str(project),
+                "ref": "opaque-tool-result-ref",
+                "offset": 16,
+                "limit": 32,
+            },
+        )
+    )
+    assert request.ok is True and request.result is not None
+    assert request.result == {
+        "session_id": "session-1",
+        "project_key": str(project),
+        "ref": "opaque-tool-result-ref",
+        "content": "bounded output",
+        "offset": 16,
+        "next_offset": 30,
+        "total_bytes": 128,
+        "sha256": "a" * 64,
+        "eof": False,
+    }
+    assert application.read_calls == [
+        ("session-1", "opaque-tool-result-ref", 16, 32)
+    ]
+
+    for bad_params in (
+        {"session_id": "session-1", "ref": "opaque-tool-result-ref"},
+        {
+            "session_id": "session-1",
+            "project_key": str(project),
+            "ref": "opaque-tool-result-ref",
+            "path": "C:/arbitrary.bin",
+        },
+        {
+            "session_id": "session-1",
+            "project_key": str(project),
+            "ref": "opaque-tool-result-ref",
+            "limit": 65537,
+        },
+    ):
+        failed = await bridge.handle_request(
+            RequestEnvelope("tool-result-invalid", "tool_result.read", bad_params)
+        )
+        assert failed.ok is False
+
+    unregistered = await bridge.handle_request(
+        RequestEnvelope(
+            "tool-result-unregistered",
+            "tool_result.read",
+            {
+                "session_id": "session-1",
+                "project_key": str(other_project.resolve()),
+                "ref": "opaque-tool-result-ref",
+            },
+        )
+    )
+    assert unregistered.ok is False
+    assert unregistered.error is not None
+    assert unregistered.error.kind == "project_not_registered"
+
+    bridge._background_runtimes["session-background"] = {
+        "project_key": str(other_project.resolve()),
+        "application": application,
+    }
+    cross_owner = await bridge.handle_request(
+        RequestEnvelope(
+            "tool-result-cross-owner-2",
+            "tool_result.read",
+            {
+                "session_id": "session-background",
+                "project_key": str(project),
+                "ref": "opaque-tool-result-ref",
+            },
+        )
+    )
+    assert cross_owner.ok is False
+    assert cross_owner.error is not None and cross_owner.error.kind == "session_unknown"
+
+    missing = await bridge.handle_request(
+        RequestEnvelope(
+            "tool-result-missing",
+            "tool_result.read",
+            {
+                "session_id": "session-1",
+                "project_key": str(project),
+                "ref": "missing-opaque-tool-ref",
+            },
+        )
+    )
+    assert missing.ok is False
+    assert missing.error is not None and missing.error.kind == "tool_result_unavailable"
+    assert "private storage detail" not in json.dumps(missing.to_dict())
+    await bridge.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_session_changed_wire_projection_has_one_replay_location() -> None:
     application = _SessionApplication()
@@ -2724,7 +2999,7 @@ async def test_compaction_keeps_background_session_alive_for_typed_resume_and_tu
         "completion": bridge._completion,
         "closed": False,
         "status": "idle",
-        "project_key": "C:/fake",
+        "project_key": str(Path("C:/fake").resolve()),
     }
 
     started = await bridge.handle_request(
@@ -2892,15 +3167,27 @@ async def test_agent_failure_stays_agent_event_and_runtime_stream_errors_are_sep
         "succeeded",
         False,
     )
-    event_handle = _EventHandle(tool_finished, failure)
+    tool_started = ToolStarted(
+        "run-1",
+        "turn-1",
+        1,
+        "batch-1",
+        "call-1",
+        "Bash",
+        "echo safe",
+    )
+    event_handle = _EventHandle(tool_started, tool_finished, failure)
     bridge._active_handle = event_handle
     bridge._turn_task = asyncio.create_task(bridge._consume_turn(event_handle))
     await bridge.wait_for_idle()
     envelopes = bridge.drain_outbox()
-    assert [item.type for item in envelopes] == ["agent_event", "agent_event"]
-    assert envelopes[0].event["type"] == "tool_finished"  # type: ignore[union-attr]
-    assert "tool_result" not in envelopes[0].event  # type: ignore[union-attr]
-    assert envelopes[1].event["type"] == "turn_failed"  # type: ignore[union-attr]
+    assert [item.type for item in envelopes] == ["agent_event", "agent_event", "agent_event"]
+    assert envelopes[0].event["type"] == "tool_started"  # type: ignore[union-attr]
+    assert envelopes[1].event["type"] == "tool_finished"  # type: ignore[union-attr]
+    assert envelopes[2].event["type"] == "turn_failed"  # type: ignore[union-attr]
+    assert envelopes[0].event["observed_at"]  # type: ignore[union-attr]
+    assert envelopes[1].event["observed_at"]  # type: ignore[union-attr]
+    assert "tool_result" not in envelopes[1].event  # type: ignore[union-attr]
 
     broken = _EventHandle(error=RuntimeError("raw-native-secret"))
     bridge._active_handle = broken
@@ -2925,7 +3212,9 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
         return {"default_model": "provider/model"}
 
     monkeypatch.setattr(bridge_module, "write_user_configuration", writer)
-    bridge = DesktopBridge(application=_FakeApplication())
+    # This redaction boundary does not depend on an active runtime, and an
+    # unconfigured lightweight fixture should not trigger real config reload.
+    bridge = DesktopBridge()
     result = await bridge.handle_request(
         RequestEnvelope(
             "settings-save",
@@ -3008,6 +3297,7 @@ async def test_bridge_reads_only_main_registered_cross_project_catalog_metadata(
             "sessions": [{
                 "session_id": "target-session",
                 "project_key": target_key,
+                    "archived": False,
                 "created_at": "2026-10-01T00:00:00+00:00",
                 "last_used_at": "2026-10-07T00:00:00+00:00",
                 "last_user_message_at": "2026-10-06T00:00:00+00:00",
@@ -3018,7 +3308,43 @@ async def test_bridge_reads_only_main_registered_cross_project_catalog_metadata(
                 "title": None,
                 "model_ref": None,
             }],
+                "project_key": target_key,
+                "archived": False,
         }
+
+        removed_registration = await bridge.handle_request(
+            RequestEnvelope(
+                "catalog-remove-target-registration",
+                "runtime.initialize",
+                {"workdir": source_key, "catalog_project_keys": [source_key]},
+            )
+        )
+        assert removed_registration.ok is True
+        removed = await bridge.handle_request(
+            RequestEnvelope(
+                "catalog-target-while-removed",
+                "project.sessions",
+                {"project_key": target_key},
+            )
+        )
+        assert removed.ok is False and removed.error is not None
+        assert removed.error.kind == "project_not_registered"
+        restored_registration = await bridge.handle_request(
+            RequestEnvelope(
+                "catalog-reregister-target",
+                "runtime.initialize",
+                {"workdir": source_key, "catalog_project_keys": [target_key]},
+            )
+        )
+        assert restored_registration.ok is True
+        reread = await bridge.handle_request(
+            RequestEnvelope(
+                "catalog-target-after-reregister",
+                "project.sessions",
+                {"project_key": target_key},
+            )
+        )
+        assert reread.ok is True and reread.result == listed.result
 
         missing_key = await bridge.handle_request(
             RequestEnvelope("catalog-missing-key", "project.sessions", {})
@@ -3035,7 +3361,7 @@ async def test_bridge_reads_only_main_registered_cross_project_catalog_metadata(
         )
         assert denied.ok is False
         assert denied.error is not None and denied.error.kind == "project_not_registered"
-        assert application.catalog_projects == [target_key]
+        assert application.catalog_projects == [target_key, target_key]
     finally:
         await bridge.shutdown()
 
@@ -3770,3 +4096,1129 @@ def test_desktop_module_rejects_invalid_utf8_without_business_dispatch() -> None
     decoded = result.stdout.decode("utf-8", errors="strict")
     assert '"kind":"transport_error"' in decoded
     assert result.stderr.decode("utf-8", errors="strict") == ""
+
+
+@pytest.mark.asyncio
+async def test_general_runtime_rpc_uses_fixed_owner_and_limits_search_scope(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    general_workdir = (home / ".uthcode").resolve()
+    project = tmp_path / "project"
+    project.mkdir()
+    candidates: list[_BackgroundSessionApplication] = []
+    search_scopes: list[tuple[str, ...]] = []
+
+    def factory(path: Path) -> _BackgroundSessionApplication:
+        candidate = _BackgroundSessionApplication("general-bootstrap", path)
+        candidate.application_mode = (
+            ApplicationMode.GENERAL
+            if path.resolve() == general_workdir
+            else ApplicationMode.CODING
+        )
+        candidate.session_service.project_key = (
+            "uthcode:general"
+            if candidate.application_mode is ApplicationMode.GENERAL
+            else str(path.resolve())
+        )
+        candidate.session_catalog_metadata = lambda **_kwargs: ()
+        candidates.append(candidate)
+        return candidate
+
+    bridge = DesktopBridge(
+        application_factory=factory,
+        home=home,
+    )
+    try:
+        initialized = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-initialize",
+                "runtime.initialize",
+                {
+                    "mode": "general",
+                    "catalog_project_keys": [str(project.resolve()), "uthcode:general"],
+                },
+            )
+        )
+        assert initialized.ok is True
+        assert bridge._current_mode() is ApplicationMode.GENERAL
+        assert bridge._current_owner_key() == "uthcode:general"
+        assert bridge._catalog_project_keys == {str(project.resolve()), "uthcode:general"}
+        assert str(general_workdir) not in bridge._catalog_project_keys
+        assert candidates[-1].runtime_context.workdir == general_workdir
+
+        async def search_sessions(
+            query: str,
+            *,
+            project_keys: tuple[str, ...],
+            max_results: int,
+            cancellation: CancellationToken,
+        ) -> SessionSearchResult:
+            del query, max_results, cancellation
+            search_scopes.append(project_keys)
+            return SessionSearchResult(
+                (
+                    SessionSearchHit(
+                        "general-hit",
+                        "uthcode:general",
+                        "General title",
+                        "public snippet",
+                        False,
+                        "2026-10-10T00:00:00+00:00",
+                    ),
+                )
+            )
+
+        bridge.application.search_sessions = search_sessions
+        search = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-search",
+                "session.search",
+                {
+                    "query": "public marker",
+                    "catalog_project_keys": [str(project.resolve()), "uthcode:general"],
+                },
+            )
+        )
+        assert search.ok is True and search.result is not None
+        operation_id = search.result["operation_id"]
+        operation = bridge._session_search_operations[str(operation_id)]
+        task = operation["task"]
+        assert isinstance(task, asyncio.Task)
+        await task
+        assert search_scopes == [("uthcode:general",)]
+        event = next(
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event" and envelope.event.get("type") == "session_search_result"
+        )
+        assert event["state"] == "completed"
+        assert event["owner_key"] == "uthcode:general"
+        assert [hit["session_id"] for hit in event["hits"]] == ["general-hit"]
+
+        cross_mode_resume = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-cross-mode-resume",
+                "session.resume",
+                {"session_id": "coding-only-session", "project_key": str(project.resolve())},
+            )
+        )
+        assert cross_mode_resume.ok is False
+        assert cross_mode_resume.error is not None
+        assert cross_mode_resume.error.kind == "project_not_registered"
+
+        created = await bridge.handle_request(
+            RequestEnvelope("general-rpc-new-session", "session.new", {})
+        )
+        assert created.ok is True and created.result is not None
+        assert bridge._current_mode() is ApplicationMode.GENERAL
+        assert bridge._current_owner_key() == "uthcode:general"
+        general_session_id = created.result["session_id"]
+
+        opened_project = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-project-open",
+                "project.open",
+                {
+                    "path": str(project.resolve()),
+                    "catalog_project_keys": [str(project.resolve()), "uthcode:general"],
+                },
+            )
+        )
+        assert opened_project.ok is True
+        reopened_general = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-reopen",
+                "general.open",
+                {"catalog_project_keys": [str(project.resolve()), "uthcode:general"]},
+            )
+        )
+        assert reopened_general.ok is True
+        cold_resume = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-cold-resume",
+                "session.resume",
+                {"session_id": general_session_id, "project_key": "uthcode:general"},
+            )
+        )
+        assert cold_resume.ok is True and cold_resume.result is not None
+        runtime = bridge._background_runtimes[str(general_session_id)]
+        preparation = runtime.get("task")
+        assert isinstance(preparation, asyncio.Task)
+        await preparation
+        restored = await bridge.handle_request(
+            RequestEnvelope(
+                "general-rpc-restore",
+                "session.resume",
+                {"session_id": general_session_id, "project_key": "uthcode:general"},
+            )
+        )
+        assert restored.ok is True
+        assert bridge._current_mode() is ApplicationMode.GENERAL
+        assert bridge._current_owner_key() == "uthcode:general"
+        assert candidates[-1].session_service.active_session.session_id == general_session_id
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_general_runtime_can_manage_archives_for_registered_coding_owner(
+    tmp_path: Path,
+) -> None:
+    project = (tmp_path / "coding-project").resolve()
+    project.mkdir()
+    home = (tmp_path / "home").resolve()
+    general_workdir = home / ".uthcode"
+    storage_root = tmp_path / "sessions"
+    coding_key = str(project)
+    configuration = EffectiveConfig(
+        default_model="fake/general-admin",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/general-admin": ModelProfile(
+                "fake/general-admin", "fake", "general-admin"
+            ),
+        },
+    )
+
+    def provider_builder(_profile, _model):
+        return FakeProvider(events=(_completed(),))
+
+    def make_application(workdir: Path, mode: ApplicationMode) -> UthCodeApplication:
+        return create_application(
+            configuration,
+            provider_builder=provider_builder,
+            runtime_context=ApplicationRuntimeContext.from_system(workdir=workdir),
+            storage_root=storage_root,
+            application_mode=mode,
+        )
+
+    coding_application = make_application(project, ApplicationMode.CODING)
+    coding_session = coding_application.create_session()
+    coding_session_id = coding_session.session_id
+    coding_application.close()
+
+    def factory(workdir: Path) -> UthCodeApplication:
+        mode = (
+            ApplicationMode.GENERAL
+            if workdir.resolve() == general_workdir.resolve()
+            else ApplicationMode.CODING
+        )
+        return make_application(workdir, mode)
+
+    bridge = DesktopBridge(
+        application_factory=factory,
+        home=home,
+        workdir=project,
+    )
+    try:
+        initialized = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-initialize",
+                "runtime.initialize",
+                {
+                    "mode": "general",
+                    "catalog_project_keys": [coding_key, "uthcode:general"],
+                },
+            )
+        )
+        assert initialized.ok is True
+        application = bridge.application
+        assert isinstance(application, UthCodeApplication)
+        assert application.application_mode is ApplicationMode.GENERAL
+        assert application.session_service is not None
+        assert application.session_service.project_key == "uthcode:general"
+
+        archived_catalog = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-list-before",
+                "project.sessions",
+                {"project_key": coding_key, "archived": False},
+            )
+        )
+        assert archived_catalog.ok is True and archived_catalog.result is not None
+        assert [row["session_id"] for row in archived_catalog.result["sessions"]] == [
+            coding_session_id
+        ]
+
+        archive = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-archive",
+                "session.archive",
+                {
+                    "session_id": coding_session_id,
+                    "project_key": coding_key,
+                    "archived": True,
+                },
+            )
+        )
+        assert archive.ok is True and archive.result is not None
+        assert archive.result["project_key"] == coding_key
+        assert archive.result["archived"] is True
+
+        archived_catalog = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-list-archived",
+                "project.sessions",
+                {"project_key": coding_key, "archived": True},
+            )
+        )
+        assert archived_catalog.ok is True and archived_catalog.result is not None
+        assert [row["session_id"] for row in archived_catalog.result["sessions"]] == [
+            coding_session_id
+        ]
+
+        restored = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-restore",
+                "session.archive",
+                {
+                    "session_id": coding_session_id,
+                    "project_key": coding_key,
+                    "archived": False,
+                },
+            )
+        )
+        assert restored.ok is True and restored.result is not None
+        assert restored.result["archived"] is False
+
+        unknown_project = tmp_path / "unknown"
+        unknown_project.mkdir()
+        unknown = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-unknown-owner",
+                "project.sessions",
+                {"project_key": str(unknown_project.resolve())},
+            )
+        )
+        assert unknown.ok is False and unknown.error is not None
+        assert unknown.error.kind == "project_not_registered"
+
+        resume = await bridge.handle_request(
+            RequestEnvelope(
+                "general-admin-cross-mode-resume",
+                "session.resume",
+                {"session_id": coding_session_id, "project_key": coding_key},
+            )
+        )
+        assert resume.ok is False and resume.error is not None
+        assert resume.error.kind == "project_not_registered"
+        assert bridge.application is application
+        assert bridge._current_mode() is ApplicationMode.GENERAL
+        assert bridge._current_owner_key() == "uthcode:general"
+        assert application.session_service.active_session is None
+    finally:
+        await bridge.shutdown()
+
+
+async def _wait_for_workspace_diff_event(
+    bridge: DesktopBridge,
+    operation_id: str,
+) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while loop.time() < deadline:
+        for envelope in bridge.drain_outbox():
+            if (
+                isinstance(envelope, AgentEventEnvelope)
+                and envelope.event.get("type") == "workspace_diff_result"
+                and envelope.event.get("operation_id") == operation_id
+            ):
+                return dict(envelope.event)
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"workspace diff operation {operation_id} did not publish a result")
+
+
+@pytest.mark.asyncio
+async def test_workspace_diff_uses_registered_coding_owner_and_redacts_configured_secrets(
+    tmp_path: Path,
+) -> None:
+    def git(root: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    current = (tmp_path / "current-project").resolve()
+    current.mkdir()
+    workspace = (tmp_path / "registered-project").resolve()
+    workspace.mkdir()
+    unregistered = (tmp_path / "unregistered-project").resolve()
+    unregistered.mkdir()
+    provider_secret = "w02ProviderCredential9c4a17d8"
+    search_secret = "w02SearchCredential6b2e83f1"
+    git(workspace, "init", "--initial-branch=main")
+    git(workspace, "config", "user.email", "test@example.invalid")
+    git(workspace, "config", "user.name", "UthCode Test")
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    git(workspace, "add", "tracked.txt")
+    git(workspace, "commit", "-m", "initial")
+    git(workspace, "switch", "-c", f"review-{provider_secret}")
+    tracked.write_text(f"{provider_secret}\nstaged version\n", encoding="utf-8")
+    git(workspace, "add", "tracked.txt")
+    tracked.write_text(f"{search_secret}\nunstaged version\n", encoding="utf-8")
+    (workspace / "new file.txt").write_text("untracked\n", encoding="utf-8")
+    (workspace / f"{search_secret}.txt").write_text("credentialed path\n", encoding="utf-8")
+
+    configuration = EffectiveConfig(
+        default_model="fake/workspace-review",
+        providers={
+            "fake": ProviderProfile(
+                "fake",
+                ProviderKind.FAKE,
+                api_key=SecretValue(provider_secret),
+            ),
+        },
+        models={
+            "fake/workspace-review": ModelProfile(
+                "fake/workspace-review", "fake", "workspace-review"
+            ),
+        },
+        search=SearchConfiguration(
+            enabled=True,
+            api_key=SecretValue(search_secret),
+        ),
+    )
+    application = create_application(
+        configuration,
+        provider_builder=lambda _profile, _model: FakeProvider(events=(_completed(),)),
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=current),
+        storage_root=tmp_path / "sessions",
+    )
+    bridge = DesktopBridge(application=application, workdir=current)
+    current_key = str(current)
+    workspace_key = str(workspace)
+    unregistered_key = str(unregistered)
+    before_application = bridge.application
+    before_mode = application.application_mode
+    before_workdir = application.runtime_context.workdir
+    try:
+        response = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-registered",
+                "workspace.diff",
+                {
+                    "project_key": workspace_key,
+                    "catalog_project_keys": [current_key, workspace_key, "uthcode:general"],
+                },
+            )
+        )
+        assert response.ok is True and response.result is not None
+        assert response.result["owner_key"] == workspace_key
+        assert response.result["state"] == "reviewing"
+        event = await _wait_for_workspace_diff_event(
+            bridge,
+            str(response.result["operation_id"]),
+        )
+        assert event["state"] == "completed"
+        assert event["source"] == "current_working_tree"
+        assert event["project_key"] == workspace_key
+        assert isinstance(event["viewed_at"], str) and event["viewed_at"]
+        result = event
+        status = result["status"]
+        assert isinstance(status, dict)
+        entries = status["entries"]
+        assert isinstance(entries, list)
+        paths_by_status = {entry["path"]: entry["xy"] for entry in entries}
+        assert paths_by_status["tracked.txt"] == "MM"
+        assert paths_by_status["new file.txt"] == "??"
+        assert paths_by_status[f"<redacted>.txt"] == "??"
+        staged = result["staged_diff"]
+        unstaged = result["unstaged_diff"]
+        assert isinstance(staged, dict) and isinstance(unstaged, dict)
+        assert "+<redacted>" in staged["text"]
+        assert "+staged version" in staged["text"]
+        assert "+<redacted>" in unstaged["text"]
+        assert "+unstaged version" in unstaged["text"]
+        assert "<redacted>" in status["branch"]
+        wire = json.dumps(event, ensure_ascii=False)
+        assert provider_secret not in wire
+        assert search_secret not in wire
+        assert bridge.application is before_application
+        assert application.application_mode is before_mode is ApplicationMode.CODING
+        assert application.runtime_context.workdir == before_workdir
+
+        denied = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-unregistered",
+                "workspace.diff",
+                {
+                    "project_key": unregistered_key,
+                    "catalog_project_keys": [current_key, workspace_key, "uthcode:general"],
+                },
+            )
+        )
+        assert denied.ok is False and denied.error is not None
+        assert denied.error.kind == "project_not_registered"
+        assert bridge.application is before_application
+        assert application.runtime_context.workdir == before_workdir
+
+        general_denied = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-general-owner",
+                "workspace.diff",
+                {
+                    "project_key": "uthcode:general",
+                    "catalog_project_keys": [current_key, workspace_key, "uthcode:general"],
+                },
+            )
+        )
+        assert general_denied.ok is False and general_denied.error is not None
+        assert general_denied.error.kind == "workspace_unavailable"
+        assert bridge.application is before_application
+        assert application.runtime_context.workdir == before_workdir
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_coding_runtime_can_manage_general_archives_without_changing_owner(
+    tmp_path: Path,
+) -> None:
+    project = (tmp_path / "coding-project").resolve()
+    project.mkdir()
+    home = (tmp_path / "home").resolve()
+    general_workdir = home / ".uthcode"
+    storage_root = tmp_path / "sessions"
+    coding_key = str(project)
+    configuration = EffectiveConfig(
+        default_model="fake/coding-admin",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/coding-admin": ModelProfile("fake/coding-admin", "fake", "coding-admin"),
+        },
+    )
+
+    def provider_builder(_profile, _model):
+        return FakeProvider(events=(_completed(),))
+
+    def make_application(workdir: Path, mode: ApplicationMode) -> UthCodeApplication:
+        return create_application(
+            configuration,
+            provider_builder=provider_builder,
+            runtime_context=ApplicationRuntimeContext.from_system(workdir=workdir),
+            storage_root=storage_root,
+            application_mode=mode,
+        )
+
+    general_creator = make_application(general_workdir, ApplicationMode.GENERAL)
+    general_session = general_creator.create_session()
+    general_session_id = general_session.session_id
+    general_creator.close()
+    general_archiver = make_application(general_workdir, ApplicationMode.GENERAL)
+    general_archiver.set_session_archived(
+        general_session_id,
+        True,
+        project_key="uthcode:general",
+    )
+    general_archiver.close()
+
+    coding_application = make_application(project, ApplicationMode.CODING)
+
+    def factory(workdir: Path) -> UthCodeApplication:
+        mode = (
+            ApplicationMode.GENERAL
+            if workdir.resolve() == general_workdir.resolve()
+            else ApplicationMode.CODING
+        )
+        return make_application(workdir, mode)
+
+    bridge = DesktopBridge(
+        application=coding_application,
+        application_factory=factory,
+        home=home,
+        workdir=project,
+    )
+    try:
+        initialized = await bridge.handle_request(
+            RequestEnvelope(
+                "coding-admin-initialize",
+                "runtime.initialize",
+                {
+                    "mode": "coding",
+                    "workdir": coding_key,
+                    "catalog_project_keys": [coding_key, "uthcode:general"],
+                },
+            )
+        )
+        assert initialized.ok is True
+        assert bridge.application is coding_application
+        assert bridge._current_mode() is ApplicationMode.CODING
+        assert bridge._current_owner_key() == coding_key
+
+        archived_catalog = await bridge.handle_request(
+            RequestEnvelope(
+                "coding-admin-general-archive-list",
+                "project.sessions",
+                {"project_key": "uthcode:general", "archived": True},
+            )
+        )
+        assert archived_catalog.ok is True and archived_catalog.result is not None
+        assert [row["session_id"] for row in archived_catalog.result["sessions"]] == [
+            general_session_id
+        ]
+
+        restored = await bridge.handle_request(
+            RequestEnvelope(
+                "coding-admin-general-archive-restore",
+                "session.archive",
+                {
+                    "session_id": general_session_id,
+                    "project_key": "uthcode:general",
+                    "archived": False,
+                },
+            )
+        )
+        assert restored.ok is True and restored.result is not None
+        assert restored.result["archived"] is False
+
+        unknown_project = (tmp_path / "unknown-project").resolve()
+        unknown_project.mkdir()
+        unknown = await bridge.handle_request(
+            RequestEnvelope(
+                "coding-admin-unknown-owner",
+                "project.sessions",
+                {"project_key": str(unknown_project)},
+            )
+        )
+        assert unknown.ok is False and unknown.error is not None
+        assert unknown.error.kind == "project_not_registered"
+
+        resume = await bridge.handle_request(
+            RequestEnvelope(
+                "coding-admin-cross-mode-resume",
+                "session.resume",
+                {"session_id": general_session_id, "project_key": "uthcode:general"},
+            )
+        )
+        assert resume.ok is False and resume.error is not None
+        assert resume.error.kind == "project_not_registered"
+        assert bridge._current_search_scope() == (coding_key,)
+        assert bridge.application is coding_application
+        assert bridge._current_mode() is ApplicationMode.CODING
+        assert bridge._current_owner_key() == coding_key
+        assert coding_application.session_service is not None
+        assert coding_application.session_service.active_session is None
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_workspace_diff_runs_off_loop_waits_for_cancel_cleanup_and_drops_late_owner_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import uthcode.integrations.tools.git_tools as git_tools_module
+
+    def git(root: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    current = (tmp_path / "current-project").resolve()
+    current.mkdir()
+    workspace = (tmp_path / "registered-project").resolve()
+    workspace.mkdir()
+    git(workspace, "init", "--initial-branch=main")
+    git(workspace, "config", "user.email", "test@example.invalid")
+    git(workspace, "config", "user.name", "UthCode Test")
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    git(workspace, "add", "tracked.txt")
+    git(workspace, "commit", "-m", "initial")
+    tracked.write_text("after\n", encoding="utf-8")
+
+    home = (tmp_path / "home").resolve()
+    general_workdir = home / ".uthcode"
+    storage_root = tmp_path / "sessions"
+    configuration = EffectiveConfig(
+        default_model="fake/workspace-cancel",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/workspace-cancel": ModelProfile("fake/workspace-cancel", "fake", "workspace-cancel"),
+        },
+    )
+
+    def make_application(workdir: Path, mode: ApplicationMode) -> UthCodeApplication:
+        return create_application(
+            configuration,
+            provider_builder=lambda _profile, _model: FakeProvider(events=(_completed(),)),
+            runtime_context=ApplicationRuntimeContext.from_system(workdir=workdir),
+            storage_root=storage_root,
+            application_mode=mode,
+        )
+
+    coding_application = make_application(current, ApplicationMode.CODING)
+
+    def factory(workdir: Path) -> UthCodeApplication:
+        mode = (
+            ApplicationMode.GENERAL
+            if workdir.resolve() == general_workdir.resolve()
+            else ApplicationMode.CODING
+        )
+        return make_application(workdir, mode)
+
+    bridge = DesktopBridge(
+        application=coding_application,
+        application_factory=factory,
+        home=home,
+        workdir=current,
+    )
+    child_processes: list[subprocess.Popen] = []
+    process_started = threading.Event()
+    try:
+        real_popen = subprocess.Popen
+
+        def slow_child(_args, **kwargs):
+            child = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+                stdin=kwargs.get("stdin"),
+                stdout=kwargs.get("stdout"),
+                stderr=kwargs.get("stderr"),
+            )
+            child_processes.append(child)
+            process_started.set()
+            return child
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(git_tools_module.subprocess, "Popen", slow_child)
+            started = await bridge.handle_request(
+                RequestEnvelope(
+                    "workspace-diff-cancel-start",
+                    "workspace.diff",
+                    {
+                        "project_key": str(workspace),
+                        "catalog_project_keys": [str(current), str(workspace), "uthcode:general"],
+                    },
+                )
+            )
+            assert started.ok is True and started.result is not None
+            operation_id = str(started.result["operation_id"])
+            assert await asyncio.wait_for(asyncio.to_thread(process_started.wait, 2), 2)
+
+            status = await asyncio.wait_for(
+                bridge.handle_request(RequestEnvelope("workspace-diff-status", "status.get", {})),
+                0.2,
+            )
+            assert status.ok is True
+            bridge._publish(AgentEventEnvelope({"type": "workspace_diff_background_probe"}))
+            assert any(
+                isinstance(envelope, AgentEventEnvelope)
+                and envelope.event.get("type") == "workspace_diff_background_probe"
+                for envelope in bridge.drain_outbox()
+            )
+
+            cancelled = await asyncio.wait_for(
+                bridge.handle_request(
+                    RequestEnvelope(
+                        "workspace-diff-cancel",
+                        "workspace.diff.cancel",
+                        {"operation_id": operation_id},
+                    )
+                ),
+                2,
+            )
+            assert cancelled.ok is True and cancelled.result is not None
+            assert cancelled.result["state"] == "cancelled"
+            assert child_processes and all(child.poll() is not None for child in child_processes)
+            cancelled_event = await _wait_for_workspace_diff_event(bridge, operation_id)
+            assert cancelled_event["state"] == "cancelled"
+            assert "staged_diff" not in cancelled_event
+
+        real_review = coding_application.read_workspace_diff
+        late_review_started = threading.Event()
+        release_late_result = threading.Event()
+
+        def delayed_review(project_key, **kwargs):
+            result = real_review(project_key, **kwargs)
+            late_review_started.set()
+            if not release_late_result.wait(5):
+                raise AssertionError("test did not release delayed workspace diff")
+            return result
+
+        coding_application.read_workspace_diff = delayed_review  # type: ignore[method-assign]
+        late = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-late-start",
+                "workspace.diff",
+                {
+                    "project_key": str(workspace),
+                    "catalog_project_keys": [str(current), str(workspace), "uthcode:general"],
+                },
+            )
+        )
+        assert late.ok is True and late.result is not None
+        late_operation_id = str(late.result["operation_id"])
+        assert await asyncio.wait_for(asyncio.to_thread(late_review_started.wait, 2), 2)
+
+        opened = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-general-navigation",
+                "general.open",
+                {"catalog_project_keys": [str(current), str(workspace), "uthcode:general"]},
+            )
+        )
+        assert opened.ok is True
+        assert bridge._current_mode() is ApplicationMode.GENERAL
+        assert bridge._current_owner_key() == "uthcode:general"
+        release_late_result.set()
+        late_event = await _wait_for_workspace_diff_event(bridge, late_operation_id)
+        assert late_event["state"] == "stale"
+        assert "staged_diff" not in late_event
+        assert "unstaged_diff" not in late_event
+    finally:
+        if 'release_late_result' in locals():
+            release_late_result.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_search_cancel_and_late_owner_change_are_isolated(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    source_key = str(source.resolve())
+    target_key = str(target.resolve())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled_worker_exited = asyncio.Event()
+    scopes: list[tuple[str, ...]] = []
+
+    application = _FakeApplication()
+    application.application_mode = ApplicationMode.CODING
+    application.session_service = SimpleNamespace(project_key=source_key)
+
+    async def search_sessions(
+        _query: str,
+        *,
+        project_keys: tuple[str, ...],
+        max_results: int,
+        cancellation: CancellationToken,
+    ) -> SessionSearchResult:
+        del max_results
+        scopes.append(project_keys)
+        started.set()
+        if _query == "sentinel query":
+            await cancellation.wait()
+            cancelled_worker_exited.set()
+            return SessionSearchResult(())
+        await release.wait()
+        return SessionSearchResult(
+            (
+                SessionSearchHit(
+                    "target-hit",
+                    target_key,
+                    "Title",
+                    "safe snippet",
+                    False,
+                    "2026-10-10T00:00:00+00:00",
+                ),
+            )
+        )
+
+    application.search_sessions = search_sessions
+    bridge = DesktopBridge(
+        application=application,
+        application_factory=lambda path: _FakeApplication(),
+        workdir=source,
+    )
+    catalog = [source_key, target_key, "uthcode:general"]
+    try:
+        first = await bridge.handle_request(
+            RequestEnvelope(
+                "search-cancel-start",
+                "session.search",
+                {"query": "sentinel query", "catalog_project_keys": catalog},
+            )
+        )
+        assert first.ok is True and first.result is not None
+        assert first.result["state"] == "searching"
+        assert await asyncio.wait_for(started.wait(), timeout=1)
+        operation_id = str(first.result["operation_id"])
+        first_operation_task = bridge._session_search_operations[operation_id]["task"]
+        assert isinstance(first_operation_task, asyncio.Task)
+        cancelled = await bridge.handle_request(
+            RequestEnvelope(
+                "search-cancel-request",
+                "session.search.cancel",
+                {"operation_id": operation_id},
+            )
+        )
+        assert cancelled.ok is True
+        await asyncio.wait_for(first_operation_task, timeout=1)
+        assert cancelled_worker_exited.is_set()
+        cancelled_event = next(
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event" and envelope.event.get("operation_id") == operation_id
+        )
+        assert cancelled_event["state"] == "cancelled"
+        assert "hits" not in cancelled_event
+
+        started.clear()
+        release.clear()
+        stale = await bridge.handle_request(
+            RequestEnvelope(
+                "search-stale-start",
+                "session.search",
+                {"query": "late query", "catalog_project_keys": catalog},
+            )
+        )
+        assert stale.ok is True and stale.result is not None
+        assert await asyncio.wait_for(started.wait(), timeout=1)
+        stale_operation_id = str(stale.result["operation_id"])
+        opened = await bridge.handle_request(
+            RequestEnvelope(
+                "search-stale-owner-change",
+                "project.open",
+                {"path": target_key, "catalog_project_keys": catalog},
+            )
+        )
+        assert opened.ok is True
+        release.set()
+        operation = bridge._session_search_operations[stale_operation_id]
+        stale_task = operation["task"]
+        assert isinstance(stale_task, asyncio.Task)
+        await stale_task
+        stale_event = next(
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event" and envelope.event.get("operation_id") == stale_operation_id
+        )
+        assert stale_event["state"] == "stale"
+        assert "hits" not in stale_event
+        assert scopes == [(source_key, target_key), (source_key, target_key)]
+    finally:
+        release.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["active", "paused", "compacting"])
+async def test_session_archive_rejects_only_the_target_runtime_gate(
+    tmp_path: Path,
+    gate: str,
+) -> None:
+    project_key = str(tmp_path.resolve())
+
+    class ArchiveApplication(_FakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.session_service = SimpleNamespace(
+                project_key=project_key,
+                active_session=SimpleNamespace(session_id="archive-target"),
+            )
+            self.application_mode = ApplicationMode.CODING
+            self.archive_calls: list[tuple[str, bool, str | None]] = []
+
+        def set_session_archived(
+            self,
+            session_id: str,
+            archived: bool,
+            *,
+            project_key: str | None = None,
+        ) -> SessionMutation:
+            self.archive_calls.append((session_id, archived, project_key))
+            return SessionMutation(session_id, project_key or project_key, archived=archived)
+
+    application = ArchiveApplication()
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+    bridge._catalog_project_keys = {project_key, "uthcode:general"}
+    handle: _FakeHandle | None = None
+    if gate == "active":
+        handle = _FakeHandle()
+        bridge._active_handle = handle
+    elif gate == "paused":
+        handle = _FakeHandle(_user_input_pause())
+        bridge._active_handle = handle
+    elif gate == "pending":
+        application.session_service.active_session = SimpleNamespace(session_id="other-active")
+        bridge._background_runtimes["archive-target"] = {
+            "application": application,
+            "handle": None,
+            "pending_pause": _user_input_pause(),
+            "status": "paused",
+            "project_key": project_key,
+        }
+    else:
+        bridge._compaction_operations["archive-target"] = {"state": "running"}
+    try:
+        rejected = await bridge.handle_request(
+            RequestEnvelope(
+                f"archive-{gate}-reject",
+                "session.archive",
+                {"session_id": "archive-target", "project_key": project_key, "archived": True},
+            )
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.kind == ("compaction_active" if gate == "compacting" else "session_busy")
+        assert application.archive_calls == []
+        if handle is not None:
+            assert handle.cancel_calls == 0
+    finally:
+        bridge._active_handle = None
+        bridge._compaction_operations.clear()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_archive_ignores_unrelated_active_background_session_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    unregistered = tmp_path / "unregistered"
+    unregistered.mkdir()
+    unregistered_key = str(unregistered.resolve())
+
+    class ArchiveApplication(_FakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.archive_calls: list[tuple[str, bool, str | None]] = []
+            self.session_service = SimpleNamespace(
+                project_key=project_key,
+                active_session=SimpleNamespace(session_id="archive-idle"),
+            )
+            self.application_mode = ApplicationMode.CODING
+
+        def set_session_archived(
+            self,
+            session_id: str,
+            archived: bool,
+            *,
+            project_key: str | None = None,
+        ) -> SessionMutation:
+            self.archive_calls.append((session_id, archived, project_key))
+            return SessionMutation(session_id, project_key or "", archived=archived)
+
+    application = ArchiveApplication()
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+    bridge._background_runtimes["other-session"] = {
+        "application": application,
+        "handle": _BlockingHandle(),
+        "task": None,
+        "project_key": project_key,
+        "status": "running",
+    }
+    try:
+        for sequence in range(2):
+            archived = await bridge.handle_request(
+                RequestEnvelope(
+                    f"archive-idempotent-{sequence}",
+                    "session.archive",
+                    {"session_id": "archive-idle", "project_key": project_key, "archived": True},
+                )
+            )
+            assert archived.ok is True and archived.result is not None
+            assert archived.result["archived"] is True
+            assert archived.result["project_key"] == project_key
+        assert bridge._background_runtimes["other-session"]["handle"].cancel_calls == 0
+        calls_before_denied = len(application.archive_calls)
+        denied = await bridge.handle_request(
+            RequestEnvelope(
+                "archive-unregistered-owner",
+                "session.archive",
+                {"session_id": "archive-idle", "project_key": unregistered_key, "archived": True},
+            )
+        )
+        assert denied.ok is False and denied.error is not None
+        assert denied.error.kind == "project_not_registered"
+        assert len(application.archive_calls) == calls_before_denied
+    finally:
+        bridge._background_runtimes.clear()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_active_coding_runtime_keeps_its_owner_through_general_round_trip(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    project_key = str(project.resolve())
+    general_workdir = (home / ".uthcode").resolve()
+
+    def factory(path: Path) -> _BackgroundSessionApplication:
+        application = _BackgroundSessionApplication("active-coding", path)
+        application.application_mode = (
+            ApplicationMode.GENERAL
+            if path.resolve() == general_workdir
+            else ApplicationMode.CODING
+        )
+        application.session_service.project_key = (
+            "uthcode:general"
+            if application.application_mode is ApplicationMode.GENERAL
+            else str(path.resolve())
+        )
+        application.session_catalog_metadata = lambda **_kwargs: ()
+        return application
+
+    coding = factory(project)
+    handle = _BlockingHandle()
+    bridge = DesktopBridge(
+        application=coding,
+        application_factory=factory,
+        workdir=project,
+        home=home,
+    )
+    bridge._catalog_project_keys = {project_key}
+    bridge._active_handle = handle
+    try:
+        opened_general = await bridge.handle_request(
+            RequestEnvelope(
+                "active-owner-general-open",
+                "general.open",
+                {"catalog_project_keys": [project_key, "uthcode:general"]},
+            )
+        )
+        assert opened_general.ok is True
+        assert handle.cancel_calls == 0
+        assert bridge._active_handle is None
+        parked = bridge._background_runtimes["active-coding"]
+        assert parked["application"] is coding
+        assert parked["project_key"] == project_key
+
+        bridge._publish_process_event(
+            coding,
+            {"type": "process_state", "session_id": "active-coding", "state": "running"},
+        )
+        event = next(
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event" and envelope.event.get("type") == "process_state"
+        )
+        assert event["project_key"] == project_key
+
+        opened_coding = await bridge.handle_request(
+            RequestEnvelope(
+                "active-owner-project-open",
+                "project.open",
+                {"path": project_key, "catalog_project_keys": [project_key, "uthcode:general"]},
+            )
+        )
+        assert opened_coding.ok is True
+        assert bridge._current_mode() is ApplicationMode.CODING
+        assert handle.cancel_calls == 0
+        assert parked["project_key"] == project_key
+        bridge._publish_process_event(
+            coding,
+            {"type": "process_state", "session_id": "active-coding", "state": "exited"},
+        )
+        returned_event = next(
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event" and envelope.event.get("type") == "process_state"
+        )
+        assert returned_event["project_key"] == project_key
+    finally:
+        await bridge.shutdown()

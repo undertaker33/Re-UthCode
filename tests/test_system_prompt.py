@@ -7,6 +7,8 @@ import pytest
 from uthcode.core.prompt import (
     RuntimePromptContext,
     build_runtime_prompt_section,
+    public_general_prompt_source,
+    public_prompt_source,
 )
 from uthcode.core.planning import (
     BehaviorMode,
@@ -86,3 +88,14 @@ def test_runtime_prompt_context_is_frozen_and_rejects_broad_objects() -> None:
         RuntimePromptContext(plan_state={})  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         RuntimePromptContext(one_shot_feedback={})  # type: ignore[arg-type]
+
+
+def test_general_public_prompt_is_a_distinct_text_assistant_asset() -> None:
+    general = public_general_prompt_source()
+    coding = public_prompt_source()
+
+    assert general.provenance.endswith("general_assistant.md")
+    assert "日常文本交流" in general.content
+    assert "面向软件工程任务" not in general.content
+    assert "TodoWrite" not in general.content
+    assert general.content != coding.content

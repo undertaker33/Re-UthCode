@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import CancelledError
+from datetime import datetime, timezone
 import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -57,6 +58,8 @@ from uthcode.core.prompt import (
     ContextSourceKind,
     ContextStability,
     RuntimePromptContext,
+    public_general_prompt_source,
+    public_prompt_source,
 )
 from uthcode.core.context import (
     ContextBudget,
@@ -84,10 +87,22 @@ from uthcode.core.permission import (
     RuleSet,
 )
 
-from .configuration import ConfigSource, EffectiveConfig, ModelProfile, ProviderProfile
+from .configuration import (
+    ApplicationMode,
+    ConfigSource,
+    EffectiveConfig,
+    GENERAL_SESSION_OWNER_KEY,
+    ModelProfile,
+    ProviderProfile,
+)
 from .context import ApplicationContextService, CompactionStatus, ContextStatus
 from .attachments import ArtifactService, AttachmentService, project_history_attachment
 from uthcode.integrations.attachment_files import AttachmentPolicy
+from uthcode.integrations.tools.git_tools import (
+    GitQueryError,
+    GitUnavailableError,
+    GitWorkspace,
+)
 from .instructions import InstructionLoader
 from .runtime_context import ApplicationRuntimeContext
 from .sessions import (
@@ -101,8 +116,13 @@ from .sessions import (
     SessionSearchResult,
     SessionReplayRecord,
     SessionOperationError,
+    _canonical_project_key,
 )
-from .tools import ApplicationToolService, tool_result_policy_for_output_limit
+from .tools import (
+    ApplicationToolService,
+    ToolResultReadPage,
+    tool_result_policy_for_output_limit,
+)
 from .provider_usage import cumulative_usage_delta, public_usage_diagnostics
 from .request_preparation import (
     effective_output_reserve as _effective_output_reserve,
@@ -121,6 +141,10 @@ class ImageInputUnsupportedError(ProviderConfigurationError):
     """Stable Application business fact for a model/image capability refusal."""
 
     code = "image_input_unsupported"
+
+
+class WorkspaceReviewError(RuntimeError):
+    """A safe Application-level failure while reading current workspace state."""
 
 
 ProviderBuilder = Callable[[ProviderProfile, ModelProfile], ProviderPort]
@@ -346,7 +370,14 @@ class UthCodeApplication:
         session_service: ApplicationSessionService | None = None,
         attachment_service: AttachmentService | None = None,
         artifact_service: ArtifactService | None = None,
+        application_mode: ApplicationMode | str = ApplicationMode.CODING,
     ) -> None:
+        self._application_mode = ApplicationMode.coerce(application_mode)
+        prompt_source = (
+            public_general_prompt_source()
+            if self._application_mode is ApplicationMode.GENERAL
+            else public_prompt_source()
+        )
         self._provider = provider
         self._configuration = configuration
         self._provider_builder = provider_builder
@@ -369,14 +400,27 @@ class UthCodeApplication:
             tool_service = ApplicationToolService(())
         if not isinstance(tool_service, ApplicationToolService):
             raise TypeError("tool_service must be an ApplicationToolService")
+        if self._application_mode is ApplicationMode.GENERAL and tool_service.definitions():
+            raise ValueError("General mode cannot be composed with Tools")
         if permission_rules_loader is not None and not callable(permission_rules_loader):
             raise TypeError("permission_rules_loader must be callable or None")
         if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
             raise TypeError("instruction_loader must be InstructionLoader or None")
+        if self._application_mode is ApplicationMode.GENERAL and instruction_loader is not None:
+            if instruction_loader.project_root is not None or instruction_loader.public_prompt != prompt_source:
+                raise ValueError("General mode requires a user-only InstructionLoader and General prompt")
         if context_service is not None and not isinstance(context_service, ApplicationContextService):
             raise TypeError("context_service must be ApplicationContextService or None")
+        if context_service is not None and context_service.prompt_source != prompt_source:
+            raise ValueError("Context service prompt does not match Application mode")
         if session_service is not None and not isinstance(session_service, ApplicationSessionService):
             raise TypeError("session_service must be ApplicationSessionService or None")
+        if (
+            self._application_mode is ApplicationMode.GENERAL
+            and session_service is not None
+            and session_service.project_key != GENERAL_SESSION_OWNER_KEY
+        ):
+            raise ValueError("General mode requires the General Session owner")
         if attachment_service is not None and not isinstance(attachment_service, AttachmentService):
             raise TypeError("attachment_service must be AttachmentService or None")
         # Keep Session and attachment owners available while composing the
@@ -405,7 +449,9 @@ class UthCodeApplication:
             self._process_manager_unsubscribe = subscribe_process(self._receive_process_observation)
         self._permission_rules_loader = permission_rules_loader
         self._instruction_loader = instruction_loader
-        self._context_service = context_service or ApplicationContextService()
+        self._context_service = context_service or ApplicationContextService(
+            prompt_source=prompt_source
+        )
         self._configure_provider_asset_resolver(self._provider)
         self._provider_usage_diagnostics = public_usage_diagnostics(None)
         self._last_provider_request_usage = public_usage_diagnostics(None)
@@ -452,6 +498,10 @@ class UthCodeApplication:
     @property
     def provider(self) -> ProviderPort:
         return self._provider
+
+    @property
+    def application_mode(self) -> ApplicationMode:
+        return self._application_mode
 
     @property
     def configuration(self) -> EffectiveConfig | None:
@@ -556,6 +606,91 @@ class UthCodeApplication:
             authorized_external=authorized_external,
             mode=mode,
         )
+
+    def read_workspace_diff(
+        self,
+        project_key: str,
+        *,
+        registered_project_keys: Sequence[str],
+        path: str | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> dict[str, object]:
+        """Read bounded current Git status/diffs for a Main-registered Coding workspace."""
+
+        if self._application_mode is not ApplicationMode.CODING:
+            raise ValueError("General mode does not expose workspace review")
+        if isinstance(registered_project_keys, (str, bytes, bytearray)) or not isinstance(
+            registered_project_keys,
+            Sequence,
+        ):
+            raise TypeError("registered_project_keys must be a sequence")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be CancellationToken or None")
+        try:
+            target = _canonical_project_key(project_key)
+        except (TypeError, ValueError):
+            raise ValueError("workspace owner is unavailable") from None
+        registered: set[str] = set()
+        for value in registered_project_keys:
+            if value == GENERAL_SESSION_OWNER_KEY:
+                continue
+            try:
+                registered.add(_canonical_project_key(value))
+            except (TypeError, ValueError):
+                continue
+        if target not in registered:
+            raise ValueError("workspace owner is not registered")
+        if path is not None and (
+            not isinstance(path, str) or not path.strip() or len(path) > 2048
+        ):
+            raise ValueError("workspace diff path is invalid")
+        try:
+            result = GitWorkspace(target).review(path=path, cancellation=cancellation)
+        except (GitUnavailableError, GitQueryError):
+            raise WorkspaceReviewError("workspace review is unavailable") from None
+        status = result.get("status")
+        if isinstance(status, Mapping):
+            branch = status.get("branch")
+            if isinstance(branch, str):
+                status = {**status, "branch": self.redact_public_text(branch)}
+            entries = status.get("entries")
+            if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, bytearray)):
+                status = {
+                    **status,
+                    "entries": [
+                        {
+                            key: self.redact_public_text(value)
+                            if key in {"path", "original_path"} and isinstance(value, str)
+                            else value
+                            for key, value in entry.items()
+                        }
+                        if isinstance(entry, Mapping)
+                        else entry
+                        for entry in entries
+                    ],
+                }
+            result = {**result, "status": status}
+        for field_name in ("staged_diff", "unstaged_diff"):
+            diff = result.get(field_name)
+            if isinstance(diff, Mapping) and isinstance(diff.get("text"), str):
+                result = {
+                    **result,
+                    field_name: {
+                        **diff,
+                        "text": self.redact_public_text(diff["text"]),
+                    },
+                }
+        return {
+            "source": "current_working_tree",
+            "project_key": target,
+            "viewed_at": datetime.now(timezone.utc).isoformat(),
+            **result,
+        }
+
+    def redact_public_text(self, value: str) -> str:
+        """Project one Application-owned string through configured-secret redaction."""
+
+        return self._tool_service.redact_public_text(value)
 
     def _process_runtime(self):
         manager = self._runtime_context.process_manager
@@ -724,6 +859,21 @@ class UthCodeApplication:
 
         return self._tool_service.definitions()
 
+    def _agent_tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        if self._application_mode is ApplicationMode.GENERAL:
+            return ()
+        return self._tool_service.definitions() + (
+            ASK_USER_TOOL_DEFINITION,
+            TODO_WRITE_TOOL_DEFINITION,
+            PROPOSE_PLAN_TOOL_DEFINITION,
+        )
+
+    def _runtime_prompt_context(
+        self,
+        value: RuntimePromptContext | None,
+    ) -> RuntimePromptContext | None:
+        return None if self._application_mode is ApplicationMode.GENERAL else value
+
     def reload_configuration(self, configuration: EffectiveConfig) -> None:
         """Apply a saved configuration at the next safe Turn boundary.
 
@@ -772,24 +922,27 @@ class UthCodeApplication:
         manager = self._runtime_context.process_manager
         if manager is None:
             raise RuntimeError("configuration reload requires the existing process manager")
-        tool_builder = self._tool_builder
-        if tool_builder is None:
-            raise RuntimeError("configuration reload requires the existing Tool builder")
         attachment_service = self._attachment_service
         session_service = self._session_service
         if attachment_service is None or session_service is None:
             raise RuntimeError("configuration reload requires the existing Session services")
         loader = self._instruction_loader
-        new_tools = tool_builder(
-            self._runtime_context.workdir,
-            on_path_access=(loader.activate_for_path if loader is not None else None),
-            attachment_service=attachment_service,
-            session_provider=lambda: session_service.active_session,
-            process_manager=manager,
-            search_configuration=configuration.search,
-            tool_limits=configuration.tool_limits,
-            redirect_authorizer=authorize_redirect,
-        )
+        if self._application_mode is ApplicationMode.GENERAL:
+            new_tools = ()
+        else:
+            tool_builder = self._tool_builder
+            if tool_builder is None:
+                raise RuntimeError("configuration reload requires the existing Tool builder")
+            new_tools = tool_builder(
+                self._runtime_context.workdir,
+                on_path_access=(loader.activate_for_path if loader is not None else None),
+                attachment_service=attachment_service,
+                session_provider=lambda: session_service.active_session,
+                process_manager=manager,
+                search_configuration=configuration.search,
+                tool_limits=configuration.tool_limits,
+                redirect_authorizer=authorize_redirect,
+            )
         secret_values = tuple(
             item.api_key
             for item in configuration.providers.values()
@@ -801,7 +954,11 @@ class UthCodeApplication:
             new_tools,
             workdir=self._runtime_context.workdir,
             secret_values=secret_values,
-            session_provider=lambda: session_service.active_session,
+            session_provider=(
+                (lambda: session_service.active_session)
+                if self._application_mode is ApplicationMode.CODING
+                else None
+            ),
             tool_result_policy=tool_result_policy_for_output_limit(
                 configuration.tool_limits.output_bytes,
             ),
@@ -923,6 +1080,8 @@ class UthCodeApplication:
     def move_session(self, session_id: str, target_project_key: str) -> SessionMutation:
         """Move an inactive durable Session to a canonical project key."""
 
+        if self._application_mode is ApplicationMode.GENERAL:
+            raise ValueError("General Sessions cannot be moved to a Coding Project")
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
         active = self._session_service.active_session
@@ -935,12 +1094,32 @@ class UthCodeApplication:
             self._context_service.clear_context()
         return result
 
-    def set_session_archived(self, session_id: str, archived: bool) -> SessionMutation:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        project_key: str | None = None,
+        registered_project_keys: Sequence[str] | None = None,
+    ) -> SessionMutation:
         """Set one Session's archive metadata through its owning service."""
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
-        return self._session_service.set_session_archived(session_id, archived)
+        if self._application_mode is ApplicationMode.GENERAL:
+            if project_key in (None, GENERAL_SESSION_OWNER_KEY):
+                project_key = GENERAL_SESSION_OWNER_KEY
+            elif (
+                registered_project_keys is None
+                or isinstance(registered_project_keys, (str, bytes, bytearray))
+                or project_key not in registered_project_keys
+            ):
+                raise ValueError("General Session archive owner is not registered")
+        return self._session_service.set_session_archived(
+            session_id,
+            archived,
+            project_key=project_key,
+        )
 
     def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return the Application-owned same-project Session Picker data."""
@@ -954,11 +1133,23 @@ class UthCodeApplication:
         project_key: str | None = None,
         *,
         archived: bool | None = False,
+        registered_project_keys: Sequence[str] | None = None,
     ) -> tuple[SessionCatalogEntry, ...]:
         """Return Session Picker rows without loading every transcript."""
 
         if self._session_service is None:
             return ()
+        if (
+            self._application_mode is ApplicationMode.GENERAL
+            and project_key is not None
+            and project_key != self._session_service.project_key
+            and (
+                registered_project_keys is None
+                or isinstance(registered_project_keys, (str, bytes, bytearray))
+                or project_key not in registered_project_keys
+            )
+        ):
+            raise ValueError("General Session query owner is not registered")
         return self._session_service.list_catalog_metadata(
             project_key=project_key,
             archived=archived,
@@ -976,6 +1167,12 @@ class UthCodeApplication:
 
         if self._session_service is None:
             raise RuntimeError("durable Session storage is not configured")
+        if self._application_mode is ApplicationMode.GENERAL and project_keys is not None:
+            if isinstance(project_keys, (str, bytes, bytearray)):
+                raise TypeError("project_keys must be a sequence of owner keys")
+            if tuple(project_keys) != (GENERAL_SESSION_OWNER_KEY,):
+                raise ValueError("General Session search is limited to the General owner")
+            project_keys = None
         if cancellation is not None and not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
         token = cancellation or CancellationToken()
@@ -1171,6 +1368,30 @@ class UthCodeApplication:
             records=self._project_replay_attachments(page.records),
         )
 
+    def read_tool_result_page(
+        self,
+        session_id: str,
+        ref: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> ToolResultReadPage:
+        """Read bounded output only through the active owner Session boundary."""
+
+        if self._application_mode is not ApplicationMode.CODING:
+            raise SessionOperationError("unknown", session_id=session_id)
+        if self._session_service is None:
+            raise SessionOperationError("storage", session_id=session_id)
+        active = self._session_service.active_session
+        if active is None or active.session_id != session_id:
+            raise SessionOperationError("unknown", session_id=session_id)
+        return self._tool_service.read_tool_result_page(
+            session_id,
+            ref,
+            offset=offset,
+            limit=limit,
+        )
+
     def _build_session_replay(self, snapshot) -> tuple[SessionReplayRecord, ...]:
         """Build the interface-neutral replay through Application redaction."""
 
@@ -1317,11 +1538,7 @@ class UthCodeApplication:
         )
         cancellation.raise_if_cancelled()
         manual_run_id = f"manual-compact:{owner_session.session_id}"
-        manual_tool_definitions = self._tool_service.definitions() + (
-            ASK_USER_TOOL_DEFINITION,
-            TODO_WRITE_TOOL_DEFINITION,
-            PROPOSE_PLAN_TOOL_DEFINITION,
-        )
+        manual_tool_definitions = self._agent_tool_definitions()
         manual_model_profile = self.current_model
         manual_reasoning = _reasoning_options(
             manual_model_profile.reasoning_effort
@@ -1963,6 +2180,7 @@ class UthCodeApplication:
         session_id: str | None,
         turn_id: str,
         message_ids: Sequence[str | None] = (),
+        tool_observations: Sequence[tuple[str, str | None, str | None]] = (),
         failed_visible_message: Message | None = None,
         failed_visible_message_id: str | None = None,
         termination_reason: TerminationReason | None = None,
@@ -2038,10 +2256,15 @@ class UthCodeApplication:
             self._record_transcript_persistence(outcome)
             return outcome
 
+        persisted_messages = _messages_with_tool_observations(
+            messages,
+            tool_observations,
+        )
+
         entries: list[TranscriptEntry] = []
         try:
             sequence = active.transcript.last_sequence + 1
-            for index, message in enumerate(messages):
+            for index, message in enumerate(persisted_messages):
                 converted = transcript_entries_from_message(
                     active.session_id,
                     turn_id,
@@ -2636,11 +2859,7 @@ class UthCodeApplication:
             plan_state=state.plan_state,
             one_shot_feedback=state.runtime_feedback,
         )
-        ordinary_tools = self._tool_service.definitions() + (
-            ASK_USER_TOOL_DEFINITION,
-            TODO_WRITE_TOOL_DEFINITION,
-            PROPOSE_PLAN_TOOL_DEFINITION,
-        )
+        ordinary_tools = self._agent_tool_definitions()
         if active is None:
             messages: tuple[Message, ...] = state.messages
             transcript = None
@@ -2660,7 +2879,7 @@ class UthCodeApplication:
                 session_id=session_id,
                 transcript=transcript,
                 instruction_loader=self._instruction_loader,
-                runtime_context=runtime_context,
+                runtime_context=self._runtime_prompt_context(runtime_context),
                 timeline=timeline,
                 tool_definitions=ordinary_tools,
                 environment_sources=self._environment_sources(
@@ -3232,10 +3451,7 @@ class UthCodeApplication:
         configured_input_limit = (
             model_profile.context_window if model_profile is not None else None
         )
-        ordinary_tool_definitions = self._tool_service.definitions()
-        tool_definitions = ordinary_tool_definitions + (ASK_USER_TOOL_DEFINITION,)
-        tool_definitions += (TODO_WRITE_TOOL_DEFINITION,)
-        tool_definitions += (PROPOSE_PLAN_TOOL_DEFINITION,)
+        tool_definitions = self._agent_tool_definitions()
 
         def active_timeline():
             if self._session_service is None:
@@ -3470,7 +3686,7 @@ class UthCodeApplication:
                     session_id=active_session_id(),
                     transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
-                    runtime_context=runtime_context,
+                    runtime_context=self._runtime_prompt_context(runtime_context),
                     timeline=timeline_value,  # type: ignore[arg-type]
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
@@ -3516,7 +3732,7 @@ class UthCodeApplication:
                     session_id=active_session_id(),
                     transcript=active_transcript(),
                     instruction_loader=self._instruction_loader,
-                    runtime_context=runtime_context,
+                    runtime_context=self._runtime_prompt_context(runtime_context),
                     timeline=timeline_value,  # type: ignore[arg-type]
                     tool_definitions=visible_definitions,
                     environment_sources=self._environment_sources(model_ref, provider.identity),
@@ -4072,6 +4288,8 @@ class UthCodeApplication:
         model_ref: str,
         identity: ProviderIdentity,
     ) -> tuple[ContextBlock, ...]:
+        if self._application_mode is ApplicationMode.GENERAL:
+            return ()
         content = "\n".join(
             (
                 f"- 工作目录：{self._runtime_context.workdir}",
@@ -4093,6 +4311,45 @@ class UthCodeApplication:
                 content=content,
             ),
         )
+
+def _messages_with_tool_observations(
+    messages: Sequence[Message],
+    observations: Sequence[tuple[str, str | None, str | None]],
+) -> tuple[Message, ...]:
+    """Copy observed Tool lifecycle facts into the durable ToolResult parts only."""
+
+    by_call_id = {
+        call_id: (started_at, completed_at)
+        for call_id, started_at, completed_at in observations
+        if isinstance(call_id, str) and call_id
+    }
+    if not by_call_id:
+        return tuple(messages)
+    projected: list[Message] = []
+    for message in messages:
+        parts: list[object] = []
+        changed = False
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                parts.append(part)
+                continue
+            metadata = dict(part.metadata)
+            # These names are Application-owned; discard any provider/tool
+            # supplied values and add only facts observed by the Run driver.
+            metadata.pop("observed_started_at", None)
+            metadata.pop("observed_completed_at", None)
+            observation = by_call_id.get(part.tool_call_id)
+            if observation is not None:
+                started_at, completed_at = observation
+                if isinstance(started_at, str) and started_at.strip():
+                    metadata["observed_started_at"] = started_at
+                if isinstance(completed_at, str) and completed_at.strip():
+                    metadata["observed_completed_at"] = completed_at
+                changed = True
+            parts.append(replace(part, metadata=metadata) if metadata != dict(part.metadata) else part)
+        projected.append(replace(message, parts=tuple(parts)) if changed else message)
+    return tuple(projected)
+
 
 __all__ = [
     "ApplicationStatus",

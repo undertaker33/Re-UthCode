@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+from uthcode.application import ApplicationSessionService, SessionOperationError, UthCodeApplication
 from uthcode.application.tools import ApplicationToolService
 from uthcode.core.agent import AgentLoop, RunState
+from uthcode.core.agent_events import ToolFinished, agent_event_from_dict
 from uthcode.core.permission import (
     Decision,
     DecisionReason,
@@ -25,12 +28,14 @@ from uthcode.core.provider import (
     ImagePart,
     FilePart,
     Message,
+    ModelLimits,
     ProviderIdentity,
     ProviderResponse,
     SourcePart,
     TextPart,
     ToolCallPart,
     ToolDefinition,
+    ToolResultPart,
     Usage,
 )
 from uthcode.core.tool import (
@@ -44,8 +49,11 @@ from uthcode.core.tool import (
     ToolPreparation,
     ToolRegistry,
     ToolSideEffect,
+    ToolProgress as CoreToolProgress,
 )
-from uthcode.integrations.session_files import SessionFileStore
+from uthcode.core.secrets import SecretValue
+from uthcode.integrations.session_files import SessionFileStore, SessionNotFoundError
+from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.tools import tool_result_read
 from uthcode.integrations.tools.tool_result_read import (
     ToolResultFileStore,
@@ -55,6 +63,7 @@ from uthcode.integrations.tools.tool_result_read import (
     ToolResultQuotaExceeded,
     ToolResultReferenceError,
     ToolResultReadTool,
+    ToolResultError,
     ToolResultTooLarge,
     format_externalized_preview,
 )
@@ -143,6 +152,35 @@ class _PersistenceFailureProvider:
         )
 
 
+class _ObservedOutputTool:
+    definition = ToolDefinition(
+        "ObservedOutput",
+        "A test read Tool with a safely externalized result.",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+
+    def preflight(self, arguments):
+        del arguments
+        return ToolPreparation(
+            PermissionAction(
+                tool="ObservedOutput",
+                action="read",
+                effect=Effect.READ,
+                resource="observed-output",
+                scope=ResourceScope.INSIDE,
+            ),
+            {},
+        )
+
+    async def execute(self, arguments, *, cancellation):
+        del arguments
+        cancellation.report_progress(
+            CoreToolProgress("reading", "PROGRESS-ONLY-OBSERVATION", current=1, total=1)
+        )
+        await asyncio.sleep(0.01)
+        return ToolExecutionResult("persisted output content that exceeds the inline threshold")
+
+
 def test_externalization_preserves_full_bytes_and_returns_bounded_pages(tmp_path: Path) -> None:
     store, writer = _session(tmp_path)
     try:
@@ -193,6 +231,8 @@ def test_application_keeps_small_results_inline_without_a_session_write() -> Non
     assert materialized.reference is None
     assert materialized.result.content == "small"
     assert materialized.result.is_error is False
+    assert materialized.result.metadata["persistence_status"] == "inline"
+    assert materialized.result.metadata["size_bytes"] == 5
 
 
 def test_hard_cap_and_session_quota_reject_before_creating_a_ref(tmp_path: Path) -> None:
@@ -294,8 +334,274 @@ def test_application_materialization_separates_execution_and_persistence_facts(
         assert materialized.reference is not None
         page = writer.read_tool_result(materialized.reference, limit=4, policy=policy)
         assert page.content == "abcd"
+        application_page = service.read_tool_result_page(
+            "session-a",
+            materialized.reference,
+            offset=0,
+            limit=4,
+        )
+        assert application_page.content == "abcd"
+        assert application_page.ref == materialized.reference
+        with pytest.raises(ToolResultError):
+            service.read_tool_result_page(
+                "different-session",
+                materialized.reference,
+            )
+        with pytest.raises(ToolResultReferenceError):
+            service.read_tool_result_page(
+                "session-a",
+                materialized.reference,
+                limit=policy.read_page_limit_bytes + 1,
+            )
     finally:
         writer.close()
+
+
+@pytest.mark.asyncio
+async def test_application_commits_observed_tool_times_and_keeps_progress_live_only(
+    tmp_path: Path,
+) -> None:
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key="project",
+        instruction_loader=None,
+    )
+    policy = _policy(
+        inline_threshold_bytes=4,
+        preview_limit_bytes=4,
+        single_result_hard_cap_bytes=256,
+        session_quota_bytes=512,
+        read_page_limit_bytes=32,
+        read_output_limit_bytes=32,
+    )
+    tool_service = ApplicationToolService(
+        (_ObservedOutputTool(),),
+        session_provider=lambda: session_service.active_session,
+        tool_result_policy=policy,
+    )
+    class ObservedOutputProvider:
+        identity = ProviderIdentity("fake", "observed", "observed-output")
+
+        def __init__(self) -> None:
+            self.requests: list[GenerationRequest] = []
+
+        async def stream(
+            self,
+            request: GenerationRequest,
+            *,
+            cancellation: CancellationToken,
+        ):
+            cancellation.raise_if_cancelled()
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield GenerationCompleted(
+                    ProviderResponse(
+                        Message(
+                            "assistant",
+                            (ToolCallPart("observed-call", "ObservedOutput", {}),),
+                        ),
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        usage=Usage(),
+                    )
+                )
+            else:
+                yield GenerationCompleted(
+                    ProviderResponse(
+                        Message("assistant", (TextPart("finished"),)),
+                        finish_reason=FinishReason.STOP,
+                        usage=Usage(),
+                    )
+                )
+
+    provider = ObservedOutputProvider()
+    application = UthCodeApplication(
+        provider,
+        session_service=session_service,
+        tool_service=tool_service,
+    )
+    try:
+        session = application.create_session("session-tool-observation")
+        handle = application.create_run().start_turn("inspect")
+        events = [event async for event in handle.events()]
+        result = await handle.result()
+
+        assert result.status.value == "completed", (
+            result,
+            [(event.type, event.to_dict()) for event in events],
+        )
+        progress = next(event for event in events if event.type == "tool_progress")
+        assert progress.stage == "reading"  # type: ignore[attr-defined]
+        assert progress.text == "PROGRESS-ONLY-OBSERVATION"  # type: ignore[attr-defined]
+        page = application.session_history_page(session.session_id)
+        tool_record = next(record for record in page.records if record.kind == "tool")
+        assert tool_record.started_at is not None
+        assert tool_record.completed_at is not None
+        assert tool_record.started_at < tool_record.completed_at
+        assert tool_record.output_ref is not None
+
+        persisted = session_service.read_session(session.session_id)
+        transcript_json = persisted.transcript.to_jsonl()
+        assert "PROGRESS-ONLY-OBSERVATION" not in transcript_json
+        assert "tool_progress" not in transcript_json
+        assert "PROGRESS-ONLY-OBSERVATION" not in repr(provider.requests)
+        tool_result = next(
+            part
+            for entry in persisted.transcript.entries
+            for part in (
+                (ToolResultPart.from_dict(entry.payload["part"]),)
+                if entry.kind.value == "tool_result"
+                else ()
+            )
+            if isinstance(part, ToolResultPart)
+        )
+        assert tool_result.metadata["observed_started_at"] == tool_record.started_at
+        assert tool_result.metadata["observed_completed_at"] == tool_record.completed_at
+
+        read_page = application.read_tool_result_page(
+            session.session_id,
+            tool_record.output_ref,
+            limit=16,
+        )
+        assert read_page.ref == tool_record.output_ref
+        assert read_page.offset == 0
+        assert read_page.content
+        with pytest.raises(SessionOperationError):
+            application.read_tool_result_page("another-session", tool_record.output_ref)
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_output_is_redacted_bounded_and_session_owned(
+    tmp_path: Path,
+) -> None:
+    secret = "inline-output-secret-92017"
+
+    class InlineOutputTool(_ObservedOutputTool):
+        definition = ToolDefinition(
+            "InlineOutput",
+            "A test read Tool returning a short result.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+
+        async def execute(self, arguments, *, cancellation):
+            del arguments, cancellation
+            return ToolExecutionResult(f"echo result: {secret}")
+
+    class LongInlineOutputTool(_ObservedOutputTool):
+        definition = ToolDefinition(
+            "LongInlineOutput",
+            "A test read Tool returning a bounded inline preview.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+
+        async def execute(self, arguments, *, cancellation):
+            del arguments, cancellation
+            return ToolExecutionResult("x" * 1500)
+
+    class InlineOutputProvider:
+        identity = ProviderIdentity("fake", "inline-output", "inline-output")
+
+        def __init__(self) -> None:
+            self.requests: list[GenerationRequest] = []
+
+        async def stream(self, request, *, cancellation):
+            cancellation.raise_if_cancelled()
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield GenerationCompleted(
+                    ProviderResponse(
+                        Message(
+                            "assistant",
+                            (
+                                ToolCallPart("inline-secret-call", "InlineOutput", {}),
+                                ToolCallPart("inline-long-call", "LongInlineOutput", {}),
+                            ),
+                        ),
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        usage=Usage(),
+                    )
+                )
+            else:
+                yield GenerationCompleted(
+                    ProviderResponse(
+                        Message("assistant", (TextPart("finished"),)),
+                        finish_reason=FinishReason.STOP,
+                        usage=Usage(),
+                    )
+                )
+
+    session_service = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key="registered-project",
+        instruction_loader=None,
+    )
+    tool_service = ApplicationToolService(
+        (InlineOutputTool(), LongInlineOutputTool()),
+        secret_values=(SecretValue(secret),),
+        session_provider=lambda: session_service.active_session,
+        tool_result_policy=_policy(
+            inline_threshold_bytes=2048,
+            single_result_hard_cap_bytes=4096,
+            session_quota_bytes=8192,
+        ),
+    )
+    provider = InlineOutputProvider()
+    application = UthCodeApplication(
+        provider,
+        session_service=session_service,
+        tool_service=tool_service,
+    )
+    try:
+        session = application.create_session("session-inline-output")
+        handle = application.create_run().start_turn("inspect command output")
+        events = [event async for event in handle.events()]
+        result = await handle.result()
+        assert result.status.value == "completed"
+
+        finished = {
+            event.tool_call_id: event
+            for event in events
+            if isinstance(event, ToolFinished)
+        }
+        safe_live = finished["inline-secret-call"]
+        assert safe_live.output_preview is not None
+        assert secret not in safe_live.output_preview
+        assert "redact" in safe_live.output_preview.lower()
+        assert safe_live.output_preview_truncated is False
+        decoded_live = agent_event_from_dict(safe_live.to_dict())
+        assert isinstance(decoded_live, ToolFinished)
+        assert decoded_live.output_preview == safe_live.output_preview
+        long_live = finished["inline-long-call"]
+        assert long_live.output_preview is not None
+        assert len(long_live.output_preview) == 1024
+        assert long_live.output_preview_truncated is True
+
+        page = application.session_history_page(session.session_id)
+        tools = {record.tool_call_id: record for record in page.records if record.kind == "tool"}
+        safe_replay = tools["inline-secret-call"]
+        assert safe_replay.output_preview == safe_live.output_preview
+        assert safe_replay.output_ref is None
+        long_replay = tools["inline-long-call"]
+        assert long_replay.output_preview == long_live.output_preview
+        assert long_replay.output_preview_truncated is True
+        encoded = json.dumps(page.to_dict(), ensure_ascii=False)
+        assert secret not in encoded
+        assert "echo result" in encoded
+        durable = session_service.read_session(session.session_id).transcript.to_jsonl()
+        assert secret not in durable
+        assert secret not in repr(provider.requests)
+
+        other_owner = ApplicationSessionService(
+            storage_root=tmp_path / "sessions",
+            project_key="another-registered-project",
+            instruction_loader=None,
+        )
+        with pytest.raises(SessionNotFoundError):
+            other_owner.read_history_page(session.session_id)
+        assert secret not in json.dumps(application.session_history_page(session.session_id).to_dict())
+    finally:
+        application.close()
 
 
 def test_materialization_externalizes_only_text_and_keeps_reference_order(

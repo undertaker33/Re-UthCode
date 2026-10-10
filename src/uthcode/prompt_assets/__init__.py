@@ -11,6 +11,7 @@ from importlib import resources
 
 
 _CODING_AGENT_ASSET = "coding_agent.md"
+_GENERAL_AGENT_ASSET = "general_assistant.md"
 
 
 def read_public_coding_prompt() -> str:
@@ -24,4 +25,15 @@ def read_public_coding_prompt() -> str:
     return content.replace("\r\n", "\n").replace("\r", "\n").rstrip()
 
 
-__all__ = ["read_public_coding_prompt"]
+def read_public_general_prompt() -> str:
+    """Return the packaged public General assistant prompt as UTF-8 text."""
+
+    content = resources.files(__package__).joinpath(_GENERAL_AGENT_ASSET).read_text(
+        encoding="utf-8"
+    )
+    if not content.strip():  # pragma: no cover - protects a broken wheel.
+        raise RuntimeError("public General prompt asset is empty")
+    return content.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+
+__all__ = ["read_public_coding_prompt", "read_public_general_prompt"]
