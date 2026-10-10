@@ -570,6 +570,352 @@ test("App moves a sent attachment into the user row and merges the empty-text au
   });
 });
 
+test("App adopts a lazy first Session before replaying early attachment events and merges UUID history identities", async () => {
+  const projectPath = "C:/lazy-first-session";
+  const lazySessionId = "lazy-session-created-by-turn";
+  const otherSessionId = "other-session";
+  const runId = "run-lazy-session";
+  const turnId = "turn-lazy-session";
+  const userMessageId = "d95b5ac8-e07d-4ba2-8e67-ca0b59842ba1";
+  const reasoningBeforeId = "74d2ae9c-a790-4b43-a839-e2fb95f3c00d";
+  const assistantMessageId = "589fe495-5b8f-45cc-9ed8-5faec24fe2d1";
+  const toolCallId = "call-lazy-session";
+  const prompt = "Read sample.xlsx";
+  const otherSession = { session_id: otherSessionId, title: "Other session", preview: "Existing chat" };
+  const lazySession = { session_id: lazySessionId, title: "First attachment chat", preview: prompt };
+  const durableRecords = [
+    { record_id: `${lazySessionId}:1:user::0`, session_id: lazySessionId, sequence: 1, turn_id: turnId, message_id: userMessageId, kind: "user", text: prompt },
+    { record_id: `${lazySessionId}:3:assistant::0`, session_id: lazySessionId, sequence: 3, turn_id: turnId, message_id: reasoningBeforeId, kind: "reasoning", text: "I will inspect the workbook." },
+    { record_id: `${lazySessionId}:5:tool:${toolCallId}:-`, session_id: lazySessionId, sequence: 5, run_id: runId, turn_id: turnId, tool_call_id: toolCallId, kind: "tool", tool_name: "ReadDocument", text: "ReadDocument", status: "succeeded", is_error: false },
+    { record_id: `${lazySessionId}:6:assistant::0`, session_id: lazySessionId, sequence: 6, turn_id: turnId, message_id: assistantMessageId, kind: "reasoning", text: "The workbook is readable." },
+    { record_id: `${lazySessionId}:7:assistant::1`, session_id: lazySessionId, sequence: 7, turn_id: turnId, message_id: assistantMessageId, kind: "assistant", text: "The workbook has one sheet." },
+  ];
+  assert.notEqual(durableRecords[0]?.record_id, userMessageId);
+  const identity = { run_id: runId, turn_id: turnId, session_id: lazySessionId, project_key: projectPath };
+  const earlyEvents: Record<string, unknown>[] = [
+    { type: "turn_started", ...identity, message_id: userMessageId, message: { role: "user", parts: [{ type: "text", text: prompt }] } },
+    { type: "reasoning_started", ...identity, message_id: reasoningBeforeId },
+    { type: "reasoning_delta", ...identity, message_id: reasoningBeforeId, text: "I will inspect the workbook." },
+    { type: "assistant_message_completed", ...identity, message_id: reasoningBeforeId, kind: "progress", message: { role: "assistant", parts: [{ type: "reasoning", text: "I will inspect the workbook." }, { type: "tool_call", tool_call_id: toolCallId, name: "ReadDocument", arguments: { path: "sample.xlsx" } }] } },
+    { type: "tool_started", ...identity, batch_id: "batch-lazy", tool_call_id: toolCallId, tool_name: "ReadDocument", command: "sample.xlsx" },
+    { type: "tool_finished", ...identity, batch_id: "batch-lazy", tool_call_id: toolCallId, tool_name: "ReadDocument", command: "sample.xlsx", status: "succeeded", is_error: false },
+    { type: "reasoning_started", ...identity, message_id: assistantMessageId },
+    { type: "reasoning_delta", ...identity, message_id: assistantMessageId, text: "The workbook is readable." },
+    { type: "assistant_message_completed", ...identity, message_id: assistantMessageId, message: { role: "assistant", parts: [{ type: "reasoning", text: "The workbook is readable." }, { type: "text", text: "The workbook has one sheet." }] } },
+    { type: "turn_completed", ...identity, final_text: "The workbook has one sheet." },
+  ];
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const preferenceWrites: Array<{ key: string; value: unknown }> = [];
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  let resolveTurnStart: ((result: JsonValue) => void) | null = null;
+  let turnStartAccepted = false;
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "runtime.initialize") return { run: null };
+      if (method === "settings.get") return { configuration: {} };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: turnStartAccepted ? [lazySession, otherSession] : [otherSession] };
+      if (method === "turn.start") {
+        earlyEvents.forEach((event) => eventListener?.(event as AgentEvent));
+        return new Promise<JsonValue>((resolve) => { resolveTurnStart = resolve; });
+      }
+      if (method === "session.resume") {
+        const sessionId = String(params.session_id ?? "");
+        return {
+          session_id: sessionId,
+          replay: [],
+          active_turn: false,
+          run: sessionId === lazySessionId ? { run_id: runId, turn_id: turnId, status: "completed" } : null,
+        };
+      }
+      if (method === "history.page") {
+        const sessionId = String(params.session_id ?? "");
+        return { session_id: sessionId, records: sessionId === lazySessionId ? durableRecords : [], next_cursor: null, has_more: false };
+      }
+      return {};
+    },
+    subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: projectPath, alias: "Lazy project", pinned: false }],
+        projectAliases: { [projectPath]: "Lazy project" }, pinnedProjectKeys: [], pinnedSessions: [],
+        expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async (key, value) => { preferenceWrites.push({ key, value }); return {} as never; },
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  const state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: prompt,
+    composerAttachments: [attachment],
+    projects: [{ path: projectPath, projectKey: projectPath, alias: "Lazy project", pinned: false, sessions: [otherSession], catalogFresh: true }],
+    selectedProjectKey: projectPath,
+    selectedSessionId: null,
+    expandedProjects: { [projectPath]: true },
+  });
+
+  await withRendererDom(async (dom, container, root) => {
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const flush = async () => {
+      await act(async () => {
+        for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    };
+    const sessionButton = (label: string) => [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes(label));
+    await flush();
+    assert.equal(Boolean(eventListener), true);
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.equal(Boolean(send), true);
+    const statusCallsBeforeStart = calls.filter((call) => call.method === "status.get").length;
+    act(() => { send!.click(); });
+    await flush();
+    assert.equal(typeof resolveTurnStart, "function");
+    assert.equal(container.querySelectorAll(".composer-attachments .file-card[data-file-ref='att-1']").length, 1);
+
+    turnStartAccepted = true;
+    act(() => { resolveTurnStart!({ run_id: runId, turn_id: turnId, status: "running", session_id: lazySessionId }); });
+    await flush();
+    assert.deepEqual(calls.find((call) => call.method === "turn.start")?.params, {
+      prompt,
+      attachments: [{ ref: attachment.ref, kind: "image" }],
+    });
+    assert.equal(calls.some((call) => call.method === "session.new"), false);
+    assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === lazySessionId), true);
+    assert.equal(calls.filter((call) => call.method === "status.get").length > statusCallsBeforeStart, true);
+    assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1);
+    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1);
+
+    const otherButton = sessionButton("Other session");
+    assert.equal(Boolean(otherButton), true);
+    act(() => { otherButton!.click(); });
+    await flush();
+    assert.equal(calls.some((call) => call.method === "session.resume" && call.params.session_id === otherSessionId), true);
+    assert.equal(container.querySelectorAll(".timeline-entry").length, 0);
+
+    const lazyButton = sessionButton("First attachment chat");
+    assert.equal(Boolean(lazyButton), true);
+    act(() => { lazyButton!.click(); });
+    await flush();
+    const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
+    const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
+    assert.deepEqual(kinds, ["user", "reasoning", "tool", "reasoning", "assistant"]);
+    assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--user")).length, 1);
+    assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--tool")).length, 1);
+    assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 1);
+    assert.equal(calls.some((call) => call.method === "history.page" && call.params.session_id === lazySessionId), true);
+  });
+});
+
+test("App parks a lazy turn accepted after navigation without stealing the selected Session", async () => {
+  const projectPath = "C:/lazy-session-navigation-race";
+  const lazySessionId = "lazy-session-race";
+  const otherSessionId = "existing-session-race";
+  const runId = "run-lazy-race";
+  const turnId = "turn-lazy-race";
+  const userMessageId = "b73322b9-e69f-4413-b5a8-b4582e2fc838";
+  const otherRunId = "run-existing-background";
+  const otherTurnId = "turn-existing-background";
+  const otherMessageId = "a5f0d79d-24a6-4b2d-9c39-6221af8f1836";
+  const prompt = "Read sample.xlsx";
+  const otherSession = { session_id: otherSessionId, title: "Existing session", preview: "Existing chat" };
+  const lazySession = { session_id: lazySessionId, title: "New background session", preview: prompt };
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const preferenceWrites: Array<{ key: string; value: unknown }> = [];
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  let resolveTurnStart: ((result: JsonValue) => void) | null = null;
+  let turnStartAccepted = false;
+  const identity = { run_id: runId, turn_id: turnId, session_id: lazySessionId, project_key: projectPath };
+  const earlyEvents: Record<string, unknown>[] = [
+    { type: "turn_started", ...identity, message_id: userMessageId, message: { role: "user", parts: [{ type: "text", text: prompt }] } },
+    { type: "reasoning_started", run_id: otherRunId, turn_id: otherTurnId, session_id: otherSessionId, project_key: projectPath, message_id: otherMessageId },
+    { type: "reasoning_delta", run_id: otherRunId, turn_id: otherTurnId, session_id: otherSessionId, project_key: projectPath, message_id: otherMessageId, text: "Background work continued." },
+    { type: "turn_completed", ...identity, final_text: "The workbook has one sheet." },
+  ];
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "runtime.initialize") return { run: null };
+      if (method === "settings.get") return { configuration: {} };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: turnStartAccepted ? [lazySession, otherSession] : [otherSession] };
+      if (method === "turn.start") {
+        earlyEvents.forEach((event) => eventListener?.(event as AgentEvent));
+        return new Promise<JsonValue>((resolve) => { resolveTurnStart = resolve; });
+      }
+      if (method === "session.resume") {
+        const sessionId = String(params.session_id ?? "");
+        return { session_id: sessionId, replay: [], active_turn: false, run: null };
+      }
+      if (method === "history.page") {
+        const sessionId = String(params.session_id ?? "");
+        return {
+          session_id: sessionId,
+          records: sessionId === lazySessionId
+            ? [{ record_id: `${lazySessionId}:1:user::0`, session_id: lazySessionId, sequence: 1, turn_id: turnId, message_id: userMessageId, kind: "user", text: prompt }]
+            : [],
+          next_cursor: null,
+          has_more: false,
+        };
+      }
+      return {};
+    },
+    subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: projectPath, alias: "Race project", pinned: false }], projectAliases: { [projectPath]: "Race project" },
+        pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: { [projectPath]: true },
+        selectedProjectKey: projectPath, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async (key, value) => { preferenceWrites.push({ key, value }); return {} as never; },
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  const state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: prompt,
+    composerAttachments: [attachment],
+    projects: [{ path: projectPath, projectKey: projectPath, alias: "Race project", pinned: false, sessions: [otherSession], catalogFresh: true }],
+    selectedProjectKey: projectPath,
+    selectedSessionId: null,
+    expandedProjects: { [projectPath]: true },
+  });
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const flush = async () => {
+      await act(async () => {
+        for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    };
+    const sessionButton = (label: string) => [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes(label));
+    await flush();
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.equal(Boolean(send), true);
+    act(() => { send!.click(); });
+    await flush();
+    assert.equal(typeof resolveTurnStart, "function");
+
+    const otherButton = sessionButton("Existing session");
+    assert.equal(Boolean(otherButton), true);
+    act(() => { otherButton!.click(); });
+    await flush();
+    assert.equal(container.querySelectorAll(".session-line.is-selected").length, 1);
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Existing session"), true);
+
+    turnStartAccepted = true;
+    act(() => { resolveTurnStart!({ run_id: runId, turn_id: turnId, status: "running", session_id: lazySessionId }); });
+    await flush();
+    assert.equal(container.querySelectorAll(".session-line.is-selected").length, 1);
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Existing session"), true);
+    assert.equal(container.querySelectorAll(".timeline-entry").length, 1);
+    assert.equal(container.querySelectorAll(".timeline-entry--reasoning").length, 1);
+    assert.equal(container.querySelector(".timeline-entry--reasoning")?.textContent?.includes("Background work continued."), true);
+    assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === lazySessionId), false);
+    assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === otherSessionId), true);
+    assert.equal(calls.some((call) => call.method === "project.sessions") && sessionButton("New background session") !== undefined, true);
+
+    const lazyButton = sessionButton("New background session");
+    assert.equal(Boolean(lazyButton), true);
+    act(() => { lazyButton!.click(); });
+    await flush();
+    assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1);
+    assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 0);
+  });
+});
+
+test("App does not report a lazy turn-start error in a Session opened while the request was pending", async () => {
+  const projectPath = "C:/lazy-session-rejection-race";
+  const otherSessionId = "existing-session-after-rejection";
+  const otherSession = { session_id: otherSessionId, title: "Existing session", preview: "Existing chat" };
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  let rejectTurnStart: ((error: Error) => void) | null = null;
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method) => {
+      if (method === "runtime.initialize") return { run: null };
+      if (method === "settings.get") return { configuration: {} };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: [otherSession] };
+      if (method === "turn.start") return new Promise<JsonValue>((_resolve, reject) => { rejectTurnStart = reject; });
+      if (method === "session.resume") return { session_id: otherSessionId, replay: [], active_turn: false, run: null };
+      if (method === "history.page") return { session_id: otherSessionId, records: [], next_cursor: null, has_more: false };
+      return {};
+    },
+    subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: projectPath, alias: "Rejection project", pinned: false }],
+        projectAliases: { [projectPath]: "Rejection project" }, pinnedProjectKeys: [], pinnedSessions: [],
+        expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async () => ({} as never),
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  const state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: "Read sample.xlsx",
+    projects: [{ path: projectPath, projectKey: projectPath, alias: "Rejection project", pinned: false, sessions: [otherSession], catalogFresh: true }],
+    selectedProjectKey: projectPath,
+    selectedSessionId: null,
+    expandedProjects: { [projectPath]: true },
+  });
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const flush = async () => {
+      await act(async () => {
+        for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    };
+    await flush();
+    assert.equal(Boolean(eventListener), true);
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.equal(Boolean(send), true);
+    act(() => { send!.click(); });
+    await flush();
+    assert.equal(typeof rejectTurnStart, "function");
+    const sessionButton = [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes("Existing session"));
+    assert.equal(Boolean(sessionButton), true);
+    act(() => { sessionButton!.click(); });
+    await flush();
+
+    act(() => { rejectTurnStart!(new Error("stale turn-start failure")); });
+    await flush();
+    assert.equal(container.querySelectorAll(".session-line.is-selected").length, 1);
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Existing session"), true);
+    assert.equal(container.querySelectorAll(".timeline-notice").length, 0);
+  });
+});
+
 test("App keeps a first-turn live tool row in order after new-session navigation and durable history recovery", async () => {
   const projectPath = "C:/first-turn-navigation";
   let eventListener: ((event: AgentEvent) => void) | null = null;

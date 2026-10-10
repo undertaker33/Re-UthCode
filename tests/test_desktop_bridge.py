@@ -51,6 +51,7 @@ from uthcode.application import (
     ResumeTurnResponse,
     RunSnapshot,
     RunStatus,
+    SessionCatalogEntry,
     SessionReplayRecord,
     FailureReason,
     OutcomeStatus,
@@ -563,6 +564,64 @@ async def test_bridge_emits_ready_turn_events_in_application_order_and_rejects_s
         assert [event["type"] for event in events][-1] == "turn_completed"
         assert [event["turn_id"] for event in events]
         assert len({event["turn_id"] for event in events}) == 1
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_turn_start_returns_the_lazily_created_session_identity_used_by_live_events(
+    tmp_path: Path,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    sessions = ApplicationSessionService(
+        storage_root=tmp_path / "sessions",
+        project_key=project_key,
+        instruction_loader=None,
+    )
+    configuration = EffectiveConfig(
+        default_model="fake/diagnostic",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={"fake/diagnostic": ModelProfile("fake/diagnostic", "fake", "diagnostic-model")},
+    )
+    application = UthCodeApplication(
+        FakeProvider(
+            events=(TextDelta("progress"), _completed("done")),
+            model_limits=ModelLimits(max_input_tokens=256_000, source="test.desktop_lazy_session"),
+        ),
+        configuration=configuration,
+        runtime_context=ApplicationRuntimeContext.from_system(
+            workdir=tmp_path,
+            platform_name="test",
+            platform_release="test",
+            current_date="2026-10-08",
+        ),
+        session_service=sessions,
+    )
+    bridge = DesktopBridge(application=application, workdir=tmp_path)
+    try:
+        assert sessions.active_session is None
+        started = await bridge.handle_request(
+            RequestEnvelope("lazy-session-start", "turn.start", {"prompt": "diagnostic prompt"})
+        )
+        assert started.ok is True
+        await bridge.wait_for_idle()
+        session = sessions.active_session
+        assert session is not None
+        assert started.result is not None
+        assert started.result["session_id"] == session.session_id
+        assert started.result["run_id"] is not None
+        assert started.result["turn_id"] is not None
+        events = [
+            envelope.event
+            for envelope in bridge.drain_outbox()
+            if envelope.type == "agent_event"
+        ]
+        assert [event["type"] for event in events][0] == "turn_started"
+        assert [event["type"] for event in events][-1] == "turn_completed"
+        assert all(event["session_id"] == session.session_id for event in events)
+        assert all(event["project_key"] == project_key for event in events)
+        assert all(event["run_id"] == started.result["run_id"] for event in events)
+        assert all(event["turn_id"] == started.result["turn_id"] for event in events)
     finally:
         await bridge.shutdown()
 
@@ -2889,6 +2948,96 @@ async def test_settings_save_redacts_transient_api_key_from_request_and_response
     assert "raw-native-secret" not in repr(request)
     assert "raw-native-secret" not in json.dumps(result.to_dict())
     await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_bridge_reads_only_main_registered_cross_project_catalog_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    unregistered = tmp_path / "unregistered"
+    source.mkdir()
+    target.mkdir()
+    unregistered.mkdir()
+    source_key = str(source.resolve())
+    target_key = str(target.resolve())
+    unregistered_key = str(unregistered.resolve())
+
+    class CatalogApplication(_FakeApplication):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_projects: list[str | None] = []
+
+        def session_catalog_metadata(self, *, project_key: str | None = None) -> tuple[SessionCatalogEntry, ...]:
+            self.catalog_projects.append(project_key)
+            if project_key != target_key:
+                return ()
+            return (
+                SessionCatalogEntry(
+                    session_id="target-session",
+                    project_key=target_key,
+                    last_used_at="2026-10-07T00:00:00+00:00",
+                    created_at="2026-10-01T00:00:00+00:00",
+                    last_user_message_at="2026-10-06T00:00:00+00:00",
+                    preview="target preview",
+                ),
+            )
+
+    application = CatalogApplication()
+    bridge = DesktopBridge(application=application, workdir=source)
+    try:
+        initialized = await bridge.handle_request(
+            RequestEnvelope(
+                "catalog-initialize",
+                "runtime.initialize",
+                {"workdir": source_key, "catalog_project_keys": [target_key]},
+            )
+        )
+        assert initialized.ok is True
+
+        listed = await bridge.handle_request(
+            RequestEnvelope(
+                "registered-project-catalog",
+                "project.sessions",
+                {"project_key": target_key},
+            )
+        )
+        assert listed.ok is True
+        assert listed.result == {
+            "sessions": [{
+                "session_id": "target-session",
+                "project_key": target_key,
+                "created_at": "2026-10-01T00:00:00+00:00",
+                "last_used_at": "2026-10-07T00:00:00+00:00",
+                "last_user_message_at": "2026-10-06T00:00:00+00:00",
+                "preview": "target preview",
+                "timeline_checkpoint_id": None,
+                "transcript_entries": 0,
+                "corrupt": False,
+                "title": None,
+                "model_ref": None,
+            }],
+        }
+
+        missing_key = await bridge.handle_request(
+            RequestEnvelope("catalog-missing-key", "project.sessions", {})
+        )
+        assert missing_key.ok is False
+        assert missing_key.error is not None and missing_key.error.kind == "invalid_request"
+
+        denied = await bridge.handle_request(
+            RequestEnvelope(
+                "unregistered-project-catalog",
+                "project.sessions",
+                {"project_key": unregistered_key},
+            )
+        )
+        assert denied.ok is False
+        assert denied.error is not None and denied.error.kind == "project_not_registered"
+        assert application.catalog_projects == [target_key]
+    finally:
+        await bridge.shutdown()
 
 
 @pytest.mark.asyncio

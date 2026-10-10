@@ -388,8 +388,16 @@ test("Main gates project use to picker or persisted recent registrations", async
       trustedEvent,
       { method: "session.move", params: { session_id: "s", target_project_key: `${target}/.` } },
     );
+    await assert.rejects(
+      runtimeRequest?.(
+        trustedEvent,
+        { method: "project.sessions", params: { project_key: persisted } },
+      ),
+      /trusted Desktop history/,
+      "catalog reads require Main's existing project registration",
+    );
     assert.deepEqual(calls.slice(0, 2), [
-      { method: "project.open", params: { path: target } },
+      { method: "project.open", params: { path: target, catalog_project_keys: [target] } },
       { method: "session.move", params: { session_id: "s", target_project_key: target } },
     ]);
 
@@ -420,21 +428,103 @@ test("Main gates project use to picker or persisted recent registrations", async
     for (const project of restartedProjects) registeredProjects.add(project);
     await runtimeRequest?.(
       trustedEvent,
-      { method: "runtime.initialize", params: { workdir: `${persisted}/.` } },
+      { method: "runtime.initialize", params: { workdir: `${persisted}/.`, catalog_project_keys: [target] } },
     );
     await runtimeRequest?.(
       trustedEvent,
       { method: "project.open", params: { path: persisted } },
     );
     assert.deepEqual(calls.slice(-2), [
-      { method: "runtime.initialize", params: { workdir: persisted } },
-      { method: "project.open", params: { path: persisted } },
+      { method: "runtime.initialize", params: { workdir: persisted, catalog_project_keys: [persisted] } },
+      { method: "project.open", params: { path: persisted, catalog_project_keys: [persisted] } },
     ]);
     assert.equal(registeredProjects.has(persisted), true);
   } finally {
     removeHandlers();
     await rm(target, { recursive: true, force: true });
     await rm(persisted, { recursive: true, force: true });
+  }
+});
+
+test("Main omits stale recent-project preferences without trusting renderer paths", async () => {
+  const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+  const fakeIpc = {
+    handle(channel: string, handler: (...args: any[]) => Promise<unknown>) {
+      handlers.set(channel, handler);
+    },
+    removeHandler(channel: string) {
+      handlers.delete(channel);
+    },
+  };
+  const mainFrame = { url: "file:///C:/UthCode/main_window/index.html" };
+  const webContents = { mainFrame };
+  const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+  const runtime = {
+    start: async () => undefined,
+    request: async () => ({ ok: true }),
+  };
+  const root = await mkdtemp(join(tmpdir(), "uthcode-stale-preferences-"));
+  const existingProject = join(root, "existing-project");
+  const pickedProject = join(root, "picked-project");
+  const deletedProject = join(root, "deleted-project");
+  await mkdir(existingProject);
+  await mkdir(pickedProject);
+  const preferences = new DesktopPreferencesStore(join(root, "desktop-preferences.json"));
+  await preferences.write("recentProjects", [
+    { path: existingProject, alias: "Existing" },
+    { path: deletedProject, alias: "Deleted" },
+  ]);
+  const registeredProjects = new Set<string>();
+  await hydrateRegisteredProjectsFromPreferences(await preferences.read(), registeredProjects);
+  const removeHandlers = registerIpcHandlers({
+    window: { webContents } as never,
+    runtime: runtime as never,
+    preferences,
+    rendererEntry: mainFrame.url,
+    isPackaged: true,
+    ipc: fakeIpc as never,
+    registeredProjects,
+    showOpenDialog: (async () => ({ canceled: false, filePaths: [pickedProject] })) as never,
+    openPath: (async () => "") as never,
+  });
+
+  try {
+    const readPreference = handlers.get(IPC_CHANNELS.preferenceRead);
+    const writePreference = handlers.get(IPC_CHANNELS.preferenceWrite);
+    const pickProject = handlers.get(IPC_CHANNELS.pickProject);
+    assert.ok(readPreference);
+    assert.ok(writePreference);
+    assert.ok(pickProject);
+
+    const projected = await readPreference(trustedEvent, "recentProjects");
+    assert.deepEqual(projected, [{ path: existingProject, alias: "Existing" }]);
+    assert.deepEqual([...registeredProjects], [existingProject]);
+
+    await assert.rejects(
+      writePreference(trustedEvent, "recentProjects", [
+        { path: existingProject, alias: "Existing" },
+        { path: pickedProject, alias: "Picked" },
+      ]),
+      (error: unknown) => typeof error === "object" && error !== null && "kind" in error
+        && (error as { kind?: unknown }).kind === "project_not_registered",
+    );
+    assert.equal(registeredProjects.has(pickedProject), false);
+
+    assert.equal(await pickProject(trustedEvent), pickedProject);
+    await writePreference(trustedEvent, "recentProjects", [
+      ...(projected as Array<{ path: string; alias?: string }>),
+      { path: pickedProject, alias: "Picked" },
+    ]);
+    assert.deepEqual(
+      (await preferences.read()).recentProjects,
+      [
+        { path: existingProject, alias: "Existing" },
+        { path: pickedProject, alias: "Picked" },
+      ],
+    );
+  } finally {
+    removeHandlers();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

@@ -469,7 +469,9 @@ def _catalog_entry(entry: object) -> dict[str, object] | None:
     values = {
         "session_id": entry.session_id,
         "project_key": entry.project_key,
+        "created_at": entry.created_at,
         "last_used_at": entry.last_used_at,
+        "last_user_message_at": entry.last_user_message_at,
         "preview": entry.preview,
         "timeline_checkpoint_id": entry.timeline_checkpoint_id,
         "transcript_entries": entry.transcript_entries,
@@ -754,6 +756,7 @@ class DesktopBridge:
             if workdir is not None
             else Path.cwd().resolve(strict=False)
         )
+        self._catalog_project_keys = {str(self._workdir)}
         self._shutdown_timeout = float(shutdown_timeout)
         # ``ready`` describes the child transport.  Application construction
         # is deliberately deferred until ``runtime.initialize`` so an
@@ -1462,7 +1465,11 @@ class DesktopBridge:
         return result
 
     @staticmethod
-    def _application_sessions_for(application: object | None) -> tuple[object, ...]:
+    def _application_sessions_for(
+        application: object | None,
+        *,
+        project_key: str | None = None,
+    ) -> tuple[object, ...]:
         # Project navigation needs identities/order only.  Prefer the
         # Application's metadata projection so opening a project does not
         # replay every Session before the selected history page is visible;
@@ -1474,7 +1481,7 @@ class DesktopBridge:
         if not callable(catalog):
             return ()
         try:
-            values = catalog()
+            values = catalog() if project_key is None else catalog(project_key=project_key)
         except Exception:
             raise BridgeError("session_error", "Session catalog unavailable") from None
         if not isinstance(values, (tuple, list)):
@@ -1484,8 +1491,17 @@ class DesktopBridge:
                 raise BridgeError("session_error", "Session catalog unavailable") from None
         return tuple(values)
 
-    def _application_sessions(self) -> tuple[object, ...]:
-        return self._application_sessions_for(self._application)
+    def _application_sessions(self, project_key: str | None = None) -> tuple[object, ...]:
+        return self._application_sessions_for(self._application, project_key=project_key)
+
+    @staticmethod
+    def _parse_catalog_project_keys(value: object, *, current_project: Path) -> set[str]:
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise BridgeError("invalid_request", "catalog_project_keys must be a list of registered Projects")
+        projects = {str(current_project.resolve(strict=False))}
+        for item in value:
+            projects.add(str(_path_value(item, "catalog_project_keys")))
+        return projects
 
     async def handle_request(self, request: RequestEnvelope) -> ResponseEnvelope:
         """Handle one already-parsed request without writing to stdout."""
@@ -1539,8 +1555,11 @@ class DesktopBridge:
         if method == "project.open":
             return await self._project_open(params)
         if method == "project.sessions":
-            _require_params(params, set(), method=method)
-            return {"sessions": _catalog_entries(self._application_sessions())}
+            _require_params(params, {"project_key"}, method=method)
+            project_key = str(_path_value(params["project_key"], "project_key"))
+            if project_key not in self._catalog_project_keys:
+                raise BridgeError("project_not_registered", "Project catalog is not registered")
+            return {"sessions": _catalog_entries(self._application_sessions(project_key))}
         if method == "history.page":
             return self._history_page(params)
         if method == "attachment.import":
@@ -1613,7 +1632,7 @@ class DesktopBridge:
         raise BridgeError("unknown_method", "unknown Desktop method")
 
     async def _runtime_initialize(self, params: Mapping[str, object]) -> dict[str, object]:
-        expected = {"workdir", "cwd"}
+        expected = {"workdir", "cwd", "catalog_project_keys"}
         if "workdir" in params and "cwd" in params:
             raise BridgeError("invalid_request", "runtime.initialize accepts only one workdir")
         if set(params) - expected:
@@ -1625,6 +1644,11 @@ class DesktopBridge:
         if selected_workdir in params:
             path = _path_value(params[selected_workdir], selected_workdir)
             self._workdir = path
+        if "catalog_project_keys" in params:
+            self._catalog_project_keys = self._parse_catalog_project_keys(
+                params["catalog_project_keys"],
+                current_project=self._workdir,
+            )
         if self._application is not None:
             self._state = "ready"
             if self._run is None:
@@ -1757,8 +1781,18 @@ class DesktopBridge:
         self._turn_task = None
 
     async def _project_open(self, params: Mapping[str, object]) -> dict[str, object]:
-        _require_params(params, {"path"}, method="project.open")
+        actual = set(params)
+        if "path" not in actual or actual - {"path", "catalog_project_keys"}:
+            raise BridgeError("invalid_request", "project.open requires a path and optional catalog registration")
         path = _path_value(params["path"], "path")
+        catalog_project_keys = (
+            self._parse_catalog_project_keys(
+                params["catalog_project_keys"],
+                current_project=path,
+            )
+            if "catalog_project_keys" in params
+            else {str(path)}
+        )
         candidate: object | None = None
         candidate_run: object | None = None
 
@@ -1846,6 +1880,7 @@ class DesktopBridge:
         self._application = candidate
         self._bind_process_events(candidate)
         self._workdir = path
+        self._catalog_project_keys = catalog_project_keys
         self._run = candidate_run
         self._dispatcher = candidate_dispatcher
         self._completion = candidate_completion
@@ -3097,11 +3132,14 @@ class DesktopBridge:
         if session_id is not None and self._supports_background_sessions():
             self._remember_current_runtime(reset_turn_projection=True)
         snapshot = self._snapshot() or {}
-        return {
+        result = {
             "run_id": snapshot.get("run_id"),
             "turn_id": snapshot.get("turn_id"),
             "status": "running",
         }
+        if session_id is not None:
+            result["session_id"] = session_id
+        return result
 
     async def _turn_steer(self, params: Mapping[str, object]) -> dict[str, object]:
         _require_params(params, {"text"}, method="turn.steer")

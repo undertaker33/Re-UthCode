@@ -459,7 +459,7 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
       copyText: async () => undefined,
-      requestRuntime: async (method) => {
+      requestRuntime: async (method, params) => {
         if (method === "runtime.initialize") throw new Error(rawSandboxFailure);
         return {};
       },
@@ -560,8 +560,10 @@ test("project groups, session state, and Runtime projections remain connected", 
   assert.match(appMarkup, /aria-label="更多操作 One"/);
   assert.doesNotMatch(appMarkup, /已置顶会话/);
   assert.doesNotMatch(appMarkup, /aria-label="移除 One"/);
-  assert.equal((appMarkup.match(/>second</gu) ?? []).length, 0);
-  assert.equal((appMarkup.match(/>first</gu) ?? []).length, 1);
+  const recentMarkup = appMarkup.match(/<section class="nav-group recent"[\s\S]*?<\/section>/u)?.[0] ?? "";
+  assert.equal((recentMarkup.match(/class="recent-line/gu) ?? []).length, 2, "Recent includes both the ordinary and pinned Session");
+  assert.match(recentMarkup, /first/u, "the selected Session remains visible in Recent");
+  assert.match(recentMarkup, /second/u, "the pinned Session is available in Recent even while its Project is collapsed");
   assert.doesNotMatch(appMarkup, /aria-label="置顶 first"/);
   for (const panelMode of ["docked", "floating", "hidden"] as const) {
     const panelMarkup = renderLanguage("en", <RuntimePanel state={createInitialState({ ...base, panelMode, currentModelRef: "provider/model", permissionMode: "auto", contextUsage: { used_tokens: 1200, budget_tokens: 128000, available: true, measurement: "estimate", source: "application" }, run: { run_id: "run-123456", behavior_mode: "plan", usage: { used_tokens: 1200, budget_tokens: 4000 } } })} onPanelModeChange={() => undefined} />);
@@ -605,9 +607,90 @@ test("sidebar session grouping keeps catalog order, pins above five ordinary row
   assert.equal(renamed.projects[0]?.sessions[5]?.preview, "six");
 });
 
+test("Recent shows every valid pinned or ordinary Session by latest user input time", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const projectA: ProjectState = {
+      path: "C:/recent-a",
+      projectKey: "C:/recent-a",
+      alias: "Pinned project",
+      pinned: true,
+      catalogFresh: true,
+      sessions: [
+        { session_id: "a-project", title: "A project session", last_user_message_at: "2026-10-04T00:00:00Z" },
+        { session_id: "a-session", title: "A pinned session", last_user_message_at: "2026-10-06T00:00:00Z", pinned: true },
+      ],
+    };
+    const projectB: ProjectState = {
+      path: "C:/recent-b",
+      projectKey: "C:/recent-b",
+      alias: "Ordinary project",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [
+        { session_id: "b1", title: "B1", last_user_message_at: "2026-10-05T00:00:00Z", last_used_at: "2030-01-01T00:00:00Z" },
+        { session_id: "b2", title: "B2", last_user_message_at: "2026-10-03T00:00:00Z" },
+        { session_id: "b3", title: "B3", last_user_message_at: "2026-10-02T00:00:00Z" },
+        { session_id: "b4", title: "B4", last_user_message_at: "2026-10-01T00:00:00Z" },
+        { session_id: "b5", title: "B5", created_at: "2026-09-30T00:00:00Z", last_user_message_at: null, last_used_at: "2040-01-01T00:00:00Z" },
+        { session_id: "b-corrupt", title: "Unavailable", last_user_message_at: "2041-01-01T00:00:00Z", corrupt: true },
+      ],
+    };
+    const noop = () => undefined;
+    const renderSidebar = (projects: ProjectState[]) => act(() => {
+      root.render(<LanguageProvider value="en"><Sidebar
+        projects={projects}
+        selectedProjectKey={projectA.projectKey}
+        selectedSessionId={null}
+        activeTurn={false}
+        expandedProjects={{}}
+        onProjectExpandedChange={noop}
+        onNewSession={noop}
+        onOpenProject={noop}
+        onResumeSession={noop}
+        onAliasChange={noop}
+        onTogglePin={noop}
+        onOpenExplorer={noop}
+        onRemoveProject={noop}
+        onToggleSessionPin={noop}
+        onRenameSession={noop}
+        onMoveSession={noop}
+        onCopySessionId={noop}
+        onOpenSettings={noop}
+      /></LanguageProvider>);
+    });
+    const recentLabels = () => Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".recent-line"),
+      (button) => button.textContent?.trim() ?? "",
+    );
+
+    renderSidebar([projectA, projectB]);
+    assert.deepEqual(recentLabels(), [
+      "A pinned session",
+      "B1",
+      "A project session",
+      "B2",
+      "B3",
+      "B4",
+      "B5",
+    ]);
+    assert.equal(container.querySelectorAll(".recent-line").length, 7, "Recent is not truncated at six and includes pins from both project groups");
+
+    const updatedB = {
+      ...projectB,
+      sessions: projectB.sessions.map((session) => session.session_id === "b4"
+        ? { ...session, last_user_message_at: "2026-10-07T00:00:00Z" }
+        : session),
+    };
+    renderSidebar([projectA, updatedB]);
+    assert.deepEqual(recentLabels(), ["B4", "A pinned session", "B1", "A project session", "B2", "B3", "B5"]);
+    assert.equal(recentLabels().includes("Unavailable"), false, "corrupt recovery rows retain their existing exclusion");
+  });
+});
+
 test("production Sidebar keeps selected rows visible, restores expansion, and exposes non-modal menus", async () => {
   await withRendererDom(async (dom, container, root) => {
     const expansionWrites: Array<{ projectKey: string; expanded: boolean }> = [];
+    const disclosureChanges: Array<{ projectKey: string; expanded: boolean }> = [];
     const pinWrites: string[] = [];
     const sessionPinWrites: string[] = [];
     const copiedIds: string[] = [];
@@ -624,6 +707,7 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
           sessionMutationBusy={sessionMutationBusy}
           expandedProjects={expandedProjects}
           onProjectExpandedChange={(projectKey, expanded) => expansionWrites.push({ projectKey, expanded })}
+          onProjectDisclosureChange={(projectKey, expanded) => disclosureChanges.push({ projectKey, expanded })}
           onNewSession={() => undefined}
           onOpenProject={() => undefined}
           onResumeSession={() => undefined}
@@ -686,6 +770,7 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
     act(() => { more.click(); });
     await tick();
     assert.deepEqual(expansionWrites.at(-1), { projectKey: "C:/source", expanded: true });
+    assert.deepEqual(disclosureChanges, [], "show more only persists Session-list expansion and does not trigger catalog reads");
     await renderSidebar([project()], null, { "C:/source": true }, "reloaded-sidebar");
     assert.deepEqual(visibleSessionIds(), sessions.map((session) => session.preview));
     await renderSidebar([project()], "s6", {}, "selected-sixth");
@@ -698,6 +783,7 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
     act(() => { projectRow!.click(); });
     await tick();
     assert.equal(container.querySelector(".session-list"), null, "clicking the project row collapses even the currently selected child Session");
+    assert.deepEqual(disclosureChanges, [{ projectKey: "C:/source", expanded: false }], "folder disclosure is a separate catalog-refresh signal");
     await renderSidebar([project()], "s6", {}, "selected-sixth-restored");
     const recentRows = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent .recent-line"), (button) => button.querySelectorAll("span")[1]?.textContent ?? "");
     assert.deepEqual(recentRows, sessions.map((session) => session.preview));
@@ -826,8 +912,291 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
   });
 });
 
+test("App preloads registered project catalogs and refreshes an expanded folder without replacing an active Session", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const alphaPath = "C:/catalog-alpha";
+    const betaPath = "C:/catalog-beta";
+    const activeRun = { run_id: "run-alpha", turn_id: "turn-alpha", status: "running", permission_mode: "default" };
+    const alphaSession = {
+      session_id: "alpha-session",
+      project_key: alphaPath,
+      title: "Alpha active Session",
+      created_at: "2026-10-01T00:00:00Z",
+      last_user_message_at: "2026-10-07T00:00:00Z",
+    };
+    const betaSession = {
+      session_id: "beta-session",
+      project_key: betaPath,
+      title: "Beta existing Session",
+      created_at: "2026-10-02T00:00:00Z",
+      last_user_message_at: "2026-10-06T00:00:00Z",
+    };
+    const catalogRequests: string[] = [];
+    const methodCalls: string[] = [];
+    let betaRequestCount = 0;
+    let resolveExpandedBeta: ((value: JsonValue) => void) | null = null;
+    const preferences: DesktopPreferences = {
+      theme: "light",
+      language: "en",
+      windowBounds: { width: 1100, height: 760, maximized: false },
+      panelMode: "docked",
+      sidebarWidth: 286,
+      runtimePanelWidth: 318,
+      recentProjects: [
+        { path: alphaPath, alias: "Alpha", pinned: false },
+        { path: betaPath, alias: "Beta", pinned: false },
+      ],
+      projectAliases: { [alphaPath]: "Alpha", [betaPath]: "Beta" },
+      pinnedProjectKeys: [],
+      pinnedSessions: [],
+      expandedProjects: { [alphaPath]: true, [betaPath]: false },
+      selectedProjectKey: alphaPath,
+      selectedSessionId: "alpha-session",
+    };
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        methodCalls.push(method);
+        if (method === "runtime.initialize") return { state: "ready", application: true, run: activeRun };
+        if (method === "settings.get") return { configuration: {} };
+        if (method === "status.get") return { active_turn: true, run: activeRun };
+        if (method === "project.sessions") {
+          const projectKey = String(params.project_key ?? "");
+          catalogRequests.push(projectKey);
+          if (projectKey === betaPath) {
+            betaRequestCount += 1;
+            if (betaRequestCount === 1) return { sessions: [] };
+            if (betaRequestCount === 2) {
+              return await new Promise<JsonValue>((resolve) => { resolveExpandedBeta = resolve; });
+            }
+            return { sessions: [betaSession] };
+          }
+          return { sessions: [alphaSession] };
+        }
+        if (method === "session.resume") {
+          return {
+            session_id: "alpha-session",
+            active_turn: true,
+            run: activeRun,
+            replay: [{ session_id: "alpha-session", sequence: 1, turn_id: "turn-alpha", kind: "assistant", text: "active-turn-marker", is_error: false }],
+          };
+        }
+        if (method === "history.page") return { session_id: "alpha-session", records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => ({} as DesktopPreferences),
+    };
+    const initialState = createInitialState({
+      language: "en",
+      projects: [
+        { path: alphaPath, projectKey: alphaPath, alias: "Alpha", pinned: false, sessions: [alphaSession], catalogFresh: true },
+        { path: betaPath, projectKey: betaPath, alias: "Beta", pinned: false, sessions: [], catalogFresh: false },
+      ],
+      selectedProjectKey: alphaPath,
+      selectedSessionId: "alpha-session",
+      activeTurn: true,
+      run: activeRun,
+      turnStatus: "streaming",
+      timeline: [{ id: "active-turn-marker", kind: "assistant", text: "active-turn-marker", turnId: "turn-alpha", messageId: "message-alpha", streaming: true }],
+    });
+    const flush = async () => act(async () => {
+      for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+
+    act(() => { root.render(<App initialState={initialState} api={api} />); });
+    await flush();
+    assert.equal(catalogRequests.filter((projectKey) => projectKey === alphaPath).length, 1);
+    assert.equal(catalogRequests.filter((projectKey) => projectKey === betaPath).length, 1, "startup reads every registered project's metadata through the selected Application");
+    assert.equal(methodCalls.includes("project.open"), false, "metadata loading does not switch or construct another Project Application");
+
+    const betaDisclosure = container.querySelector<HTMLButtonElement>('.project-line button.disclosure[aria-label="Expand Beta"]');
+    assert.ok(betaDisclosure);
+    act(() => { betaDisclosure!.click(); });
+    await flush();
+    assert.equal(betaRequestCount, 2, "expanding the project folder refreshes its catalog without using the Show more callback");
+    assert.equal(resolveExpandedBeta !== null, true);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Alpha");
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /active-turn-marker/u);
+    assert.match(container.querySelector<HTMLTextAreaElement>('.composer textarea[aria-label="Message UthCode"]')?.placeholder ?? "", /steer/u);
+
+    await act(async () => { resolveExpandedBeta?.({ sessions: [betaSession] }); });
+    await flush();
+    const betaList = Array.from(container.querySelectorAll<HTMLElement>(".session-list"))
+      .find((element) => element.getAttribute("aria-label") === "Beta Session");
+    assert.equal(betaList?.querySelectorAll(".session-line").length, 2, "the expanded catalog contains its new Session and the normal New Session action");
+    assert.equal(betaList?.textContent?.includes("Beta existing Session"), true);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Alpha");
+    assert.match(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /active-turn-marker/u);
+    assert.match(container.querySelector<HTMLTextAreaElement>('.composer textarea[aria-label="Message UthCode"]')?.placeholder ?? "", /steer/u);
+    assert.equal(methodCalls.includes("project.open"), false);
+  });
+});
 
 
+
+
+test("App bootstraps one registered catalog Application when the saved Project selection is null or stale", async () => {
+  for (const selectedProjectKey of [null, "C:/deleted-project"] as const) {
+    await withRendererDom(async (_dom, container, root) => {
+      const firstPath = "C:/registered-first";
+      const secondPath = "C:/registered-second";
+      const firstSession = { session_id: "first-session", project_key: firstPath, title: "First Session", created_at: "2026-10-01T00:00:00Z", last_user_message_at: "2026-10-05T00:00:00Z" };
+      const secondSession = { session_id: "second-session", project_key: secondPath, title: "Second Session", created_at: "2026-10-02T00:00:00Z", last_user_message_at: "2026-10-06T00:00:00Z" };
+      const preferences: DesktopPreferences = {
+        theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: firstPath, alias: "First", pinned: false }, { path: secondPath, alias: "Second", pinned: false }],
+        projectAliases: { [firstPath]: "First", [secondPath]: "Second" }, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {},
+        selectedProjectKey, selectedSessionId: selectedProjectKey ? "orphan-session" : null,
+      };
+      const calls: Array<{ method: string; params: JsonObject }> = [];
+      const api: DesktopApi = {
+        openProject: async () => null,
+        openProjectInExplorer: async () => undefined,
+        copyText: async () => undefined,
+        closeShell: async () => undefined,
+        requestRuntime: async (method, params) => {
+          calls.push({ method, params });
+          if (method === "runtime.initialize") return { state: "ready", application: true, run: { run_id: "bootstrap-run", turn_id: "bootstrap-turn", status: "running" } };
+          if (method === "project.sessions") return { sessions: params.project_key === firstPath ? [firstSession] : [secondSession] };
+          if (method === "session.resume") return { session_id: "orphan-session", active_turn: true, run: { run_id: "orphan-run", turn_id: "orphan-turn", status: "running" }, replay: [] };
+          if (method === "status.get") return { active_turn: true, run: { run_id: "bootstrap-run", turn_id: "bootstrap-turn", status: "running" } };
+          return {};
+        },
+        subscribeAgentEvents: () => () => undefined,
+        readPreference: async (key) => preferences[key],
+        writePreference: async () => preferences,
+      };
+      const flush = async () => act(async () => {
+        for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+
+      act(() => { root.render(<App initialState={createInitialState({ language: "en", projects: [] })} api={api} />); });
+      await flush();
+
+      assert.deepEqual(calls.filter((call) => call.method === "runtime.initialize").map((call) => call.params.workdir), [firstPath], "the first Main-registered Project supplies one metadata Application");
+      assert.deepEqual(calls.filter((call) => call.method === "project.sessions").map((call) => call.params.project_key).sort(), [firstPath, secondPath]);
+      assert.equal(calls.some((call) => call.method === "session.resume"), false, "a stale saved Session is never resumed through the fallback Application");
+      assert.equal(calls.some((call) => call.method === "status.get"), false, "fallback metadata does not publish Runtime state for a different visible Project");
+      assert.deepEqual(Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"), (button) => button.textContent?.trim()), ["Second Session", "First Session"]);
+      assert.equal(container.querySelector(".project-item.is-active"), null, "catalog bootstrap does not change visible Project selection");
+    });
+  }
+});
+
+test("App refreshes Recent from durable active and background user entries without changing the selected Session", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const alphaPath = "C:/recent-active";
+    const betaPath = "C:/recent-background";
+    const alphaSession = { session_id: "alpha-session", project_key: alphaPath, title: "Active Session", created_at: "2026-10-01T00:00:00Z", last_user_message_at: "2026-10-05T00:00:00Z" };
+    const betaSession = { session_id: "beta-session", project_key: betaPath, title: "Background Session", created_at: "2026-10-02T00:00:00Z", last_user_message_at: "2026-10-06T00:00:00Z" };
+    const alphaUpdated = { ...alphaSession, last_user_message_at: "2026-10-07T00:00:00Z" };
+    const betaUpdated = { ...betaSession, last_user_message_at: "2026-10-08T00:00:00Z" };
+    const preferences: DesktopPreferences = {
+      theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+      recentProjects: [{ path: alphaPath, alias: "Alpha", pinned: false }, { path: betaPath, alias: "Beta", pinned: false }],
+      projectAliases: { [alphaPath]: "Alpha", [betaPath]: "Beta" }, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {},
+      selectedProjectKey: alphaPath, selectedSessionId: "alpha-session",
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let alphaCatalogReads = 0;
+    let betaCatalogReads = 0;
+    let resolveEarlyAlpha: ((value: JsonObject) => void) | null = null;
+    let resolveEarlyBeta: ((value: JsonObject) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "runtime.initialize") return { state: "ready", application: true, run: null };
+        if (method === "settings.get") return { configuration: {} };
+        if (method === "status.get") return { active_turn: false, run: null };
+        if (method === "session.resume") return { session_id: "alpha-session", active_turn: false, run: null, replay: [] };
+        if (method === "history.page") return { session_id: "alpha-session", records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "turn.start") {
+          eventListener?.({
+            type: "turn_started", project_key: alphaPath, session_id: "alpha-session", run_id: "run-current", turn_id: "turn-current",
+            message_id: "user-current", message: { role: "user", parts: [{ type: "text", text: "new prompt" }] },
+          });
+          return { session_id: "alpha-session", run_id: "run-current", turn_id: "turn-current", status: "running", permission_mode: "default" };
+        }
+        if (method === "project.sessions") {
+          if (params.project_key === alphaPath) {
+            alphaCatalogReads += 1;
+            if (alphaCatalogReads === 2) return await new Promise<JsonValue>((resolve) => { resolveEarlyAlpha = (value) => resolve(value as JsonValue); });
+            return { sessions: [alphaCatalogReads >= 3 ? alphaUpdated : alphaSession] };
+          }
+          if (params.project_key === betaPath) {
+            betaCatalogReads += 1;
+            if (betaCatalogReads === 2) return await new Promise<JsonValue>((resolve) => { resolveEarlyBeta = (value) => resolve(value as JsonValue); });
+            return { sessions: [betaCatalogReads >= 3 ? betaUpdated : betaSession] };
+          }
+        }
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({
+      language: "en",
+      composerText: "new prompt",
+      projects: [
+        { path: alphaPath, projectKey: alphaPath, alias: "Alpha", pinned: false, sessions: [alphaSession], catalogFresh: true },
+        { path: betaPath, projectKey: betaPath, alias: "Beta", pinned: false, sessions: [betaSession], catalogFresh: true },
+      ],
+      selectedProjectKey: alphaPath,
+      selectedSessionId: "alpha-session",
+    });
+    const flush = async () => act(async () => {
+      for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    const recentTitles = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"), (button) => button.textContent?.trim());
+
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    assert.deepEqual(recentTitles(), ["Background Session", "Active Session"]);
+    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    await flush();
+    assert.equal(alphaCatalogReads, 2, "the accepted live user entry immediately re-reads its real Project metadata");
+    assert.equal(resolveEarlyAlpha !== null, true, "the metadata read can remain in flight while the Provider is active");
+
+    act(() => { eventListener?.({ type: "user_steering_applied", project_key: alphaPath, session_id: "alpha-session", run_id: "run-current", turn_id: "turn-current", steering_id: "steering-current" }); });
+    await flush();
+    assert.equal(alphaCatalogReads, 3, "another user entry refreshes metadata without waiting for assistant output");
+    assert.deepEqual(recentTitles(), ["Active Session", "Background Session"]);
+    assert.match(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.placeholder ?? "", /steer/u, "the provider response remains in progress during the Recent reorder");
+    await act(async () => { resolveEarlyAlpha?.({ sessions: [alphaSession] }); });
+    await flush();
+    assert.deepEqual(recentTitles(), ["Active Session", "Background Session"], "a late early read cannot overwrite newer durable metadata");
+
+    act(() => { eventListener?.({ type: "user_steering_applied", project_key: betaPath, session_id: "beta-session", run_id: "run-background", turn_id: "turn-background", steering_id: "steering-background" }); });
+    await flush();
+    assert.equal(betaCatalogReads, 2, "background steering refreshes the Project that owns its Session");
+    assert.equal(resolveEarlyBeta !== null, true);
+    act(() => { eventListener?.({ type: "reasoning_started", project_key: betaPath, session_id: "beta-session", run_id: "run-background", turn_id: "turn-background", message_id: "reasoning-background", iteration: 1, segment_index: 1 }); });
+    await flush();
+    assert.equal(betaCatalogReads, 2, "ordinary assistant activity does not invent a newer user-message timestamp");
+    act(() => { eventListener?.({ type: "user_steering_applied", project_key: betaPath, session_id: "beta-session", run_id: "run-background", turn_id: "turn-background", steering_id: "steering-background-2" }); });
+    await flush();
+    assert.equal(betaCatalogReads, 3, "a later background user entry refreshes only its owning Project");
+    assert.deepEqual(recentTitles(), ["Background Session", "Active Session"]);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Alpha");
+    assert.match(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.placeholder ?? "", /steer/u, "background metadata does not unlock or replace the active Session");
+    await act(async () => { resolveEarlyBeta?.({ sessions: [betaSession] }); });
+    await flush();
+    assert.deepEqual(recentTitles(), ["Background Session", "Active Session"], "a late background read cannot regress Recent ordering");
+  });
+});
 
 test("T05 App single-flights Session mutations and applies only the accepted move", async () => {
   await withRendererDom(async (_dom, container, root) => {
@@ -837,16 +1206,24 @@ test("T05 App single-flights Session mutations and applies only the accepted mov
     let moveCalls = 0;
     let renameCalls = 0;
     let catalogCalls = 0;
+    const catalogProjectKeys: string[] = [];
+    let moveAccepted = false;
     let resolveMove: ((value: JsonValue) => void) | null = null;
+    const movedSession = { ...sourceSession, project_key: targetPath, title: "Moved" };
     const api: DesktopApi = {
       openProject: async () => null,
       openProjectInExplorer: async () => undefined,
       copyText: async () => undefined,
       closeShell: async () => undefined,
-      requestRuntime: async (method) => {
+      requestRuntime: async (method, params) => {
         if (method === "session.move") {
           moveCalls += 1;
-          return await new Promise<JsonValue>((resolve) => { resolveMove = resolve; });
+          return await new Promise<JsonValue>((resolve) => {
+            resolveMove = (value) => {
+              moveAccepted = true;
+              resolve(value);
+            };
+          });
         }
         if (method === "session.rename") {
           renameCalls += 1;
@@ -854,6 +1231,13 @@ test("T05 App single-flights Session mutations and applies only the accepted mov
         }
         if (method === "project.sessions") {
           catalogCalls += 1;
+          const projectKey = params && typeof params === "object" && !Array.isArray(params)
+            && typeof (params as Record<string, unknown>).project_key === "string"
+            ? (params as Record<string, string>).project_key
+            : "";
+          catalogProjectKeys.push(projectKey);
+          if (projectKey === sourcePath) return { sessions: moveAccepted ? [] : [sourceSession] };
+          if (projectKey === targetPath) return { sessions: moveAccepted ? [movedSession] : [] };
           return { sessions: [] };
         }
         return {};
@@ -918,11 +1302,13 @@ test("T05 App single-flights Session mutations and applies only the accepted mov
     assert.ok(target);
     assert.equal(container.querySelector<HTMLElement>("aside")?.getAttribute("aria-busy"), null);
     assert.equal(catalogCalls, 1, "accepted Move refreshes the source catalog authority");
+    assert.deepEqual(catalogProjectKeys, [sourcePath]);
     assert.ok(!container.querySelector<HTMLElement>(".project-item:first-child .session-line")?.textContent?.includes("Original"));
     const targetDisclosure = target?.querySelector<HTMLButtonElement>(".disclosure");
     assert.ok(targetDisclosure);
     act(() => { targetDisclosure!.click(); });
     await flush();
+    assert.deepEqual(catalogProjectKeys, [sourcePath, targetPath], "expanding Target reads that registered Project's authoritative catalog");
     assert.match(target?.textContent ?? "", /Moved/u);
   });
 });
@@ -3852,6 +4238,22 @@ test("T07 configuration request keeps API key transient and maps current schema 
   assert.equal(request.default_model, "fake/model");
   assert.equal((request.providers as Record<string, Record<string, unknown>>).fake.api_key, "sk-transient");
   assert.equal(JSON.stringify(request).includes("sk-transient"), true);
+
+  const untouchedSearch = settingsSaveRequest(
+    { search: { enabled: true, provider: "tavily", api_key_configured: true, api_key: "stale-search-secret" } },
+    {},
+    {},
+  );
+  assert.equal(Object.hasOwn(untouchedSearch.search ?? {}, "api_key"), false);
+  assert.equal(Object.hasOwn(untouchedSearch.search ?? {}, "api_key_configured"), false);
+  const clearedSearch = settingsSaveRequest(
+    { search: { enabled: true, provider: "tavily", api_key_configured: true } },
+    {},
+    {},
+    "",
+    true,
+  );
+  assert.equal(clearedSearch.search?.api_key, "");
 });
 
 test("T07 theme classes expose system, dark, and light without changing content authority", () => {

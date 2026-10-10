@@ -246,6 +246,8 @@ class SessionCatalogEntry:
     session_id: str
     project_key: str
     last_used_at: str
+    created_at: str = ""
+    last_user_message_at: str | None = None
     preview: str = ""
     timeline_checkpoint_id: str | None = None
     transcript_entries: int = 0
@@ -844,6 +846,7 @@ class ApplicationSessionService:
                         session_id=metadata.session_id,
                         project_key=metadata.project_key,
                         last_used_at=metadata.last_used_at,
+                        created_at=metadata.created_at,
                         title=metadata.title,
                         model_ref=metadata.model_ref,
                         preview="[Session recovery unavailable]",
@@ -856,6 +859,15 @@ class ApplicationSessionService:
                     session_id=metadata.session_id,
                     project_key=metadata.project_key,
                     last_used_at=metadata.last_used_at,
+                    created_at=metadata.created_at,
+                    last_user_message_at=next(
+                        (
+                            entry.created_at
+                            for entry in reversed(snapshot.transcript.entries)
+                            if entry.kind in (TranscriptKind.USER_MESSAGE, TranscriptKind.USER_STEERING)
+                        ),
+                        None,
+                    ),
                     title=metadata.title,
                     model_ref=metadata.model_ref,
                     preview=_first_user_preview(snapshot),
@@ -869,15 +881,24 @@ class ApplicationSessionService:
             )
         return tuple(entries)
 
-    def list_catalog_metadata(self) -> tuple[SessionCatalogEntry, ...]:
+    def list_catalog_metadata(
+        self,
+        *,
+        project_key: str | None = None,
+    ) -> tuple[SessionCatalogEntry, ...]:
         """Return navigation rows without replaying every Session transcript."""
 
         entries: list[SessionCatalogEntry] = []
-        for metadata in self.list_sessions():
+        catalog_project_key = self.project_key if project_key is None else project_key
+        for metadata in self.list_sessions(project_key=catalog_project_key):
             try:
                 first_user = self.store.read_first_user_entry(
                     metadata.session_id,
-                    expected_project_key=self.project_key,
+                    expected_project_key=catalog_project_key,
+                )
+                last_user_message_at = self._latest_user_message_at(
+                    metadata.session_id,
+                    project_key=catalog_project_key,
                 )
             except SessionFileError:
                 # Keep the row selectable so an explicit resume can report the
@@ -887,6 +908,7 @@ class ApplicationSessionService:
                         session_id=metadata.session_id,
                         project_key=metadata.project_key,
                         last_used_at=metadata.last_used_at,
+                        created_at=metadata.created_at,
                         title=metadata.title,
                         model_ref=metadata.model_ref,
                         preview="[Session recovery unavailable]",
@@ -904,12 +926,38 @@ class ApplicationSessionService:
                     session_id=metadata.session_id,
                     project_key=metadata.project_key,
                     last_used_at=metadata.last_used_at,
+                    created_at=metadata.created_at,
+                    last_user_message_at=last_user_message_at,
                     title=metadata.title,
                     model_ref=metadata.model_ref,
                     preview=preview,
                 )
             )
         return tuple(entries)
+
+    def _latest_user_message_at(
+        self,
+        session_id: str,
+        *,
+        project_key: str,
+    ) -> str | None:
+        """Read backward by bounded semantic pages to the newest user input."""
+
+        cursor: str | None = None
+        while True:
+            page = self.store.read_history_page(
+                session_id,
+                cursor=cursor,
+                page_size=1,
+                expected_project_key=project_key,
+            )
+            for unit in reversed(page.units):
+                for entry in reversed(unit.entries):
+                    if entry.kind in (TranscriptKind.USER_MESSAGE, TranscriptKind.USER_STEERING):
+                        return entry.created_at
+            if page.next_cursor is None:
+                return None
+            cursor = page.next_cursor
 
     def read_session(self, session_id: str) -> SessionSnapshot:
         return self.store.read_session(session_id, expected_project_key=self.project_key)

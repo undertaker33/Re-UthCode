@@ -65,6 +65,35 @@ class _IdentityScriptProvider:
             yield event
 
 
+class _GatedLimitsProvider:
+    def __init__(self) -> None:
+        self.identity = ProviderIdentity("fake", "gated-limits", "history-gate")
+        self.limits_entered = asyncio.Event()
+        self.release_limits = asyncio.Event()
+        self.stream_entered = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.requests: list[GenerationRequest] = []
+        self.gate_limits = False
+
+    async def resolve_model_limits(self, _model: str) -> ModelLimits:
+        if self.gate_limits:
+            self.limits_entered.set()
+            await self.release_limits.wait()
+        return ModelLimits(max_input_tokens=256_000, source="test.gated_limits")
+
+    async def stream(
+        self,
+        request: GenerationRequest,
+        *,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
+        self.requests.append(request)
+        self.stream_entered.set()
+        await self.release_stream.wait()
+        cancellation.raise_if_cancelled()
+        yield _provider_response(TextPart("completed"))
+
+
 def _provider_response(*parts: object, finish_reason: FinishReason = FinishReason.STOP) -> GenerationCompleted:
     return GenerationCompleted(
         ProviderResponse(
@@ -274,6 +303,131 @@ async def test_live_event_message_ids_survive_run_persistence_and_history_page(
         assert len({record["message_id"] for record in second_turn_records}) == 2
     finally:
         await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_user_event_is_published_after_durable_retry_before_gated_provider_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-user-entry-boundary", project_key=project_key)
+    provider = _GatedLimitsProvider()
+    application = UthCodeApplication(
+        provider,  # type: ignore[arg-type]
+        session_service=ApplicationSessionService(
+            storage_root=store.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=store,
+        ),
+    )
+    await application.resume_session_for_command_async("session-user-entry-boundary")
+    provider.gate_limits = True
+    real_persist = application._persist_run_messages
+    persist_attempts = 0
+
+    def fail_first_persist(messages, *, session_id, turn_id, **metadata):  # type: ignore[no-untyped-def]
+        nonlocal persist_attempts
+        persist_attempts += 1
+        if persist_attempts == 1:
+            return SimpleNamespace(
+                persisted_message_count=0,
+                terminal_failure_appended=False,
+                transcript_durability="not_durable",
+            )
+        return real_persist(messages, session_id=session_id, turn_id=turn_id, **metadata)
+
+    monkeypatch.setattr(application, "_persist_run_messages", fail_first_persist)
+    handle = application.create_run().start_turn("durable before provider")
+    events = handle.events()
+
+    started = await asyncio.wait_for(anext(events), timeout=1)
+    assert started.event_type == "turn_started"
+    assert started.message_id
+    await asyncio.wait_for(provider.limits_entered.wait(), timeout=1)
+    assert persist_attempts == 2, "the first failed append is retried before async Provider limits"
+    assert provider.requests == [], "the Provider generation request remains gated"
+
+    transcript = store.read_session("session-user-entry-boundary").transcript
+    user_entries = [
+        entry
+        for entry in transcript.entries
+        if entry.kind is TranscriptKind.USER_MESSAGE and entry.turn_id == started.turn_id
+    ]
+    assert len(user_entries) == 1
+    assert user_entries[0].payload.get("message_id") == started.message_id
+    assert isinstance(user_entries[0].created_at, str) and user_entries[0].created_at
+
+    provider.release_limits.set()
+    await asyncio.wait_for(provider.stream_entered.wait(), timeout=1)
+    assert not handle._driver._result_future.done()  # type: ignore[union-attr]
+    assert len(provider.requests) == 1
+    handle.cancel()
+    provider.release_stream.set()
+    remaining = [event async for event in events]
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+
+    assert result.status.value == "cancelled"
+    assert any(event.event_type == "turn_cancelled" for event in remaining)
+    final_users = [
+        entry
+        for entry in store.read_session("session-user-entry-boundary").transcript.entries
+        if entry.kind is TranscriptKind.USER_MESSAGE and entry.turn_id == started.turn_id
+    ]
+    assert len(final_users) == 1, "cancel after the durable boundary does not duplicate or remove the user entry"
+
+
+@pytest.mark.asyncio
+async def test_unpersisted_user_event_is_released_with_terminal_failure_without_provider_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_key = str(tmp_path.resolve())
+    store = SessionFileStore(tmp_path / "sessions")
+    store.create_session("session-user-entry-failure", project_key=project_key)
+    provider = _GatedLimitsProvider()
+    application = UthCodeApplication(
+        provider,  # type: ignore[arg-type]
+        session_service=ApplicationSessionService(
+            storage_root=store.root,
+            project_key=project_key,
+            instruction_loader=None,
+            store=store,
+        ),
+    )
+    await application.resume_session_for_command_async("session-user-entry-failure")
+    provider.gate_limits = True
+
+    def fail_persist(_messages, *, session_id, turn_id, **_metadata):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            persisted_message_count=0,
+            terminal_failure_appended=False,
+            transcript_durability="not_durable",
+        )
+
+    monkeypatch.setattr(application, "_persist_run_messages", fail_persist)
+    handle = application.create_run().start_turn("must not reach provider")
+
+    async def collect_events():
+        return [event async for event in handle.events()]
+
+    events = await asyncio.wait_for(collect_events(), timeout=1)
+    result = await asyncio.wait_for(handle.result(), timeout=1)
+
+    assert result.status.value == "failed"
+    assert result.failure_reason.value == "persistence_unavailable"
+    assert events[0].event_type == "turn_started"
+    assert events[-1].event_type == "turn_failed"
+    assert not provider.limits_entered.is_set()
+    assert provider.requests == []
+    user_entries = [
+        entry
+        for entry in store.read_session("session-user-entry-failure").transcript.entries
+        if entry.kind is TranscriptKind.USER_MESSAGE
+    ]
+    assert user_entries == [], "a live event released at terminal does not claim failed persistence as durable"
 
 
 @pytest.mark.asyncio

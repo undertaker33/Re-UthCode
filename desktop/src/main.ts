@@ -488,12 +488,25 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
         );
       }
       const projectPath = registeredProjectPath(payload.params[field], registeredProjects);
-      requestParams = { ...payload.params, [field]: projectPath };
+      requestParams = {
+        ...payload.params,
+        [field]: projectPath,
+        // Main's existing picker/preferences authority authorizes metadata-
+        // only catalog reads without opening one Application per Project.
+        catalog_project_keys: Array.from(registeredProjects),
+      };
     } else if (payload.method === "project.open") {
       const projectPath = registeredProjectPath(payload.params.path, registeredProjects);
       // Opening is a consumer of Main authority.  It never creates trust;
       // new projects must first pass through the Main folder picker.
-      requestParams = { ...payload.params, path: projectPath };
+      requestParams = {
+        ...payload.params,
+        path: projectPath,
+        catalog_project_keys: Array.from(registeredProjects),
+      };
+    } else if (payload.method === "project.sessions") {
+      const projectPath = registeredProjectPath(payload.params.project_key, registeredProjects);
+      requestParams = { ...payload.params, project_key: projectPath };
     } else if (payload.method.startsWith("artifact.")) {
       try {
         const rawPath = payload.params.path;
@@ -585,6 +598,22 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     assertSender(event);
     assertPreferenceKey(key);
     const preferences = await options.preferences.read();
+    if (key === "recentProjects") {
+      return preferences.recentProjects.flatMap((project) => {
+        try {
+          const path = registeredProjectPath(project.path, registeredProjects);
+          return [{ ...project, path }];
+        } catch (error) {
+          if (
+            error instanceof MainBoundaryError
+            && (error.kind === "invalid_project_path" || error.kind === "project_not_registered")
+          ) {
+            return [];
+          }
+          throw error;
+        }
+      });
+    }
     return preferences[key];
   };
 

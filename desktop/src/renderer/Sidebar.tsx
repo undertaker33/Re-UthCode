@@ -28,6 +28,7 @@ export interface SidebarProps {
   sessionMutationBusy?: boolean;
   expandedProjects: Record<string, boolean>;
   onProjectExpandedChange: (projectKey: string, expanded: boolean) => void;
+  onProjectDisclosureChange?: (projectKey: string, expanded: boolean) => void;
   onNewSession: () => void;
   onOpenProject: () => void;
   onResumeSession: (project: ProjectState, sessionId: string) => void;
@@ -356,7 +357,9 @@ function ProjectEntry({ project, props, menuTarget, onMenuTarget }: ProjectEntry
     >
       <div className="project-line" onClick={(event) => {
         if ((event.target as HTMLElement).closest('.menu-trigger, input')) return;
-        setExpanded((value) => !value);
+        const next = !expanded;
+        setExpanded(next);
+        props.onProjectDisclosureChange?.(project.projectKey, next);
       }}>
         <button
           type="button"
@@ -578,19 +581,20 @@ export function Sidebar(props: SidebarProps) {
   const pinned = props.projects.filter((project) => project.pinned);
   const projects = props.projects.filter((project) => !project.pinned);
   const recent = useMemo(
-    // A pinned Project owns its child list.  Keep those Sessions out of
-    // Recent so selecting/expanding a Project never duplicates or reorders
-    // its rows in a second navigation section.
     () => {
-      const all = props.projects.flatMap((project) => project.pinned ? [] : project.sessions.filter((session) => !session.corrupt && !session.pinned).map((session) => ({ project, session })));
-      const visible = all.slice(0, 5);
-      const selected = props.selectedSessionId === null ? undefined : all.find(({ session }) => session.session_id === props.selectedSessionId);
-      if (!selected || visible.some(({ project, session }) => project.projectKey === selected.project.projectKey && session.session_id === selected.session.session_id)) return visible;
-      // Recent has no separate expand control.  Append a hidden selected row
-      // in its stable catalog position instead of moving it to the head.
-      return [...visible, selected];
+      const timestamp = (session: SessionSummary): number => {
+        const value = session.last_user_message_at || session.created_at;
+        if (!value) return 0;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      return props.projects
+        .flatMap((project) => project.sessions
+          .filter((session) => !session.corrupt)
+          .map((session) => ({ project, session })))
+        .sort((left, right) => timestamp(right.session) - timestamp(left.session));
     },
-    [props.projects, props.selectedSessionId],
+    [props.projects],
   );
   return <aside className="sidebar" aria-label={t("projects")} aria-busy={props.sessionMutationBusy === true ? "true" : undefined}><header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header><div className="sidebar-primary"><button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button><button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button></div><nav className="sidebar-scroll"><Group title={t("pinned")} projects={pinned} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Group title={t("projects")} projects={projects} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Recent entries={recent} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />{props.projects.length === 0 && <p className="empty-line">{t("openProject")}</p>}</nav><footer className="sidebar-footer"><button type="button" title={t("openSettings")} onClick={props.onOpenSettings}><UiIcon name="settings" />{t("settings")}</button></footer></aside>;
 }

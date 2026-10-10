@@ -21,6 +21,7 @@ import { SettingsView, type ConfigurationWrite } from "./SettingsView";
 import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type PendingInteraction } from "./state";
 import {
   eventIdentity,
+  eventMatchesIdentity,
   hasCompleteTurnIdentity,
   hasTurnIdentity,
   identityFromRun,
@@ -404,6 +405,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const processPermissionReleaseRef = useRef<string | null>(null);
   const runtimeStatusPollRef = useRef<Promise<boolean> | null>(null);
   const historyRequestsRef = useRef<Map<string, { token: symbol; promise: Promise<void> }>>(new Map());
+  const projectCatalogRequestSequenceRef = useRef(new Map<string, number>());
+  const projectCatalogAppliedSequenceRef = useRef(new Map<string, number>());
   const preparationPollSequenceRef = useRef(0);
   const preparationPollRef = useRef<Map<string, number>>(new Map());
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
@@ -510,7 +513,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       if (!isOwned()) return false;
     } else if (!(await waitForRuntimeLifecycleIdle()) || hasOwner() || stateRef.current.runtimeState === "restarting") return false;
     try {
-      const result = asObject(await send("project.sessions", {}));
+      const result = asObject(await send("project.sessions", { project_key: projectKey }));
       if (isOwned && !isOwned()) return false;
       if (!isOwned && (hasOwner() || stateRef.current.runtimeState === "restarting")) return false;
       const sessions = Array.isArray(result.sessions) ? result.sessions : [];
@@ -522,10 +525,43 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [hasOwner, send, t, waitForRuntimeLifecycleIdle]);
 
+  const refreshProjectCatalog = useCallback(async (projectKey: string, isOwned?: RuntimeOwnershipCheck): Promise<boolean> => {
+    const generation = runtimeGeneration();
+    if (isOwned && !isOwned()) return false;
+    const registeredProjectKeys = new Set(stateRef.current.projects.map((project) => project.projectKey));
+    for (const key of projectCatalogRequestSequenceRef.current.keys()) {
+      if (!registeredProjectKeys.has(key)) {
+        projectCatalogRequestSequenceRef.current.delete(key);
+        projectCatalogAppliedSequenceRef.current.delete(key);
+      }
+    }
+    const requestSequence = (projectCatalogRequestSequenceRef.current.get(projectKey) ?? 0) + 1;
+    projectCatalogRequestSequenceRef.current.set(projectKey, requestSequence);
+    try {
+      const result = asObject(await send("project.sessions", { project_key: projectKey }));
+      if (!isMounted() || runtimeGeneration() !== generation || (isOwned && !isOwned())) return false;
+      // Startup projects came from Main's registered-only preference
+      // projection and its catalog action follows the preference hydration
+      // dispatch. Other late reads must not recreate a removed Project.
+      if (!isOwned && !stateRef.current.projects.some((project) => project.projectKey === projectKey)) return false;
+      if (requestSequence < (projectCatalogAppliedSequenceRef.current.get(projectKey) ?? 0)) return false;
+      projectCatalogAppliedSequenceRef.current.set(projectKey, requestSequence);
+      dispatch({
+        type: "catalog_refreshed",
+        projectKey,
+        sessions: Array.isArray(result.sessions) ? result.sessions : [],
+      });
+      return true;
+    } catch {
+      // A read-only background catalog refresh must not interrupt the active
+      // Session or surface an unrelated Project error in its Runtime panel.
+      return false;
+    }
+  }, [isMounted, runtimeGeneration, send]);
+
   const reconcileSessionMutation = useCallback(async (projectKey: string, sequence: number): Promise<void> => {
-    // ``project.sessions`` is authoritative only for the Application's
-    // current project. Never apply that response to a different project after
-    // navigation; the next explicit project.open will reload its catalog.
+    // This reconciliation belongs to the Project mutation that started it;
+    // do not apply a selected-project refresh after its owner has changed.
     if (!isMounted() || sessionMutationInFlightRef.current !== sequence) return;
     if (stateRef.current.selectedProjectKey !== projectKey) return;
     await refreshCatalog(projectKey, "catalog_refresh", undefined, false);
@@ -714,7 +750,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     };
   }, [api, refreshRuntimeStatus, state.activeTurn, state.compactionStatus.state]);
 
-  const processAgentEvent = useCallback((event: AgentEvent) => {
+  const processAgentEvent = useCallback((
+    event: AgentEvent,
+    acceptedSession?: { sessionId: string; projectKey: string; runId: string; turnId: string; runtimeGeneration: number; viewRevision: number },
+  ) => {
     // Runtime lifecycle envelopes are transport-level facts. While an App
     // operation owns a restart, its explicit terminal state must not be
     // replaced by the shutdown/initialization envelopes emitted by the old
@@ -723,7 +762,27 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const eventSessionId = stringValue(event.session_id);
     const eventProjectKey = stringValue(event.project_key);
     const currentState = stateRef.current;
-    const backgroundSession = Boolean(eventSessionId && (
+    const { runId: eventRunId, turnId: eventTurnId } = eventIdentity(event);
+    if (eventProjectKey && eventSessionId
+      && hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId })
+      && (event.type === "turn_started" || event.type === "user_steering_applied")) {
+      // In the normal path, Application persists this UUID-bound user entry
+      // before releasing the event and before Provider work can block. The
+      // catalog query reads Transcript timestamps; the event itself never
+      // fabricates Recent ordering.
+      void refreshProjectCatalog(eventProjectKey);
+    }
+    const acceptedSessionIsVisible = Boolean(acceptedSession
+      && eventSessionId === acceptedSession.sessionId
+      && eventProjectKey === acceptedSession.projectKey
+      && eventRunId === acceptedSession.runId
+      && eventTurnId === acceptedSession.turnId
+      && currentState.selectedProjectKey === acceptedSession.projectKey
+      && (currentState.selectedSessionId === acceptedSession.sessionId
+        || (currentState.selectedSessionId === null
+          && currentState.sessionViewRevision === acceptedSession.viewRevision
+          && runtimeGeneration() === acceptedSession.runtimeGeneration)));
+    const backgroundSession = !acceptedSessionIsVisible && Boolean(eventSessionId && (
       !currentState.selectedSessionId
       || eventSessionId !== currentState.selectedSessionId
       || Boolean(eventProjectKey && eventProjectKey !== currentState.selectedProjectKey)
@@ -735,7 +794,6 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "agent_event", event });
       return;
     }
-    const { runId: eventRunId, turnId: eventTurnId } = eventIdentity(event);
     const latestMatches = () => {
       const latest = latestTurnIdentity();
       if (hasTurnIdentity(latest.runId, latest.turnId)) return knownIdentityMatches(latest.runId, latest.turnId, eventRunId, eventTurnId);
@@ -768,7 +826,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         }
       });
     }
-  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
+  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, refreshProjectCatalog, runtimeGeneration, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
 
   const readProcess = useCallback(async (processId: string, cursor: number) => {
     const projectKey = stateRef.current.selectedProjectKey;
@@ -1008,22 +1066,36 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       api.readPreference("expandedProjects"),
       api.readPreference("selectedProjectKey"),
       api.readPreference("selectedSessionId"),
-    ]).then(([theme, language, panelMode, sidebarWidth, runtimePanelWidth, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId]) => {
+    ]).then(async ([theme, language, panelMode, sidebarWidth, runtimePanelWidth, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId]) => {
       // A user save/navigation may have become the current lifecycle owner
       // while Desktop preferences were still loading. Do not let this late
       // bootstrap callback supersede that newer generation.
       if (cancelled || hasOwner()) return;
       dispatch({ type: "hydrate_preferences", preferences: { theme, language, panelMode, sidebarWidth, runtimePanelWidth, recentProjects, projectAliases, pinnedProjectKeys, pinnedSessions, expandedProjects, selectedProjectKey, selectedSessionId } });
       const selected = (recentProjects as DesktopPreferences["recentProjects"]).find((project) => project.path === selectedProjectKey);
-      if (selected) {
+      const bootstrapProject = selected ?? (recentProjects as DesktopPreferences["recentProjects"])[0];
+      if (bootstrapProject) {
         void enqueueRuntimeOperation("startup", async (isOwned) => {
-          const result = await send("runtime.initialize", { workdir: selected.path });
+          const result = await send("runtime.initialize", { workdir: bootstrapProject.path });
           if (cancelled || !isOwned()) throw new StaleRuntimeOperation();
-          dispatch({ type: "runtime_initialized", result, preserveRuntimeState: true });
-          await refreshConfiguration(isOwned);
-          await refreshRuntimeStatus(isOwned);
-          await refreshCatalog(selected.path, "catalog_refresh", undefined, true, isOwned);
-          if (selectedSessionId) {
+          if (selected) {
+            dispatch({ type: "runtime_initialized", result, preserveRuntimeState: true });
+            await refreshConfiguration(isOwned);
+            await refreshRuntimeStatus(isOwned);
+          } else {
+            // A registered Project can host the metadata Application when a
+            // saved selection is stale or empty. Keep that bootstrap choice
+            // out of the visible selection and Runtime projection.
+            dispatch({ type: "runtime_state", state: "ready" });
+          }
+          for (const project of recentProjects as DesktopPreferences["recentProjects"]) {
+            if (selected && project.path === selected.path) {
+              await refreshCatalog(project.path, "catalog_refresh", undefined, true, isOwned);
+            } else {
+              await refreshProjectCatalog(project.path, isOwned);
+            }
+          }
+          if (selected && selectedSessionId) {
             beginSessionPresentation(selected.path, selectedSessionId);
             const resumed = await send("session.resume", { session_id: selectedSessionId });
             if (cancelled || !isOwned()) throw new StaleRuntimeOperation();
@@ -1054,7 +1126,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       cancelTerminalStatusPoll();
       unsubscribe();
     };
-  }, [api, beginSessionPresentation, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, pollSessionPreparation, processAgentEvent, refreshCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
+  }, [api, beginSessionPresentation, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, pollSessionPreparation, processAgentEvent, refreshCatalog, refreshProjectCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
 
   const openProject = useCallback(async () => {
     if (!api) return;
@@ -1435,6 +1507,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       await executeCommand(text.trim());
       return;
     }
+    const submissionProjectKey = stateRef.current.selectedProjectKey;
+    const submissionSessionId = stateRef.current.selectedSessionId;
+    const submissionGeneration = runtimeGeneration();
+    const submissionViewRevision = stateRef.current.sessionViewRevision;
     const steering = stateRef.current.activeTurn;
     const steeringIdentity = steering ? identityFromRun(stateRef.current.run) : null;
     const clearPendingSteeringIdentity = () => {
@@ -1443,6 +1519,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       }
     };
     const pendingStart = steering ? null : beginPendingTurnStart();
+    const replayPendingBackgroundEvents = () => {
+      if (!pendingStart || pendingTurnStart() !== pendingStart) return;
+      finishPendingTurnStart(pendingStart).forEach((event) => {
+        const eventSessionId = stringValue(event.session_id);
+        const eventProjectKey = stringValue(event.project_key);
+        if ((eventSessionId && eventSessionId !== submissionSessionId)
+          || (eventProjectKey && eventProjectKey !== submissionProjectKey)) processAgentEvent(event);
+      });
+    };
     try {
       const result = steering
         ? await send("turn.steer", { text })
@@ -1456,23 +1541,51 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           } : {}),
         });
       if (!isMounted() || (pendingStart && pendingTurnStart() !== pendingStart)) return;
+      const acceptedRun = steering ? asObject(result).run : result;
+      const acceptedIdentity = identityFromRun(acceptedRun);
+      const latestState = stateRef.current;
+      const stillOwnsSubmission = latestState.selectedProjectKey === submissionProjectKey
+        && latestState.selectedSessionId === submissionSessionId
+        && latestState.sessionViewRevision === submissionViewRevision
+        && runtimeGeneration() === submissionGeneration;
+      const returnedSessionId = !steering ? stringValue(asObject(result).session_id) : null;
+      const selectedSessionMismatch = Boolean(returnedSessionId && submissionSessionId && returnedSessionId !== submissionSessionId);
+      if (!stillOwnsSubmission || selectedSessionMismatch) {
+        if (pendingStart && pendingTurnStart() === pendingStart) {
+          finishPendingTurnStart(pendingStart).forEach((event) => processAgentEvent(event));
+        }
+        if (steering) clearPendingSteeringIdentity();
+        if (returnedSessionId && submissionProjectKey && latestState.selectedProjectKey === submissionProjectKey) {
+          void refreshCatalog(submissionProjectKey, "session_new", returnedSessionId);
+        }
+        return;
+      }
       if (!steering && runtimeBusinessErrorKind(result) === "image_input_unsupported") {
-        if (pendingStart) clearPendingTurnStart();
+        replayPendingBackgroundEvents();
         dispatch({ type: "notice", text: t("turnImageInputUnsupported") });
         return;
       }
       // Bridge `turn.start` returns a flat Run DTO; only `turn.steer` wraps
       // that DTO under `run`. Keep the shapes separate and require both
       // identity components before taking poll ownership.
-      const acceptedRun = steering ? asObject(result).run : result;
-      const acceptedIdentity = identityFromRun(acceptedRun);
       if (!hasCompleteTurnIdentity(acceptedIdentity)) {
-        if (pendingStart) clearPendingTurnStart();
+        replayPendingBackgroundEvents();
         clearPendingSteeringIdentity();
         dispatch({ type: "notice", text: t("turnStartFailed") });
         return;
       }
-      const bufferedEvents = pendingStart ? finishPendingTurnStart(pendingStart, acceptedIdentity) : [];
+      const lazySessionId = !steering && !submissionSessionId && submissionProjectKey ? returnedSessionId : null;
+      const acceptedSession = lazySessionId
+        ? {
+          sessionId: lazySessionId,
+          projectKey: submissionProjectKey as string,
+          runId: acceptedIdentity.runId,
+          turnId: acceptedIdentity.turnId,
+          runtimeGeneration: submissionGeneration,
+          viewRevision: submissionViewRevision,
+        }
+        : undefined;
+      const bufferedEvents = pendingStart ? finishPendingTurnStart(pendingStart) : [];
       // This is the accepted Application boundary. Establish ownership
       // before Core events arrive, then retire any poll for the replaced Run;
       // an arbitrary turn_started event cannot do this job safely.
@@ -1483,20 +1596,33 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         run: acceptedRun,
         steering,
         text,
+        ...(lazySessionId ? { sessionId: lazySessionId } : {}),
         ...(!steering && selectedAttachments.length > 0
           ? { attachments: selectedAttachments.map(timelineAttachmentFromDraft) }
           : {}),
       });
+      if (lazySessionId) {
+        void persist("selectedSessionId", lazySessionId);
+        void refreshCatalog(submissionProjectKey as string, "session_new", lazySessionId);
+      }
       // Replaying after the accepted action preserves the exact stdout order
       // while the reducer queue applies turn_accepted before its events.
-      bufferedEvents.forEach(processAgentEvent);
+      bufferedEvents.forEach((event) => processAgentEvent(
+        event,
+        acceptedSession && eventMatchesIdentity(event, acceptedIdentity) ? acceptedSession : undefined,
+      ));
     } catch (error) {
       if (!isMounted() || (pendingStart && pendingTurnStart() !== pendingStart)) return;
-      if (pendingStart) clearPendingTurnStart();
+      replayPendingBackgroundEvents();
       clearPendingSteeringIdentity();
-      dispatch({ type: "notice", text: safeErrorMessage(error, t("turnStartFailed")) });
+      const latestState = stateRef.current;
+      const stillOwnsSubmission = latestState.selectedProjectKey === submissionProjectKey
+        && latestState.selectedSessionId === submissionSessionId
+        && latestState.sessionViewRevision === submissionViewRevision
+        && runtimeGeneration() === submissionGeneration;
+      if (stillOwnsSubmission) dispatch({ type: "notice", text: safeErrorMessage(error, t("turnStartFailed")) });
     }
-  }, [api, beginPendingTurnStart, cancelTerminalStatusPoll, clearPendingTurnStart, executeCommand, finishPendingTurnStart, hasOwner, isMounted, pendingTurnStart, processAgentEvent, send, setLatestTurnIdentity, t, waitForRuntimeUserAccess]);
+  }, [api, beginPendingTurnStart, cancelTerminalStatusPoll, clearPendingTurnStart, executeCommand, finishPendingTurnStart, hasOwner, isMounted, pendingTurnStart, persist, processAgentEvent, refreshCatalog, runtimeGeneration, send, setLatestTurnIdentity, t, waitForRuntimeUserAccess]);
 
   const completeCommand = useCallback(async (prefix: string) => {
     if (!api || !prefix.trimStart().startsWith("/")) return;
@@ -1613,6 +1739,10 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     dispatch({ type: "hydrate_preferences", preferences: { expandedProjects } });
     void persist("expandedProjects", expandedProjects);
   }, [persist]);
+
+  const setProjectDisclosure = useCallback((projectKey: string, expanded: boolean) => {
+    if (expanded) void refreshProjectCatalog(projectKey);
+  }, [refreshProjectCatalog]);
 
   const toggleRuntime = useCallback(() => {
     if (stateRef.current.focusMode) return;
@@ -2185,7 +2315,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}${documentPreviewVisible ? " document-preview-visible" : ""}`} style={shellStyle}>
-       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} /></RendererErrorBoundary>}
+       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onProjectDisclosureChange={setProjectDisclosure} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} /></RendererErrorBoundary>}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
        {state.view === "chat" && !state.focusMode && !documentPreviewVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
        {documentPreviewVisible && visibleDocumentPreview && <RendererErrorBoundary name="document-preview"><DocumentPreviewPanel preview={visibleDocumentPreview} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onClose={() => setDocumentPreview(null)} /></RendererErrorBoundary>}
