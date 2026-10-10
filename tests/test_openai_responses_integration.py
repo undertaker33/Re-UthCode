@@ -122,9 +122,15 @@ def _item_events(
     terminal: str = "completed",
     include_terminal: bool = True,
     duplicate: bool = False,
+    reasoning_content: str | None = None,
 ) -> list[object]:
     reasoning_added = responses.ResponseReasoningItem(
-        id="rs-1", summary=[], type="reasoning", encrypted_content=None, status="in_progress"
+        id="rs-1",
+        content=[] if reasoning_content is not None else None,
+        summary=[],
+        type="reasoning",
+        encrypted_content=None,
+        status="in_progress",
     )
     call_one_added = responses.ResponseFunctionToolCall(
         id="fc-1", call_id="call-1", name="search", arguments="", type="function_call", status="in_progress"
@@ -142,7 +148,16 @@ def _item_events(
         id="fc-2", call_id="call-2", name="lookup", arguments='{"q":"two"}', type="function_call", status="completed"
     )
     reasoning_done = responses.ResponseReasoningItem(
-        id="rs-1", summary=[{"type": "summary_text", "text": "plan"}], type="reasoning", encrypted_content="reasoning-signature", status="completed"
+        id="rs-1",
+        content=(
+            [{"type": "reasoning_text", "text": reasoning_content}]
+            if reasoning_content is not None
+            else None
+        ),
+        summary=[{"type": "summary_text", "text": "plan"}],
+        type="reasoning",
+        encrypted_content="reasoning-signature",
+        status="completed",
     )
     message_done = responses.ResponseOutputMessage(
         id="msg-1", content=[{"type": "output_text", "text": "answer", "annotations": []}], role="assistant", status="completed", type="message"
@@ -214,6 +229,34 @@ def _item_events(
             item=message_done, output_index=3, sequence_number=15, type="response.output_item.done"
         ),
     ]
+    if reasoning_content is not None:
+        midpoint = len(reasoning_content) // 2
+        events[5:5] = [
+            responses.ResponseReasoningTextDeltaEvent(
+                item_id="rs-1",
+                output_index=0,
+                content_index=0,
+                sequence_number=103,
+                delta=reasoning_content[:midpoint],
+                type="response.reasoning_text.delta",
+            ),
+            responses.ResponseReasoningTextDeltaEvent(
+                item_id="rs-1",
+                output_index=0,
+                content_index=0,
+                sequence_number=104,
+                delta=reasoning_content[midpoint:],
+                type="response.reasoning_text.delta",
+            ),
+            responses.ResponseReasoningTextDoneEvent(
+                item_id="rs-1",
+                output_index=0,
+                content_index=0,
+                sequence_number=105,
+                text=reasoning_content,
+                type="response.reasoning_text.done",
+            ),
+        ]
     if duplicate:
         events.insert(14, events[14])
     if include_terminal:
@@ -294,6 +337,154 @@ async def test_responses_public_stream_preserves_items_indices_usage_and_reasoni
     assert "prompt_cache_key" not in client.calls[0]
     assert all(item.get("role") != "system" for item in client.calls[0]["input"])
     assert client.stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_responses_reasoning_content_stream_closes_replays_and_keeps_summary_after_tool() -> None:
+    client = _OpenAIClient(_item_events(reasoning_content="think through"))
+    provider = build_openai_responses_provider("gpt-test", client=client)
+    first_events = await _collect(
+        provider,
+        _request(Message("user", (TextPart("make a tool call"),))),
+    )
+
+    first_response = next(event.response for event in first_events if isinstance(event, GenerationCompleted))
+    reasoning_deltas = [event.text for event in first_events if isinstance(event, ReasoningDelta)]
+    assert reasoning_deltas == ["plan", "think ", "through"]
+    assert first_response.message.parts[0] == ReasoningPart("think through\nplan")
+    reasoning_native = next(item for item in first_response.native_items if item.kind == "reasoning")
+    assert reasoning_native.payload["content"] == [
+        {"type": "reasoning_text", "text": "think through"}
+    ]
+    assert reasoning_native.payload["summary"] == [
+        {"type": "summary_text", "text": "plan"}
+    ]
+
+    replay_message = Message.from_dict(first_response.message.to_dict())
+    client.stream = _AsyncStream(_item_events())
+    second_events = await _collect(
+        provider,
+        _request(
+            replay_message,
+            Message("tool", (ToolResultPart("call-1", "tool output"),)),
+        ),
+    )
+    replayed = next(item for item in client.calls[-1]["input"] if item.get("type") == "reasoning")
+    assert replayed["content"] == reasoning_native.payload["content"]
+    assert replayed["summary"] == reasoning_native.payload["summary"]
+    assert any(
+        item.get("type") == "function_call_output" and item.get("call_id") == "call-1"
+        for item in client.calls[-1]["input"]
+    )
+    second_response = next(event.response for event in second_events if isinstance(event, GenerationCompleted))
+    assert any(isinstance(event, ReasoningDelta) and event.text == "plan" for event in second_events)
+    assert second_response.message.parts[0] == ReasoningPart("plan")
+
+
+@pytest.mark.asyncio
+async def test_responses_reasoning_content_deltas_fill_missing_native_snapshots() -> None:
+    events = _item_events(reasoning_content="think through")
+    item_done_index = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, responses.ResponseOutputItemDoneEvent)
+        and event.item.type == "reasoning"
+    )
+    item_done = events[item_done_index]
+    events[item_done_index] = item_done.model_copy(
+        update={"item": item_done.item.model_copy(update={"content": None})}
+    )
+
+    terminal_index = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, responses.ResponseCompletedEvent)
+    )
+    terminal = events[terminal_index]
+    terminal_output = [
+        item.model_copy(update={"content": None}) if item.type == "reasoning" else item
+        for item in terminal.response.output
+    ]
+    events[terminal_index] = terminal.model_copy(
+        update={
+            "response": terminal.response.model_copy(update={"output": terminal_output})
+        }
+    )
+
+    client = _OpenAIClient(events)
+    provider = build_openai_responses_provider("gpt-test", client=client)
+    first_events = await _collect(
+        provider,
+        _request(Message("user", (TextPart("make a tool call"),))),
+    )
+    first_response = next(
+        event.response for event in first_events if isinstance(event, GenerationCompleted)
+    )
+    reasoning_native = next(
+        item for item in first_response.native_items if item.kind == "reasoning"
+    )
+    assert reasoning_native.payload["content"] == [
+        {"type": "reasoning_text", "text": "think through"}
+    ]
+    assert first_response.message.parts[0] == ReasoningPart("think through\nplan")
+
+    client.stream = _AsyncStream(_item_events())
+    await _collect(
+        provider,
+        _request(
+            Message.from_dict(first_response.message.to_dict()),
+            Message("tool", (ToolResultPart("call-1", "tool output"),)),
+        ),
+    )
+    replayed = next(item for item in client.calls[-1]["input"] if item.get("type") == "reasoning")
+    assert replayed["content"] == reasoning_native.payload["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["done", "terminal"])
+async def test_responses_reasoning_content_conflicts_are_rejected_without_success(
+    conflict: str,
+) -> None:
+    events = _item_events(reasoning_content="think through")
+    if conflict == "done":
+        done_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, responses.ResponseReasoningTextDoneEvent)
+        )
+        events[done_index] = events[done_index].model_copy(update={"text": "different"})
+    else:
+        terminal_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, responses.ResponseCompletedEvent)
+        )
+        terminal = events[terminal_index]
+        terminal_response = terminal.response.model_dump(mode="python")
+        reasoning_item = next(
+            item for item in terminal_response["output"] if item["type"] == "reasoning"
+        )
+        reasoning_item["content"] = [
+            {"type": "reasoning_text", "text": "different"}
+        ]
+        events[terminal_index] = responses.ResponseCompletedEvent.model_validate(
+            {
+                **terminal.model_dump(mode="python"),
+                "response": responses.Response.model_validate(terminal_response),
+            }
+        )
+
+    client = _OpenAIClient(events)
+    provider = build_openai_responses_provider("gpt-test", client=client)
+    emitted: list[object] = []
+    with pytest.raises(InvalidProviderResponseError):
+        async for event in provider.stream(
+            _request(Message("user", (TextPart("hi"),))),
+            cancellation=CancellationToken(),
+        ):
+            emitted.append(event)
+
+    assert not any(isinstance(event, GenerationCompleted) for event in emitted)
 
 
 @pytest.mark.asyncio
