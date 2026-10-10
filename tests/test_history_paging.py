@@ -13,7 +13,7 @@ from uthcode.core.history import (
     TranscriptKind,
     timeline_record_from_dict,
 )
-from uthcode.core.provider import Message, ReasoningPart, TextPart
+from uthcode.core.provider import CancellationToken, GenerationCancelled, Message, ReasoningPart, TextPart
 from uthcode.integrations import session_files
 from uthcode.integrations.session_files import SessionCorruptError, SessionFileStore, SessionWriter
 
@@ -256,6 +256,75 @@ def test_history_page_skips_incomplete_tool_tail_and_reads_bounded_bytes(
     assert page.units[-1].turn_id == "turn-0079"
     assert all(unit.complete for unit in page.units)
     assert page.bytes_read < (tmp_path / "session-1" / "transcript.jsonl").stat().st_size
+
+
+def test_session_search_finds_text_older_than_the_default_history_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    _append_units(store, "session-1", 100)
+    service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="project",
+        instruction_loader=None,
+        store=store,
+    )
+    service.read_session = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("search must not materialize the Session transcript")
+    )
+    page_calls: list[tuple[int, bool, bool]] = []
+    original_page = store.read_history_page
+
+    def record_page(session_id: str, **kwargs: object):
+        page_calls.append(
+            (
+                int(kwargs["page_size"]),
+                bool(kwargs["include_compactions"]),
+                isinstance(kwargs["cancellation"], CancellationToken),
+            )
+        )
+        return original_page(session_id, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "read_history_page", record_page)
+    result = service.search_sessions("message-0000")
+
+    assert [hit.session_id for hit in result.hits] == ["session-1"]
+    assert "message-0000" in result.hits[0].snippet
+    assert len(page_calls) > 30
+    assert set(page_calls) == {(1, False, True)}
+
+
+def test_session_search_cancellation_stops_the_reverse_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    _append_units(store, "session-1", 50)
+    service = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="project",
+        instruction_loader=None,
+        store=store,
+    )
+    token = CancellationToken()
+    parsed = 0
+    original_parse = session_files._history_entry_from_line
+
+    def cancel_after_first_parse(raw: bytes, *, path: Path, session_id: str):
+        nonlocal parsed
+        parsed += 1
+        token.cancel()
+        return original_parse(raw, path=path, session_id=session_id)
+
+    monkeypatch.setattr(session_files, "_history_entry_from_line", cancel_after_first_parse)
+
+    with pytest.raises(GenerationCancelled):
+        service.search_sessions("no match", cancellation=token)
+    assert token.cancelled is True
+    assert parsed == 1
 
 
 def test_history_page_rejects_cursor_for_another_session(tmp_path: Path) -> None:

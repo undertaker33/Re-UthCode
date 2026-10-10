@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from uthcode.core.history import (
 )
 from uthcode.core.provider import (
     FilePart,
+    CancellationToken,
     ImagePart,
     Message,
     ReasoningPart,
@@ -77,6 +79,17 @@ _REPLAY_TOOL_STATUSES = frozenset(
         "finished",
     }
 )
+_SEARCH_TEXT_KINDS = frozenset(
+    {
+        TranscriptKind.USER_MESSAGE,
+        TranscriptKind.USER_STEERING,
+        TranscriptKind.ASSISTANT_MESSAGE,
+        TranscriptKind.FAILED_ASSISTANT_MESSAGE,
+    }
+)
+SESSION_SEARCH_MAX_QUERY_LENGTH = 512
+SESSION_SEARCH_MAX_RESULTS = 100
+SESSION_SEARCH_SNIPPET_LENGTH = 160
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +267,7 @@ class SessionCatalogEntry:
     corrupt: bool = False
     title: str | None = None
     model_ref: str | None = None
+    archived: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +277,7 @@ class SessionMutation:
     session_id: str
     project_key: str
     title: str | None = None
+    archived: bool | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -271,13 +286,67 @@ class SessionMutation:
             raise ValueError("session mutation project_key must be a non-empty string")
         if self.title is not None:
             object.__setattr__(self, "title", normalize_session_title(self.title))
+        if self.archived is not None and not isinstance(self.archived, bool):
+            raise TypeError("session mutation archived must be a boolean or None")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "session_id": self.session_id,
             "project_key": self.project_key,
             "title": self.title,
         }
+        if self.archived is not None:
+            value["archived"] = self.archived
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSearchHit:
+    """One bounded, display-safe result from a Session text search."""
+
+    session_id: str
+    project_key: str
+    title: str | None
+    snippet: str
+    archived: bool
+    last_used_at: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.session_id, "session_id"),
+            (self.project_key, "project_key"),
+            (self.snippet, "snippet"),
+            (self.last_used_at, "last_used_at"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"search hit {name} must be a non-empty string")
+        if self.title is not None and not isinstance(self.title, str):
+            raise TypeError("search hit title must be a string or None")
+        if not isinstance(self.archived, bool):
+            raise TypeError("search hit archived must be a boolean")
+        if len(self.snippet) > SESSION_SEARCH_SNIPPET_LENGTH:
+            raise ValueError("search hit snippet exceeds its limit")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSearchResult:
+    """Bounded search hits plus local unreadable-session feedback."""
+
+    hits: tuple[SessionSearchHit, ...]
+    unavailable_count: int = 0
+    has_more: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hits, tuple) or not all(
+            isinstance(hit, SessionSearchHit) for hit in self.hits
+        ):
+            raise TypeError("search hits must be a tuple of SessionSearchHit values")
+        if isinstance(self.unavailable_count, bool) or not isinstance(self.unavailable_count, int):
+            raise TypeError("unavailable_count must be an integer")
+        if self.unavailable_count < 0:
+            raise ValueError("unavailable_count cannot be negative")
+        if not isinstance(self.has_more, bool):
+            raise TypeError("has_more must be a boolean")
 
 
 @dataclass(slots=True)
@@ -702,9 +771,14 @@ class ApplicationSessionService:
             self._record_operation("resume", "failed", session_id, kind="corrupt")
             raise SessionOperationError("corrupt", session_id=session_id) from exc
 
-    def list_sessions(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
+    def list_sessions(
+        self,
+        *,
+        project_key: str | None = None,
+        archived: bool | None = False,
+    ) -> tuple[SessionMetadata, ...]:
         key = self.project_key if project_key is None else project_key
-        return self.store.list_metadata(project_key=key)
+        return self.store.list_metadata(project_key=key, archived=archived)
 
     def rename_session(self, session_id: str, title: str) -> SessionMutation:
         """Persist a Session title without rewriting its durable history."""
@@ -731,6 +805,27 @@ class ApplicationSessionService:
                 expected_project_key=self.project_key,
             ) as writer:
                 return _session_mutation(writer.update_title(normalized_title))
+        except SessionFileError as exc:
+            raise _session_operation_error(exc, session_id=session_id) from exc
+        except OSError as exc:
+            raise SessionOperationError("storage", session_id=session_id) from exc
+
+    def set_session_archived(self, session_id: str, archived: bool) -> SessionMutation:
+        """Set the durable archive state through the Session's single writer."""
+
+        if not isinstance(archived, bool):
+            raise TypeError("archived must be a boolean")
+        active = self._active
+        try:
+            if active is not None and active.session_id == session_id:
+                metadata = active._writer.update_archived(archived)
+            else:
+                with self.store.open_writer(
+                    session_id,
+                    expected_project_key=self.project_key,
+                ) as writer:
+                    metadata = writer.update_archived(archived)
+            return _session_mutation(metadata, archived=metadata.archived)
         except SessionFileError as exc:
             raise _session_operation_error(exc, session_id=session_id) from exc
         except OSError as exc:
@@ -849,6 +944,7 @@ class ApplicationSessionService:
                         created_at=metadata.created_at,
                         title=metadata.title,
                         model_ref=metadata.model_ref,
+                        archived=metadata.archived,
                         preview="[Session recovery unavailable]",
                         corrupt=True,
                     )
@@ -870,6 +966,7 @@ class ApplicationSessionService:
                     ),
                     title=metadata.title,
                     model_ref=metadata.model_ref,
+                    archived=metadata.archived,
                     preview=_first_user_preview(snapshot),
                     timeline_checkpoint_id=(
                         snapshot.timeline.active_checkpoint.turn_id
@@ -885,12 +982,16 @@ class ApplicationSessionService:
         self,
         *,
         project_key: str | None = None,
+        archived: bool | None = False,
     ) -> tuple[SessionCatalogEntry, ...]:
         """Return navigation rows without replaying every Session transcript."""
 
         entries: list[SessionCatalogEntry] = []
         catalog_project_key = self.project_key if project_key is None else project_key
-        for metadata in self.list_sessions(project_key=catalog_project_key):
+        for metadata in self.list_sessions(
+            project_key=catalog_project_key,
+            archived=archived,
+        ):
             try:
                 first_user = self.store.read_first_user_entry(
                     metadata.session_id,
@@ -911,6 +1012,7 @@ class ApplicationSessionService:
                         created_at=metadata.created_at,
                         title=metadata.title,
                         model_ref=metadata.model_ref,
+                        archived=metadata.archived,
                         preview="[Session recovery unavailable]",
                         corrupt=True,
                     )
@@ -930,10 +1032,153 @@ class ApplicationSessionService:
                     last_user_message_at=last_user_message_at,
                     title=metadata.title,
                     model_ref=metadata.model_ref,
+                    archived=metadata.archived,
                     preview=preview,
                 )
             )
         return tuple(entries)
+
+    def search_sessions(
+        self,
+        query: str,
+        *,
+        project_keys: Sequence[str] | None = None,
+        max_results: int = 20,
+        cancellation: CancellationToken | None = None,
+    ) -> SessionSearchResult:
+        """Search only public Session text in the caller's trusted owner scope.
+
+        ``project_keys`` must come from the calling Application's registered
+        project scope; omitting it restricts search to this service's owner.
+        Transcript pages are read newest-first and one complete semantic unit
+        at a time.  Search retains at most ``max_results`` hits and one page
+        while scanning, so it never builds a Session-wide text index.
+        """
+
+        if not isinstance(query, str):
+            raise TypeError("query must be a string")
+        if len(query) > SESSION_SEARCH_MAX_QUERY_LENGTH:
+            raise ValueError(
+                f"query must be at most {SESSION_SEARCH_MAX_QUERY_LENGTH} characters"
+            )
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
+            return SessionSearchResult(())
+        if isinstance(max_results, bool) or not isinstance(max_results, int):
+            raise TypeError("max_results must be an integer")
+        if max_results < 1 or max_results > SESSION_SEARCH_MAX_RESULTS:
+            raise ValueError(
+                f"max_results must be between 1 and {SESSION_SEARCH_MAX_RESULTS}"
+            )
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be CancellationToken or None")
+        token = cancellation or CancellationToken()
+        if project_keys is None:
+            scope = (self.project_key,)
+        else:
+            if isinstance(project_keys, (str, bytes, bytearray)):
+                raise TypeError("project_keys must be a sequence of owner keys")
+            requested_scope = tuple(project_keys)
+            if any(not isinstance(key, str) or not key.strip() for key in requested_scope):
+                raise ValueError("project_keys must contain non-empty strings")
+            scope = tuple(dict.fromkeys(requested_scope))
+        if not scope:
+            return SessionSearchResult(())
+
+        top_hits: list[tuple[tuple[str, str], int, SessionSearchHit]] = []
+        matched_count = 0
+        unavailable_count = 0
+
+        def note_identity_mismatch() -> None:
+            nonlocal unavailable_count
+            unavailable_count += 1
+
+        try:
+            metadata_rows = self.store.iter_metadata(
+                project_keys=scope,
+                cancellation=token,
+                on_identity_mismatch=note_identity_mismatch,
+            )
+            for metadata in metadata_rows:
+                token.raise_if_cancelled()
+                match_snippet = _search_match_snippet(metadata.title or "", normalized_query)
+                failed = False
+                if match_snippet is None:
+                    cursor: str | None = None
+                    while True:
+                        token.raise_if_cancelled()
+                        try:
+                            page = self.store.read_history_page(
+                                metadata.session_id,
+                                cursor=cursor,
+                                page_size=1,
+                                expected_project_key=metadata.project_key,
+                                include_compactions=False,
+                                cancellation=token,
+                            )
+                        except (SessionFileError, OSError):
+                            failed = True
+                            break
+                        for unit in reversed(page.units):
+                            for entry in reversed(unit.entries):
+                                if entry.kind not in _SEARCH_TEXT_KINDS:
+                                    continue
+                                try:
+                                    parts = _entry_parts(entry)
+                                except (TypeError, ValueError, KeyError):
+                                    failed = True
+                                    continue
+                                for part in reversed(parts):
+                                    if not isinstance(part, TextPart):
+                                        continue
+                                    match_snippet = _search_match_snippet(
+                                        part.text,
+                                        normalized_query,
+                                    )
+                                    if match_snippet is not None:
+                                        break
+                                if match_snippet is not None:
+                                    break
+                            if match_snippet is not None:
+                                break
+                        if match_snippet is not None or page.next_cursor is None:
+                            break
+                        cursor = page.next_cursor
+                if failed:
+                    unavailable_count += 1
+                if match_snippet is None:
+                    continue
+                hit = SessionSearchHit(
+                    session_id=metadata.session_id,
+                    project_key=metadata.project_key,
+                    title=metadata.title,
+                    snippet=match_snippet,
+                    archived=metadata.archived,
+                    last_used_at=metadata.last_used_at,
+                )
+                matched_count += 1
+                rank = (metadata.last_used_at, metadata.session_id)
+                tie_breaker = matched_count
+                if len(top_hits) < max_results:
+                    heapq.heappush(top_hits, (rank, tie_breaker, hit))
+                elif rank > top_hits[0][0]:
+                    heapq.heapreplace(top_hits, (rank, tie_breaker, hit))
+        except SessionFileError as exc:
+            raise SessionOperationError("storage") from exc
+        token.raise_if_cancelled()
+        hits = tuple(
+            hit
+            for _rank, _tie_breaker, hit in sorted(
+                top_hits,
+                key=lambda item: (item[0], item[1]),
+                reverse=True,
+            )
+        )
+        return SessionSearchResult(
+            hits=hits,
+            unavailable_count=unavailable_count,
+            has_more=matched_count > max_results,
+        )
 
     def _latest_user_message_at(
         self,
@@ -1235,6 +1480,8 @@ __all__ = [
     "SessionReplayRecord",
     "SessionActiveError",
     "SessionOperationError",
+    "SessionSearchHit",
+    "SessionSearchResult",
 ]
 
 
@@ -1258,13 +1505,18 @@ def _normalize_replay(
     return records
 
 
-def _session_mutation(metadata: SessionMetadata) -> SessionMutation:
+def _session_mutation(
+    metadata: SessionMetadata,
+    *,
+    archived: bool | None = None,
+) -> SessionMutation:
     """Project integration metadata to the Application mutation contract."""
 
     return SessionMutation(
         session_id=metadata.session_id,
         project_key=metadata.project_key,
         title=metadata.title,
+        archived=archived,
     )
 
 
@@ -1621,6 +1873,25 @@ def _bounded_preview(value: str, *, limit: int = 160) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _search_match_snippet(value: str, query: str) -> str | None:
+    """Return a normalized, bounded excerpt around one case-insensitive match."""
+
+    normalized = " ".join(value.split())
+    match = normalized.casefold().find(query.casefold())
+    if match < 0:
+        return None
+    limit = SESSION_SEARCH_SNIPPET_LENGTH
+    if len(normalized) <= limit:
+        return normalized
+    start = max(0, min(match - 40, len(normalized) - limit + 2))
+    prefix = start > 0
+    end = min(len(normalized), start + limit - (1 if prefix else 0))
+    suffix = end < len(normalized)
+    if suffix:
+        end -= 1
+    return ("…" if prefix else "") + normalized[start:end] + ("…" if suffix else "")
 
 
 def _preview_value(value: object) -> str:
