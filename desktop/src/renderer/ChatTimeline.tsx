@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
+import stripAnsi from "strip-ansi";
 import type { ProcessLogEntry, ProcessReaderState, TimelineEntry, TodoItem } from "./state";
 import type { ArtifactDescriptor, DesktopAttachmentDraft, TimelineAttachment, TimelineUnavailableAttachment } from "../desktop-api";
 import { useTranslation, type TranslationKey } from "./i18n";
@@ -19,6 +20,93 @@ export function isNearBottom(
 }
 export function scrollTimelineToBottom(element: Pick<HTMLElement, "scrollTop" | "scrollHeight" | "clientHeight">): void {
   element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+}
+
+interface ProcessLogDisplayRow {
+  sequence: number;
+  text: string;
+}
+
+type ProcessOutputStream = Exclude<ProcessLogEntry["stream"], "status">;
+
+interface ProcessLogLinePart {
+  row: ProcessLogDisplayRow;
+  start: number;
+}
+
+interface ProcessStreamProjection {
+  rawText: string;
+  plainText: string;
+  pendingCarriageReturn: boolean;
+  currentLineParts: ProcessLogLinePart[];
+}
+
+function processPlainText(rawText: string): string {
+  // The extra BEL exists only in this projection copy, so an unfinished OSC at
+  // the bounded tail is stripped without exposing its payload while it streams.
+  // Hold a partial CSI suffix until its final byte arrives; strip-ansi then
+  // handles the completed sequence with its full supported syntax.
+  const incompleteCsi = rawText.match(/(?:\u001B\[|\u009B)[0-?]*[ -/]*$/u)?.[0] ?? "";
+  const completeText = incompleteCsi ? rawText.slice(0, -incompleteCsi.length) : rawText;
+  return stripAnsi(`${completeText}\u0007`).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, "");
+}
+
+function appendProcessText(state: ProcessStreamProjection, row: ProcessLogDisplayRow, text: string): void {
+  const clearCurrentLine = () => {
+    for (const part of state.currentLineParts) part.row.text = part.row.text.slice(0, part.start);
+    state.currentLineParts = [];
+  };
+
+  for (const character of text) {
+    if (state.pendingCarriageReturn) {
+      if (character === "\n") {
+        row.text += "\n";
+        state.pendingCarriageReturn = false;
+        state.currentLineParts = [];
+        continue;
+      }
+      if (character === "\r") continue;
+      clearCurrentLine();
+      state.pendingCarriageReturn = false;
+    }
+    if (character === "\r") {
+      state.pendingCarriageReturn = true;
+      continue;
+    }
+    if (character === "\n") {
+      row.text += "\n";
+      state.currentLineParts = [];
+      continue;
+    }
+    if (state.currentLineParts.at(-1)?.row !== row) {
+      state.currentLineParts.push({ row, start: row.text.length });
+    }
+    row.text += character;
+  }
+}
+
+function projectProcessLogRows(entries: readonly ProcessLogEntry[]): ProcessLogDisplayRow[] {
+  const rows: ProcessLogDisplayRow[] = [];
+  const streams = new Map<ProcessOutputStream, ProcessStreamProjection>();
+
+  for (const entry of entries) {
+    const row = { sequence: entry.sequence, text: "" };
+    rows.push(row);
+    if (entry.stream === "status" || !entry.text) {
+      row.text = processPlainText(entry.text || `[${entry.stream}] ${entry.state ?? ""}`);
+      continue;
+    }
+    const stream = entry.stream as ProcessOutputStream;
+    const state = streams.get(stream) ?? { rawText: "", plainText: "", pendingCarriageReturn: false, currentLineParts: [] };
+    streams.set(stream, state);
+    state.rawText += entry.text;
+    const nextPlainText = processPlainText(state.rawText);
+    const delta = nextPlainText.slice(state.plainText.length);
+    state.plainText = nextPlainText;
+    appendProcessText(state, row, delta);
+  }
+
+  return rows;
 }
 
 export interface ChatTimelineProps {
@@ -410,6 +498,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
           {Array.from(new Set(processLogs.map((entry) => entry.processId))).map((processId) => {
             const reader = processReaders[processId];
             const processEntries = processLogs.filter((entry) => entry.processId === processId);
+            const displayRows = projectProcessLogRows(processEntries);
             return <section className="timeline-process-log__process" key={processId} data-process-session={sessionKey} data-process-owner={processId}>
               <header><strong>{processId.slice(0, 8)}</strong>{reader?.state && <span>{reader.state}</span>}{onReadProcess && <>
                 <button type="button" onClick={() => onReadProcess(processId, reader?.nextCursor ?? (processEntries.at(-1)?.nextCursor ?? 0))} disabled={reader?.loading === true}>{reader?.loading ? "Reading…" : "Read newer"}</button>
@@ -418,7 +507,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
               {reader?.cursorExpired && <p className="timeline-process-log__notice" role="status">Cursor expired; earliest cursor: {reader.earliestCursor}. Read from the earliest available output.</p>}
               {reader?.expired && <p className="timeline-process-log__notice" role="status">Process output expired from the Session quota.</p>}
               {reader?.error && <p className="timeline-process-log__notice" role="alert">{reader.error}</p>}
-              {processEntries.map((entry) => <pre key={`${entry.processId}:${entry.sequence}`} data-process-id={entry.processId} data-process-sequence={entry.sequence}>{entry.text || `[${entry.stream}] ${entry.state ?? ""}`}</pre>)}
+              {displayRows.filter((row) => row.text.length > 0).map((row) => <pre key={`${processId}:${row.sequence}`} data-process-id={processId} data-process-sequence={row.sequence}>{row.text}</pre>)}
             </section>;
           })}
         </div>

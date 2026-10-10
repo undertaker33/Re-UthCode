@@ -6,16 +6,77 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from uthcode.core.provider import CancellationToken
-from uthcode.integrations.tools.process_sessions import ProcessSessionError, ProcessSessionManager
+import uthcode.integrations.tools.process_sessions as process_sessions
+from uthcode.integrations.tools.process_sessions import (
+    ProcessSessionError,
+    ProcessSessionManager,
+    _ManagedProcess,
+    _PtyControl,
+    _terminate_windows_pty_tree,
+)
 from uthcode.integrations.tools.process_tools import BashTool, ProcessTool
 
 
 def _python(command: str) -> str:
     return subprocess.list2cmdline([sys.executable, "-c", command])
+
+
+def test_unreadable_pty_liveness_does_not_confirm_tree_termination() -> None:
+    class UnreadablePty:
+        def isalive(self) -> bool:
+            raise OSError("process status unavailable")
+
+    assert _terminate_windows_pty_tree(UnreadablePty()) is False
+
+
+@pytest.mark.asyncio
+async def test_posix_completed_pty_stop_preserves_exited_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise POSIX state semantics even when this focused suite runs on Windows.
+    monkeypatch.setattr(process_sessions, "os", SimpleNamespace(name="posix"))
+    manager = ProcessSessionManager()
+    control = SimpleNamespace(stop_confirmed=False)
+    completed = _ManagedProcess(
+        process_id="completed-pty",
+        session_id="s1",
+        command="fake",
+        cwd=Path.cwd(),
+        process=None,
+        control=control,
+        pty=object(),
+        state="exited",
+    )
+    manager._processes[completed.process_id] = completed
+
+    assert await manager.stop(completed.process_id, "s1") is True
+    assert completed.state == "exited"
+
+    class ExitDuringFinalizeLock:
+        async def __aenter__(self) -> ExitDuringFinalizeLock:
+            racing.state = "exited"
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    racing = _ManagedProcess(
+        process_id="racing-completed-pty",
+        session_id="s1",
+        command="fake",
+        cwd=Path.cwd(),
+        process=None,
+        control=SimpleNamespace(stop_confirmed=False),
+        pty=object(),
+    )
+    racing.pty_finalize_lock = ExitDuringFinalizeLock()  # type: ignore[assignment]
+    manager._processes[racing.process_id] = racing
+
+    assert await manager.stop(racing.process_id, "s1") is True
+    assert racing.state == "exited"
 
 
 @pytest.mark.asyncio
@@ -91,8 +152,58 @@ async def test_windows_pty_isatty_stdin_eof_and_resize(tmp_path: Path) -> None:
     await asyncio.sleep(0.6)
     after = manager.read(process.process_id, "s1", before.next_cursor)
     assert after.state == "exited" and after.exit_code == 0
-    assert any("hello" in entry.text for entry in after.entries)
+    output = "".join(entry.text for entry in after.entries)
+    assert "hello" in output
+    assert process.pty.read_blocking is False
+    assert not hasattr(process.pty, "_thread")
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_windows_pty_empty_idle_reads_do_not_end_output_pump(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("native Windows PTY contract")
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python(
+            "import time; print('READY', flush=True); time.sleep(.25); "
+            "print('AFTER-IDLE', flush=True); time.sleep(.25)"
+        ),
+        cwd=tmp_path,
+        pty=True,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline:
+            read = manager.read(process.process_id, "s1", 0)
+            output = "".join(entry.text for entry in read.entries)
+            if "READY" in output:
+                break
+            await asyncio.sleep(0.01)
+        assert "READY" in output
+        await asyncio.sleep(0.12)
+        assert process.state == "running"
+        assert process.pty_task is not None and not process.pty_task.done()
+
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline:
+            read = manager.read(process.process_id, "s1", 0)
+            output = "".join(entry.text for entry in read.entries)
+            if "AFTER-IDLE" in output:
+                break
+            await asyncio.sleep(0.01)
+        assert "AFTER-IDLE" in output
+        deadline = loop.time() + 3.0
+        while read.state == "running" and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+            read = manager.read(process.process_id, "s1", 0)
+        assert read.state == "exited" and read.exit_code == 0
+        assert process.pty_eof is True
+        assert not hasattr(process.pty, "_thread")
+    finally:
+        await manager.shutdown_session("s1")
 
 
 @pytest.mark.asyncio
@@ -157,9 +268,23 @@ async def test_posix_pty_isatty_input_eof_resize_and_no_replay(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_pty_turn_cancellation_unblocks_reader_and_reaps_child(tmp_path: Path) -> None:
     manager = ProcessSessionManager()
+    child_pid_file = tmp_path / "pty-child.pid"
+    if os.name == "nt":
+        child_script = tmp_path / "pty-child.py"
+        child_script.write_text(
+            "import os, time\n"
+            "from pathlib import Path\n"
+            f"Path({str(child_pid_file)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "print('READY', flush=True)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        command = subprocess.list2cmdline([sys.executable, str(child_script)])
+    else:
+        command = _python("import time; print('READY', flush=True); time.sleep(30)")
     process = await manager.start(
         session_id="s1",
-        command=_python("import time; print('READY', flush=True); time.sleep(30)"),
+        command=command,
         cwd=tmp_path,
         pty=True,
         turn_id="turn-cancel",
@@ -180,8 +305,97 @@ async def test_pty_turn_cancellation_unblocks_reader_and_reaps_child(tmp_path: P
         assert process.state == "exited"
         assert process.pty is not None and not process.pty.isalive()
         await asyncio.wait_for(asyncio.shield(reader_task), timeout=2.0)
+        if os.name == "nt":
+            child_pid = int(child_pid_file.read_text(encoding="ascii"))
+            await asyncio.sleep(0.1)
+            child_list = await asyncio.to_thread(
+                subprocess.run,
+                ["tasklist.exe", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert child_list.returncode == 0
+            assert f'"{child_pid}"' not in child_list.stdout
+            assert not hasattr(process.pty, "_thread")
     finally:
         await manager.shutdown_session("s1")
+
+
+@pytest.mark.asyncio
+async def test_windows_stop_after_completed_pty_does_not_target_a_reused_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("native Windows PTY contract")
+    manager = ProcessSessionManager()
+    process = await manager.start(
+        session_id="s1",
+        command=_python("print('DONE', flush=True)"),
+        cwd=tmp_path,
+        pty=True,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3.0
+        while process.state == "running" and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert process.state == "exited"
+
+        def reject_dead_pid(_pty: object) -> bool:
+            pytest.fail("a completed PTY PID must not be passed to taskkill")
+
+        monkeypatch.setattr(
+            "uthcode.integrations.tools.process_sessions._terminate_windows_pty_tree",
+            reject_dead_pid,
+        )
+        assert await manager.stop(process.process_id, "s1") is False
+        assert process.state == "unknown"
+    finally:
+        await manager.shutdown_session("s1")
+
+
+@pytest.mark.asyncio
+async def test_windows_pty_stop_failure_remains_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.name != "nt":
+        pytest.skip("native Windows PTY contract")
+
+    class FakePty:
+        pid = 12345
+        exitstatus = None
+        closed = False
+        fd = -1
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def isalive(self) -> bool:
+            return self.alive
+
+        def terminate(self, force: bool = False) -> None:
+            self.alive = False
+
+    manager = ProcessSessionManager()
+    pty = FakePty()
+    managed = _ManagedProcess(
+        process_id="failed-pty-stop",
+        session_id="s1",
+        command="fake",
+        cwd=Path.cwd(),
+        process=None,
+        control=_PtyControl(pty),
+        pty=pty,
+    )
+    manager._processes[managed.process_id] = managed
+
+    monkeypatch.setattr(
+        "uthcode.integrations.tools.process_sessions._terminate_windows_pty_tree",
+        lambda _pty: False,
+    )
+    assert await manager.stop(managed.process_id, "s1") is False
+    assert managed.state == "unknown"
+    assert pty.alive is False
 
 
 @pytest.mark.asyncio
