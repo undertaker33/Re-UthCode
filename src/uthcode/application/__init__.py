@@ -67,6 +67,8 @@ from .sessions import (
     SessionOperationError,
     SessionHistoryPage,
     SessionReplayRecord,
+    SessionSearchHit,
+    SessionSearchResult,
 )
 from uthcode.core.context import ContextUsage
 from uthcode.core.interaction import (
@@ -195,6 +197,8 @@ __all__ = [
     "SessionOperationError",
     "SessionHistoryPage",
     "SessionReplayRecord",
+    "SessionSearchHit",
+    "SessionSearchResult",
     "AgentEvent",
     "agent_event_from_dict",
     "AgentRun",

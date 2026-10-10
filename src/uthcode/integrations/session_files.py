@@ -7,12 +7,13 @@ import json
 import os
 import unicodedata
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from uthcode.core.provider import CancellationToken
 from uthcode.core.history import (
     ActiveCheckpoint,
     EpochMacroSummary,
@@ -147,6 +148,7 @@ class SessionMetadata:
     # beside the other small metadata fields so reopening a Session does not
     # have to infer its model from the process-wide default.
     model_ref: str | None = None
+    archived: bool = False
 
     def __post_init__(self) -> None:
         _validate_session_id(self.session_id)
@@ -160,6 +162,8 @@ class SessionMetadata:
             object.__setattr__(self, "title", normalize_session_title(self.title))
         if self.model_ref is not None:
             object.__setattr__(self, "model_ref", _require_text(self.model_ref, "model_ref"))
+        if not isinstance(self.archived, bool):
+            raise TypeError("archived must be a boolean")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -171,6 +175,7 @@ class SessionMetadata:
             "instruction_state": dict(self.instruction_state),
             "title": self.title,
             "model_ref": self.model_ref,
+            "archived": self.archived,
         }
 
     @classmethod
@@ -184,7 +189,7 @@ class SessionMetadata:
         missing = required.difference(value)
         if missing:
             raise SessionCorruptError(f"Session metadata missing fields: {sorted(missing)}")
-        unknown = set(value).difference(required | {"title", "model_ref"})
+        unknown = set(value).difference(required | {"title", "model_ref", "archived"})
         if unknown:
             raise SessionCorruptError(f"Session metadata has unknown fields: {sorted(unknown)}")
         try:
@@ -197,6 +202,7 @@ class SessionMetadata:
                 instruction_state=value["instruction_state"],  # type: ignore[arg-type]
                 title=value.get("title"),  # type: ignore[arg-type]
                 model_ref=value.get("model_ref"),  # type: ignore[arg-type]
+                archived=value.get("archived", False),  # type: ignore[arg-type]
             )
         except (TypeError, ValueError) as exc:
             raise SessionCorruptError(f"invalid Session metadata: {exc}") from exc
@@ -482,6 +488,8 @@ class SessionFileStore:
         cursor: str | None = None,
         page_size: int = HISTORY_PAGE_SIZE,
         expected_project_key: str | None = None,
+        include_compactions: bool = True,
+        cancellation: CancellationToken | None = None,
     ) -> SessionHistorySlice:
         """Read one recent/older page without materializing the full transcript.
 
@@ -492,6 +500,12 @@ class SessionFileStore:
         to the first byte of the oldest unit already returned.
         """
 
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be CancellationToken or None")
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        if not isinstance(include_compactions, bool):
+            raise TypeError("include_compactions must be a boolean")
         if isinstance(page_size, bool) or not isinstance(page_size, int):
             raise ValueError("page_size must be an integer")
         if page_size < 1 or page_size > HISTORY_PAGE_MAX_SIZE:
@@ -526,15 +540,22 @@ class SessionFileStore:
             session_id=session_id,
             page_size=page_size,
             end_offset=end_offset,
+            cancellation=cancellation,
         )
         # The reverse reader yields newest first.  The renderer and the
         # Application replay projection consume the normal chronological
         # order, so reverse only the bounded result here.
         units_with_offsets.reverse()
         units = tuple(unit for unit, _offset in units_with_offsets)
-        compactions, timeline_bytes, next_timeline_offset = _read_history_compactions(
-            timeline_path, units=units, end_offset=timeline_end_offset,
-        )
+        if include_compactions:
+            compactions, timeline_bytes, next_timeline_offset = _read_history_compactions(
+                timeline_path, units=units, end_offset=timeline_end_offset,
+            )
+        else:
+            compactions, timeline_bytes = (), 0
+            # Cursor envelopes always carry an integer Timeline boundary,
+            # even when search intentionally skips Timeline reads.
+            next_timeline_offset = timeline_end_offset if timeline_end_offset is not None else 0
         next_cursor = None
         if has_more and units_with_offsets:
             oldest_unit, oldest_offset = units_with_offsets[0]
@@ -644,19 +665,62 @@ class SessionFileStore:
 
         return ToolResultFileStore(self).read_page(session_id, ref, offset=offset, limit=limit, policy=policy)  # type: ignore[arg-type]
 
-    def list_metadata(self, *, project_key: str | None = None) -> tuple[SessionMetadata, ...]:
-        if not self.root.is_dir():
-            return ()
-        values: list[SessionMetadata] = []
-        for path in self.root.iterdir():
-            if not path.is_dir() or path.name == "tool-results":
-                continue
-            try:
-                metadata = _read_metadata(path / "metadata.json")
-            except SessionFileError:
-                continue
-            if project_key is None or metadata.project_key == project_key:
-                values.append(metadata)
+    def iter_metadata(
+        self,
+        *,
+        project_keys: Sequence[str] | None = None,
+        archived: bool | None = None,
+        cancellation: CancellationToken | None = None,
+        on_identity_mismatch: Callable[[], None] | None = None,
+    ) -> Iterator[SessionMetadata]:
+        """Yield metadata rows lazily, optionally restricted to trusted owners."""
+
+        if archived is not None and not isinstance(archived, bool):
+            raise TypeError("archived must be a boolean or None")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        if on_identity_mismatch is not None and not callable(on_identity_mismatch):
+            raise TypeError("on_identity_mismatch must be callable or None")
+        keys = None if project_keys is None else frozenset(project_keys)
+        if keys is not None and any(not isinstance(key, str) or not key.strip() for key in keys):
+            raise ValueError("project_keys must contain non-empty strings")
+        if keys == frozenset() or not self.root.is_dir():
+            return
+        try:
+            paths = self.root.iterdir()
+            for path in paths:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
+                if not path.is_dir() or path.name == "tool-results":
+                    continue
+                try:
+                    metadata = _read_metadata(path / "metadata.json")
+                except SessionFileError:
+                    # Without valid metadata the Session owner cannot be
+                    # established, so it is unsafe to include in a scoped read.
+                    continue
+                if keys is not None and metadata.project_key not in keys:
+                    continue
+                if metadata.session_id != path.name:
+                    # The owner is known, but the metadata identity cannot be
+                    # trusted as the directory's Session identity.
+                    if on_identity_mismatch is not None:
+                        on_identity_mismatch()
+                    continue
+                if archived is not None and metadata.archived is not archived:
+                    continue
+                yield metadata
+        except OSError as exc:
+            raise SessionFileError("could not enumerate Session metadata") from exc
+
+    def list_metadata(
+        self,
+        *,
+        project_key: str | None = None,
+        archived: bool | None = None,
+    ) -> tuple[SessionMetadata, ...]:
+        project_keys = None if project_key is None else (project_key,)
+        values = list(self.iter_metadata(project_keys=project_keys, archived=archived))
         values.sort(key=lambda item: (item.last_used_at, item.session_id), reverse=True)
         return tuple(values)
 
@@ -795,6 +859,18 @@ class SessionWriter:
 
         self._require_writable()
         metadata = replace(self.metadata, project_key=_require_text(project_key, "project_key"))
+        self._write_metadata(metadata)
+        return metadata
+
+    def update_archived(self, archived: bool) -> SessionMetadata:
+        """Converge the Session archive flag without touching activity time."""
+
+        self._require_writable()
+        if not isinstance(archived, bool):
+            raise TypeError("archived must be a boolean")
+        if self.metadata.archived is archived:
+            return self.metadata
+        metadata = replace(self.metadata, archived=archived)
         self._write_metadata(metadata)
         return metadata
 
@@ -1030,7 +1106,26 @@ class SessionWriter:
         self._require_open()
 
     def _write_metadata(self, metadata: SessionMetadata) -> None:
-        _atomic_write_json(self.store.session_path(self.session_id) / "metadata.json", metadata.to_dict())
+        self._require_open()
+        path = self.store.session_path(self.session_id) / "metadata.json"
+        try:
+            _atomic_write_json(path, metadata.to_dict())
+        except BaseException as write_error:
+            try:
+                actual = _read_metadata(path)
+                if actual.session_id != self.session_id:
+                    raise SessionCorruptError("Session metadata id does not match its directory")
+            except BaseException:
+                self._durability_unknown = True
+                raise SessionDurabilityUnknownError(
+                    "Session metadata durability is unknown; close and reopen before writing"
+                ) from write_error
+            assert self._loaded is not None
+            self._loaded = replace(
+                self._loaded,
+                snapshot=replace(self._loaded.snapshot, metadata=actual),
+            )
+            raise
         assert self._loaded is not None
         self._loaded = replace(self._loaded, snapshot=replace(self._loaded.snapshot, metadata=metadata))
 
@@ -1203,6 +1298,7 @@ def _iter_jsonl_lines_reverse(
     *,
     end_offset: int | None,
     bytes_read: list[int],
+    cancellation: CancellationToken | None = None,
 ) -> Iterator[tuple[bytes, int, int]]:
     """Yield complete JSONL lines from newest to oldest in bounded blocks."""
 
@@ -1231,6 +1327,8 @@ def _iter_jsonl_lines_reverse(
                 bytes_read[0] += len(tail)
                 right_boundary_complete = tail == b"\n"
             while position > 0:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
                 start = max(0, position - HISTORY_READ_BLOCK_BYTES)
                 handle.seek(start)
                 chunk = handle.read(position - start)
@@ -1332,6 +1430,7 @@ def _read_history_units_reverse(
     session_id: str,
     page_size: int,
     end_offset: int | None,
+    cancellation: CancellationToken | None = None,
 ) -> tuple[list[tuple[SemanticUnit, int]], bool, int]:
     """Collect at most ``page_size`` complete units from the JSONL tail."""
 
@@ -1366,7 +1465,10 @@ def _read_history_units_reverse(
         path,
         end_offset=end_offset,
         bytes_read=bytes_read,
+        cancellation=cancellation,
     ):
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         entry = _history_entry_from_line(raw, path=path, session_id=session_id)
         if expected_sequence is not None and entry.sequence != expected_sequence - 1:
             raise SessionCorruptError(

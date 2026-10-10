@@ -98,6 +98,7 @@ from .sessions import (
     SessionCatalogEntry,
     SessionHistoryPage,
     SessionMutation,
+    SessionSearchResult,
     SessionReplayRecord,
     SessionOperationError,
 )
@@ -934,6 +935,13 @@ class UthCodeApplication:
             self._context_service.clear_context()
         return result
 
+    def set_session_archived(self, session_id: str, archived: bool) -> SessionMutation:
+        """Set one Session's archive metadata through its owning service."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        return self._session_service.set_session_archived(session_id, archived)
+
     def session_catalog(self) -> tuple[SessionCatalogEntry, ...]:
         """Return the Application-owned same-project Session Picker data."""
 
@@ -944,12 +952,64 @@ class UthCodeApplication:
     def session_catalog_metadata(
         self,
         project_key: str | None = None,
+        *,
+        archived: bool | None = False,
     ) -> tuple[SessionCatalogEntry, ...]:
         """Return Session Picker rows without loading every transcript."""
 
         if self._session_service is None:
             return ()
-        return self._session_service.list_catalog_metadata(project_key=project_key)
+        return self._session_service.list_catalog_metadata(
+            project_key=project_key,
+            archived=archived,
+        )
+
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        project_keys: Sequence[str] | None = None,
+        max_results: int = 20,
+        cancellation: CancellationToken | None = None,
+    ) -> SessionSearchResult:
+        """Search public Session text off-loop and stop on caller cancellation."""
+
+        if self._session_service is None:
+            raise RuntimeError("durable Session storage is not configured")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        token = cancellation or CancellationToken()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._session_service.search_sessions,
+                query,
+                project_keys=project_keys,
+                max_results=max_results,
+                cancellation=token,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except CancelledError:
+            token.cancel()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except CancelledError:
+                    # A second navigation/cancel may interrupt this caller
+                    # again. Keep shielding the same thread worker until the
+                    # token checks stop its scan.
+                    continue
+                except BaseException:
+                    # The worker is complete; its outcome is retrieved below.
+                    break
+            try:
+                worker.result()
+            except BaseException:
+                # Caller cancellation remains primary, but retrieving the
+                # worker outcome prevents an unobserved Task exception.
+                pass
+            raise
 
     def new_session_for_command(self) -> ApplicationSession:
         """Create and commit a fresh Session only after staging succeeds."""
