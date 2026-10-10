@@ -52,8 +52,8 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-10-10
-status_note: T12已由用户授权总控串行实施与审查；活跃5包/归档17包，其他包保留原有效验收证据；当前W01经返工1通过独立复审
+status_snapshot: 2026-10-11
+status_note: T12已由用户授权总控串行实施与审查；活跃5包/归档17包，其他包保留原有效验收证据；W01已通过PR127合并；W02返工1经原Reviewer复审通过，待T11提交推送及PR合并
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -98,9 +98,9 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 | --- | --- | --- | --- |
 | T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W06 Feedback 齐全，自动回归、Runtime/PyInstaller smoke、package/make、Installer 自动测试和 packaged Electron 中英文 CDP 视觉验收已有证据；冻结 Checklist 共 86 项，仍有 20 项未完成，覆盖 Project/Session、Composer/Slash、AskUser/Plan、Settings/主题、真实 Desktop/Installer/Feature Parity 与最终状态收口，其中部分旧验收语义已被 F02 新需求取代但不得回写冻结文件，保持 `not_implemented` |
 | F02 | Desktop GUI 交互与上下文缺陷修复 | `docs/work/F02-DesktopGUI交互与上下文缺陷修复/` | W01～W05 已实施；W06 的既有 `w06-rework-*` 16 份 packaged/CDP 报告记录完整交互矩阵历史证据，P3 收紧 ResizeObserver stderr allowlist 后另有定向报告；在合入 W03/W05 返工后又从当前源码重建 SHA-256 `6cf2fd8e9e79074554aeb072de713f8edf7696679a5b656f12ae25a0c7c32849` 的 packaged app，并以 `commands` flow 分别通过 en/zh-CN canonical Slash、typed `/compact` 与 typed `/status` 当前包集成验收，报告均无 console/renderer exception/unexplained stderr。完整 16 场未使用当前包重跑，W06 Checklist 仍保留人工、真实 Provider、干净 Windows 与视觉/可访问性未验证项，因此仍为 `not_implemented` |
-| T12 | Desktop 功能补齐与工程收敛 | `docs/work/T12-Desktop功能补齐与工程收敛/` | 2026-10-10：原始任务书与三 PNG/V4 素材齐全；正式 Spec、Tasks、Checklist 和 W01–W05 Prompt 已生成，16 Task/40 条验收（3 完成、37 待验）。全部新增文档平放现有 T12 目录，无新文件夹；用户已授权总控串行派发 W01–W05、独立审核、提交推送和 PR 合并。W01 已交付归档元数据与正文搜索；首轮两项 P2 经原 Worker 返工 1 修复并由原 Reviewer 复审通过，受影响三套件 72 passed、Reviewer 新回归 3 passed；可信项目登记/运行态门禁及 Desktop 联动尚待后续。UI/交互完成后暂停等待用户验收，保持 `not_implemented`；实际证据见 [W01 Feedback](work/T12-Desktop功能补齐与工程收敛/W01-会话归档与检索-feedback.md)。范围/顺序/真实验收见 [Spec](work/T12-Desktop功能补齐与工程收敛/T12-Desktop功能补齐与工程收敛-spec.md) 和 [Checklist](work/T12-Desktop功能补齐与工程收敛/T12-Desktop功能补齐与工程收敛-checklist.md)。 |
+| T12 | Desktop 功能补齐与工程收敛 | `docs/work/T12-Desktop功能补齐与工程收敛/` | 2026-10-10：原始任务书与三 PNG/V4 素材齐全；正式 Spec、Tasks、Checklist 和 W01–W05 Prompt 已生成，16 Task/40 条验收（12 完成、28 待验）。全部新增文档平放现有 T12 目录，无新文件夹；用户已授权总控串行派发 W01–W05、独立审核、提交推送和 PR 合并。W01 已交付归档元数据与正文搜索；首轮两项 P2 经原 Worker 返工 1 修复并由原 Reviewer 复审通过，受影响三套件 72 passed、Reviewer 新回归 3 passed；W01 经 PR127 合并，merge 为 e74b709；W02 T03 完成 General 独立组合（109 passed），T04 完成可信登记与运行态协议的定向验证（152 passed、Preload 17 passed、typecheck 通过），runtime-process 20 passed；实际 bundled Coding/General initialize/session/status/shutdown JSONL 与独立 Prompt Context smoke 通过；T05 补齐 inline 安全输出及显式截断后，指定四套件最终 136 passed；实现经总控指出后修正了工具时间来源并补 General 下 Coding 归档行政通道；T06 当前只读 Git Diff 与可信历史变更摘要已落地，最终关联十套件 221 passed（18.06s）、架构 23 passed、Preload 17 passed、typecheck 通过；6.1-sol/medium 独立 Reviewer 首轮虽定向 178+39 passed、typecheck 与 Preload 17 passed，但独立复现 3 项 finding：P1 当前 Diff 已知秘密未脱敏；P2 Coding-first General 归档登记；P2 Diff 同步阻塞与取消缺口。原 Luna/max Worker 返工 1 已完成：Diff复用Application秘密脱敏、Coding可管理General归档而搜索/恢复仍隔离、Diff异步操作与可等待底层退出的取消；受影响11套件219 passed（18.24s）、Preload17、runtime-process20、typecheck通过。同一Reviewer返工1复审通过：独立Bridge4 passed/96 deselected、Git/结果持久化/架构55 passed、Preload17、typecheck通过，shutdown真实测试子进程回收smoke通过；首轮三项finding均关闭。待T11提交推送及PR合并。UI/交互完成后暂停等待用户验收，保持 `not_implemented`；实际证据见 [W01 Feedback](work/T12-Desktop功能补齐与工程收敛/W01-会话归档与检索-feedback.md) 与 [W02 Feedback](work/T12-Desktop功能补齐与工程收敛/W02-General与Desktop公共协议-feedback.md)。范围/顺序/真实验收见 [Spec](work/T12-Desktop功能补齐与工程收敛/T12-Desktop功能补齐与工程收敛-spec.md) 和 [Checklist](work/T12-Desktop功能补齐与工程收敛/T12-Desktop功能补齐与工程收敛-checklist.md)。 |
 
-2026-10-10 T12 拆分全量复核：当前活跃目录 5 个、归档目录 17 个，与上述全量清单一致；实际 Checklist 为 T10 66/20（6 份 Feedback）、F02 71/13（6 份）、F03 66/0（7 份）、T11 61/0（6 份）；数字为完成/未完成。T12 新生成 16 个 Task、40 条未勾验收、5 份 Worker Prompt，尚未派发或实施。当前 HEAD `74f9e24` 与 T12 任务书核查 SHA 一致；会话搜索/归档、General、过程聚合和自动保存仍待 T12 实施，不能因任务包存在标为已实现。本轮仅只读核查和文档检查，未重跑各包产品测试；其他包状态与原有效证据保持。用户明确不新建文件夹，T12 Prompt 及未来同名 Feedback 平放既有任务目录。能力欠账核对无新增/变更/回补，清单不变。
+2026-10-10 T12 拆分时全量复核（历史快照，当前实施以最新状态表为准）：当前活跃目录 5 个、归档目录 17 个，与上述全量清单一致；实际 Checklist 为 T10 66/20（6 份 Feedback）、F02 71/13（6 份）、F03 66/0（7 份）、T11 61/0（6 份）；数字为完成/未完成。T12 新生成 16 个 Task、40 条未勾验收、5 份 Worker Prompt，尚未派发或实施。当前 HEAD `74f9e24` 与 T12 任务书核查 SHA 一致；会话搜索/归档、General、过程聚合和自动保存仍待 T12 实施，不能因任务包存在标为已实现。本轮仅只读核查和文档检查，未重跑各包产品测试；其他包状态与原有效证据保持。用户明确不新建文件夹，T12 Prompt 及未来同名 Feedback 平放既有任务目录。能力欠账核对无新增/变更/回补，清单不变。
 
 下述带日期的进展段是历史记录，不能覆盖上表及本次最新状态。
 

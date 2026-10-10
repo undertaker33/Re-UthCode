@@ -45,11 +45,15 @@ test("T08 checked-in build contract defines the bundled Runtime and Installer", 
 
   assert.match(spec, /Analysis\(/u);
   assert.match(spec, /coding_agent\.md/u);
+  assert.match(spec, /general_assistant\.md/u);
   assert.match(spec, /console\s*=\s*True/u);
   assert.match(spec, /COLLECT\(/u);
   assert.doesNotMatch(spec, /--noconsole|--windowed|collect-all\s+everything/u);
   assert.match(buildScript, /PyInstaller/u);
   assert.match(buildScript, /re-uthcode/u);
+  assert.match(buildScript, /bundled General prompt asset/u);
+  assert.match(buildScript, /t08-general-initialize/u);
+  assert.match(buildScript, /distinct Coding and General prompt contexts/u);
   assert.match(forge, /extraResource/u);
   assert.match(forge, /maker-squirrel/u);
   assert.match(forge, /FusesPlugin/u);
@@ -65,7 +69,7 @@ test("T08 build command blocks on a real bundled Runtime smoke", { timeout: 120_
   });
   assert.match(
     `${result.stdout}\n${result.stderr}`,
-    /Bundled Runtime smoke passed: ready\/status\/shutdown JSONL and importlib\.resources prompt asset/u,
+    /Bundled Runtime checks passed: Coding and General initialize\/session\/status\/shutdown JSONL with distinct prompt contexts/u,
   );
 });
 

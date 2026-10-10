@@ -14,6 +14,7 @@ from uthcode.core.history import (
     timeline_record_from_dict,
 )
 from uthcode.core.provider import CancellationToken, GenerationCancelled, Message, ReasoningPart, TextPart
+from uthcode.core.provider import ToolCallPart, ToolResultPart
 from uthcode.integrations import session_files
 from uthcode.integrations.session_files import SessionCorruptError, SessionFileStore, SessionWriter
 
@@ -382,3 +383,227 @@ def test_history_page_identity_disambiguates_legacy_multi_part_message(tmp_path:
     assert [record.text for record in page.records] == ["thinking", "answer"]
     assert [record.message_id for record in page.records] == ["legacy-message", "legacy-message"]
     assert len({record.record_id for record in page.records}) == 2
+
+
+def test_history_replays_observed_tool_times_and_only_the_opaque_result_reference(
+    tmp_path: Path,
+) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    started_at = "2026-10-10T10:00:00+00:00"
+    completed_at = "2026-10-10T10:00:01+00:00"
+    external_ref = "opaque-tool-result-ref"
+    private_output = "PRIVATE-TOOL-OUTPUT-MUST-NOT-ENTER-REPLAY"
+    entries = (
+        TranscriptEntry(
+            "session-1",
+            1,
+            "turn-1",
+            TranscriptKind.USER_MESSAGE,
+            {"role": "user", "message_id": "user-1", "part": TextPart("inspect").to_dict()},
+            created_at="2026-10-10T09:59:59+00:00",
+            semantic_unit_id="turn-1",
+        ),
+        TranscriptEntry(
+            "session-1",
+            2,
+            "turn-1",
+            TranscriptKind.ASSISTANT_MESSAGE,
+            {"role": "assistant", "message_id": "assistant-progress-1", "part": TextPart("I will inspect the file").to_dict()},
+            created_at="2026-10-10T10:00:00+00:00",
+            semantic_unit_id="turn-1",
+        ),
+        TranscriptEntry(
+            "session-1",
+            3,
+            "turn-1",
+            TranscriptKind.TOOL_CALL,
+            {"role": "assistant", "message_id": "assistant-progress-1", "part": ToolCallPart("call-1", "ReadFile", {"path": "notes.txt"}).to_dict()},
+            created_at="2026-10-10T10:00:00+00:00",
+            semantic_unit_id="turn-1",
+        ),
+        TranscriptEntry(
+            "session-1",
+            4,
+            "turn-1",
+            TranscriptKind.TOOL_RESULT,
+            {
+                "role": "tool",
+                "message_id": "tool-result-1",
+                "part": ToolResultPart(
+                    "call-1",
+                    private_output,
+                    metadata={
+                        "execution_status": "succeeded",
+                        "persistence_status": "externalized",
+                        "ref": external_ref,
+                        "size_bytes": len(private_output.encode("utf-8")),
+                        "sha256": "a" * 64,
+                        "observed_started_at": started_at,
+                        "observed_completed_at": completed_at,
+                    },
+                ).to_dict(),
+            },
+            created_at="2026-10-10T10:00:01+00:00",
+            semantic_unit_id="turn-1",
+        ),
+        TranscriptEntry(
+            "session-1",
+            5,
+            "turn-1",
+            TranscriptKind.ASSISTANT_MESSAGE,
+            {"role": "assistant", "message_id": "assistant-final-1", "part": TextPart("The file is ready").to_dict()},
+            created_at="2026-10-10T10:00:02+00:00",
+            semantic_unit_id="turn-1",
+        ),
+    )
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        writer.append_transcript(entries)
+
+    page = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="project",
+        instruction_loader=None,
+        store=store,
+    ).read_history_page("session-1")
+    assistants = [record for record in page.records if record.kind == "assistant"]
+    tool = next(record for record in page.records if record.kind == "tool")
+
+    assert [(record.message_id, record.assistant_kind) for record in assistants] == [
+        ("assistant-progress-1", "progress"),
+        ("assistant-final-1", "final"),
+    ]
+    assert tool.turn_id == "turn-1"
+    assert tool.message_id == "assistant-progress-1"
+    assert tool.tool_call_id == "call-1"
+    assert tool.started_at == started_at
+    assert tool.completed_at == completed_at
+    assert tool.output_ref == external_ref
+    encoded = json.dumps(page.to_dict(), ensure_ascii=False)
+    assert private_output not in encoded
+    assert external_ref in encoded
+
+
+def test_history_file_change_summary_uses_only_paired_formal_write_evidence(
+    tmp_path: Path,
+) -> None:
+    store = SessionFileStore(tmp_path)
+    store.create_session("session-1", project_key="project")
+    digest = "a" * 64
+    tool_pairs = (
+        ("write", "WriteFile", {"path": "notes/one.txt", "content": "secret payload"}, {
+            "execution_status": "succeeded",
+            "evidence": "file_change",
+            "changed": True,
+            "content_digest": digest,
+        }),
+        ("escape", "EditFile", {"path": "../outside.txt", "old_text": "x", "new_text": "y"}, {
+            "execution_status": "succeeded",
+            "evidence": "file_change",
+            "changed": True,
+            "content_digest": digest,
+        }),
+        ("absolute", "WriteFile", {"path": "C:/outside.txt", "content": "x"}, {
+            "execution_status": "succeeded",
+            "evidence": "file_change",
+            "changed": True,
+            "content_digest": digest,
+        }),
+        ("patch", "ApplyPatch", {"patch": "opaque patch body"}, {
+            "side_effect": "partial",
+            "applied": ["src/new.py", "../outside.py"],
+            "failed": ["src/failed.py"],
+            "not_applied": ["src/skipped.py"],
+        }),
+        ("shell", "Bash", {"command": "echo wrote made-up.txt"}, {
+            "execution_status": "succeeded",
+            "changed": True,
+            "content_digest": digest,
+        }),
+    )
+    entries: list[TranscriptEntry] = [
+        TranscriptEntry(
+            "session-1",
+            1,
+            "turn-1",
+            TranscriptKind.USER_MESSAGE,
+            {"role": "user", "part": TextPart("update files").to_dict()},
+            semantic_unit_id="turn-1",
+        )
+    ]
+    sequence = 2
+    for call_id, tool_name, arguments, metadata in tool_pairs:
+        entries.append(
+            TranscriptEntry(
+                "session-1",
+                sequence,
+                "turn-1",
+                TranscriptKind.TOOL_CALL,
+                {
+                    "role": "assistant",
+                    "message_id": f"assistant-{call_id}",
+                    "part": ToolCallPart(call_id, tool_name, arguments).to_dict(),
+                },
+                semantic_unit_id="turn-1",
+            )
+        )
+        sequence += 1
+        entries.append(
+            TranscriptEntry(
+                "session-1",
+                sequence,
+                "turn-1",
+                TranscriptKind.TOOL_RESULT,
+                {
+                    "role": "tool",
+                    "part": ToolResultPart(call_id, "private raw result", metadata=metadata).to_dict(),
+                },
+                semantic_unit_id="turn-1",
+            )
+        )
+        sequence += 1
+    with store.open_writer("session-1", expected_project_key="project") as writer:
+        writer.append_transcript(entries)
+
+    page = ApplicationSessionService(
+        storage_root=tmp_path,
+        project_key="project",
+        instruction_loader=None,
+        store=store,
+    ).read_history_page("session-1")
+    by_call = {record.tool_call_id: record for record in page.records if record.kind == "tool"}
+    assert by_call["write"].file_changes == (
+        {"tool_name": "WriteFile", "path": "notes/one.txt", "status": "changed"},
+    )
+    assert by_call["escape"].file_changes == ()
+    assert by_call["absolute"].file_changes == ()
+    assert by_call["patch"].file_changes == (
+        {
+            "tool_name": "ApplyPatch",
+            "status": "partial",
+            "applied_paths": ("src/new.py",),
+            "failed_count": 1,
+            "not_applied_count": 1,
+        },
+    )
+    assert by_call["shell"].file_changes == ()
+    serialized = json.dumps(page.to_dict(), ensure_ascii=False)
+    assert "content_digest" not in serialized
+    assert "opaque patch body" not in serialized
+    assert "private raw result" not in serialized
+    assert "../outside.py" not in serialized
+
+
+def test_legacy_transcript_without_timestamp_remains_unavailable() -> None:
+    raw = TranscriptEntry(
+        "session-1",
+        1,
+        "turn-1",
+        TranscriptKind.USER_MESSAGE,
+        {"text": "older durable message"},
+    ).to_dict()
+    raw.pop("created_at")
+
+    restored = TranscriptEntry.from_dict(raw)
+
+    assert restored.created_at is None

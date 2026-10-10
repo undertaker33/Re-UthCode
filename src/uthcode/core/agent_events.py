@@ -2,8 +2,9 @@
 
 The event contract is deliberately smaller than the Provider contract.  It is
 safe to hand to an interface or serialize for a headless consumer: provider
-SDK values, native payloads, exceptions, and ToolResult content never cross
-this boundary.
+SDK values, native payloads, exceptions, and full ToolResult content never
+cross this boundary. An Application-marked inline result may contribute a
+bounded text preview to ToolFinished.
 """
 
 from __future__ import annotations
@@ -545,6 +546,8 @@ class ToolFinished(AgentEvent):
     command: str
     status: str
     is_error: bool
+    output_preview: str | None = None
+    output_preview_truncated: bool = False
 
     def __post_init__(self) -> None:
         AgentEvent.__post_init__(self)
@@ -556,6 +559,15 @@ class ToolFinished(AgentEvent):
         _require_text(self.status, "status")
         if not isinstance(self.is_error, bool):
             raise TypeError("is_error must be a boolean")
+        if self.output_preview is not None:
+            if not isinstance(self.output_preview, str):
+                raise TypeError("output_preview must be a string or None")
+            if len(self.output_preview) > 1024:
+                raise ValueError("output_preview must not exceed 1024 characters")
+        if not isinstance(self.output_preview_truncated, bool):
+            raise TypeError("output_preview_truncated must be a boolean")
+        if self.output_preview_truncated and self.output_preview is None:
+            raise ValueError("truncated output preview requires preview text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -996,21 +1008,23 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             _required(payload, "command"),  # type: ignore[arg-type]
         )
     if event_type == ToolFinished.event_type:
-        _expect_keys(
-            payload,
-            {
-                "type",
-                "run_id",
-                "turn_id",
-                "iteration",
-                "batch_id",
-                "tool_call_id",
-                "tool_name",
-                "command",
-                "status",
-                "is_error",
-            },
-        )
+        expected = {
+            "type",
+            "run_id",
+            "turn_id",
+            "iteration",
+            "batch_id",
+            "tool_call_id",
+            "tool_name",
+            "command",
+            "status",
+            "is_error",
+        }
+        if "output_preview" in payload:
+            expected.add("output_preview")
+        if "output_preview_truncated" in payload:
+            expected.add("output_preview_truncated")
+        _expect_keys(payload, expected)
         return ToolFinished(
             run_id,
             turn_id,
@@ -1021,6 +1035,8 @@ def agent_event_from_dict(value: Mapping[str, object]) -> AgentEventValue:
             _required(payload, "command"),  # type: ignore[arg-type]
             _required(payload, "status"),  # type: ignore[arg-type]
             _required(payload, "is_error"),  # type: ignore[arg-type]
+            payload.get("output_preview"),  # type: ignore[arg-type]
+            payload.get("output_preview_truncated", False),  # type: ignore[arg-type]
         )
     if event_type == ToolProgress.event_type:
         _expect_keys(

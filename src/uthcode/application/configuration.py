@@ -23,6 +23,27 @@ class ConfigurationModelError(ValueError):
     """Raised when an Application configuration value is invalid."""
 
 
+class ApplicationMode(str, Enum):
+    """The user-facing Application identity that scopes Sessions and tools."""
+
+    CODING = "coding"
+    GENERAL = "general"
+
+    @classmethod
+    def coerce(cls, value: "ApplicationMode | str") -> "ApplicationMode":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).strip().lower())
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationModelError(
+                f"unknown Application mode: {value!r}"
+            ) from exc
+
+
+GENERAL_SESSION_OWNER_KEY = "uthcode:general"
+
+
 def _require_text(value: str, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationModelError(f"{field_name} must be a non-empty string")
@@ -1009,9 +1030,11 @@ class EffectiveConfig:
 
 
 __all__ = [
+    "ApplicationMode",
     "ConfigSource",
     "ConfigurationModelError",
     "EffectiveConfig",
+    "GENERAL_SESSION_OWNER_KEY",
     "LaunchOptions",
     "ModelProfile",
     "ProviderKind",

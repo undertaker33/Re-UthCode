@@ -210,7 +210,14 @@ class ApplicationContextService:
         self,
         compiler: ContextCompiler | None = None,
         compactor: ContextCompactor | None = None,
+        *,
+        prompt_source: ContextBlock | None = None,
     ) -> None:
+        if prompt_source is None:
+            prompt_source = public_prompt_source()
+        if not isinstance(prompt_source, ContextBlock) or prompt_source.source_kind is not ContextSourceKind.PUBLIC_PROMPT:
+            raise TypeError("prompt_source must be a public prompt ContextBlock")
+        self._prompt_source = prompt_source
         self._compiler = compiler or ContextCompiler()
         self._compactor = compactor or ContextCompactor(
             token_estimator=self._compiler.token_estimator
@@ -237,6 +244,10 @@ class ApplicationContextService:
     @property
     def compiler(self) -> ContextCompiler:
         return self._compiler
+
+    @property
+    def prompt_source(self) -> ContextBlock:
+        return self._prompt_source
 
     @property
     def last_snapshot(self) -> ContextSnapshot | None:
@@ -511,7 +522,7 @@ class ApplicationContextService:
         if current_user is not None:
             normalized_current_turn = (*normalized_current_turn, current_user)
         bundle = ContextSourceBundle(
-            instruction_sources=(public_prompt_source(), core_runtime_contract_source()),
+            instruction_sources=(self._prompt_source, core_runtime_contract_source()),
             project_instruction_source=project_source,
             transcript=transcript,
             timeline=timeline,

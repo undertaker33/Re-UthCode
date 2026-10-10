@@ -335,6 +335,7 @@ class InstructionLoader:
         *,
         user_root: str | Path | None = None,
         project_root: str | Path | None = None,
+        public_prompt: ContextBlock | None = None,
         reader: InstructionFileReader | None = None,
         max_reference_files: int = 3,
         agents_filename: str = "AGENTS.md",
@@ -345,10 +346,20 @@ class InstructionLoader:
             raise ValueError("agents_filename must be a non-empty string")
         if user_root is None:
             raise TypeError("user_root is required")
-        if project_root is None:
-            raise TypeError("project_root is required")
         self.user_root = Path(user_root).expanduser().resolve(strict=False)
-        self.project_root = Path(project_root).expanduser().resolve(strict=False)
+        self.project_root = (
+            Path(project_root).expanduser().resolve(strict=False)
+            if project_root is not None
+            else None
+        )
+        if public_prompt is None:
+            public_prompt = public_prompt_source()
+        if (
+            not isinstance(public_prompt, ContextBlock)
+            or public_prompt.source_kind is not ContextSourceKind.PUBLIC_PROMPT
+        ):
+            raise TypeError("public_prompt must be a public prompt ContextBlock")
+        self.public_prompt = public_prompt
         self.max_reference_files = max_reference_files
         self.agents_filename = agents_filename
         self._reader = reader or _default_reader()
@@ -373,6 +384,7 @@ class InstructionLoader:
         return type(self)(
             user_root=self.user_root,
             project_root=self.project_root,
+            public_prompt=self.public_prompt,
             reader=self._reader,
             max_reference_files=self.max_reference_files,
             agents_filename=self.agents_filename,
@@ -383,7 +395,11 @@ class InstructionLoader:
 
         if not isinstance(other, InstructionLoader):
             raise TypeError("other must be an InstructionLoader")
-        if self.user_root != other.user_root or self.project_root != other.project_root:
+        if (
+            self.user_root != other.user_root
+            or self.project_root != other.project_root
+            or self.public_prompt != other.public_prompt
+        ):
             raise ValueError("InstructionLoader roots must match")
         self._session_loaded = other._session_loaded
         self._activated_directories = set(other._activated_directories)
@@ -466,6 +482,8 @@ class InstructionLoader:
 
         if not self._session_loaded:
             self.load_session(strict=strict)
+        if self.project_root is None:
+            raise InstructionPathRejectedError("project instructions are unavailable")
         target = self._project_target(target_path, strict=strict)
         directory = target if target.is_dir() else target.parent
         relative = self._relative_to_project(directory, strict=strict)
@@ -487,6 +505,8 @@ class InstructionLoader:
 
         if not self._session_loaded:
             self.load_session(strict=strict)
+        if self.project_root is None:
+            return None
         candidate = Path(target_path).expanduser()
         if not candidate.is_absolute():
             candidate = self.project_root / candidate
@@ -523,7 +543,12 @@ class InstructionLoader:
         self._stable_prefix_fingerprint = state.stable_prefix_fingerprint
         self._source_fingerprints = state.source_fingerprints
         restored: set[Path] = set()
-        for raw_scope in state.activated_directory_scopes:
+        raw_scopes = (
+            state.activated_directory_scopes
+            if self.project_root is not None
+            else ()
+        )
+        for raw_scope in raw_scopes:
             path = self._project_target(raw_scope, strict=strict)
             if path.is_file():
                 path = path.parent
@@ -594,10 +619,23 @@ class InstructionLoader:
         before_blocks = self._blocks
         before_diagnostics = self._diagnostics
         graph = _LoadGraph()
-        roots = (
-            (self.user_root / self.agents_filename, InstructionScope.USER, self.user_root, "session:user"),
-            (self.project_root / self.agents_filename, InstructionScope.PROJECT, self.project_root, "session:project"),
-        )
+        roots = [
+            (
+                self.user_root / self.agents_filename,
+                InstructionScope.USER,
+                self.user_root,
+                "session:user",
+            )
+        ]
+        if self.project_root is not None:
+            roots.append(
+                (
+                    self.project_root / self.agents_filename,
+                    InstructionScope.PROJECT,
+                    self.project_root,
+                    "session:project",
+                )
+            )
         for path, scope, trusted_root, reason in roots:
             self._load_file(
                 path,
@@ -637,7 +675,7 @@ class InstructionLoader:
             for segment in segments
         )
         prefix = build_instruction_prefix(
-            (public_prompt_source(), core_runtime_contract_source(), *blocks),
+            (self.public_prompt, core_runtime_contract_source(), *blocks),
             instruction_epoch=max(1, self._instruction_epoch),
         )
         source_fingerprints = tuple(
@@ -667,7 +705,7 @@ class InstructionLoader:
             reason = "stable"
         if changed or not old_prefix:
             prefix = build_instruction_prefix(
-                (public_prompt_source(), core_runtime_contract_source(), *blocks),
+                (self.public_prompt, core_runtime_contract_source(), *blocks),
                 instruction_epoch=epoch,
                 reason=reason,
                 changed=changed,
@@ -846,6 +884,8 @@ class InstructionLoader:
         graph.diagnostics.append(InstructionDiagnostic(code, path, scope, message))
 
     def _project_target(self, target_path: str | Path, *, strict: bool) -> Path:
+        if self.project_root is None:
+            raise InstructionPathRejectedError("project instructions are unavailable")
         try:
             return self._reader.canonical_path(target_path, trusted_root=self.project_root)
         except Exception as exc:
@@ -854,12 +894,16 @@ class InstructionLoader:
             raise InstructionPathRejectedError(str(exc)) from exc
 
     def _relative_to_project(self, path: Path, *, strict: bool) -> Path:
+        if self.project_root is None:
+            raise InstructionPathRejectedError("project instructions are unavailable")
         try:
             return path.relative_to(self.project_root)
         except ValueError as exc:
             raise InstructionPathRejectedError(str(path)) from exc
 
     def _directory_chain(self) -> tuple[Path, ...]:
+        if self.project_root is None:
+            return ()
         return tuple(
             sorted(
                 self._activated_directories,

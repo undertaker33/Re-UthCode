@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from uthcode.core.agent import (
@@ -28,6 +29,8 @@ from uthcode.core.agent_events import (
     TurnStarted,
     TurnPaused,
     TurnResumed,
+    ToolFinished,
+    ToolStarted,
     UserSteeringApplied,
     UsageUpdated,
 )
@@ -83,6 +86,7 @@ class _PendingPersistenceBatch:
     failed_visible_message_id: str | None = None
     termination_reason: TerminationReason | None = None
     failure_reason: FailureReason | None = None
+    tool_observations: tuple[tuple[str, str | None, str | None], ...] = ()
 
 
 def _new_identifier(value: str | None, field_name: str) -> str:
@@ -311,8 +315,13 @@ class AgentRun:
             messages: Sequence[Message],
             persisted_turn_id: str,
         ) -> int | None:
-            cursor = self._persist_closed_messages(messages, persisted_turn_id)
             driver = driver_ref[0]
+            tool_observations = () if driver is None else driver.tool_observations
+            cursor = self._persist_closed_messages(
+                messages,
+                persisted_turn_id,
+                tool_observations=tool_observations,
+            )
             if driver is not None:
                 driver._release_events_when_persisted(cursor, len(messages))
             return cursor
@@ -350,6 +359,7 @@ class AgentRun:
         failed_visible_message_id: str | None = None,
         termination_reason: TerminationReason | None = None,
         failure_reason: FailureReason | None = None,
+        tool_observations: Sequence[tuple[str, str | None, str | None]] = (),
     ) -> None:
         """Keep one exact FIFO retry unit without duplicating a failed append."""
 
@@ -372,6 +382,10 @@ class AgentRun:
                 and batch.termination_reason == termination_reason
                 and batch.failed_visible_message == failed_visible_message
                 and batch.failed_visible_message_id == failed_visible_message_id
+                and (
+                    not tool_observations
+                    or batch.tool_observations == tuple(tool_observations)
+                )
                 and (batch.blocked or not blocked)
             ):
                 if terminal and not batch.terminal:
@@ -400,6 +414,10 @@ class AgentRun:
                     ),
                     termination_reason=termination_reason or batch.termination_reason,
                     failure_reason=failure_reason or batch.failure_reason,
+                    tool_observations=(
+                        tuple(tool_observations)
+                        or batch.tool_observations
+                    ),
                 )
             return
         self._pending_persistence_batches.append(
@@ -414,6 +432,7 @@ class AgentRun:
                 failed_visible_message_id=failed_visible_message_id,
                 termination_reason=termination_reason,
                 failure_reason=failure_reason,
+                tool_observations=tuple(tool_observations),
             )
         )
 
@@ -434,6 +453,7 @@ class AgentRun:
                 failed_visible_message_id=batch.failed_visible_message_id,
                 termination_reason=batch.termination_reason,
                 failure_reason=batch.failure_reason,
+                tool_observations=batch.tool_observations,
             )
             batch_committed = (
                 outcome.persisted_message_count == len(batch.messages)
@@ -466,6 +486,8 @@ class AgentRun:
         self,
         messages: Sequence[Message],
         turn_id: str,
+        *,
+        tool_observations: Sequence[tuple[str, str | None, str | None]] = (),
     ) -> int | None:
         """Persist every newly closed message before its next Provider call.
 
@@ -490,6 +512,7 @@ class AgentRun:
             session_id=self._turn_session_id,
             turn_id=turn_id,
             message_ids=message_ids,
+            tool_observations=tool_observations,
         )
         if outcome.persisted_message_count:
             for index in range(
@@ -504,6 +527,7 @@ class AgentRun:
             turn_id=turn_id,
             messages=pending,
             message_ids=message_ids,
+            tool_observations=tool_observations,
             blocked=(
                 getattr(outcome, "transcript_durability", None) == "unknown"
             ),
@@ -562,6 +586,7 @@ class AgentRun:
                     pending_start,
                     turn_message_start + len(current_messages),
                 ),
+                tool_observations=handle._driver.tool_observations,
                 terminal=True,
                 failed_visible_message=(
                     handle._driver.failed_visible_message()
@@ -638,6 +663,7 @@ class _TurnDriver:
         "_persist_closed_messages",
         "_deferred_events",
         "_delivery_deferred",
+        "_tool_observations",
     )
 
     def __init__(
@@ -665,6 +691,7 @@ class _TurnDriver:
         self._usage_baseline: Usage | None = None
         self._deferred_events: list[AgentEvent] = []
         self._delivery_deferred = False
+        self._tool_observations: dict[str, list[str | None]] = {}
 
     def attach(self, handle: TurnHandle) -> None:
         if self._handle is not None:
@@ -678,6 +705,15 @@ class _TurnDriver:
     @property
     def result_value(self) -> TurnResult | None:
         return self._result_value
+
+    @property
+    def tool_observations(self) -> tuple[tuple[str, str | None, str | None], ...]:
+        """Immutable execution facts captured at ToolStarted/ToolFinished boundaries."""
+
+        return tuple(
+            (tool_call_id, values[0], values[1])
+            for tool_call_id, values in sorted(self._tool_observations.items())
+        )
 
     def ensure_started(self) -> None:
         if self._task is not None:
@@ -767,6 +803,15 @@ class _TurnDriver:
         """Publish one Core event while preserving the single live stream."""
 
         assert self._queue is not None
+        if isinstance(event, (ToolStarted, ToolFinished)):
+            observed = self._tool_observations.setdefault(
+                event.tool_call_id,
+                [None, None],
+            )
+            observed_at = datetime.now(timezone.utc).isoformat()
+            index = 0 if isinstance(event, ToolStarted) else 1
+            if observed[index] is None:
+                observed[index] = observed_at
         if isinstance(event, UsageUpdated):
             # Core emits cumulative usage for the current Turn.  Diff against
             # the immediately preceding cumulative event so the Application

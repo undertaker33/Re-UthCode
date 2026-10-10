@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from uthcode.application import load_effective_config
 from uthcode.integrations.config.data import LoadedConfigData, LoadedConfigSource
 from uthcode.integrations.config.loader import (
     ConfigurationError,
@@ -378,3 +379,36 @@ def test_user_model_writeback_keeps_bytes_when_replace_fails(
 
     assert user.read_text(encoding="utf-8") == original
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_general_configuration_load_uses_only_the_user_source(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    user = _write_user_config(home)
+    root = tmp_path / "repo"
+    cwd = root / "nested"
+    cwd.mkdir(parents=True)
+    (root / ".git").mkdir()
+    project = root / ".uthcode" / "config.toml"
+    project.parent.mkdir()
+    project.write_text(
+        '''default_model = "project/ref"
+[models."project/ref"]
+provider = "local"
+remote_id = "project-remote"
+''',
+        encoding="utf-8",
+    )
+
+    coding = load_config_data(cwd=cwd, home=home)
+    general = load_config_data(cwd=cwd, home=home, include_project_configs=False)
+
+    assert coding.default_model == "project/ref"
+    assert general.default_model == "base/ref"
+    assert general.sources == (LoadedConfigSource("user", user.resolve()),)
+    effective_general = load_effective_config(
+        cwd=cwd,
+        home=home,
+        include_project_configs=False,
+    )
+    assert effective_general.default_model == "base/ref"
+    assert tuple(source.kind for source in effective_general.sources) == ("user",)

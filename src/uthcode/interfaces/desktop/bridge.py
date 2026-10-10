@@ -14,6 +14,7 @@ import base64
 import binascii
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 from enum import Enum
 import inspect
 import json
@@ -30,6 +31,7 @@ from uthcode.application import (
     AttachmentError,
     AttachmentReference,
     agent_event_from_dict,
+    ApplicationMode,
     ApplicationStatus,
     ApplicationRuntimeContext,
     PauseRequest,
@@ -67,6 +69,10 @@ from uthcode.application import (
     SessionMutation,
     SessionOperationError,
     SessionReplayRecord,
+    SessionSearchHit,
+    SessionSearchResult,
+    ToolResultReadPage,
+    WorkspaceReviewError,
     UserConfigurationWriteRequest,
     UserConfigurationView,
     UserInputResponse,
@@ -77,6 +83,7 @@ from uthcode.application import (
     read_user_configuration,
     write_user_configuration,
     FilePart,
+    GENERAL_SESSION_OWNER_KEY,
     ImagePart,
     MessageInput,
     TextPart,
@@ -113,8 +120,15 @@ _METHODS = frozenset(
         "runtime.initialize",
         "runtime.shutdown",
         "project.open",
+        "general.open",
         "project.sessions",
+        "session.search",
+        "session.search.cancel",
+        "session.archive",
         "history.page",
+        "tool_result.read",
+        "workspace.diff",
+        "workspace.diff.cancel",
         "attachment.import",
         "attachment.preview",
         "attachment.open",
@@ -223,6 +237,11 @@ _EVENT_OUTPUT_FIELDS = frozenset(
         "segment_index",
         "text",
         "kind",
+        "stage",
+        "current",
+        "total",
+        "stream",
+        "observed_at",
         "usage",
         "previous_mode",
         "behavior_mode",
@@ -242,6 +261,8 @@ _EVENT_OUTPUT_FIELDS = frozenset(
         "command",
         "status",
         "is_error",
+        "output_preview",
+        "output_preview_truncated",
         "final_text",
         "termination_reason",
         "failure_reason",
@@ -322,6 +343,23 @@ _REPLAY_OUTPUT_FIELDS = (
     "termination_reason",
     "failure_reason",
     "message_id",
+    "assistant_kind",
+    "started_at",
+    "completed_at",
+    "output_ref",
+    "output_preview",
+    "output_preview_truncated",
+    "file_changes",
+)
+
+_TOOL_RESULT_PAGE_OUTPUT_FIELDS = (
+    "ref",
+    "content",
+    "offset",
+    "next_offset",
+    "total_bytes",
+    "sha256",
+    "eof",
 )
 
 _COMPACTION_OPERATION_STATES = frozenset(
@@ -469,6 +507,7 @@ def _catalog_entry(entry: object) -> dict[str, object] | None:
     values = {
         "session_id": entry.session_id,
         "project_key": entry.project_key,
+        "archived": entry.archived,
         "created_at": entry.created_at,
         "last_used_at": entry.last_used_at,
         "last_user_message_at": entry.last_user_message_at,
@@ -528,6 +567,111 @@ def _history_page_value(value: object) -> dict[str, object]:
     for record in records:
         if not isinstance(record, Mapping) or not isinstance(record.get("record_id"), str):
             raise BridgeError("session_error", "Session history page unavailable")
+    return projected
+
+
+def _workspace_diff_value(value: object) -> dict[str, object]:
+    """Validate the bounded Application workspace-review DTO explicitly."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "source",
+        "project_key",
+        "viewed_at",
+        "status",
+        "staged_diff",
+        "unstaged_diff",
+        "truncated",
+    }:
+        raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+    if (
+        value.get("source") != "current_working_tree"
+        or not isinstance(value.get("project_key"), str)
+        or not isinstance(value.get("viewed_at"), str)
+        or not isinstance(value.get("truncated"), bool)
+    ):
+        raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+    raw_status = value.get("status")
+    if not isinstance(raw_status, Mapping) or set(raw_status) != {
+        "branch",
+        "entries",
+        "unborn",
+        "truncated",
+    }:
+        raise BridgeError("workspace_unavailable", "workspace status is unavailable")
+    branch = raw_status.get("branch")
+    entries = raw_status.get("entries")
+    if (
+        branch is not None and not isinstance(branch, str)
+        or isinstance(entries, (str, bytes, bytearray))
+        or not isinstance(entries, (list, tuple))
+        or not isinstance(raw_status.get("unborn"), bool)
+        or not isinstance(raw_status.get("truncated"), bool)
+    ):
+        raise BridgeError("workspace_unavailable", "workspace status is unavailable")
+    projected_entries: list[dict[str, object]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) not in (
+            {"xy", "path"},
+            {"xy", "path", "original_path"},
+        ):
+            raise BridgeError("workspace_unavailable", "workspace status is unavailable")
+        if (
+            not isinstance(entry.get("xy"), str)
+            or not isinstance(entry.get("path"), str)
+            or "original_path" in entry and not isinstance(entry.get("original_path"), str)
+        ):
+            raise BridgeError("workspace_unavailable", "workspace status is unavailable")
+        projected_entries.append(dict(entry))
+    projected_diffs: dict[str, dict[str, object]] = {}
+    for name in ("staged_diff", "unstaged_diff"):
+        raw_diff = value.get(name)
+        if (
+            not isinstance(raw_diff, Mapping)
+            or set(raw_diff) != {"text", "truncated", "size_bytes"}
+            or not isinstance(raw_diff.get("text"), str)
+            or not isinstance(raw_diff.get("truncated"), bool)
+            or isinstance(raw_diff.get("size_bytes"), bool)
+            or not isinstance(raw_diff.get("size_bytes"), int)
+            or raw_diff.get("size_bytes", -1) < 0
+        ):
+            raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+        projected_diffs[name] = dict(raw_diff)
+    return {
+        "source": "current_working_tree",
+        "project_key": value["project_key"],
+        "viewed_at": value["viewed_at"],
+        "status": {
+            "branch": branch,
+            "entries": projected_entries,
+            "unborn": raw_status["unborn"],
+            "truncated": raw_status["truncated"],
+        },
+        **projected_diffs,
+        "truncated": value["truncated"],
+    }
+
+
+def _tool_result_page_value(value: object, *, expected_ref: str) -> dict[str, object]:
+    projected = _dto_fields(
+        value,
+        ToolResultReadPage,
+        _TOOL_RESULT_PAGE_OUTPUT_FIELDS,
+    )
+    if projected is None:
+        raise BridgeError("tool_result_unavailable", "Tool Result is unavailable")
+    if (
+        projected.get("ref") != expected_ref
+        or not isinstance(projected.get("content"), str)
+        or any(
+            isinstance(projected.get(field), bool)
+            or not isinstance(projected.get(field), int)
+            or projected[field] < 0
+            for field in ("offset", "next_offset", "total_bytes")
+        )
+        or not isinstance(projected.get("sha256"), str)
+        or not isinstance(projected.get("eof"), bool)
+    ):
+        raise BridgeError("tool_result_unavailable", "Tool Result is unavailable")
     return projected
 
 
@@ -740,6 +884,8 @@ class DesktopBridge:
         # Tool call and its immutable Action.  Execution still goes through
         # the same Application ToolExecutor after the response arrives.
         self._pending_process_operations: dict[str, dict[str, object]] = {}
+        self._session_search_operations: dict[str, dict[str, object]] = {}
+        self._workspace_diff_operations: dict[str, dict[str, object]] = {}
         # A selected Session owns its own Application/Run pair.  Keeping
         # those pairs here lets a background Turn continue while the user
         # navigates to another Session in the same project.
@@ -751,12 +897,20 @@ class DesktopBridge:
         self._application_factory = application_factory
         self._config_loader = config_loader
         self._home = None if home is None else Path(home).expanduser().resolve(strict=False)
+        initial_context = getattr(application, "runtime_context", None)
+        initial_context_workdir = getattr(initial_context, "workdir", None)
         self._workdir = (
             Path(workdir).expanduser().resolve(strict=False)
             if workdir is not None
+            else Path(initial_context_workdir).expanduser().resolve(strict=False)
+            if isinstance(initial_context_workdir, (str, Path))
             else Path.cwd().resolve(strict=False)
         )
-        self._catalog_project_keys = {str(self._workdir)}
+        if self._mode_for_application(application) is ApplicationMode.GENERAL:
+            self._catalog_project_keys = {GENERAL_SESSION_OWNER_KEY}
+        else:
+            self._catalog_project_keys = {str(self._workdir)}
+        self._owner_revision = 0
         self._shutdown_timeout = float(shutdown_timeout)
         # ``ready`` describes the child transport.  Application construction
         # is deliberately deferred until ``runtime.initialize`` so an
@@ -777,6 +931,85 @@ class DesktopBridge:
     @property
     def application(self) -> object | None:
         return self._application
+
+    @staticmethod
+    def _mode_for_application(application: object | None) -> ApplicationMode:
+        value = getattr(application, "application_mode", ApplicationMode.CODING)
+        try:
+            return ApplicationMode.coerce(value)
+        except (TypeError, ValueError):
+            return ApplicationMode.CODING
+
+    @staticmethod
+    def _owner_key_for_application(application: object | None, fallback: Path) -> str:
+        service = getattr(application, "session_service", None)
+        value = getattr(service, "project_key", None) if service is not None else None
+        if isinstance(value, str) and value.strip():
+            return value
+        return str(fallback)
+
+    @staticmethod
+    def _context_workdir_for_application(application: object | None, fallback: Path) -> Path:
+        context = getattr(application, "runtime_context", None)
+        value = getattr(context, "workdir", None) if context is not None else None
+        if isinstance(value, (str, Path)):
+            return Path(value).expanduser().resolve(strict=False)
+        return fallback
+
+    def _current_owner_key(self) -> str:
+        return self._owner_key_for_application(self._application, self._workdir)
+
+    def _current_mode(self) -> ApplicationMode:
+        return self._mode_for_application(self._application)
+
+    def _allowed_owner_key(self, value: object, *, method: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise BridgeError("invalid_request", "project_key must be a registered owner")
+        if value == GENERAL_SESSION_OWNER_KEY:
+            if (
+                self._current_mode() is not ApplicationMode.GENERAL
+                or value not in self._catalog_project_keys
+            ):
+                raise BridgeError("project_not_registered", f"{method} owner is not registered")
+            return value
+        path = _path_value(value, "project_key")
+        key = str(path)
+        if (
+            self._current_mode() is ApplicationMode.GENERAL
+            or key not in self._catalog_project_keys
+        ):
+            raise BridgeError("project_not_registered", f"{method} owner is not registered")
+        return key
+
+    def _allowed_catalog_owner_key(self, value: object, *, method: str) -> str:
+        """Validate an owner for read-only catalog or archive administration."""
+
+        if not isinstance(value, str) or not value.strip():
+            raise BridgeError("invalid_request", "project_key must be a registered owner")
+        if value == GENERAL_SESSION_OWNER_KEY:
+            if value not in self._catalog_project_keys:
+                raise BridgeError("project_not_registered", f"{method} owner is not registered")
+            return value
+        key = str(_path_value(value, "project_key"))
+        if key not in self._catalog_project_keys:
+            raise BridgeError("project_not_registered", f"{method} owner is not registered")
+        return key
+
+    def _current_search_scope(self) -> tuple[str, ...]:
+        if self._current_mode() is ApplicationMode.GENERAL:
+            if GENERAL_SESSION_OWNER_KEY not in self._catalog_project_keys:
+                raise BridgeError("project_not_registered", "General Session scope is not registered")
+            return (GENERAL_SESSION_OWNER_KEY,)
+        return tuple(
+            sorted(
+                key
+                for key in self._catalog_project_keys
+                if key != GENERAL_SESSION_OWNER_KEY
+            )
+        )
+
+    def _general_runtime_workdir(self) -> Path:
+        return ((self._home or Path.home()) / ".uthcode").resolve(strict=False)
 
     @property
     def run(self) -> object | None:
@@ -839,9 +1072,12 @@ class DesktopBridge:
                 safe[field_name] = value
         runtime_context = getattr(application, "runtime_context", None)
         owner_workdir = getattr(runtime_context, "workdir", None)
-        if not isinstance(owner_workdir, (str, Path)):
-            owner_workdir = self._workdir
-        safe["project_key"] = str(Path(owner_workdir).expanduser().resolve(strict=False))
+        fallback = (
+            Path(owner_workdir).expanduser().resolve(strict=False)
+            if isinstance(owner_workdir, (str, Path))
+            else self._workdir
+        )
+        safe["project_key"] = self._owner_key_for_application(application, fallback)
         try:
             projected = _json_safe(safe)
             if isinstance(projected, dict):
@@ -998,7 +1234,10 @@ class DesktopBridge:
             ) if reset_turn_projection or not isinstance(previous_status, str) else previous_status,
             "pending_pause": None if reset_turn_projection else previous_pause,
             "task_state": None if reset_turn_projection else previous_task_state,
-            "project_key": str(self._workdir),
+            "project_key": self._current_owner_key(),
+            "config_workdir": str(
+                self._context_workdir_for_application(self._application, self._workdir)
+            ),
         }
         return session_id
 
@@ -1041,18 +1280,41 @@ class DesktopBridge:
         current = self._application if owner is None else owner
         if current is None:
             raise BridgeError("application_required", "Application is not initialized")
-        target_workdir = self._workdir if workdir is None else workdir
+        mode = self._mode_for_application(current)
+        target_workdir = (
+            self._context_workdir_for_application(current, self._workdir)
+            if workdir is None
+            else workdir
+        )
         if self._application_factory is not None:
             try:
-                return self._application_factory(target_workdir)
+                candidate = self._application_factory(target_workdir)
             except Exception:
                 raise BridgeError("session_error", "Session runtime could not be prepared") from None
+            if mode is ApplicationMode.GENERAL and self._mode_for_application(candidate) is not mode:
+                close = getattr(candidate, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise BridgeError("session_error", "General Session runtime mode is unavailable")
+            return candidate
         config = None
         try:
-            if self._config_loader is not None:
+            if mode is ApplicationMode.GENERAL and self._config_loader is not None:
+                # The legacy injected loader has no user-only option.  A
+                # General clone inherits the already validated user-level
+                # snapshot instead of re-reading project configuration.
+                config = getattr(current, "configuration", None)
+            elif self._config_loader is not None:
                 config = self._config_loader(target_workdir)
             else:
-                config = load_effective_config(cwd=target_workdir, home=self._home)
+                config = load_effective_config(
+                    cwd=target_workdir,
+                    home=self._home,
+                    include_project_configs=mode is ApplicationMode.CODING,
+                )
         except Exception:
             config = getattr(current, "configuration", None)
         if not isinstance(config, EffectiveConfig):
@@ -1074,6 +1336,7 @@ class DesktopBridge:
                 model_writer=writer if callable(writer) else None,
                 runtime_context=runtime_context,
                 session_store=store,
+                application_mode=mode,
             )
         except Exception:
             raise BridgeError("session_error", "Session runtime could not be prepared") from None
@@ -1437,7 +1700,7 @@ class DesktopBridge:
         session_id = self._session_id_for_application(application)
         if session_id is not None:
             result["session_id"] = session_id
-            result["project_key"] = str(self._workdir)
+            result["project_key"] = self._owner_key_for_application(application, self._workdir)
             runtime = self._runtime_for_session(session_id)
             result["session_state"] = self._session_state_projection(runtime)
         if application_status is not None:
@@ -1469,6 +1732,8 @@ class DesktopBridge:
         application: object | None,
         *,
         project_key: str | None = None,
+        archived: bool | None = False,
+        registered_project_keys: Sequence[str] | None = None,
     ) -> tuple[object, ...]:
         # Project navigation needs identities/order only.  Prefer the
         # Application's metadata projection so opening a project does not
@@ -1476,12 +1741,42 @@ class DesktopBridge:
         # lightweight test/embedding Applications may expose only the older
         # catalog seam and remain usable through that real fallback.
         catalog = getattr(application, "session_catalog_metadata", None)
-        if not callable(catalog):
+        metadata_catalog = callable(catalog)
+        if not metadata_catalog:
             catalog = getattr(application, "session_catalog", None)
         if not callable(catalog):
             return ()
+        supports_archive_filter = False
+        supports_registered_project_keys = False
+        if metadata_catalog:
+            try:
+                signature = inspect.signature(catalog)
+                supports_archive_filter = "archived" in signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                supports_registered_project_keys = (
+                    "registered_project_keys" in signature.parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                supports_archive_filter = True
+                supports_registered_project_keys = True
+        if registered_project_keys is not None and not supports_registered_project_keys:
+            raise BridgeError("session_error", "Registered Session catalog unavailable")
         try:
-            values = catalog() if project_key is None else catalog(project_key=project_key)
+            if metadata_catalog:
+                kwargs: dict[str, object] = {"project_key": project_key}
+                if supports_archive_filter:
+                    kwargs["archived"] = archived
+                if registered_project_keys is not None:
+                    kwargs["registered_project_keys"] = registered_project_keys
+                values = catalog(**kwargs)
+            else:
+                values = catalog() if project_key is None else catalog(project_key=project_key)
         except Exception:
             raise BridgeError("session_error", "Session catalog unavailable") from None
         if not isinstance(values, (tuple, list)):
@@ -1489,18 +1784,36 @@ class DesktopBridge:
                 values = tuple(values)
             except Exception:
                 raise BridgeError("session_error", "Session catalog unavailable") from None
-        return tuple(values)
+        result = tuple(values)
+        if archived is not None and (not metadata_catalog or not supports_archive_filter):
+            result = tuple(
+                value
+                for value in result
+                if getattr(value, "archived", False) is archived
+            )
+        return result
 
     def _application_sessions(self, project_key: str | None = None) -> tuple[object, ...]:
         return self._application_sessions_for(self._application, project_key=project_key)
 
     @staticmethod
-    def _parse_catalog_project_keys(value: object, *, current_project: Path) -> set[str]:
+    def _parse_catalog_project_keys(
+        value: object,
+        *,
+        current_project: Path | None,
+    ) -> set[str]:
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise BridgeError("invalid_request", "catalog_project_keys must be a list of registered Projects")
-        projects = {str(current_project.resolve(strict=False))}
+        projects = (
+            {str(current_project.resolve(strict=False))}
+            if current_project is not None
+            else set()
+        )
         for item in value:
-            projects.add(str(_path_value(item, "catalog_project_keys")))
+            if item == GENERAL_SESSION_OWNER_KEY:
+                projects.add(item)
+            else:
+                projects.add(str(_path_value(item, "catalog_project_keys")))
         return projects
 
     async def handle_request(self, request: RequestEnvelope) -> ResponseEnvelope:
@@ -1554,14 +1867,46 @@ class DesktopBridge:
             return self._runtime_result()
         if method == "project.open":
             return await self._project_open(params)
+        if method == "general.open":
+            return await self._general_open(params)
         if method == "project.sessions":
-            _require_params(params, {"project_key"}, method=method)
-            project_key = str(_path_value(params["project_key"], "project_key"))
-            if project_key not in self._catalog_project_keys:
-                raise BridgeError("project_not_registered", "Project catalog is not registered")
-            return {"sessions": _catalog_entries(self._application_sessions(project_key))}
+            unknown = set(params).difference({"project_key", "archived"})
+            if "project_key" not in params or unknown:
+                raise BridgeError("invalid_request", "project.sessions requires a registered owner")
+            archived = params.get("archived", False)
+            if not isinstance(archived, bool):
+                raise BridgeError("invalid_request", "archived must be a boolean")
+            project_key = self._allowed_catalog_owner_key(params["project_key"], method=method)
+            return {
+                "sessions": _catalog_entries(
+                    self._application_sessions_for(
+                        self._require_application(),
+                        project_key=project_key,
+                        archived=archived,
+                        registered_project_keys=(
+                            tuple(self._catalog_project_keys)
+                            if self._current_mode() is ApplicationMode.GENERAL
+                            else None
+                        ),
+                    )
+                ),
+                "project_key": project_key,
+                "archived": archived,
+            }
+        if method == "workspace.diff":
+            return await self._workspace_diff(params)
+        if method == "workspace.diff.cancel":
+            return await self._workspace_diff_cancel(params)
+        if method == "session.search":
+            return self._session_search(params)
+        if method == "session.search.cancel":
+            return self._session_search_cancel(params)
+        if method == "session.archive":
+            return await self._session_archive(params)
         if method == "history.page":
             return self._history_page(params)
+        if method == "tool_result.read":
+            return await self._tool_result_read(params)
         if method == "attachment.import":
             return await self._attachment_import(params)
         if method == "attachment.preview":
@@ -1631,8 +1976,415 @@ class DesktopBridge:
             return await self._settings_save(params)
         raise BridgeError("unknown_method", "unknown Desktop method")
 
+    async def _workspace_diff(self, params: Mapping[str, object]) -> dict[str, object]:
+        if (
+            not {"project_key", "catalog_project_keys"}.issubset(params)
+            or set(params).difference({"project_key", "catalog_project_keys", "path"})
+        ):
+            raise BridgeError("invalid_request", "workspace.diff parameters are invalid")
+        if self._current_mode() is not ApplicationMode.CODING:
+            raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+        catalog_project_keys = self._parse_catalog_project_keys(
+            params["catalog_project_keys"],
+            current_project=None,
+        )
+        if catalog_project_keys != self._catalog_project_keys:
+            self._catalog_project_keys = catalog_project_keys
+            self._owner_revision += 1
+        project_key = self._allowed_catalog_owner_key(
+            params["project_key"],
+            method="workspace.diff",
+        )
+        if project_key == GENERAL_SESSION_OWNER_KEY:
+            raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+        path = params.get("path")
+        if path is not None and (
+            not isinstance(path, str)
+            or not path.strip()
+            or len(path) > 2048
+            or any(character in path for character in ("\x00", "\r", "\n"))
+        ):
+            raise BridgeError("invalid_request", "workspace diff path is invalid")
+        application = self._require_application()
+        review = getattr(application, "read_workspace_diff", None)
+        if not callable(review):
+            raise BridgeError("workspace_unavailable", "workspace diff is unavailable")
+        if len(self._workspace_diff_operations) >= 4:
+            raise BridgeError("workspace_diff_busy", "too many workspace reviews are active")
+
+        operation_id = uuid4().hex
+        operation: dict[str, object] = {
+            "operation_id": operation_id,
+            "application": application,
+            "owner_key": project_key,
+            "selected_owner_key": self._current_owner_key(),
+            "owner_revision": self._owner_revision,
+            "token": CancellationToken(),
+            "state": "reviewing",
+            "task": None,
+            "worker": None,
+        }
+        self._workspace_diff_operations[operation_id] = operation
+        task = asyncio.create_task(
+            self._run_workspace_diff(
+                operation,
+                review=review,
+                project_key=project_key,
+                registered_project_keys=tuple(self._catalog_project_keys),
+                path=path,
+            )
+        )
+        operation["task"] = task
+        return {
+            "operation_id": operation_id,
+            "owner_key": project_key,
+            "state": "reviewing",
+        }
+
+    def _workspace_diff_is_stale(self, operation: Mapping[str, object]) -> bool:
+        return (
+            self._owner_revision != operation.get("owner_revision")
+            or self._application is not operation.get("application")
+            or self._current_owner_key() != operation.get("selected_owner_key")
+        )
+
+    async def _run_workspace_diff(
+        self,
+        operation: dict[str, object],
+        *,
+        review: Callable[..., object],
+        project_key: str,
+        registered_project_keys: tuple[str, ...],
+        path: str | None,
+    ) -> None:
+        operation_id = operation["operation_id"]
+        token = operation["token"]
+        payload: dict[str, object] = {
+            "type": "workspace_diff_result",
+            "operation_id": operation_id,
+            "owner_key": project_key,
+            "state": "failed",
+        }
+        worker: asyncio.Task[object] | None = None
+        state = "failed"
+        try:
+            if not isinstance(token, CancellationToken):
+                return
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    review,
+                    project_key,
+                    registered_project_keys=registered_project_keys,
+                    path=path,
+                    cancellation=token,
+                )
+            )
+            operation["worker"] = worker
+            value = await asyncio.shield(worker)
+            if token.cancelled:
+                state = "cancelled"
+            elif self._workspace_diff_is_stale(operation):
+                state = "stale"
+            else:
+                payload.update(_workspace_diff_value(value))
+                state = "completed"
+        except asyncio.CancelledError:
+            if isinstance(token, CancellationToken):
+                token.cancel()
+            if worker is not None:
+                try:
+                    await asyncio.shield(worker)
+                except BaseException:
+                    pass
+            state = "cancelled"
+        except WorkspaceReviewError:
+            state = (
+                "cancelled"
+                if isinstance(token, CancellationToken) and token.cancelled
+                else "stale"
+                if self._workspace_diff_is_stale(operation)
+                else "failed"
+            )
+        except BridgeError:
+            state = "stale" if self._workspace_diff_is_stale(operation) else "failed"
+        except Exception:
+            state = (
+                "cancelled"
+                if isinstance(token, CancellationToken) and token.cancelled
+                else "stale"
+                if self._workspace_diff_is_stale(operation)
+                else "failed"
+            )
+        finally:
+            if state == "failed":
+                payload["error_kind"] = "workspace_unavailable"
+            payload["state"] = state
+            operation["state"] = state
+            try:
+                projected = _json_safe(payload)
+                if isinstance(projected, dict):
+                    self._publish(AgentEventEnvelope(projected))
+            finally:
+                self._workspace_diff_operations.pop(str(operation_id), None)
+
+    async def _workspace_diff_cancel(
+        self,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        _require_params(params, {"operation_id"}, method="workspace.diff.cancel")
+        operation_id = _text_param(params, "operation_id")
+        operation = self._workspace_diff_operations.get(operation_id)
+        if operation is None:
+            raise BridgeError("workspace_diff_unknown", "workspace review is no longer active")
+        token = operation.get("token")
+        if not isinstance(token, CancellationToken):
+            raise BridgeError("workspace_diff_unknown", "workspace review is no longer active")
+        token.cancel()
+        operation["state"] = "cancelling"
+        task = operation.get("task")
+        if isinstance(task, asyncio.Task):
+            await asyncio.shield(task)
+        return {"operation_id": operation_id, "state": operation.get("state", "cancelled")}
+
+    def _session_search(self, params: Mapping[str, object]) -> dict[str, object]:
+        allowed = {"query", "max_results", "catalog_project_keys"}
+        if "query" not in params or set(params) - allowed:
+            raise BridgeError("invalid_request", "session.search requires query and optional limits")
+        application = self._require_application()
+        query = params["query"]
+        if not isinstance(query, str) or len(query) > 512:
+            raise BridgeError("invalid_request", "query is invalid")
+        max_results = params.get("max_results", 20)
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= 100:
+            raise BridgeError("invalid_request", "max_results must be between 1 and 100")
+        if "catalog_project_keys" in params:
+            # Main injects its existing registration authority on every
+            # search.  Do not add the selected workdir here: it can be stale
+            # while General is selected or after a Project was removed.
+            self._catalog_project_keys = self._parse_catalog_project_keys(
+                params["catalog_project_keys"],
+                current_project=None,
+            )
+        owner_key = self._current_owner_key()
+        scope = self._current_search_scope()
+        search = getattr(application, "search_sessions", None)
+        if not callable(search):
+            raise BridgeError("session_error", "Application does not support Session search")
+        if len(self._session_search_operations) >= 8:
+            raise BridgeError("session_search_busy", "too many Session searches are active")
+
+        operation_id = uuid4().hex
+        token = CancellationToken()
+        operation: dict[str, object] = {
+            "operation_id": operation_id,
+            "application": application,
+            "owner_key": owner_key,
+            "owner_revision": self._owner_revision,
+            "token": token,
+            "state": "searching",
+            "task": None,
+        }
+        self._session_search_operations[operation_id] = operation
+        task = asyncio.create_task(
+            self._run_session_search(
+                operation,
+                search=search,
+                query=query,
+                project_keys=scope,
+                max_results=max_results,
+            )
+        )
+        operation["task"] = task
+        return {
+            "operation_id": operation_id,
+            "owner_key": owner_key,
+            "state": "searching",
+        }
+
+    async def _run_session_search(
+        self,
+        operation: dict[str, object],
+        *,
+        search: Callable[..., object],
+        query: str,
+        project_keys: tuple[str, ...],
+        max_results: int,
+    ) -> None:
+        operation_id = operation["operation_id"]
+        token = operation["token"]
+        owner_key = operation["owner_key"]
+        application = operation["application"]
+        state = "failed"
+        payload: dict[str, object] = {
+            "type": "session_search_result",
+            "operation_id": operation_id,
+            "owner_key": owner_key,
+            "state": state,
+        }
+        if not isinstance(token, CancellationToken):
+            self._session_search_operations.pop(str(operation_id), None)
+            return
+        try:
+            result = await self._call_session_operation(
+                search,
+                query,
+                project_keys=project_keys,
+                max_results=max_results,
+                cancellation=token,
+            )
+            if token.cancelled:
+                state = "cancelled"
+            elif (
+                self._owner_revision != operation.get("owner_revision")
+                or self._application is not application
+                or self._current_owner_key() != owner_key
+            ):
+                state = "stale"
+            elif type(result) is SessionSearchResult:
+                hits = [
+                    hit
+                    for value in result.hits
+                    if (hit := _dto_fields(
+                        value,
+                        SessionSearchHit,
+                        ("session_id", "project_key", "title", "snippet", "archived", "last_used_at"),
+                    )) is not None
+                    and hit.get("project_key") in project_keys
+                ]
+                state = "completed"
+                payload.update(
+                    {
+                        "hits": hits,
+                        "unavailable_count": result.unavailable_count,
+                        "has_more": result.has_more,
+                    }
+                )
+            else:
+                state = "failed"
+        except asyncio.CancelledError:
+            token.cancel()
+            state = "cancelled"
+        except SessionOperationError as exc:
+            state = "cancelled" if token.cancelled else "failed"
+            payload["error_kind"] = {
+                "busy": "session_busy",
+                "unknown": "session_unavailable",
+                "corrupt": "session_unavailable",
+                "storage": "session_unavailable",
+            }.get(exc.kind, "session_unavailable")
+        except Exception:
+            state = "cancelled" if token.cancelled else "failed"
+            if state == "failed":
+                payload["error_kind"] = "session_unavailable"
+        finally:
+            payload["state"] = state
+            try:
+                projected = _json_safe(payload)
+                if isinstance(projected, dict):
+                    self._publish(AgentEventEnvelope(projected))
+            finally:
+                self._session_search_operations.pop(str(operation_id), None)
+
+    def _session_search_cancel(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"operation_id"}, method="session.search.cancel")
+        operation_id = _text_param(params, "operation_id")
+        operation = self._session_search_operations.get(operation_id)
+        if operation is None:
+            raise BridgeError("session_search_unknown", "Session search is no longer active")
+        token = operation.get("token")
+        if not isinstance(token, CancellationToken):
+            raise BridgeError("session_search_unknown", "Session search is no longer active")
+        token.cancel()
+        operation["state"] = "cancelling"
+        return {"operation_id": operation_id, "state": "cancelling"}
+
+    async def _session_archive(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(
+            params,
+            {"session_id", "project_key", "archived"},
+            method="session.archive",
+        )
+        session_id = _text_param(params, "session_id")
+        project_key = self._allowed_catalog_owner_key(params["project_key"], method="session.archive")
+        archived = params["archived"]
+        if not isinstance(archived, bool):
+            raise BridgeError("invalid_request", "archived must be a boolean")
+        application = self._require_application()
+        runtime = self._runtime_for_session(session_id)
+        runtime_owner = runtime.get("project_key") if runtime is not None else None
+        current_id = self._session_id_for_application(application)
+        target_runtime = runtime
+        if current_id == session_id:
+            target_runtime = {
+                "application": application,
+                "handle": self._active_handle,
+                "pending_pause": self._pending_pause(),
+                "status": "running" if self._active_handle is not None else "idle",
+                "project_key": self._current_owner_key(),
+            }
+        if runtime_owner is not None and runtime_owner != project_key:
+            raise BridgeError("session_unknown", "Session is unavailable for this owner")
+        if target_runtime is not None:
+            handle = target_runtime.get("handle")
+            pending = target_runtime.get("pending_pause")
+            if pending is None and handle is not None:
+                pending = getattr(handle, "pending_pause", None)
+            if (
+                handle is not None
+                or pending is not None
+                or target_runtime.get("preparing") is True
+                or target_runtime.get("status") == "preparing"
+            ):
+                raise BridgeError("session_busy", "active Session cannot be archived")
+        operation = self._compaction_operation_for_session(session_id)
+        if operation is not None and operation.get("state") == "running":
+            raise BridgeError("compaction_active", "Session compaction is active")
+        if target_runtime is not None and target_runtime.get("project_key") != project_key:
+            raise BridgeError("session_unknown", "Session is unavailable for this owner")
+        archive = getattr(application, "set_session_archived", None)
+        if not callable(archive):
+            raise BridgeError("session_error", "Application does not support Session archive")
+        try:
+            metadata = await self._call_session_operation(
+                archive,
+                session_id,
+                archived,
+                project_key=project_key,
+                **(
+                    {"registered_project_keys": tuple(self._catalog_project_keys)}
+                    if self._current_mode() is ApplicationMode.GENERAL
+                    else {}
+                ),
+            )
+        except SessionOperationError as exc:
+            kind = {
+                "busy": "session_busy",
+                "corrupt": "session_unavailable",
+                "unknown": "session_unknown",
+                "storage": "session_storage_error",
+            }.get(exc.kind, "session_error")
+            raise BridgeError(kind, "Session archive state could not be updated") from None
+        except (TypeError, ValueError):
+            raise BridgeError("session_unknown", "Session is unavailable for this owner") from None
+        except Exception:
+            raise BridgeError("session_error", "Session archive state could not be updated") from None
+        projected = _dto_fields(
+            metadata,
+            SessionMutation,
+            ("session_id", "project_key", "title", "archived"),
+        )
+        if projected is None:
+            raise BridgeError("session_error", "Session archive state could not be updated")
+        if (
+            projected.get("session_id") != session_id
+            or projected.get("project_key") != project_key
+            or projected.get("archived") is not archived
+        ):
+            raise BridgeError("session_error", "Session archive state could not be verified")
+        return {"session": projected, **projected}
+
     async def _runtime_initialize(self, params: Mapping[str, object]) -> dict[str, object]:
-        expected = {"workdir", "cwd", "catalog_project_keys"}
+        expected = {"workdir", "cwd", "catalog_project_keys", "mode"}
         if "workdir" in params and "cwd" in params:
             raise BridgeError("invalid_request", "runtime.initialize accepts only one workdir")
         if set(params) - expected:
@@ -1640,22 +2392,53 @@ class DesktopBridge:
                 "invalid_request",
                 f"runtime.initialize has unknown fields: {sorted(set(params) - expected)!r}",
             )
+        try:
+            mode = ApplicationMode.coerce(params.get("mode", ApplicationMode.CODING.value))
+        except (TypeError, ValueError):
+            raise BridgeError("invalid_request", "mode must be coding or general") from None
         selected_workdir = "workdir" if "workdir" in params else "cwd"
-        if selected_workdir in params:
-            path = _path_value(params[selected_workdir], selected_workdir)
-            self._workdir = path
+        requested_workdir = (
+            _path_value(params[selected_workdir], selected_workdir)
+            if mode is ApplicationMode.CODING and selected_workdir in params
+            else None
+        )
+        if mode is ApplicationMode.GENERAL and selected_workdir in params:
+            raise BridgeError("invalid_request", "General initialization does not accept a Project path")
+        previous_catalog = set(self._catalog_project_keys)
         if "catalog_project_keys" in params:
             self._catalog_project_keys = self._parse_catalog_project_keys(
                 params["catalog_project_keys"],
-                current_project=self._workdir,
+                current_project=(
+                    requested_workdir if mode is ApplicationMode.CODING else None
+                ),
             )
+        if mode is ApplicationMode.GENERAL:
+            self._catalog_project_keys.add(GENERAL_SESSION_OWNER_KEY)
+        if self._catalog_project_keys != previous_catalog:
+            self._owner_revision += 1
         if self._application is not None:
-            self._state = "ready"
-            if self._run is None:
-                self._replace_run(self._application)
-            return self._runtime_result()
+            current_mode = self._current_mode()
+            if current_mode is mode:
+                self._state = "ready"
+                if self._run is None:
+                    self._replace_run(self._application)
+                return self._runtime_result()
+            if mode is ApplicationMode.GENERAL:
+                return await self._general_open({
+                    "catalog_project_keys": list(self._catalog_project_keys),
+                })
+            if requested_workdir is not None:
+                return await self._project_open({
+                    "path": str(requested_workdir),
+                    "catalog_project_keys": list(self._catalog_project_keys),
+                })
+            raise BridgeError("invalid_request", "Coding initialization requires a registered Project")
+        target_workdir = requested_workdir or self._workdir
         try:
-            application = self._build_application(self._workdir)
+            application = self._build_application(
+                target_workdir,
+                application_mode=mode,
+            )
         except ConfigurationInitializationRequired:
             self._state = "configuration_required"
             raise BridgeError("configuration_required", "user configuration is not initialized") from None
@@ -1739,25 +2522,59 @@ class DesktopBridge:
             )
             raise BridgeError("application_error", "Application cannot create a Run") from None
         self._application = application
+        if mode is ApplicationMode.CODING:
+            self._workdir = target_workdir
         self._run = run
+        self._bind_process_events(application)
         self._dispatcher = CommandDispatcher(self._registry, application)
         self._completion = CompletionEngine(self._registry, application)
         self._state = "ready"
+        self._owner_revision += 1
         return self._runtime_result()
 
-    def _build_application(self, workdir: Path) -> object:
+    def _build_application(
+        self,
+        workdir: Path,
+        *,
+        application_mode: ApplicationMode = ApplicationMode.CODING,
+    ) -> object:
+        mode = ApplicationMode.coerce(application_mode)
+        target_workdir = (
+            self._general_runtime_workdir()
+            if mode is ApplicationMode.GENERAL
+            else workdir
+        )
         if self._application_factory is not None:
-            return self._application_factory(workdir)
+            application = self._application_factory(target_workdir)
+            if mode is ApplicationMode.GENERAL and self._mode_for_application(application) is not mode:
+                close = getattr(application, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise BridgeError("application_error", "Application factory returned the wrong mode")
+            return application
         loader = self._config_loader
+        if mode is ApplicationMode.GENERAL and loader is not None:
+            raise BridgeError(
+                "configuration_error",
+                "General mode requires the user-only configuration loader",
+            )
         if loader is None:
-            config = load_effective_config(cwd=workdir, home=self._home)
+            config = load_effective_config(
+                cwd=target_workdir,
+                home=self._home,
+                include_project_configs=mode is ApplicationMode.CODING,
+            )
         else:
-            config = loader(workdir)
+            config = loader(target_workdir)
         if not isinstance(config, EffectiveConfig):
             raise BridgeError("configuration_error", "configuration loader returned invalid data")
         return create_application(
             config,
-            runtime_context=ApplicationRuntimeContext.from_system(workdir=workdir),
+            runtime_context=ApplicationRuntimeContext.from_system(workdir=target_workdir),
+            application_mode=mode,
         )
 
     async def _close_active_for_boundary(self) -> None:
@@ -1881,6 +2698,7 @@ class DesktopBridge:
         self._bind_process_events(candidate)
         self._workdir = path
         self._catalog_project_keys = catalog_project_keys
+        self._owner_revision += 1
         self._run = candidate_run
         self._dispatcher = candidate_dispatcher
         self._completion = candidate_completion
@@ -1888,6 +2706,114 @@ class DesktopBridge:
         self._reclaim_background_runtimes()
         return {
             "project": {"path": str(path)},
+            "sessions": candidate_sessions,
+            "run": candidate_snapshot,
+        }
+
+    async def _general_open(self, params: Mapping[str, object]) -> dict[str, object]:
+        if set(params) - {"catalog_project_keys"}:
+            raise BridgeError("invalid_request", "general.open accepts no Project path")
+        catalog_project_keys = (
+            self._parse_catalog_project_keys(
+                params["catalog_project_keys"],
+                current_project=None,
+            )
+            if "catalog_project_keys" in params
+            else set(self._catalog_project_keys)
+        )
+        catalog_project_keys.add(GENERAL_SESSION_OWNER_KEY)
+        if self._application is not None and self._current_mode() is ApplicationMode.GENERAL:
+            self._catalog_project_keys = catalog_project_keys
+            return self._runtime_result()
+
+        candidate: object | None = None
+        try:
+            candidate = self._build_application(
+                self._workdir,
+                application_mode=ApplicationMode.GENERAL,
+            )
+            candidate_run = self._create_run(candidate)
+            candidate_dispatcher = CommandDispatcher(self._registry, candidate)
+            candidate_completion = CompletionEngine(self._registry, candidate)
+            candidate_sessions = _catalog_entries(
+                self._application_sessions_for(
+                    candidate,
+                    project_key=GENERAL_SESSION_OWNER_KEY,
+                )
+            )
+            candidate_snapshot = self._snapshot_for(candidate_run, strict=True)
+        except ConfigurationInitializationRequired:
+            raise BridgeError("configuration_required", "user configuration is not initialized") from None
+        except ConfigurationError:
+            raise BridgeError("configuration_error", "user configuration is invalid") from None
+        except BridgeError:
+            if candidate is not None:
+                close = getattr(candidate, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            raise
+        except Exception:
+            if candidate is not None:
+                close = getattr(candidate, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            raise BridgeError("general_open_failed", "General could not be opened") from None
+
+        parked_old_runtime = False
+        try:
+            if self._supports_background_sessions() and (
+                self._active_handle is not None
+                or self._current_compaction_operation() is not None
+                or any(runtime.get("handle") is not None for runtime in self._background_runtimes.values())
+            ):
+                self._remember_current_runtime()
+                parked_old_runtime = True
+                self._active_handle = None
+                self._turn_task = None
+            elif self._active_handle is not None:
+                await self._close_active_for_boundary()
+        except Exception:
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
+
+        old = self._application
+        if old is not None and not parked_old_runtime:
+            close = getattr(old, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    candidate_close = getattr(candidate, "close", None)
+                    if callable(candidate_close):
+                        try:
+                            candidate_close()
+                        except Exception:
+                            pass
+                    raise BridgeError("application_close_failed", "previous Application could not close") from None
+
+        self._application = candidate
+        self._bind_process_events(candidate)
+        self._catalog_project_keys = catalog_project_keys
+        self._owner_revision += 1
+        self._run = candidate_run
+        self._dispatcher = candidate_dispatcher
+        self._completion = candidate_completion
+        self._state = "ready"
+        self._reclaim_background_runtimes()
+        return {
+            "mode": ApplicationMode.GENERAL.value,
+            "project_key": GENERAL_SESSION_OWNER_KEY,
             "sessions": candidate_sessions,
             "run": candidate_snapshot,
         }
@@ -1979,7 +2905,7 @@ class DesktopBridge:
                 "completion": completion,
                 "closed": False,
                 "status": "idle",
-                "project_key": str(self._workdir),
+                "project_key": self._owner_key_for_application(candidate, self._workdir),
             }
             self._background_runtimes[session_id] = runtime
             self._activate_runtime(runtime)
@@ -2011,10 +2937,21 @@ class DesktopBridge:
             raise BridgeError("session_error", "Session could not be created") from None
 
     async def _session_resume(self, params: Mapping[str, object]) -> dict[str, object]:
-        _require_params(params, {"session_id"}, method="session.resume")
+        if "session_id" not in params or set(params) - {"session_id", "project_key"}:
+            raise BridgeError("invalid_request", "session.resume requires a Session identity")
         session_id = _text_param(params, "session_id")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
+        requested_owner = (
+            self._allowed_owner_key(params["project_key"], method="session.resume")
+            if "project_key" in params
+            else self._current_owner_key()
+        )
+        existing = self._runtime_for_session(session_id)
+        if existing is not None and existing.get("project_key") != requested_owner:
+            raise BridgeError("session_unknown", "Session is unavailable for this owner")
+        if requested_owner != self._current_owner_key() and existing is None:
+            raise BridgeError("session_unknown", "Open the registered Project before resuming this Session")
         if self._supports_background_sessions():
             return await self._session_resume_background(session_id)
         application = self._application
@@ -2078,7 +3015,7 @@ class DesktopBridge:
                 "invalid_request",
                 "history.page is missing fields: ['session_id']",
             )
-        unknown = set(params).difference({"session_id", "cursor", "page_size"})
+        unknown = set(params).difference({"session_id", "cursor", "page_size", "project_key"})
         if unknown:
             raise BridgeError(
                 "invalid_request",
@@ -2095,7 +3032,16 @@ class DesktopBridge:
             raise BridgeError("invalid_request", "page_size must be between 1 and 100")
         if self._application is None:
             raise BridgeError("application_required", "Application is not initialized")
+        requested_owner = (
+            self._allowed_owner_key(params["project_key"], method="history.page")
+            if "project_key" in params
+            else self._current_owner_key()
+        )
         runtime = self._runtime_for_session(session_id)
+        if runtime is not None and runtime.get("project_key") != requested_owner:
+            raise BridgeError("session_unknown", "Session is unavailable for this owner")
+        if runtime is None and requested_owner != self._current_owner_key():
+            raise BridgeError("session_unknown", "Open the registered Project before reading this Session")
         application = (
             runtime.get("application") or self._application
             if runtime is not None
@@ -2108,6 +3054,65 @@ class DesktopBridge:
             page_size=page_size_value,
         )
         return _history_page_value(page)
+
+    async def _tool_result_read(
+        self,
+        params: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Read a bounded persisted Tool Result through its registered owner."""
+
+        expected = {"session_id", "project_key", "ref"}
+        optional = {"offset", "limit"}
+        missing = expected.difference(params)
+        unknown = set(params).difference(expected | optional)
+        if missing or unknown:
+            raise BridgeError("invalid_request", "tool_result.read parameters are invalid")
+        session_id = _text_param(params, "session_id")
+        ref = _text_param(params, "ref")
+        offset = params.get("offset", 0)
+        limit = params.get("limit")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise BridgeError("invalid_request", "offset must be a non-negative integer")
+        if limit is not None and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 64 * 1024
+        ):
+            raise BridgeError("invalid_request", "limit must be between 1 and 65536")
+        application_root = self._require_application()
+        requested_owner = self._allowed_owner_key(
+            params["project_key"],
+            method="tool_result.read",
+        )
+        runtime = self._runtime_for_session(session_id)
+        if runtime is not None and runtime.get("project_key") != requested_owner:
+            raise BridgeError("session_unknown", "Session is unavailable for this owner")
+        if runtime is None and requested_owner != self._current_owner_key():
+            raise BridgeError("session_unknown", "Open the registered Project before reading this Session")
+        application = (
+            runtime.get("application") or application_root
+            if runtime is not None
+            else application_root
+        )
+        reader = getattr(application, "read_tool_result_page", None)
+        if not callable(reader):
+            raise BridgeError("tool_result_unavailable", "Tool Result is unavailable")
+        try:
+            page = await self._call_session_operation(
+                reader,
+                session_id,
+                ref,
+                offset=offset,
+                limit=limit,
+            )
+        except Exception:
+            raise BridgeError("tool_result_unavailable", "Tool Result is unavailable") from None
+        projected = _tool_result_page_value(page, expected_ref=ref)
+        return {
+            "session_id": session_id,
+            "project_key": requested_owner,
+            **projected,
+        }
 
     async def _prepare_background_runtime(
         self,
@@ -2419,7 +3424,7 @@ class DesktopBridge:
         # other Sessions remain usable while its cold read is in progress.
         self._remember_current_runtime()
         owner = self._application
-        workdir = self._workdir
+        workdir = self._context_workdir_for_application(owner, self._workdir)
         runtime: dict[str, object] = {
             "application": None,
             "run": None,
@@ -2431,7 +3436,7 @@ class DesktopBridge:
             "status": "preparing",
             "preparing": True,
             "retain": True,
-            "project_key": str(workdir),
+            "project_key": self._owner_key_for_application(owner, workdir),
         }
         self._background_runtimes[session_id] = runtime
         task = asyncio.create_task(
@@ -2586,12 +3591,20 @@ class DesktopBridge:
         """
 
         target = self._workdir.resolve(strict=False)
+        selected_mode = self._current_mode()
         candidates: list[tuple[object, object | None]] = []
         seen: set[int] = set()
 
         def add(runtime: Mapping[str, object]) -> None:
             application = runtime.get("application")
             if application is None or id(application) in seen:
+                return
+            app_mode = self._mode_for_application(application)
+            if app_mode is not selected_mode:
+                return
+            if app_mode is ApplicationMode.GENERAL:
+                seen.add(id(application))
+                candidates.append((application, runtime.get("run")))
                 return
             context = getattr(application, "runtime_context", None)
             owner_workdir = getattr(context, "workdir", None)
@@ -2610,7 +3623,7 @@ class DesktopBridge:
         current_runtime: dict[str, object] = {
             "application": self._application,
             "run": self._run,
-            "project_key": str(self._workdir),
+            "project_key": self._current_owner_key(),
         }
         add(current_runtime)
         for runtime in self._background_runtimes.values():
@@ -3127,7 +4140,7 @@ class DesktopBridge:
         self._active_handle = handle
         session_id = self._session_id_for_application(application)
         self._turn_task = asyncio.create_task(
-            self._consume_turn(handle, session_id=session_id, project_key=str(self._workdir))
+            self._consume_turn(handle, session_id=session_id, project_key=self._current_owner_key())
         )
         if session_id is not None and self._supports_background_sessions():
             self._remember_current_runtime(reset_turn_projection=True)
@@ -3321,7 +4334,7 @@ class DesktopBridge:
 
         operation: dict[str, object] = {
             "session_id": session_id,
-            "project_key": str(self._workdir),
+            "project_key": self._current_owner_key(),
             "operation_id": uuid4().hex,
             "application": application,
             "application_id": id(application),
@@ -3814,6 +4827,16 @@ class DesktopBridge:
                 payload = _event(event)
                 if payload is None:
                     raise RuntimeError("invalid event projection")
+                if payload.get("type") in {
+                    "turn_started",
+                    "assistant_message_completed",
+                    "tool_started",
+                    "tool_finished",
+                    "turn_completed",
+                    "turn_failed",
+                    "turn_cancelled",
+                }:
+                    payload["observed_at"] = datetime.now(timezone.utc).isoformat()
                 if session_id is not None:
                     payload["session_id"] = session_id
                 if project_key is not None:
@@ -3929,6 +4952,30 @@ class DesktopBridge:
                     token.cancel()
                 except Exception:
                     pass
+        search_operations = [
+            operation
+            for operation in self._session_search_operations.values()
+            if isinstance(operation, dict)
+        ]
+        for operation in search_operations:
+            token = operation.get("token")
+            if isinstance(token, CancellationToken):
+                try:
+                    token.cancel()
+                except Exception:
+                    pass
+        workspace_diff_operations = [
+            operation
+            for operation in self._workspace_diff_operations.values()
+            if isinstance(operation, dict)
+        ]
+        for operation in workspace_diff_operations:
+            token = operation.get("token")
+            if isinstance(token, CancellationToken):
+                try:
+                    token.cancel()
+                except Exception:
+                    pass
         tasks: list[asyncio.Task[None]] = []
         if isinstance(self._turn_task, asyncio.Task):
             tasks.append(self._turn_task)
@@ -3940,6 +4987,16 @@ class DesktopBridge:
         tasks.extend(
             operation["task"]
             for operation in operations
+            if isinstance(operation.get("task"), asyncio.Task)
+        )
+        tasks.extend(
+            operation["task"]
+            for operation in search_operations
+            if isinstance(operation.get("task"), asyncio.Task)
+        )
+        tasks.extend(
+            operation["task"]
+            for operation in workspace_diff_operations
             if isinstance(operation.get("task"), asyncio.Task)
         )
         seen_tasks: set[int] = set()
@@ -4002,6 +5059,8 @@ class DesktopBridge:
             self._unbind_process_events(application)
         self._background_runtimes.clear()
         self._compaction_operations.clear()
+        self._session_search_operations.clear()
+        self._workspace_diff_operations.clear()
         self._pending_process_operations.clear()
         self._state = "stopped"
         if publish_state:

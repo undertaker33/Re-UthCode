@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from uthcode.core.permission import Effect, PermissionAction, ResourceScope
 from uthcode.core.provider import CancellationToken, JsonPayload, ToolDefinition
@@ -79,16 +79,23 @@ class GitWorkspace:
         self.max_output_bytes = min(max_output_bytes, _MAX_OUTPUT_BYTES)
         self.executable = executable
 
-    def status(self, *, cancellation: CancellationToken | None = None) -> dict[str, object]:
-        result = self._run(
+    def status(
+        self,
+        *,
+        cancellation: CancellationToken | None = None,
+        detect_renames: bool = False,
+    ) -> dict[str, object]:
+        if not isinstance(detect_renames, bool):
+            raise TypeError("detect_renames must be a boolean")
+        args = [
             "status",
             "--porcelain=v1",
             "-z",
             "--branch",
             "--untracked-files=all",
-            "--no-renames",
-            cancellation=cancellation,
-        )
+            "--find-renames" if detect_renames else "--no-renames",
+        ]
+        result = self._run(*args, cancellation=cancellation)
         records = result.stdout.split(b"\x00")
         branch: str | None = None
         entries: list[dict[str, object]] = []
@@ -107,7 +114,7 @@ class GitWorkspace:
             status = _decode_path(raw[:2])
             path = _decode_path(raw[3:])
             entry: dict[str, object] = {"xy": status, "path": path}
-            if status and status[0] in {"R", "C"} and index < len(records):
+            if status and ({"R", "C"} & set(status)) and index < len(records):
                 entry["original_path"] = _decode_path(records[index])
                 index += 1
             entries.append(entry)
@@ -130,6 +137,57 @@ class GitWorkspace:
         cached: bool = False,
         cancellation: CancellationToken | None = None,
     ) -> dict[str, object]:
+        paths = () if path is None else (_pathspec(path),)
+        return self._diff_paths(paths, cached=cached, ref=ref, cancellation=cancellation)
+
+    def review(
+        self,
+        *,
+        path: str | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> dict[str, object]:
+        """Read current status plus staged and unstaged diff as separate bounded facts."""
+
+        status = self.status(cancellation=cancellation, detect_renames=True)
+        paths: tuple[str, ...] = ()
+        if path is not None:
+            selected = _pathspec(path)
+            paired_paths = [selected]
+            entries = status.get("entries", ())
+            if isinstance(entries, Sequence):
+                for entry in entries:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    current_path = entry.get("path")
+                    original_path = entry.get("original_path")
+                    if current_path == selected and isinstance(original_path, str):
+                        paired_paths.append(_pathspec(original_path))
+                    elif original_path == selected and isinstance(current_path, str):
+                        paired_paths.append(_pathspec(current_path))
+            paths = tuple(dict.fromkeys(paired_paths))
+        staged = self._diff_paths(paths, cached=True, ref=None, cancellation=cancellation)
+        unstaged = self._diff_paths(paths, cached=False, ref=None, cancellation=cancellation)
+        return {
+            "status": status,
+            "staged_diff": staged,
+            "unstaged_diff": unstaged,
+            "truncated": bool(
+                status.get("truncated")
+                or staged.get("truncated")
+                or unstaged.get("truncated")
+            ),
+        }
+
+    def _diff_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        cached: bool,
+        ref: str | None,
+        cancellation: CancellationToken | None,
+    ) -> dict[str, object]:
+        if not isinstance(cached, bool):
+            raise TypeError("cached must be a boolean")
         args: list[str] = [
             "diff",
             "--no-ext-diff",
@@ -142,8 +200,7 @@ class GitWorkspace:
         if ref is not None:
             args.append(_ref(ref))
         args.append("--")
-        if path is not None:
-            args.append(_pathspec(path))
+        args.extend(_pathspec(path) for path in paths)
         result = self._run(*args, cancellation=cancellation)
         return _text_payload(result)
 
@@ -492,7 +549,11 @@ def _pathspec(value: object) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError("path must be a non-empty NUL-free string")
     normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or normalized.startswith("../") or normalized == ".." or "/../" in normalized:
+    if (
+        normalized.startswith("/")
+        or PureWindowsPath(value).drive
+        or any(part == ".." for part in normalized.split("/"))
+    ):
         raise ValueError("path must stay within the workspace")
     return normalized
 

@@ -68,6 +68,7 @@ export class MainBoundaryError extends Error {
 }
 
 const RENDERER_BOUNDARIES = new Set(["sidebar", "timeline", "composer", "runtime-panel", "document-preview"]);
+const GENERAL_SESSION_OWNER_KEY = "uthcode:general";
 
 export function isAllowedRendererUrl(url: string, rendererEntry: string, isPackaged: boolean): boolean {
   if (typeof url !== "string" || typeof rendererEntry !== "string" || !rendererEntry) return false;
@@ -131,6 +132,23 @@ function registeredProjectPath(value: unknown, registeredProjects: Set<string>):
     );
   }
   return path;
+}
+
+function registeredSessionOwner(value: unknown, registeredProjects: Set<string>): string {
+  if (value === GENERAL_SESSION_OWNER_KEY) return GENERAL_SESSION_OWNER_KEY;
+  return registeredProjectPath(value, registeredProjects);
+}
+
+function assertRuntimeParams(
+  params: JsonObject,
+  method: string,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const allowed = new Set([...required, ...optional]);
+  if (required.some((key) => !(key in params)) || Object.keys(params).some((key) => !allowed.has(key))) {
+    throw new MainBoundaryError("invalid_runtime_request", `${method} parameters are invalid`);
+  }
 }
 
 function canonicalizeRecentProjects(
@@ -470,43 +488,154 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
     }
     let requestParams = payload.params;
     if (payload.method === "session.move") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id", "target_project_key"]);
       const targetProject = registeredProjectPath(payload.params.target_project_key, registeredProjects);
       // Pass the same canonical identity that was checked against Main's
       // registration set.  The Python Bridge still repeats its own path
       // validation as a defense-in-depth boundary.
       requestParams = { ...payload.params, target_project_key: targetProject };
     } else if (payload.method === "runtime.initialize") {
-      const field = "workdir" in payload.params
-        ? "workdir"
-        : "cwd" in payload.params
-          ? "cwd"
-          : undefined;
-      if (field === undefined) {
-        throw new MainBoundaryError(
-          "invalid_project_path",
-          "Runtime initialization requires a registered Project",
-        );
+      assertRuntimeParams(payload.params, payload.method, [], ["mode", "workdir", "cwd", "catalog_project_keys"]);
+      const mode = payload.params.mode ?? "coding";
+      if (mode !== "coding" && mode !== "general") {
+        throw new MainBoundaryError("invalid_runtime_request", "Runtime mode is invalid");
       }
-      const projectPath = registeredProjectPath(payload.params[field], registeredProjects);
-      requestParams = {
-        ...payload.params,
-        [field]: projectPath,
-        // Main's existing picker/preferences authority authorizes metadata-
-        // only catalog reads without opening one Application per Project.
-        catalog_project_keys: Array.from(registeredProjects),
-      };
+      if (mode === "general") {
+        if ("workdir" in payload.params || "cwd" in payload.params) {
+          throw new MainBoundaryError("invalid_project_path", "General initialization does not accept a Project path");
+        }
+        requestParams = {
+          mode,
+          catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
+        };
+      } else {
+        const field = "workdir" in payload.params
+          ? "workdir"
+          : "cwd" in payload.params
+            ? "cwd"
+            : undefined;
+        if (field === undefined || ("workdir" in payload.params && "cwd" in payload.params)) {
+          throw new MainBoundaryError(
+            "invalid_project_path",
+            "Runtime initialization requires a registered Project",
+          );
+        }
+        const projectPath = registeredProjectPath(payload.params[field], registeredProjects);
+        requestParams = {
+          ...payload.params,
+          [field]: projectPath,
+          // Main's existing picker/preferences authority authorizes metadata-
+          // only catalog reads without opening one Application per Project.
+          catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
+        };
+      }
     } else if (payload.method === "project.open") {
+      assertRuntimeParams(payload.params, payload.method, ["path"], ["catalog_project_keys"]);
       const projectPath = registeredProjectPath(payload.params.path, registeredProjects);
       // Opening is a consumer of Main authority.  It never creates trust;
       // new projects must first pass through the Main folder picker.
       requestParams = {
         ...payload.params,
         path: projectPath,
-        catalog_project_keys: Array.from(registeredProjects),
+        catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
+      };
+    } else if (payload.method === "general.open") {
+      assertRuntimeParams(payload.params, payload.method, []);
+      requestParams = {
+        catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
       };
     } else if (payload.method === "project.sessions") {
-      const projectPath = registeredProjectPath(payload.params.project_key, registeredProjects);
-      requestParams = { ...payload.params, project_key: projectPath };
+      assertRuntimeParams(payload.params, payload.method, ["project_key"], ["archived"]);
+      if ("archived" in payload.params && typeof payload.params.archived !== "boolean") {
+        throw new MainBoundaryError("invalid_runtime_request", "archived must be a boolean");
+      }
+      const projectKey = registeredSessionOwner(payload.params.project_key, registeredProjects);
+      requestParams = { ...payload.params, project_key: projectKey };
+    } else if (payload.method === "session.search") {
+      assertRuntimeParams(payload.params, payload.method, ["query"], ["max_results", "catalog_project_keys"]);
+      if (typeof payload.params.query !== "string" || payload.params.query.length > 512) {
+        throw new MainBoundaryError("invalid_runtime_request", "Session search query is invalid");
+      }
+      if ("max_results" in payload.params && (!Number.isInteger(payload.params.max_results) || (payload.params.max_results as number) < 1 || (payload.params.max_results as number) > 100)) {
+        throw new MainBoundaryError("invalid_runtime_request", "Session search limit is invalid");
+      }
+      requestParams = {
+        ...payload.params,
+        catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
+      };
+    } else if (payload.method === "session.search.cancel") {
+      assertRuntimeParams(payload.params, payload.method, ["operation_id"]);
+      if (typeof payload.params.operation_id !== "string" || !payload.params.operation_id) {
+        throw new MainBoundaryError("invalid_runtime_request", "Session search operation is invalid");
+      }
+    } else if (payload.method === "session.archive") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id", "project_key", "archived"]);
+      if (typeof payload.params.session_id !== "string" || !payload.params.session_id || typeof payload.params.archived !== "boolean") {
+        throw new MainBoundaryError("invalid_runtime_request", "Session archive request is invalid");
+      }
+      requestParams = {
+        ...payload.params,
+        project_key: registeredSessionOwner(payload.params.project_key, registeredProjects),
+      };
+    } else if (payload.method === "session.resume") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id"], ["project_key"]);
+      if (typeof payload.params.session_id !== "string" || !payload.params.session_id) {
+        throw new MainBoundaryError("invalid_runtime_request", "Session identity is invalid");
+      }
+      if ("project_key" in payload.params) {
+        requestParams = {
+          ...payload.params,
+          project_key: registeredSessionOwner(payload.params.project_key, registeredProjects),
+        };
+      }
+    } else if (payload.method === "history.page") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id"], ["cursor", "page_size", "project_key"]);
+      if (typeof payload.params.session_id !== "string" || !payload.params.session_id) {
+        throw new MainBoundaryError("invalid_runtime_request", "Session identity is invalid");
+      }
+      if ("project_key" in payload.params) {
+        requestParams = {
+          ...payload.params,
+          project_key: registeredSessionOwner(payload.params.project_key, registeredProjects),
+        };
+      }
+    } else if (payload.method === "tool_result.read") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id", "project_key", "ref"], ["offset", "limit"]);
+      if (
+        typeof payload.params.session_id !== "string" || !payload.params.session_id ||
+        typeof payload.params.ref !== "string" || !payload.params.ref ||
+        ("offset" in payload.params && (!Number.isSafeInteger(payload.params.offset) || (payload.params.offset as number) < 0)) ||
+        ("limit" in payload.params && (!Number.isSafeInteger(payload.params.limit) || (payload.params.limit as number) < 1 || (payload.params.limit as number) > 64 * 1024))
+      ) {
+        throw new MainBoundaryError("invalid_runtime_request", "Tool Result read request is invalid");
+      }
+      requestParams = {
+        ...payload.params,
+        project_key: registeredSessionOwner(payload.params.project_key, registeredProjects),
+      };
+    } else if (payload.method === "workspace.diff.cancel") {
+      assertRuntimeParams(payload.params, payload.method, ["operation_id"]);
+      if (typeof payload.params.operation_id !== "string" || !payload.params.operation_id) {
+        throw new MainBoundaryError("invalid_runtime_request", "Workspace diff operation is invalid");
+      }
+      requestParams = { operation_id: payload.params.operation_id };
+    } else if (payload.method === "workspace.diff") {
+      assertRuntimeParams(payload.params, payload.method, ["project_key"], ["path"]);
+      const projectKey = registeredSessionOwner(payload.params.project_key, registeredProjects);
+      if (projectKey === GENERAL_SESSION_OWNER_KEY) {
+        throw new MainBoundaryError("invalid_runtime_request", "workspace diff requires a registered Coding Project");
+      }
+      if (
+        "path" in payload.params &&
+        (typeof payload.params.path !== "string" || !payload.params.path.trim() || payload.params.path.length > 2048 || /[\u0000\r\n]/u.test(payload.params.path))
+      ) {
+        throw new MainBoundaryError("invalid_runtime_request", "Workspace diff path is invalid");
+      }
+      requestParams = {
+        ...payload.params,
+        project_key: projectKey,
+        catalog_project_keys: [...registeredProjects, GENERAL_SESSION_OWNER_KEY],
+      };
     } else if (payload.method.startsWith("artifact.")) {
       try {
         const rawPath = payload.params.path;

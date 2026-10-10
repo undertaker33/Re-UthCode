@@ -1115,6 +1115,7 @@ def load_config_data(
     cwd: str | os.PathLike[str] | Path | None = None,
     home: str | os.PathLike[str] | Path | None = None,
     model: str | None = None,
+    include_project_configs: bool = True,
 ) -> LoadedConfigData:
     """Load immutable raw configuration data without constructing Application objects."""
 
@@ -1131,7 +1132,13 @@ def load_config_data(
             ) from None
         raise ConfigurationInitializationRequired(created)
 
-    paths = discover_config_paths(cwd_path, user_config)
+    if not isinstance(include_project_configs, bool):
+        raise TypeError("include_project_configs must be a boolean")
+    paths = (
+        discover_config_paths(cwd_path, user_config)
+        if include_project_configs
+        else [("user", user_config)]
+    )
     if not paths or paths[0][0] != "user":
         raise ConfigurationError("user configuration was not discovered", path=user_config)
 
