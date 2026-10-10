@@ -13,9 +13,11 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` `core/agent.py` 实现显式、集中、顺序可读的 ReAct Agent Loop；没有图节点、边、Reducer 或 Runtime DSL。
 - `[FACT]` Core 只消费 UthCode 自有 Provider、Message、Tool、Event、Permission 数据；第三方 SDK 类型止于 `integrations/providers/`。
 - `[FACT]` Anthropic Integration 的可选 `models.retrieve` 探测遇 HTTP 404 返回未知限额，由 Application 沿用配置或默认预算；其他 SDK 状态错误和超时继续上抛，不切换 Provider 或模型。该规则不影响正式 Messages 生成或 token count 请求。Anthropic thinking 签名保留字段存在性：显式空字符串可接收并原样回放，完全缺失或非字符串仍拒绝；不伪造签名，不把 reasoning 当成正式正文。
+- `[FACT]` Responses Integration 接收官方 `response.reasoning_text.delta/done`，按 reasoning item 与 content index 累计并校验完整文本；完成 item 或 terminal 省略 content 时仅补齐已收到的内容，冲突仍拒绝。原 summary 路径与 native item identity 保留，内容和摘要继续作为 typed reasoning，在同 Provider 的后续工具轮次请求中回放；未知事件不会被静默忽略。
 - `[FACT]` 正式 Application 的基础 Integration 工具为 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`、`ReadDocument`、`ViewImage`、`Process`、`ApplyPatch`、`GitWorkspace`、`WebFetch`；启用可信用户级搜索配置时再加入 `WebSearch`。这些工具都通过同一 Tool Registry 进入 Agent Loop，`ApplyPatch` 在 PLAN 隐藏，其余只读定义按 planning access 过滤。
 - `[FACT]` `ReadDocument` 对 PDF、DOCX、XLSX、PPTX 返回带页/段落/sheet/range/slide 定位的有界结构；`ViewImage` 通过 Session-owned attachment ref 返回图片或 PDF 页图。调用者只能选择 `path` 或 `asset_ref` 之一；附件 `asset_ref` 必须使用当前 Session 提供的完整原文，保持 `attachment:` 前缀和 Session/ref 归属。`ReadFile` 只读 UTF-8 文本。外部路径仍按 OUTSIDE 进入权限判断，但不会激活项目目录指令；显式指令加载仍受 project trusted root 限制。公式文本与缓存值分开保留，不执行 XLSX 重算；解析损坏、加密、超限和取消返回受控 Tool error。PDFium 文本解析和 PDF 页渲染在短生命周期私有宿主执行，取消会终止宿主；开发入口直接使用 `uthcode.integrations.pdf_worker`，frozen 入口使用 `--uthcode-pdf-worker`。
-- `[FACT]` `Bash` 是唯一进程启动入口；`yield_time_ms` 只限制当前 ToolCall 等待，显式 `timeout_seconds` 才限制进程总寿命，默认无总寿命。`Process` 按 Session 读取有界输出、写 stdin/EOF、停止和 PTY resize，进程完成后可继续由 Application 事件路由观察。
+- `[FACT]` `Bash` 是唯一进程启动入口；`yield_time_ms` 只限制当前 ToolCall 等待，显式 `timeout_seconds` 才限制进程总寿命，默认无总寿命。`Process` 按 Session 读取有界输出、写 stdin/EOF、停止和 PTY resize，进程完成后可继续由 Application 事件路由观察。`Bash`/`Process read` 的模型可见正文先给出 `process_id`、`state`、`next_cursor` 和已知的 `exit_code`；同一事实继续保留在 UI metadata 中，不依赖 Provider 额外序列化 metadata。
+- `[FACT]` PTY 普通完成依赖根退出、真实输出 EOF 和读取收尾；停止未确认时返回 `unknown`，不以外围 asyncio task 取消替代底层读取结束。Windows 使用 PyWinPTY 的低层 WinPTY 后端，保留依赖的启动参数构造，直接非阻塞读取，不创建高层 Python 线程/socket 或过滤正文。与 pipe 的启动归属、终止及读取资源边界见 [Bash 中止收口](../../core-design/A01-AgentRuntime/06-Bash中止收口.md#session-pty-的收尾边界)。
 - `[FACT]` `AskUserQuestion` 是 Core 特殊工具协议：随 Turn 暴露给 Provider，但不进入普通 `ToolRegistry` 执行路径。
 - `[FACT]` Agent Loop 直接执行固定控制检查：trusted preflight 后、Permission 前拒绝 PLAN 的非 `READ` Tool；usage accounting 后、assistant final 提交前阻断 DEFAULT 模式的 unfinished Task。普通 PLAN final 正常完成。
 - `[FACT]` `ProposePlan` 是仅在 PLAN 可见的 Core 控制 Tool；必须独占 Provider ToolCall batch，合法调用创建/替换 `PlanState` 并进入 typed Plan Review，混合 batch 整批受控拒绝。
@@ -97,9 +99,11 @@ AgentRun.start_turn(user_input)
 
 ## Provider 与 Tool 当前矩阵
 
-`EditFile` 继续在文本模式的归一化视图中唯一匹配旧文本，写回以两个匹配边界定位原始区间并保留区间之外的换行字节。实现不为每个字符建立偏移数组；替换换行样式按匹配区间、原文件、平台的顺序选择。`ProcessSessionManager` 在 POSIX PTY 输入边界编码 UTF-8 字节，Windows PTY 保持文本接口，pipe 的输入编码语义不变。
+`EditFile` 继续在文本模式的归一化视图中唯一匹配旧文本，写回以两个匹配边界定位原始区间并保留区间之外的换行字节。实现不为每个字符建立偏移数组；替换换行样式按匹配区间、原文件、平台的顺序选择。`ProcessSessionManager` 在 POSIX PTY 输入边界编码 UTF-8 字节，Windows PTY 保持文本接口，pipe 的输入编码语义不变。输入原样发送，不自动补回车或重放；Windows CMD 需要实际 CR（U+000D）或 CRLF 提交交互行，write 成功只证明接口接受了输入，程序消费仍以其输出确认。
 
 `WebSearch.domains` 接受正式 `ToolCallPart.arguments` 归一化后的 JSON 数组只读序列，继续限制最多 20 个字符串；字符串本身不作为数组接受。进入 Tavily HTTP 边界前投影为普通列表，固定端点、basic 深度、权限与用户级秘密边界不变。
+
+`WebFetch` 对公开正文中的登录链接或登录教程不再按关键词拒绝；HTML 中存在密码表单时，先剔除表单并用既有正文提取器检查剩余可读内容。纯登录表单、明确的登录密码提示以及没有可读正文的动态页仍返回受控错误；逐跳权限、公开地址校验、字节预算和取消边界不变。
 
 PDF 私有 worker 的 stdout 协议显式写入 UTF-8 字节，与父进程的 UTF-8 解码一致，避免 Windows 子进程继承本地文本编码后因 PDF 中的非 ASCII 内容异常退出。协议字段、取消与输出上限保持既有语义。
 

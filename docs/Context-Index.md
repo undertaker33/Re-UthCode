@@ -52,7 +52,8 @@ path_migration:
 ## current-status
 
 ```text
-status_snapshot: 2026-09-14
+status_snapshot: 2026-10-10
+status_note: T11验收增量更新；其他工作包保留各行原证据日期
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -87,6 +88,7 @@ status_values:
 | Task | 任务包 | 当前路径 | 当前证据 |
 | --- | --- | --- | --- |
 | F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | 截至 PR #105（`1218e31`），W01～W07 Feedback 齐全，冻结 Checklist 全部勾选，仍未归档。第 10 轮记录最终 Python `1520 passed, 3 skipped`、Desktop `216 passed`、typecheck 及中英文 packaged commands 通过；第 11 轮侧栏修复后记录 Renderer 定向 `101 passed`、typecheck、标准 package/make 与隔离英文 sessions 通过，安装器已生成但未执行安装流程。本次文档同步未重跑上述产品验证；真实 Provider、完整视觉矩阵和用户最终复验仍未完成，详见 W07 Feedback。 |
+| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-10-10：冻结Checklist 61项完成、0项待验，目录保留未归档。原四项附件/消息身份/工具引用/外部路径修复及后续惰性Session、项目目录/全量Recent、搜索密钥保存、Responses推理事件、Windows PTY收尾/正文句柄和ANSI安全显示经原worker实施、Sol独立复审通过。最终Desktop278 passed/typecheck与串行package/make、bundled Runtime smoke通过，用户确认物理安装版本并完成原生验收；三协议实际SDK用户图/工具图、安装四格式/PDF页图、Windows/Linux PTY、Tavily真实取证、正式Headless官方评分及Desktop联合链均有完整证据。模型参数误用、百炼Responses失败、脚本误判与SWE未解决/空预测按原结果保留，不推导模型排名或所有端点支持。精确命令、版本、原始失败、复用范围及本机报告见原[W01](work/T11-Agent能力补齐/feedback/W01-内容与结果公共合同-feedback.md)、[W03](work/T11-Agent能力补齐/feedback/W03-文档视觉与进程会话-feedback.md)、[W04](work/T11-Agent能力补齐/feedback/W04-联网取证与代码操作-feedback.md)、[W06](work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)末尾。 |
 
 F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷 Session 准备与首屏显示解耦；目录按需读取首条用户消息预览，手动标题优先。手动压缩按 Session 后台执行、支持取消并保留有效 epoch；完成提示按提交时 Transcript 位置从 Timeline 恢复，分页游标保留 Transcript/Timeline 字节边界。Desktop 支持项目整行折叠、悬停信息、Runtime 布局图标、完成后输入焦点恢复与尾部已读清除，侧栏保持纵向滚动并抑制横向溢出。
 
@@ -96,7 +98,6 @@ F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷
 | --- | --- | --- | --- |
 | T10 | Desktop GUI 与 TUI 全量能力迁移 | `docs/work/T10-DesktopGUI与TUI全量能力迁移/` | W01～W06 Feedback 齐全，自动回归、Runtime/PyInstaller smoke、package/make、Installer 自动测试和 packaged Electron 中英文 CDP 视觉验收已有证据；冻结 Checklist 共 86 项，仍有 20 项未完成，覆盖 Project/Session、Composer/Slash、AskUser/Plan、Settings/主题、真实 Desktop/Installer/Feature Parity 与最终状态收口，其中部分旧验收语义已被 F02 新需求取代但不得回写冻结文件，保持 `not_implemented` |
 | F02 | Desktop GUI 交互与上下文缺陷修复 | `docs/work/F02-DesktopGUI交互与上下文缺陷修复/` | W01～W05 已实施；W06 的既有 `w06-rework-*` 16 份 packaged/CDP 报告记录完整交互矩阵历史证据，P3 收紧 ResizeObserver stderr allowlist 后另有定向报告；在合入 W03/W05 返工后又从当前源码重建 SHA-256 `6cf2fd8e9e79074554aeb072de713f8edf7696679a5b656f12ae25a0c7c32849` 的 packaged app，并以 `commands` flow 分别通过 en/zh-CN canonical Slash、typed `/compact` 与 typed `/status` 当前包集成验收，报告均无 console/renderer exception/unexplained stderr。完整 16 场未使用当前包重跑，W06 Checklist 仍保留人工、真实 Provider、干净 Windows 与视觉/可访问性未验证项，因此仍为 `not_implemented` |
-| T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 截至2026-10-08，原四项附件/消息身份/工具说明/外部路径修复已完成（PR #121/#122）；真实单题Qwen与DeepSeek官方评分已记录（PR #123/#124），不推导整体模型排名。本轮原Luna实施、Sol独立复审通过文本编辑行尾、POSIX PTY字节、正式搜索数组与Windows PDF UTF-8协议修复；真实Tavily→公开静态页/PDF→正式本地正文读取闭环，Windows+Linux PTY和T14真实纠偏后用户输入回归通过，前序补勾6个有证据行，本次原生产物补验再勾A24/T16。原生续验发现的失败通知重复与冷恢复Bash运行时关闭已由原Luna修复、Sol独立复审通过；最终Desktop 267通过，标准package/make串行重建成功。新包冷恢复后真实模型完成失败测试与修复重跑，原生成报告/图片、可执行仅定位、缺失局部报错及恶意URI拒绝补验通过。联合端到端尚余临时日志现场折叠验证，单次小测试当前待人工审批；新两实例四次模型校准与官方评分完成，结果2 resolved/1 unresolved/1 empty，不推导排名。Checklist尚余8个未勾选行：A02/A10/A15各两处引用、A28与T19完成边界各一处，重复引用和共享证据不计为独立缺陷，覆盖Responses视觉、安装产物文档/PTY、联合Desktop日志折叠/端到端。当前事实与精确命令见原W01/W03/W04/W05/W06追加，整包保持 `not_implemented`、未归档。 |
 
 2026-09-13 全量目录复核：归档区 17 个包，与上表一致；活跃 F03 为 66 项完成、0 项待验收、7 份 Feedback，状态保持；T10 为 66/20、6 份 Feedback，F02 为 71/13、6 份 Feedback，均仍未满足整包完成条件。T11 W05 的 Checklist 勾选与 Feedback 只记录当前真实 Windows/现有 conda 环境证据；用户尚未配置 Tavily，因此 A18 保持未勾选；人工产物操作、WSL/POSIX 条件、安装产物 T19 和真实 Provider/Tavily 不用替代条件冒充通过。
 

@@ -144,3 +144,57 @@ Web fixture 增补取消后 AsyncClient 已关闭的观察和空 root + script �
 PDF worker 修复与独立复审后，仅恢复同 Session `e4541d63d1b244d3aef2704a22514af8`，不重搜、不重新下载：`C:/Users/93445/miniconda3/envs/re-uthcode/python.exe D:/uthcode-audits/t11-closeout-20261007/web-tools/run_tavily_session_readback.py --run-authorized`，exit 0 / passed，1.245s，网络请求与外部模型请求均 0。正式 ToolResultRead 读取静态正文 offset 0→4096 / total 31113，含 HTTP 200 来源与 Reflow 标题；正式 ReadDocument 使用已下载的完整附件引用，第一页 1947 字符、SourcePart.page=1，两条 ToolFinished 均 finished/is_error=false。没有旁路读取保存的正文文件冒充工具结果。
 
 真实网络及本地续读报告分别在 `D:/uthcode-audits/t11-closeout-20261007/web-tools/application-run-20261007-followup/application-audit.json` 与 `application-run-20261007-local-readback/local-readback.json`，初始 invalid_input、IANA network_error 与 PDF 编码失败记录保留。结合当前 8 项 Web 测试中的重定向、超限、登录/动态空页限制与取消关闭客户端覆盖，A18 的两处引用可以补勾。该结论是正式工具真实搜索/抓取/正文链，不代表任意模型都能自主正确选用搜索工具，也不表示 T11 整包完成。
+
+
+## 2026-10-08 用户 WebSearch 不可用报告与配置保存缺陷复现
+
+用户指定Session `587b7152e4744e8ba6836af40889fccc`，要求gpt-6.1-sol / medium子代理排查“问了半天Tavily额度没有减少”。独立Sol只读排查完成：88个正式Transcript记录（13 user、41 assistant、17 tool_call/17对应tool_result），WebSearch=0、WebFetch=8、Bash=6、ToolResultRead=3；native响应均为openai/chat_completions/qwen3.7-flash。8次WebFetch含3次HTTP200成功、2次正文byte limit、1次JSON非支持文本、2次登录或动态页unsupported；6次Bash都是curl/wttr天气路径。此Session没有Tavily HTTP、鉴权、Permission拒绝或额度扣减结果，不能把Fetch限制归作Tavily搜索错误。
+
+安全配置核对只输出字段存在性：当前用户search enabled=true、api_key字段缺失，正式load_effective_config的api_key_configured=false；该项目没有额外配置。用户配置mtime为2026-10-08 05:07:51 UTC，早于此Session创建10:10:54 UTC；正式factory只有enabled且配置Key时才注册WebSearch。native记录不保留当时SDK request.tools，未恢复当时实际请求工具列表；配置时间、当前正式加载/注册与WebSearch零调用支持“搜索凭据缺失导致工具未提供”，不单凭额度未下降归因模型能力。
+
+发现并用正式writer/factory离线精确复现产品缺陷：Renderer settingsSaveRequest在搜索Key未编辑时省略api_key；writer._apply_search却删除请求遗漏字段，包括原有api_key。外部合成fixture通过write_user_config普通保存后Key由存在变为缺失、enabled仍true；factory有Key时注册WebSearch，丢Key后不注册。复现证据 `D:/uthcode-audits/t11-closeout-20261007/search-diagnosis/offline-20261008T103626139735Z/diagnosis.json`，只含布尔与安全配置摘要；指定Session逐次工具脱敏投影为同目录上级 `session-projection-20261008T103751729746Z.json`。两项离线脚本由既有re-uthcode解释器执行exit0，没有修改用户真实配置或仓库，没有网络/模型请求；未执行pytest，不计作修复后测试通过。此复现证明保存缺陷存在，但未保存用户当时设置操作日志，不能断言凭据恰由某次已知操作删除。
+
+原Luna worker已接收确定finding实施最小补修：未提供搜索api_key保留原literal/env引用，显式清空继续删除；不修改Agent Loop强制联网、不放宽凭据安全或请求限量，补正式保存/加载/注册回归并交原Sol独立复审。真实丢失Key不能从上述安全视图恢复，待修复新包完成后请用户仅在设置重新输入，不在聊天传Key。本记录时源码修复与新包真实搜索续验尚未完成。另有公开正文带“Sign in”导航被登录页启发式误拒的离线候选，实际下载body未持久化，不能断言上述两个Fetch错误一定由它造成；其方案另行评估。
+
+昨日A18正式工具真实Tavily/静态页/PDF证据保留，未通过普通设置保存测试，不用该正例否定今日配置丢失报告；也不将本次零HTTP的诊断写成搜索通过。整包仍not_implemented，冻结Checklist文字不改、不归档。
+
+
+### 2026-10-08 搜索密钥省略保存补修：源码、定向与独立复审通过
+
+原Desktop Luna / max实施、原Sol / medium独立复审PASS，三文件限 `integrations/config/writer.py`、`tests/test_w04_review_fixes.py`、`desktop/tests/renderer.test.tsx`。api_key请求省略时保留原TOML literal/env来源，显式null/空白才删除；其他Search字段原完整表删改语义不变。禁用保留凭据但factory不注册WebSearch，真实用户配置未读写，未发联网/模型请求。
+
+新增正式write_user_configuration→load_effective_config→Application factory参数化回归先在旧代码literal/env两种均失败，补修后2 passed / 3.88s；覆盖未编辑保存继续注册、禁用保留但不注册、显式空清除且不注册，Application全部关闭。实际Renderer生产者契约 `T07 configuration request keeps API key transient and maps current schema fields`：1 passed / 1.956ms，确认未编辑不回传保存的secret/api_key_configured，清空发送空串。
+
+worker实际执行 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_configuration.py::test_user_configuration_write_preserves_or_replaces_keys_without_exposing_them tests/test_configuration.py::test_user_configuration_write_retains_env_key_without_resolving_it tests/test_w04_review_fixes.py::test_settings_save_preserves_untouched_search_key_and_factory_registration tests/test_architecture_boundaries.py -q`：28 passed in 8.18s，exit0；未与导航Backend编辑混跑。Sol只读scoped diffcheck exit0，source/test复审无finding。用户手册、GUI事实与Tools说明同步省略/清空/注册条件，三文档UTF-8 guard PASS。
+
+本段只记录源码与离线定向通过，不冒充最终新包或真实搜索通过；原worker正在继续用户反馈的目录展开/全量Recent排序修复，完成后统一更大验证与标准串行构建。当前用户搜索Key仍缺失，需要修复新包完成后在设置自行补填，再真实续验；没有修改当前失效配置，也没有刷Tavily请求。
+
+
+### 2026-10-08 WebFetch 登录内容误判补修：定向与独立复审通过
+
+用户会话 `587b7152e4744e8ba6836af40889fccc` 的两次 HTTP 200 抓取被归类为登录或动态页，但原响应正文未保存，不能将这两次失败逐一断定为本缺陷。Sol / medium 用离线 MockTransport 经过正式工具准备和执行复现：仅加入 Sign in 导航链接或公开登录教程就可能使可读正文被拒。未联网、未修改用户配置，也未消耗 Tavily 额度。
+
+原 Luna / max worker 只修改 `src/uthcode/integrations/tools/web_tools.py` 与 `tests/test_web_tools.py`。初版复审仍发现页眉密码表单挡住公开文章、短教程被长度/标点条件误拒，交原 worker 修复；下一版仍把教程中的 Enter your password 指令误判成登录门槛，继续退回修复。最终移除长度/标点启发式，对明确登录密码提示做整段匹配；剔除密码表单后用既有提取器检查剩余正文，保留纯表单、纯 Sign in password 和明确密码门槛拒绝。公开短文、列表、页眉登录表单旁正文以及登录教程均有回归。权限、SSRF、重定向、字节上限和取消未改变。
+
+worker 执行 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_web_tools.py -q`：16 passed in 1.69s，exit 0；scoped diff check 通过，原 Sol / medium 最终独立复审 PASS，全部已提 finding 关闭。Tools 与 Runtime 当前事实同步。本段为最终源码离线证据，不代表最终新包或真实网络验收通过；新包构建、用户补填搜索凭据后的真实 WebSearch 与 WebFetch 续验仍待完成。
+
+
+### 2026-10-08 总控冻结后端组合回归
+
+搜索凭据省略保存、WebFetch 登录误判及 Responses 事件补修已冻结并独立复审通过后，总控执行 `C:/Users/93445/miniconda3/envs/re-uthcode/python.exe -m pytest tests/test_configuration.py tests/test_w04_review_fixes.py tests/test_web_tools.py tests/test_openai_responses_integration.py tests/test_openai_compat_integration.py tests/test_anthropic_integration.py -q`：148 passed, 3 skipped in 7.58s，exit 0。3 个 skip 为三协议测试文件既有 live gate，测试本身明确不执行 W01 联网验收，不是三协议真实入模通过。本轮未发模型或 Tavily 网络请求、未读写用户真实配置。
+
+该命令未包括仍在修复的导航 Application/Bridge 测试，不复用旧导航测试为新版本背书；完整 Desktop 与标准串行 package/make 待导航复审收口后执行。Responses 工具图、安装产物原生 PTY 以及最终新包真实搜索的待验边界保持不变。
+
+
+### 2026-10-09 最终安装包：用户导航反馈与真实模型搜索闭环通过
+
+用户关闭初次启动的PowerShell后报告UthCode窗口同时退出；复用同一EvidencePath被外部脚本的防覆盖保护拒绝，这是启动证据保护，不是产品新故障证据。保留原记录，用户用新r2路径重启并保持PowerShell窗口；r2证据2026-10-09 01:20:01.723 UTC，Desktop PID4628，总控readonly CIM确认Runtime14740为直接子进程、二者使用native安装目录。启动证据记录剥离Conda/四个系统PATH和所需Runtime资源存在；本轮未重新读取运行时PEB，不能把launcher环境构造描述成新的PEB实测。
+
+用户按总控新包续验步骤反馈“都正常了”，并指定Session `9049814c91a946f991d2e38bf50f99fe`；项目展开无需新会话及Recent超过6条按该用户反馈记录，未由总控再次操作GUI。该步骤包括确认搜索配置及普通设置保存，未读取或输出用户密钥。总控仅读指定Session生成有界证据 `D:/uthcode-audits/t11-closeout-20261007/installed/final-navigation-search-session-20261009T012413130933Z.json`；原Sol独立核对指定正式记录与证据PASS：12 entries（user1、assistant5、tool_call3、tool_result3），无turn_failure。
+
+- WebSearch sequence3→4：1次正式调用、唯一成功结果、5个Python官方文档URL；Tavily响应usage.credits=1。这是实际响应用量，未查Tavily仪表盘，不把它写成仪表盘扣费观察。
+- WebFetch sequence6→7：读取 `https://docs.python.org/3/library/pathlib.html`，实际HTTP200/text-html，成功完整输出存储；没有Bash/curl替代。
+- ToolResultRead sequence9→10：ref与Fetch外部输出ref精确一致，eof=true、total_bytes=61219、完整Fetch JSON60816字符，三次调用均success且按tool_call_id一对一配对。
+- 持久native metadata为openai/chat_completions/qwen3.7-flash，最终assistant text2215字符已存储；本轮未捕获SDK请求正文、未单独查询Run终态，不把最终文本存储当作terminal状态poll。
+
+本轮最终安装包真实模型WebSearch→Fetch→完整正文读取闭环已通过，弥补此前用户会话WebSearch零调用/Key缺失的界面验证空缺；不宣称所有网页或所有模型永不误调用。此前A18的真实静态页/PDF及失败fixture有效证据继续复用，本轮不新增或改写冻结验收文字。原生PTY交互/停止/关闭及Responses工具图仍待完成，Checklist5行保持未勾，整包not_implemented、未归档，尚未提交。

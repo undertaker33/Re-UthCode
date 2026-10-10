@@ -25,6 +25,10 @@
 
 启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 
+注册 `WebSearch` 需要用户级搜索启用且已配置 API key；仅勾选启用而缺少 key 时，模型不会收到此工具。普通设置保存保留未编辑的搜索凭据，显式清空才删除；`WebFetch` 仍独立可用，其抓取网页不消耗 Tavily 搜索额度。
+
+`WebFetch` 对公开正文中的登录链接或登录教程不再按关键词拒绝；HTML 中存在密码表单时，先剔除表单并用既有正文提取器检查剩余可读内容。纯登录表单、明确的登录密码提示以及没有可读正文的动态页仍返回受控错误；逐跳权限、公开地址校验、字节预算和取消边界不变。
+
 ### `EditFile`
 
 `EditFile` 要求先读取文件并确认读取后的版本没有变化，`old_string` 必须非空且唯一匹配。匹配沿用文本读取的换行归一化视图；写回只替换命中的原始文本区间，未命中的 LF、CRLF 或 CR 换行保持原样。替换文本的换行采用命中区间的首个换行样式，没有时使用原文件的首个样式。文件没有换行时使用当前平台样式，避免 Windows 局部编辑使整份文件产生行尾差异。
@@ -54,9 +58,11 @@
 
 ### `Bash` 与 `Process`
 
-`Bash` 是唯一的进程启动入口。`yield_time_ms` 只控制本次 ToolCall 等待多久；`timeout_seconds` 是可选的进程总寿命上限，默认没有总寿命。短等待可返回仍在运行的 `process_id`，之后用 `Process` 的 `list`/`read` 获取有界增量和退出码。pipe 模式继续区分 stdout/stderr，PTY 模式提供单一 terminal 流及原生 stdin、EOF 和 resize。
+`Bash` 是唯一的进程启动入口。`yield_time_ms` 只控制本次 ToolCall 等待多久；`timeout_seconds` 是可选的进程总寿命上限，默认没有总寿命。短等待可返回仍在运行的进程。`Bash` 和 `Process read` 的结果正文以有界状态摘要开头，包含真实 `process_id`、`state`、`next_cursor`，退出码已知时附带 `exit_code`；模型按这个句柄继续操作，并把返回的游标用于下一次增量读取，不依赖仅供界面使用的 metadata。之后用 `Process` 的 `list`/`read` 获取有界增量和退出码。pipe 模式继续区分 stdout/stderr，PTY 模式提供单一 terminal 流及原生 stdin、EOF 和 resize。
 
-`Process write` 接受文字输入，在 POSIX PTY 适配边界编码为 UTF-8 字节，Windows PTY 使用原生文本接口；EOF 也按对应平台的底层接口送出。输入只发送本次提供的内容，不在等待、续读或恢复时自动重放。
+`Process write` 接受文字输入，在 POSIX PTY 适配边界编码为 UTF-8 字节，Windows PTY 使用原生文本接口；EOF 也按对应平台的底层接口送出。输入只发送本次提供的内容，不自动补回车，也不在等待、续读或恢复时自动重放。Windows CMD 的交互输入需要实际的 CR（U+000D）或 CRLF 才提交一行；只有 LF 或字面量反斜线字符不能替代回车。工具接受了输入，不代表目标程序已经消费，应读取目标程序的输出确认。
+
+停止结果只报告已确认的事实；无法确认树终止或读取收尾时保留 `unknown`，不能把父进程退出或等待超时当成停止成功。pipe 与 Windows PTY 的具体收尾边界见 [Bash 中止收口](core-design/A01-AgentRuntime/06-Bash中止收口.md)。
 
 进程句柄绑定当前 Application/Session 和启动 Turn。成功 Turn 后服务进程继续存活，新的 Turn 可以续读或显式停止；取消、失败和异常只清理本 Turn 新建的进程，Session 关闭才清理全部进程。每个 Session 默认最多保留 32 个正常终态和 128 个过期事实，单进程 UTF-8 输出环默认 2 MiB；淘汰会保留 `expired`、最早游标和原因，避免短命令长期累积。`Process read` 使用单调游标，`wait_ms` 只能在 50—60000 毫秒内取值，默认 1000 毫秒；运行中无新输出时实际等待到新输出、终态或超时，不能用 `0` 绕过有界等待，取消会及时解除等待。输出环超出容量时报告最早游标和过期状态；输出事件仍由 Application 统一做跨 chunk Secret 脱敏后路由到 Desktop，不能把后台日志当作新的 Turn 或 History 内容。stdin 是独立的执行输入授权，不能因启动命令已获批而自动获得后续输入权限。
 
