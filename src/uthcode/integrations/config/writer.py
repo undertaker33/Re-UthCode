@@ -379,12 +379,24 @@ def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
 def _apply_search(document: Any, requested: Mapping[str, Any]) -> None:
     section = _replace_or_get_table(document, "search")
     for key in _SEARCH_FIELDS:
+        if key == "api_key":
+            # Settings forms never send the saved secret back.  Omission is
+            # therefore "unchanged" for the credential, while an explicit
+            # blank/null value is the user's request to remove it.
+            if key not in requested:
+                continue
+            value = requested[key]
+            if value is None or isinstance(value, str) and not value.strip():
+                if key in section:
+                    del section[key]
+            else:
+                _set_or_delete(section, key, value)
+            continue
         if key in requested:
             _set_or_delete(section, key, requested[key])
         elif key in section:
-            # A complete search update owns this small table.  Omitted key
-            # values return to their safe defaults instead of retaining a
-            # credential or endpoint accidentally.
+            # A complete search update owns non-secret fields in this small
+            # table; omitted values return to their safe defaults.
             del section[key]
 
 

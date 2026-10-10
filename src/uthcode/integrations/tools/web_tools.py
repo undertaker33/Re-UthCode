@@ -17,6 +17,7 @@ import socket
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -639,7 +640,7 @@ class FetchWebTool:
             text = _extract_local_text(body, content_type)
         except UnicodeDecodeError:
             return _failure("Error: fetched body is not supported text", ToolFailureKind.UNSUPPORTED, details={"source": source.to_dict()})
-        if _looks_like_login_page(text):
+        if _looks_like_login_page(text, body, content_type):
             return _failure("Error: login or dynamic page content is not supported", ToolFailureKind.UNSUPPORTED, details={"source": source.to_dict()})
         if not text.strip():
             return _failure("Error: fetched page has no readable text", ToolFailureKind.UNSUPPORTED, details={"source": source.to_dict()})
@@ -675,12 +676,76 @@ def _extract_local_text(body: bytes, content_type: str) -> str:
     return html.unescape(re.sub(r"\s+", " ", text)).strip()
 
 
-def _looks_like_login_page(text: str) -> bool:
-    sample = text.casefold()
-    return bool(
-        re.search(r"\b(password|sign in|log in|登录|登入)\b", sample)
-        and ("password" in sample or "sign in" in sample or "log in" in sample or "登录" in sample or "登入" in sample)
-    )
+def _looks_like_login_page(text: str, body: bytes, content_type: str) -> bool:
+    sample = re.sub(r"\s+", " ", text).strip().casefold()
+
+    def is_authentication_gate(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", value).strip().casefold()
+        login_action = r"\b(?:sign\s+in|log\s+in|login|log-in)\b|登录|登入"
+        credential = r"\b(?:password|passcode|username|email|credentials)\b|密码|口令|用户名|邮箱"
+        if re.fullmatch(
+            r"(?:please\s+)?(?:sign\s+in|log\s+in|login|log-in)[.!?;,:]+\s*"
+            r"(?:please\s+)?(?:enter|type|provide|input)\s+(?:your\s+)?"
+            r"(?:password|passcode|credentials)[.!?;,:]*",
+            normalized,
+        ):
+            return True
+        if not re.search(login_action, normalized):
+            return False
+        if not re.search(credential, normalized):
+            return False
+        return is_auth_labels_only(normalized)
+
+    def is_auth_labels_only(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", value).strip().casefold()
+        has_auth_label = re.search(
+            r"\b(?:sign\s+in|log\s+in|login|log-in|password|passcode|username|email|credentials)\b|登录|登入|密码|口令|用户名|邮箱",
+            normalized,
+        )
+        labels_only = re.sub(
+            r"\b(?:sign\s+in|log\s+in|login|log-in|password|passcode|username|email|credentials)\b|登录|登入|密码|口令|用户名|邮箱",
+            " ",
+            normalized,
+        )
+        return bool(has_auth_label) and not labels_only.strip(" \t\r\n.,;:!?…()[]{}-_")
+
+    if content_type in {"text/html", "application/xhtml+xml"} and b"<" in body:
+        try:
+            import trafilatura
+
+            document = trafilatura.load_html(body.decode("utf-8", errors="replace"))
+        except Exception:
+            document = None
+        if document is not None:
+            password_forms = document.xpath(
+                "//form[.//input[translate(normalize-space(@type), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='password']]"
+            )
+            if password_forms:
+                for form in password_forms:
+                    parent = form.getparent()
+                    if parent is not None:
+                        parent.remove(form)
+                serialized = document.getroottree()
+                buffer = BytesIO()
+                serialized.write(buffer, encoding="utf-8", method="html")
+                remaining_html = buffer.getvalue().decode("utf-8", errors="replace")
+                remaining_text = trafilatura.extract(
+                    remaining_html,
+                    include_comments=False,
+                    include_tables=True,
+                ) or ""
+                if (
+                    not remaining_text.strip()
+                    or is_authentication_gate(remaining_text)
+                    or is_auth_labels_only(remaining_text)
+                ):
+                    return True
+                # A password form in navigation or a page header does not
+                # make independently extractable public content inaccessible.
+                return False
+
+    return is_authentication_gate(sample)
 
 
 __all__ = [

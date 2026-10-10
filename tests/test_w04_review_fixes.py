@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ from uthcode.application import (
     SearchConfiguration,
     TextPart,
     create_application,
+    load_effective_config,
+    write_user_configuration,
 )
 from uthcode.core.agent_events import TurnPaused
 from uthcode.core.permission import PermissionAction
@@ -120,6 +123,127 @@ async def _wait_for_pause_clear(handle) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("Application did not consume the permission response")
+
+
+@pytest.mark.parametrize(
+    ("key_expression", "environment_value"),
+    [
+        ("synthetic-search-key-for-test", None),
+        ("env:UTHCODE_SYNTHETIC_SEARCH_KEY", "synthetic-search-key-for-test"),
+    ],
+    ids=("literal", "environment-reference"),
+)
+def test_settings_save_preserves_untouched_search_key_and_factory_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key_expression: str,
+    environment_value: str | None,
+) -> None:
+    home = tmp_path / "home"
+    user_config = home / ".uthcode" / "config.toml"
+    if environment_value is not None:
+        monkeypatch.setenv("UTHCODE_SYNTHETIC_SEARCH_KEY", environment_value)
+
+    write_user_configuration(
+        {
+            "default_model": "local/ref",
+            "providers": {"local": {"kind": "fake"}},
+            "models": {
+                "local/ref": {
+                    "provider_profile_id": "local",
+                    "remote_id": "fake-model",
+                }
+            },
+            "search": {
+                "enabled": True,
+                "provider": "tavily",
+                "api_key": key_expression,
+                "max_results": 5,
+                "max_fetch_bytes": 4096,
+                "timeout_seconds": 7.0,
+            },
+        },
+        home=home,
+    )
+
+    # This is the production settings form shape: it carries ordinary Search
+    # edits but deliberately omits the untouched secret field.
+    write_user_configuration(
+        {
+            "search": {
+                "enabled": True,
+                "provider": "tavily",
+                "max_results": 4,
+                "max_fetch_bytes": 8192,
+                "timeout_seconds": 8.0,
+            }
+        },
+        home=home,
+    )
+    stored_search = tomllib.loads(user_config.read_text(encoding="utf-8")).get("search", {})
+    assert stored_search.get("api_key") == key_expression
+    effective = load_effective_config(cwd=tmp_path, home=home)
+    assert effective.search is not None and effective.search.api_key is not None
+    application = create_application(
+        effective,
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    try:
+        assert "WebSearch" in {item.name for item in application.tool_definitions()}
+    finally:
+        application.close()
+
+    # Disabling Search is independent from retaining its credential reference.
+    write_user_configuration(
+        {
+            "search": {
+                "enabled": False,
+                "provider": "tavily",
+                "max_results": 4,
+                "max_fetch_bytes": 8192,
+                "timeout_seconds": 8.0,
+            }
+        },
+        home=home,
+    )
+    stored_search = tomllib.loads(user_config.read_text(encoding="utf-8")).get("search", {})
+    assert stored_search.get("api_key") == key_expression
+    disabled_application = create_application(
+        load_effective_config(cwd=tmp_path, home=home),
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "disabled-sessions",
+    )
+    try:
+        assert "WebSearch" not in {item.name for item in disabled_application.tool_definitions()}
+    finally:
+        disabled_application.close()
+
+    # An explicitly blank value is the user's request to clear the key.
+    write_user_configuration(
+        {
+            "search": {
+                "enabled": True,
+                "provider": "tavily",
+                "api_key": "",
+                "max_results": 4,
+                "max_fetch_bytes": 8192,
+                "timeout_seconds": 8.0,
+            }
+        },
+        home=home,
+    )
+    cleared_search = tomllib.loads(user_config.read_text(encoding="utf-8")).get("search", {})
+    assert "api_key" not in cleared_search
+    cleared_application = create_application(
+        load_effective_config(cwd=tmp_path, home=home),
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "cleared-sessions",
+    )
+    try:
+        assert "WebSearch" not in {item.name for item in cleared_application.tool_definitions()}
+    finally:
+        cleared_application.close()
 
 
 @pytest.mark.asyncio

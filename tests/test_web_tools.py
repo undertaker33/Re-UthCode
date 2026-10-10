@@ -192,13 +192,149 @@ async def test_fetch_cancellation_and_login_pages_are_controlled() -> None:
 
     login = FetchWebTool(
         transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, headers={"content-type": "text/html"}, text="Sign in password", request=request)
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="Sign in password",
+                request=request,
+            )
         )
     )
     result = await login.execute({"url": "https://example.com"}, cancellation=CancellationToken())  # type: ignore[arg-type]
     assert result.is_error is True
     assert result.failure is not None
     assert result.failure.kind == "unsupported"
+
+    explicit_prompt = FetchWebTool(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="Sign in. Enter your password.",
+                request=request,
+            )
+        )
+    )
+    prompt_result = await explicit_prompt.execute(
+        {"url": "https://example.com/login"},
+        cancellation=CancellationToken(),  # type: ignore[arg-type]
+    )
+    assert prompt_result.is_error is True
+    assert prompt_result.failure is not None
+    assert prompt_result.failure.kind == "unsupported"
+
+    password_form = FetchWebTool(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=(
+                    "<html><body><main><h1>Sign in</h1>"
+                    '<form action="/login"><label>Password'
+                    '<input type="password" name="password"></label>'
+                    '<button type="submit">Sign in</button></form>'
+                    "</main></body></html>"
+                ),
+                request=request,
+            )
+        )
+    )
+    form_result = await password_form.execute(
+        {"url": "https://example.com/login"},
+        cancellation=CancellationToken(),  # type: ignore[arg-type]
+    )
+    assert form_result.is_error is True
+    assert form_result.failure is not None
+    assert form_result.failure.kind == "unsupported"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page, expected_text",
+    [
+        (
+            "<html><body><nav><a href='/account'>Account</a></nav>"
+            "<p>Public news is freely available.</p></body></html>",
+            "Public news is freely available.",
+        ),
+        (
+            "<html><body><nav><a href='/login'>Sign in</a></nav>"
+            "<p>Public news is freely available.</p></body></html>",
+            "Public news is freely available.",
+        ),
+        (
+            "<html><body><a href='/account'>Account</a><h1>News</h1>"
+            "<ul><li>Public research update</li><li>New model released today</li></ul>"
+            "</body></html>",
+            "New model released today",
+        ),
+        (
+            "<html><body><a href='/login'>Sign in</a><h1>News</h1>"
+            "<ul><li>Public research update</li><li>New model released today</li></ul>"
+            "</body></html>",
+            "New model released today",
+        ),
+        (
+            "<html><body><header><form action='/login'>"
+            '<input type="password"><button>Sign in</button></form></header>'
+            "<article><h1>Public news</h1>"
+            "<p>A public research update is freely available to everyone.</p>"
+            "</article></body></html>",
+            "A public research update is freely available to everyone.",
+        ),
+        (
+            "<html><body><article><h1>Public sign in tutorial</h1>"
+            "<p>Use your username and password to sign in</p>"
+            "</article></body></html>",
+            "Use your username and password to sign in",
+        ),
+        (
+            "<html><body><article><h1>Public sign in tutorial</h1>"
+            "<p>Enter your password to sign in</p>"
+            "</article></body></html>",
+            "Enter your password to sign in",
+        ),
+        (
+            "<html><body><article><h1>Public sign in tutorial</h1>"
+            "<p>This public documentation explains how to sign in safely with a password. "
+            "Its text is freely readable and is not protected by authentication.</p>"
+            "</article></body></html>",
+            "not protected by authentication",
+        ),
+    ],
+    ids=[
+        "short-account-navigation",
+        "short-sign-in-navigation",
+        "listing-account-navigation",
+        "listing-sign-in-navigation",
+        "password-form-with-public-article",
+        "short-public-sign-in-tutorial",
+        "tutorial-with-credential-instruction",
+        "public-login-tutorial",
+    ],
+)
+async def test_fetch_keeps_public_content_with_login_related_text(
+    page: str,
+    expected_text: str,
+) -> None:
+    tool = FetchWebTool(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=page,
+                request=request,
+            )
+        )
+    )
+
+    result = await tool.execute(
+        {"url": "https://example.com/public"},
+        cancellation=CancellationToken(),  # type: ignore[arg-type]
+    )
+
+    assert result.is_error is False
+    assert expected_text in json.loads(str(result.content))["content"]
 
 
 @pytest.mark.asyncio
