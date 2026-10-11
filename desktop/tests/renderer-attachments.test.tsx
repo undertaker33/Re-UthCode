@@ -514,6 +514,10 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     const activity = container.querySelector<HTMLDetailsElement>("details.timeline-activity-group");
     assert.ok(activity);
     act(() => { activity.querySelector("summary")?.dispatchEvent(new _dom.window.MouseEvent("click", { bubbles: true })); });
+    const activityItems = [...activity.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-item")];
+    assert.equal(activityItems.length, 2);
+    assert.equal(activityItems.every((item) => !item.open), true, "tool input and output actions start behind their own disclosure");
+    activityItems.forEach((item) => { item.open = true; });
     const pathDiff = [...activity.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")]
       .find((button) => button.textContent?.includes("src/entry.ts"));
     assert.ok(pathDiff);

@@ -242,6 +242,11 @@ function tableCells(line: string): string[] {
   return line.trim().replace(/^\||\|$/gu, "").split("|").map((cell) => cell.trim());
 }
 
+function startsTableAt(lines: readonly string[], index: number): boolean {
+  const header = lines[index] ?? "";
+  return index + 1 < lines.length && header.includes("|") && isTableDivider(lines[index + 1] ?? "");
+}
+
 function fenceLanguage(info: string): string {
   const value = info.trim().split(/\s+/u)[0] ?? "";
   // The label is plain text rendered by React; normalize unusual whitespace
@@ -342,7 +347,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
       blockIndex += 1;
       continue;
     }
-    if (index + 1 < lines.length && line.includes("|") && isTableDivider(lines[index + 1] ?? "")) {
+    if (startsTableAt(lines, index)) {
       const header = tableCells(line);
       const rows: string[][] = [];
       index += 2;
@@ -350,7 +355,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         rows.push(tableCells(lines[index] ?? ""));
         index += 1;
       }
-      blocks.push(<table key={`table-${blockIndex}`}><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell, options)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "", options)}</td>)}</tr>)}</tbody></table>);
+      blocks.push(<div key={`table-${blockIndex}`} className="markdown-table-scroll"><table><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell, options)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "", options)}</td>)}</tr>)}</tbody></table></div>);
       blockIndex += 1;
       continue;
     }
@@ -385,7 +390,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
     index += 1;
     while (index < lines.length && (lines[index] ?? "").trim()) {
       const next = lines[index] ?? "";
-      if (/^\s*(#{1,6})\s+|^\s*(`{3,}|~{3,})|^\s*>|^\s*[-*+]\s+|^\s*\d+[.]\s+/u.test(next)) break;
+      if (/^\s*(#{1,6})\s+|^\s*(`{3,}|~{3,})|^\s*>|^\s*[-*+]\s+|^\s*\d+[.]\s+/u.test(next) || startsTableAt(lines, index)) break;
       paragraph.push(next);
       index += 1;
     }

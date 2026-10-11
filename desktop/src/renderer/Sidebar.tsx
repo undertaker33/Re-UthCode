@@ -69,6 +69,7 @@ interface MenuAction {
   id: string;
   label: string;
   icon?: UiIconName;
+  selected?: boolean;
   danger?: boolean;
   disabled?: boolean;
   disabledReason?: string;
@@ -82,12 +83,13 @@ interface FloatingMenuProps {
   anchorRef: RefObject<HTMLElement | null>;
   onClose: () => void;
   point?: { x: number; y: number };
+  alignStart?: boolean;
 }
 
 const MENU_WIDTH = 244;
 const MENU_MARGIN = 8;
 
-export function menuPosition(anchor: HTMLElement, actionCount: number, point?: { x: number; y: number }): CSSProperties {
+export function menuPosition(anchor: HTMLElement, actionCount: number, point?: { x: number; y: number }, alignStart = false): CSSProperties {
   const rect = anchor.getBoundingClientRect();
   const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth);
   const viewportHeight = Math.max(document.documentElement.clientHeight, window.innerHeight);
@@ -107,16 +109,18 @@ export function menuPosition(anchor: HTMLElement, actionCount: number, point?: {
   const top = rect.bottom + estimatedHeight <= viewportHeight - MENU_MARGIN
     ? rect.bottom + 5
     : rect.top - estimatedHeight - 5;
-  const left = rect.right + MENU_WIDTH <= viewportWidth - MENU_MARGIN
-    ? rect.right + 5
-    : rect.left - MENU_WIDTH - 5;
+  const left = alignStart
+    ? rect.left
+    : rect.right + MENU_WIDTH <= viewportWidth - MENU_MARGIN
+      ? rect.right + 5
+      : rect.left - MENU_WIDTH - 5;
   return {
     top: Math.max(MENU_MARGIN, Math.min(top, viewportHeight - estimatedHeight - MENU_MARGIN)),
     left: Math.max(MENU_MARGIN, Math.min(left, viewportWidth - MENU_WIDTH - MENU_MARGIN)),
   };
 }
 
-function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMenuProps) {
+function FloatingMenu({ label, actions, anchorRef, onClose, point, alignStart = false }: FloatingMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [position, setPosition] = useState<CSSProperties | null>(null);
@@ -129,7 +133,7 @@ function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMen
   useEffect(() => {
     const updatePosition = () => {
       const anchor = anchorRef.current;
-      if (anchor) setPosition(menuPosition(anchor, actions.length, point));
+      if (anchor) setPosition(menuPosition(anchor, actions.length, point, alignStart));
     };
     updatePosition();
     window.addEventListener("resize", updatePosition);
@@ -143,7 +147,7 @@ function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMen
       window.removeEventListener("resize", updatePosition);
       document.removeEventListener("scroll", updatePosition, true);
     };
-  }, [actions.length, anchorRef, enabledIndexes, point]);
+  }, [actions.length, anchorRef, enabledIndexes, point, alignStart]);
 
   const closeMenu = useCallback((restoreFocus = true) => {
     onClose();
@@ -233,11 +237,12 @@ function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMen
       <button
         ref={(node) => { itemRefs.current[index] = node; }}
         type="button"
-        role="menuitem"
-        className={`sidebar-menu__item${action.danger ? " danger" : ""}`}
+        role={action.selected === undefined ? "menuitem" : "menuitemradio"}
+        className={`sidebar-menu__item${action.danger ? " danger" : ""}${action.selected ? " is-selected" : ""}`}
         disabled={action.disabled}
         title={action.disabled ? action.disabledReason : action.label}
         aria-label={action.disabled && action.disabledReason ? `${action.label}: ${action.disabledReason}` : action.label}
+        aria-checked={action.selected}
         onClick={() => {
           if (action.disabled) return;
           closeMenu();
@@ -246,6 +251,7 @@ function FloatingMenu({ label, actions, anchorRef, onClose, point }: FloatingMen
       >
         {action.icon && <UiIcon name={action.icon} />}
         <span>{action.label}</span>
+        {action.selected && <span className="sidebar-menu__check" aria-hidden="true">✓</span>}
       </button>
     </div>)}
   </div>;
@@ -608,6 +614,8 @@ function Recent({ entries, props, menuTarget, onMenuTarget }: { entries: Array<{
 export function Sidebar(props: SidebarProps) {
   const { t } = useTranslation();
   const [menuTarget, setMenuTarget] = useState<MenuTarget | null>(null);
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const modeMenuAnchorRef = useRef<HTMLDivElement>(null);
   const pinned = props.projects.filter((project) => project.pinned);
   const projects = props.projects.filter((project) => !project.pinned);
   const recent = useMemo(
@@ -627,6 +635,10 @@ export function Sidebar(props: SidebarProps) {
     [props.projects],
   );
   const mode = props.mode ?? "coding";
+  const modeActions = useMemo<MenuAction[]>(() => [
+    { id: "coding-mode", label: t("codingMode"), selected: mode === "coding", onSelect: () => props.onSwitchMode?.("coding") },
+    { id: "general-mode", label: t("generalMode"), selected: mode === "general", onSelect: () => props.onSwitchMode?.("general") },
+  ], [mode, props.onSwitchMode, t]);
   const codingProjects = props.projects.filter((project) => project.projectKey !== "uthcode:general");
   const generalProject = props.projects.find((project) => project.projectKey === "uthcode:general");
   const visibleProjects = mode === "coding" ? codingProjects : generalProject ? [generalProject] : [];
@@ -649,11 +661,14 @@ export function Sidebar(props: SidebarProps) {
   }, [mode]);
   return <>
     <aside className="sidebar" aria-label={mode === "coding" ? t("projects") : t("generalMode")} aria-busy={props.sessionMutationBusy === true ? "true" : undefined}>
-      <header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header>
-      <div className="sidebar-modes" role="group" aria-label={t("mode")}>
-        <button type="button" className={mode === "coding" ? "is-selected" : ""} aria-pressed={mode === "coding"} onClick={() => props.onSwitchMode?.("coding")}>{t("codingMode")}</button>
-        <button type="button" className={mode === "general" ? "is-selected" : ""} aria-pressed={mode === "general"} onClick={() => props.onSwitchMode?.("general")}>{t("generalMode")}</button>
-      </div>
+      <header className="sidebar-brand">
+        <div className="sidebar-brand-menu-anchor" ref={modeMenuAnchorRef}>
+          <button type="button" className="sidebar-brand-menu-trigger menu-trigger" data-mode={mode} aria-label={`UthCode · ${t("mode")}`} aria-haspopup="menu" aria-expanded={modeMenuOpen} onClick={() => setModeMenuOpen((open) => !open)}>
+            <span className="brand-mark">U</span><strong>UthCode</strong><UiIcon name="chevron" />
+          </button>
+          {modeMenuOpen && <FloatingMenu label={t("mode")} actions={modeActions} anchorRef={modeMenuAnchorRef} onClose={() => setModeMenuOpen(false)} alignStart />}
+        </div>
+      </header>
       <div className="sidebar-primary">
         <button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button>
         {mode === "coding" && <button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button>}

@@ -67,6 +67,36 @@ test("safe Markdown keeps raw HTML inert and code fences expose language plus ra
   });
 });
 
+test("safe Markdown parses streamed pipe tables immediately after Chinese headings", async () => {
+  const firstChunk: TimelineEntry = {
+    id: "streamed-table",
+    kind: "assistant",
+    text: "**📑 文件读写 & 搜索**\n| 工具 | 用途 |",
+    streaming: true,
+  };
+  const complete: TimelineEntry = {
+    ...firstChunk,
+    text: "**📑 文件读写 & 搜索**\n| 工具 | 用途 |\n|---|---|\n| `ReadFile` | 按路径读取 UTF-8 文本文件 |\n| `[unsafe](javascript:alert(1))` | <script>blocked()</script> |",
+    streaming: false,
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    const render = (entry: TimelineEntry) => <LanguageProvider value="en"><ChatTimeline entries={[entry]} todo={[]} /></LanguageProvider>;
+    act(() => { root.render(render(firstChunk)); });
+    assert.equal(container.querySelector(".markdown-table-scroll table"), null, "an incomplete streaming divider does not render a partial table");
+
+    act(() => { root.render(render(complete)); });
+    const table = container.querySelector<HTMLTableElement>(".markdown-table-scroll table");
+    assert.ok(table, "a heading paragraph stops before the immediately following table");
+    assert.deepEqual(Array.from(table.querySelectorAll("thead th"), (cell) => cell.textContent), ["工具", "用途"]);
+    assert.equal(table.querySelector("tbody code")?.textContent, "ReadFile", "inline code stays parsed inside cells");
+    assert.equal(table.querySelectorAll("tbody tr").length, 2);
+    assert.equal(table.querySelector('a[href^="javascript:"]'), null, "unsafe links in cells remain inert");
+    assert.equal(table.querySelector("script"), null, "raw HTML in cells remains text");
+    assert.match(table.textContent ?? "", /blocked\(\)/u);
+    assert.match(container.textContent ?? "", /文件读写 & 搜索/u);
+  });
+});
+
 test("ChatTimeline replays durable attachment metadata with an image preview and file fallback", () => {
   const markup = renderEnglish(<ChatTimeline
     entries={[{
