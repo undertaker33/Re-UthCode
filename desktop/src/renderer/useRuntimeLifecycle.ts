@@ -177,33 +177,6 @@ export async function waitForAuthoritativeIdle(api: DesktopApi, options: Authori
   return { state: "cancelled" };
 }
 
-export async function rebootstrapProject(
-  request: RuntimeRequest,
-  projectPath: string,
-  sessionId: string | null,
-  onProjectOpened: (result: JsonValue) => void,
-  onSessionResumed: (result: JsonValue) => void,
-  isOwned?: RuntimeOwnershipCheck,
-): Promise<void> {
-  const ensureOwned = () => {
-    if (isOwned && !isOwned()) throw new StaleRuntimeOperation();
-  };
-  ensureOwned();
-  await request("runtime.shutdown", {});
-  ensureOwned();
-  await request("runtime.initialize", { workdir: projectPath });
-  ensureOwned();
-  const opened = await request("project.open", { path: projectPath });
-  ensureOwned();
-  onProjectOpened(opened);
-  if (sessionId) {
-    ensureOwned();
-    const resumed = await request("session.resume", { session_id: sessionId });
-    ensureOwned();
-    onSessionResumed(resumed);
-  }
-}
-
 export function useRuntimeLifecycle(options: RuntimeLifecycleOptions): RuntimeLifecycle {
   const { api, stateRef, dispatch } = options;
   const mountedRef = useRef(false);

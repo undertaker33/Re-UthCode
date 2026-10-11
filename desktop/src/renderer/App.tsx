@@ -17,7 +17,8 @@ import { RendererErrorBoundary } from "./RendererErrorBoundary";
 import { RuntimePanel } from "./RuntimePanel";
 import { Sidebar, type SessionSearchHit } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
-import { SettingsView, type ConfigurationWrite } from "./SettingsView";
+import { SettingsView, type ArchivedSettingsSession, type ConfigurationWrite, type PendingConfigurationWrite } from "./SettingsView";
+import { configurationWriteIdentities } from "./settings-draft";
 import { composerDraftOwnerKey, createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type PendingInteraction } from "./state";
 import {
   eventIdentity,
@@ -26,7 +27,6 @@ import {
   hasTurnIdentity,
   identityFromRun,
   knownIdentityMatches,
-  rebootstrapProject,
   RuntimeOperationCancelled,
   StaleRuntimeOperation,
   stringValue,
@@ -475,6 +475,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const focusModeToggleRef = useRef<HTMLButtonElement>(null);
   const runtimeFocusHandoffRef = useRef(false);
   const settingsSaveInFlightRef = useRef(false);
+  const settingsSaveCountRef = useRef(0);
+  const settingsSaveTailRef = useRef<Promise<void>>(Promise.resolve());
+  const settingsRequestRevisionRef = useRef(0);
+  const settingsWriteRevisionsRef = useRef(new Map<string, number>());
+  const settingsFailedWritesRef = useRef(new Map<string, PendingConfigurationWrite>());
   const sessionMutationGenerationRef = useRef(0);
   const sessionMutationSequenceRef = useRef(0);
   const sessionMutationInFlightRef = useRef<number | null>(null);
@@ -1176,6 +1181,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     event: AgentEvent,
     acceptedSession?: { sessionId: string; projectKey: string; runId: string; turnId: string; runtimeGeneration: number; viewRevision: number },
   ) => {
+    if (event.type === "settings_applications") {
+      const counts = [event.applied, event.pending, event.failed];
+      if (counts.every((count) => typeof count === "number" && Number.isSafeInteger(count) && count >= 0)) {
+        dispatch({ type: "settings_applications", value: {
+          applied: event.applied as number,
+          pending: event.pending as number,
+          failed: event.failed as number,
+        } });
+      }
+      return;
+    }
     // Runtime lifecycle envelopes are transport-level facts. While an App
     // operation owns a restart, its explicit terminal state must not be
     // replaced by the shutdown/initialization envelopes emitted by the old
@@ -2867,139 +2883,176 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       dispatch({ type: "settings_loaded", configuration: {} });
       return;
     }
-    if (!(await waitForRuntimeLifecycleIdle()) || hasOwner()) return;
     dispatch({ type: "set_focus_mode", value: false });
     dispatch({ type: "set_view", view: "settings" });
     try {
       const result = asObject(await send("settings.get", {}));
       dispatch({ type: "settings_loaded", configuration: (asObject(result.configuration) as ConfigurationView) });
+      const applications = asObject(result.applications);
+      dispatch({ type: "settings_applications", value: {
+        applied: typeof applications.applied === "number" ? applications.applied : 0,
+        pending: typeof applications.pending === "number" ? applications.pending : 0,
+        failed: typeof applications.failed === "number" ? applications.failed : 0,
+      } });
     } catch (error) {
       dispatch({ type: "settings_error", message: safeErrorMessage(error, t("configUnavailable")) });
     }
-  }, [api, hasOwner, send, waitForRuntimeLifecycleIdle]);
+  }, [api, send, t]);
 
-  const saveSettings = useCallback(async (request: ConfigurationWrite) => {
-    if (!api || stateRef.current.activeTurn || stateRef.current.terminalStatusPending) {
-      dispatch({ type: "settings_error", message: t("finishTurnBeforeSave") });
-      throw new Error(t("finishTurnBeforeSave"));
+  const saveSettings = useCallback((request: ConfigurationWrite): Promise<ConfigurationView> => {
+    if (!api) return Promise.reject(new Error(t("desktopApiUnavailable")));
+    const autoSaveRequest = Object.keys(request.providers ?? {}).length === 0
+      && Object.keys(request.models ?? {}).length === 0
+      && Object.keys(request.provider_renames ?? {}).length === 0;
+    const identities = autoSaveRequest
+      ? configurationWriteIdentities(request).filter((identity) => identity !== "search.api_key"
+        && (identity === "default_model" || identity === "default_permission_mode" || identity.startsWith("search.") || identity.startsWith("tool_limits.")))
+      : [];
+    const revisions = new Map<string, number>();
+    for (const identity of identities) {
+      const revision = (settingsWriteRevisionsRef.current.get(identity) ?? 0) + 1;
+      settingsWriteRevisionsRef.current.set(identity, revision);
+      settingsFailedWritesRef.current.delete(identity);
+      revisions.set(identity, revision);
     }
-    // React state updates are asynchronous; this ref closes the small window
-    // in which two rapid clicks could otherwise issue duplicate durable saves.
-    if (settingsSaveInFlightRef.current) throw new Error("Settings save is already in progress");
+    if (identities.length) dispatch({ type: "settings_write_failures", value: settingsFailedWritesRef.current.size });
+    const revision = ++settingsRequestRevisionRef.current;
+    settingsSaveCountRef.current += 1;
     settingsSaveInFlightRef.current = true;
-    const mode = stateRef.current.mode;
-    const projectKey = stateRef.current.selectedProjectKey;
-    const sessionId = stateRef.current.selectedSessionId;
     dispatch({ type: "settings_saving", value: true });
-    // The durable write is itself a lifecycle operation.  Its request must be
-    // issued only after this generation owns the Runtime, and any following
-    // project/session recovery must remain on the same serialized owner.  A
-    // separate promise lets Settings clear transient secrets at the durable
-    // response boundary without waiting for best-effort Runtime projection
-    // recovery to finish.
-    let durableSettled = false;
-    let durableSucceeded = false;
-    let resolveDurable!: () => void;
-    let rejectDurable!: (reason?: unknown) => void;
-    const durable = new Promise<void>((resolve, reject) => {
-      resolveDurable = resolve;
-      rejectDurable = reject;
-    });
-    const settleDurableSuccess = () => {
-      durableSucceeded = true;
-      if (durableSettled) return;
-      durableSettled = true;
-      resolveDurable();
-    };
-    const settleDurableFailure = (error: unknown, stillOwned: boolean) => {
-      if (durableSettled) return;
-      durableSettled = true;
-      // A stale response is not retried and must not publish an old Save
-      // error over a newer navigation/save owner.  It only settles this
-      // caller's local promise as cancelled.
-      rejectDurable(stillOwned ? error : new RuntimeOperationCancelled());
-    };
-    const lifecycle = enqueueRuntimeOperation("recovery", async (isOwned) => {
-      try {
-        const result = await send("settings.save", { request: request as unknown as JsonObject });
-        // A successful durable response is safe to consume even if a newer
-        // owner took over while this request was in flight.  Do not, however,
-        // let that stale response publish settings_loaded or start recovery.
-        settleDurableSuccess();
-        if (!isMounted() || !isOwned()) return;
-        dispatch({ type: "settings_loaded", configuration: asObject(result).configuration as ConfigurationView });
-        if (mode === "general") {
-          const opened = await send("general.open", {});
-          if (!isOwned()) throw new StaleRuntimeOperation();
-          dispatch({ type: "general_opened", result: opened, sessionId });
-          if (sessionId) {
-            const resumed = await send("session.resume", { session_id: sessionId, project_key: GENERAL_PROJECT_KEY });
-            if (!isOwned()) throw new StaleRuntimeOperation();
-            const source = asObject(resumed);
-            const preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
-            if (source.preparation_failed === true) {
-              dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "failed" });
-            } else if (preparing) {
-              dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "preparing" });
-              pollSessionPreparation(GENERAL_PROJECT_KEY, sessionId);
-            } else {
-              dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true, preserveSessionRuntime: true });
-            }
+    const operation = settingsSaveTailRef.current.then(async () => {
+      const result = asObject(await send("settings.save", { request: request as unknown as JsonObject }));
+      const configuration = asObject(result.configuration) as ConfigurationView;
+      for (const [identity, writeRevision] of revisions) {
+        if (settingsWriteRevisionsRef.current.get(identity) === writeRevision) settingsFailedWritesRef.current.delete(identity);
+      }
+      if (identities.length) dispatch({ type: "settings_write_failures", value: settingsFailedWritesRef.current.size });
+      if (!isMounted() || revision !== settingsRequestRevisionRef.current) return configuration;
+      dispatch({ type: "settings_loaded", configuration });
+      const applications = asObject(result.applications);
+      dispatch({ type: "settings_applications", value: {
+        applied: typeof applications.applied === "number" ? applications.applied : 0,
+        pending: typeof applications.pending === "number" ? applications.pending : 0,
+        failed: typeof applications.failed === "number" ? applications.failed : 0,
+      } });
+      return configuration;
+    }).catch((error: unknown) => {
+      if (isMounted() && identities.length) {
+        const search = request.search
+          ? Object.fromEntries(Object.entries(request.search).filter(([field]) => field !== "api_key"))
+          : undefined;
+        const safeRequest: ConfigurationWrite = {
+          ...(Object.hasOwn(request, "default_model") ? { default_model: request.default_model } : {}),
+          ...(Object.hasOwn(request, "default_permission_mode") ? { default_permission_mode: request.default_permission_mode } : {}),
+          ...(search && Object.keys(search).length ? { search } : {}),
+          ...(request.tool_limits ? { tool_limits: request.tool_limits } : {}),
+        };
+        for (const [identity, writeRevision] of revisions) {
+          if (settingsWriteRevisionsRef.current.get(identity) !== writeRevision) continue;
+          let patch: ConfigurationWrite = safeRequest;
+          if (identity === "default_model") patch = { default_model: safeRequest.default_model };
+          else if (identity === "default_permission_mode") patch = { default_permission_mode: safeRequest.default_permission_mode };
+          else if (identity.startsWith("search.")) {
+            const field = identity.slice("search.".length);
+            patch = { search: { [field]: safeRequest.search?.[field] } };
+          } else if (identity.startsWith("tool_limits.")) {
+            const field = identity.slice("tool_limits.".length);
+            patch = { tool_limits: { [field]: safeRequest.tool_limits?.[field] } };
           }
-          const statusReady = await refreshRuntimeStatus(isOwned);
-          const catalogReady = await refreshCatalog(GENERAL_PROJECT_KEY, "catalog_refresh", sessionId || undefined, false, isOwned);
-          if (!isOwned()) throw new StaleRuntimeOperation();
-          if (!statusReady || !catalogReady) throw new Error("Runtime projections were not restored");
-        } else if (projectKey) {
-          await rebootstrapProject(
-            send,
-            projectKey,
-            sessionId,
-            (opened) => dispatch({ type: "project_opened", result: opened, preserveRuntimeState: true }),
-            (resumed) => dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true }),
-            isOwned,
-          );
-          const statusReady = await refreshRuntimeStatus(isOwned);
-          const catalogReady = await refreshCatalog(projectKey, "catalog_refresh", undefined, false, isOwned);
-          if (!isOwned()) throw new StaleRuntimeOperation();
-          if (!statusReady || !catalogReady) throw new Error("Runtime projections were not restored");
+          settingsFailedWritesRef.current.set(identity, { identity, request: patch, revision: writeRevision });
         }
-        if (!isOwned()) throw new StaleRuntimeOperation();
-        dispatch({ type: "notice", text: t("settingsSaved") });
-      } catch (error) {
-        settleDurableFailure(error, isOwned());
-        throw error;
+        dispatch({ type: "settings_write_failures", value: settingsFailedWritesRef.current.size });
       }
-    }, (_error, isOwned) => {
-      if (!isOwned()) return;
-      if (durableSucceeded) {
-        dispatch({ type: "runtime_error", message: t("settingsRuntimeRecoveryFailed"), state: "failed" });
-      } else {
-        // settings.save failed before the durable boundary; this is not a
-        // Runtime recovery failure and leaves the owner in a usable state.
-        dispatch({ type: "runtime_state", state: "ready", error: null });
-      }
-    });
-    // If the queued operation was superseded before its work began, or the
-    // component unmounted, the safe lifecycle tail still has to release the
-    // caller waiting at the durable boundary.
-    void lifecycle.then(() => {
-      settleDurableFailure(new RuntimeOperationCancelled(), false);
-    }, (error) => {
-      settleDurableFailure(error, false);
-    });
-    try {
-      await durable;
-    } catch (error) {
-      if (isMounted() && !(error instanceof RuntimeOperationCancelled)) {
+      if (isMounted() && revision === settingsRequestRevisionRef.current) {
         dispatch({ type: "settings_error", message: safeErrorMessage(error, t("settingsSaveFailed")) });
       }
       throw error;
-    } finally {
-      settingsSaveInFlightRef.current = false;
-      if (isMounted()) dispatch({ type: "settings_saving", value: false });
+    }).finally(() => {
+      settingsSaveCountRef.current = Math.max(0, settingsSaveCountRef.current - 1);
+      settingsSaveInFlightRef.current = settingsSaveCountRef.current > 0;
+      if (isMounted()) dispatch({ type: "settings_saving", value: settingsSaveInFlightRef.current });
+    });
+    settingsSaveTailRef.current = operation.then(() => undefined, () => undefined);
+    return operation;
+  }, [api, isMounted, send, t]);
+
+  const retrySettingsSave = useCallback(async () => {
+    for (const [identity, failed] of Array.from(settingsFailedWritesRef.current)) {
+      if (settingsFailedWritesRef.current.get(identity) !== failed
+        || settingsWriteRevisionsRef.current.get(identity) !== failed.revision) continue;
+      await saveSettings(failed.request).catch(() => undefined);
     }
-  }, [api, enqueueRuntimeOperation, isMounted, pollSessionPreparation, refreshCatalog, refreshRuntimeStatus, send, t]);
+  }, [saveSettings]);
+
+  const retrySettingsApply = useCallback(async () => {
+    const result = asObject(await send("settings.retry_apply", {}));
+    const applications = asObject(result.applications);
+    dispatch({ type: "settings_applications", value: {
+      applied: typeof applications.applied === "number" ? applications.applied : 0,
+      pending: typeof applications.pending === "number" ? applications.pending : 0,
+      failed: typeof applications.failed === "number" ? applications.failed : 0,
+    } });
+  }, [send]);
+
+  const loadArchivedSettingsSessions = useCallback(async (): Promise<ArchivedSettingsSession[]> => {
+    const projects = stateRef.current.projects.filter((project) => project.projectKey !== GENERAL_PROJECT_KEY);
+    const owners = [
+      ...projects.map((project) => ({ projectKey: project.projectKey, projectLabel: project.alias || project.path })),
+      { projectKey: GENERAL_PROJECT_KEY, projectLabel: t("generalMode") },
+    ];
+    const groups = await Promise.all(owners.map(async (owner) => {
+      const result = asObject(await send("project.sessions", { project_key: owner.projectKey, archived: true }));
+      const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+      return sessions.map((value) => asObject(value))
+        .filter((session) => session.archived === true && typeof session.session_id === "string")
+        .map((session) => ({
+          projectKey: owner.projectKey,
+          projectLabel: owner.projectLabel,
+          session: session as unknown as SessionSummary,
+        }));
+    }));
+    return groups.flat().sort((left, right) => {
+      const a = left.session.last_used_at ?? left.session.created_at ?? "";
+      const b = right.session.last_used_at ?? right.session.created_at ?? "";
+      return b.localeCompare(a);
+    });
+  }, [send, t]);
+
+  const restoreArchivedSettingsSession = useCallback(async (item: ArchivedSettingsSession): Promise<boolean> => {
+    const before = stateRef.current;
+    const expected = {
+      mode: before.mode,
+      projectKey: before.selectedProjectKey,
+      sessionId: before.selectedSessionId,
+      revision: before.sessionViewRevision,
+      generation: runtimeGeneration(),
+    };
+    const ownsNavigation = () => {
+      const current = stateRef.current;
+      return isMounted()
+        && current.view === "settings"
+        && runtimeGeneration() === expected.generation
+        && current.mode === expected.mode
+        && current.selectedProjectKey === expected.projectKey
+        && current.selectedSessionId === expected.sessionId
+        && current.sessionViewRevision === expected.revision;
+    };
+    const project = stateRef.current.projects.find((entry) => entry.projectKey === item.projectKey)
+      ?? (item.projectKey === GENERAL_PROJECT_KEY ? {
+        path: GENERAL_PROJECT_KEY,
+        projectKey: GENERAL_PROJECT_KEY,
+        alias: t("generalMode"),
+        pinned: false,
+        sessions: [],
+        catalogFresh: false,
+      } : null);
+    if (!project || !(await archiveSession(project, { ...item.session, archived: true }, false))) return false;
+    if (ownsNavigation()) {
+      dispatch({ type: "set_view", view: "chat" });
+      await resumeSession(project, item.session.session_id);
+    }
+    return true;
+  }, [archiveSession, isMounted, resumeSession, runtimeGeneration, t]);
 
   const backFromSettings = useCallback(() => {
     // Include the ref so a same-turn Back/Cancel event cannot slip through
@@ -3122,7 +3175,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
     : null;
   const content = state.view === "settings" ? (
-    <SettingsView state={state} onRevealApiKey={revealSettingsApiKey} onBack={backFromSettings} onSave={saveSettings} onThemeChange={setTheme} onLanguageChange={setLanguage} />
+    <SettingsView state={state} pendingWrites={Array.from(settingsFailedWritesRef.current.values())} onRevealApiKey={revealSettingsApiKey} onBack={backFromSettings} onSave={saveSettings} onRetrySave={retrySettingsSave} onRetryApply={retrySettingsApply} onLoadArchivedSessions={loadArchivedSettingsSessions} onRestoreArchivedSession={restoreArchivedSettingsSession} onThemeChange={setTheme} onLanguageChange={setLanguage} />
   ) : (
     <>
       <header className="conversation-bar">

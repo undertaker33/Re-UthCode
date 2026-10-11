@@ -7,7 +7,6 @@ import { JSDOM } from "jsdom";
 import type { AgentEvent, DesktopApi, JsonObject } from "../src/desktop-api";
 import { createInitialState } from "../src/renderer/state";
 import { App } from "../src/renderer/App";
-import { rebootstrapProject } from "../src/renderer/useRuntimeLifecycle";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><button id=before>Before</button><div id=root></div><button id=after>After</button></body></html>", { url: "http://localhost/" });
@@ -405,64 +404,4 @@ test("T03 project removal publishes terminal idle before replacement navigation 
     assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "a failed replacement navigation cannot strand the old Composer in terminal pending");
     assert.doesNotMatch(container.querySelector<HTMLElement>(".composer-state")?.textContent ?? "", /Waiting/u, "terminal idle is published through the reducer before navigation failure");
   });
-});
-
-test("T04 settings rebootstrap uses the real Runtime and project/session boundaries", async () => {
-  const calls: Array<{ method: string; params: unknown }> = [];
-  const opened: unknown[] = [];
-  const resumed: unknown[] = [];
-  const request = async (method: Parameters<NonNullable<Parameters<typeof rebootstrapProject>[0]>>[0], params: Record<string, unknown>) => {
-    calls.push({ method, params });
-    if (method === "project.open") return { project: { path: "C:/Projects/one" }, sessions: [], run: { run_id: "fresh-run" } } as const;
-    if (method === "session.resume") return { session_id: "durable-session", replay: [], run: { run_id: "resumed-run" } } as const;
-    return { state: "ready" } as const;
-  };
-  await rebootstrapProject(request, "C:/Projects/one", "durable-session", (result) => opened.push(result), (result) => resumed.push(result));
-  assert.deepEqual(calls.map((call) => call.method), ["runtime.shutdown", "runtime.initialize", "project.open", "session.resume"]);
-  assert.deepEqual(calls[1]?.params, { workdir: "C:/Projects/one" });
-  assert.equal(opened.length, 1);
-  assert.equal(resumed.length, 1);
-
-  const failedCalls: string[] = [];
-  await assert.rejects(rebootstrapProject(async (method) => {
-    failedCalls.push(method);
-    if (method === "runtime.initialize") throw new Error("initialize failed");
-    return {};
-  }, "C:/Projects/one", null, () => assert.fail("project.open must not run after initialize failure"), () => assert.fail("resume must not run after initialize failure")));
-  assert.deepEqual(failedCalls, ["runtime.shutdown", "runtime.initialize"]);
-});
-
-test("T04 rebootstrap stops at every failed lifecycle boundary", async () => {
-  const lifecycle: Array<"runtime.shutdown" | "runtime.initialize" | "project.open" | "session.resume"> = [
-    "runtime.shutdown",
-    "runtime.initialize",
-    "project.open",
-    "session.resume",
-  ];
-  for (const failedMethod of lifecycle) {
-    const calls: string[] = [];
-    await assert.rejects(rebootstrapProject(async (method) => {
-      calls.push(method);
-      if (method === failedMethod) throw new Error(`${failedMethod} failed`);
-      if (method === "project.open") return { project: { path: "C:/Projects/one" }, sessions: [], run: { run_id: "fresh-run" } };
-      if (method === "session.resume") return { session_id: "durable-session", replay: [], run: { run_id: "resumed-run" } };
-      return { state: "ready" };
-    }, "C:/Projects/one", "durable-session", () => undefined, () => undefined));
-    assert.deepEqual(calls, lifecycle.slice(0, lifecycle.indexOf(failedMethod) + 1));
-  }
-});
-
-test("T07 rebootstrap ownership stops stale lifecycle calls and callbacks", async () => {
-  let owned = true;
-  const calls: string[] = [];
-  const opened: unknown[] = [];
-  const resumed: unknown[] = [];
-  await assert.rejects(rebootstrapProject(async (method) => {
-    calls.push(method);
-    if (method === "runtime.initialize") owned = false;
-    return { project: { path: "C:/Projects/stale" }, sessions: [], run: null };
-  }, "C:/Projects/stale", "session-stale", (result) => opened.push(result), (result) => resumed.push(result), () => owned), /no longer current/u);
-  assert.deepEqual(calls, ["runtime.shutdown", "runtime.initialize"]);
-  assert.deepEqual(opened, []);
-  assert.deepEqual(resumed, []);
 });

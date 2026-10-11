@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -342,6 +343,11 @@ kind = "fake"
 provider = "local"
 remote_id = "old-remote"
 display_name = "Old"
+
+[models."new/ref"]
+provider = "local"
+remote_id = "new-remote"
+display_name = "New"
 '''
     user.write_text(original, encoding="utf-8")
     project = tmp_path / "project.toml"
@@ -357,6 +363,8 @@ display_name = "Old"
     assert updated.index("[providers.local]") < updated.index('[models."old/ref"]')
     assert 'kind = "fake"' in updated
     assert 'remote_id = "old-remote"' in updated
+    assert tomllib.loads(updated)["providers"] == tomllib.loads(original)["providers"]
+    assert tomllib.loads(updated)["models"] == tomllib.loads(original)["models"]
     assert project.read_text(encoding="utf-8") == project_text
 
 
@@ -365,7 +373,19 @@ def test_user_model_writeback_keeps_bytes_when_replace_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = tmp_path / "config.toml"
-    original = 'default_model = "old/ref"\n\n[providers.local]\nkind = "fake"\n'
+    original = '''default_model = "old/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."old/ref"]
+provider = "local"
+remote_id = "old-remote"
+
+[models."new/ref"]
+provider = "local"
+remote_id = "new-remote"
+'''
     user.write_text(original, encoding="utf-8")
 
     import uthcode.integrations.config.writer as writer

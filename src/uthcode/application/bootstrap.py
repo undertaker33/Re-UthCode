@@ -170,8 +170,11 @@ def _user_write_payload(
             mode.value if isinstance(mode, PermissionMode) else mode
         )
     if request.providers is not None:
-        providers: dict[str, dict[str, object]] = {}
+        providers: dict[str, dict[str, object] | None] = {}
         for profile_id, raw_profile in request.providers.items():
+            if raw_profile is None:
+                providers[profile_id] = None
+                continue
             if not isinstance(raw_profile, Mapping):
                 raise TypeError(f"providers.{profile_id} must be a mapping")
             providers[profile_id] = {}
@@ -189,8 +192,11 @@ def _user_write_payload(
                 )
         payload["providers"] = providers
     if request.models is not None:
-        models: dict[str, dict[str, object]] = {}
+        models: dict[str, dict[str, object] | None] = {}
         for model_ref, raw_profile in request.models.items():
+            if raw_profile is None:
+                models[model_ref] = None
+                continue
             if not isinstance(raw_profile, Mapping):
                 raise TypeError(f"models.{model_ref} must be a mapping")
             profile = dict(raw_profile)

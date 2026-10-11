@@ -161,6 +161,7 @@ _METHODS = frozenset(
         "settings.get",
         "settings.reveal_api_key",
         "settings.save",
+        "settings.retry_apply",
     }
 )
 
@@ -880,6 +881,10 @@ class DesktopBridge:
         # map owns only the per-Session task/token/identity needed to route a
         # cancellation and to keep a parked Session runtime alive.
         self._compaction_operations: dict[str, dict[str, object]] = {}
+        # Durable configuration writes may be pending or may fail to apply to
+        # an idle live Application. Keep aggregate status by object identity;
+        # runtime ownership stays in the current/background runtime maps.
+        self._configuration_application_states: dict[int, str] = {}
         # Pending direct Process approvals retain only the already-prepared
         # Tool call and its immutable Action.  Execution still goes through
         # the same Application ToolExecutor after the response arrives.
@@ -1540,6 +1545,7 @@ class DesktopBridge:
                 runtime["retain"] = False
             try:
                 self._publish_compaction_operation(operation)
+                self._apply_pending_configuration_applications()
                 self._reclaim_background_runtimes()
             finally:
                 # Terminal operations remain queryable by Session identity,
@@ -1968,12 +1974,17 @@ class DesktopBridge:
                 "configuration": _settings_configuration(
                     view,
                     self._load_settings_effective(),
-                )
+                ),
+                "durable": "saved",
+                "applications": self._configuration_application_status(),
             }
         if method == "settings.reveal_api_key":
             return await self._settings_reveal_api_key(params)
         if method == "settings.save":
             return await self._settings_save(params)
+        if method == "settings.retry_apply":
+            _require_params(params, set(), method=method)
+            return self._settings_retry_apply()
         raise BridgeError("unknown_method", "unknown Desktop method")
 
     async def _workspace_diff(self, params: Mapping[str, object]) -> dict[str, object]:
@@ -3580,42 +3591,14 @@ class DesktopBridge:
             raise BridgeError("compaction_active", f"{method} is unavailable during compaction")
 
     def _applications_for_configuration_reload(self) -> tuple[tuple[object, object | None], ...]:
-        """Return idle Applications in this configuration domain once each.
+        """Return every loaded Application/Run pair once, across owners."""
 
-        Session navigation keeps an independent Application/Run pair for
-        background Sessions.  A user configuration save is a safe-boundary
-        operation, so every such pair on the same workdir must see the new
-        Provider, Tool limits, permission default, and redactor before it is
-        selected again.  The Application and its runtime context remain the
-        same objects; only their reloadable composition changes.
-        """
-
-        target = self._workdir.resolve(strict=False)
-        selected_mode = self._current_mode()
         candidates: list[tuple[object, object | None]] = []
         seen: set[int] = set()
 
         def add(runtime: Mapping[str, object]) -> None:
             application = runtime.get("application")
             if application is None or id(application) in seen:
-                return
-            app_mode = self._mode_for_application(application)
-            if app_mode is not selected_mode:
-                return
-            if app_mode is ApplicationMode.GENERAL:
-                seen.add(id(application))
-                candidates.append((application, runtime.get("run")))
-                return
-            context = getattr(application, "runtime_context", None)
-            owner_workdir = getattr(context, "workdir", None)
-            if not isinstance(owner_workdir, (str, Path)):
-                owner_workdir = runtime.get("project_key")
-            if not isinstance(owner_workdir, (str, Path)):
-                return
-            try:
-                if Path(owner_workdir).expanduser().resolve(strict=False) != target:
-                    return
-            except (OSError, RuntimeError, TypeError):
                 return
             seen.add(id(application))
             candidates.append((application, runtime.get("run")))
@@ -3629,6 +3612,116 @@ class DesktopBridge:
         for runtime in self._background_runtimes.values():
             add(runtime)
         return tuple(candidates)
+
+    def _application_configuration(self, application: object) -> EffectiveConfig:
+        context = getattr(application, "runtime_context", None)
+        workdir = getattr(context, "workdir", None)
+        if not isinstance(workdir, (str, Path)):
+            workdir = self._workdir
+        if self._config_loader is not None:
+            configuration = self._config_loader(Path(workdir))
+        else:
+            configuration = load_effective_config(
+                cwd=workdir,
+                home=self._home,
+                include_project_configs=(
+                    self._mode_for_application(application) is ApplicationMode.CODING
+                ),
+            )
+        if not isinstance(configuration, EffectiveConfig):
+            raise TypeError("configuration loader returned invalid data")
+        return configuration
+
+    def _application_configuration_busy(self, application: object) -> bool:
+        if self._application is application and (
+            self._active_handle is not None
+            or (
+                isinstance(self._turn_task, asyncio.Task)
+                and not self._turn_task.done()
+            )
+        ):
+            return True
+        for runtime in self._background_runtimes.values():
+            if runtime.get("application") is not application:
+                continue
+            if runtime.get("handle") is not None:
+                return True
+            task = runtime.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                return True
+        return any(
+            operation.get("application") is application
+            and operation.get("state") == "running"
+            for operation in self._compaction_operations.values()
+        )
+
+    def _configuration_application_status(self) -> dict[str, int]:
+        loaded = {id(application) for application, _ in self._applications_for_configuration_reload()}
+        for application_id in tuple(self._configuration_application_states):
+            if application_id not in loaded:
+                self._configuration_application_states.pop(application_id, None)
+        counts = {"applied": 0, "pending": 0, "failed": 0}
+        for application_id in loaded:
+            state = self._configuration_application_states.get(application_id)
+            if state in counts:
+                counts[state] += 1
+        return counts
+
+    def _apply_configuration_to_application(
+        self,
+        application: object,
+        run: object | None,
+    ) -> str:
+        try:
+            configuration = self._application_configuration(application)
+            reload_configuration = getattr(application, "reload_configuration", None)
+            if not callable(reload_configuration):
+                raise TypeError("Application cannot reload configuration")
+            reload_configuration(configuration)
+            self._apply_permission_mode(run, configuration.default_permission_mode)
+        except Exception:
+            # The user-file write already crossed its durable boundary. Keep
+            # this as an application-apply failure without replaying that write
+            # or forwarding loader/provider diagnostics to the renderer.
+            return "failed"
+        return "applied"
+
+    def _apply_configuration_to_loaded_applications(
+        self,
+        *,
+        force_all: bool = False,
+        retry_failed: bool = False,
+    ) -> dict[str, int]:
+        for application, run in self._applications_for_configuration_reload():
+            application_id = id(application)
+            current = self._configuration_application_states.get(application_id)
+            if retry_failed:
+                if current not in {"pending", "failed"}:
+                    continue
+            elif not force_all and current not in {"pending", "failed"}:
+                # A safe-boundary drain only consumes an explicit unapplied
+                # write; absent/applied state carries no configuration intent.
+                continue
+            if self._application_configuration_busy(application):
+                self._configuration_application_states[application_id] = "pending"
+                continue
+            self._configuration_application_states[application_id] = (
+                self._apply_configuration_to_application(application, run)
+            )
+        return self._configuration_application_status()
+
+    def _apply_pending_configuration_applications(self) -> None:
+        previous = self._configuration_application_status()
+        current = self._apply_configuration_to_loaded_applications()
+        if current != previous:
+            self._publish(
+                AgentEventEnvelope(
+                    {
+                        "type": "settings_applications",
+                        **current,
+                    }
+                )
+            )
 
     @staticmethod
     def _apply_permission_mode(run: object | None, mode: object) -> None:
@@ -4675,7 +4768,11 @@ class DesktopBridge:
             configuration = (
                 self._config_loader(self._workdir)
                 if self._config_loader is not None
-                else load_effective_config(cwd=self._workdir, home=self._home)
+                else load_effective_config(
+                    cwd=self._workdir,
+                    home=self._home,
+                    include_project_configs=self._current_mode() is ApplicationMode.CODING,
+                )
             )
         except (ConfigurationInitializationRequired, ConfigurationError):
             return None
@@ -4704,7 +4801,6 @@ class DesktopBridge:
                     f"settings.save has unknown fields: {sorted(extra)!r}",
                 )
             request = params
-        self._ensure_no_active(method="settings.save")
         if not isinstance(request, Mapping):
             raise BridgeError("invalid_request", "request must be an object")
         try:
@@ -4722,40 +4818,32 @@ class DesktopBridge:
         except Exception:
             raise BridgeError("configuration_error", "configuration update could not be saved") from None
         applications = self._applications_for_configuration_reload()
-        if applications:
-            try:
-                configuration = (
-                    self._config_loader(self._workdir)
-                    if self._config_loader is not None
-                    else load_effective_config(cwd=self._workdir, home=self._home)
-                )
-                if not isinstance(configuration, EffectiveConfig):
-                    raise TypeError("configuration loader returned invalid data")
-                for application, run in applications:
-                    reload_configuration = getattr(application, "reload_configuration", None)
-                    if not callable(reload_configuration):
-                        continue
-                    reload_configuration(configuration)
-                    # Existing idle Runs keep their transcript/snapshot but
-                    # their next Turn must use the newly selected default
-                    # permission mode.  Active Turns are rejected above and
-                    # are therefore never mutated here.
-                    self._apply_permission_mode(run, configuration.default_permission_mode)
-            except (ConfigurationInitializationRequired, ConfigurationError):
-                raise BridgeError(
-                    "configuration_error",
-                    "configuration update could not be activated",
-                ) from None
-            except Exception:
-                raise BridgeError(
-                    "configuration_error",
-                    "configuration update could not be activated",
-                ) from None
+        for application, _ in applications:
+            self._configuration_application_states[id(application)] = "pending"
+        application_status = self._apply_configuration_to_loaded_applications(force_all=True)
         return {
             "configuration": _settings_configuration(
                 view,
                 self._load_settings_effective(),
-            )
+            ),
+            "durable": "saved",
+            "applications": application_status,
+        }
+
+    def _settings_retry_apply(self) -> dict[str, object]:
+        """Retry applying already-durable settings without another disk write."""
+
+        try:
+            view = read_user_configuration(home=self._home)
+        except ConfigurationInitializationRequired:
+            raise BridgeError("configuration_required", "user configuration is not initialized") from None
+        except ConfigurationError:
+            raise BridgeError("configuration_error", "user configuration is invalid") from None
+        application_status = self._apply_configuration_to_loaded_applications(retry_failed=True)
+        return {
+            "configuration": _settings_configuration(view, self._load_settings_effective()),
+            "durable": "saved",
+            "applications": application_status,
         }
 
     async def _settings_reveal_api_key(
@@ -4817,6 +4905,9 @@ class DesktopBridge:
                 runtime["handle"] = None
                 runtime["task"] = None
                 runtime["status"] = "failed"
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+            self._apply_pending_configuration_applications()
             self._reclaim_background_runtimes()
             return
         try:
@@ -4888,6 +4979,9 @@ class DesktopBridge:
                 runtime["task"] = None
                 if runtime.get("status") not in {"completed", "failed", "cancelled"}:
                     runtime["status"] = "failed"
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+            self._apply_pending_configuration_applications()
             self._reclaim_background_runtimes()
 
     @staticmethod

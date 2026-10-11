@@ -551,18 +551,21 @@ def _freeze_user_write_mapping(
 
 
 def _freeze_user_write_section(
-    value: Mapping[str, object] | None,
+    value: Mapping[str, Mapping[str, object] | None] | None,
     *,
     field_name: str,
-) -> Mapping[str, Mapping[str, object]] | None:
+) -> Mapping[str, Mapping[str, object] | None] | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
-    result: dict[str, Mapping[str, object]] = {}
+    result: dict[str, Mapping[str, object] | None] = {}
     for profile_id, raw_profile in value.items():
         if not isinstance(profile_id, str):
             raise TypeError(f"{field_name} keys must be strings")
+        if raw_profile is None:
+            result[profile_id] = None
+            continue
         if isinstance(raw_profile, UserProviderView):
             profile: Mapping[str, object] = {
                 "kind": raw_profile.kind,
@@ -628,15 +631,15 @@ def _freeze_provider_renames(
 class UserConfigurationWriteRequest:
     """Current-schema user configuration update.
 
-    None on a root section means leave that section unchanged.  An empty
-    mapping explicitly removes all profiles in that section.  Provider API
+    None on a root section means leave that section unchanged. Empty mappings
+    make no changes; a null profile explicitly removes one entry. Provider API
     keys are transient write input; repr and to_dict never expose values.
     """
 
     default_model: str | None = None
     default_permission_mode: PermissionMode | str | None = None
-    providers: Mapping[str, object] | None = None
-    models: Mapping[str, object] | None = None
+    providers: Mapping[str, Mapping[str, object] | None] | None = None
+    models: Mapping[str, Mapping[str, object] | None] | None = None
     search: Mapping[str, object] | None = None
     tool_limits: Mapping[str, object] | None = None
     provider_renames: Mapping[str, str] | None = None
@@ -680,10 +683,13 @@ class UserConfigurationWriteRequest:
         )
 
     def to_dict(self) -> dict[str, object]:
-        providers: dict[str, dict[str, object]] | None = None
+        providers: dict[str, dict[str, object] | None] | None = None
         if self.providers is not None:
             providers = {}
             for profile_id, profile in self.providers.items():
+                if profile is None:
+                    providers[profile_id] = None
+                    continue
                 safe: dict[str, object] = {}
                 for key, value in profile.items():
                     if key == "api_key":
@@ -699,10 +705,13 @@ class UserConfigurationWriteRequest:
                     else:
                         safe[key] = value
                 providers[profile_id] = safe
-        models = (
+        models: dict[str, dict[str, object] | None] | None = (
             None
             if self.models is None
-            else {model_ref: dict(profile) for model_ref, profile in self.models.items()}
+            else {
+                model_ref: None if profile is None else dict(profile)
+                for model_ref, profile in self.models.items()
+            }
         )
         safe_search = None
         if self.search is not None:

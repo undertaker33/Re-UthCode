@@ -5,11 +5,12 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { JSDOM } from "jsdom";
 import { createInitialState } from "../src/renderer/state";
-import { SettingsView, settingsSaveRequest, type ConfigurationWrite } from "../src/renderer/SettingsView";
+import { SettingsView, providerGroupSaveRequest, type ConfigurationWrite } from "../src/renderer/SettingsView";
 import { LanguageProvider } from "../src/renderer/i18n";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><button id=before>Before</button><div id=root></div><button id=after>After</button></body></html>", { url: "http://localhost/" });
+  Object.defineProperty(dom.window.HTMLElement.prototype, "scrollTo", { configurable: true, value: () => undefined });
   if (!("attachEvent" in dom.window.HTMLElement.prototype)) {
     Object.defineProperty(dom.window.HTMLElement.prototype, "attachEvent", { configurable: true, value: () => undefined });
     Object.defineProperty(dom.window.HTMLElement.prototype, "detachEvent", { configurable: true, value: () => undefined });
@@ -117,11 +118,8 @@ test("Settings uses one Provider/Model modal root with transactional Back and Ca
     await tick();
     assert.equal(editor(), null);
     assert.equal(dom.window.document.activeElement, providerRow);
-    const save = container.querySelector<HTMLButtonElement>('.settings-actions button[title="Save settings"]');
-    assert.ok(save);
-    act(() => { save!.click(); });
-    await tick();
-    assert.equal(saves.at(-1)?.providers?.provider?.display_name, "Gateway");
+    assert.equal(container.querySelector('.settings-actions .save-button'), null, "Settings has no global Save action");
+    assert.equal(saves.length, 0, "cancelling a Provider/Model editor does not persist its draft");
   });
 });
 
@@ -188,17 +186,152 @@ test("Settings keeps API key reveal editor-local and writes only an explicit rep
     assert.ok(apply);
     act(() => { apply!.click(); });
     await tick();
-    act(() => { container.querySelector<HTMLButtonElement>('.settings-actions button[title="Save settings"]')!.click(); });
-    await tick();
-    assert.equal(saves.at(-1)?.providers?.provider?.api_key, "replacement-secret");
-    assert.equal(JSON.stringify(saves.at(-1)).includes("saved-secret"), false);
+    assert.equal(saves.length, 1, "applying a Provider group persists it immediately");
+    assert.equal(saves[0]?.providers?.provider?.api_key, "replacement-secret");
+    assert.equal(JSON.stringify(saves[0]).includes("saved-secret"), false);
   });
 });
 
-test("settingsSaveRequest strips saved metadata and revealed values from untouched providers", () => {
-  const request = settingsSaveRequest({ providers: { provider: { kind: "openai_compat", api_key_configured: true, api_key: "revealed" } } }, {}, {});
-  assert.equal(request.providers?.provider?.api_key, undefined);
-  assert.equal(request.providers?.provider?.api_key_configured, undefined);
-  const replaced = settingsSaveRequest({ providers: { provider: { kind: "openai_compat", api_key_configured: true } } }, { provider: "new" }, { provider: true });
-  assert.equal(replaced.providers?.provider?.api_key, "new");
+test("Provider group patches omit untouched saved credentials and include explicit replacements only", () => {
+  const before = { providers: { provider: { kind: "openai_compat", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote" } }, default_model: "provider/model" };
+  const untouched = providerGroupSaveRequest(before, before, "provider");
+  assert.equal(Object.hasOwn(untouched.providers?.provider ?? {}, "api_key"), false);
+  assert.equal(Object.hasOwn(untouched.providers?.provider ?? {}, "api_key_configured"), false);
+  const replacement = providerGroupSaveRequest(before, before, "provider", "new", true);
+  assert.equal(replacement.providers?.provider?.api_key, "new");
+});
+
+test("Settings restores App-owned failed field patches and delegates retry", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    let retries = 0;
+    const state = {
+      ...createInitialState({ configuration: { ...baseConfiguration(), search: { enabled: false, max_results: 5 } }, settingsLoaded: true }),
+      settingsWriteFailures: 1,
+    };
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} pendingWrites={[{ identity: "search.max_results", request: { search: { max_results: 6 } }, revision: 1 }]} onBack={() => undefined} onSave={() => undefined} onRetrySave={async () => { retries += 1; }} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    assert.equal(container.querySelector<HTMLInputElement>("#settings-search-max-results")?.value, "6");
+    const retry = container.querySelector<HTMLButtonElement>('.settings-autosave-status button[title="Retry save"]');
+    assert.ok(retry);
+    act(() => { retry!.click(); });
+    await tick();
+    assert.equal(retries, 1);
+    assert.equal(container.querySelector('.settings-actions .save-button'), null);
+  });
+});
+
+test("Settings archive filters project and text, then restores the matching original owner", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const restored: string[] = [];
+    const sessions = [
+      { projectKey: "C:/one", projectLabel: "One", session: { session_id: "coding-a", title: "Review source", preview: "unique preview", archived: true } },
+      { projectKey: "__general__", projectLabel: "General", session: { session_id: "general-a", title: "Notes", preview: "other text", archived: true } },
+    ];
+    const state = createInitialState({ configuration: baseConfiguration(), settingsLoaded: true });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} onLoadArchivedSessions={async () => sessions} onRestoreArchivedSession={async (item) => { restored.push(item.session.session_id); return true; }} /></LanguageProvider>); });
+    await tick();
+    const archiveNav = container.querySelector<HTMLAnchorElement>('a[href="#settings-archive"]');
+    assert.ok(archiveNav);
+    act(() => { archiveNav!.click(); });
+    await tick();
+    await tick();
+    assert.deepEqual([...container.querySelectorAll(".settings-archive__group h3")].map((heading) => heading.textContent), ["One", "General"]);
+    const projectFilter = container.querySelector<HTMLInputElement>('.settings-archive__filters input[type="search"]');
+    assert.ok(projectFilter);
+    act(() => { setInput(dom, projectFilter!, "General"); });
+    await tick();
+    assert.deepEqual([...container.querySelectorAll(".settings-archive__item")].map((item) => item.textContent?.includes("Notes")), [true]);
+    setInput(dom, projectFilter!, "");
+    const textFilter = container.querySelectorAll<HTMLInputElement>('.settings-archive__filters input[type="search"]')[1];
+    assert.ok(textFilter);
+    act(() => { setInput(dom, textFilter!, "unique preview"); });
+    await tick();
+    assert.equal(container.querySelectorAll(".settings-archive__item").length, 1);
+    assert.match(container.querySelector(".settings-archive__item")?.textContent ?? "", /Review source/u);
+    const restore = container.querySelector<HTMLButtonElement>('.settings-archive__item button[title="Restore and open"]');
+    assert.ok(restore);
+    act(() => { restore!.click(); });
+    await tick();
+    assert.deepEqual(restored, ["coding-a"]);
+    assert.equal(container.querySelectorAll(".settings-archive__item").length, 0);
+  });
+});
+
+test("Settings follows the five reference categories, keeps one Archive page, and changes its page title", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const state = createInitialState({
+      configuration: {
+        ...baseConfiguration(),
+        search: { enabled: true, api_key_configured: true, max_results: 5, max_fetch_bytes: 4096, timeout_seconds: 20 },
+        tool_limits: { timeout_seconds: 30, output_bytes: 4096, attachment_bytes: 8192 },
+      },
+      settingsLoaded: true,
+    });
+    act(() => { root.render(<LanguageProvider value="zh-CN"><SettingsView state={state} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+
+    const expected = ["模型与 Provider", "常规", "工具与限制", "权限与安全", "外观与语言", "已归档会话"];
+    assert.deepEqual([...container.querySelectorAll(".settings-nav nav a")].map((item) => item.textContent), expected);
+    assert.equal(container.querySelectorAll('.settings-nav nav a[href="#settings-archive"]').length, 1);
+    assert.equal(container.querySelectorAll(".settings-content > header h1")[0]?.textContent, "模型与 Provider");
+    assert.match(container.querySelector("#settings-providers")?.textContent ?? "", /默认模型/u);
+    assert.ok(container.querySelector("#settings-tools #settings-search-enabled"));
+    assert.ok(container.querySelector("#settings-tools #settings-tool-output"));
+    assert.ok(container.querySelector("#settings-security"));
+    assert.ok(container.querySelector("#settings-appearance"));
+    assert.ok(container.querySelector("#settings-archive .settings-archive__filters"));
+    assert.match(container.querySelector("#settings-general")?.textContent ?? "", /UthCode Desktop/u);
+
+    const archive = container.querySelector<HTMLAnchorElement>('a[href="#settings-archive"]');
+    assert.ok(archive);
+    act(() => { archive!.click(); });
+    await tick();
+    assert.equal(container.querySelector(".settings-content > header h1")?.textContent, "已归档会话");
+    assert.equal(container.querySelector("#settings-archive")?.getAttribute("aria-hidden"), null);
+
+    const security = container.querySelector<HTMLAnchorElement>('a[href="#settings-security"]');
+    assert.ok(security);
+    act(() => { security!.click(); });
+    await tick();
+    assert.equal(container.querySelector(".settings-content > header h1")?.textContent, "权限与安全");
+    assert.equal(container.querySelector("#settings-security")?.getAttribute("aria-hidden"), null);
+  });
+});
+
+test("Provider Apply adopts the safe persisted group and key status without copying the key", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const saved = {
+      ...baseConfiguration(),
+      providers: { provider: { kind: "openai_compat", base_url: "https://saved.example/v1", display_name: "Saved gateway", api_key_configured: true } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "saved-remote", display_name: "Saved model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none", supports_images: false } },
+    };
+    let submitted: ConfigurationWrite | null = null;
+    const initial = createInitialState({
+      configuration: { ...baseConfiguration(), providers: { provider: { ...baseConfiguration().providers.provider, api_key_configured: false } } },
+      settingsLoaded: true,
+    });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={initial} onBack={() => undefined} onSave={async (request) => { submitted = request; return saved; }} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const row = container.querySelector<HTMLButtonElement>(".provider-row");
+    assert.ok(row);
+    act(() => { row!.click(); });
+    await tick();
+    const displayName = container.querySelector<HTMLInputElement>("#modal-provider-display-name");
+    const apiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
+    assert.ok(displayName && apiKey);
+    act(() => { setInput(dom, displayName!, "Draft gateway"); setInput(dom, apiKey!, "one-time-secret"); });
+    await tick();
+    const apply = container.querySelector<HTMLButtonElement>('.settings-editor-modal footer button[title="Apply"]');
+    assert.ok(apply);
+    act(() => { apply!.click(); });
+    await tick();
+
+    assert.equal(submitted?.providers?.provider?.api_key, "one-time-secret");
+    const savedRow = container.querySelector(".provider-row");
+    assert.match(savedRow?.textContent ?? "", /Saved gateway/u);
+    assert.match(savedRow?.textContent ?? "", /saved\.example/u);
+    assert.match(savedRow?.textContent ?? "", /Saved model/u);
+    assert.match(container.textContent ?? "", /API key saved/u);
+    assert.doesNotMatch(container.textContent ?? "", /one-time-secret/u);
+  });
 });

@@ -151,6 +151,12 @@ export interface CompactionStatusProjection {
   reason?: string;
 }
 
+export interface SettingsApplicationStatus {
+  applied: number;
+  pending: number;
+  failed: number;
+}
+
 export interface SessionSummary {
   session_id: string;
   project_key?: string;
@@ -374,6 +380,8 @@ export interface RendererState {
   settingsError: string | null;
   settingsSaving: boolean;
   settingsLoaded: boolean;
+  settingsApplications: SettingsApplicationStatus;
+  settingsWriteFailures: number;
   ignoredRunIds: string[];
   /** Increments only when the visible Session/Project timeline is replaced. */
   sessionViewRevision: number;
@@ -458,6 +466,8 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   settingsError: null,
   settingsSaving: false,
   settingsLoaded: false,
+  settingsApplications: { applied: 0, pending: 0, failed: 0 },
+  settingsWriteFailures: 0,
   ignoredRunIds: [],
   sessionViewRevision: 0,
   nextStatusId: 1,
@@ -1433,6 +1443,8 @@ export type RendererAction =
   | { type: "set_focus_mode"; value: boolean }
   | { type: "set_view"; view: "chat" | "settings" }
   | { type: "settings_loaded"; configuration: ConfigurationView }
+  | { type: "settings_applications"; value: SettingsApplicationStatus }
+  | { type: "settings_write_failures"; value: number }
   | { type: "settings_error"; message: string | null }
   | { type: "settings_saving"; value: boolean };
 
@@ -2198,6 +2210,10 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         settingsLoaded: true,
         settingsError: null,
       };
+    case "settings_applications":
+      return { ...state, settingsApplications: action.value };
+    case "settings_write_failures":
+      return { ...state, settingsWriteFailures: Math.max(0, action.value) };
     case "settings_error":
       return { ...state, settingsError: action.message };
     case "settings_saving":

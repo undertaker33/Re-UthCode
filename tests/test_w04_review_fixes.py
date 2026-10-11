@@ -45,6 +45,7 @@ from uthcode.core.provider import (
 from uthcode.integrations.tools.process_sessions import ProcessSessionManager
 from uthcode.interfaces.desktop.bridge import DesktopBridge
 from uthcode.interfaces.desktop.protocol import RequestEnvelope
+import uthcode.interfaces.desktop.bridge as bridge_module
 
 
 def _response(
@@ -514,6 +515,172 @@ async def test_desktop_settings_save_reloads_search_for_next_turn_and_keeps_proc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reload_fails", [False, True], ids=("applied", "apply-failed"))
+async def test_desktop_settings_save_keeps_active_turn_snapshot_then_applies_at_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reload_fails: bool,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "fake-model"
+
+[search]
+enabled = false
+''',
+        encoding="utf-8",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProvider(_ScriptedProvider):
+        async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken) -> AsyncIterator[ProviderEvent]:
+            self.requests.append(request)
+            cancellation.raise_if_cancelled()
+            if len(self.requests) == 1:
+                started.set()
+                await release.wait()
+            yield _response(ProviderTextPart(f"turn-{len(self.requests)}"))
+
+    provider = BlockingProvider(())
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    if reload_fails:
+        def fail_reload(_configuration: EffectiveConfig) -> None:
+            raise RuntimeError("synthetic active-Turn application failure")
+
+        monkeypatch.setattr(application, "reload_configuration", fail_reload)
+    bridge = DesktopBridge(application=application, home=home, workdir=tmp_path)
+    application.ensure_session()
+    try:
+        first = await bridge.handle_request(
+            RequestEnvelope(
+                "active-turn-start",
+                "turn.start",
+                {"prompt": "the current request keeps its original tools"},
+            )
+        )
+        assert first.ok is True
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not any(definition.name == "WebSearch" for definition in provider.requests[0].tools)
+
+        saved = await bridge.handle_request(
+            RequestEnvelope(
+                "active-turn-settings-save",
+                "settings.save",
+                {"search": {"enabled": True, "provider": "tavily", "api_key": "turn-search-secret", "max_results": 2}},
+            )
+        )
+        assert saved.ok is True and saved.result is not None
+        assert saved.result["durable"] == "saved"
+        assert saved.result["applications"] == {"applied": 0, "pending": 1, "failed": 0}
+        assert application.configuration.search is None or application.configuration.search.enabled is False  # type: ignore[union-attr]
+
+        release.set()
+        await bridge.wait_for_idle()
+        assert provider.requests[0].model == "fake-model"
+        assert application.configuration.search.enabled is (not reload_fails)  # type: ignore[union-attr]
+        events = [item.event for item in bridge.drain_outbox() if hasattr(item, "event")]
+        turn_index = next(index for index, event in enumerate(events) if event.get("type") == "turn_completed")
+        application_index = next(index for index, event in enumerate(events) if event.get("type") == "settings_applications")
+        assert turn_index < application_index
+        assert events[application_index] == {
+            "type": "settings_applications",
+            "applied": 0 if reload_fails else 1,
+            "pending": 0,
+            "failed": 1 if reload_fails else 0,
+        }
+
+        second = await bridge.handle_request(
+            RequestEnvelope(
+                "idle-turn-start",
+                "turn.start",
+                {"prompt": "the next request sees the applied tools"},
+            )
+        )
+        assert second.ok is True
+        await bridge.wait_for_idle()
+        assert len(provider.requests) == 2
+        assert any(definition.name == "WebSearch" for definition in provider.requests[-1].tools) is (not reload_fails)
+    finally:
+        release.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_retry_apply_does_not_repeat_durable_writer_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    user = home / ".uthcode" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        '''default_model = "local/ref"
+
+[providers.local]
+kind = "fake"
+
+[models."local/ref"]
+provider = "local"
+remote_id = "fake-model"
+''',
+        encoding="utf-8",
+    )
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: _ScriptedProvider(((_response(ProviderTextPart("unused")),),)),
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    real_writer = bridge_module.write_user_configuration
+    writes = 0
+
+    def counted_writer(request: object, *, home: Path | None = None) -> object:
+        nonlocal writes
+        writes += 1
+        return real_writer(request, home=home)  # type: ignore[arg-type]
+
+    def fail_reload(_configuration: EffectiveConfig) -> None:
+        raise RuntimeError("synthetic application reload failure")
+
+    monkeypatch.setattr(bridge_module, "write_user_configuration", counted_writer)
+    monkeypatch.setattr(application, "reload_configuration", fail_reload)
+    bridge = DesktopBridge(application=application, home=home, workdir=tmp_path)
+    try:
+        saved = await bridge.handle_request(
+            RequestEnvelope("failed-apply-save", "settings.save", {"default_permission_mode": "auto"})
+        )
+        assert saved.ok is True and saved.result is not None
+        assert saved.result["durable"] == "saved"
+        assert saved.result["applications"] == {"applied": 0, "pending": 0, "failed": 1}
+        durable_text = user.read_text(encoding="utf-8")
+        assert "default_permission_mode = \"auto\"" in durable_text
+        assert writes == 1
+
+        retried = await bridge.handle_request(RequestEnvelope("retry-apply-only", "settings.retry_apply", {}))
+        assert retried.ok is True and retried.result is not None
+        assert retried.result["applications"] == {"applied": 0, "pending": 0, "failed": 1}
+        assert writes == 1, "retry_apply retries Application application only"
+        assert user.read_text(encoding="utf-8") == durable_text
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_desktop_settings_save_reloads_idle_background_runtime_before_resume(
     tmp_path: Path,
 ) -> None:
@@ -670,3 +837,495 @@ async def test_process_projection_keeps_old_secret_until_child_retires(
     finally:
         unsubscribe()
         await application.close_async()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+async def test_turn_terminal_without_configuration_patch_preserves_provider_and_full_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    home = tmp_path / "home"
+    write_user_configuration(
+        {
+            "default_model": "local/ref",
+            "default_permission_mode": "default",
+            "providers": {"local": {"kind": "fake"}},
+            "models": {"local/ref": {"provider_profile_id": "local", "remote_id": "fake-model"}},
+        },
+        home=home,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FailingProvider(_ScriptedProvider):
+        async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken) -> AsyncIterator[ProviderEvent]:
+            self.requests.append(request)
+            raise RuntimeError("synthetic provider failure")
+            if False:  # pragma: no cover - makes this an async generator
+                yield _response(ProviderTextPart("unreachable"))
+
+    class BlockingProvider(_ScriptedProvider):
+        async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken) -> AsyncIterator[ProviderEvent]:
+            self.requests.append(request)
+            started.set()
+            while not release.is_set() and not cancellation.cancelled:
+                await asyncio.sleep(0.005)
+            cancellation.raise_if_cancelled()
+            yield _response(ProviderTextPart("cancelled fixture"))
+
+    provider: _ScriptedProvider
+    if outcome == "failure":
+        provider = FailingProvider(())
+    elif outcome == "cancelled":
+        provider = BlockingProvider(())
+    else:
+        provider = _ScriptedProvider(((_response(ProviderTextPart("completed fixture")),),))
+    application = create_application(
+        _config(),
+        provider_builder=lambda _provider, _model: provider,
+        runtime_context=_context(tmp_path),
+        storage_root=tmp_path / "sessions",
+    )
+    reloads = 0
+    real_reload = application.reload_configuration
+
+    def counted_reload(configuration: EffectiveConfig) -> None:
+        nonlocal reloads
+        reloads += 1
+        real_reload(configuration)
+
+    monkeypatch.setattr(application, "reload_configuration", counted_reload)
+    bridge = DesktopBridge(application=application, home=home, workdir=tmp_path)
+    run = bridge.run
+    assert run is not None
+    run.set_permission_mode(PermissionMode.FULL_ACCESS)
+
+    # A user-file change by another process is not an authorized Settings
+    # write.  An empty safe-boundary drain must not reload it or reset Run mode.
+    write_user_configuration(
+        {
+            "default_model": "disk/ref",
+            "providers": {"local": None, "disk": {"kind": "fake"}},
+            "models": {
+                "local/ref": None,
+                "disk/ref": {"provider_profile_id": "disk", "remote_id": "disk-model"},
+            },
+        },
+        home=home,
+    )
+
+    try:
+        started_reply = await bridge.handle_request(
+            RequestEnvelope(f"no-patch-{outcome}", "turn.start", {"prompt": "exercise an idle drain"})
+        )
+        assert started_reply.ok is True
+        if outcome == "cancelled":
+            await asyncio.wait_for(started.wait(), timeout=2)
+            cancelled = await bridge.handle_request(RequestEnvelope("no-patch-cancel", "turn.cancel", {}))
+            assert cancelled.ok is True
+        await bridge.wait_for_idle()
+
+        assert reloads == 0
+        assert application.configuration.default_model == "local/ref"  # type: ignore[union-attr]
+        assert set(application.configuration.providers) == {"local"}  # type: ignore[union-attr]
+        assert run.permission_mode is PermissionMode.FULL_ACCESS
+        events = [item.event.get("type") for item in bridge.drain_outbox() if hasattr(item, "event")]
+        assert "settings_applications" not in events
+        if outcome == "success":
+            assert "turn_completed" in events
+        elif outcome == "failure":
+            assert "turn_failed" in events
+        else:
+            assert "turn_cancelled" in events
+    finally:
+        release.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_terminal", ["turn", "compact"], ids=("turn-first", "compact-first"))
+async def test_owner_terminal_drains_without_save_do_not_create_cross_owner_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_terminal: str,
+) -> None:
+    home = tmp_path / "home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    write_user_configuration(
+        {
+            "default_model": "local/ref",
+            "default_permission_mode": "default",
+            "providers": {"local": {"kind": "fake"}},
+            "models": {"local/ref": {"provider_profile_id": "local", "remote_id": "fake-model"}},
+        },
+        home=home,
+    )
+    turn_started = asyncio.Event()
+    release_turn = asyncio.Event()
+    compact_started = asyncio.Event()
+    release_compact = asyncio.Event()
+
+    class BlockingProvider(_ScriptedProvider):
+        async def stream(
+            self,
+            request: GenerationRequest,
+            *,
+            cancellation: CancellationToken,
+        ) -> AsyncIterator[ProviderEvent]:
+            self.requests.append(request)
+            turn_started.set()
+            await release_turn.wait()
+            cancellation.raise_if_cancelled()
+            yield _response(ProviderTextPart("background turn completed"))
+
+    turn_provider = BlockingProvider(())
+
+    def make_application(path: Path) -> object:
+        selected_provider = turn_provider if path.resolve() == project_a.resolve() else _ScriptedProvider(())
+        return create_application(
+            load_effective_config(cwd=path, home=home),
+            provider_builder=lambda _provider, _model: selected_provider,
+            runtime_context=_context(path),
+            storage_root=tmp_path / "sessions" / path.name,
+        )
+
+    application_a = make_application(project_a)
+    application_a.ensure_session()
+    session_a = application_a.session_service.active_session  # type: ignore[union-attr]
+    assert session_a is not None
+    bridge = DesktopBridge(
+        application=application_a,
+        application_factory=make_application,
+        home=home,
+        workdir=project_a,
+    )
+    run_a = bridge.run
+    assert run_a is not None
+    run_a.set_permission_mode(PermissionMode.FULL_ACCESS)
+    reload_counts = {"a": 0, "b": 0}
+
+    def count_reloads(application: object, key: str) -> None:
+        original_reload = application.reload_configuration
+
+        def counted_reload(configuration: EffectiveConfig) -> None:
+            reload_counts[key] += 1
+            original_reload(configuration)
+
+        monkeypatch.setattr(application, "reload_configuration", counted_reload)
+
+    count_reloads(application_a, "a")
+    try:
+        started_reply = await bridge.handle_request(
+            RequestEnvelope("multi-owner-turn-start", "turn.start", {"prompt": "hold owner A active"})
+        )
+        assert started_reply.ok is True
+        await asyncio.wait_for(turn_started.wait(), timeout=2)
+
+        opened = await bridge.handle_request(
+            RequestEnvelope("multi-owner-project-open", "project.open", {"path": str(project_b)})
+        )
+        assert opened.ok is True
+        background_a = bridge._background_runtimes[session_a.session_id]
+        assert background_a["application"] is application_a
+        turn_task = background_a["task"]
+        assert isinstance(turn_task, asyncio.Task)
+
+        new_session = await bridge.handle_request(RequestEnvelope("multi-owner-session-new", "session.new", {}))
+        assert new_session.ok is True
+        application_b = bridge.application
+        run_b = bridge.run
+        assert application_b is not None and application_b is not application_a
+        assert run_b is not None
+        run_b.set_permission_mode(PermissionMode.FULL_ACCESS)
+        count_reloads(application_b, "b")
+        original_compact = application_b.compact_session
+
+        async def gated_compact(*, cancellation: CancellationToken | None = None) -> object:
+            compact_started.set()
+            await release_compact.wait()
+            return await original_compact(cancellation=cancellation)
+
+        monkeypatch.setattr(application_b, "compact_session", gated_compact)
+        compact_reply = await bridge.handle_request(
+            RequestEnvelope("multi-owner-compact-start", "command.execute", {"text": "/compact"})
+        )
+        assert compact_reply.ok is True
+        assert compact_reply.result is not None
+        compact_session_id = compact_reply.result["params"]["session_id"]
+        await asyncio.wait_for(compact_started.wait(), timeout=2)
+        compact_operation = bridge._compaction_operations[compact_session_id]
+        compact_task = compact_operation["task"]
+        assert isinstance(compact_task, asyncio.Task)
+
+        original_config_a = application_a.configuration
+        original_config_b = application_b.configuration
+        assert original_config_a is not None and original_config_b is not None
+        write_user_configuration(
+            {
+                "default_model": "disk/ref",
+                "providers": {
+                    "local": None,
+                    "disk": {"kind": "fake"},
+                },
+                "models": {
+                    "local/ref": None,
+                    "disk/ref": {"provider_profile_id": "disk", "remote_id": "disk-model"},
+                },
+            },
+            home=home,
+        )
+        assert bridge._configuration_application_states == {}
+
+        def assert_no_unrequested_apply() -> None:
+            assert bridge._configuration_application_states == {}
+            assert reload_counts == {"a": 0, "b": 0}
+            assert application_a.configuration is original_config_a
+            assert application_b.configuration is original_config_b
+            assert set(application_a.configuration.providers) == {"local"}
+            assert set(application_b.configuration.providers) == {"local"}
+            assert run_a.permission_mode is PermissionMode.FULL_ACCESS
+            assert run_b.permission_mode is PermissionMode.FULL_ACCESS
+            events = [item.event for item in bridge.drain_outbox() if hasattr(item, "event")]
+            assert not any(event.get("type") == "settings_applications" for event in events)
+
+        if first_terminal == "turn":
+            release_turn.set()
+            await asyncio.wait_for(asyncio.shield(turn_task), timeout=2)
+            assert_no_unrequested_apply()
+            release_compact.set()
+            await asyncio.wait_for(asyncio.shield(compact_task), timeout=2)
+        else:
+            release_compact.set()
+            await asyncio.wait_for(asyncio.shield(compact_task), timeout=2)
+            assert_no_unrequested_apply()
+            release_turn.set()
+            await asyncio.wait_for(asyncio.shield(turn_task), timeout=2)
+        assert_no_unrequested_apply()
+    finally:
+        release_turn.set()
+        release_compact.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reload_fails", [False, True], ids=("applied", "failed"))
+async def test_cross_project_background_turn_publishes_drained_configuration_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reload_fails: bool,
+) -> None:
+    home = tmp_path / "home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    write_user_configuration(
+        {
+            "default_model": "local/ref",
+            "default_permission_mode": "default",
+            "providers": {"local": {"kind": "fake"}},
+            "models": {"local/ref": {"provider_profile_id": "local", "remote_id": "fake-model"}},
+        },
+        home=home,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BackgroundProvider(_ScriptedProvider):
+        async def stream(self, request: GenerationRequest, *, cancellation: CancellationToken) -> AsyncIterator[ProviderEvent]:
+            self.requests.append(request)
+            started.set()
+            await release.wait()
+            cancellation.raise_if_cancelled()
+            if reload_fails:
+                yield _response(ProviderTextPart("turn still completes after apply failure"))
+            else:
+                yield _response(ProviderTextPart("turn completed"))
+
+    provider = BackgroundProvider(())
+
+    def make_application(path: Path, selected_provider: _ScriptedProvider) -> object:
+        return create_application(
+            load_effective_config(cwd=path, home=home),
+            provider_builder=lambda _provider, _model: selected_provider,
+            runtime_context=_context(path),
+            storage_root=tmp_path / "sessions" / path.name,
+        )
+
+    application_a = make_application(project_a, provider)
+    application_a.ensure_session()
+    session = application_a.session_service.active_session  # type: ignore[union-attr]
+    assert session is not None
+    bridge = DesktopBridge(
+        application=application_a,
+        application_factory=lambda path: make_application(path, _ScriptedProvider(())),
+        home=home,
+        workdir=project_a,
+    )
+    if reload_fails:
+        def fail_reload(_configuration: EffectiveConfig) -> None:
+            raise RuntimeError("synthetic application-apply failure")
+
+        monkeypatch.setattr(application_a, "reload_configuration", fail_reload)
+
+    try:
+        started_reply = await bridge.handle_request(
+            RequestEnvelope("cross-project-turn-start", "turn.start", {"prompt": "finish in the background"})
+        )
+        assert started_reply.ok is True
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        opened = await bridge.handle_request(
+            RequestEnvelope("cross-project-open", "project.open", {"path": str(project_b)})
+        )
+        assert opened.ok is True
+        background = bridge._background_runtimes[session.session_id]
+        assert background["application"] is application_a
+        assert background["handle"] is not None
+        assert background["task"] is not None
+
+        saved = await bridge.handle_request(
+            RequestEnvelope("cross-project-settings", "settings.save", {"default_permission_mode": "auto"})
+        )
+        assert saved.ok is True
+        assert saved.result is not None
+        assert saved.result["applications"] == {"applied": 1, "pending": 1, "failed": 0}
+
+        release.set()
+        task = background["task"]
+        assert isinstance(task, asyncio.Task)
+        await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        events = [
+            item.event
+            for item in bridge.drain_outbox()
+            if hasattr(item, "event")
+        ]
+        turn_index = next(index for index, event in enumerate(events) if event.get("type") == "turn_completed")
+        application_index = next(index for index, event in enumerate(events) if event.get("type") == "settings_applications")
+        assert events[turn_index]["project_key"] == str(project_a.resolve())
+        assert turn_index < application_index
+        assert events[application_index] == {
+            "type": "settings_applications",
+            "applied": 1 if reload_fails else 2,
+            "pending": 0,
+            "failed": 1 if reload_fails else 0,
+        }
+        assert "api_key" not in events[application_index]
+    finally:
+        release.set()
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact_fails", [False, True], ids=("completed-no-change", "operation-failed"))
+@pytest.mark.parametrize("reload_fails", [False, True], ids=("application-applied", "application-failed"))
+async def test_compaction_terminal_publishes_drained_configuration_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_fails: bool,
+    reload_fails: bool,
+) -> None:
+    home = tmp_path / "home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    write_user_configuration(
+        {
+            "default_model": "local/ref",
+            "default_permission_mode": "default",
+            "providers": {"local": {"kind": "fake"}},
+            "models": {"local/ref": {"provider_profile_id": "local", "remote_id": "fake-model"}},
+        },
+        home=home,
+    )
+    def make_application(path: Path) -> object:
+        return create_application(
+            load_effective_config(cwd=path, home=home),
+            provider_builder=lambda _provider, _model: _ScriptedProvider(()),
+            runtime_context=_context(path),
+            storage_root=tmp_path / "sessions" / path.name,
+        )
+
+    application_a = make_application(project_a)
+    application_a.ensure_session()
+    session = application_a.session_service.active_session  # type: ignore[union-attr]
+    assert session is not None
+    if reload_fails:
+        def fail_reload(_configuration: EffectiveConfig) -> None:
+            raise RuntimeError("synthetic Compact-boundary application failure")
+
+        monkeypatch.setattr(application_a, "reload_configuration", fail_reload)
+    original_compact = application_a.compact_session
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_compact(*, cancellation: CancellationToken | None = None) -> object:
+        started.set()
+        await release.wait()
+        if compact_fails:
+            raise RuntimeError("synthetic compaction failure")
+        return await original_compact(cancellation=cancellation)
+
+    monkeypatch.setattr(application_a, "compact_session", gated_compact)
+    bridge = DesktopBridge(
+        application=application_a,
+        application_factory=make_application,
+        home=home,
+        workdir=project_a,
+    )
+    try:
+        compact = await bridge.handle_request(
+            RequestEnvelope("compact-settings-start", "command.execute", {"text": "/compact"})
+        )
+        assert compact.ok is True
+        assert compact.result is not None
+        operation_id = compact.result["params"]["operation_id"]
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        opened = await bridge.handle_request(
+            RequestEnvelope("compact-background-open", "project.open", {"path": str(project_b)})
+        )
+        assert opened.ok is True
+        background = bridge._background_runtimes[session.session_id]
+        assert background["application"] is application_a
+        assert bridge._compaction_operations[session.session_id]["state"] == "running"
+
+        saved = await bridge.handle_request(
+            RequestEnvelope("compact-settings-save", "settings.save", {"default_permission_mode": "auto"})
+        )
+        assert saved.ok is True
+        assert saved.result is not None
+        assert saved.result["applications"] == {"applied": 1, "pending": 1, "failed": 0}
+
+        release.set()
+        operation = bridge._compaction_operations[session.session_id]
+        task = operation["task"]
+        assert isinstance(task, asyncio.Task)
+        await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        events = [
+            item.event
+            for item in bridge.drain_outbox()
+            if hasattr(item, "event")
+        ]
+        terminal_index = next(
+            index for index, event in enumerate(events)
+            if event.get("type") == "compaction_operation" and event.get("operation_id") == operation_id
+            and event.get("state") == ("failed" if compact_fails else "no_change")
+        )
+        application_index = next(index for index, event in enumerate(events) if event.get("type") == "settings_applications")
+        assert terminal_index < application_index
+        assert events[application_index] == {
+            "type": "settings_applications",
+            "applied": 1 if reload_fails else 2,
+            "pending": 0,
+            "failed": 1 if reload_fails else 0,
+        }
+    finally:
+        release.set()
+        await bridge.shutdown()
