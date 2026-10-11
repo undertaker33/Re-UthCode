@@ -405,6 +405,127 @@ test("T09 App reviews preserve Runtime error ownership and let its toggle restor
   });
 });
 
+test("T09 App auto-discovers current workspace changes without taking the panel and discards a late owner result", async () => {
+  const projectPath = "C:/summary-owner";
+  const firstSession = "summary-session-a";
+  const secondSession = "summary-session-b";
+  const project: ProjectState = {
+    path: projectPath,
+    projectKey: projectPath,
+    alias: "Summary owner",
+    pinned: false,
+    catalogFresh: true,
+    sessions: [
+      { session_id: firstSession, project_key: projectPath, title: "Summary session A" },
+      { session_id: secondSession, project_key: projectPath, title: "Summary session B" },
+    ],
+  };
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  let diffSequence = 0;
+  let resolveLateKickoff: ((value: JsonValue) => void) | null = null;
+  const diffEvent = (operationId: string, path = "src/created.py"): AgentEvent => ({
+    type: "workspace_diff_result",
+    operation_id: operationId,
+    owner_key: projectPath,
+    state: "completed",
+    source: "current_working_tree",
+    project_key: projectPath,
+    viewed_at: "2026-10-11T03:00:00.000Z",
+    status: { branch: "main", entries: [{ xy: " M", path }], unborn: false, truncated: false },
+    staged_diff: { text: `diff --git a/${path} b/${path}\n@@ -0,0 +1 @@\n+written`, truncated: false, size_bytes: 50 },
+    unstaged_diff: { text: "", truncated: false, size_bytes: 0 },
+    truncated: false,
+  } as AgentEvent);
+  const api = appTestApi(async (method, params = {}) => {
+    calls.push({ method, params: { ...params } });
+    if (method === "workspace.diff") {
+      diffSequence += 1;
+      if (diffSequence === 1) {
+        eventListener?.(diffEvent("summary-operation-1"));
+        return { operation_id: "summary-operation-1", owner_key: projectPath, state: "reviewing" };
+      }
+      if (diffSequence === 2) {
+        eventListener?.(diffEvent("review-operation-2"));
+        return { operation_id: "review-operation-2", owner_key: projectPath, state: "reviewing" };
+      }
+      if (diffSequence === 3) {
+        eventListener?.(diffEvent("late-summary-operation-3", "src/old-owner.py"));
+        return await new Promise<JsonValue>((resolve) => { resolveLateKickoff = resolve; });
+      }
+      return { operation_id: `unused-operation-${diffSequence}`, owner_key: projectPath, state: "reviewing" };
+    }
+    if (method === "workspace.diff.cancel") return { operation_id: params.operation_id ?? null, state: "cancelled" };
+    if (method === "project.sessions") return { sessions: project.sessions };
+    if (method === "session.resume") return { session_id: params.session_id ?? null, replay: [], run: null };
+    if (method === "history.page") return { session_id: params.session_id ?? null, records: [], next_cursor: null, has_more: false };
+    return method === "status.get" ? { active_turn: false } : {};
+  });
+  api.subscribeAgentEvents = (listener) => { eventListener = listener; return () => { eventListener = null; }; };
+  api.readPreference = async (key) => {
+    const values: Record<string, unknown> = {
+      theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+      recentProjects: [{ path: projectPath, alias: project.alias, pinned: false }],
+      projectAliases: { [projectPath]: project.alias }, pinnedProjectKeys: [], pinnedSessions: [],
+      expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: firstSession,
+    };
+    return values[key] as never;
+  };
+  const state = createInitialState({
+    language: "en", mode: "coding", panelMode: "docked", runtimeState: "ready",
+    projects: [project], selectedProjectKey: projectPath, selectedSessionId: firstSession,
+    expandedProjects: { [projectPath]: true }, timeline: [],
+  });
+  const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App api={api} initialState={state} />); });
+    await flush(10);
+    assert.ok(eventListener);
+    act(() => { eventListener!({
+      type: "tool_finished", project_key: projectPath, session_id: firstSession,
+      run_id: "summary-run", turn_id: "summary-turn", batch_id: "summary-batch",
+      tool_call_id: "summary-write-1", tool_name: "WriteFile", status: "succeeded", is_error: false,
+    } as AgentEvent); });
+    await flush(180);
+    assert.equal(calls.filter((call) => call.method === "workspace.diff").length, 1, "a successful live writer takes one real current-diff snapshot");
+    const summary = container.querySelector<HTMLElement>("[data-workspace-change-summary]");
+    assert.ok(summary);
+    assert.match(summary.textContent ?? "", /Files changed: 1/u);
+    assert.match(summary.textContent ?? "", /\+1/u);
+    assert.match(summary.textContent ?? "", /src\/created\.py/u);
+    assert.equal(container.querySelector(".review-panel"), null, "background discovery leaves the user's shared right-panel selection alone");
+    assert.ok(container.querySelector("#runtime-panel"), "background discovery does not replace the preferred Runtime panel");
+
+    const viewChanges = [...summary.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "View changes");
+    assert.ok(viewChanges);
+    act(() => { viewChanges.click(); });
+    await flush(10);
+    assert.ok(container.querySelector(".review-panel"), "the explicit summary action opens the existing ReviewPanel");
+    assert.deepEqual(calls.filter((call) => call.method === "workspace.diff")[1]?.params, { project_key: projectPath });
+
+    act(() => { eventListener!({
+      type: "tool_finished", project_key: projectPath, session_id: firstSession,
+      run_id: "summary-run", turn_id: "summary-turn", batch_id: "summary-batch",
+      tool_call_id: "summary-write-2", tool_name: "EditFile", status: "succeeded", is_error: false,
+    } as AgentEvent); });
+    await flush(180);
+    assert.equal(typeof resolveLateKickoff, "function", "the second summary request is pending for the old Session owner");
+    const nextSession = [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes("Summary session B"));
+    assert.ok(nextSession);
+    act(() => { nextSession.click(); });
+    await flush(10);
+    assert.equal(container.querySelector("[data-workspace-change-summary]"), null, "the old Session summary is removed on navigation");
+    resolveLateKickoff!({ operation_id: "late-summary-operation-3", owner_key: projectPath, state: "reviewing" });
+    await flush(10);
+    assert.ok(calls.some((call) => call.method === "workspace.diff.cancel" && call.params.operation_id === "late-summary-operation-3"), "a kickoff returned after navigation is cancelled under its old owner");
+    act(() => { eventListener!(diffEvent("late-summary-operation-3", "src/old-owner.py")); });
+    await flush(10);
+    assert.doesNotMatch(container.textContent ?? "", /old-owner\.py/u, "a late old-owner result cannot populate the new Session");
+  });
+});
+
 test("T09 App reviews the kickoff event, bounded output pages, process log, and rejects stale owners", async () => {
   const projectPath = "C:/review-owner";
   const firstSession = "review-session-a";

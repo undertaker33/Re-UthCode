@@ -1,4 +1,4 @@
-import { useState, type ElementType, type ReactNode } from "react";
+import { Fragment, useId, useState, type ElementType, type ReactNode } from "react";
 import { useTranslation } from "./i18n";
 import type { ArtifactDescriptor } from "../desktop-api";
 import { FileCard, fileExtension, fileKind, type FilePreviewMode } from "./FileCard";
@@ -123,6 +123,33 @@ function UnresolvedArtifactCard({
   />;
 }
 
+function ArtifactReferenceLink({ path, label, artifact, options }: { path: string; label: string; artifact?: ArtifactDescriptor; options: MarkdownRenderOptions }) {
+  const { t } = useTranslation();
+  const errorId = useId();
+  const [resolved, setResolved] = useState<ArtifactDescriptor | null>(artifact ?? null);
+  const [failed, setFailed] = useState(false);
+  const open = async () => {
+    const descriptor = resolved ?? await options.onDescribeArtifact?.(path) ?? null;
+    if (descriptor) setResolved(descriptor);
+    if (options.onDescribeArtifact && !descriptor) {
+      setFailed(true);
+      return;
+    }
+    await options.onOpenArtifact?.(descriptor?.path ?? path);
+    setFailed(false);
+  };
+  return <>
+    <a
+      className="markdown-artifact-link"
+      href="#artifact"
+      onClick={(event) => { event.preventDefault(); void open().catch(() => setFailed(true)); }}
+      aria-label={label}
+      aria-describedby={failed ? errorId : undefined}
+    >{label}</a>
+    {failed && <span id={errorId} className="markdown-artifact-link__error" role="alert">{t("artifactOpenFailed")}</span>}
+  </>;
+}
+
 interface InlineToken {
   start: number;
   end: number;
@@ -200,7 +227,7 @@ function nextInlineToken(source: string, from: number): InlineToken | null {
   return null;
 }
 
-export function renderInline(source: string, options: MarkdownRenderOptions = {}): ReactNode[] {
+export function renderInline(source: string, options: MarkdownRenderOptions = {}, artifactPaths?: Map<string, string>): ReactNode[] {
   const nodes: ReactNode[] = [];
   let last = 0;
   let index = 0;
@@ -215,7 +242,9 @@ export function renderInline(source: string, options: MarkdownRenderOptions = {}
       const target = token.target ?? "";
       if (target.startsWith("artifact:") && (options.onDescribeArtifact || options.onOpenArtifact || options.artifacts?.[target.slice("artifact:".length)])) {
         const path = target.slice("artifact:".length);
-        nodes.push(<UnresolvedArtifactCard key={`artifact-card-${index}`} path={path} label={token.label ?? path} artifact={options.artifacts?.[path]} options={options} />);
+        const label = token.label ?? path;
+        artifactPaths?.set(path, label);
+        nodes.push(<ArtifactReferenceLink key={`artifact-link-${index}`} path={path} label={label} artifact={options.artifacts?.[path]} options={options} />);
       } else {
         const href = safeHref(target);
         nodes.push(href ? <a key={`link-${index}`} href={href} target="_blank" rel="noreferrer">{token.label}</a> : <span key={`link-${index}`}>{token.label}</span>);
@@ -301,7 +330,7 @@ export function CodeFence({ code, language, onCopyText }: CodeFenceProps) {
   </div>;
 }
 
-function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): ReactNode {
+function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions, artifactPaths: Map<string, string>): ReactNode {
   const lineRecords = splitMarkdownLines(source);
   const lines = lineRecords.map((line) => line.text);
   const blocks: ReactNode[] = [];
@@ -342,7 +371,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
     if (heading) {
       const level = heading[1].length;
       const Heading = `h${level}` as ElementType;
-      blocks.push(<Heading key={`heading-${blockIndex}`}>{renderInline(heading[2], options)}</Heading>);
+      blocks.push(<Heading key={`heading-${blockIndex}`}>{renderInline(heading[2], options, artifactPaths)}</Heading>);
       index += 1;
       blockIndex += 1;
       continue;
@@ -355,7 +384,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         rows.push(tableCells(lines[index] ?? ""));
         index += 1;
       }
-      blocks.push(<div key={`table-${blockIndex}`} className="markdown-table-scroll"><table><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell, options)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "", options)}</td>)}</tr>)}</tbody></table></div>);
+      blocks.push(<div key={`table-${blockIndex}`} className="markdown-table-scroll"><table><thead><tr>{header.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInline(cell, options, artifactPaths)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{header.map((_cell, cellIndex) => <td key={`td-${cellIndex}`}>{renderInline(row[cellIndex] ?? "", options, artifactPaths)}</td>)}</tr>)}</tbody></table></div>);
       blockIndex += 1;
       continue;
     }
@@ -365,7 +394,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         quote.push((lines[index] ?? "").replace(/^\s*>\s?/u, ""));
         index += 1;
       }
-      blocks.push(<blockquote key={`quote-${blockIndex}`}>{renderMarkdownBlocks(quote.join("\n"), options)}</blockquote>);
+      blocks.push(<blockquote key={`quote-${blockIndex}`}>{renderMarkdownBlocks(quote.join("\n"), options, artifactPaths)}</blockquote>);
       blockIndex += 1;
       continue;
     }
@@ -382,7 +411,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
         index += 1;
       }
       const List = orderedList ? "ol" : "ul";
-      blocks.push(<List key={`list-${blockIndex}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInline(item, options)}</li>)}</List>);
+      blocks.push(<List key={`list-${blockIndex}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInline(item, options, artifactPaths)}</li>)}</List>);
       blockIndex += 1;
       continue;
     }
@@ -394,12 +423,7 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
       paragraph.push(next);
       index += 1;
     }
-    const artifactOnly = paragraph.length === 1 && /^\s*\[[^\]]+\]\(artifact:[^)\s]+\)\s*$/u.test(paragraph[0] ?? "");
-    if (artifactOnly) {
-      blocks.push(<div key={`paragraph-${blockIndex}`} className="markdown-artifact-block">{renderInline(paragraph[0] ?? "", options)}</div>);
-    } else {
-      blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part, options)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
-    }
+    blocks.push(<p key={`paragraph-${blockIndex}`}>{paragraph.map((part, partIndex) => <span key={`line-${partIndex}`}>{renderInline(part, options, artifactPaths)}{partIndex < paragraph.length - 1 && <br />}</span>)}</p>);
     blockIndex += 1;
   }
   return blocks;
@@ -407,5 +431,11 @@ function renderMarkdownBlocks(source: string, options: MarkdownRenderOptions): R
 
 /** Render the deliberately small safe Markdown subset without raw HTML. */
 export function renderMarkdown(source: string, options: MarkdownRenderOptions = {}): ReactNode {
-  return renderMarkdownBlocks(source, options);
+  const artifactPaths = new Map<string, string>();
+  const blocks = renderMarkdownBlocks(source, options, artifactPaths);
+  const canRenderCards = Boolean(options.onDescribeArtifact || options.onOpenArtifact || options.artifacts);
+  const cards = canRenderCards
+    ? Array.from(artifactPaths, ([path, label]) => <UnresolvedArtifactCard key={`artifact-card-${path}`} path={path} label={label} artifact={options.artifacts?.[path]} options={options} />)
+    : [];
+  return <Fragment>{blocks}{cards.length > 0 && <div className="markdown-artifact-attachments" aria-label="Referenced files">{cards}</div>}</Fragment>;
 }

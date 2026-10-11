@@ -6,7 +6,7 @@ import { useTranslation, type TranslationKey } from "./i18n";
 import { UiIcon, type UiIconName } from "./UiIcon";
 import { renderMarkdown } from "./safe-markdown";
 import { FileCard, type FilePreviewMode } from "./FileCard";
-import type { DocumentPreview } from "./DocumentPreviewPanel";
+import type { DocumentPreview, WorkspaceDiffView } from "./DocumentPreviewPanel";
 
 /** Pixels from the end that still count as being at the bottom. */
 export const TIMELINE_NEAR_BOTTOM_THRESHOLD = 72;
@@ -133,7 +133,8 @@ export interface ChatTimelineProps {
   onOpenDocument?: (preview: DocumentPreview) => void;
   onViewToolOutput?: (entry: TimelineEntry) => void;
   onReviewProcessLog?: (processId: string) => void;
-  onReviewCurrentDiff?: (path: string) => void;
+  onReviewCurrentDiff?: (path?: string) => void;
+  workspaceDiffSummary?: { state: "reviewing" | "completed" | "failed"; diff?: WorkspaceDiffView };
   onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>;
   onOpenAttachment?: (ref: string) => Promise<void>;
   onRevealAttachment?: (ref: string) => Promise<void>;
@@ -211,6 +212,234 @@ function activitySpanSeconds(entries: readonly TimelineEntry[], now: number): nu
 
 function todoStatusLabel(status: TodoItem["status"], t: (key: TranslationKey) => string): string {
   return status === "completed" ? t("completed") : status === "in_progress" ? t("inProgress") : t("pending");
+}
+
+interface WorkspaceFileLineStats {
+  additions: number;
+  deletions: number;
+  complete: boolean;
+}
+
+interface WorkspaceChangeFile {
+  path: string;
+  originalPath?: string;
+  stats: WorkspaceFileLineStats | null;
+}
+
+interface WorkspaceChangeSummary {
+  files: WorkspaceChangeFile[];
+  additions: number;
+  deletions: number;
+  filesComplete: boolean;
+  linesComplete: boolean;
+}
+
+function readGitDiffPath(source: string, start: number): { value: string; end: number } | null {
+  let index = start;
+  while (index < source.length && /\s/u.test(source[index] ?? "")) index += 1;
+  const quoted = source[index] === '"';
+  if (quoted) index += 1;
+  const bytes: number[] = [];
+  const encoder = new TextEncoder();
+  let closed = !quoted;
+  while (index < source.length) {
+    const character = source[index] ?? "";
+    if (quoted && character === '"') {
+      index += 1;
+      closed = true;
+      break;
+    }
+    if (!quoted && /\s/u.test(character)) break;
+    if (character === "\\") {
+      index += 1;
+      const escaped = source[index] ?? "";
+      if (/[0-7]/u.test(escaped)) {
+        const octal = source.slice(index, index + 3);
+        if (!/^[0-7]{3}$/u.test(octal)) return null;
+        bytes.push(Number.parseInt(octal, 8));
+        index += 3;
+      } else {
+        const decoded: Record<string, number> = { t: 9, n: 10, r: 13, b: 8, f: 12, v: 11, "\\": 92, '"': 34 };
+        const code = decoded[escaped];
+        if (code === undefined) return null;
+        bytes.push(code);
+        index += 1;
+      }
+      continue;
+    }
+    const codePoint = source.codePointAt(index);
+    if (codePoint === undefined) return null;
+    const value = String.fromCodePoint(codePoint);
+    bytes.push(...encoder.encode(value));
+    index += value.length;
+  }
+  if (!closed) return null;
+  return { value: new TextDecoder().decode(Uint8Array.from(bytes)), end: index };
+}
+
+function diffSectionPaths(line: string): string[] {
+  const prefix = "diff --git ";
+  if (!line.startsWith(prefix)) return [];
+  if (line[prefix.length] === '"') {
+    const first = readGitDiffPath(line, prefix.length);
+    if (!first) return [];
+    const second = readGitDiffPath(line, first.end);
+    if (!second || line.slice(second.end).trim() !== "") return [];
+    return Array.from(new Set([first.value.replace(/^a\//u, ""), second.value.replace(/^b\//u, "")].filter(Boolean)));
+  }
+
+  // Git leaves ordinary spaces unquoted, so whitespace tokenization can split
+  // a single path into a fake second path. Accept only an unambiguous ` b/`
+  // boundary from the complete header; otherwise do not attribute hunk stats.
+  const header = line.slice(prefix.length);
+  const boundaries: Array<{ oldPath: string; newPath: string }> = [];
+  let index = header.indexOf(" b/");
+  while (index >= 0) {
+    const oldToken = header.slice(0, index);
+    const newToken = header.slice(index + 1);
+    if (oldToken.startsWith("a/") && newToken.startsWith("b/")) {
+      const oldPath = oldToken.slice(2);
+      const newPath = newToken.slice(2);
+      if (oldPath && newPath) boundaries.push({ oldPath, newPath });
+    }
+    index = header.indexOf(" b/", index + 1);
+  }
+  if (boundaries.length !== 1) return [];
+  const [paths] = boundaries;
+  if (!paths) return [];
+  return Array.from(new Set([paths.oldPath, paths.newPath]));
+}
+
+function parseWorkspaceDiffStats(text: string): Map<string, WorkspaceFileLineStats> {
+  const result = new Map<string, WorkspaceFileLineStats>();
+  let paths: string[] = [];
+  let additions = 0;
+  let deletions = 0;
+  let complete = true;
+  let hunk: { oldRemaining: number; newRemaining: number } | null = null;
+  const flush = () => {
+    if (paths.length === 0) return;
+    const current = { additions, deletions, complete };
+    for (const path of paths) {
+      const previous = result.get(path);
+      result.set(path, previous
+        ? { additions: previous.additions + additions, deletions: previous.deletions + deletions, complete: previous.complete && complete }
+        : current);
+    }
+  };
+  for (const line of text.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      flush();
+      paths = diffSectionPaths(line);
+      additions = 0;
+      deletions = 0;
+      complete = paths.length > 0;
+      hunk = null;
+      continue;
+    }
+    if (paths.length === 0) continue;
+    if (line.startsWith("Binary files ") || line === "GIT binary patch") complete = false;
+    if (line.startsWith("@@@")) {
+      complete = false;
+      hunk = null;
+      continue;
+    }
+    const hunkHeader = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/u);
+    if (hunkHeader) {
+      hunk = { oldRemaining: Number(hunkHeader[1] ?? 1), newRemaining: Number(hunkHeader[2] ?? 1) };
+      continue;
+    }
+    if (!hunk) continue;
+    if (line.startsWith("\\")) continue;
+    if (line.startsWith("+") && hunk.newRemaining > 0) {
+      additions += 1;
+      hunk.newRemaining -= 1;
+    } else if (line.startsWith("-") && hunk.oldRemaining > 0) {
+      deletions += 1;
+      hunk.oldRemaining -= 1;
+    } else if (line.startsWith(" ")) {
+      if (hunk.oldRemaining > 0) hunk.oldRemaining -= 1;
+      if (hunk.newRemaining > 0) hunk.newRemaining -= 1;
+    } else {
+      hunk = null;
+      continue;
+    }
+    if (hunk.oldRemaining === 0 && hunk.newRemaining === 0) hunk = null;
+  }
+  if (hunk && (hunk.oldRemaining > 0 || hunk.newRemaining > 0)) complete = false;
+  flush();
+  return result;
+}
+
+function workspaceChangeSummary(diff: WorkspaceDiffView): WorkspaceChangeSummary {
+  const statsByPath = new Map<string, WorkspaceFileLineStats>();
+  for (const parsed of [parseWorkspaceDiffStats(diff.staged_diff.text), parseWorkspaceDiffStats(diff.unstaged_diff.text)]) {
+    for (const [path, stats] of parsed) {
+      const previous = statsByPath.get(path);
+      statsByPath.set(path, previous
+        ? { additions: previous.additions + stats.additions, deletions: previous.deletions + stats.deletions, complete: previous.complete && stats.complete }
+        : stats);
+    }
+  }
+  const unique = new Map(diff.status.entries.map((entry) => [entry.path, entry]));
+  const globalTruncation = diff.truncated || diff.status.truncated || diff.staged_diff.truncated || diff.unstaged_diff.truncated;
+  const files = Array.from(unique.values(), (entry) => {
+    const stats = statsByPath.get(entry.path) ?? (entry.original_path ? statsByPath.get(entry.original_path) : undefined) ?? null;
+    if (!stats || entry.xy.includes("?")) return { path: entry.path, ...(entry.original_path ? { originalPath: entry.original_path } : {}), stats: null };
+    return { path: entry.path, ...(entry.original_path ? { originalPath: entry.original_path } : {}), stats: { ...stats, complete: stats.complete && !globalTruncation } };
+  });
+  const knownStats = files.flatMap((file) => file.stats ? [file.stats] : []);
+  return {
+    files,
+    additions: knownStats.reduce((total, stats) => total + stats.additions, 0),
+    deletions: knownStats.reduce((total, stats) => total + stats.deletions, 0),
+    filesComplete: !diff.status.truncated,
+    linesComplete: !globalTruncation && files.length === knownStats.length && knownStats.every((stats) => stats.complete),
+  };
+}
+
+function WorkspaceChangeSummaryCard({ summaryState, diff, onReview }: { summaryState: "reviewing" | "completed" | "failed"; diff?: WorkspaceDiffView; onReview?: (path?: string) => void }) {
+  const { t } = useTranslation();
+  const summary = diff ? workspaceChangeSummary(diff) : null;
+  const visibleFiles = summary?.files.slice(0, 2) ?? [];
+  const hiddenCount = Math.max(0, (summary?.files.length ?? 0) - visibleFiles.length);
+  const [expanded, setExpanded] = useState(false);
+  const files = summary && expanded ? summary.files : visibleFiles;
+  const partial = summary ? !summary.linesComplete : false;
+  const displayCount = (sign: "+" | "−", value: number, complete: boolean) => `${complete ? "" : "≥"}${sign}${value}`;
+  return <section className="timeline-workspace-changes" aria-label={t("currentWorkspaceChanges")} data-workspace-change-summary="true" data-source="current_working_tree">
+    {summaryState === "completed" && summary ? <>
+      <header className="timeline-workspace-changes__header">
+        <span className="timeline-workspace-changes__icon"><UiIcon name="file" /></span>
+        <strong className="timeline-workspace-changes__title">{summary.files.length > 0
+          ? t("workspaceFilesEdited").replace("{count}", `${summary.filesComplete ? "" : "≥"}${summary.files.length}`)
+          : t("workspaceNoCurrentChanges")}</strong>
+        {summary.files.length > 0 && <span className="timeline-workspace-changes__counts" aria-label={partial ? t("workspaceCountsPartial") : undefined}>
+          <span className="timeline-workspace-changes__added">{displayCount("+", summary.additions, summary.linesComplete)}</span>
+          <span className="timeline-workspace-changes__removed">{displayCount("−", summary.deletions, summary.linesComplete)}</span>
+        </span>}
+        {partial && summary.files.length > 0 && <span className="timeline-workspace-changes__incomplete">{t("workspaceCountsPartial")}</span>}
+        {onReview && <button type="button" className="timeline-workspace-changes__review" onClick={() => onReview()}>{t("viewChanges")}</button>}
+      </header>
+      {summary.files.length > 0 && <>
+          <ul className="timeline-workspace-changes__files">{files.map((file) => {
+            const label = file.originalPath ? `${file.originalPath} → ${file.path}` : file.path;
+            const row = <><span className="timeline-workspace-changes__icon"><UiIcon name="file" /></span><span className="timeline-workspace-changes__path" title={label}>{label}</span><span className="timeline-workspace-changes__row-counts">
+              {file.stats && (file.stats.complete || file.stats.additions > 0 || file.stats.deletions > 0)
+                ? <><span className="timeline-workspace-changes__added">{displayCount("+", file.stats.additions, file.stats.complete)}</span><span className="timeline-workspace-changes__removed">{displayCount("−", file.stats.deletions, file.stats.complete)}</span></>
+                : <span aria-label={t("workspaceFileCountsUnavailable")}>—</span>}
+            </span></>;
+            return <li key={file.path}>{onReview
+              ? <button type="button" className="timeline-workspace-changes__row" onClick={() => onReview(file.path)} aria-label={`${t("viewChanges")}: ${label}`}>{row}</button>
+              : <div className="timeline-workspace-changes__row">{row}</div>}
+            </li>;
+          })}</ul>
+          {hiddenCount > 0 && <button type="button" className="timeline-workspace-changes__more" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
+            {expanded ? t("showLess") : t("showMoreFiles").replace("{count}", String(hiddenCount))}
+          </button>}
+        </>}
+    </> : <p className="timeline-workspace-changes__state" role={summaryState === "failed" ? "status" : undefined}>{summaryState === "reviewing" ? t("workspaceSummaryLoading") : t("workspaceDiffUnavailable")}</p>}
+  </section>;
 }
 
 function isUnavailableAttachment(attachment: TimelineAttachment): attachment is TimelineUnavailableAttachment {
@@ -319,7 +548,7 @@ function attachmentPreviewFingerprint(entries: TimelineEntry[]): string {
     .join("|");
 }
 
-export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, onCopyPath, onOpenDocument, onViewToolOutput, onReviewProcessLog, onReviewCurrentDiff, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, onCopyPath, onOpenDocument, onViewToolOutput, onReviewProcessLog, onReviewCurrentDiff, workspaceDiffSummary, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
@@ -623,6 +852,12 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
           <div className="timeline-content">{entry.kind === "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}{entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{entry.kind !== "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
+      {workspaceDiffSummary && <WorkspaceChangeSummaryCard
+        key={`${sessionKey}:${workspaceDiffSummary.diff?.viewed_at ?? workspaceDiffSummary.state}:${workspaceDiffSummary.diff?.status.entries.length ?? 0}`}
+        summaryState={workspaceDiffSummary.state}
+        diff={workspaceDiffSummary.diff}
+        onReview={onReviewCurrentDiff}
+      />}
       {runtimeError && !runtimeErrorVisible && <div className="timeline-runtime-error" data-runtime-error-owner="timeline" role="alert">
         <span className="timeline-notice__icon" aria-hidden="true"><UiIcon name="status" /></span>
         <span>{runtimeError}</span>

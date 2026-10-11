@@ -294,6 +294,21 @@ interface WorkspaceDiffContext {
   tabId: string;
 }
 
+interface WorkspaceDiffSummaryContext {
+  sequence: number;
+  operationId: string | null;
+  ownerKey: string;
+  owner: DocumentPreviewOwner & { ownerKey: string };
+  requestKey: string;
+}
+
+interface WorkspaceDiffSummaryState {
+  owner: DocumentPreviewOwner & { ownerKey: string };
+  requestKey: string;
+  state: "reviewing" | "completed" | "failed";
+  diff?: WorkspaceDiffView;
+}
+
 interface ReviewPanelState {
   tabs: ReviewPanelTab[];
   activeTabId: string | null;
@@ -470,6 +485,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const [reviewPanel, setReviewPanel] = useState<ReviewPanelState>({ tabs: [], activeTabId: null });
   const reviewPanelRef = useRef(reviewPanel);
   reviewPanelRef.current = reviewPanel;
+  const [workspaceDiffSummary, setWorkspaceDiffSummary] = useState<WorkspaceDiffSummaryState | null>(null);
   const [documentPreviewWidth, setDocumentPreviewWidth] = useState(460);
   const pendingProcessPermissionRef = useRef<PendingProcessPermission | null>(null);
   const processStopInFlightRef = useRef<string | null>(null);
@@ -483,6 +499,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const workspaceDiffSequenceRef = useRef(0);
   const workspaceDiffContextRef = useRef<WorkspaceDiffContext | null>(null);
   const earlyWorkspaceDiffEventsRef = useRef<Map<string, AgentEvent>>(new Map());
+  const workspaceDiffSummarySequenceRef = useRef(0);
+  const workspaceDiffSummaryContextRef = useRef<WorkspaceDiffSummaryContext | null>(null);
+  const earlyWorkspaceDiffSummaryEventsRef = useRef<Map<string, AgentEvent>>(new Map());
+  const workspaceDiffSummaryRefreshTimerRef = useRef<number | null>(null);
+  const workspaceDiffSummaryRequestKeyRef = useRef<string | null>(null);
+  const workspaceDiffSummaryOwnerRef = useRef<string | null>(null);
   const historyRequestsRef = useRef<Map<string, { token: symbol; promise: Promise<void> }>>(new Map());
   const projectCatalogRequestSequenceRef = useRef(new Map<string, number>());
   const projectCatalogAppliedSequenceRef = useRef(new Map<string, number>());
@@ -651,23 +673,134 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     });
   }, [reviewOwnerMatches, t, updateReviewTab]);
 
+  const acceptWorkspaceDiffSummaryEvent = useCallback((context: WorkspaceDiffSummaryContext, event: AgentEvent) => {
+    if (workspaceDiffSummaryContextRef.current !== context) return;
+    const payload = asObject(event);
+    if (stringValue(payload.operation_id) !== context.operationId) return;
+    if (!reviewOwnerMatches(context.owner)) {
+      workspaceDiffSummaryContextRef.current = null;
+      return;
+    }
+    if (stringValue(payload.owner_key) !== context.ownerKey) {
+      workspaceDiffSummaryContextRef.current = null;
+      setWorkspaceDiffSummary((current) => current?.requestKey === context.requestKey ? { ...current, state: "failed", diff: undefined } : current);
+      return;
+    }
+    const resultState = stringValue(payload.state);
+    if (resultState !== "completed" && resultState !== "cancelled" && resultState !== "stale" && resultState !== "failed") return;
+    workspaceDiffSummaryContextRef.current = null;
+    if (context.operationId) {
+      earlyWorkspaceDiffSummaryEventsRef.current.delete(context.operationId);
+      earlyWorkspaceDiffEventsRef.current.delete(context.operationId);
+    }
+    if (resultState === "completed") {
+      const diff = workspaceDiffFromEvent(payload, context.ownerKey);
+      setWorkspaceDiffSummary((current) => current?.requestKey === context.requestKey
+        ? diff ? { ...current, state: "completed", diff } : { ...current, state: "failed", diff: undefined }
+        : current);
+    } else {
+      setWorkspaceDiffSummary((current) => current?.requestKey === context.requestKey
+        ? { ...current, state: "failed", diff: undefined }
+        : current);
+    }
+  }, [reviewOwnerMatches]);
+
   const receiveWorkspaceDiffEvent = useCallback((event: AgentEvent): boolean => {
     if (stringValue(asObject(event).type) !== "workspace_diff_result") return false;
     const payload = asObject(event);
     const operationId = stringValue(payload.operation_id);
-    const context = workspaceDiffContextRef.current;
-    if (!context || !operationId) return true;
-    if (!context.operationId) {
-      if (stringValue(payload.owner_key) === context.ownerKey) {
-        const buffered = earlyWorkspaceDiffEventsRef.current;
-        if (buffered.size >= 4) buffered.delete(buffered.keys().next().value as string);
-        buffered.set(operationId, event);
-      }
+    if (!operationId) return true;
+    const ownerKey = stringValue(payload.owner_key);
+    const reviewContext = workspaceDiffContextRef.current;
+    const summaryContext = workspaceDiffSummaryContextRef.current;
+    if (reviewContext?.operationId === operationId) {
+      acceptWorkspaceDiffEvent(reviewContext, event);
+      earlyWorkspaceDiffSummaryEventsRef.current.delete(operationId);
       return true;
     }
-    if (context.operationId === operationId) acceptWorkspaceDiffEvent(context, event);
+    if (summaryContext?.operationId === operationId) {
+      acceptWorkspaceDiffSummaryEvent(summaryContext, event);
+      earlyWorkspaceDiffEventsRef.current.delete(operationId);
+      return true;
+    }
+    if (reviewContext && !reviewContext.operationId && ownerKey === reviewContext.ownerKey) {
+      const buffered = earlyWorkspaceDiffEventsRef.current;
+      if (buffered.size >= 4) buffered.delete(buffered.keys().next().value as string);
+      buffered.set(operationId, event);
+    }
+    if (summaryContext && !summaryContext.operationId && ownerKey === summaryContext.ownerKey) {
+      const buffered = earlyWorkspaceDiffSummaryEventsRef.current;
+      if (buffered.size >= 4) buffered.delete(buffered.keys().next().value as string);
+      buffered.set(operationId, event);
+    }
     return true;
-  }, [acceptWorkspaceDiffEvent]);
+  }, [acceptWorkspaceDiffEvent, acceptWorkspaceDiffSummaryEvent]);
+
+  const cancelWorkspaceDiffSummary = useCallback((context = workspaceDiffSummaryContextRef.current) => {
+    if (context && workspaceDiffSummaryContextRef.current !== context) return;
+    if (workspaceDiffSummaryRefreshTimerRef.current !== null) {
+      window.clearTimeout(workspaceDiffSummaryRefreshTimerRef.current);
+      workspaceDiffSummaryRefreshTimerRef.current = null;
+    }
+    workspaceDiffSummaryContextRef.current = null;
+    workspaceDiffSummarySequenceRef.current += 1;
+    earlyWorkspaceDiffSummaryEventsRef.current.clear();
+    if (context?.operationId) void send("workspace.diff.cancel", { operation_id: context.operationId }).catch(() => undefined);
+  }, [send]);
+
+  const refreshWorkspaceDiffSummary = useCallback(async (owner: DocumentPreviewOwner & { ownerKey: string }, requestKey: string) => {
+    if (!api || owner.mode !== "coding" || !owner.projectKey || owner.projectKey !== owner.ownerKey || !reviewOwnerMatches(owner)) return;
+    const previous = workspaceDiffSummaryContextRef.current;
+    const context: WorkspaceDiffSummaryContext = {
+      sequence: workspaceDiffSummarySequenceRef.current + 1,
+      operationId: null,
+      ownerKey: owner.ownerKey,
+      owner,
+      requestKey,
+    };
+    workspaceDiffSummarySequenceRef.current = context.sequence;
+    workspaceDiffSummaryContextRef.current = context;
+    earlyWorkspaceDiffSummaryEventsRef.current.clear();
+    setWorkspaceDiffSummary({ owner, requestKey, state: "reviewing" });
+    try {
+      if (previous?.operationId) {
+        try { await send("workspace.diff.cancel", { operation_id: previous.operationId }); } catch { /* the replacement kickoff reports the remaining operation limit */ }
+      }
+      if (workspaceDiffSummaryContextRef.current !== context || !reviewOwnerMatches(owner)) return;
+      const response = asObject(await send("workspace.diff", { project_key: owner.ownerKey }));
+      const operationId = stringValue(response.operation_id);
+      if (workspaceDiffSummaryContextRef.current !== context || !reviewOwnerMatches(owner)) {
+        if (operationId) void send("workspace.diff.cancel", { operation_id: operationId }).catch(() => undefined);
+        return;
+      }
+      if (!operationId || stringValue(response.owner_key) !== owner.ownerKey || stringValue(response.state) !== "reviewing") {
+        workspaceDiffSummaryContextRef.current = null;
+        setWorkspaceDiffSummary((current) => current?.requestKey === requestKey ? { ...current, state: "failed", diff: undefined } : current);
+        return;
+      }
+      context.operationId = operationId;
+      const early = earlyWorkspaceDiffSummaryEventsRef.current.get(operationId);
+      earlyWorkspaceDiffSummaryEventsRef.current.delete(operationId);
+      earlyWorkspaceDiffEventsRef.current.delete(operationId);
+      if (early) acceptWorkspaceDiffSummaryEvent(context, early);
+    } catch {
+      if (workspaceDiffSummaryContextRef.current !== context || !reviewOwnerMatches(owner)) return;
+      workspaceDiffSummaryContextRef.current = null;
+      setWorkspaceDiffSummary((current) => current?.requestKey === requestKey ? { ...current, state: "failed", diff: undefined } : current);
+    }
+  }, [acceptWorkspaceDiffSummaryEvent, api, reviewOwnerMatches, send]);
+
+  const scheduleWorkspaceDiffSummaryRefresh = useCallback((owner: DocumentPreviewOwner & { ownerKey: string }, requestKey: string) => {
+    if (!api || owner.mode !== "coding" || !owner.projectKey || owner.projectKey !== owner.ownerKey || !reviewOwnerMatches(owner)
+      || workspaceDiffSummaryRequestKeyRef.current === requestKey) return;
+    workspaceDiffSummaryOwnerRef.current = [owner.generation, owner.mode, owner.projectKey, owner.sessionId, owner.viewRevision].join(":");
+    workspaceDiffSummaryRequestKeyRef.current = requestKey;
+    if (workspaceDiffSummaryRefreshTimerRef.current !== null) window.clearTimeout(workspaceDiffSummaryRefreshTimerRef.current);
+    workspaceDiffSummaryRefreshTimerRef.current = window.setTimeout(() => {
+      workspaceDiffSummaryRefreshTimerRef.current = null;
+      void refreshWorkspaceDiffSummary(owner, requestKey);
+    }, 120);
+  }, [api, refreshWorkspaceDiffSummary, reviewOwnerMatches]);
 
   const cancelSessionSearch = useCallback(() => {
     const current = sessionSearchContextRef.current;
@@ -1102,6 +1235,17 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const terminal = event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_cancelled";
     if (terminal && (!hasCompleteTurnIdentity({ runId: eventRunId, turnId: eventTurnId }) || !latestMatches())) return;
     dispatch({ type: "agent_event", event });
+    const toolName = stringValue(event.tool_name);
+    const toolStatus = stringValue(event.status).toLowerCase();
+    const failedTool = event.is_error === true || ["failed", "error", "rejected", "cancelled", "canceled"].includes(toolStatus)
+      || stringValue(event.termination_reason) === "user_cancelled";
+    const eventSessionIsCurrent = eventSessionId === currentState.selectedSessionId || acceptedSessionIsVisible;
+    if (event.type === "tool_finished" && !failedTool && ["WriteFile", "EditFile", "ApplyPatch"].includes(toolName)
+      && eventProjectKey && eventProjectKey === currentState.selectedProjectKey && eventSessionIsCurrent) {
+      const owner = reviewOwner();
+      const requestKey = [owner.generation, owner.mode, owner.projectKey, owner.sessionId, owner.viewRevision, eventRunId, eventTurnId, stringValue(event.tool_call_id)].join(":");
+      scheduleWorkspaceDiffSummaryRefresh(owner, requestKey);
+    }
     if (terminal) {
       // The terminal event is published before the Bridge releases its
       // active handle. Keep one cancellable, backoff poll alive until the
@@ -1115,7 +1259,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         }
       });
     }
-  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, refreshProjectCatalog, runtimeGeneration, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
+  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, refreshProjectCatalog, reviewOwner, runtimeGeneration, scheduleWorkspaceDiffSummaryRefresh, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
 
   const readProcess = useCallback(async (processId: string, cursor: number) => {
     const projectKey = stateRef.current.selectedProjectKey;
@@ -2889,6 +3033,23 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     });
   }, [cancelWorkspaceDiff, reviewOwnerMatches, state.mode, state.runtimeState, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision, updateReviewPanel]);
 
+  useEffect(() => {
+    const owner = reviewOwner();
+    const ownerKey = [owner.generation, owner.mode, owner.projectKey, owner.sessionId, owner.viewRevision].join(":");
+    if (workspaceDiffSummaryOwnerRef.current !== ownerKey) {
+      workspaceDiffSummaryOwnerRef.current = ownerKey;
+      workspaceDiffSummaryRequestKeyRef.current = null;
+      cancelWorkspaceDiffSummary();
+    }
+    const context = workspaceDiffSummaryContextRef.current;
+    if (context && !reviewOwnerMatches(context.owner)) cancelWorkspaceDiffSummary(context);
+    if (workspaceDiffSummary && !reviewOwnerMatches(workspaceDiffSummary.owner)) {
+      workspaceDiffSummaryRequestKeyRef.current = null;
+      setWorkspaceDiffSummary(null);
+    }
+  }, [cancelWorkspaceDiffSummary, reviewOwner, reviewOwnerMatches, state.mode, state.runtimeState, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision, workspaceDiffSummary]);
+  useEffect(() => () => cancelWorkspaceDiffSummary(), [cancelWorkspaceDiffSummary]);
+
   const visibleReviewTabs = reviewPanel.tabs.flatMap((tab): ReviewPanelTab[] => {
     if (!reviewOwnerMatches(tab.owner)) return [];
     if (tab.kind !== "process-log") return [tab];
@@ -2901,6 +3062,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   });
   const activeReviewTabId = visibleReviewTabs.some((tab) => tab.id === reviewPanel.activeTabId) ? reviewPanel.activeTabId! : visibleReviewTabs.at(-1)?.id ?? "";
   const reviewPanelVisible = state.view === "chat" && !state.focusMode && visibleReviewTabs.length > 0;
+  const visibleWorkspaceDiffSummary = state.mode === "coding" && state.view === "chat" && workspaceDiffSummary && reviewOwnerMatches(workspaceDiffSummary.owner)
+    ? workspaceDiffSummary
+    : undefined;
   const documentPreviewMinWidth = 220;
   const documentSidebarWidth = state.focusMode || (reviewPanelVisible && viewportWidth <= 620)
     ? 0
@@ -3005,6 +3169,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         onOpenDocument={openDocumentPreview}
         onViewToolOutput={openToolOutput}
         onReviewCurrentDiff={(path) => void openWorkspaceDiff(path)}
+        workspaceDiffSummary={visibleWorkspaceDiffSummary}
         onReviewProcessLog={openProcessLog}
         onPreviewAttachment={previewAttachment}
         onOpenAttachment={openAttachment}
