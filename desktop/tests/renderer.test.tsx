@@ -1036,11 +1036,41 @@ test("T07 App switches fixed General owner, buffers early search results, and dr
     });
     act(() => { root.render(<App initialState={initialState} api={api} />); });
     await flush();
-    const modeButton = (label: string) => Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-modes button")).find((button) => button.textContent?.trim() === label);
-    const generalButton = modeButton("General");
+    const modeTrigger = container.querySelector<HTMLButtonElement>(".sidebar-brand-menu-trigger");
+    assert.ok(modeTrigger);
+    const brandMenuAnchor = container.querySelector<HTMLElement>(".sidebar-brand-menu-anchor");
+    assert.ok(brandMenuAnchor);
+    brandMenuAnchor.getBoundingClientRect = () => new dom.window.DOMRect(14, 8, 112, 34);
+    act(() => { modeTrigger!.click(); });
+    await flush(2);
+    const brandMenu = container.querySelector<HTMLElement>(".sidebar-menu");
+    assert.equal(brandMenu?.style.left, "14px", "the mode menu aligns to the brand button's left edge");
+    assert.equal(brandMenu?.style.top, "47px", "the mode menu opens just below the brand button");
+    const modeOptions = () => Array.from(container.querySelectorAll<HTMLButtonElement>('.sidebar-menu__item[role="menuitemradio"]'));
+    assert.equal(dom.window.document.activeElement, modeOptions()[0], "opening the brand menu focuses its first option");
+    act(() => { modeOptions()[0]?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); });
+    assert.equal(dom.window.document.activeElement, modeOptions()[1], "the shared menu mechanism supports arrow-key navigation");
+    act(() => { modeOptions()[1]?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    assert.equal(container.querySelector(".sidebar-menu"), null, "Escape closes the brand menu");
+    assert.equal(dom.window.document.activeElement, modeTrigger, "Escape returns focus to the brand trigger");
+
+    act(() => { modeTrigger!.click(); });
+    await flush(2);
+    act(() => { dom.window.document.getElementById("after")?.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); });
+    assert.equal(container.querySelector(".sidebar-menu"), null, "a pointer outside the brand menu closes it");
+    assert.equal(dom.window.document.activeElement, modeTrigger, "outside dismissal preserves the existing menu focus restoration");
+
+    act(() => { modeTrigger!.click(); });
+    await flush(2);
+    const generalButton = modeOptions().find((button) => button.textContent?.trim().startsWith("General"));
+    const activeCodingOption = modeOptions().find((button) => button.textContent?.trim().startsWith("Coding"));
     assert.ok(generalButton);
+    assert.ok(activeCodingOption);
+    assert.equal(activeCodingOption.getAttribute("aria-checked"), "true", "the mode dropdown marks the current Coding mode");
+    assert.equal(generalButton.getAttribute("aria-checked"), "false", "the other mode is not selected yet");
     act(() => { generalButton!.click(); });
     await flush(12);
+    assert.equal(container.querySelector<HTMLButtonElement>(".sidebar-brand-menu-trigger")?.dataset.mode, "general");
     assert.equal(calls.some((call) => call.method === "general.open"), true);
     assert.deepEqual(calls.filter((call) => call.method === "session.resume").map((call) => [call.params.session_id, call.params.project_key]), [["general-current", "uthcode:general"]]);
     assert.deepEqual(Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"), (button) => button.textContent?.trim()), ["General current"]);
@@ -1099,9 +1129,12 @@ test("T07 App switches fixed General owner, buffers early search results, and dr
     await flush();
     act(() => { eventListener?.({ type: "session_search_result", operation_id: "search-fourth", owner_key: "uthcode:general", state: "completed", hits: [{ session_id: "late-mode", project_key: "uthcode:general", title: "Late mode result", snippet: "late", archived: false, last_used_at: null }] }); });
     await flush();
-    const codingButton = modeButton("Coding");
-    assert.ok(codingButton);
-    act(() => { codingButton!.click(); });
+    act(() => { modeTrigger!.click(); });
+    await flush(2);
+    const returnToCoding = modeOptions().find((button) => button.textContent?.trim().startsWith("Coding"));
+    assert.ok(returnToCoding);
+    assert.equal(returnToCoding.getAttribute("aria-checked"), "false");
+    act(() => { returnToCoding!.click(); });
     await flush(12);
     assert.deepEqual(calls.filter((call) => ["project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? call.params.session_id ?? null, call.params.project_key ?? null]), [
       ["session.resume", "general-current", "uthcode:general"],
@@ -1218,10 +1251,15 @@ test("T07 App restores archived search results and preserves a newer owner durin
     await flush(16);
     assert.deepEqual(calls.filter((call) => call.method === "session.archive").map((call) => call.params), [{ session_id: "general-archived", project_key: "uthcode:general", archived: false }]);
     assert.deepEqual(calls.filter((call) => call.method === "session.resume").map((call) => [call.params.session_id, call.params.project_key]), [["general-archived", "uthcode:general"]]);
-    assert.equal(container.querySelector<HTMLElement>(".sidebar-modes button[aria-pressed='true']")?.textContent?.trim(), "General");
+    assert.equal(container.querySelector<HTMLButtonElement>(".sidebar-brand-menu-trigger")?.dataset.mode, "general");
 
-    const codingMode = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-modes button")).find((button) => button.textContent?.trim() === "Coding");
+    const switchModeTrigger = container.querySelector<HTMLButtonElement>(".sidebar-brand-menu-trigger");
+    assert.ok(switchModeTrigger);
+    act(() => { switchModeTrigger!.click(); });
+    await flush(2);
+    const codingMode = Array.from(container.querySelectorAll<HTMLButtonElement>('.sidebar-menu__item[role="menuitemradio"]')).find((button) => button.textContent?.trim().startsWith("Coding"));
     assert.ok(codingMode);
+    assert.equal(codingMode.getAttribute("aria-checked"), "false");
     act(() => { codingMode!.click(); });
     await flush(12);
     const sessionTrigger = container.querySelector<HTMLButtonElement>(`.project-item.is-active .session-menu-trigger`);
@@ -1250,7 +1288,7 @@ test("T07 App restores archived search results and preserves a newer owner durin
       { session_id: "general-archived", project_key: "uthcode:general", archived: false },
       { session_id: "coding-current", project_key: codingPath, archived: true },
     ]);
-    assert.equal(container.querySelector<HTMLElement>(".sidebar-modes button[aria-pressed='true']")?.textContent?.trim(), "Coding");
+    assert.equal(container.querySelector<HTMLButtonElement>(".sidebar-brand-menu-trigger")?.dataset.mode, "coding");
     assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Other Coding", "a late catalog result cannot auto-resume the previously selected project's next Session");
     assert.equal(Array.from(container.querySelectorAll<HTMLButtonElement>(".project-item.is-active .session-line.is-selected"), (button) => button.textContent?.trim()).at(-1), "Other Coding current");
     assert.equal(calls.some((call) => call.method === "session.resume" && call.params.session_id === "coding-other"), false, "the stale post-archive target is never resumed");
@@ -3068,11 +3106,14 @@ test("T08 tool activity groups stay collapsed and preserve bounded details and o
     assert.equal(failures.length, 2, "failed and cancelled Tools each have a direct row");
     assert.ok(failures.every((failure) => failure.closest("details") === null), "failure explanations and cancellation status are not under a collapsed group");
     assert.match(failures.map((failure) => failure.textContent).join(" "), /permission denied|cancelled by user/u);
-    const unavailable = Array.from(container.querySelectorAll<HTMLElement>(".timeline-activity-item.is-failed .timeline-tool-output-unavailable"));
-    assert.ok(unavailable.length >= 1, "legacy activity without output metadata is explicitly unavailable");
+    assert.equal(container.querySelectorAll(".timeline-activity-item.is-failed .timeline-tool-output-unavailable").length, 0, "an unavailable-output notice does not overflow a failure summary");
     assert.match(groups[2]?.textContent ?? "", /Duration unavailable/u, "missing live timestamps stay unavailable");
     assert.match(groups[0]?.querySelectorAll(".tool-elapsed")[0]?.textContent ?? "", /3s/u, "completed duration stays frozen from observed timestamps");
     groups[0]!.open = true;
+    const readDetails = groups[0]!.querySelector<HTMLDetailsElement>(".timeline-activity-item");
+    assert.ok(readDetails);
+    assert.equal(readDetails.open, false, "tool input and output actions remain a default-closed second disclosure");
+    readDetails.open = true;
     const outputButton = Array.from(groups[0]!.querySelectorAll<HTMLButtonElement>(".timeline-tool-output")).find((button) => button.textContent?.includes("View tool output"));
     const diffButton = Array.from(groups[0]!.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")).find((button) => button.textContent?.includes("src/app.ts"));
     assert.ok(outputButton);
@@ -3081,6 +3122,18 @@ test("T08 tool activity groups stay collapsed and preserve bounded details and o
     assert.deepEqual(viewedOutputs, ["tool-read"]);
     assert.deepEqual(reviewedPaths, ["src/app.ts"]);
   });
+});
+
+test("T08 duplicate TodoWrite labels and task-state pseudo commands stay out of activity summaries", () => {
+  const markup = renderLanguage("en", <ChatTimeline entries={[
+    { id: "todo-write", kind: "tool", text: "TodoWrite", toolName: "TodoWrite", command: "<task state update>", status: "completed" },
+  ]} todo={[]} />);
+  const document = new JSDOM(markup).window.document;
+  assert.equal(Array.from(document.body.textContent?.matchAll(/TodoWrite/gu) ?? []).length, 1, "the visible compact row uses the tool name only once");
+  assert.doesNotMatch(markup, /&lt;task state update&gt;|<task state update>/u);
+  assert.match(markup, /class="timeline-activity-item"[^>]*>/u);
+  assert.doesNotMatch(markup, /<details class="timeline-activity-item"[^>]* open=/u, "the tool detail body starts closed");
+  assert.equal(document.querySelector("details.timeline-activity-item")?.open, false, "the nested disclosure is actually closed");
 });
 
 test("T08 activity group uses the observed wall-clock span instead of adding Tool durations", async () => {

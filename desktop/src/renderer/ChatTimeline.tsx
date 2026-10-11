@@ -243,15 +243,25 @@ function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => 
   </div>;
 }
 
-function renderToolActivity(activity: TimelineEntry, now: number, t: (key: TranslationKey) => string, onViewToolOutput?: (entry: TimelineEntry) => void, onReviewCurrentDiff?: (path: string) => void) {
-  const status = activity.status || "running";
-  const elapsed = elapsedSeconds(activity, now);
+function displayableToolText(activity: TimelineEntry): string | null {
+  const text = activity.text.trim();
+  if (!text || text === activity.toolName || text === activity.command || /^<task state update>$/iu.test(text)) return null;
+  return text;
+}
+
+function displayableToolCommand(activity: TimelineEntry): string | null {
+  const command = activity.command?.trim();
+  if (!command || /^<task state update>$/iu.test(command)) return null;
+  return command;
+}
+
+function renderToolActivityDetails(activity: TimelineEntry, t: (key: TranslationKey) => string, onViewToolOutput?: (entry: TimelineEntry) => void, onReviewCurrentDiff?: (path: string) => void, showUnavailable = true) {
+  const text = displayableToolText(activity);
+  const command = displayableToolCommand(activity);
   const changes = activity.fileChanges ?? [];
-  const failed = status === "failed" || status === "cancelled";
-  return <article className={`timeline-activity-item${status === "running" ? " is-running" : ""}${failed ? " is-failed" : ""}`} key={activity.id} aria-label={(activity.toolName || t("toolLabel")) + ": " + localText(status, t)} aria-busy={status === "running" || undefined}>
-    <header><span>{activity.toolName || t("toolLabel")}</span><small className="tool-status" data-status={status} data-error={activity.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null ? <span className="tool-elapsed"> · {elapsed}s</span> : <span className="tool-elapsed"> · {t("durationUnavailable")}</span>}</small></header>
-    <p>{activity.text}</p>
-    {activity.command && <pre className="timeline-activity-command">{activity.command}</pre>}
+  return <>
+    {text && <p>{text}</p>}
+    {command && <pre className="timeline-activity-command">{command}</pre>}
     {changes.length > 0 && <ul className="timeline-file-changes" aria-label={t("reviewCurrentDiff")}>{changes.flatMap((change, changeIndex) => {
       const paths = [typeof change.path === "string" ? change.path : "", ...(Array.isArray(change.applied_paths) ? change.applied_paths.filter((path): path is string => typeof path === "string") : [])].filter(Boolean);
       const statusText = typeof change.status === "string" ? change.status : "changed";
@@ -259,8 +269,36 @@ function renderToolActivity(activity: TimelineEntry, now: number, t: (key: Trans
     })}</ul>}
     {activity.outputPreview !== undefined || activity.outputRef
       ? <button type="button" className="timeline-tool-output" onClick={() => onViewToolOutput?.(activity)}>{t("viewToolOutput")}{activity.outputPreviewTruncated ? " · " + t("previewTruncated") : ""}</button>
-      : status !== "running" && <p className="timeline-tool-output-unavailable">{t("toolOutputUnavailable")}</p>}
+      : showUnavailable && activity.status !== "running" && <p className="timeline-tool-output-unavailable">{t("toolOutputUnavailable")}</p>}
+  </>;
+}
+
+function renderToolActivity(activity: TimelineEntry, now: number, t: (key: TranslationKey) => string, onViewToolOutput?: (entry: TimelineEntry) => void, onReviewCurrentDiff?: (path: string) => void) {
+  const status = activity.status || "running";
+  const elapsed = elapsedSeconds(activity, now);
+  const failed = status === "failed" || status === "cancelled";
+  const command = displayableToolCommand(activity);
+  const name = activity.toolName || t("toolLabel");
+  const statusLine = <small className="tool-status" data-status={status} data-error={activity.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null ? <span className="tool-elapsed"> · {elapsed}s</span> : <span className="tool-elapsed"> · {t("durationUnavailable")}</span>}</small>;
+  if (failed) return <article className="timeline-activity-item is-failed" key={activity.id} aria-label={`${name}: ${localText(status, t)}`}>
+    <header><span>{name}</span>{statusLine}</header>
+    {displayableToolText(activity) && <p className="timeline-activity-failure">{displayableToolText(activity)}</p>}
+    {command && <pre className="timeline-activity-command">{command}</pre>}
+    {renderToolActivityDetails({ ...activity, text: "", command: undefined }, t, onViewToolOutput, onReviewCurrentDiff, false)}
   </article>;
+  return <details className={`timeline-activity-item${status === "running" ? " is-running" : ""}`} key={activity.id} aria-label={`${name}: ${localText(status, t)}`} aria-busy={status === "running" || undefined}>
+    <summary><span className="timeline-activity-item__name">{name}</span>{command && <span className="timeline-activity-item__command" title={command}>{command}</span>}{statusLine}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+    <div className="timeline-activity-item__details">{renderToolActivityDetails(activity, t, onViewToolOutput, onReviewCurrentDiff)}</div>
+  </details>;
+}
+
+function ToolActivityGroup({ group, now, t, onViewToolOutput, onReviewCurrentDiff }: { group: TimelineEntry[]; now: number; t: (key: TranslationKey) => string; onViewToolOutput?: (entry: TimelineEntry) => void; onReviewCurrentDiff?: (path: string) => void }) {
+  const runningCount = group.filter((item) => item.status === "running").length;
+  const span = activitySpanSeconds(group, now);
+  return <details className="timeline-activity-group" data-tool-count={group.length}>
+    <summary><UiIcon name="runtime" /><span className="timeline-activity-group__title">{group.length} {t("activities")}</span><small>{span !== null ? `${span}s` : t("durationUnavailable")}</small><span className={`timeline-activity-group__status${runningCount ? " is-running" : ""}`}>{runningCount ? t("running") : t("completed")}</span><span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+    <div className="timeline-activity-group__items">{group.map((activity) => renderToolActivity(activity, now, t, onViewToolOutput, onReviewCurrentDiff))}</div>
+  </details>;
 }
 
 function timelineContentFingerprint(entries: TimelineEntry[], notice: string | null | undefined, runtimeError: string | null | undefined, runtimeErrorVisible: boolean): string {
@@ -556,6 +594,12 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
             <span>{localText(entry.text, t)}</span>
           </p>{index === compactionIndex && compactionLine}</Fragment>;
         }
+        if (entry.kind === "reasoning") return <Fragment key={entry.id}><article className="timeline-entry timeline-entry--reasoning" aria-label={entryLabel(entry, t)} aria-busy={entry.streaming || undefined}>
+          <details className="timeline-reasoning">
+            <summary><span>{t("reasoningLabel")}</span>{entry.streaming && <small>{t("writing")}</small>}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+            <div className="timeline-reasoning__content"><div className="timeline-content">{renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}</div></div>
+          </details>
+        </article>{index === compactionIndex && compactionLine}</Fragment>;
         if (entry.kind === "tool") {
           const failed = entry.status === "failed" || entry.status === "cancelled";
           if (failed) return <Fragment key={entry.id}>{renderToolActivity(entry, now, t, onViewToolOutput, onReviewCurrentDiff)}{index === compactionIndex && compactionLine}</Fragment>;
@@ -569,13 +613,8 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
             if (activity.status === "failed" || activity.status === "cancelled") break;
             group.push(activity);
           }
-          const runningCount = group.filter((item) => item.status === "running").length;
-          const span = activitySpanSeconds(group, now);
           return <Fragment key={"activity:" + group[0]?.id}>
-            <details className="timeline-activity-group" data-tool-count={group.length}>
-              <summary><span className="timeline-activity-group__title">{group.length} {t("activities")}</span><span className={"timeline-activity-group__status" + (runningCount ? " is-running" : "")}>{runningCount ? t("running") : t("completed")}</span><small>{span !== null ? `${span}s` : t("durationUnavailable")}</small></summary>
-              <div className="timeline-activity-group__items">{group.map((activity) => renderToolActivity(activity, now, t, onViewToolOutput, onReviewCurrentDiff))}</div>
-            </details>
+            <ToolActivityGroup group={group} now={now} t={t} onViewToolOutput={onViewToolOutput} onReviewCurrentDiff={onReviewCurrentDiff} />
             {index + group.length - 1 === compactionIndex && compactionLine}
           </Fragment>;
         }
