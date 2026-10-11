@@ -184,3 +184,11 @@
 - `git diff --check`：退出码0。
 
 Reviewer未重跑Worker219项全套、runtime-process、打包smoke、真实Provider及packaged/原生视觉验收。总控核对9份冻结文件正文不变（Checklist仅复选框变化），Checklist为12完成/28待验；UTF-8 guard：索引、W01/W02 Feedback及Checklist共4份通过，无编码修复。W03及后续真实UI验收尚未实施，本轮不声明整包完成。
+
+## 总控：W02 Git交付
+
+2026-10-11，独立复审通过后，仅显式暂存W02及总控既定文档37文件，冻结9文件与staged diff检查通过。提交 `e3b6f94567f8bcdb200e74a8f096a4102e4fa7e1` 已推送 T11-Agent能力补齐；[PR128](https://github.com/undertaker33/Re-UthCode/pull/128) 经 exact head核对后合并，merge为 `51df763823beb6102d0154379a04a92ff1a28c72`。本地T11与远端T11/main均为该merge，合并后工作区干净。仓库无PR status checks，本次验收依据上述本地验证与独立复审。此Git交付记录进入下一Prompt提交；不新增单独文档提交。
+
+### 总控：合并后的Bundled Runtime验证
+
+在W02 merge `51df763` 上，以既有 re-uthcode/Python3.12.13 环境执行 `desktop/ npm run build:runtime`，退出码0。PyInstaller onedir产物为 `desktop/.runtime/uthcode-runtime`；真实bundled Runtime的Coding/General initialize/session/status/shutdown JSONL及不同Prompt Context smoke通过。无真实Provider请求、Renderer或packaged/native视觉验收；该运行时为后续W03可运行Desktop准备。

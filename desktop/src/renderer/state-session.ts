@@ -183,6 +183,7 @@ function normalizeSession(value: unknown, fallbackProjectKey?: string): SessionS
     timeline_checkpoint_id: typeof source?.timeline_checkpoint_id === "string" ? source.timeline_checkpoint_id : null,
     transcript_entries: typeof source?.transcript_entries === "number" ? source.transcript_entries : 0,
     corrupt: source?.corrupt === true,
+    archived: source?.archived === true,
     model_ref: source?.model_ref === null ? null : nonEmptyText(source?.model_ref),
     ...(runtimeStatus ? { runtime_status: runtimeStatus } : {}),
   };

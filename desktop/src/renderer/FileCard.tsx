@@ -251,7 +251,11 @@ export function FileCard({ asset, draft = false, className, dataAttributes, onPr
       const merged = result ? { ...asset, ...result } : asset;
       const mergedImage = isImage(merged);
       const mergedCode = isCode(merged);
-      if (mergedImage && effectiveSource(merged)) setImageSrc(effectiveSource(merged)!);
+      if (mergedImage && effectiveSource(merged)) {
+        const source = effectiveSource(merged)!;
+        if (onOpenDocument) onOpenDocument({ asset: merged, text: "", imageSrc: source, onOpen });
+        else setImageSrc(source);
+      }
       else if (mergedCode && typeof merged.text === "string") onOpenDocument?.({ asset: merged, text: merged.text, onOpen });
       else if (!mergedImage && !mergedCode) setActionError(t("filePreviewError"));
     } catch (error) {

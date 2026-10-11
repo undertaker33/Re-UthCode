@@ -20,7 +20,17 @@ function SidebarInfo({ children, heading, lines }: { children: ReactNode; headin
 
 export const MAX_VISIBLE_SESSIONS = 5;
 
+export interface SessionSearchHit {
+  session_id: string;
+  project_key: string;
+  title: string | null;
+  snippet: string;
+  archived: boolean;
+  last_used_at: string | null;
+}
+
 export interface SidebarProps {
+  mode?: "coding" | "general";
   projects: ProjectState[];
   selectedProjectKey: string | null;
   selectedSessionId: string | null;
@@ -41,6 +51,14 @@ export interface SidebarProps {
   onMoveSession: (project: ProjectState, session: SessionSummary, target: ProjectState) => void | Promise<void>;
   onCopySessionId: (session: SessionSummary) => void | Promise<void>;
   onOpenSettings: () => void;
+  onSwitchMode?: (mode: "coding" | "general") => void;
+  onSearch?: (query: string) => void;
+  onCancelSearch?: () => void;
+  searchResults?: SessionSearchHit[];
+  searchPending?: boolean;
+  searchError?: boolean;
+  onRestoreSearchHit?: (hit: SessionSearchHit) => void;
+  onArchiveSession?: (project: ProjectState, session: SessionSummary, archived: boolean) => void | Promise<void>;
 }
 
 type MenuTarget =
@@ -240,8 +258,9 @@ function sessionInfo(project: ProjectState, session: SessionSummary): string {
 }
 
 export function sessionGroups(sessions: SessionSummary[], showMore: boolean) {
-  const pinned = sessions.filter((session) => session.pinned);
-  const ordinary = sessions.filter((session) => !session.pinned);
+  const visibleSessions = sessions.filter((session) => !session.archived);
+  const pinned = visibleSessions.filter((session) => session.pinned);
+  const ordinary = visibleSessions.filter((session) => !session.pinned);
   const visibleOrdinary = showMore ? ordinary : ordinary.slice(0, MAX_VISIBLE_SESSIONS);
   return {
     pinned,
@@ -449,6 +468,8 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
   // the authority for the mutation; an active Turn and another pending
   // mutation both block the action.
   const busy = props.activeTurn || props.sessionMutationBusy === true;
+  const archiveBusy = props.sessionMutationBusy === true || session.runtime_status === "running" || session.runtime_status === "waiting"
+    || (props.selectedProjectKey === project.projectKey && props.selectedSessionId === session.session_id && props.activeTurn);
   const moveTargets = props.projects.filter((item) => item.projectKey !== project.projectKey);
   const moveDisabledReason = props.activeTurn
     ? t("sessionMoveActive")
@@ -501,6 +522,15 @@ function SessionEntry({ project, session, props, menuTarget, onMenuTarget, varia
       separatorBefore: true,
       onSelect: () => void props.onCopySessionId(session),
     },
+    ...(!session.archived && props.onArchiveSession ? [{
+      id: "archive",
+      label: t("archiveSession"),
+      icon: "trash" as const,
+      separatorBefore: true,
+      disabled: !canMutate || archiveBusy,
+      disabledReason: !canMutate ? t("sessionCorrupt") : archiveBusy ? t("sessionMutationBusy") : undefined,
+      onSelect: () => void props.onArchiveSession?.(project, session, true),
+    }] : []),
   ];
 
   useEffect(() => { if (!editing) setDraft(session.title ?? session.preview ?? ""); }, [editing, session.preview, session.title]);
@@ -590,11 +620,86 @@ export function Sidebar(props: SidebarProps) {
       };
       return props.projects
         .flatMap((project) => project.sessions
-          .filter((session) => !session.corrupt)
+          .filter((session) => !session.corrupt && !session.archived)
           .map((session) => ({ project, session })))
         .sort((left, right) => timestamp(right.session) - timestamp(left.session));
     },
     [props.projects],
   );
-  return <aside className="sidebar" aria-label={t("projects")} aria-busy={props.sessionMutationBusy === true ? "true" : undefined}><header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header><div className="sidebar-primary"><button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button><button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button></div><nav className="sidebar-scroll"><Group title={t("pinned")} projects={pinned} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Group title={t("projects")} projects={projects} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} /><Recent entries={recent} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />{props.projects.length === 0 && <p className="empty-line">{t("openProject")}</p>}</nav><footer className="sidebar-footer"><button type="button" title={t("openSettings")} onClick={props.onOpenSettings}><UiIcon name="settings" />{t("settings")}</button></footer></aside>;
+  const mode = props.mode ?? "coding";
+  const codingProjects = props.projects.filter((project) => project.projectKey !== "uthcode:general");
+  const generalProject = props.projects.find((project) => project.projectKey === "uthcode:general");
+  const visibleProjects = mode === "coding" ? codingProjects : generalProject ? [generalProject] : [];
+  const visibleRecent = recent.filter(({ project }) => mode === "coding" ? project.projectKey !== "uthcode:general" : project.projectKey === "uthcode:general");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  useEffect(() => {
+    setSearchOpen(false);
+    setQuery("");
+  }, [mode]);
+  return <>
+    <aside className="sidebar" aria-label={mode === "coding" ? t("projects") : t("generalMode")} aria-busy={props.sessionMutationBusy === true ? "true" : undefined}>
+      <header className="sidebar-brand"><span className="brand-mark">U</span><strong>UthCode</strong></header>
+      <div className="sidebar-modes" role="group" aria-label={t("mode")}>
+        <button type="button" className={mode === "coding" ? "is-selected" : ""} aria-pressed={mode === "coding"} onClick={() => props.onSwitchMode?.("coding")}>{t("codingMode")}</button>
+        <button type="button" className={mode === "general" ? "is-selected" : ""} aria-pressed={mode === "general"} onClick={() => props.onSwitchMode?.("general")}>{t("generalMode")}</button>
+      </div>
+      <div className="sidebar-primary">
+        <button type="button" className="primary-row" title={t("newChat")} onClick={props.onNewSession}><UiIcon name="plus" />{t("newChat")}</button>
+        {mode === "coding" && <button type="button" className="secondary-row" title={t("openProject")} onClick={props.onOpenProject}><UiIcon name="folder" />{t("openProject")}</button>}
+        <button type="button" className="secondary-row" title={`${t("searchSessions")} (Ctrl+K)`} onClick={() => setSearchOpen(true)}><UiIcon name="search" />{t("searchSessions")}<kbd>Ctrl K</kbd></button>
+      </div>
+      <nav className="sidebar-scroll">
+        {mode === "coding" ? <>
+          <Group title={t("pinned")} projects={visibleProjects.filter((project) => project.pinned)} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />
+          <Group title={t("projects")} projects={visibleProjects.filter((project) => !project.pinned)} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />
+          <Recent entries={visibleRecent} props={props} menuTarget={menuTarget} onMenuTarget={setMenuTarget} />
+          {visibleProjects.length === 0 && <p className="empty-line">{t("openProject")}</p>}
+        </> : <>
+          {generalProject && <section className="nav-group recent" aria-labelledby="nav-general-sessions"><h2 id="nav-general-sessions">{t("recent")}</h2><ul>{visibleRecent.map(({ project, session }) => <SessionEntry key={`${project.projectKey}:${session.session_id}`} project={project} session={session} props={{ ...props, projects: [project] }} menuTarget={menuTarget} onMenuTarget={setMenuTarget} variant="recent" />)}</ul></section>}
+          {(!generalProject || !visibleRecent.length) && <p className="empty-line">{t("newConversation")}</p>}
+        </>}
+      </nav>
+      <footer className="sidebar-footer"><button type="button" title={t("openSettings")} onClick={props.onOpenSettings}><UiIcon name="settings" />{t("settings")}</button></footer>
+    </aside>
+    {searchOpen && <div className="session-search-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setSearchOpen(false); props.onCancelSearch?.(); } }}>
+      <section className="session-search" role="dialog" aria-modal="true" aria-label={t("searchSessions")}>
+        <header><strong>{t("searchSessions")}</strong><button type="button" aria-label={t("cancel")} onClick={() => { setSearchOpen(false); props.onCancelSearch?.(); }}>×</button></header>
+        <form onSubmit={(event) => { event.preventDefault(); if (query.trim()) props.onSearch?.(query.trim()); }}>
+          <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("searchPlaceholder")} aria-label={t("searchPlaceholder")} maxLength={512} />
+          <button type="submit" disabled={!query.trim() || props.searchPending}>{t("search")}</button>
+          {props.searchPending && <button type="button" onClick={props.onCancelSearch}>{t("cancelSearch")}</button>}
+        </form>
+        {props.searchError && <p className="session-search__error" role="alert">{t("searchFailed")}</p>}
+        {props.searchPending && <p role="status">{t("searchingSessions")}</p>}
+        {!props.searchPending && !props.searchError && props.searchResults?.length === 0 && query.trim() && <p role="status">{t("noSearchResults")}</p>}
+        <ul>{(props.searchResults ?? []).map((hit) => {
+          const project = props.projects.find((item) => item.projectKey === hit.project_key)
+            ?? (hit.project_key === "uthcode:general" ? {
+              path: "uthcode:general",
+              projectKey: "uthcode:general",
+              alias: t("generalMode"),
+              pinned: false,
+              sessions: [],
+              catalogFresh: false,
+            } : undefined);
+          const title = hit.title?.trim() || sessionLabel({ session_id: hit.session_id });
+          return <li key={`${hit.project_key}:${hit.session_id}`}>
+            <div><strong>{title}</strong><small>{hit.project_key === "uthcode:general" ? t("generalMode") : project?.alias ?? hit.project_key}{hit.archived ? ` · ${t("archived")}` : ""}</small><p>{hit.snippet}</p></div>
+            {hit.archived ? <button type="button" disabled={!project} onClick={() => { if (project) { props.onCancelSearch?.(); props.onRestoreSearchHit?.(hit); setSearchOpen(false); } }}>{t("restoreArchived")}</button> : <button type="button" disabled={!project} onClick={() => { if (project) { props.onCancelSearch?.(); props.onResumeSession(project, hit.session_id); setSearchOpen(false); } }}>{t("openSession")}</button>}
+          </li>;
+        })}</ul>
+      </section>
+    </div>}
+  </>;
 }

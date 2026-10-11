@@ -116,7 +116,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
+  state: Pick<RendererState, "mode" | "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
   sessionPreparationStatus?: "preparing" | "ready" | "failed";
   onChange: (text: string) => void;
   onSubmit: (text: string, attachments: readonly DesktopAttachmentDraft[]) => void | Promise<void>;
@@ -144,6 +144,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   const [activeCompletion, setActiveCompletion] = useState(-1);
   const completionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const hasText = state.composerText.trim().length > 0;
+  const codingMode = state.mode === "coding";
   const slashMode = state.composerText.trimStart().startsWith("/");
   const pending = state.pendingInteraction !== null;
   const terminalStatusPending = state.terminalStatusPending;
@@ -236,18 +237,26 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   }, [language, state.configuration, state.currentModelRef, state.modelCandidates]);
 
   const submit = () => {
-    const hasAttachmentOnlyPayload = !state.activeTurn && state.composerAttachments.length > 0;
+    const hasAttachmentOnlyPayload = codingMode && !state.activeTurn && state.composerAttachments.length > 0;
     if (inputLocked || (!hasText && !hasAttachmentOnlyPayload)) return;
-    void onSubmit(state.composerText, state.composerAttachments);
+    void onSubmit(state.composerText, codingMode ? state.composerAttachments : []);
   };
 
   const handleDrop = (event: ReactDragEvent<HTMLElement>) => {
+    if (!codingMode) {
+      if (event.dataTransfer.files.length > 0) event.preventDefault();
+      return;
+    }
     if (inputLocked || state.activeTurn || event.dataTransfer.files.length === 0) return;
     event.preventDefault();
     Array.from(event.dataTransfer.files).forEach((file) => { void onImportFile(file); });
   };
 
   const handlePaste = (event: ReactClipboardEvent<HTMLElement>) => {
+    if (!codingMode) {
+      if (event.clipboardData.files.length > 0 || Array.from(event.clipboardData.types).some((type) => type.toLowerCase().startsWith("image/"))) event.preventDefault();
+      return;
+    }
     if (inputLocked || state.activeTurn) return;
     const files = Array.from(event.clipboardData.files);
     if (files.length > 0) {
@@ -314,7 +323,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   };
 
   return (
-    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (!inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
+    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (codingMode && !inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
       {state.todo.length > 0 && <section className="composer-todo todo-strip" tabIndex={0} aria-label={t("tasks")} data-iteration={state.todoIteration}>
         <header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{state.todo.length}</span></header>
         <ul>{state.todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>
@@ -326,7 +335,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
         {candidates.map((candidate, index) => <button ref={(element) => { completionOptionRefs.current[index] = element; }} type="button" key={`${candidate.value}-${index}`} role="option" aria-selected={index === activeCompletion} className={index === activeCompletion ? "is-active" : ""} onMouseEnter={() => setActiveCompletion(index)} onClick={() => chooseCompletion(index)}><span>{candidate.display ?? candidate.value}</span>{candidate.description && <small>{candidate.description}</small>}</button>)}
         {(state.commandUsage || state.commandArgumentPrompt) && <p>{state.commandUsage || state.commandArgumentPrompt}</p>}
       </div>}
-      {state.composerAttachments.length > 0 && <div className="composer-attachments" aria-label={t("attachments")}>
+      {codingMode && state.composerAttachments.length > 0 && <div className="composer-attachments" aria-label={t("attachments")}>
         {state.composerAttachments.map((attachment) => <FileCard
           key={attachment.ref}
           asset={attachment}
@@ -343,27 +352,27 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
         <textarea value={state.composerText} onChange={(event) => onChange(event.target.value)} onKeyDown={handleKeyDown} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }} placeholder={runtimeRestarting ? t("runtimeRestarting") : pending ? t("completeInteraction") : terminalStatusPending ? t("terminalStatusPending") : state.activeTurn ? t("steeringMessage") : t("message")} disabled={inputLocked} rows={3} aria-label={t("message")} />
         <div className="composer-actions">
           {compactionRunning && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCompactCancel?.()} disabled={!onCompactCancel || runtimeRestarting}><UiIcon name="stop" />{t("cancel")}</button>}
-          {state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={inputLocked || state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
+          {codingMode && state.activeTurn && !pending && !terminalStatusPending && <button type="button" title={t("pause")} aria-label={t("pause")} onClick={() => void onPause()} disabled={inputLocked || state.turnStatus === "pausing"}><UiIcon name="pause" />{t("pause")}</button>}
           {state.activeTurn && !terminalStatusPending && <button type="button" title={t("cancel")} aria-label={t("cancel")} onClick={() => void onCancel()} disabled={inputLocked}><UiIcon name="stop" />{t("cancel")}</button>}
           {/* Keep the historical action hook for integrations that locate the submit
               control from the input action group. The visible control lives in the
               bottom toolbar; this zero-area proxy preserves that DOM contract while
               avoiding a second tab stop or accessible name. */}
-          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && state.composerAttachments.length === 0))} />
+          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))} />
         </div>
       </div>
       <div className="composer-toolbar">
-        <div className="composer-selectors">
+        {codingMode && <div className="composer-selectors">
           <div className="composer-attachment-actions">
             <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" /></button>
           </div>
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
-        </div>
+        </div>}
         <div className="composer-model">
           <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
-          <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />
+          {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
         </div>
-        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && state.composerAttachments.length === 0))}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
       </div>
     </section>
   );

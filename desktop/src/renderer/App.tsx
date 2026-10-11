@@ -12,13 +12,13 @@ import type { AgentEvent, ArtifactDescriptor, DesktopApi, DesktopAttachmentDraft
 import { ChatTimeline } from "./ChatTimeline";
 import { Composer } from "./Composer";
 import { type FilePreviewMode } from "./FileCard";
-import { DocumentPreviewPanel, type DocumentPreview, type DocumentPreviewOwner } from "./DocumentPreviewPanel";
+import { ReviewPanel, type DocumentPreview, type DocumentPreviewOwner, type ReviewPanelTab, type WorkspaceDiffView } from "./DocumentPreviewPanel";
 import { RendererErrorBoundary } from "./RendererErrorBoundary";
 import { RuntimePanel } from "./RuntimePanel";
-import { Sidebar } from "./Sidebar";
+import { Sidebar, type SessionSearchHit } from "./Sidebar";
 import { InteractionSurface, interactionSurfaceKey } from "./InteractionSurface";
 import { SettingsView, type ConfigurationWrite } from "./SettingsView";
-import { createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type PendingInteraction } from "./state";
+import { composerDraftOwnerKey, createInitialState, reduceRendererState, type RendererAction, type RendererState, type ProjectState, type SessionSummary, type ConfigurationView, type PendingInteraction } from "./state";
 import {
   eventIdentity,
   eventMatchesIdentity,
@@ -229,6 +229,44 @@ function timelineAttachmentFromDraft(attachment: DesktopAttachmentDraft): Timeli
   };
 }
 
+function workspaceDiffFromEvent(value: unknown, expectedProjectKey: string): WorkspaceDiffView | null {
+  const source = asObject(value);
+  const status = asObject(source.status);
+  const staged = asObject(source.staged_diff);
+  const unstaged = asObject(source.unstaged_diff);
+  if (source.source !== "current_working_tree"
+    || source.project_key !== expectedProjectKey
+    || typeof source.viewed_at !== "string"
+    || !Number.isFinite(Date.parse(source.viewed_at))
+    || typeof status.unborn !== "boolean"
+    || typeof status.truncated !== "boolean"
+    || !Array.isArray(status.entries)
+    || typeof staged.text !== "string"
+    || typeof staged.truncated !== "boolean"
+    || !Number.isSafeInteger(staged.size_bytes) || (staged.size_bytes as number) < 0
+    || typeof unstaged.text !== "string"
+    || typeof unstaged.truncated !== "boolean"
+    || !Number.isSafeInteger(unstaged.size_bytes) || (unstaged.size_bytes as number) < 0
+    || typeof source.truncated !== "boolean") return null;
+  if (status.branch !== null && typeof status.branch !== "string") return null;
+  const entries = status.entries.flatMap((value): WorkspaceDiffView["status"]["entries"] => {
+    const entry = asObject(value);
+    if (typeof entry.xy !== "string" || typeof entry.path !== "string" || !entry.path) return [];
+    if (entry.original_path !== undefined && typeof entry.original_path !== "string") return [];
+    return [{ xy: entry.xy, path: entry.path, ...(typeof entry.original_path === "string" ? { original_path: entry.original_path } : {}) }];
+  });
+  if (entries.length !== status.entries.length) return null;
+  return {
+    source: "current_working_tree",
+    project_key: expectedProjectKey,
+    viewed_at: source.viewed_at,
+    status: { branch: typeof status.branch === "string" ? status.branch : null, entries, unborn: status.unborn, truncated: status.truncated },
+    staged_diff: { text: staged.text, truncated: staged.truncated, size_bytes: staged.size_bytes as number },
+    unstaged_diff: { text: unstaged.text, truncated: unstaged.truncated, size_bytes: unstaged.size_bytes as number },
+    truncated: source.truncated,
+  };
+}
+
 interface PendingProcessPermission {
   projectKey: string;
   sessionId: string;
@@ -236,6 +274,38 @@ interface PendingProcessPermission {
   request: JsonObject;
   submitting: boolean;
 }
+
+interface SessionSearchContext {
+  sequence: number;
+  operationId: string;
+  ownerKey: string;
+  mode: RendererState["mode"];
+  projectKey: string;
+  sessionId: string | null;
+  sessionViewRevision: number;
+  runtimeGeneration: number;
+}
+
+interface WorkspaceDiffContext {
+  sequence: number;
+  operationId: string | null;
+  ownerKey: string;
+  owner: DocumentPreviewOwner & { ownerKey: string };
+  tabId: string;
+}
+
+interface ReviewPanelState {
+  tabs: ReviewPanelTab[];
+  activeTabId: string | null;
+}
+
+interface SessionSearchView {
+  results: SessionSearchHit[];
+  pending: boolean;
+  error: boolean;
+}
+
+const GENERAL_PROJECT_KEY = "uthcode:general";
 
 function processPermissionFromResult(value: unknown, projectKey: string, sessionId: string, processId: string): PendingProcessPermission | null {
   const permission = asObject(asObject(value).permission_required);
@@ -335,7 +405,7 @@ export function commandResultNotice(
 }
 
 function projectPreferences(projects: ProjectState[]): DesktopPreferences["recentProjects"] {
-  return projects.map((project) => ({
+  return projects.filter((project) => project.projectKey !== "uthcode:general").map((project) => ({
     path: project.path,
     alias: project.alias,
     pinned: project.pinned,
@@ -397,19 +467,39 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
   const [pendingProcessPermission, setPendingProcessPermission] = useState<PendingProcessPermission | null>(null);
-  const [documentPreview, setDocumentPreview] = useState<DocumentPreview | null>(null);
+  const [reviewPanel, setReviewPanel] = useState<ReviewPanelState>({ tabs: [], activeTabId: null });
+  const reviewPanelRef = useRef(reviewPanel);
+  reviewPanelRef.current = reviewPanel;
   const [documentPreviewWidth, setDocumentPreviewWidth] = useState(460);
   const pendingProcessPermissionRef = useRef<PendingProcessPermission | null>(null);
   const processStopInFlightRef = useRef<string | null>(null);
   const processPermissionSubmitRef = useRef<string | null>(null);
   const processPermissionReleaseRef = useRef<string | null>(null);
   const runtimeStatusPollRef = useRef<Promise<boolean> | null>(null);
+  const [sessionSearch, setSessionSearch] = useState<SessionSearchView>({ results: [], pending: false, error: false });
+  const sessionSearchSequenceRef = useRef(0);
+  const sessionSearchContextRef = useRef<SessionSearchContext | null>(null);
+  const earlySessionSearchEventsRef = useRef<Map<string, AgentEvent>>(new Map());
+  const workspaceDiffSequenceRef = useRef(0);
+  const workspaceDiffContextRef = useRef<WorkspaceDiffContext | null>(null);
+  const earlyWorkspaceDiffEventsRef = useRef<Map<string, AgentEvent>>(new Map());
   const historyRequestsRef = useRef<Map<string, { token: symbol; promise: Promise<void> }>>(new Map());
   const projectCatalogRequestSequenceRef = useRef(new Map<string, number>());
   const projectCatalogAppliedSequenceRef = useRef(new Map<string, number>());
   const preparationPollSequenceRef = useRef(0);
   const preparationPollRef = useRef<Map<string, number>>(new Map());
   const t = useCallback((key: Parameters<typeof translate>[1]) => translate(stateRef.current.language, key), []);
+  const updateReviewPanel = useCallback((update: (current: ReviewPanelState) => ReviewPanelState) => {
+    const next = update(reviewPanelRef.current);
+    reviewPanelRef.current = next;
+    setReviewPanel(next);
+  }, []);
+  const updateReviewTab = useCallback((id: string, update: (tab: ReviewPanelTab) => ReviewPanelTab) => {
+    updateReviewPanel((current) => ({
+      ...current,
+      tabs: current.tabs.map((tab) => tab.id === id ? update(tab) : tab),
+    }));
+  }, [updateReviewPanel]);
 
   const send = useCallback(async (method: Parameters<DesktopApi["requestRuntime"]>[0], params: JsonObject = {}) => {
     if (!api) throw new Error(t("desktopApiUnavailable"));
@@ -442,6 +532,205 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     finishPendingTurnStart,
     clearPendingTurnStart,
   } = lifecycle;
+
+  const reviewOwner = useCallback((): DocumentPreviewOwner & { ownerKey: string } => {
+    const current = stateRef.current;
+    return {
+      generation: runtimeGeneration(),
+      mode: current.mode,
+      projectKey: current.selectedProjectKey,
+      sessionId: current.selectedSessionId,
+      viewRevision: current.sessionViewRevision,
+      ownerKey: current.selectedProjectKey ?? "",
+    };
+  }, [runtimeGeneration]);
+  const reviewOwnerMatches = useCallback((owner: DocumentPreviewOwner & { ownerKey?: string }, current = stateRef.current): boolean =>
+    isMounted()
+      && runtimeGeneration() === owner.generation
+      && current.mode === owner.mode
+      && current.selectedProjectKey === owner.projectKey
+      && current.selectedSessionId === owner.sessionId
+      && current.sessionViewRevision === owner.viewRevision,
+  [isMounted, runtimeGeneration]);
+
+  const sessionSearchEventOwned = useCallback((context: SessionSearchContext): boolean => {
+    const current = stateRef.current;
+    return isMounted()
+      && runtimeGeneration() === context.runtimeGeneration
+      && current.mode === context.mode
+      && current.selectedProjectKey === context.projectKey
+      && current.selectedSessionId === context.sessionId
+      && current.sessionViewRevision === context.sessionViewRevision;
+  }, [isMounted, runtimeGeneration]);
+
+  const acceptSessionSearchEvent = useCallback((context: SessionSearchContext, event: AgentEvent): void => {
+    if (sessionSearchContextRef.current !== context) return;
+    const payload = asObject(event);
+    const operationId = stringValue(payload.operation_id);
+    if (!operationId || operationId !== context.operationId) return;
+    if (!sessionSearchEventOwned(context)) {
+      sessionSearchContextRef.current = null;
+      return;
+    }
+    if (stringValue(payload.owner_key) !== context.ownerKey) {
+      sessionSearchContextRef.current = null;
+      setSessionSearch({ results: [], pending: false, error: true });
+      return;
+    }
+    const state = stringValue(payload.state);
+    if (state !== "completed" && state !== "cancelled" && state !== "stale" && state !== "failed") return;
+    sessionSearchContextRef.current = null;
+    if (state === "completed") {
+      const allowedProjects = new Set(stateRef.current.projects.map((project) => project.projectKey));
+      allowedProjects.add(GENERAL_PROJECT_KEY);
+      const results = (Array.isArray(payload.hits) ? payload.hits : []).flatMap((value): SessionSearchHit[] => {
+        const hit = asObject(value);
+        const sessionId = stringValue(hit.session_id);
+        const projectKey = stringValue(hit.project_key);
+        if (!sessionId || !allowedProjects.has(projectKey) || typeof hit.snippet !== "string" || typeof hit.archived !== "boolean") return [];
+        return [{
+          session_id: sessionId,
+          project_key: projectKey,
+          title: typeof hit.title === "string" ? hit.title : null,
+          snippet: hit.snippet.slice(0, 160),
+          archived: hit.archived,
+          last_used_at: typeof hit.last_used_at === "string" ? hit.last_used_at : null,
+        }];
+      }).slice(0, 20);
+      setSessionSearch({ results, pending: false, error: false });
+    } else {
+      setSessionSearch({ results: [], pending: false, error: state === "failed" });
+    }
+  }, [sessionSearchEventOwned]);
+
+  const receiveSessionSearchEvent = useCallback((event: AgentEvent): boolean => {
+    if (stringValue(asObject(event).type) !== "session_search_result") return false;
+    const payload = asObject(event);
+    const operationId = stringValue(payload.operation_id);
+    const current = sessionSearchContextRef.current;
+    if (!current || !operationId) return true;
+    if (!current.operationId) {
+      const buffered = earlySessionSearchEventsRef.current;
+      if (buffered.size >= 4) buffered.delete(buffered.keys().next().value as string);
+      buffered.set(operationId, event);
+      return true;
+    }
+    if (current.operationId === operationId) acceptSessionSearchEvent(current, event);
+    return true;
+  }, [acceptSessionSearchEvent]);
+
+  const acceptWorkspaceDiffEvent = useCallback((context: WorkspaceDiffContext, event: AgentEvent) => {
+    if (workspaceDiffContextRef.current !== context) return;
+    const payload = asObject(event);
+    if (stringValue(payload.operation_id) !== context.operationId) return;
+    if (!reviewOwnerMatches(context.owner)) {
+      workspaceDiffContextRef.current = null;
+      return;
+    }
+    if (stringValue(payload.owner_key) !== context.ownerKey) {
+      workspaceDiffContextRef.current = null;
+      updateReviewTab(context.tabId, (tab) => tab.kind === "workspace-diff"
+        ? { ...tab, state: "failed", error: t("workspaceDiffUnavailable") }
+        : tab);
+      return;
+    }
+    const state = stringValue(payload.state);
+    if (state !== "completed" && state !== "cancelled" && state !== "stale" && state !== "failed") return;
+    workspaceDiffContextRef.current = null;
+    earlyWorkspaceDiffEventsRef.current.delete(context.operationId ?? "");
+    updateReviewTab(context.tabId, (tab) => {
+      if (tab.kind !== "workspace-diff") return tab;
+      if (state === "completed") {
+        const diff = workspaceDiffFromEvent(payload, context.ownerKey);
+        return diff
+          ? { ...tab, state: "completed", diff, error: undefined }
+          : { ...tab, state: "failed", diff: undefined, error: t("workspaceDiffUnavailable") };
+      }
+      if (state === "failed") return { ...tab, state, diff: undefined, error: t("workspaceDiffUnavailable") };
+      return { ...tab, state, diff: undefined, error: undefined };
+    });
+  }, [reviewOwnerMatches, t, updateReviewTab]);
+
+  const receiveWorkspaceDiffEvent = useCallback((event: AgentEvent): boolean => {
+    if (stringValue(asObject(event).type) !== "workspace_diff_result") return false;
+    const payload = asObject(event);
+    const operationId = stringValue(payload.operation_id);
+    const context = workspaceDiffContextRef.current;
+    if (!context || !operationId) return true;
+    if (!context.operationId) {
+      if (stringValue(payload.owner_key) === context.ownerKey) {
+        const buffered = earlyWorkspaceDiffEventsRef.current;
+        if (buffered.size >= 4) buffered.delete(buffered.keys().next().value as string);
+        buffered.set(operationId, event);
+      }
+      return true;
+    }
+    if (context.operationId === operationId) acceptWorkspaceDiffEvent(context, event);
+    return true;
+  }, [acceptWorkspaceDiffEvent]);
+
+  const cancelSessionSearch = useCallback(() => {
+    const current = sessionSearchContextRef.current;
+    sessionSearchContextRef.current = null;
+    sessionSearchSequenceRef.current += 1;
+    earlySessionSearchEventsRef.current.clear();
+    setSessionSearch({ results: [], pending: false, error: false });
+    if (current?.operationId) void send("session.search.cancel", { operation_id: current.operationId }).catch(() => undefined);
+  }, [send]);
+
+  const searchSessions = useCallback(async (query: string) => {
+    const current = stateRef.current;
+    const ownerKey = current.mode === "general" ? GENERAL_PROJECT_KEY : current.selectedProjectKey;
+    if (!api || !ownerKey || current.selectedProjectKey !== ownerKey) {
+      setSessionSearch({ results: [], pending: false, error: true });
+      return;
+    }
+    const previous = sessionSearchContextRef.current;
+    if (previous?.operationId) void send("session.search.cancel", { operation_id: previous.operationId }).catch(() => undefined);
+    const sequence = sessionSearchSequenceRef.current + 1;
+    sessionSearchSequenceRef.current = sequence;
+    earlySessionSearchEventsRef.current.clear();
+    const context: SessionSearchContext = {
+      sequence,
+      operationId: "",
+      ownerKey,
+      mode: current.mode,
+      projectKey: current.selectedProjectKey,
+      sessionId: current.selectedSessionId,
+      sessionViewRevision: current.sessionViewRevision,
+      runtimeGeneration: runtimeGeneration(),
+    };
+    sessionSearchContextRef.current = context;
+    setSessionSearch({ results: [], pending: true, error: false });
+    try {
+      const result = asObject(await send("session.search", { query: query.slice(0, 512), max_results: 20 }));
+      const operationId = stringValue(result.operation_id);
+      if (sessionSearchContextRef.current !== context || sessionSearchSequenceRef.current !== sequence) {
+        if (operationId) void send("session.search.cancel", { operation_id: operationId }).catch(() => undefined);
+        return;
+      }
+      if (!operationId || stringValue(result.owner_key) !== ownerKey || stringValue(result.state) !== "searching") {
+        sessionSearchContextRef.current = null;
+        setSessionSearch({ results: [], pending: false, error: true });
+        return;
+      }
+      const owned = { ...context, operationId };
+      sessionSearchContextRef.current = owned;
+      const earlyEvent = earlySessionSearchEventsRef.current.get(operationId);
+      earlySessionSearchEventsRef.current.clear();
+      if (earlyEvent) acceptSessionSearchEvent(owned, earlyEvent);
+    } catch {
+      if (sessionSearchContextRef.current === context && sessionSearchSequenceRef.current === sequence) {
+        sessionSearchContextRef.current = null;
+        setSessionSearch({ results: [], pending: false, error: true });
+      }
+    }
+  }, [acceptSessionSearchEvent, api, runtimeGeneration, send]);
+
+  useEffect(() => {
+    const current = sessionSearchContextRef.current;
+    if (current && !sessionSearchEventOwned(current)) cancelSessionSearch();
+  }, [cancelSessionSearch, sessionSearchEventOwned, state.mode, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -1041,6 +1330,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     let cancelled = false;
     const unsubscribe = api.subscribeAgentEvents((event) => {
       if (cancelled) return;
+      if (receiveSessionSearchEvent(event)) return;
+      if (receiveWorkspaceDiffEvent(event)) return;
       const pendingStart = pendingTurnStart();
       const pendingEventIdentity = eventIdentity(event);
       if (pendingStart && hasTurnIdentity(pendingEventIdentity.runId, pendingEventIdentity.turnId)) {
@@ -1126,7 +1417,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       cancelTerminalStatusPoll();
       unsubscribe();
     };
-  }, [api, beginSessionPresentation, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, pollSessionPreparation, processAgentEvent, refreshCatalog, refreshProjectCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
+  }, [api, beginSessionPresentation, bufferPendingTurnEvent, cancelTerminalStatusPoll, clearPendingTurnStart, enqueueRuntimeOperation, hasOwner, pendingTurnStart, pollSessionPreparation, processAgentEvent, receiveSessionSearchEvent, receiveWorkspaceDiffEvent, refreshCatalog, refreshProjectCatalog, refreshConfiguration, refreshRuntimeStatus, send, t]);
 
   const openProject = useCallback(async () => {
     if (!api) return;
@@ -1181,10 +1472,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const resumeSession = useCallback(async (project: ProjectState, sessionId: string) => {
     if (!api) return;
+    const targetIsGeneral = project.projectKey === GENERAL_PROJECT_KEY;
     // Clicking the already-visible row is a presentation no-op.  In
     // particular, never enqueue a lifecycle operation that waits for its own
     // active Turn to become idle.
     if (sessionId
+      && stateRef.current.mode === (targetIsGeneral ? "general" : "coding")
       && stateRef.current.selectedProjectKey === project.projectKey
       && stateRef.current.selectedSessionId === sessionId
       && stateRef.current.sessionPreparation[sessionRuntimeKey(project.projectKey, sessionId)] !== "failed") return;
@@ -1193,7 +1486,12 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       // navigation also preserves the old runtime, so switching rows/projects
       // never cancels a background Turn.
       if (!isOwned()) throw new StaleRuntimeOperation();
-      if (stateRef.current.selectedProjectKey !== project.projectKey) {
+      if (targetIsGeneral && stateRef.current.mode !== "general") {
+        const opened = await send("general.open", {});
+        if (!isOwned()) throw new StaleRuntimeOperation();
+        dispatch({ type: "general_opened", result: opened, sessionId: sessionId || null });
+        dispatch({ type: "runtime_state", state: "ready", error: null });
+      } else if (!targetIsGeneral && (stateRef.current.mode !== "coding" || stateRef.current.selectedProjectKey !== project.projectKey)) {
         const opened = await send("project.open", { path: project.path });
         if (!isOwned()) throw new StaleRuntimeOperation();
         dispatch({ type: "project_opened", result: opened, preserveRuntimeState: true, preserveSessionRuntime: true });
@@ -1202,7 +1500,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       let preparing = false;
       if (sessionId) {
         beginSessionPresentation(project.projectKey, sessionId);
-        const result = await send("session.resume", { session_id: sessionId });
+        const result = await send("session.resume", { session_id: sessionId, project_key: project.projectKey });
         if (!isOwned()) throw new StaleRuntimeOperation();
         const source = asObject(result);
         preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
@@ -1216,7 +1514,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           cancelTerminalStatusPoll();
           dispatch({ type: "session_resumed", result, preserveRuntimeState: true, preserveSessionRuntime: true, preserveTimeline: true });
         }
-        await persist("selectedSessionId", sessionId);
+        if (!targetIsGeneral) await persist("selectedSessionId", sessionId);
       } else {
         const result = await send("session.new", {});
         if (!isOwned()) throw new StaleRuntimeOperation();
@@ -1226,7 +1524,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           setLatestTurnIdentity(identityFromRun(source.run));
           cancelTerminalStatusPoll();
           dispatch({ type: "session_new", sessionId: nextId, run: source.run, modelRef: typeof source.model_ref === "string" ? source.model_ref : null, preserveSessionRuntime: true });
-          await persist("selectedSessionId", nextId);
+          if (!targetIsGeneral) await persist("selectedSessionId", nextId);
         }
       }
       if (!isOwned()) throw new StaleRuntimeOperation();
@@ -1243,6 +1541,62 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     const project = stateRef.current.projects.find((item) => item.projectKey === stateRef.current.selectedProjectKey);
     if (project) await resumeSession(project, "");
   }, [resumeSession]);
+
+  const switchMode = useCallback(async (mode: RendererState["mode"]) => {
+    const current = stateRef.current;
+    if (current.mode === mode) return;
+    cancelSessionSearch();
+    if (mode === "coding") {
+      const saved = current.modeSelections.coding;
+      const project = saved.projectKey
+        ? current.projects.find((item) => item.projectKey === saved.projectKey && item.projectKey !== GENERAL_PROJECT_KEY)
+        : null;
+      if (project) {
+        if (saved.sessionId) await resumeSession(project, saved.sessionId);
+        else await openProjectPath(project.path);
+        return;
+      }
+      await enqueueRuntimeOperation("navigation", async (isOwned) => {
+        if (!isOwned()) throw new StaleRuntimeOperation();
+        dispatch({ type: "mode_empty", mode: "coding" });
+      }, () => undefined, "stopped");
+      return;
+    }
+
+    await enqueueRuntimeOperation("navigation", async (isOwned) => {
+      const sessionId = stateRef.current.modeSelections.general.sessionId;
+      const opened = await send("general.open", {});
+      if (!isOwned()) throw new StaleRuntimeOperation();
+      dispatch({ type: "general_opened", result: opened, sessionId });
+      dispatch({ type: "runtime_state", state: "ready", error: null });
+      let preparing = false;
+      if (sessionId) {
+        beginSessionPresentation(GENERAL_PROJECT_KEY, sessionId);
+        const resumed = await send("session.resume", { session_id: sessionId, project_key: GENERAL_PROJECT_KEY });
+        if (!isOwned()) throw new StaleRuntimeOperation();
+        const source = asObject(resumed);
+        preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
+        if (source.preparation_failed === true) {
+          dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "failed" });
+        } else if (preparing) {
+          dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "preparing" });
+          pollSessionPreparation(GENERAL_PROJECT_KEY, sessionId);
+        } else {
+          setLatestTurnIdentity(identityFromRun(source.run));
+          cancelTerminalStatusPoll();
+          dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true, preserveSessionRuntime: true });
+        }
+      }
+      if (!isOwned()) throw new StaleRuntimeOperation();
+      await refreshCatalog(GENERAL_PROJECT_KEY, sessionId ? "session_resume" : "catalog_refresh", sessionId || undefined, true, isOwned);
+      if (!sessionId || !preparing) {
+        await refreshRuntimeStatus(isOwned);
+        await refreshConfiguration(isOwned);
+      }
+    }, (error, isOwned) => {
+      if (isOwned()) dispatch({ type: "runtime_error", message: safeErrorMessage(error, t("sessionOpenFailed")), state: "ready" });
+    });
+  }, [beginSessionPresentation, cancelSessionSearch, cancelTerminalStatusPoll, enqueueRuntimeOperation, openProjectPath, pollSessionPreparation, refreshCatalog, refreshConfiguration, refreshRuntimeStatus, resumeSession, send, setLatestTurnIdentity, t]);
 
   const loadOlderHistory = useCallback(() => {
     const current = stateRef.current;
@@ -1267,10 +1621,26 @@ export function App({ api: explicitApi, initialState }: AppProps) {
 
   const executeCommand = useCallback(async (text: string) => {
     if (!text.trim() || !api || commandInFlightRef.current) return;
+    const owner = {
+      generation: runtimeGeneration(),
+      mode: stateRef.current.mode,
+      projectKey: stateRef.current.selectedProjectKey,
+      sessionId: stateRef.current.selectedSessionId,
+      viewRevision: stateRef.current.sessionViewRevision,
+    };
+    const ownsCommand = () => {
+      const current = stateRef.current;
+      return isMounted()
+        && runtimeGeneration() === owner.generation
+        && current.mode === owner.mode
+        && current.selectedProjectKey === owner.projectKey
+        && current.selectedSessionId === owner.sessionId
+        && current.sessionViewRevision === owner.viewRevision
+        && !hasOwner();
+    };
     if ((hasOwner() || stateRef.current.runtimeState === "restarting")
       && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return;
-    const generation = runtimeGeneration();
-    const isCurrent = () => isMounted() && runtimeGeneration() === generation && !hasOwner();
+    const isCurrent = ownsCommand;
     if (!isCurrent() || commandInFlightRef.current) return;
     commandInFlightRef.current = true;
     try {
@@ -1487,12 +1857,31 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     await send("attachment.reveal", { ref });
   }, [api, send]);
 
-  const submitComposer = useCallback(async (text: string, attachments: readonly DesktopAttachmentDraft[] = stateRef.current.composerAttachments) => {
+  const submitComposer = useCallback(async (text: string) => {
+    const invokedState = stateRef.current;
+    const submissionOwner = {
+      mode: invokedState.mode,
+      projectKey: invokedState.selectedProjectKey,
+      sessionId: invokedState.selectedSessionId,
+      viewRevision: invokedState.sessionViewRevision,
+      runtimeGeneration: runtimeGeneration(),
+    };
+    const selectedAttachments = invokedState.mode === "coding" && !invokedState.activeTurn
+      ? invokedState.composerAttachments.map((attachment) => ({ ...attachment }))
+      : [];
+    const ownsSubmissionOwner = () => {
+      const current = stateRef.current;
+      return isMounted()
+        && runtimeGeneration() === submissionOwner.runtimeGeneration
+        && current.mode === submissionOwner.mode
+        && current.selectedProjectKey === submissionOwner.projectKey
+        && current.selectedSessionId === submissionOwner.sessionId
+        && current.sessionViewRevision === submissionOwner.viewRevision;
+    };
     const isCompactionRunning = () => (stateRef.current.compactionStatus.state as string) === "running";
-    const selectedAttachments = stateRef.current.activeTurn ? [] : attachments;
-    if (!api || !isMounted() || (!text.trim() && selectedAttachments.length === 0) || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
-    const selectedProjectKey = stateRef.current.selectedProjectKey;
-    const selectedSessionId = stateRef.current.selectedSessionId;
+    if (!api || !isMounted() || (!text.trim() && selectedAttachments.length === 0) || pendingTurnStart() || invokedState.pendingInteraction || invokedState.terminalStatusPending || isCompactionRunning()) return;
+    const selectedProjectKey = submissionOwner.projectKey;
+    const selectedSessionId = submissionOwner.sessionId;
     const preparation = selectedProjectKey && selectedSessionId
       ? stateRef.current.sessionPreparation[sessionRuntimeKey(selectedProjectKey, selectedSessionId)]
       : undefined;
@@ -1501,18 +1890,22 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     // owner to finish recovery so they cannot race a second writer.
     if (!text.trimStart().startsWith("/") && preparation !== undefined && preparation !== "ready") return;
     if ((hasOwner() || stateRef.current.runtimeState === "restarting")
-      && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return;
-    if (!isMounted() || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
+      && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting" || !ownsSubmissionOwner())) return;
+    if (!ownsSubmissionOwner() || pendingTurnStart() || stateRef.current.pendingInteraction || stateRef.current.terminalStatusPending || isCompactionRunning()) return;
     if (text.trimStart().startsWith("/")) {
       await executeCommand(text.trim());
       return;
     }
-    const submissionProjectKey = stateRef.current.selectedProjectKey;
-    const submissionSessionId = stateRef.current.selectedSessionId;
-    const submissionGeneration = runtimeGeneration();
-    const submissionViewRevision = stateRef.current.sessionViewRevision;
-    const steering = stateRef.current.activeTurn;
-    const steeringIdentity = steering ? identityFromRun(stateRef.current.run) : null;
+    const submissionProjectKey = submissionOwner.projectKey;
+    const submissionSessionId = submissionOwner.sessionId;
+    const submissionGeneration = submissionOwner.runtimeGeneration;
+    const submissionViewRevision = submissionOwner.viewRevision;
+    const submissionMode = submissionOwner.mode;
+    const submissionText = text;
+    const submissionAttachmentRefs = selectedAttachments.map((attachment) => attachment.ref);
+    const submissionDraftRevision = stateRef.current.composerDraftRevisions[composerDraftOwnerKey(submissionMode, submissionProjectKey, submissionSessionId)] ?? 0;
+    const steering = invokedState.activeTurn;
+    const steeringIdentity = steering ? identityFromRun(invokedState.run) : null;
     const clearPendingSteeringIdentity = () => {
       if (steering && steeringIdentity && hasCompleteTurnIdentity(steeringIdentity)) {
         dispatch({ type: "steering_submission_failed", runId: steeringIdentity.runId, turnId: steeringIdentity.turnId });
@@ -1546,11 +1939,31 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const latestState = stateRef.current;
       const stillOwnsSubmission = latestState.selectedProjectKey === submissionProjectKey
         && latestState.selectedSessionId === submissionSessionId
+        && latestState.mode === submissionMode
         && latestState.sessionViewRevision === submissionViewRevision
         && runtimeGeneration() === submissionGeneration;
       const returnedSessionId = !steering ? stringValue(asObject(result).session_id) : null;
       const selectedSessionMismatch = Boolean(returnedSessionId && submissionSessionId && returnedSessionId !== submissionSessionId);
       if (!stillOwnsSubmission || selectedSessionMismatch) {
+        // Navigation may move the visible composer while turn.start is in
+        // flight. Retire only the exact draft version that this accepted Run
+        // captured; never project its Run or clear the newly selected owner.
+        if (!steering
+          && runtimeBusinessErrorKind(result) !== "image_input_unsupported"
+          && hasCompleteTurnIdentity(acceptedIdentity)) {
+          dispatch({
+            type: "submission_committed_offscreen",
+            submission: {
+              mode: submissionMode,
+              projectKey: submissionProjectKey,
+              sessionId: submissionSessionId,
+              draftRevision: submissionDraftRevision,
+              text: submissionText,
+              attachmentRefs: submissionAttachmentRefs,
+              ...(!submissionSessionId && submissionProjectKey && returnedSessionId ? { acceptedSessionId: returnedSessionId } : {}),
+            },
+          });
+        }
         if (pendingStart && pendingTurnStart() === pendingStart) {
           finishPendingTurnStart(pendingStart).forEach((event) => processAgentEvent(event));
         }
@@ -1596,13 +2009,25 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         run: acceptedRun,
         steering,
         text,
+        submission: {
+          mode: submissionMode,
+          projectKey: submissionProjectKey,
+          sessionId: submissionSessionId,
+          viewRevision: submissionViewRevision,
+          draftRevision: submissionDraftRevision,
+          text: submissionText,
+          attachmentRefs: submissionAttachmentRefs,
+        },
         ...(lazySessionId ? { sessionId: lazySessionId } : {}),
         ...(!steering && selectedAttachments.length > 0
-          ? { attachments: selectedAttachments.map(timelineAttachmentFromDraft) }
+          ? {
+            attachments: selectedAttachments.map(timelineAttachmentFromDraft),
+            submittedAttachmentRefs: selectedAttachments.map((attachment) => attachment.ref),
+          }
           : {}),
       });
       if (lazySessionId) {
-        void persist("selectedSessionId", lazySessionId);
+        if (submissionMode === "coding") void persist("selectedSessionId", lazySessionId);
         void refreshCatalog(submissionProjectKey as string, "session_new", lazySessionId);
       }
       // Replaying after the accepted action preserves the exact stdout order
@@ -1618,6 +2043,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       const latestState = stateRef.current;
       const stillOwnsSubmission = latestState.selectedProjectKey === submissionProjectKey
         && latestState.selectedSessionId === submissionSessionId
+        && latestState.mode === submissionMode
         && latestState.sessionViewRevision === submissionViewRevision
         && runtimeGeneration() === submissionGeneration;
       if (stillOwnsSubmission) dispatch({ type: "notice", text: safeErrorMessage(error, t("turnStartFailed")) });
@@ -1744,12 +2170,6 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     if (expanded) void refreshProjectCatalog(projectKey);
   }, [refreshProjectCatalog]);
 
-  const toggleRuntime = useCallback(() => {
-    if (stateRef.current.focusMode) return;
-    const current = stateRef.current.panelMode;
-    setPanelMode(current === "hidden" || (current === "docked" && narrowViewport) ? "floating" : "hidden");
-  }, [narrowViewport, setPanelMode]);
-
   const aliasChange = useCallback((projectKey: string, alias: string) => {
     const projects = stateRef.current.projects.map((project) => project.projectKey === projectKey ? { ...project, alias } : project);
     dispatch({ type: "hydrate_preferences", preferences: { recentProjects: projectPreferences(projects), projectAliases: Object.fromEntries(projects.map((project) => [project.projectKey, project.alias])) } });
@@ -1861,6 +2281,113 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     }
   }, [beginSessionMutation, endSessionMutation, hasOwner, isMounted, persist, reconcileSessionMutation, refreshCatalog, runtimeGeneration, send, t, waitForRuntimeUserAccess]);
 
+  const archiveSession = useCallback(async (project: ProjectState, session: SessionSummary, archived: boolean): Promise<boolean> => {
+    if (!api || !session.session_id) return false;
+    const before = stateRef.current;
+    const selectedTarget = before.selectedProjectKey === project.projectKey && before.selectedSessionId === session.session_id;
+    if (session.runtime_status === "running" || session.runtime_status === "waiting"
+      || (selectedTarget && (before.activeTurn || before.terminalStatusPending))) {
+      dispatch({ type: "notice", text: t("sessionMutationBusy") });
+      return false;
+    }
+    const mutation = beginSessionMutation();
+    if (!mutation) return false;
+    const { sequence, generation: mutationGeneration } = mutation;
+    const runtimeGenerationAtStart = runtimeGeneration();
+    const expected = {
+      mode: before.mode,
+      projectKey: before.selectedProjectKey,
+      sessionId: before.selectedSessionId,
+      revision: before.sessionViewRevision,
+    };
+    const ownsNavigation = () => {
+      const current = stateRef.current;
+      return runtimeGeneration() === runtimeGenerationAtStart
+        && current.mode === expected.mode
+        && current.selectedProjectKey === expected.projectKey
+        && current.selectedSessionId === expected.sessionId
+        && current.sessionViewRevision === expected.revision;
+    };
+    let navigateTo: { project: ProjectState; sessionId: string } | null = null;
+    let clearArchivedCurrent = false;
+    try {
+      if ((hasOwner() || stateRef.current.runtimeState === "restarting")
+        && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return false;
+      if (!isMounted() || sessionMutationInFlightRef.current !== sequence || sessionMutationGenerationRef.current !== mutationGeneration || runtimeGeneration() !== runtimeGenerationAtStart) return false;
+      const result = await send("session.archive", {
+        session_id: session.session_id,
+        project_key: project.projectKey,
+        archived,
+      });
+      if (!isMounted() || sessionMutationInFlightRef.current !== sequence) return false;
+      dispatch({ type: "session_mutated", sourceProjectKey: project.projectKey, result });
+      // The archive/restore has already committed. Refresh that project's
+      // durable catalog even if navigation changed while the request ran;
+      // only the optional follow-up navigation belongs to the captured view.
+      const catalog = asObject(await send("project.sessions", { project_key: project.projectKey, archived: false }));
+      if (!isMounted() || sessionMutationInFlightRef.current !== sequence) return true;
+      const sessions = Array.isArray(catalog.sessions) ? catalog.sessions : [];
+      dispatch({ type: "catalog_refreshed", projectKey: project.projectKey, sessions, reason: "catalog_refresh" });
+      if (!ownsNavigation()) return true;
+      if (selectedTarget && archived) {
+        const nextId = sessions.map((value) => asObject(value)).find((value) => value.archived !== true && value.corrupt !== true && typeof value.session_id === "string")?.session_id;
+        if (typeof nextId === "string") {
+          navigateTo = { project, sessionId: nextId };
+        } else {
+          clearArchivedCurrent = true;
+        }
+      }
+      return true;
+    } catch (error) {
+      if (isMounted() && sessionMutationInFlightRef.current === sequence) {
+        dispatch({ type: "notice", text: safeErrorMessage(error, t("sessionArchiveFailed")) });
+      }
+      return false;
+    } finally {
+      endSessionMutation(sequence);
+      if (clearArchivedCurrent && isMounted() && ownsNavigation()) {
+        dispatch({ type: "session_archived_current", projectKey: project.projectKey, sessionId: session.session_id });
+      }
+      if (navigateTo && isMounted() && ownsNavigation()) await resumeSession(navigateTo.project, navigateTo.sessionId);
+    }
+  }, [api, beginSessionMutation, endSessionMutation, hasOwner, isMounted, resumeSession, runtimeGeneration, send, t, waitForRuntimeUserAccess]);
+
+  const restoreSearchHit = useCallback(async (hit: SessionSearchHit) => {
+    const before = stateRef.current;
+    const expected = {
+      mode: before.mode,
+      projectKey: before.selectedProjectKey,
+      sessionId: before.selectedSessionId,
+      revision: before.sessionViewRevision,
+      generation: runtimeGeneration(),
+    };
+    const ownsNavigation = () => {
+      const current = stateRef.current;
+      return isMounted()
+        && runtimeGeneration() === expected.generation
+        && current.mode === expected.mode
+        && current.selectedProjectKey === expected.projectKey
+        && current.selectedSessionId === expected.sessionId
+        && current.sessionViewRevision === expected.revision;
+    };
+    const existing = stateRef.current.projects.find((item) => item.projectKey === hit.project_key);
+    const project: ProjectState | null = existing ?? (hit.project_key === GENERAL_PROJECT_KEY ? {
+      path: GENERAL_PROJECT_KEY,
+      projectKey: GENERAL_PROJECT_KEY,
+      alias: t("generalMode"),
+      pinned: false,
+      sessions: [],
+      catalogFresh: false,
+    } : null);
+    if (!project) return;
+    const session = project.sessions.find((item) => item.session_id === hit.session_id) ?? {
+      session_id: hit.session_id,
+      project_key: hit.project_key,
+      archived: true,
+    };
+    if (await archiveSession(project, session, false) && ownsNavigation()) await resumeSession(project, hit.session_id);
+  }, [archiveSession, isMounted, resumeSession, runtimeGeneration, t]);
+
   const copyText = useCallback(async (text: string) => {
     if (!api) throw new Error("Desktop API is unavailable");
     await api.copyText(text);
@@ -1939,37 +2466,202 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     return descriptor;
   }, [artifactDescriptor, send]);
 
-  const documentPreviewMatchesCurrent = useCallback((preview: DocumentPreview | null): boolean => {
-    const owner = preview?.owner;
-    if (!owner) return false;
-    const current = stateRef.current;
-    return owner.generation === runtimeGeneration()
-      && owner.projectKey === current.selectedProjectKey
-      && owner.sessionId === current.selectedSessionId
-      && owner.viewRevision === current.sessionViewRevision;
-  }, [runtimeGeneration]);
-
   const openDocumentPreview = useCallback((preview: DocumentPreview) => {
-    const current = stateRef.current;
-    const owner: DocumentPreviewOwner = {
-      generation: runtimeGeneration(),
-      projectKey: current.selectedProjectKey,
-      sessionId: current.selectedSessionId,
-      viewRevision: current.sessionViewRevision,
-    };
+    const owner = reviewOwner();
     const onOpen = preview.onOpen;
-    setDocumentPreview({
+    const ownedPreview: DocumentPreview = {
       ...preview,
       owner,
       onOpen: onOpen
         ? async () => {
-          const currentPreview: DocumentPreview = { ...preview, owner };
-          if (!documentPreviewMatchesCurrent(currentPreview)) return;
+          if (!reviewOwnerMatches(owner)) return;
           await onOpen();
         }
         : undefined,
+    };
+    const id = `document:${String(preview.asset.ref ?? preview.asset.path ?? preview.asset.display_name ?? preview.asset.name ?? "file")}`;
+    const tab: ReviewPanelTab = { kind: "document", id, title: String(preview.asset.display_name ?? preview.asset.name ?? preview.asset.path ?? t("filePreview")), owner, preview: ownedPreview };
+    updateReviewPanel((current) => ({ tabs: [...current.tabs.filter((item) => item.id !== id), tab], activeTabId: id }));
+  }, [reviewOwner, reviewOwnerMatches, t, updateReviewPanel]);
+
+  const cancelWorkspaceDiff = useCallback((context = workspaceDiffContextRef.current) => {
+    if (!context || workspaceDiffContextRef.current !== context) return;
+    workspaceDiffContextRef.current = null;
+    earlyWorkspaceDiffEventsRef.current.clear();
+    if (context.operationId) void send("workspace.diff.cancel", { operation_id: context.operationId }).catch(() => undefined);
+  }, [send]);
+
+  const closeReviewTab = useCallback((id: string) => {
+    const tab = reviewPanelRef.current.tabs.find((item) => item.id === id);
+    if (tab?.kind === "workspace-diff" && workspaceDiffContextRef.current?.tabId === id) cancelWorkspaceDiff();
+    updateReviewPanel((current) => {
+      const tabs = current.tabs.filter((item) => item.id !== id);
+      const activeTabId = current.activeTabId === id ? tabs.at(-1)?.id ?? null : current.activeTabId;
+      return { tabs, activeTabId };
     });
-  }, [documentPreviewMatchesCurrent, runtimeGeneration]);
+  }, [cancelWorkspaceDiff, updateReviewPanel]);
+
+  const closeReviewPanel = useCallback(() => {
+    cancelWorkspaceDiff();
+    earlyWorkspaceDiffEventsRef.current.clear();
+    updateReviewPanel(() => ({ tabs: [], activeTabId: null }));
+  }, [cancelWorkspaceDiff, updateReviewPanel]);
+
+  const toggleRuntime = useCallback(() => {
+    if (stateRef.current.focusMode) return;
+    const current = stateRef.current.panelMode;
+    if (reviewPanelRef.current.tabs.length > 0) {
+      // Review and Runtime share the right column. Reveal the preferred
+      // Runtime layout by closing its owner-bound ReviewPanel through the
+      // existing cancellation and focus-preserving path.
+      if (current === "hidden" || (current === "docked" && narrowViewport)) setPanelMode("floating");
+      closeReviewPanel();
+      return;
+    }
+    setPanelMode(current === "hidden" || (current === "docked" && narrowViewport) ? "floating" : "hidden");
+  }, [closeReviewPanel, narrowViewport, setPanelMode]);
+
+  const openWorkspaceDiff = useCallback(async (path?: string) => {
+    const current = stateRef.current;
+    if (!api || current.mode !== "coding" || !current.selectedProjectKey) return;
+    const owner = reviewOwner();
+    const id = `workspace-diff:${owner.ownerKey}:${path ?? "all"}`;
+    const previous = workspaceDiffContextRef.current;
+    const context: WorkspaceDiffContext = {
+      sequence: workspaceDiffSequenceRef.current + 1,
+      operationId: null,
+      ownerKey: owner.ownerKey,
+      owner,
+      tabId: id,
+    };
+    workspaceDiffSequenceRef.current = context.sequence;
+    workspaceDiffContextRef.current = context;
+    earlyWorkspaceDiffEventsRef.current.clear();
+    const tab: ReviewPanelTab = { kind: "workspace-diff", id, title: path ? path.split(/[\\/]/u).at(-1) || path : t("currentWorkingTree"), owner, path, state: "reviewing" };
+    updateReviewPanel((panel) => ({ tabs: [...panel.tabs.filter((item) => item.id !== id), tab], activeTabId: id }));
+    try {
+      if (previous?.operationId) {
+        try { await send("workspace.diff.cancel", { operation_id: previous.operationId }); } catch { /* the next kickoff reports the remaining operation limit */ }
+      }
+      if (workspaceDiffContextRef.current !== context || !reviewOwnerMatches(owner)) return;
+      const params: JsonObject = { project_key: owner.ownerKey, ...(path ? { path } : {}) };
+      const result = asObject(await send("workspace.diff", params));
+      const operationId = stringValue(result.operation_id);
+      if (workspaceDiffContextRef.current !== context || !reviewOwnerMatches(owner)) {
+        if (operationId) void send("workspace.diff.cancel", { operation_id: operationId }).catch(() => undefined);
+        return;
+      }
+      if (!operationId || stringValue(result.owner_key) !== owner.ownerKey || stringValue(result.state) !== "reviewing") {
+        workspaceDiffContextRef.current = null;
+        const errorKind = runtimeBusinessErrorKind(result);
+        updateReviewTab(id, (existing) => existing.kind === "workspace-diff"
+          ? { ...existing, state: "failed", error: errorKind === "workspace_diff_busy" ? t("workspaceDiffUnavailable") : t("workspaceDiffUnavailable") }
+          : existing);
+        return;
+      }
+      context.operationId = operationId;
+      const early = earlyWorkspaceDiffEventsRef.current.get(operationId);
+      earlyWorkspaceDiffEventsRef.current.clear();
+      if (early) acceptWorkspaceDiffEvent(context, early);
+    } catch {
+      if (workspaceDiffContextRef.current !== context || !reviewOwnerMatches(owner)) return;
+      workspaceDiffContextRef.current = null;
+      updateReviewTab(id, (existing) => existing.kind === "workspace-diff"
+        ? { ...existing, state: "failed", error: t("workspaceDiffUnavailable") }
+        : existing);
+    }
+  }, [acceptWorkspaceDiffEvent, api, reviewOwner, reviewOwnerMatches, send, t, updateReviewTab, updateReviewPanel]);
+
+  const readToolOutputPage = useCallback(async (id: string) => {
+    const tab = reviewPanelRef.current.tabs.find((candidate) => candidate.id === id);
+    if (!tab || tab.kind !== "tool-output" || !tab.ref || tab.nextOffset === null || tab.loading
+      || !tab.owner.projectKey || !tab.owner.sessionId || !reviewOwnerMatches(tab.owner)) return;
+    const requestedOffset = tab.nextOffset;
+    const sessionId = tab.owner.sessionId;
+    const projectKey = tab.owner.projectKey;
+    updateReviewTab(id, (current) => current.kind === "tool-output" ? { ...current, loading: true, error: undefined } : current);
+    try {
+      const response = asObject(await send("tool_result.read", {
+        session_id: sessionId,
+        project_key: projectKey,
+        ref: tab.ref,
+        offset: requestedOffset,
+        limit: 64 * 1024,
+      }));
+      const current = reviewPanelRef.current.tabs.find((candidate) => candidate.id === id);
+      if (!reviewOwnerMatches(tab.owner) || !current || current.kind !== "tool-output" || current.ref !== tab.ref) return;
+      const content = response.content;
+      const offset = response.offset;
+      const nextOffset = response.next_offset;
+      const totalBytes = response.total_bytes;
+      const eof = response.eof;
+      const sha256 = response.sha256;
+      const byteLength = typeof content === "string" ? new TextEncoder().encode(content).byteLength : Number.MAX_SAFE_INTEGER;
+      const valid = response.ref === tab.ref
+        && typeof content === "string"
+        && byteLength <= 64 * 1024
+        && offset === requestedOffset
+        && Number.isSafeInteger(nextOffset) && (nextOffset as number) >= requestedOffset
+        && Number.isSafeInteger(totalBytes) && (totalBytes as number) >= (nextOffset as number)
+        && typeof eof === "boolean"
+        && typeof sha256 === "string";
+      if (!valid || (!eof && nextOffset === requestedOffset)) {
+        updateReviewTab(id, (currentTab) => currentTab.kind === "tool-output" ? { ...currentTab, loading: false, error: t("toolOutputUnavailable") } : currentTab);
+        return;
+      }
+      updateReviewTab(id, (currentTab) => currentTab.kind === "tool-output" ? {
+        ...currentTab,
+        text: requestedOffset === 0 ? content as string : currentTab.text + (content as string),
+        loading: false,
+        error: undefined,
+        offset: requestedOffset,
+        nextOffset: eof ? null : nextOffset as number,
+        totalBytes: totalBytes as number,
+        sha256,
+        eof,
+        truncated: !eof,
+      } : currentTab);
+    } catch {
+      if (!reviewOwnerMatches(tab.owner)) return;
+      updateReviewTab(id, (currentTab) => currentTab.kind === "tool-output" ? { ...currentTab, loading: false, error: t("toolOutputUnavailable") } : currentTab);
+    }
+  }, [reviewOwnerMatches, send, t, updateReviewTab]);
+
+  const openToolOutput = useCallback((entry: RendererState["timeline"][number]) => {
+    const owner = reviewOwner();
+    const id = `tool-output:${owner.sessionId ?? "none"}:${entry.outputRef ?? entry.id}`;
+    const hasRef = Boolean(entry.outputRef && owner.projectKey && owner.sessionId);
+    const tab: ReviewPanelTab = {
+      kind: "tool-output",
+      id,
+      title: `${entry.toolName || t("viewToolOutput")}`,
+      owner,
+      ...(hasRef ? { ref: entry.outputRef } : {}),
+      text: entry.outputPreview ?? "",
+      loading: false,
+      truncated: entry.outputPreviewTruncated === true || hasRef,
+      offset: 0,
+      nextOffset: hasRef ? 0 : null,
+      totalBytes: null,
+      sha256: null,
+      eof: !hasRef && entry.outputPreviewTruncated !== true,
+      ...(!hasRef && entry.outputPreviewTruncated ? { error: t("toolOutputUnavailable") } : {}),
+    };
+    updateReviewPanel((current) => ({ tabs: [...current.tabs.filter((item) => item.id !== id), tab], activeTabId: id }));
+    if (hasRef) void readToolOutputPage(id);
+  }, [readToolOutputPage, reviewOwner, t, updateReviewPanel]);
+
+  const openProcessLog = useCallback((processId: string) => {
+    const owner = reviewOwner();
+    const key = owner.projectKey && owner.sessionId ? sessionRuntimeKey(owner.projectKey, owner.sessionId) : "";
+    const logs = stateRef.current.processLogs[key] ?? [];
+    const reader = stateRef.current.processReaders[key]?.[processId] ?? {
+      nextCursor: 0, earliestCursor: 0, cursorExpired: false, state: null, expired: false, loading: false, error: null,
+    };
+    const id = `process-log:${owner.ownerKey}:${owner.sessionId ?? "none"}:${processId}`;
+    const tab: ReviewPanelTab = { kind: "process-log", id, title: `${t("processLog")}: ${processId}`, owner, processId, entries: logs.filter((entry) => entry.processId === processId), reader };
+    updateReviewPanel((current) => ({ tabs: [...current.tabs.filter((item) => item.id !== id), tab], activeTabId: id }));
+  }, [reviewOwner, t, updateReviewPanel]);
 
   const removeProject = useCallback(async (project: ProjectState) => {
     const current = stateRef.current;
@@ -2051,6 +2743,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     // in which two rapid clicks could otherwise issue duplicate durable saves.
     if (settingsSaveInFlightRef.current) throw new Error("Settings save is already in progress");
     settingsSaveInFlightRef.current = true;
+    const mode = stateRef.current.mode;
     const projectKey = stateRef.current.selectedProjectKey;
     const sessionId = stateRef.current.selectedSessionId;
     dispatch({ type: "settings_saving", value: true });
@@ -2091,7 +2784,29 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         settleDurableSuccess();
         if (!isMounted() || !isOwned()) return;
         dispatch({ type: "settings_loaded", configuration: asObject(result).configuration as ConfigurationView });
-        if (projectKey) {
+        if (mode === "general") {
+          const opened = await send("general.open", {});
+          if (!isOwned()) throw new StaleRuntimeOperation();
+          dispatch({ type: "general_opened", result: opened, sessionId });
+          if (sessionId) {
+            const resumed = await send("session.resume", { session_id: sessionId, project_key: GENERAL_PROJECT_KEY });
+            if (!isOwned()) throw new StaleRuntimeOperation();
+            const source = asObject(resumed);
+            const preparing = source.preparing === true || asObject(source.session_state).status === "preparing";
+            if (source.preparation_failed === true) {
+              dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "failed" });
+            } else if (preparing) {
+              dispatch({ type: "session_preparation", projectKey: GENERAL_PROJECT_KEY, sessionId, status: "preparing" });
+              pollSessionPreparation(GENERAL_PROJECT_KEY, sessionId);
+            } else {
+              dispatch({ type: "session_resumed", result: resumed, preserveRuntimeState: true, preserveSessionRuntime: true });
+            }
+          }
+          const statusReady = await refreshRuntimeStatus(isOwned);
+          const catalogReady = await refreshCatalog(GENERAL_PROJECT_KEY, "catalog_refresh", sessionId || undefined, false, isOwned);
+          if (!isOwned()) throw new StaleRuntimeOperation();
+          if (!statusReady || !catalogReady) throw new Error("Runtime projections were not restored");
+        } else if (projectKey) {
           await rebootstrapProject(
             send,
             projectKey,
@@ -2140,7 +2855,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
       settingsSaveInFlightRef.current = false;
       if (isMounted()) dispatch({ type: "settings_saving", value: false });
     }
-  }, [api, enqueueRuntimeOperation, isMounted, refreshCatalog, refreshRuntimeStatus, send, t]);
+  }, [api, enqueueRuntimeOperation, isMounted, pollSessionPreparation, refreshCatalog, refreshRuntimeStatus, send, t]);
 
   const backFromSettings = useCallback(() => {
     // Include the ref so a same-turn Back/Cancel event cannot slip through
@@ -2165,14 +2880,29 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   }, [state.focusMode]);
 
   useEffect(() => {
-    if (!documentPreview || documentPreviewMatchesCurrent(documentPreview)) return;
-    setDocumentPreview(null);
-  }, [documentPreview, documentPreviewMatchesCurrent, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision]);
+    const diff = workspaceDiffContextRef.current;
+    if (diff && !reviewOwnerMatches(diff.owner)) cancelWorkspaceDiff(diff);
+    updateReviewPanel((current) => {
+      const tabs = current.tabs.filter((tab) => reviewOwnerMatches(tab.owner));
+      const activeTabId = tabs.some((tab) => tab.id === current.activeTabId) ? current.activeTabId : tabs.at(-1)?.id ?? null;
+      return { tabs, activeTabId };
+    });
+  }, [cancelWorkspaceDiff, reviewOwnerMatches, state.mode, state.runtimeState, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision, updateReviewPanel]);
 
-  const visibleDocumentPreview = documentPreviewMatchesCurrent(documentPreview) ? documentPreview : null;
-  const documentPreviewVisible = state.view === "chat" && visibleDocumentPreview !== null;
+  const visibleReviewTabs = reviewPanel.tabs.flatMap((tab): ReviewPanelTab[] => {
+    if (!reviewOwnerMatches(tab.owner)) return [];
+    if (tab.kind !== "process-log") return [tab];
+    const key = tab.owner.projectKey && tab.owner.sessionId ? sessionRuntimeKey(tab.owner.projectKey, tab.owner.sessionId) : "";
+    return [{
+      ...tab,
+      entries: (state.processLogs[key] ?? []).filter((entry) => entry.processId === tab.processId),
+      reader: state.processReaders[key]?.[tab.processId] ?? tab.reader,
+    }];
+  });
+  const activeReviewTabId = visibleReviewTabs.some((tab) => tab.id === reviewPanel.activeTabId) ? reviewPanel.activeTabId! : visibleReviewTabs.at(-1)?.id ?? "";
+  const reviewPanelVisible = state.view === "chat" && !state.focusMode && visibleReviewTabs.length > 0;
   const documentPreviewMinWidth = 220;
-  const documentSidebarWidth = state.focusMode || (documentPreviewVisible && viewportWidth <= 620)
+  const documentSidebarWidth = state.focusMode || (reviewPanelVisible && viewportWidth <= 620)
     ? 0
     : narrowViewport
       ? Math.max(112, Math.min(154, viewportWidth * 0.3))
@@ -2180,7 +2910,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const documentPreviewMaxWidth = Math.max(documentPreviewMinWidth, viewportWidth - documentSidebarWidth - CONVERSATION_MIN_WIDTH);
   const effectiveDocumentPreviewWidth = Math.min(documentPreviewWidth, documentPreviewMaxWidth);
 
-  const runtimeVisible = !state.focusMode && state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
+  const runtimeVisible = state.mode === "coding" && !state.focusMode && !reviewPanelVisible && state.panelMode !== "hidden" && !(narrowViewport && state.panelMode === "docked");
   useLayoutEffect(() => {
     if (!runtimeVisible || !runtimeFocusHandoffRef.current) return;
     runtimeFocusHandoffRef.current = false;
@@ -2237,7 +2967,8 @@ export function App({ api: explicitApi, initialState }: AppProps) {
           <h1>{state.selectedSessionId ? `${t("session")} ${state.selectedSessionId.slice(0, 8)}` : t("newConversation")}</h1>
         </div>
         <div className="conversation-actions">
-          {!state.focusMode && <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>}
+          {state.mode === "coding" && state.selectedProjectKey && <button type="button" className="icon-button" title={t("reviewCurrentDiff")} aria-label={t("reviewCurrentDiff")} onClick={() => void openWorkspaceDiff()}><UiIcon name="file" /></button>}
+          {state.mode === "coding" && !state.focusMode && <button ref={runtimeToggleRef} type="button" className="icon-button" title={runtimeToggleLabel} aria-label={runtimeToggleLabel} aria-expanded={runtimeVisible} aria-controls={RUNTIME_PANEL_ID} onClick={toggleRuntime}><UiIcon name="panel" /><span className="sr-only">{runtimeVisible ? t("runtimePanelOpen") : t("runtimePanelClosed")}</span></button>}
           <button ref={focusModeToggleRef} type="button" className="icon-button focus-mode-toggle" title={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-label={state.focusMode ? t("exitFocusMode") : t("enterFocusMode")} aria-pressed={state.focusMode} onClick={() => setFocusMode(!state.focusMode)}><UiIcon name="focus" /><span className="sr-only">{state.focusMode ? t("exitFocusMode") : t("enterFocusMode")}</span></button>
         </div>
       </header>
@@ -2272,6 +3003,9 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         onPreviewArtifact={previewArtifact}
         onCopyPath={copyText}
         onOpenDocument={openDocumentPreview}
+        onViewToolOutput={openToolOutput}
+        onReviewCurrentDiff={(path) => void openWorkspaceDiff(path)}
+        onReviewProcessLog={openProcessLog}
         onPreviewAttachment={previewAttachment}
         onOpenAttachment={openAttachment}
         onRevealAttachment={revealAttachment}
@@ -2301,6 +3035,7 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   );
 
   const themeClass = `theme-${state.theme}`;
+  const shellPanelMode = state.mode === "general" ? "hidden" : state.panelMode;
   const wideLayout = !narrowViewport && state.view === "chat" && !state.focusMode;
   const widthBounds = layoutWidthBounds(
     typeof window === "undefined" ? 1280 : window.innerWidth,
@@ -2314,13 +3049,13 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     "--document-preview-width": `${effectiveDocumentPreviewWidth}px`,
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
-    <div className={`app-shell ${themeClass} panel-${state.panelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}${documentPreviewVisible ? " document-preview-visible" : ""}`} style={shellStyle}>
-       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onProjectDisclosureChange={setProjectDisclosure} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} /></RendererErrorBoundary>}
+    <div className={`app-shell ${themeClass} panel-${shellPanelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}${reviewPanelVisible ? " document-preview-visible" : ""}`} style={shellStyle}>
+       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar mode={state.mode} projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onProjectDisclosureChange={setProjectDisclosure} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} onSwitchMode={(mode) => void switchMode(mode)} onSearch={(query) => void searchSessions(query)} onCancelSearch={cancelSessionSearch} searchResults={sessionSearch.results} searchPending={sessionSearch.pending} searchError={sessionSearch.error} onRestoreSearchHit={(hit) => void restoreSearchHit(hit)} onArchiveSession={(project, session, archived) => void archiveSession(project, session, archived)} /></RendererErrorBoundary>}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
-       {state.view === "chat" && !state.focusMode && !documentPreviewVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
-       {documentPreviewVisible && visibleDocumentPreview && <RendererErrorBoundary name="document-preview"><DocumentPreviewPanel preview={visibleDocumentPreview} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onClose={() => setDocumentPreview(null)} /></RendererErrorBoundary>}
+       {state.view === "chat" && state.mode === "coding" && !state.focusMode && !reviewPanelVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
+       {reviewPanelVisible && <RendererErrorBoundary name="review-panel"><ReviewPanel tabs={visibleReviewTabs} activeTabId={activeReviewTabId} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onSelectTab={(id) => updateReviewPanel((current) => ({ ...current, activeTabId: id }))} onCloseTab={closeReviewTab} onClose={closeReviewPanel} onReadToolOutput={(id) => void readToolOutputPage(id)} onReadProcess={readProcess} /></RendererErrorBoundary>}
       {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}
-      {wideLayout && state.panelMode === "docked" && !documentPreviewVisible && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
+      {wideLayout && state.mode === "coding" && state.panelMode === "docked" && !reviewPanelVisible && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
     </div>
   </LanguageProvider>;
 }

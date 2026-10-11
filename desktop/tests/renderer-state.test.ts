@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { AgentEvent } from "../src/desktop-api";
 import {
   createInitialState,
+  composerDraftOwnerKey,
   normalizeProviderRequestUsage,
   reduceRendererState,
   type RendererState,
@@ -1114,6 +1115,7 @@ test("accepted attachment drafts merge into the authoritative user message for t
       steering: false,
       text,
       attachments: [attachment],
+      submittedAttachmentRefs: [attachment.ref],
     });
     state = reduceRendererState(state, {
       type: "agent_event",
@@ -1180,9 +1182,11 @@ test("T08 reducer ignores late stream data and duplicate tool terminals", () => 
   assert.equal(reduceRendererState(state, event({ type: "assistant_message_delta", run_id: "run-1", turn_id: "turn-1", message_id: "answer-1", text: "late" })), state);
 
   state = reduceRendererState(state, event({ type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash" }));
+  const startedTool = state.timeline.find((entry) => entry.kind === "tool");
+  assert.equal(startedTool?.startedAt, undefined, "live duration is unavailable until Bridge supplies its observed start time");
   state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "completed", is_error: false }));
   const completedTool = state.timeline.find((entry) => entry.kind === "tool");
-  assert.ok(completedTool?.endedAt);
+  assert.equal(completedTool?.endedAt, undefined, "missing Bridge finish time is never replaced with renderer wall time");
   assert.equal(reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "failed", is_error: true })), state);
   assert.equal(state.timeline.find((entry) => entry.kind === "tool")?.endedAt, completedTool?.endedAt);
 
@@ -1385,20 +1389,62 @@ test("T06 Plan draft failure and cancellation settle the matching draft", () => 
   }
 });
 
-test("T06 tool rows freeze elapsed time and settle explicit failure/cancellation", () => {
+test("T08 live tool timing uses only Bridge observed_at and replay timing may remain unavailable", () => {
   let state = createInitialState();
   const event = (payload: Record<string, unknown>) => ({ type: "agent_event" as const, event: payload as AgentEvent });
-  state = reduceRendererState(state, event({ type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash" }));
+  const startedAt = "2026-10-11T01:02:03.000Z";
+  const endedAt = "2026-10-11T01:02:06.200Z";
+  state = reduceRendererState(state, event({ type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", observed_at: startedAt }));
   const started = state.timeline.find((entry) => entry.kind === "tool");
   assert.equal(started?.status, "running");
-  assert.equal(typeof started?.startedAt, "number");
-  state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "cancelled", is_error: false }));
+  assert.equal(started?.startedAt, Date.parse(startedAt));
+  state = reduceRendererState(state, event({ type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: "batch-1", tool_call_id: "call-1", tool_name: "Bash", status: "cancelled", is_error: false, observed_at: endedAt }));
   const finished = state.timeline.find((entry) => entry.kind === "tool");
   assert.equal(state.timeline.filter((entry) => entry.kind === "tool").length, 1);
   assert.equal(finished?.status, "cancelled");
   assert.equal(finished?.isError, false);
-  assert.equal(typeof finished?.endedAt, "number");
-  assert.ok((finished?.endedAt ?? 0) >= (finished?.startedAt ?? 0));
+  assert.equal(finished?.endedAt, Date.parse(endedAt));
+  assert.equal(replayToTimeline([replayRecord(1, "tool", "old Bash record")])[0]?.startedAt, undefined, "legacy replay without timing remains unavailable");
+  const replayed = replayToTimeline([{ session_id: "session-1", sequence: 1, turn_id: "turn-1", kind: "tool", text: "timed Bash record", is_error: false, started_at: startedAt, completed_at: endedAt }])[0];
+  assert.equal(replayed?.startedAt, Date.parse(startedAt));
+  assert.equal(replayed?.endedAt, Date.parse(endedAt));
+});
+
+test("T08 ToolCall identity stays unique across live events and overlapping history pages", () => {
+  const projectKey = "C:/Projects/tool-history-overlap";
+  const record = (sequence: number, toolCallId: string) => ({
+    record_id: `session-tool:${sequence}:tool:${toolCallId}`,
+    session_id: "session-tool",
+    sequence,
+    run_id: "run-tool",
+    turn_id: "turn-tool",
+    kind: "tool",
+    tool_call_id: toolCallId,
+    tool_name: "Read",
+    text: "Read completed",
+    status: "completed",
+    is_error: false,
+  });
+  let state = createInitialState({ selectedProjectKey: projectKey, selectedSessionId: "session-tool" });
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-tool",
+    replace: true,
+    result: { session_id: "session-tool", records: [record(2, "call-two")], next_cursor: "older", has_more: true, unit_count: 1 },
+  });
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "tool").map((entry) => entry.toolCallId), ["call-two"]);
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "tool_started", run_id: "run-tool", turn_id: "turn-tool", batch_id: "batch-late", tool_call_id: "call-two", tool_name: "Read" } });
+  state = reduceRendererState(state, { type: "agent_event", event: { type: "tool_finished", run_id: "run-tool", turn_id: "turn-tool", batch_id: "batch-late", tool_call_id: "call-two", tool_name: "Read", status: "succeeded", is_error: false } });
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "tool").map((entry) => entry.toolCallId), ["call-two"], "late live events matching durable ToolCall identity are not counted twice");
+
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId: "session-tool",
+    result: { session_id: "session-tool", records: [record(1, "call-one"), record(2, "call-two")], next_cursor: null, has_more: false, unit_count: 1 },
+  });
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "tool").map((entry) => [entry.sequence, entry.toolCallId]), [[1, "call-one"], [2, "call-two"]], "paging overlap merges stable ToolCall records while retaining order");
 });
 
 test("T05 turn_completed settles reasoning while removing only the assistant preview", () => {
@@ -1469,6 +1515,185 @@ test("T06 runtime initialization updates permission from its safe Run projection
   assert.equal(state.runtimeState, "ready");
   assert.equal(state.run?.run_id, "run-runtime");
   assert.equal(state.permissionMode, "auto");
+});
+
+test("T10 control receipts preserve mode-owned drafts and accepted submissions clear only their captured version", () => {
+  const projectKey = "C:/t10-draft-owner";
+  const firstAttachment = { ref: "draft-one", display_name: "one.png", mime_type: "image/png", size_bytes: 4 };
+  const laterAttachment = { ref: "draft-two", display_name: "two.png", mime_type: "image/png", size_bytes: 5 };
+  let state = createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-one",
+    composerText: "keep this draft",
+    composerAttachments: [firstAttachment],
+  });
+  state = reduceRendererState(state, { type: "composer_text", text: "keep this draft" });
+  const controlResults = [
+    { code: "model_picker_opened", ui_action: { type: "open_model_picker" } },
+    { code: "model_selected", params: { model_ref: "provider/model" }, ui_action: { type: "model_selected", model_ref: "provider/model" } },
+    { code: "permission_mode_selected", params: { mode: "auto" }, ui_action: { type: "permission_mode_selected", mode: "auto" } },
+    { code: "command_failed", status: "execution_error", ui_action: null },
+  ];
+  for (const result of controlResults) {
+    state = reduceRendererState(state, { type: "command_result", result: { command: "control", status: "success", params: {}, ...result } });
+    assert.equal(state.composerText, "keep this draft", `${result.code} must not clear text`);
+    assert.deepEqual(state.composerAttachments.map((attachment) => attachment.ref), ["draft-one"], `${result.code} must not clear attachments`);
+  }
+  state = reduceRendererState(state, { type: "command_result", result: { command: "clear", status: "success", code: "transcript_cleared", params: {}, ui_action: { type: "clear_transcript" } } });
+  assert.equal(state.composerText, "keep this draft", "clear transcript keeps the active draft");
+  state = reduceRendererState(state, { type: "command_result", result: { command: "new", status: "success", code: "session_created", params: {}, ui_action: { type: "session_changed", session_id: "session-two", restored: false } } });
+  assert.equal(state.selectedSessionId, "session-two");
+  assert.equal(state.composerText, "", "a new Session activates its own empty draft");
+  assert.deepEqual(state.composerAttachments, []);
+  state = reduceRendererState(state, { type: "command_result", result: { command: "resume", status: "success", code: "session_resumed", params: { replay: [] }, ui_action: { type: "session_changed", session_id: "session-one", restored: true } } });
+  assert.equal(state.composerText, "keep this draft", "returning to the original Session restores its text");
+  assert.deepEqual(state.composerAttachments.map((attachment) => attachment.ref), ["draft-one"], "returning to the original Session restores its attachment");
+
+  const capturedSubmission = {
+    mode: "coding" as const,
+    projectKey,
+    sessionId: null,
+    viewRevision: 3,
+    draftRevision: 0,
+    text: "submitted text",
+    attachmentRefs: ["draft-one"],
+  };
+  let lazy = createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: null,
+    sessionViewRevision: 3,
+    composerText: "submitted text",
+    composerAttachments: [firstAttachment],
+  });
+  lazy = reduceRendererState(lazy, { type: "composer_text", text: "typed after send" });
+  lazy = reduceRendererState(lazy, { type: "composer_attachment_added", attachment: laterAttachment });
+  lazy = reduceRendererState(lazy, {
+    type: "turn_accepted",
+    run: { run_id: "run-lazy", turn_id: "turn-lazy", status: "running" },
+    steering: false,
+    text: "submitted text",
+    sessionId: "lazy-session",
+    attachments: [firstAttachment],
+    submittedAttachmentRefs: ["draft-one"],
+    submission: capturedSubmission,
+  });
+  assert.equal(lazy.selectedSessionId, "lazy-session");
+  assert.equal(lazy.composerText, "typed after send", "the first accepted Turn preserves later typing in its new lazy Session owner");
+  assert.deepEqual(lazy.composerAttachments.map((attachment) => attachment.ref), ["draft-one", "draft-two"], "later attachment edits remain in the lazy Session draft");
+  assert.deepEqual(lazy.composerDrafts[composerDraftOwnerKey("coding", projectKey, "lazy-session")]?.attachments.map((attachment) => attachment.ref), ["draft-one", "draft-two"]);
+  assert.equal(lazy.composerDrafts[composerDraftOwnerKey("coding", projectKey, null)], undefined, "the old no-Session owner is retired after adoption");
+
+  const cleanSubmission = reduceRendererState(createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: null,
+    sessionViewRevision: 3,
+    composerText: "submitted text",
+    composerAttachments: [firstAttachment],
+  }), {
+    type: "turn_accepted",
+    run: { run_id: "run-clean", turn_id: "turn-clean", status: "running" },
+    steering: false,
+    text: "submitted text",
+    sessionId: "lazy-clean",
+    attachments: [firstAttachment],
+    submittedAttachmentRefs: ["draft-one"],
+    submission: capturedSubmission,
+  });
+  assert.equal(cleanSubmission.composerText, "");
+  assert.deepEqual(cleanSubmission.composerAttachments, [], "a successful submission clears the exact sent attachment refs");
+  assert.deepEqual(cleanSubmission.composerDrafts[composerDraftOwnerKey("coding", projectKey, "lazy-clean")], { text: "", attachments: [] });
+
+  const capturedRevision = 0;
+  let editedOffscreen = createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: "session-a",
+    composerText: "submitted text",
+    composerAttachments: [firstAttachment],
+  });
+  editedOffscreen = reduceRendererState(editedOffscreen, { type: "session_resumed", result: { session_id: "session-b", restored: true, replay: [] } });
+  editedOffscreen = reduceRendererState(editedOffscreen, { type: "session_resumed", result: { session_id: "session-a", restored: true, replay: [] } });
+  editedOffscreen = reduceRendererState(editedOffscreen, { type: "composer_text", text: "edited after submit" });
+  editedOffscreen = reduceRendererState(editedOffscreen, { type: "composer_text", text: "submitted text" });
+  editedOffscreen = reduceRendererState(editedOffscreen, { type: "session_resumed", result: { session_id: "session-b", restored: true, replay: [] } });
+  const editedState = reduceRendererState(editedOffscreen, {
+    type: "submission_committed_offscreen",
+    submission: { ...capturedSubmission, sessionId: "session-a", draftRevision: capturedRevision },
+  });
+  assert.equal(editedState, editedOffscreen, "a late commit cannot clear a draft that was edited after submission, even if its text later matches again");
+  assert.deepEqual(editedState.composerDrafts[composerDraftOwnerKey("coding", projectKey, "session-a")]?.attachments.map((attachment) => attachment.ref), ["draft-one"]);
+
+  let untouchedOffscreen = createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: null,
+    composerText: "submitted text",
+    composerAttachments: [firstAttachment],
+  });
+  untouchedOffscreen = reduceRendererState(untouchedOffscreen, { type: "session_resumed", result: { session_id: "session-b", restored: true, replay: [] } });
+  untouchedOffscreen = reduceRendererState(untouchedOffscreen, {
+    type: "submission_committed_offscreen",
+    submission: { ...capturedSubmission, draftRevision: capturedRevision, acceptedSessionId: "lazy-accepted" },
+  });
+  assert.equal(untouchedOffscreen.selectedSessionId, "session-b", "a late commit leaves the newly selected Session visible");
+  assert.equal(untouchedOffscreen.composerText, "", "a late commit does not write the submitted text into the visible Session");
+  assert.equal(untouchedOffscreen.composerDrafts[composerDraftOwnerKey("coding", projectKey, null)], undefined, "the successfully submitted no-Session draft owner is retired");
+  assert.deepEqual(untouchedOffscreen.composerDrafts[composerDraftOwnerKey("coding", projectKey, "lazy-accepted")], { text: "", attachments: [] });
+
+  const otherOwner = createInitialState({ mode: "general", selectedProjectKey: "uthcode:general", selectedSessionId: "general-session", composerText: "general draft" });
+  assert.equal(reduceRendererState(otherOwner, {
+    type: "turn_accepted",
+    run: { run_id: "late-run", turn_id: "late-turn", status: "running" },
+    steering: false,
+    text: "submitted text",
+    sessionId: "late-session",
+    submission: capturedSubmission,
+  }), otherOwner, "a stale accepted response cannot write into a different mode/Session/revision owner");
+});
+
+test("T10 a current-owner accepted receipt cannot clear an edited-and-reverted draft version", () => {
+  const projectKey = "C:/t10-current-draft-version";
+  const sessionId = "session-current-draft-version";
+  const sentAttachment = { ref: "sent-ref", display_name: "sent.txt", mime_type: "text/plain", size_bytes: 4 };
+  const editedAttachment = { ref: "edited-ref", display_name: "edited.txt", mime_type: "text/plain", size_bytes: 6 };
+  const submission = {
+    mode: "coding" as const,
+    projectKey,
+    sessionId,
+    viewRevision: 0,
+    draftRevision: 0,
+    text: "sent prompt",
+    attachmentRefs: [sentAttachment.ref],
+  };
+  const startingState = createInitialState({
+    mode: "coding",
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    composerText: submission.text,
+    composerAttachments: [sentAttachment],
+  });
+  const accepted = (state: RendererState) => reduceRendererState(state, {
+    type: "turn_accepted",
+    run: { run_id: "run-current-draft-version", turn_id: "turn-current-draft-version", status: "running" },
+    steering: false,
+    text: submission.text,
+    submission,
+  });
+
+  let editedAndReverted = reduceRendererState(startingState, { type: "composer_text", text: "temporary edit" });
+  editedAndReverted = reduceRendererState(editedAndReverted, { type: "composer_text", text: submission.text });
+  editedAndReverted = reduceRendererState(editedAndReverted, { type: "composer_attachment_added", attachment: editedAttachment });
+  editedAndReverted = reduceRendererState(editedAndReverted, { type: "composer_attachment_removed", ref: editedAttachment.ref });
+  const retained = accepted(editedAndReverted);
+  assert.equal(retained.composerText, submission.text, "an edit followed by a textual revert is still a newer draft version");
+  assert.deepEqual(retained.composerAttachments.map((attachment) => attachment.ref), [sentAttachment.ref], "an attachment edit followed by a vector revert is still a newer draft version");
+
+  const unchanged = accepted(startingState);
+  assert.equal(unchanged.composerText, "", "an unchanged accepted submission clears its captured prompt");
+  assert.deepEqual(unchanged.composerAttachments, [], "an unchanged accepted submission clears its captured attachments");
 });
 
 test("compaction operation events retain per-Session identity and reject stale terminals", () => {
