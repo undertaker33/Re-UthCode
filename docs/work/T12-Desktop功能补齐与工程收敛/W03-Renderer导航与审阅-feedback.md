@@ -173,3 +173,85 @@ npx tsx --test --test-name-pattern='T07 App switches fixed General owner|safe Ma
 2026-10-11，同一 gpt-6.1-sol/medium Reviewer 独立复审 PASS，未发现本轮残留 finding；已实际查看两张参考图、三张用户截图及 V4 HTML，核对活动一级摘要和默认关闭二级详情、失败摘要、Logo 下拉及无空行表格根因修复。执行 `npx tsx --test --test-name-pattern='safe Markdown|T07 App switches fixed General owner|General lazy Turns|current-owner accepted|failed live Tool|delayed archive catalog|restoring a search hit|Runtime switch|T08|T09 App reviews|T10 control receipts|successful lazy Turn|App parks a lazy turn' tests/renderer-chat.test.tsx tests/renderer-state.test.ts tests/renderer-attachments.test.tsx tests/renderer.test.tsx`：29 passed、0 failed；`npm run typecheck` 和 `git diff --check` 均退出码 0。另以 `node --import tsx -e $reviewCode` 只读内存 smoke 确认公开 reasoning 默认折叠、展开后流式更新保留展开，progress/Plan/final 直显，menuitemradio 和 Tab/Shift-Tab 焦点、品牌 below-start 与原 context 定位均通过；此前六项缺陷关联回归无回退。
 
 复审没有编辑、构建、Git 写入或操作用户 App。当前旧运行版仍占用标准打包输出，无法据持久会话文件确认是否有活动 Turn；总控已向用户确认窗口空闲/关闭后再替换运行版，防止中断执行。此时尚未重建或重验原生窗口，不把 CSS/JSDOM 审核当作用户视觉验收。W04/W05 尚未启动，Checklist 保持 14/26，包状态仍 not_implemented。
+
+
+## 总控：用户界面返工 Git 交付与运行版等待
+
+2026-10-11，原 Worker 和同一 Reviewer 复审 PASS 后，仅暂存 7 个 Renderer 实现/测试文件及 Context-Index、W03 Feedback 共 9 文件；9 份冻结文档与 Checklist 逐字未变，Feedback 从 HEAD 原内容开始的追加性校验通过；UTF-8 guard 2/2 与 staged diffcheck 均通过。提交 `734553c915397ef67b18d1938eb134dd4861a08f` 已推送 T11-Agent能力补齐，[PR130](https://github.com/undertaker33/Re-UthCode/pull/130) 的 head/9 文件范围与本地审定集一致，MERGEABLE/CLEAN 后按 exact head 合并，merge 为 `a284ca19cb280c819ca51ca7f66d8979c901ebca`。本地 T11、远端 T11、main 和 PR merge SHA 经 Git/GitHub API 核对一致，合并后的工作区干净；merge 未改变审定 Renderer、测试、Backend 或构建输入。
+
+当前运行版仍是前次 PR129 的旧包，本轮没有重建，也未以它验证新 UI。旧 UthCode 窗口仍在使用标准打包输出，无法可靠判断其活动 Turn；总控已提出只针对旧窗口空闲/关闭的确认，等待回复后才能安全替换并打开新包。此等待只影响运行版重建与用户复验，代码审查及授权 Git 交付已完成。W04/W05 未启动，Checklist 仍 14/26，未宣称用户视觉通过或整包完成。这份交付记录与索引状态按既有约定进入下一次必要文档提交，不单拆文档提交。
+
+
+## 总控：用户关闭旧窗口后的重建与复验交付
+
+2026-10-11，用户回复“我已关闭旧窗口”，总控实测 UthCode 进程已全部退出。在 PR130 merge `a284ca19cb280c819ca51ca7f66d8979c901ebca`、无生产源码写入的工作树中，经 Conda hook 激活既有 re-uthcode（Python 3.12.13），执行 `desktop/ npm run package`：退出码 0。标准 PyInstaller onedir、bundled Coding/General initialize/session/status/shutdown JSONL 与独立 Prompt Context smoke、webpack/Electron Forge win32-x64 均通过。新 `desktop/out/UthCode-win32-x64/UthCode.exe` 时间为本机 2026-10-11 12:54:52，app.asar 为 12:54:50；构建日志位于本机临时目录 `uthcode-t12-w03-ui-package.log`。未执行 make 或安装器验收。
+
+针对新包执行 `desktop/ node scripts/cdp-packaged-visual-acceptance.mjs --language zh --flow visual --exe out/UthCode-win32-x64/UthCode.exe --output dist/manual-acceptance --port 9346 --timeout-ms 60000`：退出码 0，driver/Electron 正常退出，报告 exit.status=passed、failure=null、consoleErrors=[]、rendererExceptions=[]、unexplained stderr=[]。本轮复用既有 dist/manual-acceptance 目录，其报告文件此前不存在；未新建工作包文件夹或覆盖旧验收报告。检查 zh-CN、暗/亮主题、1264×761 与 760×640 CSS 视口，以及 docked/floating/hidden 布局，生成 6 张新包窗口截图；总控实际打开查看暗色 docked 和亮色截图。报告：`desktop/dist/manual-acceptance/acceptance-report.json`；隔离 host/Electron/driver profile 均清理完成，无 Provider 服务/真实请求。
+
+以上只证明新包真实 Renderer 的 shell/响应式布局及对应测试路径，不是此次思考/工具/Markdown 真实内容交互的人工验收，也不替代真实 Provider、原生输入/缩放或完整 T15 联合验证。思考和工具折叠、Logo 菜单与表格内容回归仍依据前述 Worker/Reviewer 定向证据，最终效果待用户确认。构建/视觉验证前后审定生产源码、测试及构建输入无差异；正式新包已打开，按用户第5步再次暂停 W03 页面/交互复验。W04/W05 尚未启动，Checklist 维持 14/26，不以 shell 报告追加复合项勾选。交付记录和索引随下一次必要文档提交，不单独拆文档提交。
+
+
+## 用户验收返工（二）：当前工作区摘要与正文 Artifact 卡片
+
+2026-10-11，按用户最新 UI 反馈在 Renderer 内完成三项修正；W03 Prompt、Spec、Tasks、Checklist 等冻结正文未改，本记录只追加到本 Feedback。按用户明确授权，旧“完成后等待 W03 UI 验收再继续”的暂停约定由总控按原授权顺序覆盖；本 Worker 不实施 W04/W05。
+
+- **内容区对齐**：在 `.app-shell` 统一使用 820px 内容最大宽度和 24px 最小 gutter，时间线消息、一级活动卡、当前工作区摘要与 Composer 共用同一几何规则，随 Runtime docked/hidden/floating 和 Review 所在内容列变化。正文附件仍保持既有次序：用户消息附件在正文前，Assistant/工具附件在正文后；Artifact 卡片最后显示。本轮未运行可见窗口矩形/人工视觉验收。
+- **当前工作区摘要**：只在当前可见 Coding owner 收到成功 `tool_finished` 的 `WriteFile`、`EditFile` 或 `ApplyPatch` 时触发，以 120ms 合并近邻写操作，再调用既有 `workspace.diff({project_key})`；响应必须是现有 `source=current_working_tree` Diff DTO。摘要使用与右栏审阅分离的局部查询上下文，但共享现有 RPC、owner 匹配、cancel 命令、DTO 校验和 operation 身份路由；kickoff 前事件分别有界缓存，kickoff 后仅消费匹配 operation_id。切换 mode/project/session/viewRevision 后丢弃摘要并取消已知 operation，迟到的 kickoff 回包取消其 operation；读取摘要不打开/夺取 Review 或 Runtime 面板。文件数按 status.entries 的 path 去重，行数只解析 staged 与 unstaged Git diff hunk 上下文；同文件 a/b 路径去重，避免重复统计，rename 用真实 original_path/当前路径匹配。二进制、untracked 和未知/截断行数显示为不可用或下界，摘要不会捏造完整精确统计，也不把当前 Diff 归属为历史 Turn。卡片先显示真实前两条路径，“再显示 N 个文件”展开剩余项；明确点击“查看变更”或文件行才调用现有 ReviewPanel 路径。
+- **正文 Artifact 引用**：仅从安全 Markdown 真正解析出的 `artifact:` 链接 token 收集引用；inline code/code fence 等文字不生成卡片，完全相同的引用只生成一张卡。引用留在正文原位置作为链接，卡片通过原 `describeArtifact`、`openArtifact`、`FileCard` 预览/打开/授权等受控路径在消息末尾展示。点击/授权描述失败时显示通用本地 alert，不暴露异常路径或细节；普通路径文本仍不自动变成链接。
+
+本轮实际执行（均在 `desktop/`，Conda `re-uthcode`，Python 3.12.13）：
+
+```powershell
+npx tsx --test --test-name-pattern='ChatTimeline keeps artifact references|ChatTimeline exposes controlled artifact-link failures|ChatTimeline summarizes only counted workspace diff hunks|T09 App auto-discovers current workspace changes' tests/renderer-chat.test.tsx tests/renderer-attachments.test.tsx
+```
+
+结果：4 passed、0 failed、退出码 0。初次运行暴露统计缺陷：`diff --git a/x b/x` 的两侧路径 alias 在同一路径下将 +/- 翻倍；现已在 Diff section 内按唯一路径去重，复跑上述回归转绿。新增 App 回归验证成功 writer→真实 DTO 摘要、kickoff 前事件、自动摘要不夺取右栏、显式查看打开原 ReviewPanel、跨 Session 迟到 kickoff 被取消且旧 owner 结果不显示。纯 Diff 投影回归验证 hunk 上下文中的 `+++` 内容、暂存与未暂存合并、空格中文路径、rename、untracked/binary 未知行数、截断下界、真实文件数去重及展开路径。Artifact 回归验证正文链接/底部去重卡、代码块伪引用忽略、现有受控预览/打开回调和通用可见失败。
+
+```powershell
+npx tsx --test tests/renderer-chat.test.tsx
+```
+
+结果：17 passed、0 failed、退出码 0；包含中文标题后无空行的流式 pipe table、安全链接与原始 HTML、Artifact、附件历史投影和 process 文本回归。
+
+```powershell
+npx tsx --test --test-name-pattern='T09 App|T08 .*tool activity|T07 App switches fixed General owner' tests/renderer-attachments.test.tsx tests/renderer.test.tsx
+```
+
+结果：10 passed、0 failed、退出码 0；包含本轮 T09 摘要/迟到 owner、现有 Review/Runtime 错误归属交接、General owner 菜单/搜索隔离与 T08 默认折叠工具组。
+
+```powershell
+npm run typecheck
+```
+
+结果：`tsc --noEmit` 退出码 0。本轮未执行 build/package、真实 Provider、原生可见窗口检查或人工视觉验收；这些仍未验证，Checklist 未新增勾选。本轮没有协议/Backend/Main 改动、能力欠账变更、W04/W05 实施或 Git 写操作。
+
+
+## 用户验收返工（二）复审修复：Git 空格路径与共享边距
+
+2026-10-11，同一 Reviewer 复审发现两项 P2，本 Worker 仅修复以下 Renderer 范围并增加必要回归；没有扩大到其他模块。
+
+- **普通空格路径统计串线**：`diff --git a/src/file name.md b/src/file name.md` 的路径本身未被 Git 引号包裹，按空白读 token 会把 `src/file` 和 `name.md` 当成两条路径，导致同前缀文件串统计。本次对完整 header 搜索 ` b/` 边界，只接受唯一且完整的双路径候选；无法无歧义解析时不把截断 token 用于统计。回归同时覆盖同前缀 `src/file`（+1）和 `src/file name.md`（+2），并逐行断言计数互不串线；原有 quoted 中文空格与 rename 覆盖保留。
+- **响应式 gutter 分离**：原 max-width 820px 只将 timeline 调到 16px，Composer 仍为 24px；max-width 680px 又分别写 timeline 10px、Composer 左右 8px。现改为在 app-shell 的断点分别更新共享 `--chat-content-gutter`（820px 下 16px、680px 下 10px），删除 timeline 与 Composer 各自的水平覆盖。宽屏 24px/820px 内容上限以及 Runtime/Review 网格行为不变。本次未运行原生窗口矩形或用户视觉验收。
+
+在 `desktop/` 执行：
+
+```powershell
+npx tsx --test tests/renderer-chat.test.tsx
+```
+
+结果：17 passed、0 failed、0 skipped，退出码 0；其中 Diff 摘要回归确认普通空格的两条近似路径各自得到真实 +1 与 +2 行统计。
+
+```powershell
+npm run typecheck
+```
+
+结果：`tsc --noEmit` 退出码 0。本轮未执行 Git 命令、build/package 或用户 App 操作；未验证 packaged/native 矩形与视觉效果，交同一 Reviewer 复审。
+
+
+## 总控：用户验收返工（二）独立复审闭环
+
+2026-10-11，同一 gpt-6.1-sol/medium Reviewer 首轮发现两项 P2：未 quoted 的普通空格 Git 路径会串入同前缀文件计数；窄屏 media 仍单独覆盖 Timeline/Composer gutter。原 gpt-6-luna/max Worker 修复并追加返工记录，同一 Reviewer 复审 PASS，未发现残留 finding。独立内存 smoke 确认 src/file +1、src/file name.md +2 正确归属，rename old-only/new-only/original_path 匹配正确，歧义 header 保持不可用。CSS 源码几何核算确认 760px 两者均532px、600px均426px，宽屏 Runtime 三布局及 Review 同宽；这不是 native 矩形验收。
+
+Reviewer 在 desktop/、既有 re-uthcode 环境执行 `npx tsx --test --test-name-pattern='artifact|safe Markdown|counted workspace|T09 App|General lazy Turns|current-owner accepted|failed live Tool|delayed archive catalog|restoring a search hit|Runtime switch|T08 .*activity|seven adjacent|T07 App switches fixed General owner|T10 control receipts|successful lazy Turn|App parks a lazy turn' tests/renderer-chat.test.tsx tests/renderer-state.test.ts tests/renderer-attachments.test.tsx tests/renderer.test.tsx`：28 passed、0 failed；`npm run typecheck`、`git diff --check` 和 `node --import tsx -e $reviewCode` 均退出码0。已实际查看最新三张截图，并对照既有参考图/HTML。最新摘要、Artifact、折叠/菜单/表格和此前六项缺陷关联回归通过。
+
+本轮未构建打包、操作用户 App或验证真实窗口/native/真实Provider，旧包不用于证明最新修改。Checklist 未新增勾选；用户明确取消后续UI暂停，完成本轮授权Git交付后直接W04/W05，运行版重建和剩余真实联合验收由后续完成。未跟踪 test-file.md 为用户测试数据，保持原样且排除提交。

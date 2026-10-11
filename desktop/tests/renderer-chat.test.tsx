@@ -10,6 +10,7 @@ import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { LanguageProvider } from "../src/renderer/i18n";
 import type { TimelineEntry } from "../src/renderer/state";
 import type { ArtifactDescriptor, DesktopAttachmentDraft } from "../src/desktop-api";
+import type { WorkspaceDiffView } from "../src/renderer/DocumentPreviewPanel";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><div id=root></div></body></html>", { url: "http://localhost/" });
@@ -247,7 +248,7 @@ test("ChatTimeline retries an in-flight image preview when history updates repla
   }
 });
 
-test("ChatTimeline resolves artifact links into the formal card and controlled preview", async () => {
+test("ChatTimeline keeps artifact references inline, dedupes bottom cards, and uses controlled actions", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const artifact: ArtifactDescriptor = {
       path: "C:\\Projects\\UthCode\\preview.png",
@@ -262,7 +263,7 @@ test("ChatTimeline resolves artifact links into the formal card and controlled p
     let openCalls = 0;
     let previewCalls = 0;
     const render = () => root.render(<LanguageProvider value="en"><ChatTimeline
-      entries={[codeEntry("[preview](artifact:C:\\Projects\\UthCode\\preview.png)")]}
+      entries={[codeEntry("Open [preview](artifact:C:\\Projects\\UthCode\\preview.png) and [again](artifact:C:\\Projects\\UthCode\\preview.png).\n\n```md\n[not a reference](artifact:C:\\Projects\\UthCode\\hidden.png)\n```")]}
       todo={[]}
       sessionKey="artifact-session"
       onDescribeArtifact={async () => { describeCalls += 1; return artifact; }}
@@ -271,19 +272,136 @@ test("ChatTimeline resolves artifact links into the formal card and controlled p
     /></LanguageProvider>);
     act(render);
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    assert.ok(container.querySelector(".artifact-card"));
+    const link = container.querySelector<HTMLAnchorElement>(".markdown-artifact-link");
+    assert.ok(link);
+    assert.equal(container.querySelectorAll(".markdown-artifact-link").length, 2, "each prose reference remains a link");
+    assert.equal(container.querySelectorAll(".markdown-artifact-attachments .artifact-card").length, 1, "repeated references share one controlled file card");
+    assert.equal(container.querySelectorAll('[data-artifact-path="C:\\Projects\\UthCode\\hidden.png"]').length, 0, "code-fenced pseudo references do not become cards");
+    const messageBody = container.querySelector(".timeline-entry .timeline-content");
+    assert.equal(messageBody?.lastElementChild?.classList.contains("markdown-artifact-attachments"), true, "the file card follows the message Markdown");
+    act(() => { link!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(describeCalls, 1);
+    assert.equal(openCalls, 1, "the inline link opens through the same formal artifact path");
     const preview = container.querySelector<HTMLButtonElement>(".artifact-card__actions button");
     assert.ok(preview);
     act(() => { preview!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    assert.equal(describeCalls, 1);
+    assert.equal(describeCalls, 1, "the bottom card reuses the Session-scoped formal descriptor cache");
     assert.equal(previewCalls, 1);
     assert.ok(container.querySelector('img[src="data:image/png;base64,AAAA"]'));
     const open = Array.from(container.querySelectorAll<HTMLButtonElement>(".artifact-card__actions button")).find((button) => button.textContent === "Open");
     assert.ok(open);
     act(() => { open!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    assert.equal(openCalls, 1);
+    assert.equal(openCalls, 2);
+  });
+});
+
+test("ChatTimeline exposes controlled artifact-link failures", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<LanguageProvider value="en"><ChatTimeline
+      entries={[codeEntry("[missing](artifact:C:/missing.txt)")]}
+      todo={[]}
+      sessionKey="artifact-error-session"
+      onDescribeArtifact={async () => null}
+      onOpenArtifact={async () => { throw new Error("private path detail"); }}
+    /></LanguageProvider>); });
+    const link = container.querySelector<HTMLAnchorElement>(".markdown-artifact-link");
+    assert.ok(link);
+    act(() => { link.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.match(container.querySelector('[role="alert"]')?.textContent ?? "", /Artifact could not be opened/u);
+    assert.doesNotMatch(container.textContent ?? "", /private path detail/u);
+  });
+});
+
+test("ChatTimeline summarizes only counted workspace diff hunks and expands real file paths", async () => {
+  const diff: WorkspaceDiffView = {
+    source: "current_working_tree",
+    project_key: "C:/workspace-summary",
+    viewed_at: "2026-10-11T03:00:00.000Z",
+    status: {
+      branch: "main",
+      entries: [
+        { xy: " M", path: "src/file.ts" },
+        { xy: "M ", path: "docs/文件 名.md" },
+        { xy: "R ", path: "src/renamed.ts", original_path: "src/old.ts" },
+        { xy: "??", path: "notes/new.txt" },
+        { xy: " M", path: "assets/raw.bin" },
+        { xy: " M", path: "src/file" },
+        { xy: " M", path: "src/file name.md" },
+        { xy: " M", path: "src/file.ts" },
+      ],
+      unborn: false,
+      truncated: false,
+    },
+    staged_diff: {
+      text: [
+        "diff --git a/src/file.ts b/src/file.ts",
+        "--- a/src/file.ts",
+        "+++ b/src/file.ts",
+        "@@ -1,3 +1,4 @@",
+        " keep",
+        "-removed",
+        "+++literal",
+        "+added",
+        " stay",
+        "diff --git \"a/docs/\\346\\226\\207\\344\\273\\266 \\345\\220\\215.md\" \"b/docs/\\346\\226\\207\\344\\273\\266 \\345\\220\\215.md\"",
+        "@@ -1,2 +1 @@",
+        "-old one",
+        "-old two",
+        "+new",
+        "diff --git a/src/old.ts b/src/renamed.ts",
+        "@@ -0,0 +1 @@",
+        "+rename content",
+        "diff --git a/assets/raw.bin b/assets/raw.bin",
+        "GIT binary patch",
+        "diff --git a/src/file b/src/file",
+        "@@ -0,0 +1 @@",
+        "+short name content",
+        "diff --git a/src/file name.md b/src/file name.md",
+        "@@ -0,0 +1,2 @@",
+        "+first spaced path line",
+        "+second spaced path line",
+      ].join("\n"),
+      truncated: false,
+      size_bytes: 0,
+    },
+    unstaged_diff: {
+      text: "diff --git a/src/file.ts b/src/file.ts\n@@ -4 +4,2 @@\n context\n+unstaged",
+      truncated: false,
+      size_bytes: 0,
+    },
+    truncated: false,
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<LanguageProvider value="en"><ChatTimeline
+      entries={[]}
+      todo={[]}
+      workspaceDiffSummary={{ state: "completed", diff }}
+      sessionKey="workspace-summary-session"
+    /></LanguageProvider>); });
+    const card = container.querySelector<HTMLElement>("[data-workspace-change-summary]");
+    assert.ok(card);
+    assert.match(card.textContent ?? "", /Files changed: 7/u, "status paths are deduplicated and untracked file counts as a file");
+    assert.match(card.textContent ?? "", /≥\+8/u, "staged and unstaged hunk lines are counted without treating +++ headers as file data");
+    assert.match(card.textContent ?? "", /≥−3/u);
+    assert.match(card.textContent ?? "", /src\/file\.ts/u);
+    assert.match(card.textContent ?? "", /docs\/文件 名\.md/u);
+    assert.doesNotMatch(card.textContent ?? "", /src\/renamed\.ts/u, "only the first two paths show before expansion");
+    const more = [...card.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Show 5 more files"));
+    assert.ok(more);
+    act(() => { more.click(); });
+    assert.match(card.textContent ?? "", /src\/old\.ts → src\/renamed\.ts/u, "Git rename metadata is preserved in the path row");
+    const rowForPath = (path: string) => [...card.querySelectorAll<HTMLElement>(".timeline-workspace-changes__files li")]
+      .find((row) => row.querySelector(".timeline-workspace-changes__path")?.textContent === path);
+    assert.equal(rowForPath("src/file")?.querySelector(".timeline-workspace-changes__row-counts")?.textContent, "+1−0");
+    assert.equal(rowForPath("src/file name.md")?.querySelector(".timeline-workspace-changes__row-counts")?.textContent, "+2−0");
+    const untracked = [...card.querySelectorAll(".timeline-workspace-changes__files li")].find((row) => row.textContent?.includes("notes/new.txt"));
+    assert.match(untracked?.textContent ?? "", /—/u, "untracked file line counts stay unknown");
+    const binary = [...card.querySelectorAll(".timeline-workspace-changes__files li")].find((row) => row.textContent?.includes("assets/raw.bin"));
+    assert.match(binary?.textContent ?? "", /—/u, "binary file line counts stay unknown");
   });
 });
 
