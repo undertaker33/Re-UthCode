@@ -1108,7 +1108,7 @@ remote_id = "b"
     assert 'provider = "a"' in rendered
 
 
-def test_user_configuration_write_adds_modifies_and_deletes_unreferenced_profiles(
+def test_user_configuration_write_adds_modifies_and_explicitly_deletes_profiles(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -1142,6 +1142,7 @@ remote_id = "remove"
             providers={
                 "keep": {"kind": ProviderKind.FAKE},
                 "new": {"kind": "fake"},
+                "remove": None,
             },
             models={
                 "keep/ref": {
@@ -1153,6 +1154,7 @@ remote_id = "remove"
                     "provider_profile_id": "new",
                     "remote_id": "new-remote",
                 },
+                "remove/ref": None,
             },
         ),
         home=home,
@@ -1196,6 +1198,7 @@ remote_id = "other"
                 default_model="keep/ref",
                 providers={"keep": {"kind": "fake"}},
                 models={
+                    "keep/ref": None,
                     "other/ref": {
                         "provider_profile_id": "keep",
                         "remote_id": "other",
@@ -1335,14 +1338,7 @@ remote_id = "remote"
     with pytest.raises(ConfigurationError, match="provider reference"):
         write_user_configuration(
             UserConfigurationWriteRequest(
-                default_model="local/ref",
-                providers={},
-                models={
-                    "local/ref": {
-                        "provider_profile_id": "local",
-                        "remote_id": "remote",
-                    }
-                },
+                providers={"local": None},
             ),
             home=home,
         )

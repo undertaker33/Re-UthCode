@@ -1,28 +1,41 @@
-import type { LanguagePreference, ThemePreference } from "../desktop-api";
 import type { ConfigurationView } from "./state";
 
-/** The JSON-shaped candidate accepted by the existing Configuration write. */
+/** A partial, field-owned patch accepted by the user-configuration writer. */
 export interface ConfigurationWrite {
   default_model?: string;
   default_permission_mode?: "default" | "auto";
-  providers?: Record<string, Record<string, unknown>>;
-  models?: Record<string, Record<string, unknown>>;
+  providers?: Record<string, Record<string, unknown> | null>;
+  models?: Record<string, Record<string, unknown> | null>;
   search?: Record<string, unknown>;
   tool_limits?: Record<string, unknown>;
+  provider_renames?: Record<string, string>;
 }
 
-export type SettingsCategory = "providers" | "defaults" | "interface" | "about";
-
-export function configurationRequest(value: ConfigurationWrite): ConfigurationWrite {
-  const request: ConfigurationWrite = {};
-  if (value.default_model !== undefined) request.default_model = value.default_model;
-  if (value.default_permission_mode !== undefined) request.default_permission_mode = value.default_permission_mode;
-  if (value.providers) request.providers = Object.fromEntries(Object.entries(value.providers).map(([key, profile]) => [key, { ...profile }]));
-  if (value.models) request.models = Object.fromEntries(Object.entries(value.models).map(([key, profile]) => [key, { ...profile }]));
-  if (value.search) request.search = { ...value.search };
-  if (value.tool_limits) request.tool_limits = { ...value.tool_limits };
-  return request;
+export interface PendingConfigurationWrite {
+  identity: string;
+  request: ConfigurationWrite;
+  revision: number;
 }
+
+export function configurationWriteIdentities(request: ConfigurationWrite): string[] {
+  const identities: string[] = [];
+  if (Object.hasOwn(request, "default_model")) identities.push("default_model");
+  if (Object.hasOwn(request, "default_permission_mode")) identities.push("default_permission_mode");
+  for (const field of Object.keys(request.search ?? {})) identities.push(`search.${field}`);
+  for (const field of Object.keys(request.tool_limits ?? {})) identities.push(`tool_limits.${field}`);
+  for (const field of Object.keys(request.providers ?? {})) identities.push(`providers.${field}`);
+  for (const field of Object.keys(request.models ?? {})) identities.push(`models.${field}`);
+  for (const field of Object.keys(request.provider_renames ?? {})) identities.push(`provider_renames.${field}`);
+  return identities.length ? identities : ["configuration"];
+}
+
+/** Renderer-owned values always contain profiles; null is reserved for an explicit write deletion. */
+export type SettingsDraft = Omit<ConfigurationWrite, "providers" | "models"> & {
+  providers?: Record<string, Record<string, unknown>>;
+  models?: Record<string, Record<string, unknown>>;
+};
+
+export type SettingsCategory = "providers" | "general" | "tools" | "security" | "appearance" | "archive";
 
 export function normalizeOptionalText(value: unknown): unknown {
   if (typeof value !== "string") return value;
@@ -30,59 +43,68 @@ export function normalizeOptionalText(value: unknown): unknown {
   return normalized || null;
 }
 
-/**
- * Build the only settings write shape that can carry a candidate API key.
- *
- * Secret values are supplied separately from the non-secret draft. This
- * helper deliberately never copies a revealed value from a provider profile;
- * only an explicit touched replacement can add `api_key` to the request.
- */
-export function settingsSaveRequest(
-  draft: ConfigurationWrite,
-  replacementKeys: Record<string, string>,
-  touchedKeys: Record<string, boolean>,
-  searchReplacementKey = "",
-  searchKeyTouched = false,
-): ConfigurationWrite {
-  const search = draft.search
-    ? (() => {
-      const next = { ...draft.search };
-      delete next.api_key_configured;
-      delete next.api_key;
-      if (searchKeyTouched) next.api_key = searchReplacementKey;
-      return next;
-    })()
-    : undefined;
-  const toolLimits = draft.tool_limits
-    ? { ...draft.tool_limits }
-    : undefined;
-  return configurationRequest({
-    ...draft,
-    providers: Object.fromEntries(Object.entries(draft.providers ?? {}).map(([id, profile]) => {
-      const next = { ...profile };
-      if (Object.prototype.hasOwnProperty.call(next, "base_url")) next.base_url = normalizeOptionalText(next.base_url);
-      if (Object.prototype.hasOwnProperty.call(next, "display_name")) next.display_name = normalizeOptionalText(next.display_name);
-      delete next.api_key_configured;
-      delete next.api_key;
-      if (touchedKeys[id]) next.api_key = replacementKeys[id] ?? "";
-      return [id, next];
-    })),
-    models: draft.models
-      ? Object.fromEntries(Object.entries(draft.models).map(([ref, profile]) => {
-        const next = { ...profile };
-        if (Object.prototype.hasOwnProperty.call(next, "display_name")) next.display_name = normalizeOptionalText(next.display_name);
-        return [ref, next];
-      }))
-      : draft.models,
-    search,
-    tool_limits: toolLimits,
-  });
+export function providerGroupIsValid(draft: SettingsDraft, providerId: string): boolean {
+  const models = Object.entries(draft.models ?? {});
+  if (models.length === 0) return false;
+  if (draft.default_model && !draft.models?.[draft.default_model]) return false;
+  return models.every(([, model]) => typeof model.provider_profile_id === "string"
+    && Boolean(draft.providers?.[model.provider_profile_id])
+    && typeof model.remote_id === "string"
+    && Boolean(model.remote_id.trim())
+    && (model.provider_profile_id !== providerId || Boolean(draft.providers?.[providerId])));
 }
 
-export function withoutRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
-  const next = { ...record };
-  delete next[key];
-  return next;
+/** Build one Provider and its associated Model changes for the editor Apply. */
+export function providerGroupSaveRequest(
+  before: SettingsDraft,
+  draft: SettingsDraft,
+  providerId: string,
+  replacementKey = "",
+  replacementTouched = false,
+): ConfigurationWrite {
+  const request: ConfigurationWrite = {};
+  const provider = draft.providers?.[providerId];
+  if (!provider) {
+    request.providers = { [providerId]: null };
+  } else {
+    const profile: Record<string, unknown> = {
+      kind: provider.kind,
+      base_url: normalizeOptionalText(provider.base_url),
+      display_name: normalizeOptionalText(provider.display_name),
+    };
+    // Revealed credentials are never copied from the draft. Only an explicit
+    // replacement field can cross the settings boundary.
+    if (replacementTouched) profile.api_key = replacementKey;
+    request.providers = { [providerId]: profile };
+  }
+
+  const priorRefs = Object.entries(before.models ?? {})
+    .filter(([, model]) => model?.provider_profile_id === providerId)
+    .map(([ref]) => ref);
+  const currentModels = draft.models ?? {};
+  const currentRefs = Object.entries(currentModels)
+    .filter(([, model]) => model?.provider_profile_id === providerId);
+  const models: Record<string, Record<string, unknown> | null> = {};
+  for (const modelRef of priorRefs) {
+    if (!currentModels[modelRef]) models[modelRef] = null;
+  }
+  for (const [modelRef, model] of currentRefs) {
+    if (!model) continue;
+    models[modelRef] = {
+      provider_profile_id: model.provider_profile_id,
+      remote_id: typeof model.remote_id === "string" ? model.remote_id.trim() : model.remote_id,
+      display_name: normalizeOptionalText(model.display_name),
+      context_window: model.context_window,
+      max_output_tokens: model.max_output_tokens,
+      reasoning_effort: model.reasoning_effort,
+      supports_images: model.supports_images,
+    };
+  }
+  if (Object.keys(models).length) request.models = models;
+  if (before.default_model !== draft.default_model && draft.default_model !== undefined) {
+    request.default_model = draft.default_model;
+  }
+  return request;
 }
 
 export function parseOptionalPositiveInteger(value: string): number | null {
@@ -95,7 +117,7 @@ export function stringValue(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-export function sourceConfig(value: ConfigurationView | null): ConfigurationWrite {
+export function sourceConfig(value: ConfigurationView | null): SettingsDraft {
   const providers: Record<string, Record<string, unknown>> = {};
   for (const [id, raw] of Object.entries(value?.providers ?? {})) {
     const profile = raw as Record<string, unknown>;
@@ -162,7 +184,7 @@ export function modelFieldId(prefix: string, ref: string, field: string): string
   return `${prefix}-${encoded}-${field}`;
 }
 
-export function providerModels(draft: ConfigurationWrite, providerId: string): Array<[string, Record<string, unknown>]> {
+export function providerModels(draft: SettingsDraft, providerId: string): Array<[string, Record<string, unknown>]> {
   return Object.entries(draft.models ?? {}).filter(([, model]) => model.provider_profile_id === providerId);
 }
 
@@ -190,9 +212,3 @@ export function modelRemoteLabel(model: Record<string, unknown> | undefined, unn
 export function providerLabel(providerId: string, provider: Record<string, unknown> | undefined): string {
   return stringValue(provider?.display_name).trim() || providerId;
 }
-
-// Keep the imports used by SettingsView's public callback contract in one
-// small, dependency-free module. These aliases are types only and disappear
-// from the renderer bundle.
-export type SettingsTheme = ThemePreference;
-export type SettingsLanguage = LanguagePreference;

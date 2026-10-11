@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type MouseEvent } from "react";
-import type { ConfigurationWrite } from "./settings-draft";
+import type { SettingsDraft } from "./settings-draft";
 import {
   createInternalModelRef,
   modalFocusableElements,
@@ -21,21 +21,22 @@ export const reasoningEffortOptions = ["", "none", "minimal", "low", "medium", "
 
 export interface SettingsEditorModalProps {
   providerId: string;
-  draft: ConfigurationWrite;
+  draft: SettingsDraft;
   settingsBusy: boolean;
   fieldPrefix?: string;
   /** The control that opened this transaction; it owns return focus. */
   returnFocus: HTMLElement | null;
   /** The page remains the only non-secret draft owner. */
   backgroundElements?: Array<HTMLElement | null>;
-  onDraftChange: (update: (current: ConfigurationWrite) => ConfigurationWrite) => void;
+  onDraftChange: (update: (current: SettingsDraft) => SettingsDraft) => void;
   onCancel: () => void;
-  onApplyProvider: (providerId: string) => void;
+  onApplyProvider: (providerId: string) => boolean | Promise<boolean>;
   onRemoveProvider: (providerId: string) => void;
   onRevealApiKey?: (providerId: string) => Promise<string | null>;
   replacementKey?: string;
   replacementTouched?: boolean;
   onReplacementChange: (providerId: string, value: string) => void;
+  applyError?: string | null;
 }
 
 type EditorStep = "provider" | "model";
@@ -60,6 +61,7 @@ export function SettingsEditorModal({
   replacementKey = "",
   replacementTouched = false,
   onReplacementChange,
+  applyError,
 }: SettingsEditorModalProps) {
   const { t } = useTranslation();
   const generatedPrefix = useId().replace(/:/gu, "");
@@ -323,12 +325,13 @@ export function SettingsEditorModal({
                 {revealPending && <p className="settings-row__hint" role="status">{t("revealingApiKey")}</p>}
                 {revealError && <p className="settings-row__hint settings-row__hint--error" role="alert">{t("revealKeyFailed")}</p>}
               </div></div>
+              {applyError && <p className="settings-row__hint settings-row__hint--error" role="alert">{applyError}</p>}
               <section className="settings-models" aria-labelledby={`${titleId}-models`}><div className="settings-subsection__heading"><div><p className="eyebrow">{t("models")}</p><h3 id={`${titleId}-models`}>{t("models")}</h3></div><button type="button" className="icon-button" title={t("addModel")} aria-label={t("addModel")} onClick={addModel} disabled={settingsBusy}><UiIcon name="plus" /></button></div>
                 {models.length > 0 ? <div className="settings-model-list">{models.map(([ref, model]) => { const label = modelLabel(model, t("unnamedModel")); return <article className="settings-model-row" key={ref}><div><strong>{label}</strong><small>{modelRemoteLabel(model, t("modelNotConfigured"))}{draft.default_model === ref ? ` · ${t("defaultMarker")}` : ""}</small></div><div className="settings-model-row__actions"><button type="button" data-model-edit-ref={ref} title={`${t("editModel")} ${label}`} aria-label={`${t("editModel")} ${label}`} onClick={() => editModel(ref)} disabled={settingsBusy}><UiIcon name="edit" /></button><button type="button" title={`${t("removeModel")} ${label}`} aria-label={`${t("removeModel")} ${label}`} onClick={() => removeModel(ref)} disabled={settingsBusy}><UiIcon name="trash" /></button></div></article>; })}</div> : <p className="settings-empty settings-empty--compact">{t("noModels")}</p>}
               </section>
-              {providerDeletePending && <div className="settings-confirm" role="alert"><p>{t("removeProviderQuestion")}</p><div><button type="button" onClick={() => { onRemoveProvider(providerId); onApplyProvider(providerId); }} disabled={settingsBusy}>{t("remove")}</button><button type="button" onClick={() => setProviderDeletePending(false)} disabled={settingsBusy}>{t("cancel")}</button></div></div>}
+              {providerDeletePending && <div className="settings-confirm" role="alert"><p>{t("removeProviderQuestion")}</p><div><button type="button" onClick={() => { onRemoveProvider(providerId); void onApplyProvider(providerId); }} disabled={settingsBusy}>{t("remove")}</button><button type="button" onClick={() => setProviderDeletePending(false)} disabled={settingsBusy}>{t("cancel")}</button></div></div>}
             </div>
-            <footer>{!providerDeletePending && <button type="button" className="danger" title={t("removeProvider")} onClick={() => setProviderDeletePending(true)} disabled={settingsBusy}>{t("removeProvider")}</button>}<button type="button" title={t("cancel")} onClick={onCancel} disabled={settingsBusy}>{t("cancel")}</button><button type="button" title={t("apply")} onClick={() => { if (settingsBusy) return; onDraftChange((current) => { const profile = current.providers?.[providerId]; if (!profile) return current; return { ...current, providers: { ...current.providers, [providerId]: { ...profile, base_url: normalizeOptionalText(profile.base_url), display_name: normalizeOptionalText(profile.display_name) } } }; }); onApplyProvider(providerId); }} disabled={settingsBusy}>{t("apply")}</button></footer>
+            <footer>{!providerDeletePending && <button type="button" className="danger" title={t("removeProvider")} onClick={() => setProviderDeletePending(true)} disabled={settingsBusy}>{t("removeProvider")}</button>}<button type="button" title={t("cancel")} onClick={onCancel} disabled={settingsBusy}>{t("cancel")}</button><button type="button" title={t("apply")} onClick={() => { if (settingsBusy) return; onDraftChange((current) => { const profile = current.providers?.[providerId]; if (!profile) return current; return { ...current, providers: { ...current.providers, [providerId]: { ...profile, base_url: normalizeOptionalText(profile.base_url), display_name: normalizeOptionalText(profile.display_name) } } }; }); void onApplyProvider(providerId); }} disabled={settingsBusy}>{t("apply")}</button></footer>
           </>
         ) : (
           <>

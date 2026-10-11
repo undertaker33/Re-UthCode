@@ -255,3 +255,10 @@ npm run typecheck
 Reviewer 在 desktop/、既有 re-uthcode 环境执行 `npx tsx --test --test-name-pattern='artifact|safe Markdown|counted workspace|T09 App|General lazy Turns|current-owner accepted|failed live Tool|delayed archive catalog|restoring a search hit|Runtime switch|T08 .*activity|seven adjacent|T07 App switches fixed General owner|T10 control receipts|successful lazy Turn|App parks a lazy turn' tests/renderer-chat.test.tsx tests/renderer-state.test.ts tests/renderer-attachments.test.tsx tests/renderer.test.tsx`：28 passed、0 failed；`npm run typecheck`、`git diff --check` 和 `node --import tsx -e $reviewCode` 均退出码0。已实际查看最新三张截图，并对照既有参考图/HTML。最新摘要、Artifact、折叠/菜单/表格和此前六项缺陷关联回归通过。
 
 本轮未构建打包、操作用户 App或验证真实窗口/native/真实Provider，旧包不用于证明最新修改。Checklist 未新增勾选；用户明确取消后续UI暂停，完成本轮授权Git交付后直接W04/W05，运行版重建和剩余真实联合验收由后续完成。未跟踪 test-file.md 为用户测试数据，保持原样且排除提交。
+
+
+## 总控：用户验收返工（二）Git 交付与 W04 交接
+
+2026-10-11，复审 PASS 后仅暂存八个 Renderer 源码/测试文件及 Context-Index、W03 Feedback，共10文件；冻结九份文档未变，Feedback追加性、UTF-8 guard 2/2、staged diffcheck通过。提交 `33018cc873094ce34eea5005324ee221d1450f6a` 已推送 T11-Agent能力补齐，[PR131](https://github.com/undertaker33/Re-UthCode/pull/131) head及10文件范围与审定集合一致，MERGEABLE/CLEAN后按指定head合并，merge `0d5a4ccda31a4d07cba24943acd1d3dc40c25893`。本地T11、远端T11、main与PR merge经Git/GitHub API核对一致；merge未改变审定src/desktop输入。tracked工作区干净，仅用户未跟踪test-file.md保留且未提交。
+
+依据用户最新取消UI暂停的直接授权，继续派发W04，不等待本轮运行版重建或UI复验；最新真实窗口、native、Provider与完整联合E2E仍留后续验收。此Git闭环与索引随下一Prompt必要提交进入版本控制，不单拆文档提交。

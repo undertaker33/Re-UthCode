@@ -180,6 +180,7 @@ export const RUNTIME_METHODS = [
   "settings.get",
   "settings.reveal_api_key",
   "settings.save",
+  "settings.retry_apply",
 ] as const;
 
 export type RuntimeMethod = (typeof RUNTIME_METHODS)[number];

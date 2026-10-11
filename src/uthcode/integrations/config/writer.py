@@ -102,7 +102,7 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
                     path=path,
                     field="providers",
                 )
-            if not isinstance(profile, Mapping):
+            if profile is None or not isinstance(profile, Mapping):
                 continue
             for key in profile:
                 if key not in _PROVIDER_FIELDS:
@@ -120,7 +120,7 @@ def _validate_existing_schema(mapping: Mapping[str, Any], *, path: Path) -> None
                     path=path,
                     field="models",
                 )
-            if not isinstance(profile, Mapping):
+            if profile is None or not isinstance(profile, Mapping):
                 continue
             for key in profile:
                 if key not in {
@@ -219,6 +219,8 @@ def _validate_payload_shape(payload: Mapping[str, Any], *, path: Path) -> None:
                     path=path,
                     field=section_name,
                 )
+            if profile is None:
+                continue
             if not isinstance(profile, Mapping):
                 raise ConfigurationError(
                     "value must be a table",
@@ -262,12 +264,6 @@ def _replace_or_get_table(document: Any, name: str) -> Any:
         current = toml_table()
         document[name] = current
     return current
-
-
-def _delete_missing_profiles(section: Any, requested: Mapping[str, Any]) -> None:
-    for profile_id in tuple(section.keys()):
-        if profile_id not in requested:
-            del section[profile_id]
 
 
 def _set_or_delete(table: Any, key: str, value: object) -> None:
@@ -316,7 +312,7 @@ def _apply_provider_renames(
     if not isinstance(models, Mapping):
         return
     for profile in models.values():
-        if not isinstance(profile, Mapping):
+        if profile is None or not isinstance(profile, Mapping):
             continue
         provider_id = profile.get("provider")
         if provider_id in renames:
@@ -325,34 +321,26 @@ def _apply_provider_renames(
 
 def _apply_providers(document: Any, requested: Mapping[str, Any]) -> None:
     section = _replace_or_get_table(document, "providers")
-    _delete_missing_profiles(section, requested)
     for profile_id, raw_profile in requested.items():
+        if raw_profile is None:
+            section.pop(profile_id, None)
+            continue
         profile = section.get(profile_id)
         if not isinstance(profile, Mapping):
             profile = toml_table()
             section[profile_id] = profile
-        if "kind" not in raw_profile:
-            if "kind" in profile:
-                del profile["kind"]
-        else:
+        if "kind" in raw_profile:
             _set_or_delete(profile, "kind", raw_profile.get("kind"))
-        # Omitted base_url means clear the old endpoint.  Omitted api_key is
-        # intentionally different: it retains a literal/env expression.
         if "base_url" in raw_profile:
             _set_or_delete(profile, "base_url", raw_profile.get("base_url"))
-        elif "base_url" in profile:
-            del profile["base_url"]
         if "display_name" in raw_profile:
             _set_or_delete(profile, "display_name", raw_profile.get("display_name"))
-        elif "display_name" in profile:
-            del profile["display_name"]
         if "api_key" in raw_profile and raw_profile.get("api_key") is not None:
             _set_or_delete(profile, "api_key", raw_profile.get("api_key"))
 
 
 def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
     section = _replace_or_get_table(document, "models")
-    _delete_missing_profiles(section, requested)
     field_names = (
         "provider_profile_id",
         "remote_id",
@@ -364,6 +352,9 @@ def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
     )
     toml_names = {"provider_profile_id": "provider"}
     for model_ref, raw_profile in requested.items():
+        if raw_profile is None:
+            section.pop(model_ref, None)
+            continue
         profile = section.get(model_ref)
         if not isinstance(profile, Mapping):
             profile = toml_table()
@@ -372,8 +363,6 @@ def _apply_models(document: Any, requested: Mapping[str, Any]) -> None:
             toml_name = toml_names.get(field_name, field_name)
             if field_name in raw_profile:
                 _set_or_delete(profile, toml_name, raw_profile.get(field_name))
-            elif toml_name in profile:
-                del profile[toml_name]
 
 
 def _apply_search(document: Any, requested: Mapping[str, Any]) -> None:
@@ -394,10 +383,6 @@ def _apply_search(document: Any, requested: Mapping[str, Any]) -> None:
             continue
         if key in requested:
             _set_or_delete(section, key, requested[key])
-        elif key in section:
-            # A complete search update owns non-secret fields in this small
-            # table; omitted values return to their safe defaults.
-            del section[key]
 
 
 def _apply_tool_limits(document: Any, requested: Mapping[str, Any]) -> None:
@@ -405,20 +390,19 @@ def _apply_tool_limits(document: Any, requested: Mapping[str, Any]) -> None:
     for key in _TOOL_LIMITS_FIELDS:
         if key in requested:
             _set_or_delete(section, key, requested[key])
-        elif key in section:
-            del section[key]
 
 
 def write_user_config(
     path: str | os.PathLike[str] | Path,
     payload: Mapping[str, Any],
 ) -> Path:
-    """Atomically write a complete current-schema user configuration update.
+    """Atomically merge a partial current-schema user configuration update.
 
     The payload uses Application-owned names.  In particular,
     provider_profile_id is translated to the TOML field provider.  An omitted
     Provider api_key retains the existing literal or env: expression; a
-    supplied value is written once and is never returned.
+    supplied value is written once and is never returned. Null profile values
+    explicitly delete that Provider or Model.
     """
 
     target = Path(path).expanduser().resolve(strict=False)
@@ -477,37 +461,12 @@ def write_user_config(
     return _atomic_write(target, dumps(document))
 
 
-def _write_user_preference(
-    path: str | os.PathLike[str],
-    field: str,
-    value: str,
-) -> Path:
-    """Atomically update one validated root user preference."""
-
-    if field == "default_model":
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("default_model must be a non-empty string")
-    elif field == "default_permission_mode":
-        if value not in {"default", "auto"}:
-            raise ValueError("default_permission_mode must be default or auto")
-    else:  # pragma: no cover
-        raise ValueError("unsupported user preference")
-    target = Path(path).expanduser().resolve(strict=False)
-    original = target.read_text(encoding="utf-8")
-    try:
-        document = parse(original)
-    except Exception:
-        raise ValueError("user configuration is not valid TOML") from None
-    if "model" in document:
-        raise ValueError("unsupported configuration field: model")
-    document[field] = value
-    return _atomic_write(target, dumps(document))
-
-
 def write_user_default_model(path: str | os.PathLike[str], model_ref: str) -> Path:
     """Atomically update only the root default_model value of a user file."""
 
-    return _write_user_preference(path, "default_model", model_ref)
+    if not isinstance(model_ref, str) or not model_ref.strip():
+        raise ValueError("default_model must be a non-empty string")
+    return write_user_config(path, {"default_model": model_ref})
 
 
 def write_user_default_permission_mode(
@@ -516,7 +475,9 @@ def write_user_default_permission_mode(
 ) -> Path:
     """Atomically update only the safe root permission default."""
 
-    return _write_user_preference(path, "default_permission_mode", mode)
+    if mode not in {"default", "auto"}:
+        raise ValueError("default_permission_mode must be default or auto")
+    return write_user_config(path, {"default_permission_mode": mode})
 
 
 __all__ = [

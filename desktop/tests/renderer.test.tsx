@@ -24,7 +24,7 @@ import { ChatTimeline, isNearBottom, scrollTimelineToBottom } from "../src/rende
 import { renderMarkdown } from "../src/renderer/safe-markdown";
 import { Composer, ContextRing, applyCompletion, contextUsagePercent, edgeCompletionIndex, modelDisplayName, nextCompletionIndex } from "../src/renderer/Composer";
 import { InteractionSurface, buildPermissionResponse, buildPlanResponse, buildResumeResponse, buildRetryResponse, buildUserInputResponse, interactionSurfaceKey } from "../src/renderer/InteractionSurface";
-import { SettingsView, configurationRequest, modelFieldId, parseOptionalPositiveInteger, providerModels, reasoningEffortOptions, settingsSaveRequest, withoutRecordKey, type ConfigurationWrite } from "../src/renderer/SettingsView";
+import { SettingsView, modelFieldId, parseOptionalPositiveInteger, providerGroupSaveRequest, providerModels, reasoningEffortOptions, sourceConfig, type ConfigurationWrite } from "../src/renderer/SettingsView";
 import { RuntimeLayoutControls, RuntimePanel, providerUsageLabel, stateLabel } from "../src/renderer/RuntimePanel";
 import { CustomSelect, customSelectConsumesEscape, customSelectPosition, initialEnabledOption, nextEnabledOption } from "../src/renderer/CustomSelect";
 import { LanguageProvider, resources, translate } from "../src/renderer/i18n";
@@ -421,13 +421,21 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
       act(() => { root.render(<App initialState={state} api={api} />); });
       for (let index = 0; index < 4; index += 1) await flush();
 
-      const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-      assert.ok(save);
-      act(() => { save!.click(); });
+      const provider = container.querySelector<HTMLButtonElement>(".provider-row");
+      assert.ok(provider);
+      act(() => { provider!.click(); });
+      await flush();
+      const apply = container.querySelector<HTMLButtonElement>(`.settings-editor-modal footer button[title="${translate(language, "apply")}"]`);
+      assert.ok(apply);
+      act(() => { apply!.click(); });
       for (let index = 0; index < 10; index += 1) await flush();
-      const saveError = container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "";
+      const saveError = container.querySelector<HTMLElement>(".settings-editor-modal [role=alert]")?.textContent ?? "";
       assert.equal(saveError, translate(language, "settingsSaveFailed"));
       assert.doesNotMatch(container.textContent ?? "", /RuntimeRequestError|settings\.save|native rejection|config\.toml/u);
+      const cancel = container.querySelector<HTMLButtonElement>(`.settings-editor-modal footer button[title="${translate(language, "cancel")}"]`);
+      assert.ok(cancel);
+      act(() => { cancel!.click(); });
+      await flush();
 
       const theme = Array.from(container.querySelectorAll<HTMLButtonElement>(".custom-select__trigger"))
         .find((button) => button.title === translate(language, "theme"));
@@ -472,6 +480,277 @@ test("T08 App presents localized safe fallbacks for settings, preference, and bu
     for (let index = 0; index < 12; index += 1) await flush();
     assert.match(container.querySelector<HTMLElement>(".runtime-panel__error")?.textContent ?? "", /Runtime could not start/u);
     assert.doesNotMatch(container.textContent ?? "", /RuntimeBoundaryError|sandbox launch failed|uthcode-runtime|resources/u);
+  });
+});
+
+test("T12 App keeps a failed non-secret field patch across Settings unmount and retries only that current field", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let stored: Record<string, unknown> = {
+      default_model: "provider/model",
+      default_permission_mode: "default",
+      providers: { provider: { kind: "openai_compat", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "model" } },
+      search: { enabled: false, max_results: 5, max_fetch_bytes: 2048 },
+      tool_limits: {},
+    };
+    const saves: JsonObject[] = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "settings.get") return { configuration: stored };
+        if (method === "settings.save") {
+          const request = params.request as JsonObject;
+          saves.push(request);
+          if (saves.length === 1) throw new Error("synthetic first field write failure");
+          const search = request.search as Record<string, unknown> | undefined;
+          stored = { ...stored, ...request, ...(search ? { search: { ...(stored.search as object), ...search } } : {}) };
+          return { configuration: stored, durable: "saved", applications: { applied: 1, pending: 0, failed: 0 } };
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: stored as never, settingsLoaded: true });
+    const flush = async (rounds = 8) => act(async () => {
+      for (let index = 0; index < rounds; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    const setInput = async (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      assert.ok(setter);
+      act(() => {
+        input.focus();
+        setter!.call(input, value);
+        input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+        input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await flush();
+    };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const maxResults = container.querySelector<HTMLInputElement>("#settings-search-max-results");
+    const maxBytes = container.querySelector<HTMLInputElement>("#settings-search-max-bytes");
+    assert.ok(maxResults && maxBytes);
+    await setInput(maxResults!, "6");
+    await setInput(maxBytes!, "4096");
+    assert.deepEqual(saves, [{ search: { max_results: 6 } }, { search: { max_fetch_bytes: 4096 } }]);
+    assert.ok(container.querySelector('.settings-autosave-status button[title="Retry save"]'));
+
+    const back = container.querySelector<HTMLButtonElement>('.settings-view__back[title="Back to chat"]');
+    assert.ok(back);
+    act(() => { back!.click(); });
+    await flush();
+    assert.equal(container.querySelector(".settings-view"), null, "Settings really unmounts on navigation");
+    const open = container.querySelector<HTMLButtonElement>(`.sidebar-footer button[title="${translate("en", "openSettings")}"]`);
+    assert.ok(open);
+    act(() => { open!.click(); });
+    await flush();
+    assert.equal(container.querySelector<HTMLInputElement>("#settings-search-max-results")?.value, "6", "App-owned failure survives Settings unmount");
+    assert.equal(container.querySelector<HTMLInputElement>("#settings-search-max-bytes")?.value, "4096", "the other field reflects its durable write");
+    const retry = container.querySelector<HTMLButtonElement>('.settings-autosave-status button[title="Retry save"]');
+    assert.ok(retry);
+    act(() => { retry!.click(); });
+    await flush();
+    assert.deepEqual(saves[2], { search: { max_results: 6 } }, "retry does not replay the unrelated successful field");
+    assert.equal(container.querySelector('.settings-autosave-status button[title="Retry save"]'), null);
+    assert.equal(JSON.stringify(saves).includes("secret"), false);
+  });
+});
+
+test("T12 App drops a stale failed field intent when a newer value for that field saves", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let saves = 0;
+    const stored = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "model" } },
+      search: { enabled: false, max_results: 5 },
+    };
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "settings.save") {
+          saves += 1;
+          if (saves === 1) throw new Error("stale write failure");
+          return { configuration: { ...stored, search: { ...stored.search, max_results: 7 } }, durable: "saved", applications: { applied: 1, pending: 0, failed: 0 } };
+        }
+        if (method === "settings.get") return { configuration: stored };
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: stored, settingsLoaded: true });
+    const flush = async () => act(async () => { for (let i = 0; i < 10; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const field = container.querySelector<HTMLInputElement>("#settings-search-max-results");
+    assert.ok(field);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(setter);
+    const edit = async (value: string) => {
+      act(() => {
+        field!.focus();
+        setter!.call(field!, value);
+        field!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+        field!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        field!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await flush();
+    };
+    await edit("6");
+    assert.ok(container.querySelector('.settings-autosave-status button[title="Retry save"]'));
+    await edit("7");
+    assert.equal(saves, 2);
+    assert.equal(container.querySelector('.settings-autosave-status button[title="Retry save"]'), null, "the previous revision cannot be retried over the newer value");
+    assert.equal(field!.value, "7");
+  });
+});
+
+test("W04 settings application events refresh only valid counters and reject an old API generation", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const stored: DesktopPreferences = {
+      theme: "system",
+      language: "en",
+      windowBounds: { width: 1100, height: 760, maximized: false },
+      panelMode: "docked",
+      sidebarWidth: 286,
+      runtimePanelWidth: 318,
+      recentProjects: [],
+      projectAliases: {},
+      pinnedProjectKeys: [],
+      pinnedSessions: [],
+      expandedProjects: {},
+      selectedProjectKey: null,
+      selectedSessionId: null,
+    };
+    let oldListener: ((event: AgentEvent) => void) | null = null;
+    let currentListener: ((event: AgentEvent) => void) | null = null;
+    const api = (capture: (listener: (event: AgentEvent) => void) => void): DesktopApi => ({
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async () => ({}),
+      subscribeAgentEvents: (listener) => {
+        capture(listener);
+        return () => undefined;
+      },
+      readPreference: async (key) => stored[key],
+      writePreference: async () => stored,
+    });
+    const initial = createInitialState({
+      language: "en",
+      view: "settings",
+      configuration: { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "model" } } },
+      settingsLoaded: true,
+      settingsApplications: { applied: 0, pending: 1, failed: 0 },
+    });
+    const flush = async () => act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    act(() => { root.render(<App initialState={initial} api={api((listener) => { oldListener = listener; })} />); });
+    await flush();
+    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /waiting for active work/u);
+
+    act(() => { oldListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
+    await flush();
+    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /could not apply/u);
+    assert.ok([...container.querySelectorAll(".settings-autosave-status button")].some((button) => button.title === "Retry apply" || button.textContent === "Retry apply"));
+    act(() => { oldListener?.({ type: "settings_applications", applied: 0, pending: -1, failed: 0 }); });
+    await flush();
+    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /could not apply/u, "malformed Bridge counts do not replace the current projection");
+    act(() => { oldListener?.({ type: "settings_applications", applied: 1, pending: 0, failed: 0 }); });
+    await flush();
+
+    act(() => { root.render(<App initialState={initial} api={api((listener) => { currentListener = listener; })} />); });
+    await flush();
+    act(() => { oldListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
+    await flush();
+    assert.equal(container.querySelector(".settings-autosave-status")?.textContent?.trim(), "Settings saved", "an unsubscribed runtime generation cannot overwrite current status");
+
+    act(() => { currentListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
+    await flush();
+    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /could not apply/u);
+
+    act(() => { currentListener?.({ type: "settings_applications", applied: 1, pending: 0, failed: 0 }); });
+    await flush();
+    assert.equal(container.querySelector(".settings-autosave-status")?.textContent?.trim(), "Settings saved");
+    assert.equal(container.querySelector(".provider-row")?.textContent?.includes("provider"), true, "application counters do not replace the current configuration projection");
+  });
+});
+
+test("T12 failed Search key remains editor-local and is cleared when Settings closes", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    let saves = 0;
+    const stored = {
+      default_model: "provider/model",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", api_key_configured: false } },
+      models: { "provider/model": { provider_profile_id: "provider", remote_id: "model" } },
+      search: { enabled: false, api_key_configured: false, max_results: 5 },
+    };
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method) => {
+        if (method === "settings.get") return { configuration: stored };
+        if (method === "settings.save") {
+          saves += 1;
+          throw new Error("synthetic Search key write failure");
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({ language: "en", view: "settings", configuration: stored, settingsLoaded: true });
+    const flush = async (duration = 0) => act(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, duration));
+      for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const key = container.querySelector<HTMLInputElement>("#settings-search-key");
+    assert.ok(key);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    assert.ok(setter);
+    act(() => {
+      key!.focus();
+      setter!.call(key!, "transient-search-secret");
+      key!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "transient-search-secret" }));
+      key!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      key!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await flush(560);
+    assert.equal(saves, 1);
+    assert.equal(key!.value, "transient-search-secret", "the failed replacement stays in the open editor for its local retry");
+    assert.ok(container.querySelector<HTMLInputElement>("#settings-search-key")?.parentElement?.querySelector("button"));
+    assert.equal(container.querySelector('.settings-autosave-status button[title="Retry save"]'), null, "the Search key never enters App's non-secret failure queue");
+
+    const back = container.querySelector<HTMLButtonElement>('.settings-view__back[title="Back to chat"]');
+    assert.ok(back);
+    act(() => { back!.click(); });
+    await flush();
+    assert.equal(container.querySelector(".settings-view"), null);
+    const open = container.querySelector<HTMLButtonElement>(`.sidebar-footer button[title="${translate("en", "openSettings")}"]`);
+    assert.ok(open);
+    act(() => { open!.click(); });
+    await flush();
+    assert.equal(container.querySelector<HTMLInputElement>("#settings-search-key")?.value, "", "reopening starts without a cancelled secret draft");
+    assert.equal(container.querySelector<HTMLInputElement>("#settings-search-key")?.parentElement?.querySelector("button"), null);
+    assert.equal(container.querySelector('.settings-autosave-status button[title="Retry save"]'), null);
   });
 });
 
@@ -3521,7 +3800,7 @@ test("T06 Provider Retry and user Pause render only typed continuation/cancel co
 test("T07 Settings uses the current configuration view and does not render secret values", () => {
   const state = createInitialState({ configuration: { default_model: "fake/model", default_permission_mode: "auto", providers: { fake: { provider_profile_id: "fake", kind: "fake", base_url: null, api_key_configured: false } }, models: { "fake/model": { model_ref: "fake/model", provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 128000, max_output_tokens: 4096, reasoning_effort: "none" } } }, settingsLoaded: true });
   const markup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
-  assert.match(markup, /协议与模型|默认项|界面|关于/);
+  assert.match(markup, /模型与 Provider|常规|工具与限制|权限与安全|外观与语言|已归档会话/);
   assert.match(markup, />Model</);
   assert.doesNotMatch(markup, /sk-live-secret|api_key=|secret value/u);
 });
@@ -3530,7 +3809,7 @@ test("T07 rebuilt Settings and typed interactions keep accessible continuous and
   const state = createInitialState({ runtimeState: "ready", theme: "light", configuration: { default_model: "fake/model", default_permission_mode: "default", providers: { fake: { kind: "fake", api_key_configured: true } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model" } } }, settingsLoaded: true });
   const settingsMarkup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
   assert.match(settingsMarkup, /aria-label="设置"/u);
-  for (const id of ["providers", "defaults", "interface", "about"]) {
+  for (const id of ["providers", "general", "tools", "security", "appearance"]) {
     assert.match(settingsMarkup, new RegExp(`href="#settings-${id}"`));
     assert.match(settingsMarkup, new RegExp(`id="settings-${id}"`));
   }
@@ -3553,27 +3832,25 @@ test("T07 rebuilt Settings and typed interactions keep accessible continuous and
   assert.match(css, /\.interaction-surface\s*\{[^}]*border-top:\s*2px solid var\(--accent\)/s);
 });
 
-test("T07 removing a provider discards its transient key before the same ID can be recreated", () => {
-  const apiKeys = withoutRecordKey({ fake: "sk-transient", keep: "sk-keep" }, "fake");
-  const touchedKeys = withoutRecordKey({ fake: true, keep: true }, "fake");
-  const recreatedDraft = { providers: { fake: { kind: "fake", base_url: null }, keep: { kind: "fake", base_url: null } } };
-  const request = settingsSaveRequest(recreatedDraft, apiKeys, touchedKeys);
-  const providers = request.providers as Record<string, Record<string, unknown>>;
-  assert.equal(providers.fake.api_key, undefined);
-  assert.equal(providers.keep.api_key, "sk-keep");
+test("T07 a recreated provider cannot inherit a discarded transient key", () => {
+  const before = { providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake", remote_id: "model" } } };
+  const recreatedDraft = { providers: { fake: { kind: "fake", base_url: null, api_key: "sk-transient" } }, models: before.models };
+  const request = providerGroupSaveRequest(before, recreatedDraft, "fake");
+  assert.equal(request.providers?.fake?.api_key, undefined);
   assert.doesNotMatch(JSON.stringify(request), /sk-transient/u);
 });
 
 test("T07 four-field setup writes a valid OpenAI-compatible candidate without guessed model limits", () => {
-  const request = settingsSaveRequest({
+  const draft = {
     default_model: "model",
     default_permission_mode: "default",
-    providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
-    models: { model: { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } },
-  }, { provider: "sk-test-only" }, { provider: true });
+    providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", display_name: null, api_key_configured: false } },
+      models: { model: { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null, supports_images: null } },
+  };
+  const request = providerGroupSaveRequest({}, draft, "provider", "sk-test-only", true);
   assert.equal(request.default_model, "model");
-  assert.deepEqual(request.providers?.provider, { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key: "sk-test-only" });
-  assert.deepEqual(request.models?.model, { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
+  assert.deepEqual(request.providers?.provider, { kind: "openai_compat", base_url: "https://gateway.example/v1", display_name: null, api_key: "sk-test-only" });
+  assert.deepEqual(request.models?.model, { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null, supports_images: null });
 });
 
 test("T07 saved API key reveal is explicit, transient, and cleared with the protocol modal", async () => {
@@ -3616,10 +3893,7 @@ test("T07 saved API key reveal is explicit, transient, and cleared with the prot
     assert.ok(apply);
     act(() => { apply!.click(); });
     await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    await tick();
+    assert.equal(container.querySelector('.settings-actions .save-button'), null);
     const providerRequest = saves[0]?.providers?.provider;
     assert.ok(providerRequest);
     assert.equal(providerRequest.api_key, undefined, "the revealed value must never enter an untouched write");
@@ -3666,16 +3940,10 @@ test("T07 replacement key remains after a failed save and is the only key-bearin
     assert.ok(apply);
     act(() => { apply!.click(); });
     await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    await tick();
     assert.equal(rejectedRequest?.providers?.provider?.api_key, "replacement-only");
-    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
-    assert.ok(reopened);
-    act(() => { reopened!.click(); });
-    await tick();
-    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "replacement-only", "a failed save keeps the replacement in the modal");
+    assert.ok(container.querySelector('.settings-editor-modal [role="alert"]'), "a failed group Apply retains a visible modal-local error");
+    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "replacement-only", "the replacement key remains editor-local after failure");
+    assert.equal(container.querySelector('.settings-autosave-status button[title="Retry save"]'), null, "Provider secrets are not copied into the field retry state");
   });
 });
 
@@ -3743,11 +4011,13 @@ test("Settings provider names are editable labels while provider IDs remain stab
   assert.match(namedMarkup, />Local gateway</u);
   assert.match(namedMarkup, />protocol_1</u, "a missing display name falls back to the stable provider ID");
 
-  const request = settingsSaveRequest({
+  const before = { default_model: "protocol/model", providers: { protocol: { kind: "fake", display_name: "Old" } }, models: { "protocol/model": { provider_profile_id: "protocol", remote_id: "served-model" } } };
+  const draft = {
     default_model: "protocol/model",
-    providers: { protocol: { kind: "fake", display_name: "  Company DeepSeek  " } },
+    providers: { protocol: { kind: "fake", base_url: null, display_name: "  Company DeepSeek  " } },
     models: { "protocol/model": { provider_profile_id: "protocol", remote_id: "served-model" } },
-  }, {}, {});
+  };
+  const request = providerGroupSaveRequest(before, draft, "protocol");
   assert.equal(request.providers?.protocol?.display_name, "Company DeepSeek");
   assert.equal(request.models?.["protocol/model"]?.provider_profile_id, "protocol");
 
@@ -3776,10 +4046,6 @@ test("Settings provider names are editable labels while provider IDs remain stab
     const apply = container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Apply"]');
     assert.ok(apply);
     act(() => { apply!.click(); });
-    await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
     await tick();
     assert.equal(saves[0]?.providers?.protocol?.display_name, "Renamed display only");
     assert.equal(saves[0]?.models?.["protocol/model"]?.provider_profile_id, "protocol");
@@ -3833,11 +4099,8 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     await tick();
     assert.equal(container.querySelector('.settings-editor-modal'), null);
     assert.equal(dom.window.document.activeElement, providerRow, "Escape cancels the transaction and restores focus to the provider row");
-    const saveBeforeAdd = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(saveBeforeAdd);
-    act(() => { saveBeforeAdd!.click(); });
-    await tick();
-    assert.equal(saves.at(-1)?.default_model, "provider/primary", "Cancel restores default_model before global Save");
+    assert.equal(saves.length, 0, "Escape cancels the group without a global Save entry point");
+    assert.equal(container.querySelector('.settings-actions .save-button'), null);
     act(() => { providerRow!.click(); });
     await tick();
     const addModel = providerDialog()!.querySelector<HTMLButtonElement>('button[title="Add model"]');
@@ -3876,6 +4139,7 @@ test("T07 protocol model modal supports add, default, edit, delete, and focus-sa
     act(() => { providerCancel!.click(); });
     await tick();
     assert.equal(container.querySelector('[role="dialog"]'), null);
+    assert.equal(saves.length, 0, "cancel discards the whole un-applied Provider/Model group");
   });
 });
 
@@ -3928,464 +4192,10 @@ test("T07 provider URL and model display name preserve edit-time spaces and norm
     assert.ok(applyProvider);
     act(() => { applyProvider!.click(); });
     await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    await tick();
+    assert.equal(container.querySelector('.settings-actions .save-button'), null);
+    assert.equal(saves.length, 1, "Provider Apply is the group's persistence boundary");
     assert.equal(saves.at(-1)?.providers?.provider?.base_url, "https://gateway.example/v1");
     assert.equal(saves.at(-1)?.models?.["provider/model"]?.display_name, "My Model");
-  });
-});
-
-test("T07 durable Settings save clears transient secrets even when Runtime recovery fails", async () => {
-  type RecoveryFailure = "project.open" | "session.resume" | "status.get" | "project.sessions";
-  const config = { default_model: "provider/model", default_permission_mode: "default" as const, providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
-  const project: ProjectState = { path: "C:/settings-project", projectKey: "C:/settings-project", alias: "Settings project", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
-  const preferences: DesktopPreferences = {
-    theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
-    recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
-  };
-  const runScenario = async (failure: RecoveryFailure, replacement = false, deferFailure = false) => withRendererDom(async (dom, container, root) => {
-    const calls: Array<{ method: string; params: JsonObject }> = [];
-    const saveRequests: JsonObject[] = [];
-    let savingStarted = false;
-    let rejectDeferredFailure: ((reason?: unknown) => void) | null = null;
-    const deferredFailure = new Promise<never>((_resolve, reject) => { rejectDeferredFailure = reject; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push({ method, params });
-        if (method === "settings.save") {
-          savingStarted = true;
-          saveRequests.push(params.request as JsonObject);
-          return { configuration: config };
-        }
-        if (savingStarted && method === failure) {
-          if (deferFailure && failure === "project.open") return await deferredFailure;
-          throw new Error(`synthetic ${failure} failure`);
-        }
-        if (method === "settings.get") return { configuration: config };
-        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
-        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
-        if (method === "project.sessions") return { sessions: [] };
-        if (method === "status.get") return { active_turn: false };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      readPreference: async (key) => preferences[key],
-      writePreference: async () => preferences,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: project.sessions[0]?.session_id ?? null });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    await tick();
-    await tick();
-    if (replacement) {
-      const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
-      assert.ok(providerRow);
-      act(() => { providerRow!.click(); });
-      await tick();
-      const input = container.querySelector<HTMLInputElement>("#modal-api-key");
-      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
-      assert.ok(input);
-      assert.ok(setter);
-      act(() => {
-        input!.focus();
-        setter!.call(input, "w04-replacement-only");
-        input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "w04-replacement-only" }));
-        input!.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-        input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-        input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
-      });
-      await tick();
-      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
-      assert.ok(applyProvider);
-      act(() => { applyProvider!.click(); });
-      await tick();
-    }
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    if (deferFailure) {
-      await tick();
-      assert.equal(save!.disabled, false, "Settings saving ends at the durable write while Runtime recovery is pending");
-      const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
-      assert.ok(reopened);
-      act(() => { reopened!.click(); });
-      await tick();
-      assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "transient key is cleared before deferred Runtime recovery settles");
-      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
-      assert.ok(applyProvider);
-      act(() => { applyProvider!.click(); });
-      await tick();
-      rejectDeferredFailure?.(new Error(`synthetic ${failure} failure`));
-    }
-    for (let index = 0; index < 8; index += 1) await tick();
-    assert.equal(container.querySelector(".settings-view__error"), null, "durable save does not become a Settings error after recovery failure");
-    const recoveryMessage = container.querySelector(".settings-view__runtime-error")?.textContent
-      ?? container.querySelector("#runtime-panel [role=alert]")?.textContent
-      ?? "";
-    assert.match(recoveryMessage, /Settings were saved/u, "Runtime recovery failure is presented independently from the durable Settings result");
-    assert.ok(calls.some((call) => call.method === failure), `save recovery reaches ${failure}`);
-    assert.equal(saveRequests.length, 1);
-    if (replacement) {
-      assert.equal(saveRequests[0]?.providers?.provider?.api_key, "w04-replacement-only");
-      const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
-      assert.ok(reopened);
-      act(() => { reopened!.click(); });
-      await tick();
-      assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "a durable save does not repopulate the saved plaintext after recovery failure");
-      const applyProvider = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="provider"] footer button[title="Apply"]');
-      assert.ok(applyProvider);
-      act(() => { applyProvider!.click(); });
-      await tick();
-      const secondSave = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-      assert.ok(secondSave);
-      act(() => { secondSave!.click(); });
-      for (let index = 0; index < 8; index += 1) await tick();
-      assert.equal(saveRequests.length, 2);
-      assert.equal(saveRequests[1]?.providers?.provider?.api_key, undefined, "a later Save cannot resubmit the cleared plaintext");
-      assert.doesNotMatch(JSON.stringify(saveRequests[1]), /w04-replacement-only/u);
-    }
-  });
-  await runScenario("project.open", true, true);
-  await runScenario("session.resume");
-  await runScenario("status.get");
-  await runScenario("project.sessions");
-});
-
-test("T07 durable Settings Save locks the real Settings DOM and clears an A draft after success", async () => {
-  await withRendererDom(async (dom, container, root) => {
-    const config = {
-      default_model: "provider/model",
-      default_permission_mode: "default" as const,
-      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } },
-      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
-    };
-    const project: ProjectState = { path: "C:/settings-dom-success", projectKey: "C:/settings-dom-success", alias: "Settings DOM success", pinned: false, sessions: [], catalogFresh: true };
-    const preferences: DesktopPreferences = {
-      theme: "light", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
-      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: null,
-    };
-    const calls: Array<{ method: string; params: JsonObject }> = [];
-    const saveRequests: JsonObject[] = [];
-    let resolveSave: ((value: JsonObject) => void) | null = null;
-    let resolveShutdown: ((value: JsonObject) => void) | null = null;
-    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
-    const pendingShutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push({ method, params });
-        if (method === "settings.save") {
-          saveRequests.push(params.request as JsonObject);
-          return pendingSave;
-        }
-        if (method === "runtime.shutdown") return pendingShutdown;
-        if (method === "runtime.initialize") return { run: null };
-        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
-        if (method === "project.sessions") return { sessions: [] };
-        if (method === "status.get") return { active_turn: false };
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      // Keep preference bootstrap from opening a second lifecycle owner; this
-      // fixture supplies the selected Project as its authoritative state.
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
-      writePreference: async () => preferences,
-    };
-    const state = createInitialState({ language: "en", theme: "light", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    const setInput = (input: HTMLInputElement, value: string) => {
-      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
-      assert.ok(setter);
-      if (input.isConnected) input.focus();
-      setter!.call(input, value);
-      input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-      input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-      input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
-    };
-
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
-    assert.ok(providerRow);
-    act(() => { providerRow!.click(); });
-    await tick();
-    const baseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
-    const apiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
-    const modelEdit = container.querySelector<HTMLButtonElement>(".settings-model-row__actions button[title^=\"Edit model\"]");
-    assert.ok(baseUrl && apiKey && modelEdit);
-    act(() => {
-      setInput(baseUrl!, " https://gateway.example/v1 ");
-      setInput(apiKey!, "draft-a");
-    });
-    await tick();
-    // Switch the same modal root to the Model step so Save closes the active
-    // transaction and its input handlers are exercised after the lifecycle starts.
-    act(() => { modelEdit!.click(); });
-    await tick();
-    const modelRemote = container.querySelector<HTMLInputElement>('.settings-editor-modal[data-settings-editor-step="model"] input[id$="-remote"]');
-    const modelBack = container.querySelector<HTMLButtonElement>('.settings-editor-modal[data-settings-editor-step="model"] footer button[title="Back to chat"]');
-    assert.ok(modelRemote && modelBack);
-
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    const settings = container.querySelector<HTMLElement>(".settings-view");
-    assert.equal(settings?.getAttribute("aria-busy"), "true");
-    assert.equal(settings?.getAttribute("aria-describedby"), "settings-busy-status");
-    assert.match(container.querySelector<HTMLElement>(".settings-view__busy-status")?.textContent ?? "", /Saving settings…/u);
-    assert.equal(dom.window.document.activeElement, container.querySelector("#settings-busy-status"), "busy status receives focus while the modal is closed");
-    assert.equal(container.querySelector("[role=dialog]"), null, "Save closes the shared editor modal");
-    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
-    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 0, "Runtime recovery waits for durable Save");
-    assert.equal(saveRequests[0]?.providers?.provider?.api_key, "draft-a");
-
-    const addProvider = container.querySelector<HTMLButtonElement>(".row-add--inline");
-    const triggers = Array.from(container.querySelectorAll<HTMLButtonElement>(".settings-view .custom-select__trigger"));
-    const back = container.querySelector<HTMLButtonElement>(".settings-view__back");
-    const cancel = container.querySelector<HTMLButtonElement>('.settings-actions button[title="Cancel"]');
-    assert.ok(addProvider && back && cancel);
-    assert.equal(addProvider!.disabled, true);
-    assert.equal(providerRow!.disabled, true);
-    assert.equal(triggers.length, 4);
-    assert.ok(triggers.every((trigger) => trigger.disabled), "permission/default/theme/language controls are disabled");
-    assert.equal(back!.disabled, true);
-    assert.equal(cancel!.disabled, true);
-    assert.equal(save!.disabled, true);
-
-    // These are the real DOM entry points captured before Save. Native
-    // disabled controls and detached modal controls must not create a B draft
-    // or mutate A while the durable request is pending.
-    act(() => {
-      providerRow!.click();
-      addProvider!.click();
-      triggers.forEach((trigger) => trigger.click());
-      back!.click();
-      cancel!.click();
-      modelBack!.click();
-      setInput(baseUrl!, " B provider ");
-      setInput(apiKey!, "draft-b");
-      setInput(modelRemote!, "model-b");
-    });
-    await tick();
-    assert.equal(container.querySelector("[role=dialog]"), null);
-    assert.equal(container.querySelectorAll(".provider-row").length, 1, "Add Provider and Provider row remain inert");
-    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1, "blocked entries do not issue a second Save");
-
-    resolveSave?.({
-      configuration: {
-        ...config,
-        providers: { provider: { ...config.providers.provider } },
-        models: { "provider/model": { ...config.models["provider/model"] } },
-      },
-    });
-    for (let index = 0; index < 8; index += 1) await tick();
-    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "false");
-    assert.equal(container.querySelector(".settings-view__busy-status"), null);
-    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
-    assert.equal(dom.window.document.activeElement, container.querySelector(".settings-actions .save-button"), "Save regains focus at the durable boundary");
-    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
-
-    // settings_loaded resets the visible draft and clears the transient key;
-    // the still-pending Runtime recovery must not reintroduce it.
-    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
-    assert.ok(reopened);
-    act(() => { reopened!.click(); });
-    await tick();
-    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "", "durable success clears the A replacement");
-    assert.equal(container.querySelector<HTMLInputElement>("#modal-base-url")?.value, "https://gateway.example/v1");
-    assert.equal(container.querySelectorAll(".settings-model-row").length, 1, "no B model draft was created");
-    act(() => { container.querySelector<HTMLButtonElement>('.provider-modal > footer button[title="Cancel"]')?.click(); });
-    await tick();
-
-    resolveShutdown?.({});
-    for (let index = 0; index < 16; index += 1) await tick();
-    assert.equal(container.querySelector<HTMLElement>(".settings-view__runtime-status"), null);
-  });
-});
-
-test("T07 durable Settings Save failure keeps the A draft after the modal closes and re-enables editing", async () => {
-  await withRendererDom(async (dom, container, root) => {
-    const config = {
-      default_model: "provider/model",
-      default_permission_mode: "default" as const,
-      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } },
-      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
-    };
-    const calls: Array<{ method: string; params: JsonObject }> = [];
-    let rejectSave: ((reason?: unknown) => void) | null = null;
-    const pendingSave = new Promise<JsonObject>((_resolve, reject) => { rejectSave = reject; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push({ method, params });
-        if (method === "settings.save") return pendingSave;
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
-      writePreference: async () => undefined,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    const setInput = (input: HTMLInputElement, value: string) => {
-      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
-      assert.ok(setter);
-      if (input.isConnected) input.focus();
-      setter!.call(input, value);
-      input.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-      input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-      input.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
-    };
-
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    const providerRow = container.querySelector<HTMLButtonElement>(".provider-row");
-    assert.ok(providerRow);
-    act(() => { providerRow!.click(); });
-    await tick();
-    const baseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
-    const apiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
-    assert.ok(baseUrl && apiKey);
-    act(() => {
-      setInput(baseUrl!, " A draft ");
-      setInput(apiKey!, "draft-a");
-    });
-    await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "true");
-    assert.equal(container.querySelector("[role=dialog]"), null);
-    rejectSave?.(new Error("synthetic durable failure"));
-    for (let index = 0; index < 10; index += 1) await tick();
-    assert.equal(calls.filter((call) => call.method === "settings.save").length, 1);
-    assert.equal(container.querySelector<HTMLElement>(".settings-view")?.getAttribute("aria-busy"), "false");
-    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /Configuration could not be saved/u);
-    assert.doesNotMatch(container.textContent ?? "", /synthetic durable failure/u);
-    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
-
-    const reopened = container.querySelector<HTMLButtonElement>(".provider-row");
-    assert.ok(reopened);
-    act(() => { reopened!.click(); });
-    await tick();
-    assert.equal(container.querySelector<HTMLInputElement>("#modal-base-url")?.value, " A draft ", "durable failure retains A's edit-time spaces");
-    assert.equal(container.querySelector<HTMLInputElement>("#modal-api-key")?.value, "draft-a", "durable failure retains A's replacement");
-    assert.equal(container.querySelectorAll(".provider-row").length, 1);
-    assert.equal(container.querySelectorAll(".settings-model-row").length, 1);
-    const editedBaseUrl = container.querySelector<HTMLInputElement>("#modal-base-url");
-    const editedApiKey = container.querySelector<HTMLInputElement>("#modal-api-key");
-    assert.ok(editedBaseUrl && editedApiKey);
-    act(() => {
-      setInput(editedBaseUrl!, " A draft edited ");
-      setInput(editedApiKey!, "draft-a-edited");
-    });
-    await tick();
-    assert.equal(editedBaseUrl!.value, " A draft edited ", "the retained A draft remains editable");
-    assert.equal(editedApiKey!.value, "draft-a-edited", "the retained replacement remains editable");
-  });
-});
-
-test("T07 durable Save owns the lifecycle before its RPC, gates Back, and lets newer navigation supersede stale recovery", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = {
-      default_model: "provider/model",
-      default_permission_mode: "default" as const,
-      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
-      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
-    };
-    const first: ProjectState = { path: "C:/pending-save-a", projectKey: "C:/pending-save-a", alias: "Pending A", pinned: false, sessions: [{ session_id: "session-a" }], catalogFresh: true };
-    const second: ProjectState = { path: "C:/pending-save-b", projectKey: "C:/pending-save-b", alias: "Pending B", pinned: false, sessions: [{ session_id: "session-b", title: "Pending B session" }], catalogFresh: true };
-    const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
-      recentProjects: [{ path: first.path, alias: first.alias }, { path: second.path, alias: second.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: first.projectKey, selectedSessionId: "session-a",
-    };
-    const calls: Array<{ method: string; params: JsonObject }> = [];
-    let resolveSave: ((value: JsonObject) => void) | null = null;
-    let resolveShutdown: ((value: JsonObject) => void) | null = null;
-    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
-    const pendingShutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push({ method, params });
-        if (method === "settings.save") return pendingSave;
-        if (method === "runtime.shutdown") return pendingShutdown;
-        if (method === "runtime.initialize") return { run: null };
-        if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
-        if (method === "session.resume") return { session_id: String(params.session_id), replay: [], run: null };
-        if (method === "project.sessions") return { sessions: [] };
-        if (method === "status.get") return { active_turn: false };
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      // Prevent preference bootstrap from creating an unrelated lifecycle
-      // owner; this test controls the selected Project explicitly.
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
-      writePreference: async () => preferences,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [first, second], selectedProjectKey: first.projectKey, selectedSessionId: "session-a" });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 4; index += 1) await tick();
-
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    const back = container.querySelector<HTMLButtonElement>(".settings-view__back");
-    const cancel = container.querySelector<HTMLButtonElement>('.settings-actions button[title="Cancel"]');
-    assert.ok(save && back && cancel);
-    act(() => { save!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.deepEqual(calls.map((call) => call.method), ["settings.save"], "the durable RPC is issued only after the new lifecycle owner is installed");
-    assert.equal(save!.disabled, true);
-    assert.equal(back!.disabled, true, "Back is gated while the durable request is pending");
-    assert.equal(cancel!.disabled, true, "Cancel is gated while the durable request is pending");
-    act(() => { back!.click(); cancel!.click(); });
-    await tick();
-    assert.ok(container.querySelector(".settings-view"), "a pending Save cannot leave Settings through Back or Cancel");
-
-    // Durable success releases transient Settings saving immediately, but the
-    // same owner remains in Runtime shutdown until its projection recovery is
-    // either completed or superseded.
-    resolveSave?.({ configuration: config });
-    for (let index = 0; index < 6; index += 1) await tick();
-    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false);
-    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
-
-    // Back is now allowed at the durable boundary. Selecting Project B takes
-    // the next generation, so A's late shutdown completion cannot continue to
-    // initialize/open/resume A or overwrite B's owner state.
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-view__back")?.click(); });
-    await tick();
-    const targetSession = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line")).find((button) => button.textContent?.includes("Pending B session"));
-    assert.ok(targetSession);
-    act(() => { targetSession!.click(); });
-    for (let index = 0; index < 5; index += 1) await tick();
-    assert.equal(calls.filter((call) => call.method === "project.open").length, 0, "Project B waits for A's already-issued shutdown rather than racing it");
-    resolveShutdown?.({});
-    for (let index = 0; index < 16; index += 1) await tick();
-    assert.deepEqual(calls.filter((call) => ["runtime.initialize", "project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? call.params.session_id ?? null]), [["project.open", second.path], ["session.resume", "session-b"]], "stale A recovery cannot publish or continue after B takes ownership");
-    assert.equal(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent?.includes("Ready"), true);
   });
 });
 
@@ -4446,387 +4256,6 @@ test("ordinary Session navigation keeps lifecycle ownership without presenting a
   });
 });
 
-test("T07 durable Save failure releases its lifecycle owner without starting Runtime recovery", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
-    const calls: string[] = [];
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method) => {
-        calls.push(method);
-        if (method === "settings.save") throw new Error("synthetic durable failure");
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
-      writePreference: async () => undefined,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 3; index += 1) await tick();
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
-    for (let index = 0; index < 8; index += 1) await tick();
-    assert.deepEqual(calls, ["settings.save"], "a failed durable Save never starts project recovery");
-    assert.match(container.querySelector<HTMLElement>(".settings-view__error")?.textContent ?? "", /Configuration could not be saved/u);
-    assert.doesNotMatch(container.textContent ?? "", /synthetic durable failure/u);
-    assert.equal(container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.disabled, false, "failure returns Save to an actionable state");
-    assert.equal(container.querySelector<HTMLElement>(".settings-view__runtime-status"), null, "failed Save leaves no stuck restarting state");
-  });
-});
-
-test("T07 unmount invalidates a pending durable Save without continuing its old recovery", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
-    const calls: string[] = [];
-    let resolveSave: ((value: JsonObject) => void) | null = null;
-    const pendingSave = new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method) => {
-        calls.push(method);
-        if (method === "settings.save") return pendingSave;
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
-      writePreference: async () => undefined,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, selectedProjectKey: "C:/detached-save", selectedSessionId: "session-1" });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 3; index += 1) await tick();
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
-    await tick();
-    assert.deepEqual(calls, ["settings.save"]);
-    act(() => { root.unmount(); });
-    resolveSave?.({ configuration: config });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.deepEqual(calls, ["settings.save"], "unmount prevents a late durable response from starting project recovery");
-  });
-});
-
-test("T07 newer durable Save supersedes a blocked recovery without concurrent Runtime ownership", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = {
-      default_model: "provider/model",
-      default_permission_mode: "default" as const,
-      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
-      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
-    };
-    const project: ProjectState = { path: "C:/save-ownership", projectKey: "C:/save-ownership", alias: "Save ownership", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
-    const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
-      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
-    };
-    const calls: string[] = [];
-    let saveCalls = 0;
-    let shutdownCalls = 0;
-    let resolveFirstShutdown: ((value: JsonObject) => void) | null = null;
-    const firstShutdown = new Promise<JsonObject>((resolve) => { resolveFirstShutdown = resolve; });
-    let eventListener: ((event: AgentEvent) => void) | null = null;
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method) => {
-        calls.push(method);
-        if (method === "settings.save") {
-          saveCalls += 1;
-          return { configuration: config };
-        }
-        if (method === "runtime.shutdown") {
-          shutdownCalls += 1;
-          if (shutdownCalls === 1) eventListener?.({ type: "runtime_state", state: "ready" });
-          return shutdownCalls === 1 ? firstShutdown : {};
-        }
-        if (method === "runtime.initialize") return { run: null };
-        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
-        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
-        if (method === "project.sessions") return { sessions: [] };
-        if (method === "status.get") return { active_turn: false };
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
-      readPreference: async (key) => preferences[key],
-      writePreference: async () => preferences,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: "session-1" });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 6; index += 1) await tick();
-    const save = () => {
-      const button = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-      assert.ok(button);
-      act(() => { button!.click(); });
-    };
-    save();
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(saveCalls, 1);
-    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
-    save();
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(saveCalls, 1, "the next durable Save waits behind the first owner instead of racing its in-flight Runtime RPC");
-    assert.equal(shutdownCalls, 1, "the second recovery waits for the first in-flight lifecycle RPC");
-    resolveFirstShutdown?.({});
-    for (let index = 0; index < 14; index += 1) await tick();
-    assert.equal(saveCalls, 2, "the next durable Save is issued only after the stale owner settles");
-    assert.equal(shutdownCalls, 2);
-    const lifecycle = calls.slice(calls.indexOf("settings.save")).filter((method) => ["runtime.shutdown", "runtime.initialize", "project.open", "session.resume"].includes(method));
-    assert.deepEqual(lifecycle, ["runtime.shutdown", "runtime.shutdown", "runtime.initialize", "project.open", "session.resume"], "the stale Save cannot publish or continue its old lifecycle");
-    assert.equal(container.querySelector(".settings-view__runtime-status"), null, "the terminal recovery state leaves restarting");
-    assert.equal(container.querySelector(".settings-view__runtime-error"), null, "a stale recovery does not surface a late error");
-    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u, "the newest Runtime owner reaches ready");
-  });
-});
-
-test("T07 completed lifecycle owner releases ordinary refreshes and runtime events", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = {
-      default_model: "provider/model",
-      default_permission_mode: "default" as const,
-      providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: false } },
-      models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } },
-    };
-    const project: ProjectState = { path: "C:/lifecycle-terminal", projectKey: "C:/lifecycle-terminal", alias: "Lifecycle terminal", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
-    const preferences: DesktopPreferences = {
-      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
-      recentProjects: [{ path: project.path, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
-    };
-    const calls: Array<{ method: string; params: JsonObject }> = [];
-    let resolveShutdown: ((value: JsonObject) => void) | null = null;
-    let eventListener: ((event: AgentEvent) => void) | null = null;
-    const shutdown = new Promise<JsonObject>((resolve) => { resolveShutdown = resolve; });
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push({ method, params });
-        if (method === "settings.save") return { configuration: config };
-        if (method === "runtime.shutdown") return await shutdown;
-        if (method === "runtime.initialize") return { run: null };
-        if (method === "project.open") return { project: { path: project.path }, sessions: [], run: null };
-        if (method === "session.resume") return { session_id: "session-1", replay: [], run: null };
-        if (method === "project.sessions") return { sessions: [{ session_id: "session-1", preview: "refreshed" }] };
-        if (method === "status.get") return { active_turn: false };
-        if (method === "settings.get") return { configuration: config };
-        if (method === "command.complete") return { candidates: [{ value: "/model", display: "/model" }], argument_candidates: [] };
-        if (method === "command.execute") return { command: "new", status: "success", code: "session_created", params: {}, ui_action: { type: "session_changed", session_id: "session-1", restored: false } };
-        return {};
-      },
-      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
-      // Keep preference bootstrap from starting a second lifecycle owner; the
-      // test supplies the selected project as its authoritative initial state.
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return preferences[key]; },
-      writePreference: async () => preferences,
-    };
-    const state = createInitialState({
-      language: "en", view: "settings", runtimeState: "ready", configuration: config, settingsLoaded: true,
-      composerText: "/", commandCandidates: [{ value: "/model", display: "/model" }], projects: [project], selectedProjectKey: project.projectKey, selectedSessionId: "session-1",
-      run: { run_id: "run-recovery", turn_id: "turn-recovery", status: "idle" },
-    });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(calls.filter((call) => call.method === "runtime.shutdown").length, 1);
-    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
-
-    // Transport lifecycle envelopes cannot replace the explicit restarting
-    // state while the recovery owner is still pending.
-    act(() => { eventListener?.({ type: "runtime_state", state: "ready" }); });
-    await tick();
-    assert.match(container.querySelector<HTMLElement>(".settings-view__runtime-status")?.textContent ?? "", /Runtime is restarting/u);
-    const beforeStaleTerminal = calls.length;
-    act(() => { eventListener?.({ type: "turn_completed", run_id: "run-recovery", turn_id: "turn-recovery" }); });
-    await tick();
-    assert.equal(calls.slice(beforeStaleTerminal).filter((call) => call.method === "status.get").length, 0, "a terminal event cannot start a status RPC during lifecycle recovery");
-
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-view__back")?.click(); });
-    await tick();
-    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
-    const send = container.querySelector<HTMLButtonElement>(".composer-actions button:last-child");
-    const modelTrigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
-    assert.ok(textarea && send && modelTrigger);
-    assert.equal(textarea!.disabled, true, "returning to chat keeps Composer locked during recovery");
-    assert.equal(container.querySelector<HTMLElement>(".composer")?.getAttribute("aria-disabled"), "true");
-    assert.equal(container.querySelector(".command-menu"), null, "slash completion is hidden during recovery");
-    const beforeBlockedChat = calls.length;
-    act(() => { send!.click(); modelTrigger!.click(); });
-    await tick();
-    assert.equal(calls.length, beforeBlockedChat, "chat buttons cannot issue Runtime RPC while recovery is pending");
-
-    resolveShutdown?.({});
-    for (let index = 0; index < 18; index += 1) await tick();
-    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u, "terminal lifecycle completion leaves Runtime ready");
-    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.disabled, false, "terminal lifecycle completion releases Composer");
-    const completion = container.querySelector<HTMLButtonElement>(".command-menu button");
-    assert.ok(completion, "completion controls return after recovery terminal");
-    const beforeCompletion = calls.length;
-    act(() => { completion!.click(); });
-    await tick();
-    assert.ok(calls.slice(beforeCompletion).some((call) => call.method === "command.complete"), "completion resumes after recovery terminal");
-
-    const setter = Object.getOwnPropertyDescriptor((_dom.window.HTMLTextAreaElement as typeof HTMLTextAreaElement).prototype, "value")?.set;
-    assert.ok(setter);
-    const beforeCommand = calls.length;
-    act(() => {
-      setter!.call(textarea, "/switch");
-      textarea!.dispatchEvent(new _dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "/switch" }));
-      textarea!.dispatchEvent(new _dom.window.Event("input", { bubbles: true }));
-    });
-    await tick();
-    act(() => { send!.click(); });
-    for (let index = 0; index < 6; index += 1) await tick();
-    const afterCommand = calls.slice(beforeCommand).map((call) => call.method);
-    assert.ok(afterCommand.includes("command.execute"), "command entry resumes after recovery terminal");
-    assert.ok(afterCommand.includes("status.get"), "ordinary status refresh resumes after owner cleanup");
-    assert.ok(afterCommand.includes("project.sessions"), "ordinary catalog refresh resumes after owner cleanup");
-
-    act(() => { eventListener?.({ type: "runtime_state", state: "stopped" }); });
-    await tick();
-    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Stopped/u, "runtime_state events are accepted after owner cleanup");
-    act(() => { eventListener?.({ type: "runtime_state", state: "ready" }); });
-    await tick();
-    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
-
-    const settings = container.querySelector<HTMLButtonElement>('button[title="Open Settings"]');
-    assert.ok(settings);
-    const beforeSettings = calls.length;
-    act(() => { settings!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.ok(calls.slice(beforeSettings).some((call) => call.method === "settings.get"), "settings refresh resumes after owner cleanup");
-  });
-});
-
-test("T07 navigation supersedes blocked recovery and unmount suppresses late lifecycle writes", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model", display_name: "Model" } } };
-    const first: ProjectState = { path: "C:/recovery-project", projectKey: "C:/recovery-project", alias: "Recovery", pinned: false, sessions: [{ session_id: "session-1" }], catalogFresh: true };
-    const second: ProjectState = { path: "C:/navigation-project", projectKey: "C:/navigation-project", alias: "Navigation", pinned: false, sessions: [{ session_id: "session-2", title: "Navigation session" }], catalogFresh: true };
-    const calls: string[] = [];
-    const resumedSessions: string[] = [];
-    let shutdownCalls = 0;
-    let resolveFirstShutdown: ((value: JsonObject) => void) | null = null;
-    let resolveSecondShutdown: ((value: JsonObject) => void) | null = null;
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method, params) => {
-        calls.push(method);
-        if (method === "settings.save") return { configuration: config };
-        if (method === "runtime.shutdown") {
-          shutdownCalls += 1;
-          if (shutdownCalls === 1) return new Promise<JsonObject>((resolve) => { resolveFirstShutdown = resolve; });
-          if (shutdownCalls === 2) return new Promise<JsonObject>((resolve) => { resolveSecondShutdown = resolve; });
-          return {};
-        }
-        if (method === "project.open") return { project: { path: params.path }, sessions: [], run: null };
-        if (method === "runtime.initialize") return { run: null };
-        if (method === "session.resume") {
-          resumedSessions.push(String(params.session_id));
-          return { session_id: String(params.session_id), replay: [], run: null };
-        }
-        if (method === "project.sessions") return { sessions: [] };
-        if (method === "status.get") return { active_turn: false };
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      // Reject preference bootstrap so the initial selected Project remains the
-      // supplied test state; this test is about the lifecycle queue itself.
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
-      writePreference: async () => undefined,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true, projects: [first, second], selectedProjectKey: first.projectKey, selectedSessionId: "session-1" });
-    const tick = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions .save-button")?.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(shutdownCalls, 1);
-    act(() => { container.querySelector<HTMLButtonElement>(".settings-actions button[title=\"Cancel\"]")?.click(); });
-    await tick();
-    const targetSession = Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line")).find((button) => button.textContent?.includes("Navigation session"));
-    assert.ok(targetSession);
-    act(() => { targetSession!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(shutdownCalls, 1, "navigation waits for the blocked recovery RPC instead of racing it");
-    resolveFirstShutdown?.({});
-    for (let index = 0; index < 14; index += 1) await tick();
-    assert.equal(calls.filter((method) => method === "project.open").length, 1);
-    assert.deepEqual(resumedSessions, ["session-2"], "only the new navigation may resume; stale recovery cannot resume the old session");
-    assert.match(container.querySelector<HTMLElement>("#runtime-panel h2")?.textContent ?? "", /Ready/u);
-
-    // A second blocked recovery is invalidated by unmount. Its in-flight
-    // shutdown may settle, but no late project/session lifecycle call follows.
-    act(() => { container.querySelector<HTMLButtonElement>("button[title=\"Open Settings\"]")?.click(); });
-    await tick();
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); });
-    for (let index = 0; index < 4; index += 1) await tick();
-    assert.equal(shutdownCalls, 2);
-    act(() => { root.unmount(); });
-    resolveSecondShutdown?.({});
-    for (let index = 0; index < 6; index += 1) await tick();
-    assert.equal(calls.filter((method) => method === "project.open").length, 1, "unmount invalidates the detached recovery before project.open");
-    assert.deepEqual(resumedSessions, ["session-2"], "unmount prevents any late Session resume");
-  });
-});
-
-test("T07 duplicate Save clicks issue one durable request", async () => {
-  await withRendererDom(async (_dom, container, root) => {
-    const config = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", api_key_configured: false } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "remote-model" } } };
-    let resolveSave: ((value: JsonObject) => void) | null = null;
-    let saveCalls = 0;
-    const api: DesktopApi = {
-      openProject: async () => null,
-      openProjectInExplorer: async () => undefined,
-      copyText: async () => undefined,
-      closeShell: async () => undefined,
-      requestRuntime: async (method) => {
-        if (method === "settings.save") {
-          saveCalls += 1;
-          return new Promise<JsonObject>((resolve) => { resolveSave = resolve; });
-        }
-        if (method === "settings.get") return { configuration: config };
-        return {};
-      },
-      subscribeAgentEvents: () => () => undefined,
-      readPreference: async (key) => { if (key === "theme") throw new Error("synthetic preferences unavailable"); return undefined; },
-      writePreference: async () => undefined,
-    };
-    const state = createInitialState({ language: "en", view: "settings", configuration: config, settingsLoaded: true });
-    act(() => { root.render(<App initialState={state} api={api} />); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    const save = container.querySelector<HTMLButtonElement>(".settings-actions .save-button");
-    assert.ok(save);
-    act(() => { save!.click(); save!.click(); });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    assert.equal(saveCalls, 1);
-    resolveSave?.({ configuration: config });
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-  });
-});
-
 test("Prompt 2 provider editor groups and preserves every existing model field", () => {
   assert.equal(modelFieldId("dialog", "a/b", "remote"), "dialog-0061-002f-0062-remote");
   assert.equal(modelFieldId("dialog", "a/b", "remote"), modelFieldId("dialog", "a/b", "remote"));
@@ -4836,12 +4265,12 @@ test("Prompt 2 provider editor groups and preserves every existing model field",
   assert.notEqual(modelFieldId("dialog", "one/model", "remote"), modelFieldId("dialog", "two/model", "remote"));
   assert.deepEqual(reasoningEffortOptions, ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"]);
   assert.equal(reasoningEffortOptions.includes("invalid" as never), false);
-  const draft = { providers: { provider: { kind: "openai_compat" } }, models: { primary: { provider_profile_id: "provider", remote_id: "one", display_name: "One", context_window: 128000, max_output_tokens: 8192, reasoning_effort: "high" }, secondary: { provider_profile_id: "provider", remote_id: "two", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null }, other: { provider_profile_id: "other", remote_id: "three" } } };
+  const draft = { providers: { provider: { kind: "openai_compat" } }, models: { primary: { provider_profile_id: "provider", remote_id: "one", display_name: "One", context_window: 128000, max_output_tokens: 8192, reasoning_effort: "high", supports_images: null }, secondary: { provider_profile_id: "provider", remote_id: "two", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null, supports_images: null }, other: { provider_profile_id: "other", remote_id: "three" } } };
   assert.deepEqual(providerModels(draft, "provider"), [["primary", draft.models.primary], ["secondary", draft.models.secondary]]);
-  const request = settingsSaveRequest(draft, {}, {});
+  const request = providerGroupSaveRequest(draft, draft, "provider");
   assert.deepEqual(request.models?.primary, draft.models.primary);
   assert.deepEqual(request.models?.secondary, draft.models.secondary);
-  const staleRequest = settingsSaveRequest({ ...draft, providers: { provider: { kind: "openai_compat", api_key: "stale-revealed-value" } } }, {}, {});
+  const staleRequest = providerGroupSaveRequest(draft, { ...draft, providers: { provider: { kind: "openai_compat", api_key: "stale-revealed-value" } } }, "provider");
   assert.equal(staleRequest.providers?.provider?.api_key, undefined);
 });
 
@@ -4849,37 +4278,28 @@ test("T07 missing optional model fields stay null instead of becoming invalid em
   const state = createInitialState({ configuration: { default_model: "provider/model", default_permission_mode: "default", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1", api_key_configured: true } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model" } } }, settingsLoaded: true });
   const markup = renderToStaticMarkup(<SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} />);
   assert.match(markup, />served-model</u);
-  const request = settingsSaveRequest({ default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1" } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } } }, {}, {});
-  assert.deepEqual(request.models?.["provider/model"], { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null });
+  const draft = { default_model: "provider/model", providers: { provider: { kind: "openai_compat", base_url: "https://gateway.example/v1" } }, models: { "provider/model": { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null } } };
+  const request = providerGroupSaveRequest(draft, draft, "provider");
+  assert.deepEqual(request.models?.["provider/model"], { provider_profile_id: "provider", remote_id: "served-model", display_name: null, context_window: null, max_output_tokens: null, reasoning_effort: null, supports_images: undefined });
   assert.doesNotMatch(JSON.stringify(request), /"display_name":""/u);
 });
 
-test("T07 configuration request keeps API key transient and maps current schema fields", () => {
-  const request = configurationRequest({
+test("T07 source projection strips credentials and Provider group writes require an explicit replacement", () => {
+  const projected = sourceConfig({
     default_model: "fake/model",
     default_permission_mode: "default",
-    providers: { fake: { kind: "fake", base_url: null, api_key: "sk-transient" } },
+    providers: { fake: { kind: "fake", base_url: null, api_key: "provider-secret", api_key_configured: true } },
     models: { "fake/model": { provider_profile_id: "fake", remote_id: "model", display_name: "Model", context_window: 1000, max_output_tokens: 500, reasoning_effort: "none" } },
+    search: { enabled: true, provider: "tavily", api_key_configured: true, api_key: "search-secret" },
   });
-  assert.equal(request.default_model, "fake/model");
-  assert.equal((request.providers as Record<string, Record<string, unknown>>).fake.api_key, "sk-transient");
-  assert.equal(JSON.stringify(request).includes("sk-transient"), true);
-
-  const untouchedSearch = settingsSaveRequest(
-    { search: { enabled: true, provider: "tavily", api_key_configured: true, api_key: "stale-search-secret" } },
-    {},
-    {},
-  );
-  assert.equal(Object.hasOwn(untouchedSearch.search ?? {}, "api_key"), false);
-  assert.equal(Object.hasOwn(untouchedSearch.search ?? {}, "api_key_configured"), false);
-  const clearedSearch = settingsSaveRequest(
-    { search: { enabled: true, provider: "tavily", api_key_configured: true } },
-    {},
-    {},
-    "",
-    true,
-  );
-  assert.equal(clearedSearch.search?.api_key, "");
+  assert.equal(Object.hasOwn(projected.providers?.fake ?? {}, "api_key"), false);
+  assert.equal(Object.hasOwn(projected.providers?.fake ?? {}, "api_key_configured"), true);
+  assert.equal(Object.hasOwn(projected.search ?? {}, "api_key"), false);
+  assert.doesNotMatch(JSON.stringify(projected), /provider-secret|search-secret/u);
+  const withoutReplacement = providerGroupSaveRequest(projected, projected, "fake");
+  assert.equal(Object.hasOwn(withoutReplacement.providers?.fake ?? {}, "api_key"), false);
+  const withReplacement = providerGroupSaveRequest(projected, projected, "fake", "replacement-secret", true);
+  assert.equal(withReplacement.providers?.fake?.api_key, "replacement-secret");
 });
 
 test("T07 theme classes expose system, dark, and light without changing content authority", () => {
@@ -4900,9 +4320,7 @@ test("main workspace visual contract keeps 16px SVGs and readable theme tokens",
   assert.match(css, /--accent-user:\s*#4a50b8;[^\n]*--accent-action:\s*#5158c9;[^\n]*--on-accent:\s*#fff/s);
   assert.match(css, /@media \(prefers-color-scheme: light\)[\s\S]*\.theme-system[\s\S]*--text:\s*#202027/s);
   assert.match(css, /\.theme-light\s*\{[^}]*--bg:\s*#f5f5f7;[^}]*--accent:\s*#565fd7/s);
-  assert.match(css, /\.settings-view__busy-status::before\s*\{[^}]*content:\s*"";[^}]*animation:\s*settings-save-spin/s);
-  assert.match(css, /\.settings-view\[aria-busy="true"\][^}]*opacity:\s*1[^}]*background:\s*var\(--raised\)/s);
-  assert.match(css, /@keyframes\s+settings-save-spin\s*\{[^}]*transform:\s*rotate\(360deg\)/s);
+  assert.match(css, /\.settings-autosave-status\s*\{[^}]*min-height:\s*36px;[^}]*justify-content:\s*space-between/s);
   assert.ok(contrastRatio("#aaaab4", "#2b2b2f") >= 4.5, "dark busy disabled text remains readable on raised controls");
   assert.ok(contrastRatio("#5f606b", "#e3e3e9") >= 4.5, "light busy disabled text remains readable on raised controls");
   for (const background of ["#1d1d1f", "#18181a", "#242427", "#2b2b2f"]) assert.ok(contrastRatio("#9696a1", background) >= 4.5);
@@ -4994,7 +4412,7 @@ test("T07 Settings exposes editable schema IDs and model context/token limits", 
   assert.equal(parseOptionalPositiveInteger("128000"), 128000);
   assert.equal(parseOptionalPositiveInteger(""), null);
   const identityDraft = { providers: { fake: { kind: "fake" } }, models: { "fake/model": { provider_profile_id: "fake" } } };
-  const identityRequest = configurationRequest(identityDraft);
+  const identityRequest = providerGroupSaveRequest(identityDraft, identityDraft, "fake");
   assert.deepEqual(Object.keys(identityRequest.providers ?? {}), ["fake"], "provider identity stays as the configuration key");
   assert.equal(identityRequest.models?.["fake/model"]?.provider_profile_id, "fake");
   assert.doesNotMatch(markup, /model_ref|modelReference|Profile ID|配置 ID/u);

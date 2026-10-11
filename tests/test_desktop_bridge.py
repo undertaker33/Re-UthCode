@@ -3489,7 +3489,7 @@ def test_command_result_projects_application_business_error_code() -> None:
 
 
 @pytest.mark.asyncio
-async def test_settings_save_search_round_trips_safe_view_and_blocks_active_turn(
+async def test_settings_save_search_is_durable_and_pending_during_active_turn(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -3545,15 +3545,18 @@ remote_id = "local"
     assert active.ok is True
     assert "desktop-search-secret" not in json.dumps(active.to_dict(), ensure_ascii=False)
     bridge._active_handle = object()
-    blocked = await bridge.handle_request(
+    pending = await bridge.handle_request(
         RequestEnvelope(
-            "settings-search-blocked",
+            "settings-search-pending",
             "settings.save",
             {"search": {"enabled": False}},
         )
     )
-    assert blocked.ok is False
-    assert blocked.error is not None and blocked.error.kind == "turn_active"
+    assert pending.ok is True and pending.result is not None
+    assert pending.result["durable"] == "saved"
+    assert pending.result["applications"] == {"applied": 0, "pending": 1, "failed": 0}
+    assert pending.result["configuration"]["search"]["enabled"] is False
+    assert 'enabled = false' in user.read_text(encoding="utf-8")
     bridge._active_handle = None
     await bridge.shutdown()
 
@@ -3696,6 +3699,7 @@ attachment_bytes = 4096
     after = saved.result["configuration"]
     assert isinstance(after, dict)
     assert after["configured"]["tool_limits"] == {
+        "timeout_seconds": 30.0,
         "output_bytes": 8192,
         "attachment_bytes": 16384,
     }
