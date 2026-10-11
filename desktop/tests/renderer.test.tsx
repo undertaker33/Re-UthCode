@@ -14,6 +14,7 @@ import {
   reduceRendererState,
   type ProjectState,
   type SessionSummary,
+  type TimelineEntry,
   type RendererState,
 } from "../src/renderer/state";
 import { applyProjectOpened, applySessionMutation, sessionRuntimeKey } from "../src/renderer/state-session";
@@ -912,6 +913,470 @@ test("production Sidebar keeps selected rows visible, restores expansion, and ex
   });
 });
 
+test("T07 Sidebar keeps Coding and General Recent lists separate and can restore a cross-mode General hit", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const coding: ProjectState = {
+      path: "C:/coding-sidebar",
+      projectKey: "C:/coding-sidebar",
+      alias: "Coding workspace",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [
+        { session_id: "coding-live", title: "Coding live" },
+        { session_id: "coding-archived", title: "Coding archived", archived: true },
+      ],
+    };
+    const general: ProjectState = {
+      path: "uthcode:general",
+      projectKey: "uthcode:general",
+      alias: "General",
+      pinned: false,
+      catalogFresh: true,
+      sessions: [{ session_id: "general-live", title: "General live" }],
+    };
+    const restored: string[] = [];
+    const noop = () => undefined;
+    act(() => { root.render(<LanguageProvider value="en"><Sidebar
+      mode="general"
+      projects={[coding, general]}
+      selectedProjectKey={general.projectKey}
+      selectedSessionId="general-live"
+      activeTurn={false}
+      expandedProjects={{}}
+      onProjectExpandedChange={noop}
+      onNewSession={noop}
+      onOpenProject={noop}
+      onResumeSession={noop}
+      onAliasChange={noop}
+      onTogglePin={noop}
+      onOpenExplorer={noop}
+      onRemoveProject={noop}
+      onToggleSessionPin={noop}
+      onRenameSession={noop}
+      onMoveSession={noop}
+      onCopySessionId={noop}
+      onOpenSettings={noop}
+      searchResults={[{ session_id: "archived-general", project_key: "uthcode:general", title: "Old General", snippet: "stored result", archived: true, last_used_at: null }]}
+      onRestoreSearchHit={(hit) => restored.push(`${hit.project_key}:${hit.session_id}`)}
+    /></LanguageProvider>); });
+    assert.deepEqual(Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"), (button) => button.textContent?.trim()), ["General live"], "General navigation does not show Coding Sessions");
+    assert.equal(container.textContent?.includes("Coding live"), false);
+    const searchButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Search Sessions"));
+    assert.ok(searchButton);
+    act(() => { searchButton!.click(); });
+    const restore = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-search li > button")).find((button) => button.textContent?.includes("Restore and open"));
+    assert.ok(restore);
+    assert.equal(restore?.disabled, false, "a fixed General owner can be restored even when the result came from Coding search");
+    act(() => { restore!.click(); });
+    assert.deepEqual(restored, ["uthcode:general:archived-general"]);
+  });
+});
+
+test("T07 App switches fixed General owner, buffers early search results, and drops stale operation events", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const codingPath = "C:/mode-coding";
+    const codingSession = { session_id: "coding-current", project_key: codingPath, title: "Coding current" };
+    const generalSession = { session_id: "general-current", project_key: "uthcode:general", title: "General current" };
+    const coding: ProjectState = { path: codingPath, projectKey: codingPath, alias: "Coding", pinned: false, sessions: [codingSession], catalogFresh: true };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    const cancelledSearches: string[] = [];
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let searchRequestCount = 0;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "general.open") return { mode: "general", project_key: "uthcode:general", sessions: [generalSession], run: null };
+        if (method === "project.open") return { project: { path: codingPath }, sessions: [codingSession], run: null };
+        if (method === "session.resume") return { session_id: params.session_id, replay: [], active_turn: false, run: { run_id: `run-${params.session_id}`, status: "idle" }, session_state: { status: "idle" } };
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "project.sessions") return { sessions: params.project_key === "uthcode:general" ? [generalSession] : [codingSession] };
+        if (method === "status.get") return { active_turn: false, run: null, runtime: { state: "ready" } };
+        if (method === "settings.get") return { configuration: {} };
+        if (method === "session.search") {
+          searchRequestCount += 1;
+          if (searchRequestCount === 1) {
+            eventListener?.({
+              type: "session_search_result",
+              operation_id: "search-first",
+              owner_key: "uthcode:general",
+              state: "completed",
+              hits: [{ session_id: "general-first-hit", project_key: "uthcode:general", title: "First General result", snippet: "first snippet", archived: false, last_used_at: null }],
+              unavailable_count: 0,
+              has_more: false,
+            });
+            return { operation_id: "search-first", owner_key: "uthcode:general", state: "searching" };
+          }
+          return { operation_id: `search-${["first", "second", "third", "fourth"][searchRequestCount - 1]}`, owner_key: "uthcode:general", state: "searching" };
+        }
+        if (method === "session.search.cancel") { cancelledSearches.push(String(params.operation_id)); return { operation_id: params.operation_id, state: "cancelling" }; }
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => await new Promise<never>(() => undefined) as never,
+      writePreference: async () => undefined,
+    };
+    const initialState = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [coding],
+      selectedProjectKey: codingPath,
+      selectedSessionId: "coding-current",
+      expandedProjects: { [codingPath]: true },
+      modeSelections: {
+        coding: { projectKey: codingPath, sessionId: "coding-current" },
+        general: { projectKey: "uthcode:general", sessionId: "general-current" },
+      },
+    });
+    const flush = async (rounds = 8) => act(async () => {
+      for (let index = 0; index < rounds; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    act(() => { root.render(<App initialState={initialState} api={api} />); });
+    await flush();
+    const modeButton = (label: string) => Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-modes button")).find((button) => button.textContent?.trim() === label);
+    const generalButton = modeButton("General");
+    assert.ok(generalButton);
+    act(() => { generalButton!.click(); });
+    await flush(12);
+    assert.equal(calls.some((call) => call.method === "general.open"), true);
+    assert.deepEqual(calls.filter((call) => call.method === "session.resume").map((call) => [call.params.session_id, call.params.project_key]), [["general-current", "uthcode:general"]]);
+    assert.deepEqual(Array.from(container.querySelectorAll<HTMLButtonElement>(".recent-line"), (button) => button.textContent?.trim()), ["General current"]);
+
+    const searchButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Search Sessions"));
+    assert.ok(searchButton);
+    act(() => { searchButton!.click(); });
+    const input = container.querySelector<HTMLInputElement>(".session-search input");
+    const form = container.querySelector<HTMLFormElement>(".session-search form");
+    assert.ok(input);
+    assert.ok(form);
+    const setInput = async (value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+      act(() => {
+        setter?.call(input, value);
+        input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+        input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await flush();
+      assert.equal(input?.value, value);
+    };
+    await setInput("first");
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    assert.equal(searchRequestCount, 1, "the query input submits its current text to session.search");
+    assert.match(container.textContent ?? "", /First General result/u, "an event delivered before the kickoff Promise resolves is applied by its returned operation identity");
+
+    await setInput("second");
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    assert.match(container.textContent ?? "", /Searching Sessions/u);
+    act(() => { eventListener?.({ type: "session_search_result", operation_id: "search-first", owner_key: "uthcode:general", state: "completed", hits: [{ session_id: "late", project_key: "uthcode:general", title: "Late first result", snippet: "late", archived: false, last_used_at: null }] }); });
+    await flush();
+    assert.doesNotMatch(container.textContent ?? "", /Late first result/u, "a prior search operation cannot replace the current query");
+    act(() => { eventListener?.({ type: "session_search_result", operation_id: "search-second", owner_key: "uthcode:general", state: "completed", hits: [{ session_id: "general-second-hit", project_key: "uthcode:general", title: "Second General result", snippet: "second snippet", archived: false, last_used_at: null }] }); });
+    await flush();
+    assert.match(container.textContent ?? "", /Second General result/u);
+    assert.doesNotMatch(container.textContent ?? "", /First General result/u);
+
+    await setInput("third");
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    act(() => { eventListener?.({ type: "session_search_result", operation_id: "search-third", owner_key: "C:/wrong-project", state: "completed", hits: [{ session_id: "wrong-owner", project_key: "uthcode:general", title: "Wrong owner result", snippet: "wrong", archived: false, last_used_at: null }] }); });
+    await flush();
+    assert.match(container.textContent ?? "", /Search is unavailable/u);
+    assert.doesNotMatch(container.textContent ?? "", /Wrong owner result/u);
+
+    await setInput("fourth");
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    assert.match(container.textContent ?? "", /Searching Sessions/u);
+    const closeSearch = container.querySelector<HTMLButtonElement>('.session-search > header button[aria-label="Cancel"]');
+    assert.ok(closeSearch);
+    act(() => { closeSearch!.click(); });
+    await flush();
+    act(() => { eventListener?.({ type: "session_search_result", operation_id: "search-fourth", owner_key: "uthcode:general", state: "completed", hits: [{ session_id: "late-mode", project_key: "uthcode:general", title: "Late mode result", snippet: "late", archived: false, last_used_at: null }] }); });
+    await flush();
+    const codingButton = modeButton("Coding");
+    assert.ok(codingButton);
+    act(() => { codingButton!.click(); });
+    await flush(12);
+    assert.deepEqual(calls.filter((call) => ["project.open", "session.resume"].includes(call.method)).map((call) => [call.method, call.params.path ?? call.params.session_id ?? null, call.params.project_key ?? null]), [
+      ["session.resume", "general-current", "uthcode:general"],
+      ["project.open", codingPath, null],
+      ["session.resume", "coding-current", codingPath],
+    ]);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Coding");
+    assert.deepEqual(cancelledSearches, ["search-fourth"], "closing the current pending search cancels only its own operation");
+  });
+});
+
+test("T07 App restores archived search results and preserves a newer owner during delayed archive catalog refresh", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const codingPath = "C:/archive-mode-coding";
+    const otherCodingPath = "C:/archive-mode-other-coding";
+    const codingCurrent = { session_id: "coding-current", project_key: codingPath, title: "Coding current" };
+    const codingOther = { session_id: "coding-other", project_key: codingPath, title: "Coding other" };
+    const otherCodingSession = { session_id: "other-coding-session", project_key: otherCodingPath, title: "Other Coding current" };
+    const generalRestored = { session_id: "general-archived", project_key: "uthcode:general", title: "Restored General" };
+    const coding: ProjectState = { path: codingPath, projectKey: codingPath, alias: "Coding", pinned: false, sessions: [codingCurrent, codingOther], catalogFresh: true };
+    const otherCoding: ProjectState = { path: otherCodingPath, projectKey: otherCodingPath, alias: "Other Coding", pinned: false, sessions: [otherCodingSession], catalogFresh: true };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let codingArchived = false;
+    let deferCodingArchiveCatalog = false;
+    let resolveCodingArchiveCatalog: ((value: JsonValue) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "session.search") {
+          eventListener?.({
+            type: "session_search_result",
+            operation_id: "archived-general-search",
+            owner_key: codingPath,
+            state: "completed",
+            hits: [{ session_id: "general-archived", project_key: "uthcode:general", title: "Restored General", snippet: "archived content", archived: true, last_used_at: null }],
+            unavailable_count: 0,
+            has_more: false,
+          });
+          return { operation_id: "archived-general-search", owner_key: codingPath, state: "searching" };
+        }
+        if (method === "session.archive") {
+          if (params.project_key === codingPath) {
+            codingArchived = params.archived === true;
+            deferCodingArchiveCatalog = params.archived === true;
+          }
+          const value = { session_id: params.session_id, project_key: params.project_key, title: params.project_key === codingPath ? "Coding current" : "Restored General", archived: params.archived };
+          return { ...value, session: value };
+        }
+        if (method === "project.sessions") {
+          if (params.project_key === "uthcode:general") return { sessions: [generalRestored] };
+          if (params.project_key === otherCodingPath) return { sessions: [otherCodingSession] };
+          if (params.project_key === codingPath && deferCodingArchiveCatalog) {
+            return await new Promise<JsonValue>((resolve) => { resolveCodingArchiveCatalog = resolve; });
+          }
+          return { sessions: codingArchived ? [codingOther] : [codingCurrent, codingOther] };
+        }
+        if (method === "general.open") return { mode: "general", project_key: "uthcode:general", sessions: [generalRestored], run: null };
+        if (method === "project.open") return params.path === otherCodingPath
+          ? { project: { path: otherCodingPath }, sessions: [otherCodingSession], run: null }
+          : { project: { path: codingPath }, sessions: codingArchived ? [codingOther] : [codingCurrent, codingOther], run: null };
+        if (method === "session.resume") return { session_id: params.session_id, replay: [], active_turn: false, run: { run_id: `run-${params.session_id}`, status: "idle" }, session_state: { status: "idle" } };
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false, unit_count: 0 };
+        if (method === "status.get") return { active_turn: false, run: null, runtime: { state: "ready" } };
+        if (method === "settings.get") return { configuration: {} };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => await new Promise<never>(() => undefined) as never,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+        projects: [coding, otherCoding],
+      selectedProjectKey: codingPath,
+      selectedSessionId: "coding-current",
+        expandedProjects: { [codingPath]: true, [otherCodingPath]: true },
+      modeSelections: {
+        coding: { projectKey: codingPath, sessionId: "coding-current" },
+        general: { projectKey: "uthcode:general", sessionId: null },
+      },
+    });
+    const flush = async (rounds = 10) => act(async () => {
+      for (let index = 0; index < rounds; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const searchButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Search Sessions"));
+    assert.ok(searchButton);
+    act(() => { searchButton!.click(); });
+    const input = container.querySelector<HTMLInputElement>(".session-search input");
+    const form = container.querySelector<HTMLFormElement>(".session-search form");
+    assert.ok(input);
+    assert.ok(form);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    act(() => {
+      setter?.call(input, "archived general");
+      input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "archived general" }));
+      input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await flush();
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    assert.match(container.textContent ?? "", /Restored General/u);
+    const restore = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-search li > button")).find((button) => button.textContent?.includes("Restore and open"));
+    assert.ok(restore);
+    act(() => { restore!.click(); });
+    await flush(16);
+    assert.deepEqual(calls.filter((call) => call.method === "session.archive").map((call) => call.params), [{ session_id: "general-archived", project_key: "uthcode:general", archived: false }]);
+    assert.deepEqual(calls.filter((call) => call.method === "session.resume").map((call) => [call.params.session_id, call.params.project_key]), [["general-archived", "uthcode:general"]]);
+    assert.equal(container.querySelector<HTMLElement>(".sidebar-modes button[aria-pressed='true']")?.textContent?.trim(), "General");
+
+    const codingMode = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-modes button")).find((button) => button.textContent?.trim() === "Coding");
+    assert.ok(codingMode);
+    act(() => { codingMode!.click(); });
+    await flush(12);
+    const sessionTrigger = container.querySelector<HTMLButtonElement>(`.project-item.is-active .session-menu-trigger`);
+    assert.ok(sessionTrigger);
+    act(() => { sessionTrigger!.click(); });
+    await flush(2);
+    const archive = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-menu__item")).find((button) => button.textContent?.trim() === "Archive Session");
+    assert.ok(archive);
+    act(() => { archive!.click(); });
+    await flush(3);
+    assert.equal(typeof resolveCodingArchiveCatalog, "function", "the archive committed and is awaiting its delayed catalog refresh");
+    const otherProjectDisclosure = container.querySelector<HTMLButtonElement>('.project-line button.disclosure[aria-label="Expand Other Coding"]');
+    assert.ok(otherProjectDisclosure);
+    act(() => { otherProjectDisclosure!.click(); });
+    await flush(2);
+    const otherSessionRow = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)")).find((button) => button.textContent?.includes("Other Coding current"));
+    assert.ok(otherSessionRow);
+    act(() => { otherSessionRow!.click(); });
+    await flush(12);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Other Coding", "the user's navigation becomes the current owner during the archive catalog request");
+
+    await act(async () => { resolveCodingArchiveCatalog?.({ sessions: [codingOther] }); });
+    await flush(16);
+    assert.equal(codingArchived, true);
+    assert.deepEqual(calls.filter((call) => call.method === "session.archive").map((call) => call.params), [
+      { session_id: "general-archived", project_key: "uthcode:general", archived: false },
+      { session_id: "coding-current", project_key: codingPath, archived: true },
+    ]);
+    assert.equal(container.querySelector<HTMLElement>(".sidebar-modes button[aria-pressed='true']")?.textContent?.trim(), "Coding");
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Other Coding", "a late catalog result cannot auto-resume the previously selected project's next Session");
+    assert.equal(Array.from(container.querySelectorAll<HTMLButtonElement>(".project-item.is-active .session-line.is-selected"), (button) => button.textContent?.trim()).at(-1), "Other Coding current");
+    assert.equal(calls.some((call) => call.method === "session.resume" && call.params.session_id === "coding-other"), false, "the stale post-archive target is never resumed");
+    assert.equal(container.querySelectorAll(".project-item").length > 0, true, "the catalog refresh still updates the archived project's facts");
+  });
+});
+
+test("T07 restoring a search hit after async archive work does not navigate over a newer owner", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const codingPath = "C:/restore-race-coding";
+    const otherPath = "C:/restore-race-other";
+    const generalArchived = { session_id: "general-restore-race", project_key: "uthcode:general", title: "Archived General hit", archived: true };
+    const codingSession = { session_id: "coding-restore-race", project_key: codingPath, title: "Coding current" };
+    const otherSession = { session_id: "other-restore-race", project_key: otherPath, title: "Other current" };
+    const projects: ProjectState[] = [
+      { path: codingPath, projectKey: codingPath, alias: "Coding", pinned: false, sessions: [codingSession], catalogFresh: true },
+      { path: otherPath, projectKey: otherPath, alias: "Other", pinned: false, sessions: [otherSession], catalogFresh: true },
+      { path: "uthcode:general", projectKey: "uthcode:general", alias: "General", pinned: false, sessions: [generalArchived], catalogFresh: true },
+    ];
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let deferGeneralCatalog = false;
+    let resolveGeneralCatalog: ((value: JsonValue) => void) | null = null;
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "session.search") {
+          eventListener?.({
+            type: "session_search_result",
+            operation_id: "restore-race-search",
+            owner_key: codingPath,
+            state: "completed",
+            hits: [{ session_id: generalArchived.session_id, project_key: "uthcode:general", title: generalArchived.title, snippet: "archived text", archived: true, last_used_at: null }],
+            unavailable_count: 0,
+            has_more: false,
+          });
+          return { operation_id: "restore-race-search", owner_key: codingPath, state: "searching" };
+        }
+        if (method === "session.search.cancel") return { accepted: true };
+        if (method === "session.archive") {
+          deferGeneralCatalog = true;
+          const restored = { session_id: params.session_id, project_key: params.project_key, title: "Archived General hit", archived: false };
+          return { ...restored, session: restored };
+        }
+        if (method === "project.sessions") {
+          if (params.project_key === "uthcode:general" && deferGeneralCatalog) {
+            return await new Promise<JsonValue>((resolve) => { resolveGeneralCatalog = resolve; });
+          }
+          if (params.project_key === otherPath) return { sessions: [otherSession] };
+          return { sessions: [codingSession] };
+        }
+        if (method === "project.open") return params.path === otherPath
+          ? { project: { path: otherPath }, sessions: [otherSession], run: null }
+          : { project: { path: codingPath }, sessions: [codingSession], run: null };
+        if (method === "session.resume") return { session_id: params.session_id, replay: [], active_turn: false, run: null, session_state: { status: "idle" } };
+        if (method === "history.page") return { session_id: params.session_id, records: [], next_cursor: null, has_more: false };
+        if (method === "status.get") return { active_turn: false, run: null, runtime: { state: "ready" } };
+        if (method === "settings.get") return { configuration: {} };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => await new Promise<never>(() => undefined) as never,
+      writePreference: async () => undefined,
+    };
+    const state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects,
+      selectedProjectKey: codingPath,
+      selectedSessionId: codingSession.session_id,
+      expandedProjects: { [codingPath]: true, [otherPath]: true },
+      modeSelections: {
+        coding: { projectKey: codingPath, sessionId: codingSession.session_id },
+        general: { projectKey: "uthcode:general", sessionId: null },
+      },
+    });
+    const flush = async (rounds = 8) => act(async () => {
+      for (let index = 0; index < rounds; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const searchButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Search Sessions"));
+    assert.ok(searchButton);
+    act(() => { searchButton!.click(); });
+    const input = container.querySelector<HTMLInputElement>(".session-search input");
+    const form = container.querySelector<HTMLFormElement>(".session-search form");
+    assert.ok(input);
+    assert.ok(form);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    act(() => {
+      setter?.call(input, "archived hit");
+      input!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "archived hit" }));
+      input!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      input!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await flush();
+    act(() => { form!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true })); });
+    await flush();
+    const restore = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-search li > button")).find((button) => button.textContent?.includes("Restore and open"));
+    assert.ok(restore);
+    act(() => { restore!.click(); });
+    await flush(3);
+    assert.equal(typeof resolveGeneralCatalog, "function", "restore has committed and is waiting for the General catalog");
+
+    const otherDisclosure = container.querySelector<HTMLButtonElement>('.project-line button.disclosure[aria-label="Expand Other"]');
+    assert.ok(otherDisclosure);
+    act(() => { otherDisclosure!.click(); });
+    await flush(2);
+    const otherRow = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)")).find((button) => button.textContent?.includes("Other current"));
+    assert.ok(otherRow);
+    act(() => { otherRow!.click(); });
+    await flush(12);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Other", "the newer project navigation finishes before the old restore catalog response");
+
+    await act(async () => { resolveGeneralCatalog?.({ sessions: [{ ...generalArchived, archived: false }] }); });
+    await flush(14);
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .project-select")?.textContent?.trim(), "Other", "the late restore result cannot steal the selected project");
+    assert.equal(container.querySelector<HTMLElement>(".project-item.is-active .session-line.is-selected")?.textContent?.trim(), "Other current");
+    assert.equal(calls.some((call) => call.method === "session.resume" && call.params.session_id === generalArchived.session_id), false, "restore does not enqueue an automatic resume after its owner changed");
+  });
+});
+
 test("App preloads registered project catalogs and refreshes an expanded folder without replacing an active Session", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const alphaPath = "C:/catalog-alpha";
@@ -1662,7 +2127,7 @@ test("T05 narrow viewport structure keeps Sidebar visible and reopens hidden Run
     const shell = container.querySelector<HTMLElement>(".app-shell");
     assert.ok(shell);
     assert.ok(container.querySelector(".sidebar"), "navigation remains available at 533 CSS px");
-    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const toggle = container.querySelector<HTMLButtonElement>('.conversation-actions button[aria-controls="runtime-panel"]');
     assert.ok(toggle);
     assert.equal(toggle?.getAttribute("aria-controls"), "runtime-panel");
     assert.equal(toggle?.getAttribute("aria-expanded"), "false");
@@ -1698,7 +2163,7 @@ test("T05 Runtime drawer restores focus when a wide docked panel becomes hidden 
   await withRendererDom(async (dom, container, root) => {
     Object.defineProperty(dom.window, "innerWidth", { configurable: true, value: 1100 });
     act(() => { root.render(<App initialState={createInitialState({ language: "en", panelMode: "docked" })} api={undefined} />); });
-    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const toggle = container.querySelector<HTMLButtonElement>('.conversation-actions button[aria-controls="runtime-panel"]');
     const runtime = container.querySelector<HTMLElement>("#runtime-panel");
     assert.ok(toggle);
     assert.ok(runtime);
@@ -1724,7 +2189,7 @@ test("T06 responsive Runtime error owner handoff preserves focus across a real r
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     const timelineError = container.querySelector<HTMLElement>(".timeline-runtime-error");
     const openSettings = timelineError?.querySelector<HTMLButtonElement>("button");
-    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const toggle = container.querySelector<HTMLButtonElement>('.conversation-actions button[aria-controls="runtime-panel"]');
     assert.ok(timelineError && openSettings && toggle);
     assert.equal(container.querySelector("#runtime-panel")?.getAttribute("aria-hidden"), "true");
     act(() => { openSettings!.focus(); });
@@ -1749,7 +2214,7 @@ test("T05 wide floating Runtime keeps its three-state layout without drawer dism
     before?.focus();
     act(() => { root.render(<App initialState={createInitialState({ language: "en", panelMode: "floating" })} api={undefined} />); });
     const shell = container.querySelector<HTMLElement>(".app-shell");
-    const toggle = container.querySelector<HTMLButtonElement>(".conversation-actions button");
+    const toggle = container.querySelector<HTMLButtonElement>('.conversation-actions button[aria-controls="runtime-panel"]');
     const runtime = container.querySelector<HTMLElement>("#runtime-panel");
     assert.ok(shell);
     assert.ok(runtime);
@@ -1985,7 +2450,11 @@ test("App pages history independently across quick A→B→A navigation and dedu
     await flush();
     assert.ok(previewCalls.some(({ ref }) => ref === "session-a-image-ref"), "preview receives the opaque AttachmentReference.ref");
     assert.ok(previewCalls.every(({ ref }) => ref !== "missing-ref"), "unavailable attachments are never sent to preview");
-    assert.ok(userEntry!.querySelector('[role="dialog"] img[src^="data:image/png"]'), "the renderer applies the real attachment.preview response");
+    assert.ok(container.querySelector(".document-review-image img"), "the historical image opens in the shared review panel");
+    const reviewImage = container.querySelector<HTMLButtonElement>(".document-review-image button");
+    assert.ok(reviewImage);
+    act(() => { reviewImage!.click(); });
+    assert.ok(container.querySelector('.image-preview-modal[role="dialog"] img[src^="data:image/png"]'), "the renderer applies the real attachment.preview response in the zoom modal");
   });
 });
 
@@ -2543,10 +3012,13 @@ test("T05 markdown renderer covers common blocks without executing raw HTML", ()
   assert.match(html, /&lt;script&gt;/);
 });
 
-test("T05 tool timeline rows keep only the safe summary projection", () => {
+test("T08 collapsed tool activity keeps its command metadata but does not invent result content", () => {
   const markup = renderToStaticMarkup(<ChatTimeline entries={[{ id: "tool-1", kind: "tool", text: "Bash completed", command: "cat secret-result", toolName: "Bash", status: "completed", isError: false }]} todo={[]} />);
+  assert.match(markup, /<details class="timeline-activity-group" data-tool-count="1">/u, "activity starts collapsed under the native details control");
   assert.match(markup, /Bash completed/);
-  assert.doesNotMatch(markup, /cat secret-result|ToolResult|secret-result/u);
+  assert.match(markup, /cat secret-result/u, "the actual tool command remains inspectable when the group is expanded");
+  assert.match(markup, /没有可用输出/u, "missing historical result content stays explicitly unavailable");
+  assert.doesNotMatch(markup, /ToolResult|secret-output/u);
 });
 
 test("T05 Composer exposes separate steering, pause, cancel, and Python-backed command completion paths", () => {
@@ -2571,38 +3043,139 @@ test("T05 Composer exposes separate steering, pause, cancel, and Python-backed c
 
 
 
-test("T06 tool DOM rows expose one status entity with icon, text, ARIA, and frozen elapsed", async () => {
+test("T08 tool activity groups stay collapsed and preserve bounded details and observed durations", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const startedAt = Date.now() - 5000;
-    const renderTimeline = (entry: Parameters<typeof ChatTimeline>[0]["entries"]) => {
-      act(() => { root.render(<LanguageProvider value="en"><ChatTimeline entries={entry} todo={[]} /></LanguageProvider>); });
-    };
-    renderTimeline([{ id: "tool-row", kind: "tool", text: "Bash summary", toolName: "Bash", status: "running", streaming: false, startedAt }]);
-    const running = container.querySelector<HTMLElement>(".timeline-entry--tool");
-    assert.ok(running);
-    assert.equal(running?.getAttribute("aria-busy"), "true");
-    assert.equal(running?.querySelector<HTMLElement>('[data-status="running"]')?.textContent?.includes("running"), true);
-    assert.ok(running?.querySelector(".tool-status .ui-icon"));
-    assert.ok(running?.querySelector(".tool-elapsed"));
-    const initialElapsed = Number.parseInt(running?.querySelector(".tool-elapsed")?.textContent?.replace(/\D/gu, "") ?? "0", 10);
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 1050)); });
-    const laterElapsed = Number.parseInt(container.querySelector(".tool-elapsed")?.textContent?.replace(/\D/gu, "") ?? "0", 10);
-    assert.ok(laterElapsed > initialElapsed, "running elapsed must continue increasing");
-    renderTimeline([{ id: "tool-row", kind: "tool", text: "Bash summary", toolName: "Bash", status: "completed", streaming: false, startedAt, endedAt: startedAt + 3000 }]);
-    const completed = container.querySelector<HTMLElement>(".timeline-entry--tool");
-    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1);
-    assert.equal(completed?.getAttribute("aria-busy"), null);
-    assert.equal(completed?.querySelector<HTMLElement>('[data-status="completed"]')?.textContent?.includes("completed"), true);
-    assert.match(completed?.querySelector(".tool-elapsed")?.textContent ?? "", /3s/u);
-    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 20)); });
-    assert.match(container.querySelector(".tool-elapsed")?.textContent ?? "", /3s/u, "terminal elapsed remains frozen");
-    for (const status of ["failed", "cancelled"] as const) {
-      renderTimeline([{ id: `tool-${status}`, kind: "tool", text: "Bash summary", toolName: "Bash", status, streaming: false, startedAt, endedAt: startedAt + 4000, isError: status === "failed" }]);
-      const terminal = container.querySelector<HTMLElement>(".timeline-entry--tool");
-      assert.equal(terminal?.querySelector<HTMLElement>(`[data-status="${status}"]`) !== null, true);
-      assert.match(terminal?.getAttribute("aria-label") ?? "", new RegExp(status, "iu"));
-      assert.ok(terminal?.querySelector(".tool-status .ui-icon"));
-    }
+    const endedAt = startedAt + 3000;
+    const entries: Parameters<typeof ChatTimeline>[0]["entries"] = [
+      { id: "tool-read", kind: "tool", text: "Read completed", toolName: "Read", command: "read source", status: "completed", startedAt, endedAt, outputPreview: "bounded preview", outputPreviewTruncated: true, fileChanges: [{ path: "src/app.ts", status: "modified" }] },
+      { id: "tool-write", kind: "tool", text: "Write rejected: permission denied", toolName: "Write", status: "failed", isError: true },
+      { id: "tool-cancel", kind: "tool", text: "Bash cancelled by user", toolName: "Bash", status: "cancelled", isError: false },
+      { id: "tool-running", kind: "tool", text: "Search running", toolName: "Search", status: "running", startedAt },
+      { id: "answer", kind: "assistant", text: "Between batches", status: "completed" },
+      { id: "tool-last", kind: "tool", text: "Fetch completed", toolName: "Fetch", status: "completed" },
+    ];
+    const viewedOutputs: string[] = [];
+    const reviewedPaths: string[] = [];
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} onViewToolOutput={(entry) => viewedOutputs.push(entry.id)} onReviewCurrentDiff={(path) => reviewedPaths.push(path)} /></LanguageProvider>);
+    });
+    const groups = Array.from(container.querySelectorAll<HTMLDetailsElement>(".timeline-activity-group"));
+    assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["1", "1", "1"], "success groups stop at immediately visible failures and restart afterwards");
+    assert.equal(groups[0]?.open, false, "dense tool details start collapsed");
+    assert.match(groups[0]?.querySelector("summary")?.textContent ?? "", /1 activities/u);
+    const failures = [...container.querySelectorAll<HTMLElement>(".timeline-activity-item.is-failed")];
+    assert.equal(failures.length, 2, "failed and cancelled Tools each have a direct row");
+    assert.ok(failures.every((failure) => failure.closest("details") === null), "failure explanations and cancellation status are not under a collapsed group");
+    assert.match(failures.map((failure) => failure.textContent).join(" "), /permission denied|cancelled by user/u);
+    const unavailable = Array.from(container.querySelectorAll<HTMLElement>(".timeline-activity-item.is-failed .timeline-tool-output-unavailable"));
+    assert.ok(unavailable.length >= 1, "legacy activity without output metadata is explicitly unavailable");
+    assert.match(groups[2]?.textContent ?? "", /Duration unavailable/u, "missing live timestamps stay unavailable");
+    assert.match(groups[0]?.querySelectorAll(".tool-elapsed")[0]?.textContent ?? "", /3s/u, "completed duration stays frozen from observed timestamps");
+    groups[0]!.open = true;
+    const outputButton = Array.from(groups[0]!.querySelectorAll<HTMLButtonElement>(".timeline-tool-output")).find((button) => button.textContent?.includes("View tool output"));
+    const diffButton = Array.from(groups[0]!.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")).find((button) => button.textContent?.includes("src/app.ts"));
+    assert.ok(outputButton);
+    assert.ok(diffButton);
+    act(() => { outputButton!.click(); diffButton!.click(); });
+    assert.deepEqual(viewedOutputs, ["tool-read"]);
+    assert.deepEqual(reviewedPaths, ["src/app.ts"]);
+  });
+});
+
+test("T08 activity group uses the observed wall-clock span instead of adding Tool durations", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const start = Date.now() - 10_000;
+    const entries: Parameters<typeof ChatTimeline>[0]["entries"] = [
+      { id: "span-one", kind: "tool", text: "One completed", toolName: "One", status: "completed", startedAt: start, endedAt: start + 3_000 },
+      { id: "span-two", kind: "tool", text: "Two completed", toolName: "Two", status: "completed", startedAt: start + 2_000, endedAt: start + 4_000 },
+      { id: "span-three", kind: "tool", text: "Three completed", toolName: "Three", status: "completed", startedAt: start + 3_000, endedAt: start + 5_000 },
+    ];
+    act(() => {
+      root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} /></LanguageProvider>);
+    });
+    const summary = container.querySelector<HTMLDetailsElement>(".timeline-activity-group summary");
+    assert.ok(summary);
+    assert.match(summary.textContent ?? "", /5s/u, "the group spans earliest start to latest completion");
+    assert.doesNotMatch(summary.textContent ?? "", /7s/u, "overlapping per-Tool durations are not added together");
+  });
+});
+
+test("T08 seven adjacent Tools stay one collapsed group across event batches and visible segments split it", () => {
+  let streamed = createInitialState();
+  for (let index = 1; index <= 7; index += 1) {
+    const batchId = index < 4 ? "batch-one" : "batch-two";
+    streamed = reduceRendererState(streamed, { type: "agent_event", event: { type: "tool_started", run_id: "run-1", turn_id: "turn-1", batch_id: batchId, tool_call_id: `call-${index}`, tool_name: `Tool${index}`, iteration: index < 4 ? 1 : 2 } });
+    streamed = reduceRendererState(streamed, { type: "agent_event", event: { type: "tool_finished", run_id: "run-1", turn_id: "turn-1", batch_id: batchId, tool_call_id: `call-${index}`, tool_name: `Tool${index}`, status: "succeeded", is_error: false, iteration: index < 4 ? 1 : 2 } });
+  }
+  const streamedTools = streamed.timeline.filter((entry) => entry.kind === "tool");
+  assert.equal(streamedTools.length, 7, "seven tool calls from two batches project once apiece");
+  const tool = (index: number): TimelineEntry => ({
+    id: `batch-tool-${index}`,
+    kind: "tool",
+    text: `Tool ${index} completed`,
+    turnId: "turn-1",
+    toolCallId: `call-${index}`,
+    toolName: `Tool${index}`,
+    iteration: index < 4 ? 1 : 2,
+    status: "completed",
+  });
+  const markup = renderToStaticMarkup(<LanguageProvider value="en"><ChatTimeline entries={[
+    ...streamedTools,
+    { id: "progress", kind: "status", text: "Progress: checking files", status: "info" },
+    tool(8),
+    { id: "reasoning", kind: "reasoning", text: "Public reasoning", status: "completed" },
+    tool(9),
+    { id: "user", kind: "user", text: "Follow-up" },
+    tool(10),
+    { id: "permission", kind: "status", text: "Waiting for permission", status: "info" },
+    tool(11),
+    { id: "ask", kind: "status", text: "Waiting for user input", status: "info" },
+    tool(12),
+    { id: "plan-review", kind: "plan", text: "Review proposed plan", status: "pending", planState: "draft" },
+    tool(13),
+    { id: "failure", kind: "status", text: "Turn failed: runtime error", status: "failed", isError: true },
+    tool(14),
+    { id: "answer", kind: "assistant", text: "Final answer", status: "completed" },
+  ]} todo={[]} /></LanguageProvider>);
+  const toolCounts = Array.from(markup.matchAll(/<details class="timeline-activity-group" data-tool-count="(\d+)"/gu), (match) => match[1]);
+  assert.deepEqual(toolCounts, ["7", "1", "1", "1", "1", "1", "1", "1"], "adjacent tools across batches stay together, and public segments including interactions and failures split groups");
+  assert.match(markup, /<article class="timeline-entry timeline-entry--assistant"[^>]*>.*?Final answer.*?<\/article>/u, "the final answer remains directly visible outside every activity group");
+  assert.match(markup, /Public reasoning/u);
+  assert.match(markup, /Waiting for permission/u);
+  assert.match(markup, /Waiting for user input/u);
+  assert.match(markup, /Review proposed plan/u);
+  assert.match(markup, /Turn failed/u);
+});
+
+test("T08 a failed live Tool breaks collapsed groups and leaves its command and safe output action visible", async () => {
+  let state = createInitialState({
+    selectedProjectKey: "C:/t08-tool-failure-visibility",
+    selectedSessionId: "session-tool-failure-visibility",
+    run: { run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", status: "running" },
+    activeTurn: true,
+  });
+  const events: AgentEvent[] = [
+    { type: "tool_started", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-a", tool_call_id: "call-before", tool_name: "Read", command: "read safe.txt" },
+    { type: "tool_finished", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-a", tool_call_id: "call-before", tool_name: "Read", command: "read safe.txt", status: "succeeded", is_error: false },
+    { type: "tool_started", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-a", tool_call_id: "call-failed", tool_name: "Bash", command: "remove protected file" },
+    { type: "tool_finished", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-a", tool_call_id: "call-failed", tool_name: "Bash", command: "remove protected file", status: "failed", is_error: true, output_preview: "Permission denied by the active security policy" },
+    { type: "tool_started", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-b", tool_call_id: "call-after", tool_name: "Read", command: "read summary.txt" },
+    { type: "tool_finished", run_id: "run-tool-failure-visibility", turn_id: "turn-tool-failure-visibility", session_id: "session-tool-failure-visibility", project_key: "C:/t08-tool-failure-visibility", batch_id: "batch-b", tool_call_id: "call-after", tool_name: "Read", command: "read summary.txt", status: "succeeded", is_error: false },
+  ];
+  for (const event of events) state = reduceRendererState(state, { type: "agent_event", event });
+  assert.deepEqual(state.timeline.filter((entry) => entry.kind === "tool").map((entry) => entry.status), ["completed", "failed", "completed"], "the live reducer projects success, failure, then success in order");
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<LanguageProvider value="en"><ChatTimeline entries={state.timeline} todo={[]} /></LanguageProvider>); });
+    const groups = [...container.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-group")];
+    assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["1", "1"], "successful calls on either side of failure remain separate normal groups");
+    assert.ok(groups.every((group) => !group.open), "normal activity groups remain collapsed by default");
+    const failure = container.querySelector<HTMLElement>(".timeline-activity-item.is-failed");
+    assert.ok(failure, "the failed tool row is directly rendered");
+    assert.equal(failure.closest("details"), null, "the failure is not hidden under a collapsed details element");
+    assert.match(failure.textContent ?? "", /remove protected file/u, "the failed command is visible with its failure row");
+    assert.ok(failure.querySelector(".timeline-tool-output"), "the safe output action is reachable directly from the visible failed row");
   });
 });
 
@@ -4422,6 +4995,24 @@ test("T07 Runtime switch and three layout modes remain operational", async () =>
   assert.match(dockedMarkup, /aria-label="关闭 Runtime 面板"/);
   assert.match(dockedMarkup, /aria-expanded="true"/);
   assert.match(dockedMarkup, /aria-controls="runtime-panel"/);
+  const generalMarkup = renderToStaticMarkup(<App initialState={createInitialState({
+    language: "en",
+    mode: "general",
+    panelMode: "docked",
+    selectedProjectKey: "uthcode:general",
+    composerText: "General draft",
+    activeTurn: true,
+    run: { run_id: "general-run", turn_id: "general-turn", behavior_mode: "default" },
+    permissionMode: "default",
+    runtimeState: "configuration_required",
+    runtimeError: "General configuration needs attention",
+  })} api={undefined} />);
+  assert.match(generalMarkup, /class="app-shell theme-system panel-hidden"/u, "General releases the docked Runtime column while preserving Coding's saved panel preference");
+  assert.doesNotMatch(generalMarkup, /id="runtime-panel"|aria-controls="runtime-panel"|layout-separator--runtime/u, "General omits Coding's Runtime panel and its controls");
+  assert.doesNotMatch(generalMarkup, /Current Context|Compaction|Default permission|Project uthcode:general|>DEFAULT</u, "General does not expose Runtime technical diagnostics");
+  assert.match(generalMarkup, /General configuration needs attention/u, "General still shows configuration errors in the conversation");
+  assert.match(generalMarkup, /<textarea[^>]*>General draft<\/textarea>/u, "General keeps its real Composer draft");
+  assert.match(generalMarkup, /aria-label="Cancel"/u, "General keeps the real active-turn cancellation control");
   const floatingMarkup = renderToStaticMarkup(<App initialState={createInitialState({ panelMode: "floating" })} api={undefined} />);
   assert.match(floatingMarkup, /runtime-panel--floating/);
   const settingsMarkup = renderToStaticMarkup(<App initialState={createInitialState({ view: "settings", panelMode: "docked", settingsLoaded: true })} api={undefined} />);
@@ -4945,6 +5536,149 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
     assert.ok(modelOption);
     act(() => { modelOption?.click(); });
     assert.deepEqual(commands, ["/permission full_access", "/model", "/model remote/fallback"]);
+  });
+});
+
+test("T10 General Composer exposes text, model, and cancel while refusing Coding attachment and permission controls", async () => {
+  const state = createInitialState({
+    mode: "general",
+    runtimeState: "ready",
+    selectedProjectKey: "uthcode:general",
+    selectedSessionId: "general-session",
+    composerText: "General draft",
+    composerAttachments: [{ ref: "unexpected-draft", display_name: "hidden.png", mime_type: "image/png", size_bytes: 4 }],
+    activeTurn: true,
+    turnStatus: "running",
+    currentModelRef: "provider/general",
+    modelCandidates: ["provider/general"],
+    configuration: { models: { "provider/general": { display_name: "General Model" } } },
+  });
+  const submitted: Array<{ text: string; refs: string[] }> = [];
+  const markup = renderLanguage("en", <Composer state={state} onChange={() => undefined} onSubmit={(text, attachments) => submitted.push({ text, refs: attachments.map((item) => item.ref) })} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} onChooseAttachment={() => undefined} onPasteAttachment={() => undefined} onImportFile={() => undefined} onRemoveAttachment={() => undefined} />);
+  assert.match(markup, /General Model/u);
+  assert.doesNotMatch(markup, /Default permission|attachmentChoose|hidden\.png|composer-selectors|context-ring/u);
+  assert.match(markup, /class="composer-model"/u);
+  assert.doesNotMatch(markup, /title="pause"|aria-label="pause"/u, "General has no pause control");
+  assert.match(markup, /aria-label="Cancel"/u, "General keeps the running-turn cancel control");
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<LanguageProvider value="en"><Composer state={{ ...state, activeTurn: false }} onChange={() => undefined} onSubmit={(text, attachments) => submitted.push({ text, refs: attachments.map((item) => item.ref) })} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} onChooseAttachment={() => undefined} onPasteAttachment={() => undefined} onImportFile={() => undefined} onRemoveAttachment={() => undefined} /></LanguageProvider>); });
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    assert.deepEqual(submitted, [{ text: "General draft", refs: [] }], "even stale attachment state cannot ride along with a General text Turn");
+  });
+});
+
+test("T10 Coding picker and control receipts preserve a text-plus-attachment draft across success, failure, and cancellation", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const projectPath = "C:/t10-control-draft";
+    const project: ProjectState = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Draft owner",
+      pinned: false,
+      sessions: [{ session_id: "session-one", project_key: projectPath }],
+      catalogFresh: true,
+    };
+    const attachment = { ref: "t10-attachment", display_name: "notes.png", mime_type: "image/png", size_bytes: 8 };
+    const configuration = {
+      default_model: "provider/current",
+      default_permission_mode: "default" as const,
+      providers: { provider: { kind: "openai_compat", api_key_configured: true } },
+      models: {
+        "provider/current": { provider_profile_id: "provider", remote_id: "current", display_name: "Current Model" },
+        "provider/business": { provider_profile_id: "provider", remote_id: "business", display_name: "Business Failure" },
+        "provider/rpc": { provider_profile_id: "provider", remote_id: "rpc", display_name: "RPC Failure" },
+        "provider/chosen": { provider_profile_id: "provider", remote_id: "chosen", display_name: "Chosen Model" },
+      },
+    };
+    const preferences: DesktopPreferences = {
+      theme: "system", language: "en", windowBounds: { width: 1100, height: 760, maximized: false }, panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+      recentProjects: [{ path: projectPath, alias: project.alias }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {}, selectedProjectKey: projectPath, selectedSessionId: "session-one",
+    };
+    const calls: Array<{ method: string; params: JsonObject }> = [];
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "runtime.initialize") return { state: "ready", run: { run_id: "run-t10", status: "idle" } };
+        if (method === "project.sessions") return { sessions: [{ session_id: "session-one", project_key: projectPath }] };
+        if (method === "session.resume") return { session_id: "session-one", replay: [], run: { run_id: "run-t10", status: "idle" } };
+        if (method === "settings.get") return { configuration };
+        if (method === "status.get") return { active_turn: false, run: { run_id: "run-t10", status: "idle" }, application: { current_model: "provider/current" } };
+        if (method === "command.complete") return { candidates: [], argument_candidates: ["provider/business", "provider/rpc", "provider/chosen"] };
+        if (method === "command.execute") {
+          const text = String(params.text ?? "");
+          if (text === "/permission auto") return { command: "permission", status: "success", code: "permission_mode_selected", params: {}, ui_action: { type: "permission_mode_selected", mode: "auto", warning: false } };
+          if (text === "/permission full_access" || text === "/model provider/business") return { command: "control", status: "execution_error", code: "command_failed", params: {}, ui_action: null };
+          if (text === "/permission default" || text === "/model provider/rpc") throw new Error("synthetic control RPC failure");
+          if (text === "/model") return { command: "model", status: "success", code: "model_picker_opened", params: {}, ui_action: { type: "open_model_picker" } };
+          if (text === "/model provider/chosen") return { command: "model", status: "success", code: "model_selected", params: { model_ref: "provider/chosen" }, ui_action: { type: "model_selected", model_ref: "provider/chosen" } };
+        }
+        return {};
+      },
+      subscribeAgentEvents: () => () => undefined,
+      readPreference: async (key) => preferences[key],
+      writePreference: async () => preferences,
+    };
+    const state = createInitialState({
+      language: "en", runtimeState: "ready", projects: [project], selectedProjectKey: projectPath, selectedSessionId: "session-one",
+      composerText: "unsent Coding prompt", composerAttachments: [attachment], currentModelRef: "provider/current", permissionMode: "default", configuration,
+    });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await flush();
+    const assertDraft = () => {
+      assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, "unsent Coding prompt");
+      assert.match(container.querySelector<HTMLElement>('.composer-attachments .file-card[aria-label^="notes.png"]')?.getAttribute("aria-label") ?? "", /notes\.png/u);
+    };
+    const choosePermission = async (label: string) => {
+      const trigger = container.querySelector<HTMLButtonElement>(".composer-selectors .custom-select__trigger");
+      assert.ok(trigger);
+      act(() => { trigger!.click(); });
+      const option = Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>(".custom-select__list button")).find((button) => button.textContent?.trim() === label);
+      assert.ok(option, `missing permission option ${label}`);
+      act(() => { option!.click(); });
+      await flush();
+      assertDraft();
+    };
+    const chooseModel = async (label: string) => {
+      const trigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
+      assert.ok(trigger);
+      act(() => { trigger!.click(); });
+      const option = Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>(".custom-select__list button")).find((button) => button.textContent?.trim() === label);
+      assert.ok(option, `missing model option ${label}`);
+      act(() => { option!.click(); });
+      await flush();
+      assertDraft();
+    };
+
+    assertDraft();
+    await choosePermission("Auto");
+    await choosePermission("Full access"); // typed Application business failure
+    await choosePermission("DEFAULT"); // RPC rejection
+
+    const modelTrigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
+    assert.ok(modelTrigger);
+    act(() => { modelTrigger!.click(); }); // also requests /model and command.complete
+    await flush();
+    assertDraft();
+    const focusedOption = dom.window.document.activeElement as HTMLButtonElement;
+    act(() => { focusedOption.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    await flush();
+    assertDraft(); // closing an opened picker is a draft-preserving cancellation
+
+    await chooseModel("Business Failure");
+    await chooseModel("RPC Failure");
+    await chooseModel("Chosen Model");
+    assert.equal(calls.filter((call) => call.method === "turn.start" || call.method === "turn.steer").length, 0, "control picker operations never create or steer a Turn");
+    assert.deepEqual(calls.filter((call) => call.method === "command.execute").map((call) => call.params.text), [
+      "/permission auto", "/permission full_access", "/permission default", "/model", "/model provider/business", "/model provider/rpc", "/model provider/chosen",
+    ]);
   });
 });
 

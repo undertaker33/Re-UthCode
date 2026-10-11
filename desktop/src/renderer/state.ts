@@ -167,6 +167,7 @@ export interface SessionSummary {
   /** Live status supplied by the bridge without changing catalog order. */
   runtime_status?: "idle" | "running" | "waiting" | "completed" | "failed" | "cancelled";
   unread?: boolean;
+  archived?: boolean;
 }
 
 export interface ProjectState {
@@ -208,6 +209,10 @@ export interface TimelineEntry {
   streaming?: boolean;
   startedAt?: number;
   endedAt?: number;
+  outputPreview?: string;
+  outputPreviewTruncated?: boolean;
+  outputRef?: string;
+  fileChanges?: Array<Record<string, JsonValue>>;
   planRevision?: number;
   planState?: "draft" | "final" | "failed" | "cancelled";
   attachments?: TimelineAttachment[];
@@ -302,6 +307,8 @@ export interface ConfigurationView extends ConfigurationLayer {
 
 export interface RendererState {
   runtimeState: RuntimeStateName;
+  /** Current navigation mode; General owns one fixed, non-project catalog. */
+  mode: "coding" | "general";
   runtimeError: string | null;
   projects: ProjectState[];
   selectedProjectKey: string | null;
@@ -349,6 +356,12 @@ export interface RendererState {
   composerText: string;
   /** Session-owned imported drafts waiting for the next Turn. */
   composerAttachments: DesktopAttachmentDraft[];
+  /** Drafts remain local to their mode/project/Session owner. */
+  composerDrafts: Record<string, { text: string; attachments: DesktopAttachmentDraft[] }>;
+  /** Revision changes whenever an owner edits its draft, for late commit receipts. */
+  composerDraftRevisions: Record<string, number>;
+  /** Last visible owner in each mode, used only to restore navigation. */
+  modeSelections: Record<"coding" | "general", { projectKey: string | null; sessionId: string | null }>;
   panelMode: PanelModePreference;
   sidebarWidth: number;
   runtimePanelWidth: number;
@@ -390,6 +403,7 @@ export interface SessionRuntimeSnapshot {
 
 export const DEFAULT_RENDERER_STATE: RendererState = {
   runtimeState: "booting",
+  mode: "coding",
   runtimeError: null,
   projects: [],
   selectedProjectKey: null,
@@ -427,6 +441,12 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   diagnostics: [],
   composerText: "",
   composerAttachments: [],
+  composerDrafts: {},
+  composerDraftRevisions: {},
+  modeSelections: {
+    coding: { projectKey: null, sessionId: null },
+    general: { projectKey: "uthcode:general", sessionId: null },
+  },
   panelMode: "docked",
   sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   runtimePanelWidth: DEFAULT_RUNTIME_PANEL_WIDTH,
@@ -445,6 +465,53 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   processReaders: {},
 };
 
+export function composerDraftOwnerKey(mode: RendererState["mode"], projectKey: string | null, sessionId: string | null): string {
+  return JSON.stringify([mode, projectKey, sessionId]);
+}
+
+function cacheComposerDraft(state: RendererState): RendererState {
+  const key = composerDraftOwnerKey(state.mode, state.selectedProjectKey, state.selectedSessionId);
+  return {
+    ...state,
+    composerDrafts: {
+      ...state.composerDrafts,
+      [key]: { text: state.composerText, attachments: state.composerAttachments.map((attachment) => ({ ...attachment })) },
+    },
+    composerDraftRevisions: { ...state.composerDraftRevisions, [key]: state.composerDraftRevisions[key] ?? 0 },
+  };
+}
+
+function activateComposerDraft(state: RendererState, mode: RendererState["mode"], projectKey: string | null, sessionId: string | null): RendererState {
+  const key = composerDraftOwnerKey(mode, projectKey, sessionId);
+  const draft = state.composerDrafts[key] ?? { text: "", attachments: [] };
+  return {
+    ...state,
+    mode,
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    composerText: draft.text,
+    composerAttachments: draft.attachments.map((attachment) => ({ ...attachment })),
+    composerDrafts: {
+      ...state.composerDrafts,
+      [key]: { text: draft.text, attachments: draft.attachments.map((attachment) => ({ ...attachment })) },
+    },
+    composerDraftRevisions: { ...state.composerDraftRevisions, [key]: state.composerDraftRevisions[key] ?? 0 },
+    modeSelections: { ...state.modeSelections, [mode]: { projectKey, sessionId } },
+  };
+}
+
+function updateActiveComposerDraft(state: RendererState, text = state.composerText, attachments = state.composerAttachments): RendererState {
+  const key = composerDraftOwnerKey(state.mode, state.selectedProjectKey, state.selectedSessionId);
+  return {
+    ...state,
+    composerDrafts: {
+      ...state.composerDrafts,
+      [key]: { text, attachments: attachments.map((attachment) => ({ ...attachment })) },
+    },
+    composerDraftRevisions: { ...state.composerDraftRevisions, [key]: (state.composerDraftRevisions[key] ?? 0) + 1 },
+  };
+}
+
 export function createInitialState(overrides: Partial<RendererState> = {}): RendererState {
   return {
     ...DEFAULT_RENDERER_STATE,
@@ -456,6 +523,18 @@ export function createInitialState(overrides: Partial<RendererState> = {}): Rend
     todo: overrides.todo?.map((item) => ({ ...item })) ?? [],
     diagnostics: overrides.diagnostics ? [...overrides.diagnostics] : [],
     composerAttachments: overrides.composerAttachments?.map((attachment) => ({ ...attachment })) ?? [],
+    composerDrafts: overrides.composerDrafts
+      ? Object.fromEntries(Object.entries(overrides.composerDrafts).map(([key, draft]) => [key, { text: draft.text, attachments: draft.attachments.map((attachment) => ({ ...attachment })) }]))
+      : {},
+    composerDraftRevisions: {
+      ...Object.fromEntries(Object.keys(overrides.composerDrafts ?? {}).map((key) => [key, overrides.composerDraftRevisions?.[key] ?? 0])),
+      ...(overrides.composerDraftRevisions ?? {}),
+      [composerDraftOwnerKey(overrides.mode ?? DEFAULT_RENDERER_STATE.mode, overrides.selectedProjectKey ?? null, overrides.selectedSessionId ?? null)]:
+        overrides.composerDraftRevisions?.[composerDraftOwnerKey(overrides.mode ?? DEFAULT_RENDERER_STATE.mode, overrides.selectedProjectKey ?? null, overrides.selectedSessionId ?? null)] ?? 0,
+    },
+    modeSelections: overrides.modeSelections
+      ? { coding: { ...overrides.modeSelections.coding }, general: { ...overrides.modeSelections.general } }
+      : { coding: { projectKey: null, sessionId: null }, general: { projectKey: "uthcode:general", sessionId: null } },
     ignoredRunIds: overrides.ignoredRunIds ? [...overrides.ignoredRunIds] : [],
     sessionModels: overrides.sessionModels ? { ...overrides.sessionModels } : {},
     sessionRuntime: overrides.sessionRuntime
@@ -653,6 +732,12 @@ function applyLiveContextDelta(state: RendererState, text: string): RendererStat
       source: "turn",
     },
   };
+}
+
+function observedTimestamp(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/u.test(value)) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 function eventId(prefix: string, event: Record<string, JsonValue>): string {
@@ -1120,7 +1205,8 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const id = eventId("tool", payload);
     const closedReasoning = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     if (closedReasoning.timeline.some((entry) => entry.id === id)) return closedReasoning;
-    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, startedAt: Date.now() }] };
+    const observedAt = observedTimestamp(payload.observed_at);
+    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, ...(observedAt !== undefined ? { startedAt: observedAt } : {}) }] };
   }
   if (type === "tool_finished") {
     if (hasDurableTimelineIdentity(state, "tool", turnId, textValue(payload.tool_call_id))) return state;
@@ -1130,12 +1216,13 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const failed = payload.is_error === true || rawStatus === "failed" || rawStatus === "error" || rawStatus === "rejected";
     const isError = failed;
     const status: TimelineStatus = cancelled ? "cancelled" : failed ? "failed" : "completed";
-    const endedAt = Date.now();
+    const endedAt = observedTimestamp(payload.observed_at);
+    const outputPreview = typeof payload.output_preview === "string" && payload.output_preview.length <= 1024 ? payload.output_preview : undefined;
     const existing = state.timeline.find((entry) => entry.id === id);
     if (existing && existing.status !== "running") return state;
     let next = existing
-      ? updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError, endedAt, startedAt: entry.startedAt ?? endedAt }))
-      : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, startedAt: endedAt, endedAt }] };
+      ? updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }))
+      : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }] };
     const iteration = positiveInteger(payload.iteration);
     const toolCallId = nonEmptyText(payload.tool_call_id);
     if ((cancelled || failed) && eventRunId && iteration !== null && toolCallId) next = planTerminalForTool(next, eventRunId, turnId, iteration, toolCallId, cancelled ? "cancelled" : "failed");
@@ -1306,6 +1393,8 @@ export type RendererAction =
   | { type: "status_loaded"; result: unknown }
   | { type: "runtime_error"; message: string; state?: RuntimeStateName }
   | { type: "project_opened"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean }
+  | { type: "general_opened"; result: unknown; sessionId: string | null }
+  | { type: "mode_empty"; mode: "coding" | "general" }
   | { type: "catalog_refreshed"; projectKey: string; sessions: unknown[]; reason?: SessionOrderReason; focusSessionId?: string }
   | { type: "history_page_started"; projectKey: string; sessionId: string }
   | { type: "history_page_loading"; projectKey: string; sessionId: string }
@@ -1314,6 +1403,7 @@ export type RendererAction =
   | { type: "session_preparation"; projectKey: string; sessionId: string; status: SessionPreparationState }
   | { type: "session_resumed"; result: unknown; preserveRuntimeState?: boolean; preserveSessionRuntime?: boolean; preserveTimeline?: boolean }
   | { type: "session_mutated"; sourceProjectKey: string; result: unknown }
+  | { type: "session_archived_current"; projectKey: string; sessionId: string }
   | { type: "session_new"; sessionId: string; run: unknown; modelRef?: string | null; preserveSessionRuntime?: boolean }
   | { type: "compaction_started"; trigger?: CompactionTrigger; operationId?: string; sessionId?: string; projectKey?: string }
   | { type: "agent_event"; event: AgentEvent }
@@ -1325,7 +1415,8 @@ export type RendererAction =
   | { type: "session_mutation_busy"; value: boolean }
   | { type: "command_candidates"; result: unknown }
   | { type: "model_candidates"; values: string[] }
-  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string; attachments?: TimelineAttachment[]; sessionId?: string }
+  | { type: "turn_accepted"; run: unknown; steering: boolean; text?: string; attachments?: TimelineAttachment[]; submittedAttachmentRefs?: string[]; sessionId?: string; submission?: { mode: RendererState["mode"]; projectKey: string | null; sessionId: string | null; viewRevision: number; draftRevision: number; text: string; attachmentRefs: string[] } }
+  | { type: "submission_committed_offscreen"; submission: { mode: RendererState["mode"]; projectKey: string | null; sessionId: string | null; draftRevision: number; text: string; attachmentRefs: string[]; acceptedSessionId?: string } }
   | { type: "steering_submission_failed"; runId: string; turnId: string }
   | { type: "composer_attachment_added"; attachment: DesktopAttachmentDraft }
   | { type: "composer_attachment_removed"; ref: string }
@@ -1490,12 +1581,58 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     }
     case "runtime_error":
       return { ...state, runtimeState: action.state ?? "failed", runtimeError: action.message };
-    case "project_opened":
-      return applyProjectOpened(state, action.result, action.preserveRuntimeState, action.preserveSessionRuntime);
+    case "project_opened": {
+      const cached = cacheComposerDraft(state);
+      const opened = applyProjectOpened(cached, action.result, action.preserveRuntimeState, action.preserveSessionRuntime);
+      const project = asRecord(resultRecord(action.result).project);
+      if (!nonEmptyText(project?.path)) return opened;
+      return activateComposerDraft(opened, "coding", opened.selectedProjectKey, null);
+    }
+    case "general_opened": {
+      const cached = cacheComposerDraft(state);
+      const previousSelections = {
+        ...cached.modeSelections,
+        [cached.mode]: { projectKey: cached.selectedProjectKey, sessionId: cached.selectedSessionId },
+      };
+      const source = resultRecord(action.result);
+      const opened = applyProjectOpened(cached, {
+        project: { path: "uthcode:general" },
+        sessions: Array.isArray(source.sessions) ? source.sessions : [],
+        run: source.run,
+      }, true, true);
+      return activateComposerDraft({ ...opened, modeSelections: previousSelections }, "general", "uthcode:general", action.sessionId);
+    }
+    case "mode_empty": {
+      const cached = cacheComposerDraft(state);
+      const selections = {
+        ...cached.modeSelections,
+        [cached.mode]: { projectKey: cached.selectedProjectKey, sessionId: cached.selectedSessionId },
+      };
+      const empty = {
+        ...cached,
+        modeSelections: selections,
+        timeline: [],
+        todo: [],
+        todoIteration: 0,
+        run: null,
+        activeTurn: false,
+        terminalStatusPending: false,
+        turnStatus: "idle" as const,
+        pendingInteraction: null,
+        contextUsage: contextUsageAtBoundary(),
+        lastProviderRequestUsage: providerRequestUsageAtBoundary(),
+        permissionMode: "unknown" as const,
+        currentModelRef: null,
+        runtimeState: "stopped" as const,
+        sessionViewRevision: cached.sessionViewRevision + 1,
+        view: "chat" as const,
+      };
+      return activateComposerDraft(empty, action.mode, action.mode === "general" ? "uthcode:general" : null, null);
+    }
     case "catalog_refreshed":
       return applyCatalogRefreshed(state, action.projectKey, action.sessions, action.reason, action.focusSessionId);
     case "history_page_started": {
-      const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
+      const stateWithCache = cacheVisibleRuntime(cacheComposerDraft(state), state.selectedProjectKey, state.selectedSessionId);
       const key = sessionRuntimeKey(action.projectKey, action.sessionId);
       const history = stateWithCache.sessionHistory[key];
       const cached = stateWithCache.sessionRuntime[key];
@@ -1506,7 +1643,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       const sessionRuntime = cached
         ? { ...stateWithCache.sessionRuntime, [key]: { ...cached, timeline: timeline.map((entry) => ({ ...entry })) } }
         : stateWithCache.sessionRuntime;
-      return {
+      return activateComposerDraft({
         ...target,
         selectedProjectKey: action.projectKey,
         selectedSessionId: action.sessionId,
@@ -1523,8 +1660,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         sessionViewRevision: stateWithCache.sessionViewRevision + 1,
         runtimeError: null,
         notice: null,
-        composerAttachments: [],
-      };
+      }, state.mode, action.projectKey, action.sessionId);
     }
     case "history_page_loading": {
       const key = sessionRuntimeKey(action.projectKey, action.sessionId);
@@ -1588,20 +1724,14 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     }
     case "session_resumed":
       {
-        const next = {
-          ...applySessionResumed(state, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime),
-          // Draft attachments belong to the selected Session. A successful
-          // resume may replace the owner even when the visible timeline is
-          // temporarily preserved during preparation.
-          composerAttachments: [],
-        };
-        if (!action.preserveTimeline) return next;
+        const cached = cacheComposerDraft(state);
+        const next = applySessionResumed(cached, action.result, action.preserveRuntimeState, providerRequestUsageFromResult(action.result), action.preserveSessionRuntime);
+        let presented = next;
+        if (action.preserveTimeline) {
         const sessionId = nonEmptyText(resultRecord(action.result).session_id);
-        const projectKey = state.selectedProjectKey;
-        if (!sessionId || !projectKey || state.selectedSessionId !== sessionId) return next;
-        return {
+        const projectKey = next.selectedProjectKey;
+        if (sessionId && projectKey && next.selectedSessionId === sessionId) presented = {
           ...next,
-          composerAttachments: [],
           timeline: state.timeline.map((entry) => ({ ...entry })),
           ...(next.sessionRuntime[sessionRuntimeKey(projectKey, sessionId)]
             ? {
@@ -1614,21 +1744,48 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
               },
             }
             : {}),
-          sessionViewRevision: state.sessionViewRevision,
+          sessionViewRevision: next.sessionViewRevision,
           sessionPreparation: { ...state.sessionPreparation, [sessionRuntimeKey(projectKey, sessionId)]: "ready" },
         };
       }
+        return activateComposerDraft(presented, state.mode, presented.selectedProjectKey, presented.selectedSessionId);
+      }
     case "session_mutated":
       return applySessionMutation(state, action.sourceProjectKey, action.result);
+    case "session_archived_current": {
+      if (state.selectedProjectKey !== action.projectKey || state.selectedSessionId !== action.sessionId) return state;
+      const cached = cacheVisibleRuntime(cacheComposerDraft(state), action.projectKey, action.sessionId);
+      return activateComposerDraft({
+        ...cached,
+        selectedSessionId: null,
+        timeline: [],
+        todo: [],
+        todoIteration: 0,
+        run: null,
+        activeTurn: false,
+        terminalStatusPending: false,
+        turnStatus: "idle",
+        pendingInteraction: null,
+        completionBlocked: null,
+        contextUsage: contextUsageAtBoundary(),
+        lastProviderRequestUsage: providerRequestUsageAtBoundary(),
+        permissionMode: "unknown",
+        currentModelRef: null,
+        compactionStatus: { state: "idle", trigger: null, changed: null },
+        sessionViewRevision: cached.sessionViewRevision + 1,
+        runtimeState: "ready",
+        runtimeError: null,
+        notice: null,
+      }, state.mode, action.projectKey, null);
+    }
     case "session_new": {
-      const stateWithCache = cacheVisibleRuntime(state, state.selectedProjectKey, state.selectedSessionId);
+      const stateWithCache = cacheVisibleRuntime(cacheComposerDraft(state), state.selectedProjectKey, state.selectedSessionId);
       const modelRef = nonEmptyText(action.modelRef);
       const next: RendererState = {
         ...permissionUnknownAtRunBoundary(stateWithCache, action.run, action.preserveSessionRuntime !== true),
         selectedSessionId: action.sessionId,
         timeline: [],
         pendingSteeringMessageIds: {},
-        composerAttachments: [],
         todo: [],
         todoIteration: 0,
         activeTurn: false,
@@ -1645,7 +1802,27 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       };
       const key = sessionRuntimeKey(stateWithCache.selectedProjectKey, action.sessionId);
       const runtime = runtimeSnapshotFromState(next);
-      return updateSessionRuntimeStatus({ ...next, sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } }, stateWithCache.selectedProjectKey, action.sessionId, "idle");
+      const statusState = updateSessionRuntimeStatus({ ...next, sessionRuntime: { ...stateWithCache.sessionRuntime, [key]: runtime } }, stateWithCache.selectedProjectKey, action.sessionId, "idle");
+      let composerState = statusState;
+      const targetDraftExists = Object.prototype.hasOwnProperty.call(stateWithCache.composerDrafts, composerDraftOwnerKey(state.mode, state.selectedProjectKey, action.sessionId));
+      if (!state.selectedSessionId && !targetDraftExists) {
+        const sourceKey = composerDraftOwnerKey(state.mode, state.selectedProjectKey, null);
+        const sourceDraft = stateWithCache.composerDrafts[sourceKey];
+        if (sourceDraft) {
+          const composerDrafts = { ...stateWithCache.composerDrafts };
+          const composerDraftRevisions = { ...stateWithCache.composerDraftRevisions };
+          delete composerDrafts[sourceKey];
+          const targetKey = composerDraftOwnerKey(state.mode, state.selectedProjectKey, action.sessionId);
+          composerDrafts[targetKey] = {
+            text: sourceDraft.text,
+            attachments: sourceDraft.attachments.map((attachment) => ({ ...attachment })),
+          };
+          composerDraftRevisions[targetKey] = composerDraftRevisions[sourceKey] ?? 0;
+          delete composerDraftRevisions[sourceKey];
+          composerState = { ...statusState, composerDrafts, composerDraftRevisions };
+        }
+      }
+      return activateComposerDraft(composerState, state.mode, state.selectedProjectKey, action.sessionId);
     }
     case "compaction_started": {
       if ((action.sessionId && action.sessionId !== state.selectedSessionId)
@@ -1706,6 +1883,11 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     case "model_candidates":
       return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
     case "turn_accepted": {
+      const submission = action.submission;
+      if (submission && (submission.mode !== state.mode
+        || submission.projectKey !== state.selectedProjectKey
+        || submission.sessionId !== state.selectedSessionId
+        || submission.viewRevision !== state.sessionViewRevision)) return state;
       const acceptedRun = normalizeRun(action.run);
       const acceptedPermission = permissionModeOf(acceptedRun);
       const acceptedRunId = runIdOf(acceptedRun);
@@ -1746,14 +1928,84 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           attachments: attachments.map((attachment) => ({ ...attachment })),
         }])
         : state.timeline;
-      const next = { ...state, timeline, pendingSteeringMessageIds, run: acceptedRun ?? state.run, permissionMode, activeTurn: true, terminalStatusPending: false, turnStatus: "running" as const, composerText: "", ...(action.steering ? {} : { pendingInteraction: null, todo: [], todoIteration: 0, composerAttachments: [] }) };
+      const submittedAttachmentRefs = submission?.attachmentRefs ?? action.submittedAttachmentRefs ?? [];
+      const currentAttachmentRefs = state.composerAttachments.map((attachment) => attachment.ref);
+      const activeDraftKey = composerDraftOwnerKey(state.mode, state.selectedProjectKey, state.selectedSessionId);
+      const submittedDraftVersionMatches = !submission
+        || (state.composerDraftRevisions[activeDraftKey] ?? 0) === submission.draftRevision;
+      const submittedTextMatches = submittedDraftVersionMatches
+        && state.composerText === (submission?.text ?? action.text ?? "");
+      const submittedAttachmentsMatch = submittedDraftVersionMatches
+        && submittedAttachmentRefs.length === currentAttachmentRefs.length
+        && submittedAttachmentRefs.every((ref, index) => ref === currentAttachmentRefs[index]);
+      const acceptedState = {
+        ...state,
+        timeline,
+        pendingSteeringMessageIds,
+        run: acceptedRun ?? state.run,
+        permissionMode,
+        activeTurn: true,
+        terminalStatusPending: false,
+        turnStatus: "running" as const,
+        composerText: submittedTextMatches ? "" : state.composerText,
+        ...(action.steering ? {} : {
+          pendingInteraction: null,
+          todo: [],
+          todoIteration: 0,
+          composerAttachments: submittedAttachmentsMatch ? [] : state.composerAttachments,
+        }),
+      };
+      const next = updateActiveComposerDraft(acceptedState);
       const acceptedSessionId = !state.selectedSessionId ? nonEmptyText(action.sessionId) : null;
       if (acceptedSessionId) {
+        const sourceKey = composerDraftOwnerKey(state.mode, state.selectedProjectKey, state.selectedSessionId);
+        const targetKey = composerDraftOwnerKey(state.mode, state.selectedProjectKey, acceptedSessionId);
+        const composerDrafts = { ...next.composerDrafts };
+        const composerDraftRevisions = { ...next.composerDraftRevisions };
+        const currentDraft = composerDrafts[sourceKey] ?? { text: next.composerText, attachments: next.composerAttachments };
+        composerDrafts[targetKey] = {
+          text: currentDraft.text,
+          attachments: currentDraft.attachments.map((attachment) => ({ ...attachment })),
+        };
+        composerDraftRevisions[targetKey] = composerDraftRevisions[sourceKey] ?? 0;
+        delete composerDrafts[sourceKey];
+        delete composerDraftRevisions[sourceKey];
+        next.composerDrafts = composerDrafts;
+        next.composerDraftRevisions = composerDraftRevisions;
         next.selectedSessionId = acceptedSessionId;
         next.sessionViewRevision = state.sessionViewRevision + 1;
       }
       if (!action.steering || !action.text?.trim()) return next;
       return { ...next, timeline: [...next.timeline, { id: `steering:${next.run?.run_id ?? "run"}:${next.run?.turn_id ?? "turn"}:${next.nextStatusId}`, kind: "steering", text: action.text, runId: next.run?.run_id, turnId: next.run?.turn_id, ...(pendingSteeringId ? { messageId: pendingSteeringId } : {}), status: "completed" }], nextStatusId: next.nextStatusId + 1 };
+    }
+    case "submission_committed_offscreen": {
+      const { submission } = action;
+      const sourceKey = composerDraftOwnerKey(submission.mode, submission.projectKey, submission.sessionId);
+      const sourceDraft = state.composerDrafts[sourceKey];
+      if (!sourceDraft || state.composerDraftRevisions[sourceKey] !== submission.draftRevision) return state;
+      const textMatches = sourceDraft.text === submission.text;
+      const attachmentRefs = sourceDraft.attachments.map((attachment) => attachment.ref);
+      const attachmentsMatch = attachmentRefs.length === submission.attachmentRefs.length
+        && submission.attachmentRefs.every((ref, index) => ref === attachmentRefs[index]);
+      if (!textMatches && !attachmentsMatch) return state;
+      const remainingDraft = {
+        text: textMatches ? "" : sourceDraft.text,
+        attachments: attachmentsMatch ? [] : sourceDraft.attachments.map((attachment) => ({ ...attachment })),
+      };
+      const composerDrafts = { ...state.composerDrafts };
+      const composerDraftRevisions = { ...state.composerDraftRevisions };
+      const committedRevision = submission.draftRevision + 1;
+      if (!submission.sessionId && submission.acceptedSessionId) {
+        const targetKey = composerDraftOwnerKey(submission.mode, submission.projectKey, submission.acceptedSessionId);
+        composerDrafts[targetKey] = remainingDraft;
+        composerDraftRevisions[targetKey] = committedRevision;
+        delete composerDrafts[sourceKey];
+        delete composerDraftRevisions[sourceKey];
+      } else {
+        composerDrafts[sourceKey] = remainingDraft;
+        composerDraftRevisions[sourceKey] = committedRevision;
+      }
+      return { ...state, composerDrafts, composerDraftRevisions };
     }
     case "steering_submission_failed": {
       const pendingSteeringMessageIds = pendingSteeringWithoutTurn(state, action.runId, action.turnId);
@@ -1761,12 +2013,12 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
     }
     case "composer_attachment_added": {
       if (state.composerAttachments.some((attachment) => attachment.ref === action.attachment.ref)) return state;
-      return { ...state, composerAttachments: [...state.composerAttachments, { ...action.attachment }] };
+      return updateActiveComposerDraft({ ...state, composerAttachments: [...state.composerAttachments, { ...action.attachment }] });
     }
     case "composer_attachment_removed":
-      return { ...state, composerAttachments: state.composerAttachments.filter((attachment) => attachment.ref !== action.ref) };
+      return updateActiveComposerDraft({ ...state, composerAttachments: state.composerAttachments.filter((attachment) => attachment.ref !== action.ref) });
     case "composer_attachments_cleared":
-      return state.composerAttachments.length === 0 ? state : { ...state, composerAttachments: [] };
+      return state.composerAttachments.length === 0 ? state : updateActiveComposerDraft({ ...state, composerAttachments: [] });
     case "command_result": {
       const source = resultRecord(action.result);
       // Command results are a typed Desktop contract.  Never render
@@ -1785,7 +2037,6 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           compactionStatus: { state: "running", trigger: "manual", changed: null, operation_id: operationId },
           commandOutput: notice,
           notice,
-          composerText: "",
         };
       }
       if (source.code === "compact_failed" || source.code === "compact_cancelled" || source.code === "compact_no_change" || source.code === "compact_completed") {
@@ -1801,7 +2052,6 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           compactionStatus: { state: compactState, trigger: "manual", changed: compactState === "completed" ? true : compactState === "no_change" ? false : null },
           commandOutput: notice,
           notice,
-          composerText: "",
         };
       }
       // `/status` carries the same safe projection as `status.get`.  Consume
@@ -1813,7 +2063,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           type: "status_loaded",
           result: params ?? {},
         });
-        return { ...projected, commandOutput: notice, notice, composerText: "" };
+        return { ...projected, commandOutput: notice, notice };
       }
       // `/compact` returns only its safe compaction DTO.  Apply it at the
       // same typed boundary; no command prose is needed to update the panel.
@@ -1823,19 +2073,20 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           compactionStatus: normalizeCompactionStatus(params.compaction_status, state.compactionStatus),
           commandOutput: notice,
           notice,
-          composerText: "",
         };
       }
       const sessionChanged = actionValue?.type === "session_changed";
       if (sessionChanged && typeof actionValue.session_id === "string") {
         const replay = params?.replay;
         const run = params?.run;
+        const cached = cacheComposerDraft(state);
         const next = actionValue.restored === true
-          ? applySessionResumed(state, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params), true)
-          : { ...permissionUnknownAtRunBoundary(state, run, false), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...state.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
-        return { ...next, pendingSteeringMessageIds: {}, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
+          ? applySessionResumed(cached, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params), true)
+          : { ...permissionUnknownAtRunBoundary(cached, run, false), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...cached.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
+        const presented = activateComposerDraft({ ...next, pendingSteeringMessageIds: {}, commandOutput: notice, notice, modelPickerOpen: false }, state.mode, next.selectedProjectKey, actionValue.session_id);
+        return presented;
       }
-      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], pendingSteeringMessageIds: {}, commandOutput: notice, composerText: "" };
+      if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], pendingSteeringMessageIds: {}, commandOutput: notice };
       if (actionValue?.type === "behavior_mode_selected" || actionValue?.type === "permission_mode_selected" || actionValue?.type === "model_selected") {
         const projectedRun = normalizeRun(params?.run);
         const projectedPermission = permissionModeOf(projectedRun);
@@ -1861,13 +2112,13 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
             sessions: project.sessions.map((session) => session.session_id === state.selectedSessionId ? { ...session, model_ref: selectedModelRef } : session),
           }))
           : state.projects;
-        return { ...state, run, permissionMode, currentModelRef, sessionModels, projects, contextUsage, commandOutput: notice, notice, composerText: "", modelPickerOpen: false };
+        return { ...state, run, permissionMode, currentModelRef, sessionModels, projects, contextUsage, commandOutput: notice, notice, modelPickerOpen: false };
       }
-      if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: notice, notice, composerText: "" };
-      return { ...state, commandOutput: notice, notice, composerText: "" };
+      if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: notice, notice };
+      return { ...state, commandOutput: notice, notice };
     }
     case "composer_text":
-      return { ...state, composerText: action.text };
+      return updateActiveComposerDraft({ ...state, composerText: action.text });
     case "session_result_seen":
       return state;
     case "clear_timeline":

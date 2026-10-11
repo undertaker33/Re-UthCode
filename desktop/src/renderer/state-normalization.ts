@@ -401,6 +401,11 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
       const runId = nonEmptyText(source.run_id);
       const turnId = nonEmptyText(source.turn_id);
       const attachments = normalizeAttachments(source.attachments);
+      const startedAt = observedTimestamp(source.started_at);
+      const endedAt = observedTimestamp(source.completed_at);
+      const fileChanges = Array.isArray(source.file_changes)
+        ? source.file_changes.map(asRecord).filter((item): item is Record<string, JsonValue> => item !== null)
+        : [];
       const statusValue = source.status;
       const terminalStatus: TimelineStatus = statusValue === "failed" || statusValue === "error" || statusValue === "rejected"
         ? "failed"
@@ -428,11 +433,23 @@ export function replayToTimeline(records: readonly unknown[]): TimelineEntry[] {
         planState: normalizedKind === "plan"
           ? terminalStatus === "failed" ? "failed" : terminalStatus === "cancelled" ? "cancelled" : "final"
           : undefined,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(endedAt !== undefined ? { endedAt } : {}),
+        ...(typeof source.output_preview === "string" && source.output_preview.length <= 1024 ? { outputPreview: source.output_preview } : {}),
+        ...(source.output_preview_truncated === true && typeof source.output_preview === "string" && source.output_preview.length <= 1024 ? { outputPreviewTruncated: true } : {}),
+        ...(typeof source.output_ref === "string" && source.output_ref.length > 0 ? { outputRef: source.output_ref } : {}),
+        ...(fileChanges.length > 0 ? { fileChanges } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
         sequence,
       };
     });
   return mergeUserMessageParts(timeline);
+}
+
+function observedTimestamp(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/u.test(value)) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 /** Normalize a complete Desktop command response for reducer branches. */

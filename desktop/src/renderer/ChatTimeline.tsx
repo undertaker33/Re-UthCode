@@ -131,6 +131,9 @@ export interface ChatTimelineProps {
   onPreviewArtifact?: (path: string, mode?: FilePreviewMode) => Promise<ArtifactDescriptor | null>;
   onCopyPath?: (path: string) => Promise<void>;
   onOpenDocument?: (preview: DocumentPreview) => void;
+  onViewToolOutput?: (entry: TimelineEntry) => void;
+  onReviewProcessLog?: (processId: string) => void;
+  onReviewCurrentDiff?: (path: string) => void;
   onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>;
   onOpenAttachment?: (ref: string) => Promise<void>;
   onRevealAttachment?: (ref: string) => Promise<void>;
@@ -191,8 +194,19 @@ function toolStatusIcon(status: string): UiIconName {
 
 function elapsedSeconds(entry: TimelineEntry, now: number): number | null {
   if (entry.startedAt === undefined) return null;
-  const end = entry.endedAt ?? now;
+  const end = entry.status === "running" ? now : entry.endedAt;
+  if (end === undefined) return null;
   return Math.max(0, Math.floor((end - entry.startedAt) / 1000));
+}
+
+function activitySpanSeconds(entries: readonly TimelineEntry[], now: number): number | null {
+  if (entries.length === 0 || entries.some((entry) => entry.startedAt === undefined)) return null;
+  const ends = entries.map((entry) => entry.status === "running" ? now : entry.endedAt);
+  if (ends.some((end) => end === undefined)) return null;
+  const starts = entries.map((entry) => entry.startedAt!);
+  const earliestStart = Math.min(...starts);
+  const latestEnd = Math.max(...ends as number[]);
+  return Math.max(0, Math.floor((latestEnd - earliestStart) / 1000));
 }
 
 function todoStatusLabel(status: TodoItem["status"], t: (key: TranslationKey) => string): string {
@@ -203,7 +217,7 @@ function isUnavailableAttachment(attachment: TimelineAttachment): attachment is 
   return "available" in attachment && attachment.available === false;
 }
 
-function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => string, previews: Readonly<Record<string, DesktopAttachmentDraft>>, onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>, onOpenAttachment?: (ref: string) => Promise<void>, onRevealAttachment?: (ref: string) => Promise<void>, onCopyAttachmentPath?: (ref: string, assetRef?: string) => Promise<void>) {
+function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => string, previews: Readonly<Record<string, DesktopAttachmentDraft>>, onPreviewAttachment?: (ref: string, mode?: FilePreviewMode) => Promise<DesktopAttachmentDraft | null>, onOpenAttachment?: (ref: string) => Promise<void>, onRevealAttachment?: (ref: string) => Promise<void>, onCopyAttachmentPath?: (ref: string, assetRef?: string) => Promise<void>, onOpenDocument?: (preview: DocumentPreview) => void) {
   if (!entry.attachments || entry.attachments.length === 0) return null;
   return <div className="timeline-attachments" aria-label={t("attachments")}>
     {entry.attachments.map((attachment, index) => {
@@ -222,10 +236,31 @@ function renderAttachmentRows(entry: TimelineEntry, t: (key: TranslationKey) => 
           onOpen={onOpenAttachment ? async () => onOpenAttachment(attachment.ref) : undefined}
           onReveal={onRevealAttachment ? async () => onRevealAttachment(attachment.ref) : undefined}
           onCopyPath={onCopyAttachmentPath ? async () => onCopyAttachmentPath(attachment.ref, hydrated.asset_ref) : undefined}
+          onOpenDocument={onOpenDocument}
         />
       </div>;
     })}
   </div>;
+}
+
+function renderToolActivity(activity: TimelineEntry, now: number, t: (key: TranslationKey) => string, onViewToolOutput?: (entry: TimelineEntry) => void, onReviewCurrentDiff?: (path: string) => void) {
+  const status = activity.status || "running";
+  const elapsed = elapsedSeconds(activity, now);
+  const changes = activity.fileChanges ?? [];
+  const failed = status === "failed" || status === "cancelled";
+  return <article className={`timeline-activity-item${status === "running" ? " is-running" : ""}${failed ? " is-failed" : ""}`} key={activity.id} aria-label={(activity.toolName || t("toolLabel")) + ": " + localText(status, t)} aria-busy={status === "running" || undefined}>
+    <header><span>{activity.toolName || t("toolLabel")}</span><small className="tool-status" data-status={status} data-error={activity.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null ? <span className="tool-elapsed"> · {elapsed}s</span> : <span className="tool-elapsed"> · {t("durationUnavailable")}</span>}</small></header>
+    <p>{activity.text}</p>
+    {activity.command && <pre className="timeline-activity-command">{activity.command}</pre>}
+    {changes.length > 0 && <ul className="timeline-file-changes" aria-label={t("reviewCurrentDiff")}>{changes.flatMap((change, changeIndex) => {
+      const paths = [typeof change.path === "string" ? change.path : "", ...(Array.isArray(change.applied_paths) ? change.applied_paths.filter((path): path is string => typeof path === "string") : [])].filter(Boolean);
+      const statusText = typeof change.status === "string" ? change.status : "changed";
+      return paths.map((path) => <li key={changeIndex + ":" + path}><span>{statusText}</span>{onReviewCurrentDiff ? <button type="button" onClick={() => onReviewCurrentDiff(path)}>{path} · {t("reviewCurrentDiff")}</button> : <span>{path}</span>}</li>);
+    })}</ul>}
+    {activity.outputPreview !== undefined || activity.outputRef
+      ? <button type="button" className="timeline-tool-output" onClick={() => onViewToolOutput?.(activity)}>{t("viewToolOutput")}{activity.outputPreviewTruncated ? " · " + t("previewTruncated") : ""}</button>
+      : status !== "running" && <p className="timeline-tool-output-unavailable">{t("toolOutputUnavailable")}</p>}
+  </article>;
 }
 
 function timelineContentFingerprint(entries: TimelineEntry[], notice: string | null | undefined, runtimeError: string | null | undefined, runtimeErrorVisible: boolean): string {
@@ -246,7 +281,7 @@ function attachmentPreviewFingerprint(entries: TimelineEntry[]): string {
     .join("|");
 }
 
-export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, onCopyPath, onOpenDocument, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
+export function ChatTimeline({ entries, todo, notice, compactionNotice, compactionAnchor, compactionRunning = false, compactionCompleted = false, onLatestSeen, runtimeError, runtimeErrorVisible = false, onOpenSettings, onCopyText, onOpenArtifact, onDescribeArtifact, onAuthorizeArtifact, onRevealArtifact, onPreviewArtifact, onCopyPath, onOpenDocument, onViewToolOutput, onReviewProcessLog, onReviewCurrentDiff, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, sessionKey = "default", onLoadOlder, onRetryOlder, historyHasMore = false, historyLoading = false, historyError = null, historyRevision = 0, preparationStatus, processLogs = [], processReaders = {}, onReadProcess, onStopProcess }: ChatTimelineProps) {
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   const [showNewMessages, setShowNewMessages] = useState(false);
@@ -500,7 +535,7 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
             const processEntries = processLogs.filter((entry) => entry.processId === processId);
             const displayRows = projectProcessLogRows(processEntries);
             return <section className="timeline-process-log__process" key={processId} data-process-session={sessionKey} data-process-owner={processId}>
-              <header><strong>{processId.slice(0, 8)}</strong>{reader?.state && <span>{reader.state}</span>}{onReadProcess && <>
+              <header><strong>{processId.slice(0, 8)}</strong>{reader?.state && <span>{reader.state}</span>}{onReviewProcessLog && <button type="button" onClick={() => onReviewProcessLog(processId)}>{t("reviewProcessLog")}</button>}{onReadProcess && <>
                 <button type="button" onClick={() => onReadProcess(processId, reader?.nextCursor ?? (processEntries.at(-1)?.nextCursor ?? 0))} disabled={reader?.loading === true}>{reader?.loading ? "Reading…" : "Read newer"}</button>
                 {(reader?.earliestCursor ?? 0) > 0 && <button type="button" onClick={() => onReadProcess(processId, 0)} disabled={reader?.loading === true}>Load earliest</button>}
               </>}{onStopProcess && reader?.state === "running" && <button type="button" onClick={() => onStopProcess(processId)}>Stop</button>}</header>
@@ -521,11 +556,32 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
             <span>{localText(entry.text, t)}</span>
           </p>{index === compactionIndex && compactionLine}</Fragment>;
         }
-        const status = entry.status || "running";
-        const elapsed = entry.kind === "tool" ? elapsedSeconds(entry, now) : null;
-        return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}${entry.kind === "tool" && status === "running" ? " is-running" : ""}`} aria-label={`${entryLabel(entry, t)}${entry.kind === "tool" ? `: ${localText(status, t)}` : ""}`} aria-busy={entry.streaming || status === "running" || undefined}>
-          <header><span>{entryLabel(entry, t)}</span>{entry.kind === "tool" && <small className="tool-status" data-status={status} data-error={entry.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null && <span className="tool-elapsed" aria-label={`${elapsed}s`}> · {elapsed}s</span>}</small>}{entry.streaming && <small>{t("writing")}</small>}</header>
-          <div className="timeline-content">{entry.kind === "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}{entry.kind === "tool" ? <p><span className="tool-summary-icon" aria-hidden="true"><UiIcon name={toolStatusIcon(status)} /></span><span>{entry.text}</span><span className="sr-only"> · {localText(status, t)}{elapsed !== null ? ` · ${elapsed}s` : ""}</span></p> : entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{entry.kind !== "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath)}</div>
+        if (entry.kind === "tool") {
+          const failed = entry.status === "failed" || entry.status === "cancelled";
+          if (failed) return <Fragment key={entry.id}>{renderToolActivity(entry, now, t, onViewToolOutput, onReviewCurrentDiff)}{index === compactionIndex && compactionLine}</Fragment>;
+          const previousToolFailed = index > 0
+            && entries[index - 1]?.kind === "tool"
+            && (entries[index - 1]?.status === "failed" || entries[index - 1]?.status === "cancelled");
+          if (index > 0 && entries[index - 1]?.kind === "tool" && !previousToolFailed) return null;
+          const group: TimelineEntry[] = [];
+          for (let cursor = index; cursor < entries.length && entries[cursor]?.kind === "tool"; cursor += 1) {
+            const activity = entries[cursor]!;
+            if (activity.status === "failed" || activity.status === "cancelled") break;
+            group.push(activity);
+          }
+          const runningCount = group.filter((item) => item.status === "running").length;
+          const span = activitySpanSeconds(group, now);
+          return <Fragment key={"activity:" + group[0]?.id}>
+            <details className="timeline-activity-group" data-tool-count={group.length}>
+              <summary><span className="timeline-activity-group__title">{group.length} {t("activities")}</span><span className={"timeline-activity-group__status" + (runningCount ? " is-running" : "")}>{runningCount ? t("running") : t("completed")}</span><small>{span !== null ? `${span}s` : t("durationUnavailable")}</small></summary>
+              <div className="timeline-activity-group__items">{group.map((activity) => renderToolActivity(activity, now, t, onViewToolOutput, onReviewCurrentDiff))}</div>
+            </details>
+            {index + group.length - 1 === compactionIndex && compactionLine}
+          </Fragment>;
+        }
+        return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}`} aria-label={entryLabel(entry, t)} aria-busy={entry.streaming || undefined}>
+          <header><span>{entryLabel(entry, t)}</span>{entry.streaming && <small>{t("writing")}</small>}</header>
+          <div className="timeline-content">{entry.kind === "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}{entry.kind === "status" ? renderMarkdown(localText(entry.text, t), { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts }) : renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{entry.kind !== "user" && renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}</div>
         </article>{index === compactionIndex && compactionLine}</Fragment>;
       })}
       {runtimeError && !runtimeErrorVisible && <div className="timeline-runtime-error" data-runtime-error-owner="timeline" role="alert">

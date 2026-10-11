@@ -11,11 +11,16 @@ import { Composer } from "../src/renderer/Composer";
 import { DocumentPreviewPanel } from "../src/renderer/DocumentPreviewPanel";
 import { FileCard } from "../src/renderer/FileCard";
 import { RendererErrorBoundary } from "../src/renderer/RendererErrorBoundary";
-import { createInitialState } from "../src/renderer/state";
+import { createInitialState, type ProcessLogEntry, type ProjectState } from "../src/renderer/state";
+import { sessionRuntimeKey } from "../src/renderer/state-session";
 import { LanguageProvider, resources } from "../src/renderer/i18n";
 
 async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement, root: Root) => Promise<T>): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body><div id=root></div></body></html>", { url: "http://localhost/" });
+  if (!("attachEvent" in dom.window.HTMLElement.prototype)) {
+    Object.defineProperty(dom.window.HTMLElement.prototype, "attachEvent", { configurable: true, value: () => undefined });
+    Object.defineProperty(dom.window.HTMLElement.prototype, "detachEvent", { configurable: true, value: () => undefined });
+  }
   const container = dom.window.document.getElementById("root");
   assert.ok(container);
   const globalObject = globalThis as unknown as Record<string, unknown>;
@@ -281,6 +286,307 @@ test("App preserves imported Markdown preview text and opens its document panel"
   });
 });
 
+test("T09 chat image attachment opens in the shared review tab and keeps the zoom modal", async () => {
+  const api = appTestApi(async (method) => {
+    if (method === "attachment.preview") return { attachment: { ...attachment, preview_kind: "image", data_url: attachment.data_url } };
+    return method === "status.get" ? { active_turn: false } : {};
+  });
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App api={api} initialState={createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      timeline: [{ id: "image-message", kind: "user", text: "See image", attachments: [{ ref: attachment.ref, display_name: attachment.display_name, mime_type: attachment.mime_type, size_bytes: attachment.size_bytes, data_url: attachment.data_url }] }],
+    })} />); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const card = container.querySelector<HTMLElement>(".timeline-attachments .file-card");
+    assert.ok(card);
+    act(() => { card.dispatchEvent(new _dom.window.MouseEvent("dblclick", { bubbles: true })); });
+    await act(async () => { for (let index = 0; index < 3; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.equal(container.querySelectorAll(".review-panel").length, 1);
+    assert.equal(container.querySelector(".document-review-image img")?.getAttribute("src"), attachment.data_url);
+    const imageButton = container.querySelector<HTMLButtonElement>(".document-review-image button");
+    assert.ok(imageButton);
+    act(() => { imageButton.click(); });
+    assert.ok(container.querySelector(".image-preview-modal[role='dialog']"), "the right-panel preview retains the existing zoom and focus modal");
+    assert.ok(container.querySelector(".image-preview-modal footer button"));
+  });
+});
+
+test("T09 App reviews preserve Runtime error ownership and let its toggle restore the panel", async () => {
+  const projectPath = "C:/review-runtime-owner";
+  const project: ProjectState = {
+    path: projectPath,
+    projectKey: projectPath,
+    alias: "Runtime review",
+    pinned: false,
+    catalogFresh: true,
+    sessions: [],
+  };
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let diffSequence = 0;
+  const runtimeError = "Runtime could not start";
+  const api = appTestApi(async (method, params = {}) => {
+    calls.push({ method, params: { ...params } });
+    if (method === "runtime.initialize") throw new Error(runtimeError);
+    if (method === "workspace.diff") {
+      diffSequence += 1;
+      return { operation_id: `runtime-review-${diffSequence}`, owner_key: projectPath, state: "reviewing" };
+    }
+    if (method === "workspace.diff.cancel") return { operation_id: params.operation_id ?? null, state: "cancelled" };
+    if (method === "project.sessions") return { sessions: project.sessions };
+    if (method === "history.page") return { session_id: params.session_id ?? null, records: [], next_cursor: null, has_more: false };
+    return method === "status.get" ? { active_turn: false } : {};
+  });
+  const preferenceValues: Record<string, unknown> = {
+    theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+    recentProjects: [{ path: projectPath, alias: project.alias, pinned: false }],
+    projectAliases: { [projectPath]: project.alias }, pinnedProjectKeys: [], pinnedSessions: [],
+    expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: null,
+  };
+  api.readPreference = async (key) => preferenceValues[key] as never;
+  const state = createInitialState({
+    language: "en",
+    mode: "coding",
+    panelMode: "docked",
+    runtimeState: "configuration_required",
+    runtimeError,
+    projects: [project],
+    selectedProjectKey: projectPath,
+    selectedSessionId: null,
+    expandedProjects: { [projectPath]: true },
+  });
+  const flush = async () => { await act(async () => { for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+
+  await withRendererDom(async (dom, container, root) => {
+    act(() => { root.render(<App api={api} initialState={state} />); });
+    await flush();
+    const runtimeToggle = container.querySelector<HTMLButtonElement>('.conversation-actions button[aria-controls="runtime-panel"]');
+    assert.ok(runtimeToggle);
+    assert.equal(runtimeToggle.getAttribute("aria-label"), "Close Runtime panel");
+    assert.equal(runtimeToggle.getAttribute("aria-expanded"), "true");
+    assert.equal(container.querySelector("[data-runtime-error-owner]")?.getAttribute("data-runtime-error-owner"), "runtime-panel");
+    assert.match(container.querySelector(".runtime-panel__error")?.textContent ?? "", new RegExp(runtimeError, "u"));
+
+    const openDiff = () => [...container.querySelectorAll<HTMLButtonElement>(".conversation-actions button")]
+      .find((button) => button.getAttribute("aria-label") === "Review current diff");
+    act(() => { openDiff()?.click(); });
+    await flush();
+    assert.ok(container.querySelector(".review-panel"));
+    assert.equal(container.querySelectorAll("#runtime-panel").length, 0, "Review takes the shared right panel slot");
+    assert.equal(container.querySelector("[data-runtime-error-owner]")?.getAttribute("data-runtime-error-owner"), "timeline");
+    assert.match(container.querySelector(".timeline-runtime-error")?.textContent ?? "", new RegExp(runtimeError, "u"));
+    assert.equal(container.querySelectorAll('[role="alert"]').length, 1, "Review does not hide or duplicate the Runtime error alert");
+    assert.equal(runtimeToggle.getAttribute("aria-label"), "Open Runtime panel");
+    assert.equal(runtimeToggle.getAttribute("aria-expanded"), "false");
+
+    runtimeToggle.focus();
+    act(() => { runtimeToggle.click(); });
+    await flush();
+    assert.equal(container.querySelector(".review-panel"), null, "the Runtime toggle closes the existing owner-bound ReviewPanel");
+    assert.ok(container.querySelector("#runtime-panel"), "the Runtime toggle restores the preferred docked Runtime panel");
+    assert.equal(container.querySelector("[data-runtime-error-owner]")?.getAttribute("data-runtime-error-owner"), "runtime-panel");
+    assert.equal(container.querySelector(".timeline-runtime-error"), null);
+    assert.equal(runtimeToggle.getAttribute("aria-label"), "Close Runtime panel");
+    assert.equal(runtimeToggle.getAttribute("aria-expanded"), "true");
+    assert.equal(dom.window.document.activeElement, runtimeToggle, "the stable Runtime control retains focus across the panel handoff");
+    assert.deepEqual(calls.filter((call) => call.method === "workspace.diff.cancel").map((call) => call.params.operation_id), ["runtime-review-1"]);
+
+    act(() => { openDiff()?.click(); });
+    await flush();
+    assert.ok(container.querySelector(".review-panel"), "the user can switch back to Review from the same Runtime layout preference");
+    assert.equal(container.querySelector("[data-runtime-error-owner]")?.getAttribute("data-runtime-error-owner"), "timeline");
+    assert.equal(runtimeToggle.getAttribute("aria-label"), "Open Runtime panel");
+    assert.equal(runtimeToggle.getAttribute("aria-expanded"), "false");
+
+    act(() => { runtimeToggle.click(); });
+    await flush();
+    assert.ok(container.querySelector("#runtime-panel"));
+    assert.equal(container.querySelector(".review-panel"), null);
+  });
+});
+
+test("T09 App reviews the kickoff event, bounded output pages, process log, and rejects stale owners", async () => {
+  const projectPath = "C:/review-owner";
+  const firstSession = "review-session-a";
+  const secondSession = "review-session-b";
+  const project: ProjectState = {
+    path: projectPath,
+    projectKey: projectPath,
+    alias: "Review owner",
+    pinned: false,
+    catalogFresh: true,
+    sessions: [
+      { session_id: firstSession, project_key: projectPath, title: "Review session A" },
+      { session_id: secondSession, project_key: projectPath, title: "Review session B" },
+    ],
+  };
+  const sessionKey = sessionRuntimeKey(projectPath, firstSession);
+  const logs: ProcessLogEntry[] = [{ processId: "process-review", sequence: 1, stream: "stdout", text: "first process line", nextCursor: 1 }];
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let eventListener: ((event: AgentEvent) => void) | null = null;
+  let diffSequence = 0;
+  let resolveLateOutput: ((value: JsonValue) => void) | null = null;
+  const diffEvent = (operationId: string, content: string, path = "src/current.ts"): AgentEvent => ({
+    type: "workspace_diff_result",
+    operation_id: operationId,
+    owner_key: projectPath,
+    state: "completed",
+    source: "current_working_tree",
+    project_key: projectPath,
+    viewed_at: "2026-10-11T02:00:00.000Z",
+    status: { branch: "main", entries: [{ xy: " M", path }], unborn: false, truncated: false },
+    staged_diff: { text: `+ staged ${content}`, truncated: false, size_bytes: content.length + 9 },
+    unstaged_diff: { text: `- unstaged ${content}`, truncated: false, size_bytes: content.length + 11 },
+    truncated: false,
+  } as AgentEvent);
+  const api = appTestApi(async (method, params = {}) => {
+    calls.push({ method, params: { ...params } });
+    if (method === "workspace.diff") {
+      diffSequence += 1;
+      const operationId = `review-diff-${diffSequence}`;
+      if (diffSequence === 1) eventListener?.(diffEvent(operationId, "first"));
+      if (diffSequence === 2) eventListener?.(diffEvent(operationId, "path", String(params.path)));
+      if (diffSequence === 4) eventListener?.({
+        type: "workspace_diff_result",
+        operation_id: operationId,
+        owner_key: projectPath,
+        state: "failed",
+        error_kind: "workspace_unavailable",
+      } as AgentEvent);
+      return { operation_id: operationId, owner_key: projectPath, state: "reviewing" };
+    }
+    if (method === "workspace.diff.cancel") return { operation_id: params.operation_id ?? null, state: "cancelled" };
+    if (method === "tool_result.read") {
+      if (params.ref === "result-late") return await new Promise<JsonValue>((resolve) => { resolveLateOutput = resolve; });
+      const offset = Number(params.offset ?? 0);
+      return offset === 0
+        ? { ref: params.ref, content: "first", offset: 0, next_offset: 5, total_bytes: 11, sha256: "a".repeat(64), eof: false }
+        : { ref: params.ref, content: "second", offset: 5, next_offset: 11, total_bytes: 11, sha256: "a".repeat(64), eof: true };
+    }
+    if (method === "process.read") return { process_id: params.process_id ?? "process-review", entries: [], next_cursor: params.cursor ?? 1, earliest_cursor: 0, state: "running" };
+    if (method === "project.sessions") return { sessions: project.sessions };
+    if (method === "session.resume") return { session_id: params.session_id ?? null, replay: [], run: null };
+    if (method === "history.page") return { session_id: params.session_id ?? null, records: [], next_cursor: null, has_more: false };
+    return method === "status.get" ? { active_turn: false } : {};
+  });
+  api.subscribeAgentEvents = (listener) => { eventListener = listener; return () => { eventListener = null; }; };
+  api.readPreference = async (key) => {
+    const values: Record<string, unknown> = {
+      theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+      recentProjects: [{ path: projectPath, alias: "Review owner", pinned: false }],
+      projectAliases: { [projectPath]: "Review owner" }, pinnedProjectKeys: [], pinnedSessions: [],
+      expandedProjects: { [projectPath]: true }, selectedProjectKey: projectPath, selectedSessionId: firstSession,
+    };
+    return values[key] as never;
+  };
+  const state = createInitialState({
+    language: "en",
+    mode: "coding",
+    runtimeState: "ready",
+    projects: [project],
+    selectedProjectKey: projectPath,
+    selectedSessionId: firstSession,
+    expandedProjects: { [projectPath]: true },
+    timeline: [
+      { id: "review-tool-a", kind: "tool", text: "Read completed", toolName: "Read", status: "completed", outputPreview: "safe preview", outputPreviewTruncated: true, outputRef: "result-a", fileChanges: [{ path: "src/entry.ts", status: "modified" }] },
+      { id: "review-tool-late", kind: "tool", text: "Run completed", toolName: "Run", status: "completed", outputPreview: "late preview", outputPreviewTruncated: true, outputRef: "result-late" },
+    ],
+    processLogs: { [sessionKey]: logs },
+    processReaders: { [sessionKey]: { "process-review": { nextCursor: 1, earliestCursor: 0, cursorExpired: false, state: "running", expired: false, loading: false, error: null } } },
+  });
+  const flush = async () => { await act(async () => { for (let index = 0; index < 8; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App api={api} initialState={state} />); });
+    await flush();
+    assert.ok(eventListener);
+    const currentDiff = [...container.querySelectorAll<HTMLButtonElement>(".conversation-actions button")]
+      .find((button) => button.getAttribute("aria-label") === "Review current diff");
+    assert.ok(currentDiff);
+    act(() => { currentDiff.click(); });
+    await flush();
+    assert.deepEqual(calls.find((call) => call.method === "workspace.diff")?.params, { project_key: projectPath });
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /\+ staged first/u);
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /- unstaged first/u);
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /src\/current\.ts/u);
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /2026/u, "viewed_at is shown as a current-Diff timestamp");
+
+    const activity = container.querySelector<HTMLDetailsElement>("details.timeline-activity-group");
+    assert.ok(activity);
+    act(() => { activity.querySelector("summary")?.dispatchEvent(new _dom.window.MouseEvent("click", { bubbles: true })); });
+    const pathDiff = [...activity.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")]
+      .find((button) => button.textContent?.includes("src/entry.ts"));
+    assert.ok(pathDiff);
+    act(() => { pathDiff.click(); });
+    await flush();
+    assert.deepEqual(calls.filter((call) => call.method === "workspace.diff")[1]?.params, { project_key: projectPath, path: "src/entry.ts" });
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /\+ staged path/u);
+
+    const outputButtons = activity.querySelectorAll<HTMLButtonElement>(".timeline-tool-output");
+    assert.equal(outputButtons.length, 2);
+    assert.ok(container.querySelector(".timeline")?.getAttribute("data-session-key")?.includes(firstSession), container.querySelector(".timeline")?.getAttribute("data-session-key") ?? "no timeline session key");
+    act(() => { outputButtons[0]!.click(); });
+    await flush();
+    assert.ok(calls.some((call) => call.method === "tool_result.read"), JSON.stringify(calls));
+    assert.match(container.querySelector(".review-panel__output")?.textContent ?? "", /first/u);
+    assert.ok((calls.find((call) => call.method === "tool_result.read")?.params.limit as number) <= 64 * 1024);
+    const readMore = container.querySelector<HTMLButtonElement>(".review-panel__more");
+    assert.ok(readMore);
+    act(() => { readMore.click(); });
+    await flush();
+    assert.equal(container.querySelector(".review-panel__output")?.textContent, "firstsecond");
+    assert.deepEqual(calls.filter((call) => call.method === "tool_result.read").map((call) => call.params.offset), [0, 5]);
+
+    const processLog = [...container.querySelectorAll<HTMLButtonElement>(".timeline-process-log button")]
+      .find((button) => button.textContent === "Review process log");
+    assert.ok(processLog);
+    act(() => { processLog.click(); });
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /first process line/u);
+    const readNewer = [...container.querySelectorAll<HTMLButtonElement>(".review-panel__more")]
+      .find((button) => button.textContent === "Read newer");
+    assert.ok(readNewer);
+    act(() => { readNewer.click(); });
+    await flush();
+    assert.deepEqual(calls.find((call) => call.method === "process.read")?.params, { process_id: "process-review", cursor: 1 });
+
+    act(() => { outputButtons[1]!.click(); });
+    await flush();
+    assert.equal(typeof resolveLateOutput, "function");
+    const secondSessionButton = [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes("Review session B"));
+    assert.ok(secondSessionButton);
+    act(() => { secondSessionButton.click(); });
+    await flush();
+    assert.equal(container.querySelector(".review-panel"), null, "switching Session closes the old owner tabs");
+    resolveLateOutput!({ ref: "result-late", content: "late private page", offset: 0, next_offset: 17, total_bytes: 17, sha256: "b".repeat(64), eof: true });
+    await flush();
+    assert.doesNotMatch(container.textContent ?? "", /late private page/u);
+
+    const nextOwnerDiff = [...container.querySelectorAll<HTMLButtonElement>(".conversation-actions button")]
+      .find((button) => button.getAttribute("aria-label") === "Review current diff");
+    assert.ok(nextOwnerDiff);
+    act(() => { nextOwnerDiff.click(); });
+    await flush();
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /Reading the current working tree/u);
+    const firstSessionButton = [...container.querySelectorAll<HTMLButtonElement>("button.session-line")]
+      .find((button) => button.textContent?.includes("Review session A"));
+    assert.ok(firstSessionButton);
+    act(() => { firstSessionButton.click(); });
+    await flush();
+    assert.ok(calls.some((call) => call.method === "workspace.diff.cancel" && call.params.operation_id === "review-diff-3"));
+    eventListener!({ ...diffEvent("review-diff-3", "late old owner"), project_key: projectPath } as AgentEvent);
+    await flush();
+    assert.doesNotMatch(container.textContent ?? "", /late old owner/u);
+
+    const failedDiff = [...container.querySelectorAll<HTMLButtonElement>(".conversation-actions button")]
+      .find((button) => button.getAttribute("aria-label") === "Review current diff");
+    assert.ok(failedDiff);
+    act(() => { failedDiff.click(); });
+    await flush();
+    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /unavailable/u);
+  });
+});
+
 test("Python document preview renders syntax tokens with dark and light theme colors", async () => {
   const markup = renderToStaticMarkup(<LanguageProvider value="en"><DocumentPreviewPanel
     preview={{ asset: { display_name: "sample.py", mime_type: "text/x-python" }, text: "# note\ndef greet(name):\n    return str(42)\nmessage = 'ok'" }}
@@ -513,6 +819,127 @@ test("App keeps an imported attachment available for retry when turn.start fails
   });
 });
 
+test("T10 a successful lazy Turn preserves the edited prompt and attachment vector", async () => {
+  const projectPath = "C:/t10-lazy-draft-version";
+  const laterAttachment = { ref: "att-later", display_name: "later.txt", mime_type: "text/plain", size_bytes: 6 };
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let resolveTurnStart: ((result: JsonValue) => void) | null = null;
+  const api: DesktopApi = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "runtime.initialize") return { state: "ready", run: null };
+      if (method === "settings.get") return { configuration: {} };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: [] };
+      if (method === "attachment.import") return { attachment: laterAttachment };
+      if (method === "attachment.preview") return { attachment: laterAttachment };
+      if (method === "turn.start") return new Promise<JsonValue>((resolve) => { resolveTurnStart = resolve; });
+      return {};
+    },
+    subscribeAgentEvents: () => () => undefined,
+    readPreference: async (key) => {
+      const values: Record<string, unknown> = {
+        theme: "light", language: "en", panelMode: "docked", sidebarWidth: 286, runtimePanelWidth: 318,
+        recentProjects: [{ path: projectPath, alias: "Draft version" }], projectAliases: {}, pinnedProjectKeys: [], pinnedSessions: [], expandedProjects: {},
+        selectedProjectKey: projectPath, selectedSessionId: null,
+      };
+      return values[key] as never;
+    },
+    writePreference: async () => ({}) as never,
+    chooseAttachment: async () => ({ name: "later.txt", mime_type: "text/plain", data_base64: "bGF0ZXI=" }),
+    pasteAttachment: async () => null,
+  };
+  const project: ProjectState = { path: projectPath, projectKey: projectPath, alias: "Draft version", pinned: false, sessions: [], catalogFresh: true };
+  const initialState = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: "submitted prompt",
+    composerAttachments: [attachment],
+    projects: [project],
+    selectedProjectKey: projectPath,
+    selectedSessionId: null,
+  });
+  await withRendererDom(async (dom, container, root) => {
+    act(() => { root.render(<App initialState={initialState} api={api} />); });
+    const flush = async () => { await act(async () => { for (let index = 0; index < 5; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await flush();
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    await flush();
+    assert.equal(typeof resolveTurnStart, "function");
+    assert.deepEqual(calls.find((call) => call.method === "turn.start")?.params, {
+      prompt: "submitted prompt",
+      attachments: [{ ref: attachment.ref, kind: "image" }],
+    });
+
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    assert.ok(textarea);
+    const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value")?.set;
+    assert.ok(setter);
+    act(() => {
+      textarea!.focus();
+      setter!.call(textarea, "later draft text");
+      textarea!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "later draft text" }));
+      textarea!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      textarea!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await flush();
+    const choose = container.querySelector<HTMLButtonElement>(".composer-attachment-actions button");
+    assert.ok(choose);
+    act(() => { choose!.click(); });
+    await flush();
+    assert.equal(container.querySelectorAll(".composer-attachments .file-card").length, 2, "a later attachment joins the still-editable draft while the first request is pending");
+    assert.equal(textarea!.value, "later draft text");
+
+    act(() => { resolveTurnStart!({ run_id: "run-lazy-version", turn_id: "turn-lazy-version", status: "running", session_id: "session-lazy-version" }); });
+    await flush();
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, "later draft text", "success clears only the submitted text value");
+    assert.equal(container.querySelectorAll(".composer-attachments .file-card").length, 2, "success does not clear later attachment refs");
+    assert.equal(calls.some((call) => call.method === "session.new"), false, "first accepted Turn uses the returned lazy Session identity");
+  });
+});
+
+test("General lazy Turns keep their accepted Session out of the Coding resume preference", async () => {
+  const writes: Array<{ key: string; value: unknown }> = [];
+  const calls: string[] = [];
+  const api: DesktopApi = {
+    ...appTestApi(async (method) => {
+      calls.push(method);
+      if (method === "turn.start") return { run_id: "run-general-lazy", turn_id: "turn-general-lazy", status: "running", session_id: "general-lazy-session" };
+      if (method === "status.get") return { active_turn: false };
+      if (method === "project.sessions") return { sessions: [{ session_id: "general-lazy-session", project_key: "uthcode:general", preview: "hello" }] };
+      return {};
+    }),
+    readPreference: async () => await new Promise<never>(() => undefined) as never,
+    writePreference: async (key, value) => { writes.push({ key, value }); return {} as never; },
+  };
+  const state = createInitialState({
+    mode: "general",
+    language: "en",
+    runtimeState: "ready",
+    composerText: "hello from General",
+    selectedProjectKey: "uthcode:general",
+    selectedSessionId: null,
+    projects: [{ path: "uthcode:general", projectKey: "uthcode:general", alias: "General", pinned: false, sessions: [], catalogFresh: true }],
+  });
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    await act(async () => { for (let index = 0; index < 4; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const send = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(send);
+    act(() => { send!.click(); });
+    await act(async () => { for (let index = 0; index < 4; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    assert.ok(calls.includes("turn.start"));
+    assert.match(container.querySelector(".conversation-title h1")?.textContent ?? "", /^Session general-/u, "the accepted lazy Session still becomes the live General owner");
+    assert.equal(writes.some((write) => write.key === "selectedSessionId" && write.value === "general-lazy-session"), false, "the General Session ID cannot poison Coding startup selection");
+  });
+});
+
 test("App moves a sent attachment into the user row and merges the empty-text authoritative message id", async () => {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   let eventListener: ((event: AgentEvent) => void) | null = null;
@@ -694,7 +1121,10 @@ test("App adopts a lazy first Session before replaying early attachment events a
     assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === lazySessionId), true);
     assert.equal(calls.filter((call) => call.method === "status.get").length > statusCallsBeforeStart, true);
     assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1);
-    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1);
+    const restoredActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
+    assert.ok(restoredActivity);
+    assert.equal(restoredActivity.querySelectorAll(".timeline-activity-item").length, 1);
+    assert.match(restoredActivity.textContent ?? "", /ReadDocument/u);
 
     const otherButton = sessionButton("Other session");
     assert.equal(Boolean(otherButton), true);
@@ -709,9 +1139,12 @@ test("App adopts a lazy first Session before replaying early attachment events a
     await flush();
     const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
     const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
-    assert.deepEqual(kinds, ["user", "reasoning", "tool", "reasoning", "assistant"]);
+    assert.deepEqual(kinds, ["user", "reasoning", "reasoning", "assistant"]);
     assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--user")).length, 1);
-    assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--tool")).length, 1);
+    const replayedActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
+    assert.ok(replayedActivity);
+    assert.equal(replayedActivity.querySelectorAll(".timeline-activity-item").length, 1);
+    assert.match(replayedActivity.textContent ?? "", /ReadDocument/u);
     assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 1);
     assert.equal(calls.some((call) => call.method === "history.page" && call.params.session_id === lazySessionId), true);
   });
@@ -1007,7 +1440,7 @@ test("App keeps a first-turn live tool row in order after new-session navigation
     assert.ok(newChat);
     act(() => { newChat.click(); });
     await flush();
-    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 0);
+    assert.equal(container.querySelectorAll(".timeline-activity-item").length, 0);
     const send = container.querySelector<HTMLButtonElement>(".composer-send");
     assert.ok(send);
     act(() => { send.click(); });
@@ -1028,7 +1461,15 @@ test("App keeps a first-turn live tool row in order after new-session navigation
       publish({ type: "turn_completed", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, final_text: "The workbook has one sheet." });
     });
     await flush();
-    assert.equal(container.querySelectorAll(".timeline-entry--tool").length, 1, "the live first-turn tool row is visible before navigation");
+    const liveActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
+    assert.ok(liveActivity, "the live first-turn tool call is shown in an activity group");
+    const liveActivitySummary = liveActivity.querySelector("summary");
+    assert.ok(liveActivitySummary);
+    assert.equal(liveActivity.open, false, "tool activity starts collapsed");
+    act(() => { liveActivitySummary.click(); });
+    assert.equal(liveActivity.open, true, "the user can expand the activity group");
+    assert.equal(liveActivity.querySelectorAll(".timeline-activity-item").length, 1);
+    assert.match(liveActivity.textContent ?? "", /ReadDocument/u);
 
     const otherSession = sessionButton("Other session");
     assert.ok(otherSession);
@@ -1041,9 +1482,11 @@ test("App keeps a first-turn live tool row in order after new-session navigation
 
     const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
     const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
-    assert.deepEqual(kinds, ["user", "reasoning", "tool", "reasoning", "assistant"]);
-    assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--tool")).length, 1);
-    assert.match(rows[2]?.textContent ?? "", /ReadDocument/u);
+    assert.deepEqual(kinds, ["user", "reasoning", "reasoning", "assistant"]);
+    const recoveredActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
+    assert.ok(recoveredActivity);
+    assert.equal(recoveredActivity.querySelectorAll(".timeline-activity-item").length, 1);
+    assert.match(recoveredActivity.textContent ?? "", /ReadDocument/u);
     assert.equal(calls.filter((call) => call.method === "history.page" && call.params.session_id === "session-a").length, 1);
     assert.ok(calls.filter((call) => call.method === "session.resume" && call.params.session_id === "session-a").every(() => true));
   });
