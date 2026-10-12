@@ -37,6 +37,7 @@ const generalFlows = new Set(["general-real", "general-cancel", "general-invalid
 const projectOne = option("project-one");
 const projectTwo = option("project-two");
 const diffProject = option("diff-project");
+const diffUnbornProject = option("diff-unborn-project");
 const artifactPath = option("artifact-path");
 const reviewMarkdownPath = option("review-markdown-path");
 const reviewTextPath = option("review-text-path");
@@ -2098,6 +2099,77 @@ async function runLifecycleFlow(session) {
   writeLog("assertion_pass", { description: `packaged Session lifecycle stage ${lifecycleStage} completed through real UI` });
 }
 
+async function verifyEmptyComposer(session) {
+  await waitFor(session, "empty Composer ready", "document.querySelector('.composer textarea')?.value === '' && !document.querySelector('.settings-view')");
+  const observations = [];
+  for (const width of [1280, 900, 720]) {
+    await session.send("Emulation.setDeviceMetricsOverride", { width, height: 900, deviceScaleFactor: 1, mobile: false });
+    const observed = await waitForStableObservationWithin(session, "stable empty Composer " + width, `(() => {
+      const composer = document.querySelector('.composer');
+      const input = composer?.querySelector('textarea');
+      const selectors = [...(composer?.querySelectorAll('.custom-select') || [])];
+      const rect = composer?.getBoundingClientRect();
+      const style = composer ? getComputedStyle(composer) : null;
+      const verticalPadding = style ? parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) : 0;
+      return { ready: Boolean(input && input.value === '' && rect?.height), width: innerWidth, height: rect?.height, verticalPadding, contentHeight: rect ? rect.height - verticalPadding : null, inputHeight: input?.getBoundingClientRect().height, resize: input ? getComputedStyle(input).resize : null, iconSelectors: selectors.filter((node) => node.classList.contains('custom-select--icon-only') && node.querySelector('.custom-select__trigger > svg') && !node.querySelector('.custom-select__value')).length };
+    })()`, 3_000);
+    if (observed.resize !== "none" || observed.iconSelectors !== 2) throw new Error(`empty Composer controls were incorrect: ${JSON.stringify(observed)}`);
+    observations.push(observed);
+    await capture(session, "empty-composer-" + width);
+  }
+  if (Math.max(...observations.map((item) => item.height)) - Math.min(...observations.map((item) => item.height)) > 1) throw new Error(`empty Composer height changed across widths: ${JSON.stringify(observations)}`);
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  await setSelect(session, "Runtime panel layout", "hidden");
+  const wideSend = await waitForStableObservationWithin(session, "wide empty Composer Send fits visible text", `(() => {
+    const button = document.querySelector('.composer-send');
+    const label = button?.querySelector('.composer-send__label');
+    const icon = button?.querySelector('svg');
+    const rect = button?.getBoundingClientRect();
+    const labelRect = label?.getBoundingClientRect();
+    const iconRect = icon?.getBoundingClientRect();
+    const visible = label && getComputedStyle(label).display !== 'none';
+    return { ready: document.querySelector('.app-shell')?.classList.contains('panel-hidden') && Boolean(button && label && icon), labelVisible: Boolean(visible), buttonWidth: rect?.width, labelWidth: labelRect?.width, iconWidth: iconRect?.width, fits: Boolean(rect && labelRect && iconRect && (!visible || (labelRect.left >= rect.left && labelRect.right <= rect.right && iconRect.left >= rect.left && iconRect.right <= rect.right && iconRect.right <= labelRect.left))) };
+  })()`, 3_000);
+  if (!wideSend.labelVisible || !wideSend.fits) throw new Error(`wide empty Send label did not fit: ${JSON.stringify(wideSend)}`);
+  await capture(session, "empty-composer-wide-visible-send");
+  await setSelect(session, "Runtime panel layout", "docked");
+  const before = observations[0].inputHeight;
+  for (const selector of [".composer-selectors .custom-select__trigger", ".composer-model .custom-select__trigger"]) {
+    await clickSelector(session, selector);
+    await waitFor(session, "icon selector opens actual options", "Boolean(document.querySelector('[role=listbox] [role=option]'))");
+    const height = await evaluateAction(session, "empty textarea height with options open", "document.querySelector('.composer textarea').getBoundingClientRect().height");
+    if (Math.abs(height - before) > 1) throw new Error("empty input height changed when a selector opened");
+    await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await waitFor(session, "icon selector Escape restores focus", `!document.querySelector('[role=listbox]') && document.activeElement === document.querySelector(${JSON.stringify(selector)})`);
+  }
+  return { observations, wideSend, menuHeightStable: true, keyboardEscape: true };
+}
+
+async function verifyPermissionActivity(session) {
+  const evidence = await waitForStableObservationWithin(session, "completed Turn activity ownership", `(() => {
+    const groups = [...document.querySelectorAll('details.timeline-activity-group')];
+    const group = groups[0];
+    const final = document.querySelector('.timeline-entry--assistant');
+    const failed = group?.querySelector('details.timeline-activity-item.is-failed');
+    const interactions = [...document.querySelectorAll('.timeline-activity-event')];
+    const composer = document.querySelector('.composer');
+    const groupRect = group?.getBoundingClientRect();
+    const composerRect = composer?.getBoundingClientRect();
+    const ready = groups.length === 1 && Boolean(final && failed) && Number(group?.dataset.reasoningCount) === 3 && Number(group?.dataset.toolCount) === 2 && interactions.length >= 2 && interactions.every((item) => group.contains(item)) && Boolean(group.compareDocumentPosition(final) & Node.DOCUMENT_POSITION_FOLLOWING) && !document.querySelector('[aria-label="Permission approval"]');
+    return { ready, groupCount: groups.length, reasoningCount: Number(group?.dataset.reasoningCount), toolCount: Number(group?.dataset.toolCount), failureCount: Number(group?.dataset.failureCount), groupCollapsed: group?.open === false, failedCollapsed: failed?.open === false, reasoningDisclosures: group?.querySelectorAll('details.timeline-reasoning').length || 0, interactionTexts: interactions.map((item) => item.textContent), widthDifference: groupRect && composerRect ? Math.abs(groupRect.width - composerRect.width) : null };
+  })()`, 5_000);
+  if (!evidence.groupCollapsed || !evidence.failedCollapsed || evidence.reasoningDisclosures || evidence.widthDifference > 2) throw new Error(`Turn folding or width was incorrect: ${JSON.stringify(evidence)}`);
+  await capture(session, "permission-turn-collapsed");
+  await clickSelector(session, ".timeline-activity-group > summary");
+  await capture(session, "permission-turn-expanded");
+  await clickSelector(session, ".timeline-activity-item.is-failed > summary");
+  await capture(session, "permission-failed-command-expanded");
+  await clickSelector(session, ".timeline-activity-item.is-failed > summary");
+  await clickSelector(session, ".timeline-activity-group > summary");
+  flowEvidence.permissionActivity = evidence;
+}
+
 async function runSettingsUiFlow(session) {
   if (requestedLanguage !== "en" || !projectOne || !projectTwo) throw new Error("settings-ui requires English and two isolated projects");
   // Seed only runner-owned sessions through the real public Application API.
@@ -2116,6 +2188,24 @@ async function runSettingsUiFlow(session) {
   })()`);
   await clickText(session, "Settings");
   await waitFor(session, "Settings search ready", "Boolean(document.querySelector('#settings-global-search-input'))");
+  const searchPlacement = await evaluateAction(session, "observe Settings sidebar search", `(() => {
+    const nav = document.querySelector('.settings-nav');
+    const title = nav?.querySelector('h1');
+    const search = nav?.querySelector('.settings-global-search');
+    const categories = nav?.querySelector('nav');
+    const input = search?.querySelector('input');
+    const rules = (items) => [...items].flatMap((item) => [item, ...(item.cssRules ? rules(item.cssRules) : [])]);
+    const nativeCancelRule = [...document.styleSheets].some((sheet) => rules(sheet.cssRules).some((rule) => rule.selectorText === '.settings-global-search input[type="search"]::-webkit-search-cancel-button' && rule.style?.display === 'none'));
+    const ready = Boolean(title && search && categories && title.getBoundingClientRect().bottom <= search.getBoundingClientRect().top && search.getBoundingClientRect().bottom <= categories.getBoundingClientRect().top);
+    window.__settingsSuccessFlashes = [];
+    window.__settingsSaveObserver = new MutationObserver(() => {
+      const text = document.querySelector('.settings-autosave-status')?.textContent || '';
+      if (/settings saved|saved;|设置已保存/i.test(text) && window.__settingsSuccessFlashes.length < 20) window.__settingsSuccessFlashes.push(text);
+    });
+    window.__settingsSaveObserver.observe(document.querySelector('.settings-view'), { subtree: true, childList: true, characterData: true });
+    return { ready, inSidebar: Boolean(search), nativeCancelSuppressionRule: input?.type !== 'search' || nativeCancelRule };
+  })()`);
+  if (!searchPlacement.ready || !searchPlacement.nativeCancelSuppressionRule) throw new Error(`Settings sidebar search or native clear was incorrect: ${JSON.stringify(searchPlacement)}`);
   const category = async (name) => clickSelector(session, `.settings-nav a[href='#settings-${name}']`);
   const clearSearch = async () => {
     await clickSelector(session, ".settings-global-search__clear");
@@ -2241,6 +2331,9 @@ async function runSettingsUiFlow(session) {
   }
   await setInput(session, "settings-global-search-input", "ZZZ_NO_SETTING_RESULT");
   await waitFor(session, "Settings search empty result", "document.querySelector('.settings-global-search__results')?.innerText.includes('No matching settings')");
+  const clearCount = await evaluateAction(session, "count Settings clear controls", "document.querySelectorAll('.settings-global-search button.settings-global-search__clear').length");
+  if (clearCount !== 1) throw new Error("Settings search did not have exactly one clear control");
+  await capture(session, "settings-sidebar-search-single-clear");
   await clearSearch();
   await category("tools");
   const before = await evaluateAction(session, "focus web search switch", "(() => { const input = document.querySelector('#settings-search-enabled[role=switch]'); if (!input) throw new Error('switch missing'); input.focus(); return input.checked; })()");
@@ -2264,7 +2357,11 @@ async function runSettingsUiFlow(session) {
   await session.send("Emulation.setDeviceMetricsOverride", { width: 720, height: 900, deviceScaleFactor: 1, mobile: false });
   await capture(session, "settings-narrow-archive");
   await session.send("Emulation.clearDeviceMetricsOverride");
-  flowEvidence.settingsUi = { archives, themes, fields, savedSwitch, archiveProjects: projects, generalFilter: true, exactOwnerFilter: true, emptySearch: true, modalEscape: true };
+  const successFlashes = await evaluateAction(session, "stop Settings save observation", "(() => { window.__settingsSaveObserver?.disconnect(); return window.__settingsSuccessFlashes; })()");
+  if (successFlashes.length) throw new Error(`Settings success message flashed during actual saves: ${JSON.stringify(successFlashes)}`);
+  await clickText(session, "Back to chat");
+  const emptyComposer = await verifyEmptyComposer(session);
+  flowEvidence.settingsUi = { archives, themes, fields, savedSwitch, searchPlacement, clearCount, successFlashes, emptyComposer, archiveProjects: projects, generalFilter: true, exactOwnerFilter: true, emptySearch: true, modalEscape: true };
   if (!skipQuit) await evaluateAction(session, "close isolated Settings shell", "window.uthcode.closeShell()");
   writeLog("assertion_pass", { description: "actual packaged Settings themes, field search, keyboard switch, archive owner filtering and narrow rendering" });
 }
@@ -2279,7 +2376,9 @@ async function runDiffFlow(session) {
     const paths = [...(panel?.querySelectorAll('.review-panel__paths li') || [])].map((item) => ({ status: item.querySelector('code')?.textContent?.trim() || '', path: item.querySelector('span')?.textContent?.trim() || '', original: item.querySelector('small')?.textContent?.replace(/^←\\s*/u, '').trim() || '' }));
     const sections = [...(panel?.querySelectorAll('.review-panel__diff-section') || [])].map((item) => ({ scope: item.dataset.diffScope, title: item.querySelector('h3')?.textContent?.trim() || '', text: [...item.querySelectorAll('.review-panel__diff-line code')].map((line) => line.textContent || '').join('\\n') }));
     const rows = [...(panel?.querySelectorAll('[data-diff-kind]') || [])].map((item) => ({ kind: item.dataset.diffKind, text: item.querySelector('code')?.textContent, numbers: [...item.querySelectorAll('.review-panel__diff-line-number')].map((number) => number.textContent), background: getComputedStyle(item).backgroundColor }));
-    return { paths, sections, rows, viewedAt: panel?.querySelector('.review-panel__content-header time')?.dateTime || '', selectorInHeader: Boolean(panel?.querySelector('.review-panel__content-header .custom-select__trigger')), text: panel?.innerText || '' };
+    const trigger = panel?.querySelector('.review-panel__content-header .custom-select__trigger');
+    const rect = trigger?.getBoundingClientRect();
+    return { paths, sections, rows, viewedAt: panel?.querySelector('.review-panel__content-header time')?.dateTime || '', selectorInHeader: Boolean(trigger), selectorSize: rect ? { width: rect.width, height: rect.height } : null, emptyParagraphs: panel?.querySelectorAll('.review-panel__diff-empty').length || 0, text: panel?.innerText || '' };
   })()`);
   await capture(session, "current-workspace-diff-initial");
   writeLog("acceptance_diagnostic", {
@@ -2297,9 +2396,9 @@ async function runDiffFlow(session) {
   for (const path of required) if (!paths.some((entry) => entry.path === path)) throw new Error(`tracked Git change is missing from actual diff status: ${path}; ${JSON.stringify(paths)}`);
   if (!paths.some((entry) => entry.path === "renamed.txt" && entry.original === "rename-source.txt")) throw new Error(`tracked rename original path was not shown: ${JSON.stringify(paths)}`);
   const untrackedStatus = paths.filter((entry) => entry.path === "untracked.txt" || entry.original === "untracked.txt");
-  if (untrackedStatus.length !== 1 || untrackedStatus[0].path !== "untracked.txt" || untrackedStatus[0].status !== "??" || untrackedStatus[0].original !== "") throw new Error(`All uncommitted scope must show exactly one status-only untracked.txt entry with Git status ??: ${JSON.stringify(untrackedStatus)}`);
+  if (untrackedStatus.length !== 1 || untrackedStatus[0].path !== "untracked.txt" || untrackedStatus[0].status !== "??" || untrackedStatus[0].original !== "") throw new Error(`All uncommitted scope must show exactly one untracked.txt entry with Git status ??: ${JSON.stringify(untrackedStatus)}`);
   const allDiff = evidence.sections.map((section) => section.text).join("\n");
-  if (allDiff.includes("untracked evidence must stay absent")) throw new Error("untracked file contents were incorrectly projected into the real diff sections");
+  if (!allDiff.includes("UNTRACKED_DIFF_BODY")) throw new Error("untracked file change content was absent from the actual diff");
   const removedRow = evidence.rows.find((row) => row.kind === "removed" && row.text === "old tracked line" && row.numbers[0] === "1" && row.numbers[1] === "");
   const addedRow = evidence.rows.find((row) => row.kind === "added" && row.text === "new tracked line" && row.numbers[0] === "" && row.numbers[1] === "1");
   if (!removedRow || !addedRow) {
@@ -2312,8 +2411,8 @@ async function runDiffFlow(session) {
   if (!removedColor || !addedColor || removedColor === addedColor || [removedColor, addedColor].includes("rgba(0, 0, 0, 0)")) throw new Error("actual diff rows did not have distinct colored backgrounds");
   if (!allDiff.includes("DIFF_CONTEXT_ROW_497") || !allDiff.includes("DIFF_CHANGED_ROW_500") || allDiff.includes("DIFF_CONTEXT_ROW_1\n") || evidence.rows.filter((row) => row.kind === "context").length > 12) throw new Error("1000-line file was not restricted to change hunks and nearby context");
   if (!evidence.selectorInHeader || !evidence.sections.some((section) => section.scope === "staged") || !evidence.sections.some((section) => section.scope === "unstaged")) throw new Error("actual scope selector or sourced patch sections were absent");
-  if (!evidence.viewedAt || !Number.isFinite(Date.parse(evidence.viewedAt))) throw new Error(`real diff view timestamp was absent or invalid: ${JSON.stringify(evidence.viewedAt)}`);
-  flowEvidence.diff = { project: resolve(diffProject), statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: false, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), viewedAt: evidence.viewedAt, timestampParsed: true };
+  if (evidence.viewedAt || evidence.emptyParagraphs || !evidence.selectorSize || evidence.selectorSize.width > 145 || evidence.selectorSize.height > 32) throw new Error(`Diff header was not compact or retained removed content: ${JSON.stringify(evidence)}`);
+  flowEvidence.diff = { project: resolve(diffProject), statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: true, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), visibleTimestampAbsent: true, emptyParagraphsAbsent: true, selectorSize: evidence.selectorSize };
   await capture(session, "current-workspace-diff");
   const scopeEvidence = [];
   for (const [value, labels] of [["staged", ["Staged", "已暂存"]], ["unstaged", ["Unstaged", "未暂存"]]]) {
@@ -2352,8 +2451,29 @@ async function runDiffFlow(session) {
   })()`);
   flowEvidence.diff.ownerSwitch = { previousOwner, selectedSessionId: nextOwner.sessionId, observation: ownerSwitch };
   await capture(session, "diff-owner-switched");
+  if (!diffUnbornProject) throw new Error("unborn Diff project was not provided");
+  const unbornProjectLabel = `T12 Unborn Diff · ${diffUnbornProject}`;
+  const selectedUnborn = await evaluateAction(session, "expand runner-owned unborn Git project", `(() => { const button = [...document.querySelectorAll('button.project-select')].find((item) => item.getAttribute('aria-label') === ${JSON.stringify(unbornProjectLabel)}); if (!button) return false; if (button.getAttribute('aria-expanded') !== 'true') button.click(); return true; })()`);
+  if (!selectedUnborn) throw new Error("unborn Git project was not available in the actual sidebar");
+  await waitFor(session, "unborn project New session entry", `(() => { const button = [...document.querySelectorAll('button.project-select')].find((item) => item.getAttribute('aria-label') === ${JSON.stringify(unbornProjectLabel)}); return Boolean(button?.closest('.project-item')?.querySelector('button.new-session-line')); })()`);
+  await evaluateAction(session, "open actual new Session in unborn project", `(() => { const button = [...document.querySelectorAll('button.project-select')].find((item) => item.getAttribute('aria-label') === ${JSON.stringify(unbornProjectLabel)})?.closest('.project-item')?.querySelector('button.new-session-line'); if (!button) throw new Error('unborn project New session entry missing'); button.click(); })()`);
+  await waitFor(session, "unborn Coding project ready", `(async () => { const status = await window.uthcode.requestRuntime('status.get', {}); return status?.project_key === ${JSON.stringify(diffUnbornProject)} && status?.runtime?.state === 'ready'; })()`);
+  await clickSelector(session, 'button[aria-label="Review current diff"], button[aria-label="查看当前差异"]');
+  const unborn = await waitFor(session, "actual new-file-only Git patch", `(() => {
+    const panel = document.querySelector('.review-panel');
+    const row = [...(panel?.querySelectorAll('[data-diff-kind="added"] code') || [])].find((item) => item.textContent === 'UNBORN_NEW_FILE_BODY');
+    return row ? { content: row.textContent, paths: [...panel.querySelectorAll('.review-panel__paths li span')].map((item) => item.textContent), emptyParagraphs: panel.querySelectorAll('.review-panel__diff-empty').length, visibleTimestamp: Boolean(panel.querySelector('time')) } : false;
+  })()`);
+  if (unborn.emptyParagraphs || unborn.visibleTimestamp || !unborn.paths.includes("new-file.txt")) throw new Error(`unborn Diff was incorrect: ${JSON.stringify(unborn)}`);
+  flowEvidence.diff.unborn = unborn;
+  await capture(session, "diff-unborn-new-file");
+  await setSelect(session, requestedLanguage === "en" ? "Diff scope" : "Diff 范围", requestedLanguage === "en" ? "Staged" : "已暂存");
+  await waitFor(session, "unborn staged scope has no new-file body or empty paragraph", "!document.querySelector('.review-panel__diff')?.textContent.includes('UNBORN_NEW_FILE_BODY') && !document.querySelector('.review-panel__diff-empty') && document.querySelectorAll('.review-panel__paths li').length === 0");
+  await setSelect(session, requestedLanguage === "en" ? "Diff scope" : "Diff 范围", requestedLanguage === "en" ? "Unstaged" : "未暂存");
+  await waitFor(session, "unborn unstaged scope restores actual new-file body", "document.querySelector('.review-panel__diff')?.textContent.includes('UNBORN_NEW_FILE_BODY')");
+  flowEvidence.diff.unborn.scopeFiltering = true;
   if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
-  writeLog("assertion_pass", { description: "packaged chat entry shows tracked current Git diff and view time, then a real Coding Session switch clears the old Diff panel" });
+  writeLog("assertion_pass", { description: "packaged chat entry shows tracked and untracked Git changes with a compact scope selector, then a real Coding Session switch clears the old Diff panel" });
 }
 
 async function runGeneralRealProviderFlow(session) {
@@ -2719,8 +2839,14 @@ async function run() {
       await submitTodoFlow(session, expectedText);
     } else if (flow === "permission") {
       await waitForInteraction(session, "dynamic Permission surface", '[aria-label="Permission approval"]');
+      await capture(session, "permission-pending-control");
       await clickText(session, "Allow once");
       await waitFor(session, `Permission continuation ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
+      await verifyPermissionActivity(session);
+      // This flow verifies the real interaction/activity chain. The other
+      // flows retain the broader shell-resize and Settings acceptance matrix.
+      if (!skipQuit) await evaluateAction(session, "close isolated permission shell", "window.uthcode.closeShell()");
+      return;
     } else if (flow === "plan") {
       await submitPlanFlow(session, expectedText);
     } else if (flow === "failure") {

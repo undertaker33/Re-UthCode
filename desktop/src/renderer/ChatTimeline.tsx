@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type UIEvent } from "react";
 import stripAnsi from "strip-ansi";
 import type { ProcessLogEntry, ProcessReaderState, TimelineEntry, TodoItem } from "./state";
 import type { ArtifactDescriptor, DesktopAttachmentDraft, TimelineAttachment, TimelineUnavailableAttachment } from "../desktop-api";
@@ -509,30 +509,42 @@ function renderToolActivity(activity: TimelineEntry, now: number, t: (key: Trans
   const command = displayableToolCommand(activity);
   const name = activity.toolName || t("toolLabel");
   const statusLine = <small className="tool-status" data-status={status} data-error={activity.isError || undefined}><UiIcon name={toolStatusIcon(status)} /><span>{localText(status, t)}</span>{elapsed !== null ? <span className="tool-elapsed"> · {elapsed}s</span> : <span className="tool-elapsed"> · {t("durationUnavailable")}</span>}</small>;
-  if (failed) return <article className="timeline-activity-item is-failed" key={activity.id} aria-label={`${name}: ${localText(status, t)}`}>
-    <header><span>{name}</span>{statusLine}</header>
-    {displayableToolText(activity) && <p className="timeline-activity-failure">{displayableToolText(activity)}</p>}
-    {command && <pre className="timeline-activity-command">{command}</pre>}
-    {renderToolActivityDetails({ ...activity, text: "", command: undefined }, t, onViewToolOutput, onReviewCurrentDiff, false)}
-  </article>;
+  if (failed) return <details className="timeline-activity-item is-failed" key={activity.id} aria-label={`${name}: ${localText(status, t)}`}>
+    <summary><span className="timeline-activity-item__name">{name}</span>{statusLine}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+    <div className="timeline-activity-item__details">
+      {displayableToolText(activity) && <p className="timeline-activity-failure">{displayableToolText(activity)}</p>}
+      {!displayableToolText(activity) && activity.outputPreview && <p className="timeline-activity-failure">{activity.outputPreview}</p>}
+      {command && <pre className="timeline-activity-command">{command}</pre>}
+      {renderToolActivityDetails({ ...activity, text: "", command: undefined }, t, onViewToolOutput, onReviewCurrentDiff, false)}
+    </div>
+  </details>;
   return <details className={`timeline-activity-item${status === "running" ? " is-running" : ""}`} key={activity.id} aria-label={`${name}: ${localText(status, t)}`} aria-busy={status === "running" || undefined}>
-    <summary><span className="timeline-activity-item__name">{name}</span>{command && <span className="timeline-activity-item__command" title={command}>{command}</span>}{statusLine}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+    <summary><span className="timeline-activity-item__name">{name}</span>{statusLine}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
     <div className="timeline-activity-item__details">{renderToolActivityDetails(activity, t, onViewToolOutput, onReviewCurrentDiff)}</div>
   </details>;
 }
 
-function ToolActivityGroup({ group, now, t, onViewToolOutput, onReviewCurrentDiff }: { group: TimelineEntry[]; now: number; t: (key: TranslationKey) => string; onViewToolOutput?: (entry: TimelineEntry) => void; onReviewCurrentDiff?: (path: string) => void }) {
-  const runningCount = group.filter((item) => item.status === "running").length;
-  const span = activitySpanSeconds(group, now);
-  return <details className="timeline-activity-group" data-tool-count={group.length}>
-    <summary><UiIcon name="runtime" /><span className="timeline-activity-group__title">{group.length} {t("activities")}</span><small>{span !== null ? `${span}s` : t("durationUnavailable")}</small><span className={`timeline-activity-group__status${runningCount ? " is-running" : ""}`}>{runningCount ? t("running") : t("completed")}</span><span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
-    <div className="timeline-activity-group__items">{group.map((activity) => renderToolActivity(activity, now, t, onViewToolOutput, onReviewCurrentDiff))}</div>
+function renderTurnActivityEntry(activity: TimelineEntry, now: number, t: (key: TranslationKey) => string, renderReasoning: (entry: TimelineEntry) => ReactNode, onViewToolOutput?: (entry: TimelineEntry) => void, onReviewCurrentDiff?: (path: string) => void) {
+  if (activity.kind === "tool") return renderToolActivity(activity, now, t, onViewToolOutput, onReviewCurrentDiff);
+  if (activity.kind === "reasoning") return renderReasoning(activity);
+  if (activity.kind === "status" && activity.activityKind === "interaction") return <p className="timeline-activity-event" key={activity.id} role="status"><UiIcon name="status" /><span>{localText(activity.text, t)}</span></p>;
+  return null;
+}
+
+function TurnActivityGroup({ group, now, t, renderReasoning, onViewToolOutput, onReviewCurrentDiff }: { group: TimelineEntry[]; now: number; t: (key: TranslationKey) => string; renderReasoning: (entry: TimelineEntry) => ReactNode; onViewToolOutput?: (entry: TimelineEntry) => void; onReviewCurrentDiff?: (path: string) => void }) {
+  const tools = group.filter((item) => item.kind === "tool");
+  const failures = tools.filter((item) => item.status === "failed" || item.status === "cancelled").length;
+  const runningCount = tools.filter((item) => item.status === "running").length;
+  const span = activitySpanSeconds(tools, now);
+  return <details className="timeline-activity-group" data-turn-id={group[0]?.turnId} data-activity-count={group.length} data-tool-count={tools.length} data-reasoning-count={group.filter((item) => item.kind === "reasoning").length} data-failure-count={failures}>
+    <summary><UiIcon name="runtime" /><span className="timeline-activity-group__title">{t("thinkingAndActivity")}</span><small>{group.length} {t("activities")}{span !== null ? ` · ${span}s` : ""}</small>{failures > 0 && <span className="timeline-activity-group__failures"><UiIcon name="warning" />{failures} {t("failed")}</span>}<span className={`timeline-activity-group__status${runningCount ? " is-running" : ""}`}>{runningCount ? t("running") : t("completed")}</span><span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
+    <div className="timeline-activity-group__items">{group.map((activity) => renderTurnActivityEntry(activity, now, t, renderReasoning, onViewToolOutput, onReviewCurrentDiff))}</div>
   </details>;
 }
 
 function timelineContentFingerprint(entries: TimelineEntry[], notice: string | null | undefined, runtimeError: string | null | undefined, runtimeErrorVisible: boolean): string {
   return JSON.stringify({
-    entries: entries.map((entry) => [entry.id, entry.kind, entry.text, entry.status, entry.streaming, entry.endedAt]),
+    entries: entries.map((entry) => [entry.id, entry.kind, entry.text, entry.status, entry.streaming, entry.endedAt, entry.runId, entry.turnId, entry.activityKind, entry.toolCallId]),
     notice: notice ?? null,
     runtimeError: runtimeError ?? null,
     runtimeErrorVisible,
@@ -779,6 +791,28 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
     {compactionRunning && <span className="compaction-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>}
   </p>;
 
+  const activityGroups = new Map<string, { key: string; entries: TimelineEntry[]; indexes: number[] }>();
+  entries.forEach((entry, index) => {
+    const activity = entry.kind === "reasoning" || entry.kind === "tool"
+      || (entry.kind === "status" && entry.activityKind === "interaction");
+    if (!activity) return;
+    const key = entry.turnId ? `turn:${entry.turnId}` : `entry:${entry.id}`;
+    const group = activityGroups.get(key) ?? { key, entries: [], indexes: [] };
+    group.entries.push(entry);
+    group.indexes.push(index);
+    activityGroups.set(key, group);
+  });
+  const activityGroupAtIndex = new Map<number, { key: string; entries: TimelineEntry[]; indexes: number[]; firstIndex: number }>();
+  for (const group of activityGroups.values()) {
+    const firstIndex = group.indexes[0]!;
+    for (const index of group.indexes) activityGroupAtIndex.set(index, { ...group, firstIndex });
+  }
+
+  const renderReasoningActivity = (entry: TimelineEntry) => <article className="timeline-activity-reasoning" key={entry.id} aria-label={t("reasoningLabel")} aria-busy={entry.streaming || undefined}>
+    <header><span>{t("reasoningLabel")}</span>{entry.streaming && <small>{t("writing")}</small>}</header>
+    <div className="timeline-reasoning__content"><div className="timeline-content">{renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}</div></div>
+  </article>;
+
   useEffect(() => {
     if (!entries.some((entry) => entry.kind === "tool" && entry.status === "running")) return undefined;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -823,28 +857,12 @@ export function ChatTimeline({ entries, todo, notice, compactionNotice, compacti
             <span>{localText(entry.text, t)}</span>
           </p>{index === compactionIndex && compactionLine}</Fragment>;
         }
-        if (entry.kind === "reasoning") return <Fragment key={entry.id}><article className="timeline-entry timeline-entry--reasoning" aria-label={entryLabel(entry, t)} aria-busy={entry.streaming || undefined}>
-          <details className="timeline-reasoning">
-            <summary><span>{t("reasoningLabel")}</span>{entry.streaming && <small>{t("writing")}</small>}<span className="timeline-disclosure-caret" aria-hidden="true" /></summary>
-            <div className="timeline-reasoning__content"><div className="timeline-content">{renderMarkdown(entry.text, { onCopyText, onOpenArtifact, onDescribeArtifact: describeArtifact, onAuthorizeArtifact: authorizeArtifact, authorizeArtifactLabel: t("artifactAuthorize"), onRevealArtifact, onPreviewArtifact: previewArtifact, onOpenDocument, onCopyPath, artifacts })}{renderAttachmentRows(entry, t, attachmentPreviews, onPreviewAttachment, onOpenAttachment, onRevealAttachment, onCopyAttachmentPath, onOpenDocument)}</div></div>
-          </details>
-        </article>{index === compactionIndex && compactionLine}</Fragment>;
-        if (entry.kind === "tool") {
-          const failed = entry.status === "failed" || entry.status === "cancelled";
-          if (failed) return <Fragment key={entry.id}>{renderToolActivity(entry, now, t, onViewToolOutput, onReviewCurrentDiff)}{index === compactionIndex && compactionLine}</Fragment>;
-          const previousToolFailed = index > 0
-            && entries[index - 1]?.kind === "tool"
-            && (entries[index - 1]?.status === "failed" || entries[index - 1]?.status === "cancelled");
-          if (index > 0 && entries[index - 1]?.kind === "tool" && !previousToolFailed) return null;
-          const group: TimelineEntry[] = [];
-          for (let cursor = index; cursor < entries.length && entries[cursor]?.kind === "tool"; cursor += 1) {
-            const activity = entries[cursor]!;
-            if (activity.status === "failed" || activity.status === "cancelled") break;
-            group.push(activity);
-          }
-          return <Fragment key={"activity:" + group[0]?.id}>
-            <ToolActivityGroup group={group} now={now} t={t} onViewToolOutput={onViewToolOutput} onReviewCurrentDiff={onReviewCurrentDiff} />
-            {index + group.length - 1 === compactionIndex && compactionLine}
+        const activityGroup = activityGroupAtIndex.get(index);
+        if (activityGroup) {
+          if (index !== activityGroup.firstIndex) return null;
+          return <Fragment key={`turn-activity:${activityGroup.key}`}>
+            <TurnActivityGroup group={activityGroup.entries} now={now} t={t} renderReasoning={renderReasoningActivity} onViewToolOutput={onViewToolOutput} onReviewCurrentDiff={onReviewCurrentDiff} />
+            {compactionLine && activityGroup.indexes.includes(compactionIndex) && compactionLine}
           </Fragment>;
         }
         return <Fragment key={entry.id}><article className={`timeline-entry timeline-entry--${entry.kind}`} aria-label={entryLabel(entry, t)} aria-busy={entry.streaming || undefined}>

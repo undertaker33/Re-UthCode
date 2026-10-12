@@ -93,8 +93,8 @@ test("Review Diff scopes preserve Git status and render actual unified hunk line
     const diffHeader = container.querySelector(".review-panel__content-header--diff");
     assert.ok(diffHeader);
     assert.match(diffHeader.textContent ?? "", /Current working tree/u);
-    assert.equal(diffHeader.querySelector("time")?.getAttribute("datetime"), diff.viewed_at);
-    assert.ok(diffHeader.querySelector('[aria-label="Diff scope"]'), "scope is beside the workspace title and snapshot time");
+    assert.equal(diffHeader.querySelector("time"), null, "the current workspace heading does not display a snapshot timestamp");
+    assert.ok(diffHeader.querySelector('[aria-label="Diff scope"]'), "scope is beside the workspace title");
     assert.equal(container.querySelector(".review-panel__diff-toolbar [aria-label='Diff scope']"), null);
     const removed = container.querySelector<HTMLElement>('[data-diff-kind="removed"]');
     const added = container.querySelector<HTMLElement>('[data-diff-kind="added"]');
@@ -127,7 +127,7 @@ test("Review Diff scopes preserve Git status and render actual unified hunk line
   });
 });
 
-test("Review Diff keeps empty scopes to one message and leaves untracked files as status only", async () => {
+test("Review Diff renders untracked text patches and leaves empty scopes without a footer", async () => {
   await withRendererDom(async (dom, container, root) => {
     const diff = {
       source: "current_working_tree" as const,
@@ -135,23 +135,29 @@ test("Review Diff keeps empty scopes to one message and leaves untracked files a
       viewed_at: "2026-10-12T01:00:00Z",
       status: { branch: "main", unborn: false, truncated: false, entries: [{ xy: "??", path: "new.txt" }] },
       staged_diff: { text: "", truncated: false, size_bytes: 0 },
-      unstaged_diff: { text: "", truncated: false, size_bytes: 0 },
+      unstaged_diff: {
+        text: "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+new file body\n",
+        truncated: false,
+        size_bytes: 112,
+      },
       truncated: false,
     };
     const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/workspace-empty", sessionId: "session", viewRevision: 1, ownerKey: "C:/workspace-empty" };
     const tab = { kind: "workspace-diff" as const, id: "empty-diff-tab", title: "Working tree", owner, state: "completed" as const, diff };
     await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="empty-diff-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
-    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 1);
+    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 0);
     assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["new.txt"]);
+    assert.equal(container.querySelector('[data-diff-kind="added"] code')?.textContent, "new file body");
     const scope = container.querySelector<HTMLButtonElement>('.review-panel__content-header--diff [aria-label="Diff scope"]');
     assert.ok(scope);
     act(() => { scope!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
-    const unstagedOption = [...dom.window.document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((option) => option.textContent === "Unstaged");
-    assert.ok(unstagedOption);
-    act(() => { unstagedOption!.click(); });
-    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 1);
+    const stagedOption = [...dom.window.document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((option) => option.textContent === "Staged");
+    assert.ok(stagedOption);
+    act(() => { stagedOption!.click(); });
+    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 0, "an empty scope does not add a redundant empty-state footer");
     assert.equal(container.querySelectorAll(".review-panel__diff-section").length, 0);
+    assert.equal(container.querySelector('[data-diff-kind="added"] code'), null, "the untracked patch appears only in the unstaged scope");
   });
 });
 
@@ -227,6 +233,24 @@ test("Composer exposes attachment-only send and an accessible plus-only attachme
   assert.doesNotMatch(markup, /<button[^>]*aria-label="Attach"[^>]*>[^<]*Attach/u);
   assert.doesNotMatch(markup, /aria-label="Paste"/u);
   assert.match(markup, /Send/u);
+});
+
+test("empty Composer marks the compact state while keeping its submit label accessible", () => {
+  const empty = renderToStaticMarkup(renderComposer(createInitialState({
+    language: "en",
+    composerText: "",
+    composerAttachments: [],
+  })));
+  assert.match(empty, /class="composer" data-empty="true" data-coding-mode="true"/u);
+  assert.match(empty, /<button class="composer-send"[^>]*title="Send" aria-label="Send"[^>]*><svg[\s\S]*?<\/svg><span class="composer-send__label">Send<\/span><\/button>/u);
+
+  const populated = renderToStaticMarkup(renderComposer(createInitialState({
+    language: "en",
+    composerText: "draft",
+    composerAttachments: [],
+  })));
+  assert.match(populated, /class="composer" data-empty="false" data-coding-mode="true"/u);
+  assert.match(populated, /<span class="composer-send__label">Send<\/span>/u);
 });
 
 test("RendererErrorBoundary reports only its fixed boundary code and recovers locally", async () => {
@@ -728,16 +752,16 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     assert.match(container.querySelector(".review-panel")?.textContent ?? "", /\+ staged first/u);
     assert.match(container.querySelector(".review-panel")?.textContent ?? "", /- unstaged first/u);
     assert.match(container.querySelector(".review-panel")?.textContent ?? "", /src\/current\.ts/u);
-    assert.match(container.querySelector(".review-panel")?.textContent ?? "", /2026/u, "viewed_at is shown as a current-Diff timestamp");
+    assert.equal(container.querySelector(".review-panel__content-header--diff time"), null, "viewed_at remains internal and is not shown in the workspace heading");
 
-    const activity = container.querySelector<HTMLDetailsElement>("details.timeline-activity-group");
-    assert.ok(activity);
-    act(() => { activity.querySelector("summary")?.dispatchEvent(new _dom.window.MouseEvent("click", { bubbles: true })); });
-    const activityItems = [...activity.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-item")];
+    const activities = [...container.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-group")];
+    assert.equal(activities.length, 2, "legacy entries without a Turn identity remain independently grouped");
+    activities.forEach((activity) => act(() => { activity.querySelector("summary")?.dispatchEvent(new _dom.window.MouseEvent("click", { bubbles: true })); }));
+    const activityItems = activities.flatMap((activity) => [...activity.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-item")]);
     assert.equal(activityItems.length, 2);
     assert.equal(activityItems.every((item) => !item.open), true, "tool input and output actions start behind their own disclosure");
     activityItems.forEach((item) => { item.open = true; });
-    const pathDiff = [...activity.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")]
+    const pathDiff = [...container.querySelectorAll<HTMLButtonElement>(".timeline-file-changes button")]
       .find((button) => button.textContent?.includes("src/entry.ts"));
     assert.ok(pathDiff);
     act(() => { pathDiff.click(); });
@@ -761,7 +785,7 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree"]);
     assert.equal(container.querySelector(".review-panel__content-header strong")?.textContent, "Current working tree", "closing an inactive/selected tab keeps the remaining Review tab usable");
 
-    const outputButtons = activity.querySelectorAll<HTMLButtonElement>(".timeline-tool-output");
+    const outputButtons = activities.flatMap((activity) => [...activity.querySelectorAll<HTMLButtonElement>(".timeline-tool-output")]);
     assert.equal(outputButtons.length, 2);
     assert.ok(container.querySelector(".timeline")?.getAttribute("data-session-key")?.includes(firstSession), container.querySelector(".timeline")?.getAttribute("data-session-key") ?? "no timeline session key");
     act(() => { outputButtons[0]!.click(); });
@@ -883,6 +907,19 @@ test("document preview composer adapts to conversation-column width", async () =
   assert.match(narrowComposer, /\.composer-selectors\s*\{[^}]*display:\s*grid;[^}]*grid-column:\s*1 \/ -1/su);
   assert.match(narrowComposer, /\.composer-model\s*\{[^}]*grid-row:\s*2/su);
   assert.match(narrowComposer, /\.composer-send\s*\{[^}]*grid-row:\s*2/su);
+  assert.match(css, /\.composer\[data-empty="true"\] \.composer-toolbar\s*\{[^}]*grid-template-columns:\s*max-content minmax\(0, 1fr\) max-content;[^}]*grid-template-rows:\s*auto/su);
+  const compactEmptySendRules = [...css.matchAll(/\.composer\[data-empty="true"\] \.composer-send\s*\{([^}]*)\}/gu)].map((match) => match[1] ?? "");
+  assert.equal(compactEmptySendRules.length, 3, "the base rule stays content-sized and only narrow rules constrain the icon trigger");
+  assert.doesNotMatch(compactEmptySendRules[0] ?? "", /(?:min-)?width:\s*30px/u);
+  assert.match(compactEmptySendRules[1] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
+  assert.match(compactEmptySendRules[2] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
+  const narrowViewportRules = css.slice(css.lastIndexOf("@media (max-width: 820px)"), css.lastIndexOf("@container conversation (max-width: 720px)"));
+  const narrowConversationRules = css.slice(css.lastIndexOf("@container conversation (max-width: 720px)"));
+  assert.match(narrowViewportRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
+  assert.match(narrowConversationRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*6px/su, "filled Composer keeps its existing stacked narrow layout");
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer\[data-empty="true"\]\s*\{\s*padding-bottom:\s*8px;/su);
+  assert.match(css, /\.app-shell\.panel-docked \.composer\[data-empty="true"\] \.composer-input\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*gap:\s*8px/su);
 });
 
 test("App keeps a draft and renders attachment removal failures on the local card", async () => {
@@ -1380,6 +1417,9 @@ test("App adopts a lazy first Session before replaying early attachment events a
     assert.equal(container.querySelectorAll(".timeline-entry--user").length, 1);
     const restoredActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
     assert.ok(restoredActivity);
+    assert.equal(container.querySelectorAll("details.timeline-activity-group").length, 1, "live and replayed entries from one Turn share one activity group");
+    assert.equal(restoredActivity.dataset.turnId, turnId);
+    assert.equal(restoredActivity.querySelectorAll(".timeline-activity-reasoning").length, 2);
     assert.equal(restoredActivity.querySelectorAll(".timeline-activity-item").length, 1);
     assert.match(restoredActivity.textContent ?? "", /ReadDocument/u);
 
@@ -1396,10 +1436,14 @@ test("App adopts a lazy first Session before replaying early attachment events a
     await flush();
     const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
     const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
-    assert.deepEqual(kinds, ["user", "reasoning", "reasoning", "assistant"]);
+    assert.deepEqual(kinds, ["user", "assistant"], "reasoning and tools are grouped outside the message rows");
     assert.equal(rows.filter((row) => row.classList.contains("timeline-entry--user")).length, 1);
     const replayedActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
     assert.ok(replayedActivity);
+    assert.equal(container.querySelectorAll("details.timeline-activity-group").length, 1);
+    assert.equal(replayedActivity.dataset.turnId, turnId);
+    assert.equal(replayedActivity.dataset.reasoningCount, "2");
+    assert.equal(replayedActivity.querySelectorAll(".timeline-activity-reasoning").length, 2);
     assert.equal(replayedActivity.querySelectorAll(".timeline-activity-item").length, 1);
     assert.match(replayedActivity.textContent ?? "", /ReadDocument/u);
     assert.equal(container.querySelectorAll(".timeline-entry--user .file-card[data-file-ref='att-1']").length, 1);
@@ -1517,9 +1561,10 @@ test("App parks a lazy turn accepted after navigation without stealing the selec
     await flush();
     assert.equal(container.querySelectorAll(".session-line.is-selected").length, 1);
     assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Existing session"), true);
-    assert.equal(container.querySelectorAll(".timeline-entry").length, 1);
-    assert.equal(container.querySelectorAll(".timeline-entry--reasoning").length, 1);
-    assert.equal(container.querySelector(".timeline-entry--reasoning")?.textContent?.includes("Background work continued."), true);
+    assert.equal(container.querySelectorAll(".timeline-entry").length, 0, "background Turn activity does not become a message row in the selected Session");
+    const backgroundActivity = container.querySelector<HTMLElement>(`details.timeline-activity-group[data-turn-id="${otherTurnId}"]`);
+    assert.ok(backgroundActivity, "the background Turn is retained under its own activity group");
+    assert.equal(backgroundActivity.querySelector(".timeline-activity-reasoning")?.textContent?.includes("Background work continued."), true);
     assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === lazySessionId), false);
     assert.equal(preferenceWrites.some((item) => item.key === "selectedSessionId" && item.value === otherSessionId), true);
     assert.equal(calls.some((call) => call.method === "project.sessions") && sessionButton("New background session") !== undefined, true);
@@ -1766,9 +1811,13 @@ test("App hydrates externalized tool output after terminal idle without replacin
 
     const rows = [...container.querySelectorAll<HTMLElement>(".timeline-entry")];
     const kinds = rows.map((row) => [...row.classList].find((name) => name.startsWith("timeline-entry--"))?.slice("timeline-entry--".length));
-    assert.deepEqual(kinds, ["user", "reasoning", "reasoning", "assistant"]);
+    assert.deepEqual(kinds, ["user", "assistant"], "history keeps reasoning inside the Turn activity group");
     const recoveredActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
     assert.ok(recoveredActivity);
+    assert.equal(container.querySelectorAll("details.timeline-activity-group").length, 1);
+    assert.equal(recoveredActivity.dataset.turnId, "turn-a");
+    assert.equal(recoveredActivity.dataset.reasoningCount, "2");
+    assert.equal(recoveredActivity.querySelectorAll(".timeline-activity-reasoning").length, 2);
     assert.equal(recoveredActivity.querySelectorAll(".timeline-activity-item").length, 1);
     assert.match(recoveredActivity.textContent ?? "", /ReadDocument/u);
     assert.ok(recoveredActivity.querySelector(".timeline-tool-output"), "replay metadata adds the durable externalized result action to the live tool row");

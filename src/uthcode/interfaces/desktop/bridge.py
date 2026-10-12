@@ -614,12 +614,15 @@ def _workspace_diff_value(value: object) -> dict[str, object]:
         if not isinstance(entry, Mapping) or set(entry) not in (
             {"xy", "path"},
             {"xy", "path", "original_path"},
+            {"xy", "path", "review_error"},
+            {"xy", "path", "original_path", "review_error"},
         ):
             raise BridgeError("workspace_unavailable", "workspace status is unavailable")
         if (
             not isinstance(entry.get("xy"), str)
             or not isinstance(entry.get("path"), str)
             or "original_path" in entry and not isinstance(entry.get("original_path"), str)
+            or "review_error" in entry and entry.get("review_error") != "unavailable"
         ):
             raise BridgeError("workspace_unavailable", "workspace status is unavailable")
         projected_entries.append(dict(entry))

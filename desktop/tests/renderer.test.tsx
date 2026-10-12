@@ -659,7 +659,7 @@ test("W04 settings application events refresh only valid counters and reject an 
     const flush = async () => act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     act(() => { root.render(<App initialState={initial} api={api((listener) => { oldListener = listener; })} />); });
     await flush();
-    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /waiting for active work/u);
+    assert.match(container.querySelector(".settings-autosave-status")?.textContent ?? "", /apply when active work reaches an idle point/u);
 
     act(() => { oldListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
     await flush();
@@ -3467,11 +3467,17 @@ test("T05 markdown renderer covers common blocks without executing raw HTML", ()
 
 test("T08 collapsed tool activity keeps its command metadata but does not invent result content", () => {
   const markup = renderToStaticMarkup(<ChatTimeline entries={[{ id: "tool-1", kind: "tool", text: "Bash completed", command: "cat secret-result", toolName: "Bash", status: "completed", isError: false }]} todo={[]} />);
-  assert.match(markup, /<details class="timeline-activity-group" data-tool-count="1">/u, "activity starts collapsed under the native details control");
+  assert.match(markup, /<details class="timeline-activity-group"[^>]*data-tool-count="1"/u, "the whole turn starts collapsed under the native details control");
   assert.match(markup, /Bash completed/);
   assert.match(markup, /cat secret-result/u, "the actual tool command remains inspectable when the group is expanded");
   assert.match(markup, /没有可用输出/u, "missing historical result content stays explicitly unavailable");
   assert.doesNotMatch(markup, /ToolResult|secret-output/u);
+  const document = new JSDOM(markup).window.document;
+  const group = document.querySelector<HTMLDetailsElement>(".timeline-activity-group");
+  const tool = document.querySelector<HTMLDetailsElement>(".timeline-activity-item");
+  assert.equal(group?.open, false);
+  assert.equal(tool?.open, false, "tool command/output remains a second, initially closed disclosure");
+  assert.doesNotMatch(group?.querySelector("summary")?.textContent ?? "", /cat secret-result/u, "commands are not exposed before either disclosure is expanded");
 });
 
 test("T05 Composer exposes separate steering, pause, cancel, and Python-backed command completion paths", () => {
@@ -3501,12 +3507,12 @@ test("T08 tool activity groups stay collapsed and preserve bounded details and o
     const startedAt = Date.now() - 5000;
     const endedAt = startedAt + 3000;
     const entries: Parameters<typeof ChatTimeline>[0]["entries"] = [
-      { id: "tool-read", kind: "tool", text: "Read completed", toolName: "Read", command: "read source", status: "completed", startedAt, endedAt, outputPreview: "bounded preview", outputPreviewTruncated: true, fileChanges: [{ path: "src/app.ts", status: "modified" }] },
-      { id: "tool-write", kind: "tool", text: "Write rejected: permission denied", toolName: "Write", status: "failed", isError: true },
-      { id: "tool-cancel", kind: "tool", text: "Bash cancelled by user", toolName: "Bash", status: "cancelled", isError: false },
-      { id: "tool-running", kind: "tool", text: "Search running", toolName: "Search", status: "running", startedAt },
-      { id: "answer", kind: "assistant", text: "Between batches", status: "completed" },
-      { id: "tool-last", kind: "tool", text: "Fetch completed", toolName: "Fetch", status: "completed" },
+      { id: "tool-read", kind: "tool", text: "Read completed", runId: "run-activity", turnId: "turn-activity", toolName: "Read", command: "read source", status: "completed", startedAt, endedAt, outputPreview: "bounded preview", outputPreviewTruncated: true, fileChanges: [{ path: "src/app.ts", status: "modified" }] },
+      { id: "tool-write", kind: "tool", text: "Write rejected: permission denied", runId: "run-activity", turnId: "turn-activity", toolName: "Write", status: "failed", isError: true },
+      { id: "tool-cancel", kind: "tool", text: "Bash cancelled by user", runId: "run-activity", turnId: "turn-activity", toolName: "Bash", status: "cancelled", isError: false },
+      { id: "tool-running", kind: "tool", text: "Search running", runId: "run-activity", turnId: "turn-activity", toolName: "Search", status: "running", startedAt },
+      { id: "answer", kind: "assistant", text: "Final answer", runId: "run-activity", turnId: "turn-activity", status: "completed" },
+      { id: "tool-last", kind: "tool", text: "Fetch completed", runId: "run-activity", turnId: "turn-activity", toolName: "Fetch", status: "completed" },
     ];
     const viewedOutputs: string[] = [];
     const reviewedPaths: string[] = [];
@@ -3514,18 +3520,19 @@ test("T08 tool activity groups stay collapsed and preserve bounded details and o
       root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} onViewToolOutput={(entry) => viewedOutputs.push(entry.id)} onReviewCurrentDiff={(path) => reviewedPaths.push(path)} /></LanguageProvider>);
     });
     const groups = Array.from(container.querySelectorAll<HTMLDetailsElement>(".timeline-activity-group"));
-    assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["1", "1", "1"], "success groups stop at immediately visible failures and restart afterwards");
-    assert.equal(groups[0]?.open, false, "dense tool details start collapsed");
-    assert.match(groups[0]?.querySelector("summary")?.textContent ?? "", /1 activities/u);
+    assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["5"], "every Tool from the same Turn shares one activity group");
+    assert.equal(groups[0]?.open, false, "the entire Turn activity group starts collapsed");
+    assert.equal(groups[0]?.dataset.failureCount, "2", "the outer summary retains a failure count");
+    assert.match(groups[0]?.querySelector("summary")?.textContent ?? "", /2 failed/u);
     const failures = [...container.querySelectorAll<HTMLElement>(".timeline-activity-item.is-failed")];
-    assert.equal(failures.length, 2, "failed and cancelled Tools each have a direct row");
-    assert.ok(failures.every((failure) => failure.closest("details") === null), "failure explanations and cancellation status are not under a collapsed group");
+    assert.equal(failures.length, 2, "failed and cancelled Tools each keep a nested status row");
+    assert.ok(failures.every((failure) => failure.tagName === "DETAILS" && !failure.hasAttribute("open")), "failure command and explanation stay under a second collapsed disclosure");
     assert.match(failures.map((failure) => failure.textContent).join(" "), /permission denied|cancelled by user/u);
     assert.equal(container.querySelectorAll(".timeline-activity-item.is-failed .timeline-tool-output-unavailable").length, 0, "an unavailable-output notice does not overflow a failure summary");
-    assert.match(groups[2]?.textContent ?? "", /Duration unavailable/u, "missing live timestamps stay unavailable");
+    assert.match(groups[0]?.querySelectorAll(".tool-elapsed")[1]?.textContent ?? "", /Duration unavailable/u, "missing live timestamps stay unavailable");
     assert.match(groups[0]?.querySelectorAll(".tool-elapsed")[0]?.textContent ?? "", /3s/u, "completed duration stays frozen from observed timestamps");
     groups[0]!.open = true;
-    const readDetails = groups[0]!.querySelector<HTMLDetailsElement>(".timeline-activity-item");
+    const readDetails = groups[0]!.querySelector<HTMLDetailsElement>('.timeline-activity-item[aria-label^="Read"]');
     assert.ok(readDetails);
     assert.equal(readDetails.open, false, "tool input and output actions remain a default-closed second disclosure");
     readDetails.open = true;
@@ -3536,6 +3543,8 @@ test("T08 tool activity groups stay collapsed and preserve bounded details and o
     act(() => { outputButton!.click(); diffButton!.click(); });
     assert.deepEqual(viewedOutputs, ["tool-read"]);
     assert.deepEqual(reviewedPaths, ["src/app.ts"]);
+    const finalAnswer = container.querySelector(".timeline-entry--assistant");
+    assert.ok(finalAnswer && !finalAnswer.closest(".timeline-activity-group"), "the final assistant answer remains outside the collapsed activity group");
   });
 });
 
@@ -3555,9 +3564,9 @@ test("T08 activity group uses the observed wall-clock span instead of adding Too
   await withRendererDom(async (_dom, container, root) => {
     const start = Date.now() - 10_000;
     const entries: Parameters<typeof ChatTimeline>[0]["entries"] = [
-      { id: "span-one", kind: "tool", text: "One completed", toolName: "One", status: "completed", startedAt: start, endedAt: start + 3_000 },
-      { id: "span-two", kind: "tool", text: "Two completed", toolName: "Two", status: "completed", startedAt: start + 2_000, endedAt: start + 4_000 },
-      { id: "span-three", kind: "tool", text: "Three completed", toolName: "Three", status: "completed", startedAt: start + 3_000, endedAt: start + 5_000 },
+      { id: "span-one", kind: "tool", text: "One completed", runId: "run-span", turnId: "turn-span", toolName: "One", status: "completed", startedAt: start, endedAt: start + 3_000 },
+      { id: "span-two", kind: "tool", text: "Two completed", runId: "run-span", turnId: "turn-span", toolName: "Two", status: "completed", startedAt: start + 2_000, endedAt: start + 4_000 },
+      { id: "span-three", kind: "tool", text: "Three completed", runId: "run-span", turnId: "turn-span", toolName: "Three", status: "completed", startedAt: start + 3_000, endedAt: start + 5_000 },
     ];
     act(() => {
       root.render(<LanguageProvider value="en"><ChatTimeline entries={entries} todo={[]} /></LanguageProvider>);
@@ -3569,7 +3578,7 @@ test("T08 activity group uses the observed wall-clock span instead of adding Too
   });
 });
 
-test("T08 seven adjacent Tools stay one collapsed group across event batches and visible segments split it", () => {
+test("T08 same-Turn tools share a collapsed group while unscoped public rows stay separate", () => {
   let streamed = createInitialState();
   for (let index = 1; index <= 7; index += 1) {
     const batchId = index < 4 ? "batch-one" : "batch-two";
@@ -3582,7 +3591,6 @@ test("T08 seven adjacent Tools stay one collapsed group across event batches and
     id: `batch-tool-${index}`,
     kind: "tool",
     text: `Tool ${index} completed`,
-    turnId: "turn-1",
     toolCallId: `call-${index}`,
     toolName: `Tool${index}`,
     iteration: index < 4 ? 1 : 2,
@@ -3606,8 +3614,8 @@ test("T08 seven adjacent Tools stay one collapsed group across event batches and
     tool(14),
     { id: "answer", kind: "assistant", text: "Final answer", status: "completed" },
   ]} todo={[]} /></LanguageProvider>);
-  const toolCounts = Array.from(markup.matchAll(/<details class="timeline-activity-group" data-tool-count="(\d+)"/gu), (match) => match[1]);
-  assert.deepEqual(toolCounts, ["7", "1", "1", "1", "1", "1", "1", "1"], "adjacent tools across batches stay together, and public segments including interactions and failures split groups");
+  const toolCounts = Array.from(markup.matchAll(/<details class="timeline-activity-group"[^>]*data-tool-count="(\d+)"/gu), (match) => match[1]);
+  assert.deepEqual(toolCounts, ["7", "1", "0", "1", "1", "1", "1", "1", "1"], "the durable Run/Turn identity groups all seven calls; rows without a Turn identity remain separate");
   assert.match(markup, /<article class="timeline-entry timeline-entry--assistant"[^>]*>.*?Final answer.*?<\/article>/u, "the final answer remains directly visible outside every activity group");
   assert.match(markup, /Public reasoning/u);
   assert.match(markup, /Waiting for permission/u);
@@ -3616,7 +3624,7 @@ test("T08 seven adjacent Tools stay one collapsed group across event batches and
   assert.match(markup, /Turn failed/u);
 });
 
-test("T08 a failed live Tool breaks collapsed groups and leaves its command and safe output action visible", async () => {
+test("T08 a failed live Tool stays in its collapsed Turn group with command and output behind the nested disclosure", () => {
   let state = createInitialState({
     selectedProjectKey: "C:/t08-tool-failure-visibility",
     selectedSessionId: "session-tool-failure-visibility",
@@ -3634,17 +3642,107 @@ test("T08 a failed live Tool breaks collapsed groups and leaves its command and 
   for (const event of events) state = reduceRendererState(state, { type: "agent_event", event });
   assert.deepEqual(state.timeline.filter((entry) => entry.kind === "tool").map((entry) => entry.status), ["completed", "failed", "completed"], "the live reducer projects success, failure, then success in order");
 
-  await withRendererDom(async (_dom, container, root) => {
-    act(() => { root.render(<LanguageProvider value="en"><ChatTimeline entries={state.timeline} todo={[]} /></LanguageProvider>); });
-    const groups = [...container.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-group")];
-    assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["1", "1"], "successful calls on either side of failure remain separate normal groups");
-    assert.ok(groups.every((group) => !group.open), "normal activity groups remain collapsed by default");
-    const failure = container.querySelector<HTMLElement>(".timeline-activity-item.is-failed");
-    assert.ok(failure, "the failed tool row is directly rendered");
-    assert.equal(failure.closest("details"), null, "the failure is not hidden under a collapsed details element");
-    assert.match(failure.textContent ?? "", /remove protected file/u, "the failed command is visible with its failure row");
-    assert.ok(failure.querySelector(".timeline-tool-output"), "the safe output action is reachable directly from the visible failed row");
+  const markup = renderLanguage("en", <ChatTimeline entries={state.timeline} todo={[]} />);
+  const document = new JSDOM(markup).window.document;
+  const groups = [...document.querySelectorAll<HTMLDetailsElement>("details.timeline-activity-group")];
+  assert.deepEqual(groups.map((group) => group.dataset.toolCount), ["3"], "success and failure stay together under their true Run/Turn owner");
+  assert.equal(groups[0]?.dataset.failureCount, "1", "the outer summary retains the failure count");
+  assert.ok(groups.every((group) => !group.open), "the whole Turn activity stays collapsed by default");
+  const failure = document.querySelector<HTMLDetailsElement>(".timeline-activity-item.is-failed");
+  assert.ok(failure, "the failed Tool has its own nested disclosure");
+  assert.equal(failure.open, false, "failure command, explanation, and output action stay hidden until the Tool row opens");
+  assert.equal(failure.closest("details.timeline-activity-group")?.getAttribute("data-turn-id"), groups[0]?.getAttribute("data-turn-id"));
+  assert.doesNotMatch(groups[0]?.querySelector("summary")?.textContent ?? "", /remove protected file|Permission denied/u);
+  const nestedSummary = failure.querySelector("summary");
+  const failureDetails = failure.querySelector(".timeline-activity-item__details");
+  assert.doesNotMatch(nestedSummary?.textContent ?? "", /remove protected file|Permission denied/u, "the second summary retains only the safe name/status");
+  assert.match(failureDetails?.textContent ?? "", /remove protected file/u, "the command is available inside the nested failure row");
+  assert.match(failureDetails?.textContent ?? "", /Permission denied by the active security policy/u, "the controlled error remains inspectable inside the nested row");
+  assert.ok(failure.querySelector(".timeline-tool-output"), "the safe output action remains available after opening the nested row");
+});
+
+test("T08 history hydration anchors permission statuses before their Tool and keeps the current Turn pending", () => {
+  const projectKey = "C:/timeline-interaction-order";
+  const sessionId = "session-interaction-order";
+  let state = createInitialState({
+    selectedProjectKey: projectKey,
+    selectedSessionId: sessionId,
+    run: { run_id: "run-one", turn_id: "turn-one", status: "running" },
+    activeTurn: true,
   });
+  const dispatch = (event: AgentEvent) => { state = reduceRendererState(state, { type: "agent_event", event }); };
+  const permissionRequest = (runId: string, turnId: string, toolCallId: string) => ({
+    permission_id: `permission-${toolCallId}`,
+    run_id: runId,
+    turn_id: turnId,
+    tool_call_id: toolCallId,
+    tool: "ReadFile",
+    action: "read",
+    effect: "allow",
+    resource: "safe.txt",
+    scope: "workspace",
+    reason: "mode_fallback",
+    mode: "default",
+    choices: ["once", "reject"],
+    guard: false,
+  });
+  dispatch({ type: "turn_started", project_key: projectKey, session_id: sessionId, run_id: "run-one", turn_id: "turn-one", message_id: "user-one", message: { role: "user", parts: [{ type: "text", text: "first request" }] } });
+  dispatch({ type: "reasoning_delta", run_id: "run-one", turn_id: "turn-one", message_id: "reasoning-one-a", text: "first reasoning" });
+  dispatch({ type: "turn_paused", run_id: "run-one", turn_id: "turn-one", pause: { pause_id: "pause-one", run_id: "run-one", turn_id: "turn-one", kind: "permission_required", tool_call_id: "call-one", permission_request: permissionRequest("run-one", "turn-one", "call-one") } });
+  dispatch({ type: "turn_resumed", run_id: "run-one", turn_id: "turn-one", pause_id: "pause-one", kind: "permission_required" });
+  dispatch({ type: "tool_started", run_id: "run-one", turn_id: "turn-one", session_id: sessionId, project_key: projectKey, batch_id: "batch-one", tool_call_id: "call-one", tool_name: "ReadFile", command: "ReadFile('safe.txt')" });
+  dispatch({ type: "tool_finished", run_id: "run-one", turn_id: "turn-one", session_id: sessionId, project_key: projectKey, batch_id: "batch-one", tool_call_id: "call-one", tool_name: "ReadFile", command: "ReadFile('safe.txt')", status: "succeeded", is_error: false });
+  dispatch({ type: "reasoning_delta", run_id: "run-one", turn_id: "turn-one", message_id: "reasoning-one-b", text: "second reasoning" });
+  dispatch({ type: "assistant_message_completed", run_id: "run-one", turn_id: "turn-one", message_id: "assistant-one", message: { role: "assistant", parts: [{ type: "text", text: "first final answer" }] } });
+  dispatch({ type: "turn_completed", run_id: "run-one", turn_id: "turn-one", final_text: "first final answer" });
+
+  state = { ...state, run: { run_id: "run-two", turn_id: "turn-two", status: "running" }, activeTurn: true, terminalStatusPending: false, turnStatus: "running" };
+  dispatch({ type: "turn_started", project_key: projectKey, session_id: sessionId, run_id: "run-two", turn_id: "turn-two", message_id: "user-two", message: { role: "user", parts: [{ type: "text", text: "second request" }] } });
+  dispatch({ type: "reasoning_delta", run_id: "run-two", turn_id: "turn-two", message_id: "reasoning-two", text: "current reasoning" });
+  dispatch({ type: "turn_paused", run_id: "run-two", turn_id: "turn-two", pause: { pause_id: "pause-two", run_id: "run-two", turn_id: "turn-two", kind: "permission_required", tool_call_id: "call-two", permission_request: permissionRequest("run-two", "turn-two", "call-two") } });
+  const pendingBeforeHydration = state.pendingInteraction;
+  assert.equal(pendingBeforeHydration?.turnId, "turn-two");
+
+  state = reduceRendererState(state, {
+    type: "history_page_loaded",
+    projectKey,
+    sessionId,
+    result: { session_id: sessionId, records: [
+      { record_id: "record-user-one", sequence: 1, run_id: "run-one", turn_id: "turn-one", message_id: "user-one", kind: "user", text: "first request" },
+      { record_id: "record-tool-one", sequence: 2, run_id: "run-one", turn_id: "turn-one", tool_call_id: "call-one", kind: "tool", tool_name: "ReadFile", text: "ReadFile", command: "ReadFile('safe.txt')", status: "succeeded", is_error: false },
+      { record_id: "record-assistant-one", sequence: 3, run_id: "run-one", turn_id: "turn-one", message_id: "assistant-one", kind: "assistant", text: "first final answer", is_error: false },
+      { record_id: "record-user-two", sequence: 4, run_id: "run-two", turn_id: "turn-two", message_id: "user-two", kind: "user", text: "second request" },
+    ], next_cursor: null, has_more: false },
+  });
+
+  const firstTurn = state.timeline.filter((entry) => entry.turnId === "turn-one");
+  const firstWaiting = firstTurn.findIndex((entry) => entry.text === "Waiting for permission");
+  const firstAnswered = firstTurn.findIndex((entry) => entry.text === "Interaction answered");
+  const firstTool = firstTurn.findIndex((entry) => entry.kind === "tool");
+  const firstFinal = firstTurn.findIndex((entry) => entry.kind === "assistant" && entry.status === "completed");
+  assert.ok(firstWaiting >= 0 && firstWaiting < firstAnswered && firstAnswered < firstTool && firstTool < firstFinal, "permission wait and answer remain before the associated Tool and final assistant record after hydration");
+  assert.deepEqual(state.pendingInteraction, pendingBeforeHydration, "history refresh cannot clear the live permission control for the second Turn");
+  assert.equal(state.pendingInteraction?.turnId, "turn-two");
+
+  const markup = renderLanguage("en", <ChatTimeline entries={state.timeline} todo={[]} />);
+  const document = new JSDOM(markup).window.document;
+  const groups = [...document.querySelectorAll<HTMLDetailsElement>(".timeline-activity-group")];
+  const firstGroup = groups.find((group) => group.dataset.turnId === "turn-one");
+  const secondGroup = groups.find((group) => group.dataset.turnId === "turn-two");
+  assert.ok(firstGroup && secondGroup, "each Turn has one complete activity disclosure");
+  assert.equal(firstGroup.open, false);
+  assert.equal(secondGroup.open, false);
+  assert.match(secondGroup.textContent ?? "", /Waiting for permission/u, "the live permission notice remains in its current Turn group");
+  firstGroup.open = true;
+    assert.equal(firstGroup.querySelectorAll(".timeline-activity-reasoning").length, 2, "multiple reasoning segments are visible directly when the outer Turn group opens");
+  assert.equal(firstGroup.querySelectorAll("details.timeline-activity-item").length, 1, "Tool details remain a second-level disclosure");
+  assert.equal(firstGroup.querySelector("details.timeline-activity-item")?.open, false);
+  assert.match(firstGroup.textContent ?? "", /Waiting for permission.*Interaction answered/su);
+  const finalArticle = document.querySelector<HTMLElement>(".timeline-entry--assistant");
+  assert.ok(finalArticle && !finalArticle.closest(".timeline-activity-group"), "final assistant text remains outside the activity group");
+  const pendingMarkup = renderLanguage("en", <InteractionSurface interaction={state.pendingInteraction!} onSubmit={() => undefined} onCancel={() => undefined} />);
+  assert.match(pendingMarkup, /role="dialog"/u, "the actual current permission control remains available outside the collapsed history activity group");
+  assert.match(pendingMarkup, /Allow once/u);
 });
 
 test("T06 Todo strip exposes status text and one compact focusable visual entity", async () => {
@@ -5407,6 +5505,17 @@ test("compaction timeline keeps chronological notices and shows running or faile
   assert.match(render("working", true, false), /compaction-spinner/u);
   assert.match(render("failed result", false, false), /failed result/u);
   assert.match(render("cancelled result", false, false), /cancelled result/u);
+
+  const grouped = renderLanguage("en", <ChatTimeline entries={[
+    { id: "group-user", kind: "user", text: "request", runId: "run-group", turnId: "turn-group", sequence: 1 },
+    { id: "group-tool", kind: "tool", text: "ReadFile", runId: "run-group", turnId: "turn-group", toolCallId: "call-group", toolName: "ReadFile", status: "completed", sequence: 2 },
+    { id: "group-answer", kind: "assistant", text: "answer", runId: "run-group", turnId: "turn-group", status: "completed", sequence: 3 },
+    { id: "next-user", kind: "user", text: "next", runId: "run-next", turnId: "turn-next", sequence: 4 },
+  ]} todo={[]} compactionAnchor={{ id: "group-tool", kind: "tool" }} compactionNotice="Compaction is ready" compactionCompleted />);
+  const groupedRoot = new JSDOM(grouped).window.document;
+  const turnGroup = groupedRoot.querySelector(".timeline-activity-group");
+  assert.ok(turnGroup);
+  assert.ok(turnGroup.nextElementSibling?.classList.contains("timeline-compaction"), "the transient compaction notice stays anchored immediately after its collapsed Turn group");
 });
 
 test("ChatTimeline places transient notices and Runtime errors after the latest conversation entry", async () => {

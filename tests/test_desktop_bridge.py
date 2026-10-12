@@ -73,6 +73,7 @@ from uthcode.application import (
     Usage,
     UthCodeApplication,
     create_application,
+    load_effective_config,
 )
 from uthcode.core.agent_events import (
     AssistantMessageCompleted,
@@ -4515,6 +4516,30 @@ async def _wait_for_workspace_diff_event(
     raise AssertionError(f"workspace diff operation {operation_id} did not publish a result")
 
 
+def test_workspace_diff_boundary_preserves_local_untracked_review_errors() -> None:
+    payload = {
+        "source": "current_working_tree",
+        "project_key": "C:/registered",
+        "viewed_at": "2026-10-12T00:00:00+00:00",
+        "status": {
+            "branch": "main",
+            "entries": [{"xy": "??", "path": "gone.txt", "review_error": "unavailable"}],
+            "unborn": False,
+            "truncated": False,
+        },
+        "staged_diff": {"text": "", "truncated": False, "size_bytes": 0},
+        "unstaged_diff": {"text": "", "truncated": False, "size_bytes": 0},
+        "truncated": False,
+    }
+    projected = bridge_module._workspace_diff_value(payload)
+    assert projected["status"]["entries"] == [
+        {"xy": "??", "path": "gone.txt", "review_error": "unavailable"}
+    ]
+    payload["status"]["entries"][0]["review_error"] = "raw-error-detail"
+    with pytest.raises(bridge_module.BridgeError):
+        bridge_module._workspace_diff_value(payload)
+
+
 @pytest.mark.asyncio
 async def test_workspace_diff_uses_registered_coding_owner_and_redacts_configured_secrets(
     tmp_path: Path,
@@ -4547,7 +4572,7 @@ async def test_workspace_diff_uses_registered_coding_owner_and_redacts_configure
     tracked.write_text(f"{provider_secret}\nstaged version\n", encoding="utf-8")
     git(workspace, "add", "tracked.txt")
     tracked.write_text(f"{search_secret}\nunstaged version\n", encoding="utf-8")
-    (workspace / "new file.txt").write_text("untracked\n", encoding="utf-8")
+    (workspace / "new file.txt").write_text(f"{provider_secret} untracked body\n", encoding="utf-8")
     (workspace / f"{search_secret}.txt").write_text("credentialed path\n", encoding="utf-8")
 
     configuration = EffectiveConfig(
@@ -4620,6 +4645,9 @@ async def test_workspace_diff_uses_registered_coding_owner_and_redacts_configure
         assert "+staged version" in staged["text"]
         assert "+<redacted>" in unstaged["text"]
         assert "+unstaged version" in unstaged["text"]
+        untracked_patch = unstaged["text"].split("+++ b/new file.txt", 1)[1]
+        assert "@@ -0,0 +1 @@" in untracked_patch
+        assert "+<redacted>" in untracked_patch
         assert "<redacted>" in status["branch"]
         wire = json.dumps(event, ensure_ascii=False)
         assert provider_secret not in wire
@@ -4657,6 +4685,141 @@ async def test_workspace_diff_uses_registered_coding_owner_and_redacts_configure
         assert general_denied.error.kind == "workspace_unavailable"
         assert bridge.application is before_application
         assert application.runtime_context.workdir == before_workdir
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_workspace_diff_redacts_multiline_literal_and_env_secrets_with_bounded_untracked_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uthcode.application import generation as generation_module
+    from uthcode.integrations.tools.git_tools import GitWorkspace as GitWorkspaceImplementation
+
+    def git(root: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    current = (tmp_path / "current-project").resolve()
+    current.mkdir()
+    workspace = (tmp_path / "registered-project").resolve()
+    workspace.mkdir()
+    git(workspace, "init", "--initial-branch=main")
+    git(workspace, "config", "user.email", "test@example.invalid")
+    git(workspace, "config", "user.name", "UthCode Test")
+    (workspace / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+    git(workspace, "add", "baseline.txt")
+    git(workspace, "commit", "-m", "initial")
+
+    literal_secret = "++ literal-alpha-9d41\nliteral-beta-6b03"
+    environment_secret = "environment-alpha-34ac\nenvironment-beta-82df"
+    environment_name = "W05_REVIEW_MULTILINE_ENV_SECRET"
+    monkeypatch.setenv(environment_name, environment_secret)
+    config_home = tmp_path / "config-home"
+    user_config = config_home / ".uthcode" / "config.toml"
+    user_config.parent.mkdir(parents=True)
+    literal_expression = literal_secret.replace("\n", r"\n")
+    user_config.write_text(
+        f'''default_model = "fake/workspace-review"
+
+[providers.fake]
+kind = "fake"
+api_key = "{literal_expression}"
+
+[models."fake/workspace-review"]
+provider = "fake"
+remote_id = "workspace-review"
+
+[search]
+enabled = true
+provider = "tavily"
+api_key = "env:{environment_name}"
+''',
+        encoding="utf-8",
+    )
+
+    padding_lines = [
+        f"bounded padding row {index:04d} " + "p" * 92
+        for index in range(5)
+    ]
+    body_lines = [
+        literal_secret,
+        environment_secret,
+        *padding_lines,
+        literal_secret,
+        *(f"bounded filler row {index:04d} " + "x" * 96 for index in range(500)),
+    ]
+    body = "\n".join(body_lines) + "\n"
+    (workspace / "bounded-review.txt").write_text(body, encoding="utf-8")
+    complete_diff = GitWorkspaceImplementation(
+        workspace,
+        max_output_bytes=1_000_000,
+    ).review()["unstaged_diff"]["text"]
+    partial_secret_line = f"+{literal_secret.splitlines()[0]}\n"
+    cutoff = complete_diff.rfind(partial_secret_line) + len(partial_secret_line)
+    assert cutoff > 0
+    assert complete_diff[cutoff:].startswith(f"+{literal_secret.splitlines()[1]}\n")
+    output_limit = len(complete_diff[:cutoff].encode("utf-8"))
+    assert 0 < output_limit <= 1024
+    monkeypatch.setattr(
+        generation_module,
+        "GitWorkspace",
+        lambda root: GitWorkspaceImplementation(root, max_output_bytes=output_limit),
+    )
+
+    configuration = load_effective_config(
+        cwd=current,
+        home=config_home,
+        include_project_configs=False,
+    )
+    application = create_application(
+        configuration,
+        provider_builder=lambda _profile, _model: FakeProvider(events=(_completed(),)),
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=current),
+        storage_root=tmp_path / "sessions",
+    )
+    bridge = DesktopBridge(application=application, workdir=current)
+    workspace_key = str(workspace)
+    try:
+        response = await bridge.handle_request(
+            RequestEnvelope(
+                "workspace-diff-multiline-secret",
+                "workspace.diff",
+                {
+                    "project_key": workspace_key,
+                    "catalog_project_keys": [str(current), workspace_key, "uthcode:general"],
+                },
+            )
+        )
+        assert response.ok is True and response.result is not None
+        event = await _wait_for_workspace_diff_event(
+            bridge,
+            str(response.result["operation_id"]),
+        )
+        assert event["state"] == "completed"
+        assert event["status"]["entries"] == [
+            {"xy": "??", "path": "bounded-review.txt"}
+        ]
+        diff = event["unstaged_diff"]
+        assert diff["truncated"] is True
+        assert event["truncated"] is True
+        assert diff["size_bytes"] <= 1024
+        assert len(diff["text"].encode("utf-8")) <= 1024
+        assert f"@@ -0,0 +1,{len(body.splitlines())} @@" in diff["text"]
+        assert "+<redacted>" in diff["text"]
+        assert "+bounded padding row 0000" in diff["text"]
+        assert diff["size_bytes"] == output_limit
+        wire = json.dumps(event, ensure_ascii=False)
+        for secret in (literal_secret, environment_secret):
+            assert secret not in wire
+            for line in secret.splitlines():
+                assert line not in diff["text"]
     finally:
         await bridge.shutdown()
 

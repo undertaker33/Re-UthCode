@@ -210,6 +210,7 @@ export interface TimelineEntry {
   toolName?: string;
   command?: string;
   status?: TimelineStatus;
+  activityKind?: "interaction";
   isError?: boolean;
   sequence?: number;
   streaming?: boolean;
@@ -573,7 +574,7 @@ function appendStatus(
   state: RendererState,
   text: string,
   status: TimelineStatus = "info",
-  identity?: Pick<TimelineEntry, "id" | "runId" | "turnId">,
+  identity?: Pick<TimelineEntry, "id" | "runId" | "turnId" | "toolCallId" | "activityKind">,
 ): RendererState {
   if (identity && state.timeline.some((entry) => entry.id === identity.id)) return state;
   const id = identity?.id ?? `status:${state.nextStatusId}`;
@@ -586,6 +587,8 @@ function appendStatus(
       status,
       ...(identity?.runId ? { runId: identity.runId } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(identity?.toolCallId ? { toolCallId: identity.toolCallId } : {}),
+      ...(identity?.activityKind ? { activityKind: identity.activityKind } : {}),
     }],
     nextStatusId: state.nextStatusId + 1,
   };
@@ -620,6 +623,11 @@ function sameTimelineIdentity(left: TimelineEntry, right: TimelineEntry): boolea
   // live event do not carry the same stable id, preserve both rather than
   // guessing from kind/text/Turn and dropping a real record.
   return false;
+}
+
+function sameTimelineTurn(left: TimelineEntry, right: TimelineEntry): boolean {
+  return Boolean(left.turnId && right.turnId && left.turnId === right.turnId
+    && (!left.runId || !right.runId || left.runId === right.runId));
 }
 
 function mergeTimelineAttachments(...sources: (readonly TimelineAttachment[] | undefined)[]): TimelineAttachment[] {
@@ -717,11 +725,115 @@ function mergeTimelineEntries(
     const replace = preferIncoming || (incomingIsLive && !existingIsLive) || (existing.streaming && !candidate.streaming);
     result[index] = replace ? { ...existing, ...candidate } : { ...candidate, ...existing };
   });
-  return result.sort((left, right) => {
-    if (left.sequence === undefined) return right.sequence === undefined ? 0 : 1;
-    if (right.sequence === undefined) return -1;
-    return left.sequence - right.sequence || Number(left.kind === "compaction") - Number(right.kind === "compaction");
-  });
+  const durable = result.filter((entry) => entry.sequence !== undefined).sort((left, right) =>
+    left.sequence! - right.sequence! || Number(left.kind === "compaction") - Number(right.kind === "compaction"));
+  const live = result.filter((entry) => entry.sequence === undefined);
+  if (durable.length === 0) return result;
+  if (live.length === 0) return durable;
+
+  const basePositions = result.slice(0, base.length);
+  const durableIndex = new Map(durable.map((entry, index) => [entry.id, index]));
+  const insertionIndex = (entry: TimelineEntry): number => {
+    const sameTurn = durable
+      .map((candidate, index) => ({ candidate, index }))
+      .filter(({ candidate }) => sameTimelineTurn(candidate, entry));
+    if (entry.activityKind === "interaction") {
+      if (entry.toolCallId) {
+        const relatedTool = sameTurn.find(({ candidate }) =>
+          candidate.kind === "tool" && candidate.toolCallId === entry.toolCallId);
+        if (relatedTool) return relatedTool.index;
+      }
+
+      // Interaction rows carry the live Run/Turn identity but no durable
+      // sequence. Anchor them to the next same-Turn replay record when one
+      // exists. If history arrives after the final record, keep the interaction
+      // immediately before that final answer instead of sorting it to the end.
+      const position = basePositions.findIndex((candidate) => candidate.id === entry.id);
+      if (position >= 0) {
+        for (let cursor = position + 1; cursor < basePositions.length; cursor += 1) {
+          const candidate = basePositions[cursor]!;
+          const index = candidate.sequence !== undefined && sameTimelineTurn(candidate, entry)
+            ? durableIndex.get(candidate.id)
+            : undefined;
+          if (index !== undefined) return index;
+        }
+        for (let cursor = position - 1; cursor >= 0; cursor -= 1) {
+          const candidate = basePositions[cursor]!;
+          const index = candidate.sequence !== undefined && sameTimelineTurn(candidate, entry)
+            ? durableIndex.get(candidate.id)
+            : undefined;
+          if (index !== undefined) return candidate.kind === "assistant" && candidate.status === "completed" ? index : index + 1;
+        }
+      }
+      const final = sameTurn.find(({ candidate }) => candidate.kind === "assistant" && candidate.status === "completed");
+      if (final) return final.index;
+      const lastUser = sameTurn.filter(({ candidate }) => candidate.kind === "user").at(-1);
+      if (lastUser) return lastUser.index + 1;
+    }
+
+    const position = basePositions.findIndex((candidate) => candidate.id === entry.id);
+    let previous: number | undefined;
+    let next: number | undefined;
+    if (position >= 0) {
+      for (let cursor = position - 1; cursor >= 0; cursor -= 1) {
+        const candidate = basePositions[cursor]!;
+        const index = candidate.sequence !== undefined && sameTimelineTurn(candidate, entry)
+          ? durableIndex.get(candidate.id)
+          : undefined;
+        if (index !== undefined) { previous = index; break; }
+      }
+      for (let cursor = position + 1; cursor < basePositions.length; cursor += 1) {
+        const candidate = basePositions[cursor]!;
+        const index = candidate.sequence !== undefined && sameTimelineTurn(candidate, entry)
+          ? durableIndex.get(candidate.id)
+          : undefined;
+        if (index !== undefined) { next = index; break; }
+      }
+    }
+    if (previous !== undefined && next !== undefined) return previous < next ? next : previous + 1;
+    if (previous !== undefined) return previous + 1;
+    if (next !== undefined) return next;
+    if (sameTurn.length > 0) {
+      const final = sameTurn.find(({ candidate }) => candidate.kind === "assistant" && candidate.status === "completed");
+      if (final) return final.index;
+      const lastUser = sameTurn.filter(({ candidate }) => candidate.kind === "user").at(-1);
+      if (lastUser) return lastUser.index + 1;
+      return sameTurn[0]!.index;
+    }
+
+    // A live record for a new or partially loaded Turn has no durable anchor
+    // yet. Keep its existing order after the closest older history, instead of
+    // sorting every unsequenced event after all later Turns.
+    if (position >= 0) {
+      for (let cursor = position - 1; cursor >= 0; cursor -= 1) {
+        const index = basePositions[cursor]?.sequence !== undefined
+          ? durableIndex.get(basePositions[cursor]!.id)
+          : undefined;
+        if (index !== undefined) return index + 1;
+      }
+      for (let cursor = position + 1; cursor < basePositions.length; cursor += 1) {
+        const index = basePositions[cursor]?.sequence !== undefined
+          ? durableIndex.get(basePositions[cursor]!.id)
+          : undefined;
+        if (index !== undefined) return index;
+      }
+    }
+    return durable.length;
+  };
+
+  const anchored = new Map<number, TimelineEntry[]>();
+  for (const entry of live) {
+    const index = Math.max(0, Math.min(durable.length, insertionIndex(entry)));
+    const items = anchored.get(index) ?? [];
+    items.push(entry);
+    anchored.set(index, items);
+  }
+  const ordered: TimelineEntry[] = [];
+  for (let index = 0; index <= durable.length; index += 1) {
+    ordered.push(...(anchored.get(index) ?? []));
+    if (index < durable.length) ordered.push(durable[index]!);
+  }
+  return ordered;
 }
 
 /**
@@ -824,15 +936,16 @@ function planTerminalForTool(state: RendererState, runId: string, turnId: string
 function updateAssistantFinal(state: RendererState, event: Record<string, JsonValue>, text: string): RendererState {
   const messageId = textValue(event.message_id);
   const id = eventId("assistant", event);
+  const runId = textValue(event.run_id) || undefined;
   const current = state.timeline.findIndex((entry) => entry.id === id);
   if (current >= 0) {
     if (state.timeline[current]?.status === "completed" && !state.timeline[current]?.streaming) return state;
-    return updateTimelineEntry(state, id, (entry) => ({ ...entry, text, status: "completed", streaming: false }));
+    return updateTimelineEntry(state, id, (entry) => ({ ...entry, ...(runId ? { runId } : {}), text, status: "completed", streaming: false }));
   }
   if (!text) return state;
   return {
     ...state,
-    timeline: [...state.timeline, { id, kind: "assistant", text, turnId: textValue(event.turn_id), messageId: messageId || undefined, status: "completed", streaming: false }],
+    timeline: [...state.timeline, { id, kind: "assistant", text, ...(runId ? { runId } : {}), turnId: textValue(event.turn_id), messageId: messageId || undefined, status: "completed", streaming: false }],
   };
 }
 
@@ -1133,7 +1246,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const id = reasoningSegmentId(payload);
     if (hasDurableTimelineIdentity(state, "reasoning", turnId, textValue(payload.message_id))) return state;
     if (state.timeline.some((entry) => entry.id === id)) return state;
-    return { ...state, timeline: [...state.timeline, { id, kind: "reasoning", text: "", turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
+    return { ...state, timeline: [...state.timeline, { id, kind: "reasoning", text: "", ...(eventRunId ? { runId: eventRunId } : {}), turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_delta") {
     const messageId = textValue(payload.message_id);
@@ -1154,7 +1267,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
       && entry.turnId === turnId
       && entry.messageId === messageId)) return state;
     const id = eventId("reasoning", payload);
-    return { ...withEstimate, timeline: [...withEstimate.timeline, { id, kind: "reasoning", text, turnId, messageId: messageId || undefined, status: "streaming", streaming: true }] };
+    return { ...withEstimate, timeline: [...withEstimate.timeline, { id, kind: "reasoning", text, ...(eventRunId ? { runId: eventRunId } : {}), turnId, messageId: messageId || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "reasoning_finished") {
     const id = reasoningSegmentId(payload);
@@ -1181,7 +1294,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
       if (!existing.streaming) return state;
       return updateTimelineEntry(reasoningClosed, id, (entry) => ({ ...entry, text: entry.text + text, status: "streaming", streaming: true }));
     }
-    return { ...reasoningClosed, timeline: [...reasoningClosed.timeline, { id, kind: "assistant", text, turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
+    return { ...reasoningClosed, timeline: [...reasoningClosed.timeline, { id, kind: "assistant", text, ...(eventRunId ? { runId: eventRunId } : {}), turnId, messageId: textValue(payload.message_id) || undefined, status: "streaming", streaming: true }] };
   }
   if (type === "assistant_message_completed") {
     const messageId = textValue(payload.message_id);
@@ -1200,6 +1313,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
         id: `reasoning:${textValue(payload.run_id)}:${turnId}:${messageId}:complete:${index}`,
         kind: "reasoning" as const,
         text: textValue(part?.text),
+        ...(eventRunId ? { runId: eventRunId } : {}),
         turnId,
         messageId: messageId || undefined,
         status: "completed" as const,
@@ -1216,7 +1330,7 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const closedReasoning = { ...state, timeline: state.timeline.map((entry) => entry.turnId === turnId && entry.kind === "reasoning" ? { ...entry, streaming: false, status: "completed" as TimelineStatus } : entry) };
     if (closedReasoning.timeline.some((entry) => entry.id === id)) return closedReasoning;
     const observedAt = observedTimestamp(payload.observed_at);
-    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, ...(observedAt !== undefined ? { startedAt: observedAt } : {}) }] };
+    return { ...closedReasoning, timeline: [...closedReasoning.timeline, { id, kind: "tool", text: textValue(payload.tool_name), ...(eventRunId ? { runId: eventRunId } : {}), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status: "running", streaming: false, ...(observedAt !== undefined ? { startedAt: observedAt } : {}) }] };
   }
   if (type === "tool_finished") {
     if (hasDurableTimelineIdentity(state, "tool", turnId, textValue(payload.tool_call_id))) return state;
@@ -1231,8 +1345,8 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const existing = state.timeline.find((entry) => entry.id === id);
     if (existing && existing.status !== "running") return state;
     let next = existing
-      ? updateTimelineEntry(state, id, (entry) => ({ ...entry, text: entry.text || textValue(payload.tool_name), status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }))
-      : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }] };
+      ? updateTimelineEntry(state, id, (entry) => ({ ...entry, ...(eventRunId ? { runId: eventRunId } : {}), text: entry.text || textValue(payload.tool_name), status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }))
+      : { ...state, timeline: [...state.timeline, { id, kind: "tool" as const, text: textValue(payload.tool_name), ...(eventRunId ? { runId: eventRunId } : {}), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, toolName: textValue(payload.tool_name) || undefined, command: textValue(payload.command) || undefined, status, isError, ...(endedAt !== undefined ? { endedAt } : {}), ...(outputPreview !== undefined ? { outputPreview } : {}), ...(payload.output_preview_truncated === true && outputPreview !== undefined ? { outputPreviewTruncated: true } : {}) }] };
     const iteration = positiveInteger(payload.iteration);
     const toolCallId = nonEmptyText(payload.tool_call_id);
     if ((cancelled || failed) && eventRunId && iteration !== null && toolCallId) next = planTerminalForTool(next, eventRunId, turnId, iteration, toolCallId, cancelled ? "cancelled" : "failed");
@@ -1327,7 +1441,15 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     };
     return appendStatus({ ...state, pendingSteeringMessageIds }, "Steering applied", "completed");
   }
-  if (type === "turn_pausing") return appendStatus({ ...state, turnStatus: "pausing" }, "Pausing…", "info");
+  if (type === "turn_pausing") {
+    const pauseId = textValue(payload.pause_id);
+    return appendStatus({ ...state, turnStatus: "pausing" }, "Pausing…", "info", {
+      id: `status:interaction:${eventRunId ?? "run"}:${turnId}:${pauseId || "pausing"}`,
+      runId: eventRunId ?? undefined,
+      turnId,
+      activityKind: "interaction",
+    });
+  }
   if (type === "user_input_requested") {
     return { ...state, pendingInteraction: { kind: "user_input_required", pauseId: textValue(payload.pause_id), runId: textValue(payload.run_id), turnId, toolCallId: textValue(payload.tool_call_id) || undefined, request: asRecord(payload.request) ?? undefined, reason: "user_input_required" }, turnStatus: "paused", activeTurn: true, terminalStatusPending: false };
   }
@@ -1339,9 +1461,31 @@ function reduceAgentEvent(state: RendererState, event: AgentEvent): RendererStat
     const request = asRecord(pause.user_input_request ?? pause.permission_request ?? pause.plan_review_request);
     const next = { ...state, pendingInteraction: { kind: interactionKind, pauseId: textValue(pause.pause_id), runId: textValue(pause.run_id), turnId: textValue(pause.turn_id), toolCallId: textValue(pause.tool_call_id) || undefined, request: request ?? undefined, reason: textValue(pause.reason), iteration: typeof pause.iteration === "number" ? pause.iteration : undefined }, turnStatus: "paused" as const, activeTurn: true, terminalStatusPending: false };
     const label = interactionKind === "permission_required" ? "permission" : interactionKind === "plan_review_required" ? "plan review" : interactionKind === "provider_unavailable" ? "provider retry" : interactionKind === "user_input_required" ? "user input" : "turn pause";
-    return appendStatus(next, `Waiting for ${label}`, "info");
+    const pauseId = textValue(pause.pause_id);
+    return appendStatus(next, `Waiting for ${label}`, "info", {
+      id: `status:interaction:${pauseId}:waiting`,
+      runId: textValue(pause.run_id) || eventRunId || undefined,
+      turnId: textValue(pause.turn_id) || turnId,
+      toolCallId: textValue(pause.tool_call_id) || undefined,
+      activityKind: "interaction",
+    });
   }
-  if (type === "turn_resumed") return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true, terminalStatusPending: false }, "Interaction answered", "info");
+  if (type === "turn_resumed") {
+    const pauseId = textValue(payload.pause_id);
+    const pendingPause = state.pendingInteraction;
+    const resumedToolCallId = pendingPause?.pauseId === pauseId
+      && pendingPause.runId === eventRunId
+      && pendingPause.turnId === turnId
+      ? pendingPause.toolCallId
+      : undefined;
+    return appendStatus({ ...state, pendingInteraction: null, turnStatus: "running", activeTurn: true, terminalStatusPending: false }, "Interaction answered", "info", {
+      id: `status:interaction:${pauseId || `${eventRunId ?? "run"}:${turnId}`}:answered`,
+      runId: eventRunId ?? undefined,
+      turnId,
+      toolCallId: resumedToolCallId,
+      activityKind: "interaction",
+    });
+  }
   if (type === "usage_updated") {
     const usage = asRecord(payload.usage);
     // Core UsageUpdated is cumulative across every Provider request in the
