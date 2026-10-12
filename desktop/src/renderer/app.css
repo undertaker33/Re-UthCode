@@ -203,7 +203,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .image-preview-stage:active { cursor: grabbing; }
 .image-preview-stage > img { width: auto; height: auto; max-width: 90%; max-height: 90%; flex: none; border-radius: 0; transform-origin: center; object-fit: contain; will-change: transform; }
 .image-preview-modal > footer { border-top: 1px solid var(--line); border-bottom: 0; }
-.document-preview-panel { position: relative; z-index: 1; grid-column: 3; display: flex; width: 100%; min-width: 0; height: 100vh; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--sidebar); }
+.document-preview-panel { position: relative; grid-column: 3; display: flex; width: 100%; min-width: 0; height: 100vh; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--sidebar); }
 .app-shell.document-preview-visible.focus-mode .document-preview-panel { grid-column: 2; }
 .document-preview-panel__resize { position: absolute; z-index: 1; top: 0; bottom: 0; left: -7px; width: 14px; cursor: col-resize; border: 0; background: transparent; }
 .document-preview-panel > header { display: flex; min-height: 52px; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 10px 14px; }

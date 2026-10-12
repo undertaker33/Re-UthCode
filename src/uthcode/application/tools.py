@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -79,8 +80,9 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 )
 _SENSITIVE_OPTION_VALUE = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])"
-    r"(?:--?|/)?[A-Za-z0-9_-]*"
-    rf"{_SENSITIVE_NAME}[ \t]+)"
+    r"(?:--?|/)?"
+    rf"(?:{_SENSITIVE_NAME}|"
+    r"[A-Za-z0-9_-]*(?:key|auth)(?:[_-][A-Za-z0-9]+)*)[ \t]+)"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
 )
 
@@ -169,24 +171,47 @@ class _SecretRedactor:
                 values.append(value)
         self._secret_values = tuple(values)
 
-    def redact(self, value: str) -> str:
+    def redact(self, value: str, *, preserve_line_breaks: bool = False) -> str:
         if not isinstance(value, str):
             raise TypeError("summary values must be strings")
 
+        def replacement(match: re.Match[str], visible: str) -> str:
+            if preserve_line_breaks:
+                return _preserve_line_breaks(match.group(0), visible)
+            return visible
+
         # Shape-based credentials are removed first so an unrelated, shorter
         # environment value cannot split a credential into printable pieces.
-        redacted = _AUTHORIZATION_VALUE.sub(_replace_authorization, value)
-        redacted = _BEARER_CREDENTIAL.sub(f"Bearer {_REDACTED}", redacted)
+        redacted = _AUTHORIZATION_VALUE.sub(
+            lambda match: replacement(match, _replace_authorization(match)),
+            value,
+        )
+        redacted = _BEARER_CREDENTIAL.sub(
+            lambda match: replacement(match, f"Bearer {_REDACTED}"),
+            redacted,
+        )
         redacted = _SENSITIVE_ASSIGNMENT.sub(
-            rf"\g<prefix>{_REDACTED}",
+            lambda match: replacement(
+                match,
+                f"{match.group('prefix')}{_REDACTED}",
+            ),
             redacted,
         )
         redacted = _SENSITIVE_OPTION_VALUE.sub(
-            rf"\g<prefix>{_REDACTED}",
+            lambda match: replacement(
+                match,
+                f"{match.group('prefix')}{_REDACTED}",
+            ),
             redacted,
         )
-        redacted = _BARE_API_KEY.sub(_REDACTED, redacted)
-        redacted = _SENSITIVE_TOKEN.sub(_REDACTED, redacted)
+        redacted = _BARE_API_KEY.sub(
+            lambda match: replacement(match, _REDACTED),
+            redacted,
+        )
+        redacted = _SENSITIVE_TOKEN.sub(
+            lambda match: replacement(match, _REDACTED),
+            redacted,
+        )
 
         # Configured secret sources are authoritative even when their current
         # value is short. Ambient environment values use a conservative
@@ -200,15 +225,65 @@ class _SecretRedactor:
         ]
         configured_values.extend(secret.reveal() for secret in self._secret_values)
         for secret in sorted(set(configured_values), key=len, reverse=True):
-            redacted = redacted.replace(secret, _REDACTED)
+            if not preserve_line_breaks or ("\n" not in secret and "\r" not in secret):
+                redacted = redacted.replace(secret, _REDACTED)
+                continue
+            pieces: list[str] = []
+            offset = 0
+            while (position := redacted.find(secret, offset)) >= 0:
+                pieces.append(redacted[offset:position])
+                pieces.append(_preserve_line_breaks(secret, _REDACTED))
+                offset = position + len(secret)
+            if pieces:
+                pieces.append(redacted[offset:])
+                redacted = "".join(pieces)
         ambient_values = {
             value
             for value in os.environ.values()
             if _is_ambient_secret_candidate(value)
         }
         for secret in sorted(ambient_values, key=len, reverse=True):
-            redacted = _replace_bounded_value(redacted, secret)
+            redacted = _replace_bounded_value(
+                redacted,
+                secret,
+                preserve_line_breaks=preserve_line_breaks,
+            )
         return redacted
+
+    def redact_numbered_file(self, value: str) -> str:
+        """Redact ReadFile output while keeping its generated line numbers.
+
+        The generated line-number prefixes are removed while the original
+        text is redacted as one continuous value, then restored in order.
+        Redaction on this path retains source line breaks so each line keeps
+        its original number, including when a secret spans multiple lines.
+        """
+
+        if not isinstance(value, str):
+            raise TypeError("summary values must be strings")
+
+        records = value.splitlines(keepends=True)
+        if not records:
+            return self.redact(value)
+        prefixes: list[str] = []
+        source: list[str] = []
+        for record in records:
+            match = re.match(r"(\d+\t)", record)
+            if match is None:
+                return self.redact(value)
+            prefixes.append(match.group(1))
+            source.append(record[match.end() :])
+
+        redacted_lines = self.redact(
+            "".join(source),
+            preserve_line_breaks=True,
+        ).splitlines(keepends=True)
+        if len(redacted_lines) < len(prefixes):
+            redacted_lines.extend("" for _ in range(len(prefixes) - len(redacted_lines)))
+        return "".join(
+            prefix + line
+            for prefix, line in zip(prefixes, redacted_lines, strict=True)
+        )
 
     def progress_tail_length(self, value: str) -> int:
         """Return the short raw suffix that may still complete a secret."""
@@ -261,22 +336,36 @@ def _replace_authorization(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{scheme or ''}{_REDACTED}"
 
 
+def _preserve_line_breaks(original: str, replacement: str) -> str:
+    line_breaks = re.findall(r"\r\n|\r|\n", original)
+    already_kept = len(re.findall(r"\r\n|\r|\n", replacement))
+    return replacement + "".join(line_breaks[already_kept:])
+
+
 def _is_ambient_secret_candidate(value: str) -> bool:
     return bool(value.strip()) and value not in _NON_SECRET_AMBIENT_VALUES
 
 
-def _replace_bounded_value(value: str, secret: str) -> str:
+def _replace_bounded_value(
+    value: str,
+    secret: str,
+    *,
+    preserve_line_breaks: bool = False,
+) -> str:
     left_boundary = (
         r"(?<![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", secret[0]) else ""
     )
     right_boundary = (
         r"(?![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", secret[-1]) else ""
     )
-    return re.sub(
-        f"{left_boundary}{re.escape(secret)}{right_boundary}",
-        _REDACTED,
-        value,
-    )
+    pattern = f"{left_boundary}{re.escape(secret)}{right_boundary}"
+    if preserve_line_breaks:
+        return re.sub(
+            pattern,
+            lambda match: _preserve_line_breaks(match.group(0), _REDACTED),
+            value,
+        )
+    return re.sub(pattern, _REDACTED, value)
 
 
 class ApplicationToolService:
@@ -928,16 +1017,24 @@ class ApplicationToolService:
         outcome: ToolExecutionOutcome,
     ) -> ToolExecutionOutcome:
         content = outcome.content
+
+        def redact_text(text: str) -> str:
+            return _redact_tool_text(
+                outcome.tool_name,
+                text,
+                self._redactor,
+            )
+
         if isinstance(content, ContentSequence):
             parts = tuple(
-                TextPart(self._redactor.redact(part.text))
+                TextPart(redact_text(part.text))
                 if isinstance(part, TextPart)
                 else part
                 for part in content.parts
             )
             content = ContentSequence(parts)
         else:
-            content = ContentSequence(self._redactor.redact(str(content)))
+            content = ContentSequence(redact_text(str(content)))
         details = _redact_value(outcome.details, self._redactor.redact)
         progress = tuple(
             replace(item, text=self._redactor.redact(item.text))
@@ -1133,6 +1230,50 @@ def _redact_value(value: object, redact: Callable[[str], str]) -> object:
     if isinstance(value, set):
         return {_redact_value(item, redact) for item in value}
     return value
+
+
+def _redact_tool_text(
+    tool_name: str,
+    text: str,
+    redactor: _SecretRedactor,
+) -> str:
+    """Redact payload text without changing generated framing or JSON facts."""
+
+    if tool_name == "ReadFile":
+        return redactor.redact_numbered_file(text)
+
+    if tool_name in {"ToolResultRead", "HistoryRead"}:
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return redactor.redact(text)
+        if not isinstance(payload, dict):
+            return redactor.redact(text)
+        if tool_name == "ToolResultRead":
+            page_content = payload.get("content")
+            if not isinstance(page_content, str):
+                return redactor.redact(text)
+            payload["content"] = redactor.redact(page_content)
+        else:
+            entries = payload.get("entries")
+            if not isinstance(entries, list) or any(
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("payload"), Mapping)
+                for entry in entries
+            ):
+                return redactor.redact(text)
+            for entry in entries:
+                entry["payload"] = _redact_value(
+                    entry["payload"], redactor.redact
+                )
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    return redactor.redact(text)
 
 
 def _content_with_text(content: ContentSequence, replacement: str) -> ContentSequence:

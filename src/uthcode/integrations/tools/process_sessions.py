@@ -1140,7 +1140,7 @@ def _terminate_windows_pty_tree(pty: Any) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=5.0,
+            timeout=10.0,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired):

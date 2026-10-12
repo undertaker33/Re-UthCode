@@ -418,7 +418,10 @@ async def test_grep_reports_regex_timeout_as_a_controlled_failure(tmp_path: Path
 @pytest.mark.asyncio
 async def test_search_materializes_then_reads_through_application_tool_result_read(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("W05_STRUCTURED_METADATA_SECRET", "false")
+    monkeypatch.setenv("W05_STRUCTURED_CONTENT_SECRET", "needle")
     for index in range(5):
         (tmp_path / f"result-{index}.txt").write_text("needle\n", encoding="utf-8")
 
@@ -480,7 +483,10 @@ async def test_search_materializes_then_reads_through_application_tool_result_re
         read_materialized = service.materialize_tool_result(read_outcome)
         page = json.loads(str(read_materialized.result.content))
         assert page["ref"] == materialized.reference
-        assert page["content"]
+        assert "<redacted>" in page["content"]
+        assert "needle" not in page["content"]
+        assert page["eof"] is False
+        assert page["next_offset"] == 64
         assert read_materialized.persistence_status.value == "inline"
     finally:
         writer.close()

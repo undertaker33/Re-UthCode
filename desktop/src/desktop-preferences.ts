@@ -44,6 +44,7 @@ const MAX_STRING_LENGTH = 4096;
 const MAX_RECENT_PROJECTS = 50;
 const MAX_PINNED_PROJECTS = 200;
 const MAX_PINNED_SESSIONS = 500;
+const RENAME_RETRY_DELAYS_MS = [25, 50, 100] as const;
 
 export class PreferenceValidationError extends Error {
   readonly kind = "invalid_preference";
@@ -261,8 +262,22 @@ function validateDocument(value: unknown): DesktopPreferences {
   return result;
 }
 
+async function replaceDocument(temporaryPath: string, filePath: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(temporaryPath, filePath);
+      return;
+    } catch (error) {
+      const delayMs = RENAME_RETRY_DELAYS_MS[attempt];
+      if ((error as NodeJS.ErrnoException).code !== "EPERM" || delayMs === undefined) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export class DesktopPreferencesStore {
   readonly filePath: string;
+  private writeTail: Promise<void> = Promise.resolve();
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -285,7 +300,13 @@ export class DesktopPreferencesStore {
     }
   }
 
-  async write<K extends PreferenceKey>(key: K, value: DesktopPreferences[K]): Promise<DesktopPreferences> {
+  write<K extends PreferenceKey>(key: K, value: DesktopPreferences[K]): Promise<DesktopPreferences> {
+    const operation = this.writeTail.then(() => this.writeNext(key, value));
+    this.writeTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async writeNext<K extends PreferenceKey>(key: K, value: DesktopPreferences[K]): Promise<DesktopPreferences> {
     if (!isPreferenceKey(key)) {
       throw new PreferenceValidationError("unknown preference");
     }
@@ -323,7 +344,7 @@ export class DesktopPreferencesStore {
       } finally {
         await handle.close();
       }
-      await rename(temporaryPath, this.filePath);
+      await replaceDocument(temporaryPath, this.filePath);
     } finally {
       // A failed write/rename must not leave an unbounded collection of
       // preference temp files beside the authoritative document.

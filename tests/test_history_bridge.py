@@ -826,20 +826,20 @@ async def test_cold_prepare_captures_owner_workdir_before_project_switch(
 ) -> None:
     """A queued cold task keeps the project boundary it was created for."""
 
+    owner_workdir = tmp_path / "project-a"
     sessions_root = tmp_path / "sessions"
     source_store = SessionFileStore(sessions_root)
-    source_store.create_session("session-a", project_key="project")
-    source_store.create_session("session-b", project_key="project")
+    source_store.create_session("session-a", project_key=str(owner_workdir))
+    source_store.create_session("session-b", project_key=str(owner_workdir))
     source_service = ApplicationSessionService(
         storage_root=sessions_root,
-        project_key="project",
+        project_key=str(owner_workdir),
         instruction_loader=None,
         store=source_store,
     )
     source = UthCodeApplication(FakeProvider(), session_service=source_service)
     source.resume_session_for_command("session-a")
 
-    owner_workdir = tmp_path / "project-a"
     switched_workdir = tmp_path / "project-b"
     factory_started = Event()
     release_factory = Event()
@@ -854,7 +854,7 @@ async def test_cold_prepare_captures_owner_workdir_before_project_switch(
             FakeProvider(),
             session_service=ApplicationSessionService(
                 storage_root=sessions_root,
-                project_key="project",
+                project_key=str(owner_workdir),
                 instruction_loader=None,
                 store=candidate_store,
             ),

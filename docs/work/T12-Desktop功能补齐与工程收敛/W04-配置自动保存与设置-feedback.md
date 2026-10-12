@@ -116,3 +116,9 @@ Bridge 修改没有改变模块依赖边界，复用本轮前有效架构检查 
 最终独立命令：`python -m pytest tests/test_w04_review_fixes.py -k 'settings_save_keeps_active_turn_snapshot_then_applies_at_idle or turn_terminal_without_configuration_patch or cross_project_background_turn_publishes or compaction_terminal_publishes or owner_terminal_drains_without_save or settings_retry_apply' -q`，结果 14 passed、8 deselected、2.53s，退出码 0。内存复现与 git diff --check 退出码 0；复用上一轮独立 Renderer 129 passed、typecheck 通过和架构 23 passed 有效证据。Worker 最终六文件 Python 回归为 229 passed，未冒称本轮重新执行 Renderer 或架构。
 
 T11/T12 六项复合条件已有对应源码与自动化证据；冻结 Checklist 只增加六个完成标记，九份冻结文档正文核对未变，既有 Feedback 按轮次追加。用户 test-file.md 保留且排除提交。packaged/native/真实 Provider 与全包长期事实文档仍交 W05，包状态保持 not_implemented，不自行归档。用户已明确取消 UI 验收暂停，审核与 Git 后直接继续 W05。
+
+## 总控 Git 交付与 W05 交接（2026-10-11）
+
+W04 提交 `1d52d93a6c5e9035dea61df3bdf563b6e33c7e4d`（feat(desktop): autosave settings at safe runtime boundaries），精确 25 文件，包含本轮源码/测试/反馈、六个 Checklist 勾选与总控 W03 PR131 收口、索引更新，未提交用户 test-file.md。PR [#132](https://github.com/undertaker33/Re-UthCode/pull/132) 经 head/files/mergeable 核对，以匹配该 head 的 merge 于 2026-10-11T11:00:46Z 合并，merge `46d3c0d4808aab63c98df0de257833bf20b3eb9f`。
+
+SSH 临时 URL 改写仅用于 fetch/push，HTTPS origin 保持不变。merge 后本地 T11、远端 T11、GitHub main 与 PR merge 均一致；`git diff 1d52d93 HEAD -- src desktop` 无差异，已审核输入未变，tracked 工作区当时干净，仅 test-file.md 未跟踪。此追加 Git 记录和后续索引交接将随下一个必要 W05 提交纳入，不额外拆碎提交。按用户持续授权直接派发 W05，真实 packaged/native/Provider 与包级文档验收仍不能提前视为完成。

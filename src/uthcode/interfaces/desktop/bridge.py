@@ -1196,6 +1196,13 @@ class DesktopBridge:
         value = getattr(application, "session_id", None)
         return value if isinstance(value, str) and value.strip() else None
 
+    @staticmethod
+    def _active_session_id_for_application(application: object | None) -> str | None:
+        service = getattr(application, "session_service", None)
+        active = getattr(service, "active_session", None) if service is not None else None
+        value = getattr(active, "session_id", None)
+        return value if isinstance(value, str) and value.strip() else None
+
     def _supports_background_sessions(self) -> bool:
         """Whether this is a real configured Application that can be cloned."""
 
@@ -2324,8 +2331,19 @@ class DesktopBridge:
         runtime = self._runtime_for_session(session_id)
         runtime_owner = runtime.get("project_key") if runtime is not None else None
         current_id = self._session_id_for_application(application)
+        runtime_application = runtime.get("application") if runtime is not None else None
+        target_application = application
+        if (
+            self._active_session_id_for_application(application) != session_id
+            and runtime_application is not None
+            and self._active_session_id_for_application(runtime_application) == session_id
+        ):
+            # A parked Session keeps its writer in its own Application. Route
+            # the mutation through that owner instead of opening a second
+            # writer from the currently selected Application.
+            target_application = runtime_application
         target_runtime = runtime
-        if current_id == session_id:
+        if current_id == session_id and target_application is application:
             target_runtime = {
                 "application": application,
                 "handle": self._active_handle,
@@ -2352,7 +2370,7 @@ class DesktopBridge:
             raise BridgeError("compaction_active", "Session compaction is active")
         if target_runtime is not None and target_runtime.get("project_key") != project_key:
             raise BridgeError("session_unknown", "Session is unavailable for this owner")
-        archive = getattr(application, "set_session_archived", None)
+        archive = getattr(target_application, "set_session_archived", None)
         if not callable(archive):
             raise BridgeError("session_error", "Application does not support Session archive")
         try:
@@ -2363,7 +2381,7 @@ class DesktopBridge:
                 project_key=project_key,
                 **(
                     {"registered_project_keys": tuple(self._catalog_project_keys)}
-                    if self._current_mode() is ApplicationMode.GENERAL
+                    if self._mode_for_application(target_application) is ApplicationMode.GENERAL
                     else {}
                 ),
             )
@@ -3435,7 +3453,14 @@ class DesktopBridge:
         # other Sessions remain usable while its cold read is in progress.
         self._remember_current_runtime()
         owner = self._application
-        workdir = self._context_workdir_for_application(owner, self._workdir)
+        # The Bridge owns the currently registered Project path. Snapshot it
+        # before asynchronous preparation so a later project switch cannot
+        # substitute a new owner or a stale default RuntimeContext path.
+        workdir = (
+            self._general_runtime_workdir()
+            if self._current_mode() is ApplicationMode.GENERAL
+            else self._workdir
+        )
         runtime: dict[str, object] = {
             "application": None,
             "run": None,

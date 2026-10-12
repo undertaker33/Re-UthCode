@@ -321,7 +321,7 @@ def test_rule_resource_regex_matches_normalized_windows_summary() -> None:
     assert result.matched_rule_id == rule.rule_id
 
 
-def test_sensitive_guard_protects_read_and_grep_but_not_metadata(
+def test_sensitive_guard_protects_read_grep_and_sensitive_glob_candidates(
     tmp_path: Path,
 ) -> None:
     from uthcode.integrations.tools.file_tools import ReadFileTool
@@ -350,8 +350,9 @@ def test_sensitive_guard_protects_read_and_grep_but_not_metadata(
         assert "TOKEN=not-returned-by-this-test" not in (grep_action.resource or "")
         assert grep_result.decision is Decision.ASK
         assert grep_result.matched_rule_kind is RuleKind.GUARD
-        assert glob_result.decision is Decision.ALLOW
-        assert glob_result.matched_rule_kind is None
+        assert glob_result.decision is Decision.ASK
+        assert glob_result.matched_rule_kind is RuleKind.GUARD
+        assert glob_result.matched_rule_id == "default-sensitive-Glob"
         assert read_result.decision is Decision.ASK
     finally:
         secret.unlink(missing_ok=True)

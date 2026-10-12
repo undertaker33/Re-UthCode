@@ -84,11 +84,6 @@ function effectiveSource(asset: FileCardAsset): string | undefined {
   return undefined;
 }
 
-export function fileLanguage(asset: FileCardAsset): string {
-  const extension = fileExtension(asset);
-  return extension === "markdown" ? "md" : extension;
-}
-
 export interface ImagePreviewModalProps {
   src: string;
   alt: string;
@@ -323,8 +318,4 @@ export function FileCard({ asset, draft = false, className, dataAttributes, onPr
     {actionError && <p className="file-card__error" role="alert">{actionError}</p>}
     {imageSrc && <ImagePreviewModal src={imageSrc} alt={name} onClose={() => setImageSrc(null)} />}
   </article>;
-}
-
-export function attachmentAsset(attachment: DesktopAttachmentDraft): FileCardAsset {
-  return attachment;
 }

@@ -2636,6 +2636,142 @@ test("T05 App keeps a background Session stream visible after switching away and
   });
 });
 
+test("App refreshes a completed background Session on return and keeps late history under its owner", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const projectPath = "C:/background-tool-history";
+    const project = {
+      path: projectPath,
+      projectKey: projectPath,
+      alias: "Background history",
+      pinned: false,
+      sessions: [
+        { session_id: "session-a", title: "Session A", project_key: projectPath },
+        { session_id: "session-b", title: "Session B", project_key: projectPath },
+      ],
+      catalogFresh: true,
+    } satisfies ProjectState;
+    const runFor = (id: "a" | "b") => ({ run_id: `run-${id}`, turn_id: `turn-${id}`, status: "idle" });
+    let eventListener: ((event: AgentEvent) => void) | null = null;
+    let visibleSessionId = "session-a";
+    let sessionARefreshCount = 0;
+    let resolveFirstSessionARefresh: ((value: JsonObject) => void) | null = null;
+    const initialAHistory = {
+      session_id: "session-a",
+      records: [{ record_id: "session-a:1:user:0", session_id: "session-a", sequence: 1, turn_id: "turn-a", kind: "user", text: "Read a large file", is_error: false }],
+      next_cursor: null,
+      has_more: false,
+    };
+    const completedAHistory = {
+      session_id: "session-a",
+      records: [
+        ...initialAHistory.records,
+        { record_id: "session-a:2:tool:background-call:0", session_id: "session-a", sequence: 2, run_id: "run-a", turn_id: "turn-a", tool_call_id: "background-call", kind: "tool", tool_name: "ReadFile", text: "ReadFile", status: "succeeded", is_error: false, output_ref: "tool-result-ref:session-a:background-call" },
+        { record_id: "session-a:3:assistant:0", session_id: "session-a", sequence: 3, run_id: "run-a", turn_id: "turn-a", kind: "assistant", text: "File read complete", is_error: false },
+      ],
+      next_cursor: null,
+      has_more: false,
+    };
+    const api: DesktopApi = {
+      openProject: async () => null,
+      openProjectInExplorer: async () => undefined,
+      copyText: async () => undefined,
+      closeShell: async () => undefined,
+      requestRuntime: async (method, params) => {
+        if (method === "history.page") {
+          const sessionId = typeof params.session_id === "string" ? params.session_id : "";
+          if (sessionId !== "session-a") return { session_id: sessionId, records: [], next_cursor: null, has_more: false };
+          sessionARefreshCount += 1;
+          if (sessionARefreshCount === 1) {
+            return await new Promise<JsonObject>((resolve) => { resolveFirstSessionARefresh = resolve; });
+          }
+          return completedAHistory;
+        }
+        if (method === "session.resume") {
+          visibleSessionId = typeof params.session_id === "string" ? params.session_id : visibleSessionId;
+          const id = visibleSessionId === "session-b" ? "b" : "a";
+          return { session_id: visibleSessionId, restored: true, replay: [], active_turn: false, run: runFor(id), session_state: { active_turn: false, run: runFor(id) } };
+        }
+        if (method === "project.sessions") return { sessions: project.sessions };
+        if (method === "status.get") return { session_id: visibleSessionId, project_key: projectPath, active_turn: false, session_state: { active_turn: false, run: runFor(visibleSessionId === "session-b" ? "b" : "a") } };
+        return {};
+      },
+      subscribeAgentEvents: (listener) => { eventListener = listener; return () => { eventListener = null; }; },
+      readPreference: async () => { throw new Error("skip preference bootstrap"); },
+      writePreference: async () => undefined,
+    };
+    let state = createInitialState({
+      language: "en",
+      runtimeState: "ready",
+      projects: [project],
+      selectedProjectKey: projectPath,
+      selectedSessionId: "session-a",
+      run: { run_id: "run-a", turn_id: "turn-a", status: "running" },
+      activeTurn: true,
+      turnStatus: "running",
+    });
+    state = reduceRendererState(state, {
+      type: "history_page_loaded",
+      projectKey: projectPath,
+      sessionId: "session-a",
+      replace: true,
+      result: initialAHistory,
+    });
+    act(() => { root.render(<App initialState={state} api={api} />); });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const flush = async () => { await act(async () => { for (let index = 0; index < 5; index += 1) await tick(); }); };
+    const row = (title: string) => [...container.querySelectorAll<HTMLButtonElement>(".session-line:not(.new-session-line)")]
+      .find((button) => button.textContent?.includes(title));
+    const setDraft = async (text: string) => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+      const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value")?.set;
+      assert.ok(textarea && setter);
+      act(() => {
+        textarea!.focus();
+        setter!.call(textarea, text);
+        textarea!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+        textarea!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        textarea!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+      });
+      await flush();
+    };
+
+    await flush();
+    assert.ok(row("Session B"));
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    const owner = { project_key: projectPath, session_id: "session-a", run_id: "run-a", turn_id: "turn-a" };
+    assert.ok(eventListener);
+    act(() => {
+      eventListener!({ type: "tool_started", ...owner, batch_id: "batch-background", tool_call_id: "background-call", tool_name: "ReadFile", command: "large-file.txt" });
+      eventListener!({ type: "tool_finished", ...owner, batch_id: "batch-background", tool_call_id: "background-call", tool_name: "ReadFile", command: "large-file.txt", status: "succeeded", is_error: false });
+      eventListener!({ type: "turn_completed", ...owner, final_text: "File read complete" });
+    });
+    await flush();
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Session B"), true, "a background terminal event leaves the selected Session unchanged");
+    assert.doesNotMatch(container.querySelector<HTMLElement>(".timeline")?.textContent ?? "", /ReadFile/u, "background Tool activity does not enter the foreground timeline");
+    await setDraft("Session B draft");
+
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    assert.equal(sessionARefreshCount, 1, "returning to a cached Session refreshes its first history page");
+    assert.ok(resolveFirstSessionARefresh, "the refresh is independently pending under Session A");
+    assert.equal(container.querySelector(".timeline-tool-output"), null, "the live background event did not fabricate an externalized result reference");
+
+    act(() => { row("Session B")!.click(); });
+    await flush();
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, "Session B draft");
+    act(() => { resolveFirstSessionARefresh!(completedAHistory); });
+    await flush();
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Session B"), true, "a late completed page remains cached under Session A");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, "Session B draft", "late background history preserves the foreground draft");
+
+    act(() => { row("Session A")!.click(); });
+    await flush();
+    assert.equal(sessionARefreshCount, 2, "reopening the cached Session remains a read-only bounded refresh");
+    assert.ok(container.querySelector(".timeline-tool-output"), "the durable replay reference restores the safe Tool output action");
+  });
+});
+
 test("App pages history independently across quick A→B→A navigation and dedupes late live output", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const projectPath = "C:/history-navigation";
