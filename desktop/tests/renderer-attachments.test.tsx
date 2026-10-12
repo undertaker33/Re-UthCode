@@ -8,7 +8,7 @@ import { JSDOM } from "jsdom";
 import type { AgentEvent, DesktopApi, DesktopAttachmentDraft, DesktopAttachmentInput, JsonValue } from "../src/desktop-api";
 import { App } from "../src/renderer/App";
 import { Composer } from "../src/renderer/Composer";
-import { DocumentPreviewPanel } from "../src/renderer/DocumentPreviewPanel";
+import { DocumentPreviewPanel, ReviewPanel, parseUnifiedDiffLines } from "../src/renderer/DocumentPreviewPanel";
 import { FileCard } from "../src/renderer/FileCard";
 import { RendererErrorBoundary } from "../src/renderer/RendererErrorBoundary";
 import { createInitialState, type ProcessLogEntry, type ProjectState } from "../src/renderer/state";
@@ -56,6 +56,104 @@ async function withRendererDom<T>(callback: (dom: JSDOM, container: HTMLElement,
     }
   }
 }
+
+test("Review Diff scopes preserve Git status and render actual unified hunk line numbers", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const diff = {
+      source: "current_working_tree" as const,
+      project_key: "C:/workspace",
+      viewed_at: "2026-10-12T00:00:00Z",
+      status: {
+        branch: "main",
+        unborn: false,
+        truncated: false,
+        entries: [
+          { xy: "M ", path: "staged.py" },
+          { xy: " M", path: "unstaged.py" },
+          { xy: "??", path: "untracked.txt" },
+        ],
+      },
+      staged_diff: {
+        text: "diff --git a/staged.py b/staged.py\n--- a/staged.py\n+++ b/staged.py\n@@ -8,2 +8,2 @@\n context\n-old value\n+new value\n",
+        truncated: false,
+        size_bytes: 100,
+      },
+      unstaged_diff: {
+        text: "diff --git a/unstaged.py b/unstaged.py\n--- a/unstaged.py\n+++ b/unstaged.py\n@@ -3 +3 @@\n-before\n+after\n",
+        truncated: false,
+        size_bytes: 100,
+      },
+      truncated: false,
+    };
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/workspace", sessionId: "session", viewRevision: 1, ownerKey: "C:/workspace" };
+    const tab = { kind: "workspace-diff" as const, id: "diff-tab", title: "Working tree", owner, state: "completed" as const, diff };
+    await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="diff-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
+    assert.equal(container.querySelectorAll(".review-panel__diff-section").length, 2);
+    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["staged.py", "unstaged.py", "untracked.txt"]);
+    const diffHeader = container.querySelector(".review-panel__content-header--diff");
+    assert.ok(diffHeader);
+    assert.match(diffHeader.textContent ?? "", /Current working tree/u);
+    assert.equal(diffHeader.querySelector("time")?.getAttribute("datetime"), diff.viewed_at);
+    assert.ok(diffHeader.querySelector('[aria-label="Diff scope"]'), "scope is beside the workspace title and snapshot time");
+    assert.equal(container.querySelector(".review-panel__diff-toolbar [aria-label='Diff scope']"), null);
+    const removed = container.querySelector<HTMLElement>('[data-diff-kind="removed"]');
+    const added = container.querySelector<HTMLElement>('[data-diff-kind="added"]');
+    assert.equal(removed?.querySelectorAll(".review-panel__diff-line-number")[0]?.textContent, "9");
+    assert.equal(removed?.querySelectorAll(".review-panel__diff-line-number")[1]?.textContent, "");
+    assert.equal(added?.querySelectorAll(".review-panel__diff-line-number")[0]?.textContent, "");
+    assert.equal(added?.querySelectorAll(".review-panel__diff-line-number")[1]?.textContent, "9");
+    const scope = container.querySelector<HTMLButtonElement>('[aria-label="Diff scope"]');
+    assert.ok(scope);
+    act(() => { scope!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const stagedOption = [...dom.window.document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((option) => option.textContent === "Staged");
+    assert.ok(stagedOption);
+    act(() => { stagedOption!.click(); });
+    assert.deepEqual([...container.querySelectorAll(".review-panel__diff-section")].map((section) => section.getAttribute("data-diff-scope")), ["staged"]);
+    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["staged.py"]);
+    assert.equal(container.querySelector(".review-panel__paths")?.textContent?.includes("untracked.txt"), false, "untracked status is not converted to synthetic patch content");
+    assert.deepEqual(parseUnifiedDiffLines("@@ -2,2 +4,2 @@ context\n same\n-old\n+new").map((line) => [line.kind, line.oldLine, line.newLine]), [
+      ["hunk", null, null],
+      ["context", 2, 4],
+      ["removed", 3, null],
+      ["added", null, 5],
+    ]);
+    assert.deepEqual(parseUnifiedDiffLines("@@ -1,<redacted> +1,<redacted> @@\n-old tracked line\n+new tracked line\n unchanged context").map((line) => [line.kind, line.text, line.oldLine, line.newLine]), [
+      ["hunk", "@@ -1,<redacted> +1,<redacted> @@", null, null],
+      ["removed", "old tracked line", 1, null],
+      ["added", "new tracked line", null, 1],
+      ["context", "unchanged context", 2, 2],
+    ]);
+  });
+});
+
+test("Review Diff keeps empty scopes to one message and leaves untracked files as status only", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const diff = {
+      source: "current_working_tree" as const,
+      project_key: "C:/workspace-empty",
+      viewed_at: "2026-10-12T01:00:00Z",
+      status: { branch: "main", unborn: false, truncated: false, entries: [{ xy: "??", path: "new.txt" }] },
+      staged_diff: { text: "", truncated: false, size_bytes: 0 },
+      unstaged_diff: { text: "", truncated: false, size_bytes: 0 },
+      truncated: false,
+    };
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/workspace-empty", sessionId: "session", viewRevision: 1, ownerKey: "C:/workspace-empty" };
+    const tab = { kind: "workspace-diff" as const, id: "empty-diff-tab", title: "Working tree", owner, state: "completed" as const, diff };
+    await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="empty-diff-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
+    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 1);
+    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["new.txt"]);
+    const scope = container.querySelector<HTMLButtonElement>('.review-panel__content-header--diff [aria-label="Diff scope"]');
+    assert.ok(scope);
+    act(() => { scope!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+    const unstagedOption = [...dom.window.document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((option) => option.textContent === "Unstaged");
+    assert.ok(unstagedOption);
+    act(() => { unstagedOption!.click(); });
+    assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 1);
+    assert.equal(container.querySelectorAll(".review-panel__diff-section").length, 0);
+  });
+});
 
 const attachment: DesktopAttachmentDraft = {
   ref: "att-1",

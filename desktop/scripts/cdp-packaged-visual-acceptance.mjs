@@ -246,15 +246,20 @@ function runGit(projectPath, args) {
 
 async function createControlledDiffProject(projectPath) {
   await mkdir(projectPath, { recursive: true });
+  const longLines = Array.from({ length: 1000 }, (_, index) => `DIFF_CONTEXT_ROW_${index + 1}`);
+  await writeFile(join(projectPath, "long.txt"), `${longLines.join("\n")}\n`, "utf8");
   await writeFile(join(projectPath, "modified.txt"), "old tracked line\nunchanged context\n", "utf8");
   await writeFile(join(projectPath, "deleted.txt"), "tracked delete\n", "utf8");
   await writeFile(join(projectPath, "rename-source.txt"), "tracked rename\n", "utf8");
+  await writeFile(join(projectPath, ".gitignore"), "/.uthcode/permissions.toml\n", "utf8");
   runGit(projectPath, ["init", "--initial-branch=main"]);
   runGit(projectPath, ["config", "user.name", "UthCode T12 Acceptance"]);
   runGit(projectPath, ["config", "user.email", "t12-acceptance@example.invalid"]);
   runGit(projectPath, ["add", "--all"]);
   runGit(projectPath, ["commit", "-m", "seed controlled diff project"]);
   await writeFile(join(projectPath, "modified.txt"), "new tracked line\nunchanged context\n", "utf8");
+  longLines[499] = "DIFF_CHANGED_ROW_500";
+  await writeFile(join(projectPath, "long.txt"), `${longLines.join("\n")}\n`, "utf8");
   await writeFile(join(projectPath, "added.txt"), "new staged line\n", "utf8");
   await writeFile(join(projectPath, "untracked.txt"), "untracked evidence must stay absent\n", "utf8");
   runGit(projectPath, ["add", "added.txt"]);
@@ -356,12 +361,13 @@ async function main() {
   const executablePath = win32.normalize(executable);
   const flow = option("flow", "visual");
   const isLifecycleFlow = lifecycleFlows.has(flow);
+  const isSettingsFlow = flow === "settings-ui";
   const isDiffFlow = diffFlows.has(flow);
   const isRealProviderFlow = realProviderFlows.has(flow);
   const isInvalidConfigurationFlow = invalidConfigurationFlows.has(flow);
   const isGeneralCancelFlow = generalCancelFlows.has(flow);
   const isProviderFlow = providerFlows.has(flow) || commandFlows.has(flow) || isLifecycleFlow;
-  if (flow !== "visual" && flow !== "shell" && !isProviderFlow && !isDiffFlow && !isRealProviderFlow && !isInvalidConfigurationFlow) throw new Error(`unsupported packaged CDP flow: ${flow}`);
+  if (flow !== "visual" && flow !== "shell" && !isSettingsFlow && !isProviderFlow && !isDiffFlow && !isRealProviderFlow && !isInvalidConfigurationFlow) throw new Error(`unsupported packaged CDP flow: ${flow}`);
   const fixtureScenario = option("scenario", isGeneralCancelFlow ? "delay" : commandFlows.has(flow) || isLifecycleFlow ? "stream" : providerFlows.has(flow) ? flow : "stream");
   if (isProviderFlow && !providerFlows.has(fixtureScenario)) throw new Error(`unsupported fixture scenario: ${fixtureScenario}`);
   const planChoice = option("plan-choice", "approve");
@@ -443,7 +449,7 @@ async function main() {
       await copyFile(realProviderConfigSource, isolatedConfigPath);
       realProviderConfigCopied = true;
     }
-    if (isLifecycleFlow) {
+    if (isLifecycleFlow || isSettingsFlow) {
       lifecycleProjectOne = join(host.root, "projects", "coding-one");
       lifecycleProjectTwo = join(host.root, "projects", "coding-two");
       await Promise.all([mkdir(lifecycleProjectOne, { recursive: true }), mkdir(lifecycleProjectTwo, { recursive: true })]);
@@ -457,17 +463,17 @@ async function main() {
     isolatedSessionStorageReady = true;
     const recentProjects = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow
       ? []
-      : isLifecycleFlow
+      : isLifecycleFlow || isSettingsFlow
       ? [
-        { path: lifecycleProjectOne, alias: "T12 Coding One", pinned: false },
-        { path: lifecycleProjectTwo, alias: "T12 Coding Two", pinned: false },
+        { path: lifecycleProjectOne, alias: isSettingsFlow ? "UI Same project" : "T12 Coding One", pinned: false },
+        { path: lifecycleProjectTwo, alias: isSettingsFlow ? "UI Same project" : "T12 Coding Two", pinned: false },
       ]
       : isDiffFlow
         ? [{ path: diffProject, alias: "T12 Diff project", pinned: false }]
         : flow === "review"
           ? [{ path: reviewProject, alias: "T12 Review project", pinned: false }]
           : [{ path: workspaceRoot, alias: "Re-UthCode", pinned: false }];
-    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "review" ? reviewProject : workspaceRoot;
+    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow || isSettingsFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "review" ? reviewProject : workspaceRoot;
     const projectAliases = Object.fromEntries(recentProjects.map((project) => [project.path, project.alias]));
     const desktopPreferences = JSON.stringify({
       language: preferenceLanguage,
@@ -565,6 +571,7 @@ async function main() {
         ...(isProviderFlow ? ["--scenario", fixtureScenario] : []),
         ...(flow === "review" ? ["--expect-text", "W05_REVIEW_READY"] : []),
         ...(isLifecycleFlow ? ["--stage", stage, "--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo, ...(expectedSessions ? ["--expected-sessions", JSON.stringify(expectedSessions)] : [])] : []),
+        ...(isSettingsFlow ? ["--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo] : []),
         ...(isDiffFlow ? ["--diff-project", diffProject] : []),
         ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
         ...(flow === "ask-one" ? ["--ask-question-count", "1"] : []),

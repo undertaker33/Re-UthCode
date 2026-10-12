@@ -1481,7 +1481,7 @@ async function setInput(session, label, value) {
     const wanted = ${JSON.stringify(label)};
     const aliases = { "Message UthCode": ["Message UthCode", "发送给 UthCode"] };
     const labels = aliases[wanted] ?? [wanted];
-    const element = [...document.querySelectorAll("input,textarea")].find((item) => labels.includes(item.getAttribute("aria-label") || ""));
+    const element = [...document.querySelectorAll("input,textarea")].find((item) => item.id === wanted || labels.includes(item.getAttribute("aria-label") || ""));
     if (!element) return false;
     element.focus();
     const prototype = Object.getPrototypeOf(element);
@@ -1492,7 +1492,7 @@ async function setInput(session, label, value) {
     element.dispatchEvent(new Event("change", { bubbles: true }));
     return true;
   })()`);
-  if (!changed) throw new Error(`input aria-label not found: ${label}`);
+  if (!changed) throw new Error(`input id / aria-label not found: ${label}`);
 }
 
 async function setSelect(session, label, value) {
@@ -2098,6 +2098,177 @@ async function runLifecycleFlow(session) {
   writeLog("assertion_pass", { description: `packaged Session lifecycle stage ${lifecycleStage} completed through real UI` });
 }
 
+async function runSettingsUiFlow(session) {
+  if (requestedLanguage !== "en" || !projectOne || !projectTwo) throw new Error("settings-ui requires English and two isolated projects");
+  // Seed only runner-owned sessions through the real public Application API.
+  const archives = await evaluateAction(session, "seed isolated archived Settings examples", `(async () => {
+    const result = [];
+    for (const owner of [{ path: ${JSON.stringify(projectOne)}, title: 'UI_ARCHIVE_ONE' }, { path: ${JSON.stringify(projectTwo)}, title: 'UI_ARCHIVE_TWO' }, { path: null, title: 'UI_ARCHIVE_GENERAL' }]) {
+      await window.uthcode.requestRuntime(owner.path ? 'project.open' : 'general.open', owner.path ? { path: owner.path } : {});
+      const created = await window.uthcode.requestRuntime('session.new', {});
+      if (!created?.session_id) throw new Error('isolated Session creation failed');
+      await window.uthcode.requestRuntime('session.rename', { session_id: created.session_id, title: owner.title });
+      await window.uthcode.requestRuntime('session.archive', { session_id: created.session_id, project_key: owner.path || 'uthcode:general', archived: true });
+      result.push({ title: owner.title, sessionId: created.session_id });
+    }
+    await window.uthcode.requestRuntime('project.open', { path: ${JSON.stringify(projectOne)} });
+    return result;
+  })()`);
+  await clickText(session, "Settings");
+  await waitFor(session, "Settings search ready", "Boolean(document.querySelector('#settings-global-search-input'))");
+  const category = async (name) => clickSelector(session, `.settings-nav a[href='#settings-${name}']`);
+  const clearSearch = async () => {
+    await clickSelector(session, ".settings-global-search__clear");
+    await waitFor(session, "Settings search cleared", "document.querySelector('#settings-global-search-input')?.value === '' && !document.querySelector('.settings-global-search__results')");
+  };
+  const settleSettingsScreenshot = (description, { modal = false, switchId = null, expectedChecked = null } = {}) => waitForStableObservationWithin(session, description, `(() => {
+    const backdrop = document.querySelector('.provider-modal-backdrop');
+    const providerModal = document.querySelector('.provider-modal');
+    const input = ${JSON.stringify(Boolean(switchId))} ? document.getElementById(${JSON.stringify(switchId)}) : null;
+    const track = input?.parentElement?.querySelector('.settings-switch__track') ?? null;
+    const knob = track?.querySelector(':scope > span') ?? null;
+    const nodes = [backdrop, providerModal, track, knob].filter(Boolean);
+    const animations = [...new Set(nodes.flatMap((node) => node.getAnimations({ subtree: true })))];
+    const animationStates = animations.map((animation) => ({ kind: animation.transitionProperty ? 'transition' : 'animation', property: animation.transitionProperty || animation.animationName || '', state: animation.playState }));
+    const backdropOpacity = backdrop ? getComputedStyle(backdrop).opacity : null;
+    const modalOpacity = providerModal ? getComputedStyle(providerModal).opacity : null;
+    const checked = input ? input.checked : null;
+    const trackStyle = track ? getComputedStyle(track) : null;
+    const knobStyle = knob ? getComputedStyle(knob) : null;
+    const modalReady = !${JSON.stringify(modal)} || Boolean(backdrop && providerModal && backdropOpacity === '1' && modalOpacity === '1');
+    const switchReady = !${JSON.stringify(Boolean(switchId))} || Boolean(input && track && knob && (${JSON.stringify(expectedChecked === null)} || checked === ${JSON.stringify(expectedChecked)}));
+    const motionReady = animations.every((animation) => animation.playState === 'finished' || animation.playState === 'idle');
+    return {
+      ready: modalReady && switchReady && motionReady,
+      modal: { present: Boolean(providerModal), backdropPresent: Boolean(backdrop), backdropOpacity, modalOpacity },
+      switch: input ? { id: input.id, checked, expectedChecked: ${JSON.stringify(expectedChecked)}, trackBackground: trackStyle?.backgroundColor ?? null, knobTransform: knobStyle?.transform ?? null } : null,
+      animations: animationStates,
+    };
+  })()`, 3_000);
+  const themes = [];
+  for (const theme of ["light", "dark", "system"]) {
+    await category("appearance");
+    await setSelect(session, "settings-theme", theme);
+    await category("providers");
+    const defaultModelControl = "#settings-default-model .custom-select__trigger";
+    await clickSelector(session, defaultModelControl);
+    for (const media of theme === "system" ? ["light", "dark"] : [theme]) {
+      await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: media }] });
+      const expression = `(() => {
+        const documentRoot = document.documentElement;
+        const themeRoot = document.querySelector('.app-shell');
+        const scope = document.querySelector('.custom-select__portal-scope');
+        const list = document.querySelector('.custom-select__list');
+        const trigger = document.querySelector(${JSON.stringify(defaultModelControl)});
+        const styleOf = (element) => {
+          if (!element) return null;
+          const style = getComputedStyle(element);
+          return { colorScheme: style.colorScheme, surface: style.getPropertyValue('--surface').trim(), text: style.getPropertyValue('--text').trim(), background: style.backgroundColor, color: style.color };
+        };
+        const documentStyle = styleOf(documentRoot);
+        const themeStyle = styleOf(themeRoot);
+        const scopeStyle = styleOf(scope);
+        const listStyle = styleOf(list);
+        const triggerStyle = styleOf(trigger);
+        let resolvedSurface = null;
+        let resolvedText = null;
+        if (scope) {
+          const probe = document.createElement('span');
+          probe.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:0;height:0;visibility:hidden;pointer-events:none;background-color:var(--surface);color:var(--text)';
+          scope.appendChild(probe);
+          const probeStyle = getComputedStyle(probe);
+          resolvedSurface = probeStyle.backgroundColor;
+          resolvedText = probeStyle.color;
+          probe.remove();
+        }
+        const expectedClass = ${JSON.stringify(`theme-${theme}`)};
+        const expectedScheme = ${JSON.stringify(media)};
+        const ready = Boolean(list && trigger && themeRoot && scope)
+          && themeRoot.classList.contains(expectedClass)
+          && scope.classList.contains(expectedClass)
+          && themeStyle.colorScheme === expectedScheme
+          && scopeStyle.colorScheme === expectedScheme
+          && scopeStyle.surface === themeStyle.surface
+          && scopeStyle.text === themeStyle.text
+          && listStyle.background === resolvedSurface
+          && listStyle.color === resolvedText;
+        return { ready, theme: ${JSON.stringify(theme)}, media: ${JSON.stringify(media)}, listPresent: Boolean(list), documentRoot: { className: documentRoot.className, ...documentStyle }, themeRoot: { className: themeRoot?.className ?? null, ...themeStyle }, portal: { className: scope?.className ?? null, ...scopeStyle }, list: listStyle, trigger: triggerStyle, resolvedSurface, resolvedText };
+      })()`;
+      const evidence = await evaluateAction(session, "observe Settings dropdown theme tokens", expression);
+      writeLog("acceptance_diagnostic", { description: "Settings dropdown theme token observation before assertion", observation: evidence });
+      await capture(session, "settings-" + theme + "-" + media + "-menu");
+      if (!evidence?.ready) throw new Error(`Settings dropdown theme tokens did not match ${theme}/${media}: ${JSON.stringify(evidence)}`);
+      const colors = await waitForStableObservationWithin(session, "dropdown follows active theme tokens", expression, 3_000);
+      themes.push({ theme: colors.theme, media: colors.media, menu: colors.list.background, resolvedSurface: colors.resolvedSurface, colorScheme: colors.portal.colorScheme, portal: colors.portal, list: colors.list });
+    }
+    await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await waitFor(session, "dropdown Escape restores focus", `(() => { const trigger = document.querySelector(${JSON.stringify(defaultModelControl)}); return !document.querySelector('[role=listbox]') && Boolean(trigger) && document.activeElement === trigger; })()`);
+  }
+  const lightMenu = themes.find((item) => item.theme === "light");
+  const darkMenu = themes.find((item) => item.theme === "dark");
+  const systemLightMenu = themes.find((item) => item.theme === "system" && item.media === "light");
+  const systemDarkMenu = themes.find((item) => item.theme === "system" && item.media === "dark");
+  if (!lightMenu || !darkMenu || lightMenu.menu === darkMenu.menu) throw new Error("light and dark menu surfaces did not differ");
+  if (systemLightMenu?.menu !== lightMenu.menu || systemDarkMenu?.menu !== darkMenu.menu) throw new Error("system menu did not follow the active light/dark color scheme");
+  await category("appearance");
+  await setSelect(session, "settings-theme", "light");
+  const fields = [];
+  for (const [query, selector, step] of [["Base URL", "#modal-base-url", "provider"], ["Context window", '[id$="-context"]', "model"], ["Reasoning effort", '[id$="-reasoning"]', "model"], ["Supports image input", '[id$="-supports"]', "model"], ["API Key", "#modal-api-key", "provider"]]) {
+    await setInput(session, "settings-global-search-input", query);
+    await waitFor(session, "Settings field result " + query, "Boolean(document.querySelector('.settings-global-search__results button'))");
+    const opened = await evaluateAction(session, "open exact Settings field result", `(() => { const button = [...document.querySelectorAll('.settings-global-search__results button')].find((item) => item.querySelector('span')?.textContent?.trim() === ${JSON.stringify(query)}); if (!button) return false; button.click(); return true; })()`);
+    if (!opened) throw new Error("exact Settings field result was absent: " + query);
+    const focused = await waitFor(session, "search focuses exact editor field", `(() => { const modal = document.querySelector('[data-settings-editor-step=${step}]'); const target = modal?.querySelector(${JSON.stringify(selector)}); return target && target === document.activeElement ? { query: ${JSON.stringify(query)}, id: target.id, type: target.type || null, keyHidden: target.id === 'modal-api-key' ? target.type === 'password' && target.value === '' : null } : false; })()`);
+    if (query === "API Key" && !focused.keyHidden) throw new Error("API Key search exposed a credential");
+    fields.push(focused);
+    if (query === "Context window") {
+      await settleSettingsScreenshot("Settings model-search modal reaches settled visual state", { modal: true });
+      await capture(session, "settings-search-model-field");
+    }
+    if (query === "Reasoning effort") {
+      await clickSelector(session, selector);
+      await waitFor(session, "modal dropdown uses light theme", "Boolean(document.querySelector('.custom-select__portal-scope.theme-light [role=listbox]'))");
+      await settleSettingsScreenshot("Settings modal dropdown reaches settled visual state", { modal: true });
+      await capture(session, "settings-light-modal-menu");
+      await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+      await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+      await waitFor(session, "Escape closes menu before editor", "!document.querySelector('[role=listbox]') && Boolean(document.querySelector('[data-settings-editor-step=model]'))");
+    }
+    await clickButtonContaining(session, "Cancel", ".settings-editor-modal footer button");
+    await waitFor(session, "editor cancelled", "!document.querySelector('.settings-editor-modal')");
+    await clearSearch();
+  }
+  await setInput(session, "settings-global-search-input", "ZZZ_NO_SETTING_RESULT");
+  await waitFor(session, "Settings search empty result", "document.querySelector('.settings-global-search__results')?.innerText.includes('No matching settings')");
+  await clearSearch();
+  await category("tools");
+  const before = await evaluateAction(session, "focus web search switch", "(() => { const input = document.querySelector('#settings-search-enabled[role=switch]'); if (!input) throw new Error('switch missing'); input.focus(); return input.checked; })()");
+  await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: " ", code: "Space", windowsVirtualKeyCode: 32 });
+  await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32 });
+  const savedSwitch = await waitFor(session, "keyboard switch autosave", `(async () => { const input = document.querySelector('#settings-search-enabled'); const saved = await window.uthcode.requestRuntime('settings.get', {}); return input?.checked === ${JSON.stringify(!before)} && saved?.configuration?.search?.enabled === ${JSON.stringify(!before)} && !document.querySelector('.settings-autosave-status') ? { checked: input.checked, saved: true, successBannerAbsent: true } : false; })()`);
+  const switchVisual = await settleSettingsScreenshot("Settings keyboard switch reaches settled visual state", { switchId: "settings-search-enabled", expectedChecked: !before });
+  writeLog("acceptance_diagnostic", { description: "stable Settings switch appearance before screenshot", observation: switchVisual });
+  await capture(session, "settings-light-tools-switch");
+  await category("archive");
+  await waitFor(session, "three actual archived Sessions", "document.querySelectorAll('.settings-archive__item').length === 3");
+  await clickSelector(session, "#settings-archive-project-filter");
+  const projects = await evaluateAction(session, "archive project dropdown labels", "[...document.querySelectorAll('[role=option]')].map((item) => item.textContent.trim())");
+  if (projects.filter((item) => item.startsWith("UI Same project · ")).length !== 2 || !projects.includes("General") || !projects.includes("All projects")) throw new Error("archive dropdown did not distinguish actual same-name owners");
+  await capture(session, "settings-archive-project-menu");
+  await clickButtonContaining(session, "General", "[role=option]");
+  await waitFor(session, "General archive filter", "document.querySelectorAll('.settings-archive__item').length === 1 && document.querySelector('.settings-archive__item')?.textContent.includes('UI_ARCHIVE_GENERAL')");
+  await setSelect(session, "settings-archive-project-filter", projects.find((item) => item.includes("coding-one")));
+  await waitFor(session, "exact Coding owner archive filter", "document.querySelectorAll('.settings-archive__item').length === 1 && document.querySelector('.settings-archive__item')?.textContent.includes('UI_ARCHIVE_ONE')");
+  await setSelect(session, "settings-archive-project-filter", "All projects");
+  await session.send("Emulation.setDeviceMetricsOverride", { width: 720, height: 900, deviceScaleFactor: 1, mobile: false });
+  await capture(session, "settings-narrow-archive");
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  flowEvidence.settingsUi = { archives, themes, fields, savedSwitch, archiveProjects: projects, generalFilter: true, exactOwnerFilter: true, emptySearch: true, modalEscape: true };
+  if (!skipQuit) await evaluateAction(session, "close isolated Settings shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: "actual packaged Settings themes, field search, keyboard switch, archive owner filtering and narrow rendering" });
+}
+
 async function runDiffFlow(session) {
   if (!diffProject) throw new Error("diff requires --diff-project");
   const opened = await evaluateAction(session, "open current workspace diff from chat", `(() => { const button = document.querySelector('button[aria-label=\"Review current diff\"], button[aria-label=\"查看当前差异\"]'); if (!button) return false; button.click(); return true; })()`);
@@ -2106,21 +2277,59 @@ async function runDiffFlow(session) {
   const evidence = await evaluateAction(session, "inspect real current workspace diff", `(() => {
     const panel = document.querySelector('.review-panel');
     const paths = [...(panel?.querySelectorAll('.review-panel__paths li') || [])].map((item) => ({ status: item.querySelector('code')?.textContent?.trim() || '', path: item.querySelector('span')?.textContent?.trim() || '', original: item.querySelector('small')?.textContent?.replace(/^←\\s*/u, '').trim() || '' }));
-    const sections = [...(panel?.querySelectorAll('.review-panel__diff-section') || [])].map((item) => ({ title: item.querySelector('h3')?.textContent?.trim() || '', text: item.querySelector('pre')?.textContent || '' }));
-    return { paths, sections, viewedAt: panel?.querySelector('.review-panel__content-header small')?.textContent?.trim() || '', text: panel?.innerText || '' };
+    const sections = [...(panel?.querySelectorAll('.review-panel__diff-section') || [])].map((item) => ({ scope: item.dataset.diffScope, title: item.querySelector('h3')?.textContent?.trim() || '', text: [...item.querySelectorAll('.review-panel__diff-line code')].map((line) => line.textContent || '').join('\\n') }));
+    const rows = [...(panel?.querySelectorAll('[data-diff-kind]') || [])].map((item) => ({ kind: item.dataset.diffKind, text: item.querySelector('code')?.textContent, numbers: [...item.querySelectorAll('.review-panel__diff-line-number')].map((number) => number.textContent), background: getComputedStyle(item).backgroundColor }));
+    return { paths, sections, rows, viewedAt: panel?.querySelector('.review-panel__content-header time')?.dateTime || '', selectorInHeader: Boolean(panel?.querySelector('.review-panel__content-header .custom-select__trigger')), text: panel?.innerText || '' };
   })()`);
+  await capture(session, "current-workspace-diff-initial");
+  writeLog("acceptance_diagnostic", {
+    description: "initial packaged Diff evidence from controlled Git fixture",
+    evidence: {
+      paths: evidence.paths,
+      sections: evidence.sections,
+      rows: evidence.rows,
+      viewedAt: evidence.viewedAt,
+      selectorInHeader: evidence.selectorInHeader,
+    },
+  });
   const paths = evidence.paths;
-  const required = ["modified.txt", "added.txt", "deleted.txt", "renamed.txt"];
+  const required = ["modified.txt", "added.txt", "deleted.txt", "renamed.txt", "long.txt"];
   for (const path of required) if (!paths.some((entry) => entry.path === path)) throw new Error(`tracked Git change is missing from actual diff status: ${path}; ${JSON.stringify(paths)}`);
   if (!paths.some((entry) => entry.path === "renamed.txt" && entry.original === "rename-source.txt")) throw new Error(`tracked rename original path was not shown: ${JSON.stringify(paths)}`);
   const untrackedStatus = paths.filter((entry) => entry.path === "untracked.txt" || entry.original === "untracked.txt");
-  if (untrackedStatus.some((entry) => entry.status !== "??")) throw new Error(`untracked path did not retain its Git status: ${JSON.stringify(untrackedStatus)}`);
+  if (untrackedStatus.length !== 1 || untrackedStatus[0].path !== "untracked.txt" || untrackedStatus[0].status !== "??" || untrackedStatus[0].original !== "") throw new Error(`All uncommitted scope must show exactly one status-only untracked.txt entry with Git status ??: ${JSON.stringify(untrackedStatus)}`);
   const allDiff = evidence.sections.map((section) => section.text).join("\n");
   if (allDiff.includes("untracked evidence must stay absent")) throw new Error("untracked file contents were incorrectly projected into the real diff sections");
-  if (!allDiff.includes("-old tracked line") || !allDiff.includes("+new tracked line") || !evidence.sections.some((section) => /staged/i.test(section.title)) || !evidence.sections.some((section) => /unstaged/i.test(section.title))) throw new Error(`real staged/unstaged diff content was incomplete: ${JSON.stringify(evidence.sections)}`);
+  const removedRow = evidence.rows.find((row) => row.kind === "removed" && row.text === "old tracked line" && row.numbers[0] === "1" && row.numbers[1] === "");
+  const addedRow = evidence.rows.find((row) => row.kind === "added" && row.text === "new tracked line" && row.numbers[0] === "" && row.numbers[1] === "1");
+  if (!removedRow || !addedRow) {
+    const changedRowSample = evidence.rows.filter((row) => row.kind === "removed" || row.kind === "added").slice(0, 8);
+    const rowSample = evidence.rows.slice(0, 8);
+    throw new Error(`actual removed/added rows or old/new line numbers were absent; changed rows=${JSON.stringify(changedRowSample)}; initial rows=${JSON.stringify(rowSample)}`);
+  }
+  const removedColor = evidence.rows.find((row) => row.kind === "removed")?.background;
+  const addedColor = evidence.rows.find((row) => row.kind === "added")?.background;
+  if (!removedColor || !addedColor || removedColor === addedColor || [removedColor, addedColor].includes("rgba(0, 0, 0, 0)")) throw new Error("actual diff rows did not have distinct colored backgrounds");
+  if (!allDiff.includes("DIFF_CONTEXT_ROW_497") || !allDiff.includes("DIFF_CHANGED_ROW_500") || allDiff.includes("DIFF_CONTEXT_ROW_1\n") || evidence.rows.filter((row) => row.kind === "context").length > 12) throw new Error("1000-line file was not restricted to change hunks and nearby context");
+  if (!evidence.selectorInHeader || !evidence.sections.some((section) => section.scope === "staged") || !evidence.sections.some((section) => section.scope === "unstaged")) throw new Error("actual scope selector or sourced patch sections were absent");
   if (!evidence.viewedAt || !Number.isFinite(Date.parse(evidence.viewedAt))) throw new Error(`real diff view timestamp was absent or invalid: ${JSON.stringify(evidence.viewedAt)}`);
   flowEvidence.diff = { project: resolve(diffProject), statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: false, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), viewedAt: evidence.viewedAt, timestampParsed: true };
   await capture(session, "current-workspace-diff");
+  const scopeEvidence = [];
+  for (const [value, labels] of [["staged", ["Staged", "已暂存"]], ["unstaged", ["Unstaged", "未暂存"]]]) {
+    const chosen = await evaluateAction(session, "choose Diff scope " + value, `(() => { document.querySelector('.review-panel__content-header .custom-select__trigger')?.click(); return true; })()`);
+    if (!chosen) throw new Error("Diff header selector was absent");
+    await waitFor(session, "Diff scope options", "Boolean(document.querySelector('[role=listbox]'))");
+    const selected = await evaluateAction(session, "select Diff scope option", `(() => { const button = [...document.querySelectorAll('[role=option]')].find((item) => ${JSON.stringify(labels)}.includes(item.textContent?.trim())); if (!button) return false; button.click(); return true; })()`);
+    if (!selected) throw new Error("Diff scope option was absent: " + value);
+    const scoped = await waitFor(session, "only selected Diff scope", `(() => { const scopes = [...document.querySelectorAll('.review-panel__diff-section')].map((item) => item.dataset.diffScope); return scopes.length === 1 && scopes[0] === ${JSON.stringify(value)} ? { scopes, paths: [...document.querySelectorAll('.review-panel__paths li span')].map((item) => item.textContent?.trim() || '') } : false; })()`);
+    const expectedPaths = value === "staged" ? ["added.txt", "deleted.txt", "renamed.txt"] : ["long.txt", "modified.txt", "untracked.txt"];
+    const actualPaths = [...scoped.paths].sort();
+    if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) throw new Error(`${value} Diff scope paths were missing, extra, or out of contract: ${JSON.stringify({ expectedPaths, actualPaths })}`);
+    scopeEvidence.push({ value, ...scoped });
+    await capture(session, "current-workspace-diff-" + value);
+  }
+  flowEvidence.diff = { ...flowEvidence.diff, selectorInHeader: true, removedColor, addedColor, longFileLines: 1000, renderedContextRows: evidence.rows.filter((row) => row.kind === "context").length, scopes: scopeEvidence };
   const previousOwner = await evaluateAction(session, "record owner before changing the current Diff Session", `(() => {
     const label = document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.getAttribute('aria-label') || '';
     return { sessionId: label.split(' · ')[1] || null, projectLabel: document.querySelector('button.project-select')?.textContent?.trim() || null };
@@ -2423,6 +2632,10 @@ async function run() {
     }
     if (flow === "diff") {
       await runDiffFlow(session);
+      return;
+    }
+    if (flow === "settings-ui") {
+      await runSettingsUiFlow(session);
       return;
     }
     if (flow === "general-real") {

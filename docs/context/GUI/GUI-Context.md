@@ -39,16 +39,16 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[BOUNDARY]` 现有 CDP/packaged acceptance 使用隔离 profile、DOM/keyboard/CDP 合成输入和 CSS viewport 观察；它可以证明 Renderer/Bridge/Application 投影与键盘/ARIA/布局合同，但不等同于 native pointer、Windows 原生缩放或人工视觉验收。未具备这些环境时不能把 synthetic viewport 或普通 mouse 对照写成 native input PASS。
 - `[FACT]` 手动 `/compact` 返回操作身份后由 Session 所属的后台任务执行，Bridge 通过带 `session_id`、`project_key`、`operation_id` 的 `compaction_operation` 通知投影进度和结果。Composer 锁定该 Session 的普通输入并提供显式取消入口，`compaction.cancel` 校验 Session/操作身份；状态区分 completed、no_change、cancelled、failed，另保留有效提交 `changed` 与安全 `reason`，Runtime 面板显示原因和提交说明。无需 Compact 的成功 no-op 不伪造一次成功压缩。
 - `[FACT]` Bridge 请求接收仍串行，仅长时间手动压缩脱离该循环；切换 Session 不取消压缩，已停放的压缩运行时保留至终态。`/compact` 启动请求恢复使用普通 RPC 等待上限，不再靠免除 30 秒超时等待整个压缩。普通 RPC 超时只结束当前等待，迟到的合法响应不会把存活 Runtime 判为协议损坏；已超时请求的 ID 保留至响应到达或进程边界结束。关闭时取消活动操作、等待收尾，再关闭 writer；外层 PythonRuntime 保留有界 child 回收边界，重新启动不会自动重试旧压缩。
-- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。支持的字段自动保存；已运行 Turn 保留启动时捕获的配置，保存的新值在安全边界排队应用，并显示 applied/pending/failed 状态及相应的重试入口。
+- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。设置搜索只匹配本地化名称/说明索引，不扫描配置值或秘密；选择结果会切换分类并定位字段。搜索启用和模型图片能力用可键盘操作的开关呈现。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。支持的字段自动保存；已运行 Turn 保留启动时捕获的配置，保存的新值在安全边界排队应用；成功保存不显示常驻提示，保存中、pending、failed 状态与重试入口仍保留。
 - `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入。自动保存仍遵守配置应用安全边界，Provider/Model 编辑器自身继续使用显式 Apply/Cancel。
 - `[FACT]` Settings 同一配置出口还编辑 `tool_limits.timeout_seconds`、`output_bytes`、`attachment_bytes`；用户值与项目收紧值在配置层得到 configured/effective/source 投影，Renderer 同时显示 search、vision、tool limits、attachment limits 的实际来源。保存只在下一安全边界作用于当前和 background runtime，active/compact 快照沿该边界更新，ProcessSessionManager 中已启动进程继续使用捕获的旧启动参数与旧脱敏投影，项目收紧值不会反写用户配置。
 - `[FACT]` Settings 未编辑搜索密钥时不发送 api_key 或 api_key_configured；正式配置 writer 保留原 TOML literal/env 引用，只有显式 null/空白值才删除。禁用搜索保留凭据来源，但正式工厂不注册 WebSearch；安全配置摘要仍只投影是否已配置，不回传真实密钥。
 - `[FACT]` 产物链由 `artifact.describe/preview/open/reveal` 组成：Application 的 `ArtifactService` 校验存在性、工作目录或显式外部授权，Main 再校验注册项目/授权路径并执行真实 `shell.openPath` 或 `shell.showItemInFolder`。Renderer 的“授权外部文件”只触发 Main-owned 原生单文件 picker，Main 对选中文件复核并保留进程内单路径 grant；模型 URI、Renderer boolean 和持久化偏好都不能自动授予。图片只通过受控 preview 数据返回，Office 默认 open，可执行文件与不支持的 HTML/SVG 默认 reveal；Renderer 只消费 ArtifactDescriptor 卡片，不访问任意 fs/shell，缺失或不支持只生成局部反馈，不重跑 Agent。
 - `[FACT]` 普通 Session/Project navigation 与真正 `runtime.shutdown -> runtime.initialize` 生命周期分开显示：前者保留 operation gate 与 generation ownership，但不显示“正在重启”。`CustomSelect` 的 listbox 通过 `document.body` portal 进入 fixed overlay，按 trigger/viewport 几何上下放置，并在滚动、resize、键盘与 Escape 边界更新或关闭，因此不受 modal overflow 裁剪。
 - `[FACT]` Coding 与 General 是两个 Application mode。Coding 的显式 `session.new` 在首条消息前返回 Session ID 并登记目录；General 的 `New chat` 可先保留无持久 row 的草稿，首次发送后再持久化。General 使用自己的 Application owner，不继承 Coding 项目指令且不提供 Tool。
-- `[FACT]` Sidebar 的 Session 搜索在 Coding 模式覆盖当前已登记的 Coding 项目，在 General 模式仅搜索 General owner；公开标题与 Transcript 片段搜索包括已归档 Session，结果分别提供打开或恢复并打开。Session 菜单可归档条目，Settings 的 Archive 分类可按项目/文本筛选并恢复。
+- `[FACT]` Sidebar 的 Session 搜索在 Coding 模式覆盖当前已登记的 Coding 项目，在 General 模式仅搜索 General owner；公开标题与 Transcript 片段搜索包括已归档 Session，结果分别提供打开或恢复并打开。Session 菜单可归档条目；Settings 的 Archive 分类可按精确 project key（含 General）和文本筛选并恢复到原 owner，同名项目在选项中可区分。
 - `[FACT]` Settings 页面不使用全局保存按钮；字段或关联组通过配置 Application 自动写入，Provider/Model 编辑器保留显式 Apply/Cancel 草稿语义，失败状态由对应设置控件呈现。
-- `[FACT]` 右侧 Review 面板以当前 Project/Session owner 管理文件、Workspace Diff、Tool output 和 Process log tabs；用户可切换或关闭单个 tab，也可关闭整个面板。聊天顶部 Coding Diff 按钮打开当前工作树差异，Tool 活动详情在可用时提供 View tool output；活动组与单条 Tool 活动各自可折叠。
+- `[FACT]` 右侧 Review 面板以当前 Project/Session owner 管理文件、Workspace Diff、Tool output 和 Process log tabs；用户可切换或关闭单个 tab，也可关闭整个面板。聊天顶部 Coding Diff 按钮打开当前工作树差异；范围下拉位于工作区标题和查看时间旁，可切换全部未提交、已暂存或未暂存部分，行视图直接呈现正式 Git unified hunk 的上下文、旧/新行号、新增和删除。hunk count 被脱敏时保留占位符，行号只依据可见数字起始行，不恢复隐藏 count。untracked 项只保留状态/路径，不合成 patch 或增删统计。Tool 活动详情在可用时提供 View tool output；活动组与单条 Tool 活动各自可折叠。
 - `[FACT]` 聊天 FileCard 与右侧 DocumentPreviewPanel 都可打开 `ImagePreviewModal`。Modal 使用 fixed overlay 和 Workspace 层级；`.document-preview-panel` 保持定位及 resize 手柄，但不建立会将其子 modal 困在低层的 stacking context。modal 的主题颜色继承当前 app shell，关闭后恢复预览入口焦点。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
 - `[FACT]` Renderer 将带非空 `turn_id` 的实时失败通知与历史 failure 记录投影为同一个终态失败身份，避免首次加载历史或重叠分页后显示两次。当前历史 DTO 不含 `run_id`；缺少 Turn 身份的通知保留原记录身份，不按错误文本去重，普通状态、不同 Turn 的失败与后续实时内容继续独立显示。
@@ -89,7 +89,7 @@ visible Session A 有 active Turn
 | Composer | prompt/Slash 输入、Steering、暂停/取消、模型/权限选择、Context ring、选择/粘贴/拖拽附件和仅附件发送；Todo 条置于输入区上方 | Command/Turn/Context/Session Attachment Application 投影 |
 | Runtime panel | Turn、Run、模型、Permission、Context、Compact、Mode、Project、Session 的安全事实 | `status.get` / `/status` 的 Application 投影 |
 | Interaction surface | AskUser、Permission、Plan review、Pause、Retry 的 typed response | 同一 `TurnHandle` 的 pending interaction |
-| Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits、工具 timeout/output/attachment limits 与 theme/language 编辑、Model 图片能力声明；不保存明文 API key 到 Desktop preference；运行中的 Turn 保留捕获配置，支持的写入排队到安全边界应用 | Configuration Application boundary + Renderer preference |
+| Settings | Provider/Model/default/Permission、Tavily 搜索启用/key/limits、工具 timeout/output/attachment limits 与 theme/language 编辑、Model 图片能力声明；本地化名称/说明搜索定位分类或字段，Archive 按 project key/文本筛选；不保存明文 API key 到 Desktop preference；成功保存不常驻提示，运行中的 Turn 保留捕获配置，支持的写入排队到安全边界应用 | Configuration Application boundary + Renderer preference |
 | Artifacts | 授权文件的描述、图片受控预览、系统打开或 Explorer 定位；外部文件需用户通过 Main picker 明确授权；缺失/不支持的局部反馈 | Application `ArtifactService` + Desktop Bridge/Main + Renderer FileCard |
 
 ## 附件与产物预览职责
@@ -115,7 +115,8 @@ Renderer 导航、布局与组合                -> desktop/src/renderer/App.tsx
 Composer / Todo / Context 显示          -> desktop/src/renderer/Composer.tsx + RuntimePanel.tsx
 侧栏 Session 管理                       -> desktop/src/renderer/Sidebar.tsx
 聊天分页、阅读位置、代码块复制          -> desktop/src/renderer/ChatTimeline.tsx + safe-markdown.tsx
-Settings draft / 单根编辑器             -> desktop/src/renderer/SettingsView.tsx + SettingsEditorModal.tsx + settings-draft.ts
+Settings 搜索/草稿/单根编辑器            -> desktop/src/renderer/SettingsView.tsx + SettingsEditorModal.tsx + settings-draft.ts + CustomSelect.tsx
+Review Diff / SVG 操作图标                -> desktop/src/renderer/DocumentPreviewPanel.tsx + UiIcon.tsx + app.css
 历史分页与压缩提示持久投影               -> application/sessions.py + integrations/session_files.py（位于 src/uthcode/）
 ```
 
@@ -126,6 +127,8 @@ Settings draft / 单根编辑器             -> desktop/src/renderer/SettingsVie
 | reducer、Session 缓存和导航隔离 | `desktop/tests/renderer-state.test.ts`、`renderer-session.test.tsx` |
 | runtime ownership、迟到事件和终态收敛 | `desktop/tests/renderer-runtime-lifecycle.test.tsx`、`runtime-process.test.ts` |
 | 单根 Settings、返回焦点和秘密显示生命周期 | `desktop/tests/renderer-settings.test.tsx` |
+| Settings 搜索/归档筛选/布尔开关/portal 主题 | `desktop/tests/renderer-settings.test.tsx` |
+| Review Diff scope/hunk 行号与新增/删除展示 | `desktop/tests/renderer-attachments.test.tsx` |
 | Markdown 原文复制、历史分页和阅读位置 | `desktop/tests/renderer-chat.test.tsx` |
 | 产物卡片、受控图片预览和 Main 打开/定位边界 | `tests/test_desktop_artifacts.py`、`desktop/tests/preload.test.ts`、`desktop/tests/renderer-chat.test.tsx` |
 | 附件选择/粘贴/拖拽、预览/移除、仅附件发送和失败重发 | `desktop/tests/renderer-attachments.test.tsx`、`tests/test_desktop_bridge.py` |

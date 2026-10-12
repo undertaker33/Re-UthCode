@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off" | "minimize" | "floating" | "maximize" | "focus" | "file" | "search";
+export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off" | "minimize" | "floating" | "maximize" | "focus" | "file" | "search" | "close";
 
 export function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -11,6 +11,7 @@ export function UiIcon({ name }: { name: UiIconName }) {
     focus: <path d="M6 3H3v3M10 3h3v3M3 10v3h3M13 10v3h-3" />,
     file: <><path d="M4 2.75h5l3 3v7.5H4z" /><path d="M9 2.75v3h3M5.75 8h4.5M5.75 10.25h4.5" /></>,
     search: <><circle cx="6.8" cy="6.8" r="4.1" /><path d="m10 10 3.2 3.2" /></>,
+    close: <path d="m4 4 8 8m0-8-8 8" strokeWidth="1.7" />,
     folder: <path d="M2.75 5.25h10.5v7H2.75zM3.25 5.25V3.5h3.2l1.3 1.75" />,
     chevron: <path d="m5 6.25 3 3.25 3-3.25" />,
     pin: <path d="m5.1 3.25 5.8 5.8M9.75 2.75l3.5 3.5-2.2 1.2-2.5 2.5-1.2 2.2-3.5-3.5 2.2-1.2 2.5-2.5zM5.65 10.35l-2.9 2.9" />,
@@ -33,5 +34,5 @@ export function UiIcon({ name }: { name: UiIconName }) {
     eye: <><path d="M1.75 8s2.25-3.5 6.25-3.5S14.25 8 14.25 8 12 11.5 8 11.5 1.75 8 1.75 8z" /><circle cx="8" cy="8" r="1.75" /></>,
     "eye-off": <><path d="m2.25 2.25 11.5 11.5M6.15 6.15A2.6 2.6 0 0 0 10 9.85M4.4 4.4C2.65 5.35 1.75 8 1.75 8s2.25 3.5 6.25 3.5c1.05 0 1.95-.2 2.7-.5M11.6 4.4C13.35 5.35 14.25 8 14.25 8s-.45.7-1.25 1.45" /></>,
   };
-  return <svg className="ui-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">{paths[name]}</svg>;
+  return <svg className={`ui-icon ui-icon--${name}`} viewBox="0 0 16 16" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }

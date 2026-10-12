@@ -24,6 +24,8 @@ export interface SettingsEditorModalProps {
   draft: SettingsDraft;
   settingsBusy: boolean;
   fieldPrefix?: string;
+  initialModelRef?: string | null;
+  initialFocusId?: string | null;
   /** The control that opened this transaction; it owns return focus. */
   returnFocus: HTMLElement | null;
   /** The page remains the only non-secret draft owner. */
@@ -51,6 +53,8 @@ export function SettingsEditorModal({
   draft,
   settingsBusy,
   fieldPrefix: providedFieldPrefix,
+  initialModelRef = null,
+  initialFocusId = null,
   returnFocus,
   backgroundElements = [],
   onDraftChange,
@@ -66,8 +70,8 @@ export function SettingsEditorModal({
   const { t } = useTranslation();
   const generatedPrefix = useId().replace(/:/gu, "");
   const fieldPrefix = providedFieldPrefix ?? generatedPrefix;
-  const [step, setStep] = useState<EditorStep>("provider");
-  const [editingModelRef, setEditingModelRef] = useState<string | null>(null);
+  const [step, setStep] = useState<EditorStep>(() => initialModelRef ? "model" : "provider");
+  const [editingModelRef, setEditingModelRef] = useState<string | null>(() => initialModelRef);
   const [providerDeletePending, setProviderDeletePending] = useState(false);
   const [replacementValue, setReplacementValue] = useState(replacementKey);
   const [replacementTouchedLocal, setReplacementTouchedLocal] = useState(replacementTouched);
@@ -130,10 +134,15 @@ export function SettingsEditorModal({
     const root = rootRef.current;
     if (!root) return;
     queueMicrotask(() => {
+      const requested = initialFocusId ? document.getElementById(initialFocusId) : null;
+      if (requested instanceof HTMLElement && root.contains(requested) && !requested.matches(":disabled")) {
+        requested.focus();
+        return;
+      }
       const focusable = modalFocusableElements(root);
       (focusable.find((element) => element !== closeButtonRef.current) ?? closeButtonRef.current)?.focus();
     });
-  }, [step, editingModelRef]);
+  }, [step, editingModelRef, initialFocusId]);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
@@ -311,7 +320,7 @@ export function SettingsEditorModal({
           <>
             <header>
               <div><p className="eyebrow">{t("protocol")}</p><h2 id={titleId}>{providerLabel(providerId, provider)}</h2></div>
-              <button ref={closeButtonRef} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={onCancel} disabled={settingsBusy}>×</button>
+              <button ref={closeButtonRef} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={onCancel} disabled={settingsBusy}><UiIcon name="close" /></button>
             </header>
             <div className="provider-modal__body">
               <div className="settings-row"><label htmlFor="modal-provider-display-name">{t("providerDisplayName")}</label><input id="modal-provider-display-name" value={stringValue(provider.display_name)} placeholder={t("providerDisplayNameFallback")} onChange={(event) => updateProvider("display_name", event.target.value || null)} disabled={settingsBusy} /></div>
@@ -337,7 +346,7 @@ export function SettingsEditorModal({
           <>
             <header>
               <div><p className="eyebrow">{t("model")}</p><h2 id={modelTitleId}>{modelLabel(editedModel, t("unnamedModel"))}</h2></div>
-              <button ref={closeButtonRef} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={onCancel} disabled={settingsBusy}>×</button>
+              <button ref={closeButtonRef} type="button" title={t("cancel")} aria-label={t("cancel")} onClick={onCancel} disabled={settingsBusy}><UiIcon name="close" /></button>
             </header>
             <div className="provider-modal__body">
               {editedModel && editingModelRef && <>
@@ -346,8 +355,8 @@ export function SettingsEditorModal({
                 <div className="settings-row"><label htmlFor={modelFieldId(fieldPrefix, editingModelRef, "context")}>{t("contextWindow")}</label><input id={modelFieldId(fieldPrefix, editingModelRef, "context")} type="number" min="1" value={editedModel.context_window == null ? "" : String(editedModel.context_window)} onChange={(event) => updateModel(editingModelRef, "context_window", parseOptionalPositiveInteger(event.target.value))} disabled={settingsBusy} /></div>
                 <div className="settings-row"><label htmlFor={modelFieldId(fieldPrefix, editingModelRef, "output")}>{t("maxOutput")}</label><input id={modelFieldId(fieldPrefix, editingModelRef, "output")} type="number" min="1" value={editedModel.max_output_tokens == null ? "" : String(editedModel.max_output_tokens)} onChange={(event) => updateModel(editingModelRef, "max_output_tokens", parseOptionalPositiveInteger(event.target.value))} disabled={settingsBusy} /></div>
                 <div className="settings-row"><span className="settings-row__label">{t("reasoning")}</span><CustomSelect id={modelFieldId(fieldPrefix, editingModelRef, "reasoning")} label={t("reasoning")} value={stringValue(editedModel.reasoning_effort)} options={reasoningEffortOptions.map((value) => ({ value, label: value || "—" }))} onChange={(value) => updateModel(editingModelRef, "reasoning_effort", value || null)} disabled={settingsBusy} /></div>
-                <label className="settings-default-toggle"><input type="checkbox" checked={editedModel.supports_images === true} onChange={(event) => updateModel(editingModelRef, "supports_images", event.target.checked)} disabled={settingsBusy} />{t("supportsImages")}</label>
-                <label className="settings-default-toggle"><input type="checkbox" checked={draft.default_model === editingModelRef} onChange={(event) => { if (!settingsBusy && event.target.checked) onDraftChange((current) => ({ ...current, default_model: editingModelRef })); }} disabled={settingsBusy} />{t("makeDefault")}</label>
+                <label className="settings-default-toggle settings-default-toggle--switch"><span>{t("supportsImages")}</span><span className="settings-switch"><input id={modelFieldId(fieldPrefix, editingModelRef, "supports")} type="checkbox" role="switch" checked={editedModel.supports_images === true} onChange={(event) => updateModel(editingModelRef, "supports_images", event.currentTarget.checked)} disabled={settingsBusy} /><span className="settings-switch__track" aria-hidden="true"><span /></span></span></label>
+                <label className="settings-default-toggle"><input id={modelFieldId(fieldPrefix, editingModelRef, "default")} type="checkbox" checked={draft.default_model === editingModelRef} onChange={(event) => { if (!settingsBusy && event.target.checked) onDraftChange((current) => ({ ...current, default_model: editingModelRef })); }} disabled={settingsBusy} />{t("makeDefault")}</label>
               </>}
             </div>
             <footer><button type="button" title={t("cancel")} onClick={onCancel} disabled={settingsBusy}>{t("cancel")}</button><button type="button" title={t("back")} onClick={goBackToProvider} disabled={settingsBusy}>{t("back")}</button><button type="button" title={t("apply")} onClick={applyModel} disabled={settingsBusy}>{t("apply")}</button></footer>

@@ -224,8 +224,9 @@ test("Settings archive filters project and text, then restores the matching orig
   await withRendererDom(async (dom, container, root) => {
     const restored: string[] = [];
     const sessions = [
-      { projectKey: "C:/one", projectLabel: "One", session: { session_id: "coding-a", title: "Review source", preview: "unique preview", archived: true } },
-      { projectKey: "__general__", projectLabel: "General", session: { session_id: "general-a", title: "Notes", preview: "other text", archived: true } },
+      { projectKey: "C:/one", projectLabel: "Repo", session: { session_id: "coding-a", title: "Review source", preview: "unique preview", archived: true } },
+      { projectKey: "D:/two", projectLabel: "Repo", session: { session_id: "coding-b", title: "Other source", preview: "another preview", archived: true } },
+      { projectKey: "uthcode:general", projectLabel: "General", session: { session_id: "general-a", title: "Notes", preview: "other text", archived: true } },
     ];
     const state = createInitialState({ configuration: baseConfiguration(), settingsLoaded: true });
     act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} onLoadArchivedSessions={async () => sessions} onRestoreArchivedSession={async (item) => { restored.push(item.session.session_id); return true; }} /></LanguageProvider>); });
@@ -235,14 +236,24 @@ test("Settings archive filters project and text, then restores the matching orig
     act(() => { archiveNav!.click(); });
     await tick();
     await tick();
-    assert.deepEqual([...container.querySelectorAll(".settings-archive__group h3")].map((heading) => heading.textContent), ["One", "General"]);
-    const projectFilter = container.querySelector<HTMLInputElement>('.settings-archive__filters input[type="search"]');
+    assert.deepEqual([...container.querySelectorAll(".settings-archive__group h3")].map((heading) => heading.textContent), ["Repo", "Repo", "General"]);
+    const projectFilter = container.querySelector<HTMLButtonElement>("#settings-archive-project-filter");
     assert.ok(projectFilter);
-    act(() => { setInput(dom, projectFilter!, "General"); });
+    const chooseProject = async (label: string) => {
+      act(() => { projectFilter!.click(); });
+      await tick();
+      const option = [...dom.window.document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((item) => item.textContent === label);
+      assert.ok(option, "archive project option exists");
+      act(() => { option!.click(); });
+      await tick();
+    };
+    await chooseProject("Repo · C:/one");
+    assert.deepEqual([...container.querySelectorAll(".settings-archive__item")].map((item) => item.textContent?.includes("Review source")), [true]);
+    await chooseProject("General");
     await tick();
     assert.deepEqual([...container.querySelectorAll(".settings-archive__item")].map((item) => item.textContent?.includes("Notes")), [true]);
-    setInput(dom, projectFilter!, "");
-    const textFilter = container.querySelectorAll<HTMLInputElement>('.settings-archive__filters input[type="search"]')[1];
+    await chooseProject("All projects");
+    const textFilter = container.querySelector<HTMLInputElement>("#settings-archive-text-filter");
     assert.ok(textFilter);
     act(() => { setInput(dom, textFilter!, "unique preview"); });
     await tick();
@@ -281,6 +292,7 @@ test("Settings follows the five reference categories, keeps one Archive page, an
     assert.ok(container.querySelector("#settings-appearance"));
     assert.ok(container.querySelector("#settings-archive .settings-archive__filters"));
     assert.match(container.querySelector("#settings-general")?.textContent ?? "", /UthCode Desktop/u);
+    assert.equal(container.querySelector(".settings-nav .eyebrow, .settings-content > header .eyebrow"), null, "Settings omits the repeated product eyebrow");
 
     const archive = container.querySelector<HTMLAnchorElement>('a[href="#settings-archive"]');
     assert.ok(archive);
@@ -295,6 +307,157 @@ test("Settings follows the five reference categories, keeps one Archive page, an
     await tick();
     assert.equal(container.querySelector(".settings-content > header h1")?.textContent, "权限与安全");
     assert.equal(container.querySelector("#settings-security")?.getAttribute("aria-hidden"), null);
+  });
+});
+
+test("Settings search opens and focuses the matching Provider field without indexing values", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const state = createInitialState({
+      configuration: {
+        ...baseConfiguration(),
+        search: { enabled: true, api_key_configured: true, max_results: 5 },
+      },
+      settingsLoaded: true,
+    });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const search = container.querySelector<HTMLInputElement>("#settings-global-search-input");
+    assert.ok(search);
+    act(() => { setInput(dom, search!, "base url"); });
+    await tick();
+    const fieldResult = [...container.querySelectorAll<HTMLButtonElement>(".settings-global-search__results button")].find((button) => button.querySelector("span")?.textContent === "Base URL" && button.querySelector("small")?.textContent === "Protocol 1");
+    assert.ok(fieldResult);
+    act(() => { fieldResult!.click(); });
+    await tick();
+    const editor = container.querySelector<HTMLElement>('[role="dialog"][data-settings-editor-step="provider"]');
+    const baseUrl = editor?.querySelector<HTMLInputElement>("#modal-base-url");
+    assert.ok(baseUrl, "Base URL search opens the Provider editor");
+    assert.equal(dom.window.document.activeElement, baseUrl, "search focuses the matching editable field");
+    act(() => { editor?.querySelector<HTMLButtonElement>('footer button[title="Cancel"]')?.click(); });
+    await tick();
+    act(() => { setInput(dom, search!, "credential-that-is-not-a-label"); });
+    await tick();
+    assert.match(container.querySelector(".settings-global-search__results")?.textContent ?? "", /No matching settings/u);
+    act(() => { setInput(dom, search!, ""); });
+    await tick();
+    assert.equal(container.querySelector(".settings-global-search__results"), null);
+    assert.equal(container.querySelector(".settings-global-search__clear"), null);
+  });
+});
+
+test("Settings search indexes editable Provider and Model labels and focuses each exact control", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const state = createInitialState({ configuration: baseConfiguration(), settingsLoaded: true });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const search = container.querySelector<HTMLInputElement>("#settings-global-search-input");
+    assert.ok(search);
+    const cases = [
+      { query: "provider name", label: "Provider name", context: "Protocol 1", step: "provider", selector: "#modal-provider-display-name" },
+      { query: "protocol", label: "Protocol", context: "Protocol 1", step: "provider", selector: "#modal-protocol" },
+      { query: "api key", label: "API Key", context: "Protocol 1", step: "provider", selector: "#modal-api-key", hidden: true },
+      { query: "remote model id", label: "Remote model ID", context: "Model 1", step: "model", selector: '[id$="-remote"]' },
+      { query: "display name", label: "Display name", context: "Model 1", step: "model", selector: '[id$="-display"]' },
+      { query: "context window", label: "Context window", context: "Model 1", step: "model", selector: '[id$="-context"]' },
+      { query: "max output tokens", label: "Max output tokens", context: "Model 1", step: "model", selector: '[id$="-output"]' },
+      { query: "reasoning effort", label: "Reasoning effort", context: "Model 1", step: "model", selector: '[id$="-reasoning"]' },
+      { query: "supports image input", label: "Supports image input", context: "Model 1", step: "model", selector: '[id$="-supports"]' },
+      { query: "use as default", label: "Use as default model", context: "Model 1", step: "model", selector: '[id$="-default"]' },
+    ] as const;
+    for (const item of cases) {
+      act(() => { setInput(dom, search!, item.query); });
+      await tick();
+      const result = [...container.querySelectorAll<HTMLButtonElement>(".settings-global-search__results button")]
+        .find((button) => button.querySelector("span")?.textContent === item.label && button.querySelector("small")?.textContent === item.context);
+      assert.ok(result, `search includes ${item.label} for ${item.context}`);
+      act(() => { result!.click(); });
+      await tick();
+      const editor = container.querySelector<HTMLElement>(`[role="dialog"][data-settings-editor-step="${item.step}"]`);
+      const field = editor?.querySelector<HTMLElement>(item.selector);
+      assert.ok(field, `${item.label} search opens the matching editor control`);
+      assert.equal(dom.window.document.activeElement, field, `${item.label} search focuses the exact control`);
+      if ("hidden" in item && item.hidden) {
+        assert.equal((field as HTMLInputElement).type, "password", "search does not reveal or index the saved API key");
+        assert.equal((field as HTMLInputElement).value, "", "the saved key remains absent from the renderer draft");
+      }
+      act(() => { editor?.querySelector<HTMLButtonElement>('footer button[title="Cancel"]')?.click(); });
+      await tick();
+    }
+    for (const configuredValue of ["128000", "4096", "remote-model", "gateway.example"]) {
+      act(() => { setInput(dom, search!, configuredValue); });
+      await tick();
+      assert.match(container.querySelector(".settings-global-search__results")?.textContent ?? "", /No matching settings/u, `${configuredValue} is not part of the search index`);
+    }
+  });
+});
+
+test("Settings search opens the supports-images model field without indexing configured values", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const saves: ConfigurationWrite[] = [];
+    const state = createInitialState({ configuration: baseConfiguration(), settingsLoaded: true });
+    act(() => { root.render(<LanguageProvider value="zh-CN"><SettingsView state={state} onBack={() => undefined} onSave={(request) => { saves.push(request); }} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const search = container.querySelector<HTMLInputElement>("#settings-global-search-input");
+    assert.ok(search);
+    act(() => { setInput(dom, search!, "支持图片输入"); });
+    await tick();
+    const result = container.querySelector<HTMLButtonElement>(".settings-global-search__results button");
+    assert.ok(result);
+    act(() => { result!.click(); });
+    await tick();
+    const modal = container.querySelector<HTMLElement>('[role="dialog"][data-settings-editor-step="model"]');
+    assert.ok(modal, "search opens the selected model editor directly");
+    const supportsSwitch = modal.querySelector<HTMLInputElement>('[role="switch"]');
+    assert.ok(supportsSwitch);
+    assert.equal(supportsSwitch.id.endsWith("-supports"), true);
+    assert.equal(supportsSwitch.checked, false);
+    assert.ok(supportsSwitch.labels?.[0]?.textContent?.includes("支持图片输入"));
+    act(() => { supportsSwitch.click(); });
+    await tick();
+    assert.equal(supportsSwitch.checked, true, "the switch preserves native checkbox activation semantics");
+    const applyModel = modal.querySelector<HTMLButtonElement>('footer button[title="应用"]');
+    assert.ok(applyModel);
+    act(() => { applyModel!.click(); });
+    await tick();
+    assert.equal(container.querySelector('[role="dialog"]')?.getAttribute("data-settings-editor-step"), "provider");
+    const cancelEditor = container.querySelector<HTMLButtonElement>('[role="dialog"] footer button[title="取消"]');
+    assert.ok(cancelEditor);
+    act(() => { cancelEditor!.click(); });
+    await tick();
+    assert.equal(saves.length, 0, "the Model editor keeps its existing draft and Cancel persistence boundary");
+    assert.ok(container.querySelector(".settings-global-search__results"), "search text remains available without scanning the modal");
+  });
+});
+
+test("Settings boolean controls expose compact switch semantics and autosave", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const saves: ConfigurationWrite[] = [];
+    const state = createInitialState({ configuration: { ...baseConfiguration(), search: { enabled: false } }, settingsLoaded: true });
+    act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onBack={() => undefined} onSave={(request) => saves.push(request)} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
+    await tick();
+    const searchSwitch = container.querySelector<HTMLInputElement>('#settings-search-enabled[role="switch"]');
+    assert.ok(searchSwitch);
+    assert.equal(searchSwitch.checked, false);
+    assert.equal(searchSwitch.disabled, false);
+    act(() => { searchSwitch!.click(); });
+    await tick();
+    assert.deepEqual(saves.at(-1), { search: { enabled: true } });
+  });
+});
+
+test("CustomSelect portal inherits the selected Settings theme", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    for (const theme of ["theme-light", "theme-dark", "theme-system"] as const) {
+      act(() => { root.render(<div className={theme}><LanguageProvider value="en"><SettingsView state={createInitialState({ configuration: baseConfiguration(), settingsLoaded: true })} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider></div>); });
+      await tick();
+      const trigger = container.querySelector<HTMLButtonElement>("#settings-theme");
+      assert.ok(trigger);
+      act(() => { trigger!.click(); });
+      await tick();
+      assert.ok(dom.window.document.querySelector(".custom-select__portal-scope." + theme), "portal inherits the active theme class");
+      act(() => { trigger!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+      await tick();
+    }
   });
 });
 

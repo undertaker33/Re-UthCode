@@ -156,7 +156,7 @@ export function ImagePreviewModal({ src, alt, onClose }: ImagePreviewModalProps)
 
   return <div className="image-preview-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <div ref={dialogRef} className="image-preview-modal" role="dialog" aria-modal="true" aria-label={alt} tabIndex={-1}>
-      <header><strong>{alt}</strong><button type="button" aria-label={t("closePreview")} onClick={onClose}>×</button></header>
+      <header><strong>{alt}</strong><button type="button" aria-label={t("closePreview")} onClick={onClose}><UiIcon name="close" /></button></header>
       <div className="image-preview-stage" onWheel={onWheel} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerCancel={endDrag}><img src={src} alt={alt} draggable={false} style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})` }} /></div>
       <footer><span>{Math.round(zoom * 100)}%</span><button type="button" onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }); }}>{t("resetPreview")}</button></footer>
     </div>
@@ -304,7 +304,7 @@ export function FileCard({ asset, draft = false, className, dataAttributes, onPr
   return <article ref={cardRef} className={`file-card${hasImagePreview ? " file-card--image-preview" : ""}${className ? ` ${className}` : ""}`} data-file-kind={kind} data-file-ref={asset.ref ?? asset.path ?? asset.asset_ref} {...attributes} onDoubleClick={onDoubleClick} onContextMenu={onCardContextMenu} onKeyDown={onCardKeyDown} tabIndex={0} aria-label={`${name} · ${kind}`} title={image ? undefined : name}>
     <div className="file-card__visual">{image && effectiveSource(asset) ? <img src={effectiveSource(asset)} alt={name} loading="lazy" /> : <><UiIcon name="file" /><span className="file-card__extension" aria-hidden="true">{extensionLabel}</span></>}</div>
     {!image && <div className="file-card__meta"><strong>{name}</strong><small>{asset.mime_type || kind} · {(asset.size_bytes ?? 0).toLocaleString()} B</small></div>}
-    {draft && onRemove && <button type="button" className="file-card__remove-button" aria-label={`${t("attachmentRemove")}: ${name}`} title={`${t("attachmentRemove")}: ${name}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); void run(onRemove); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); }} disabled={busy}><span aria-hidden="true">×</span></button>}
+    {draft && onRemove && <button type="button" className="file-card__remove-button" aria-label={`${t("attachmentRemove")}: ${name}`} title={`${t("attachmentRemove")}: ${name}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); void run(onRemove); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); }} disabled={busy}><UiIcon name="close" /></button>}
     <div ref={ownMenuRef} className="file-card__menu-wrap">
       <div ref={menuRef} className={`file-card__menu${asset.path ? " artifact-card__actions" : ""}`} role="menu" aria-label={`${t("fileActions")}: ${name}`} hidden={!menuOpen} onKeyDown={onMenuKeyDown}>
         {((image && (onPreview || effectiveSource(asset))) || (code && onPreview)) && <button type="button" role="menuitem" onClick={() => void preview("full")} disabled={busy}>{t("filePreview")}</button>}
