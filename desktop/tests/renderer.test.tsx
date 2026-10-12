@@ -675,7 +675,7 @@ test("W04 settings application events refresh only valid counters and reject an 
     await flush();
     act(() => { oldListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
     await flush();
-    assert.equal(container.querySelector(".settings-autosave-status")?.textContent?.trim(), "Settings saved", "an unsubscribed runtime generation cannot overwrite current status");
+    assert.equal(container.querySelector(".settings-autosave-status"), null, "an unsubscribed runtime generation cannot create an idle success notice");
 
     act(() => { currentListener?.({ type: "settings_applications", applied: 0, pending: 0, failed: 1 }); });
     await flush();
@@ -683,7 +683,7 @@ test("W04 settings application events refresh only valid counters and reject an 
 
     act(() => { currentListener?.({ type: "settings_applications", applied: 1, pending: 0, failed: 0 }); });
     await flush();
-    assert.equal(container.querySelector(".settings-autosave-status")?.textContent?.trim(), "Settings saved");
+    assert.equal(container.querySelector(".settings-autosave-status"), null, "successful idle saves do not leave a persistent notice");
     assert.equal(container.querySelector(".provider-row")?.textContent?.includes("provider"), true, "application counters do not replace the current configuration projection");
   });
 });
@@ -4448,7 +4448,7 @@ test("T07 theme classes expose system, dark, and light without changing content 
 
 test("main workspace visual contract keeps 16px SVGs and readable theme tokens", async () => {
   const markup = renderToStaticMarkup(<App initialState={createInitialState({ theme: "dark", timeline: [{ id: "user-1", kind: "user", text: "hello" }] })} api={undefined} />);
-  assert.match(markup, /class="ui-icon" viewBox="0 0 16 16"/);
+  assert.match(markup, /class="ui-icon(?: ui-icon--[a-z-]+)?" viewBox="0 0 16 16"/);
   assert.match(markup, /class="timeline-entry timeline-entry--user"/);
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.ui-icon\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;[^}]*stroke-width:\s*1\.35/s);
@@ -5058,7 +5058,8 @@ test("T06 CustomSelect flips by available geometry and restores trigger focus", 
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const below = dom.window.document.querySelector<HTMLElement>(".custom-select__list.is-below");
     assert.ok(below, "menu should flip below when the lower viewport has more space");
-    assert.equal(below!.parentElement, dom.window.document.body, "the listbox is portalled outside the clipping ancestor");
+    assert.equal(below!.parentElement?.classList.contains("custom-select__portal-scope"), true, "the listbox is portalled inside the theme scope");
+    assert.equal(below!.parentElement?.parentElement, dom.window.document.body, "the theme scope is outside the clipping ancestor");
     assert.equal(below!.style.position, "", "fixed positioning remains a shared CSS contract");
     assert.equal(below!.style.left, "112px", "horizontal placement stays inside the viewport");
     rect = { top: 200, bottom: 230, left: 24, right: 204 };

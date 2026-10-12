@@ -689,7 +689,7 @@ export function Sidebar(props: SidebarProps) {
     </aside>
     {searchOpen && <div className="session-search-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setSearchOpen(false); props.onCancelSearch?.(); } }}>
       <section className="session-search" role="dialog" aria-modal="true" aria-label={t("searchSessions")}>
-        <header><strong>{t("searchSessions")}</strong><button type="button" aria-label={t("cancel")} onClick={() => { setSearchOpen(false); props.onCancelSearch?.(); }}>×</button></header>
+        <header><strong>{t("searchSessions")}</strong><button type="button" aria-label={t("cancel")} onClick={() => { setSearchOpen(false); props.onCancelSearch?.(); }}><UiIcon name="close" /></button></header>
         <form onSubmit={(event) => { event.preventDefault(); if (query.trim()) props.onSearch?.(query.trim()); }}>
           <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("searchPlaceholder")} aria-label={t("searchPlaceholder")} maxLength={512} />
           <button type="submit" disabled={!query.trim() || props.searchPending}>{t("search")}</button>
