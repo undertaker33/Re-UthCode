@@ -26,6 +26,7 @@ does_not_own: permission strategy, persistence, UI, multi-agent scheduling
 - `[FACT]` Agent Loop 是 `RunState` 的唯一写入者；Provider、Tool、Permission、Application、Interface 返回结果/事件/控制响应，不直接改写 Core 状态。
 - `[FACT]` Tool 可在执行期间经由 `CancellationToken.report_progress()` 发布有界观察；Agent Loop 将其送入 Application 的脱敏、跨 chunk 有界尾部投影，再通过同一 `AgentEvent` 流发布 `ToolProgress`。进度不会进入 `RunState`、Tool Result 正文、History 或 Provider 请求；结果中的 progress 仅作为没有实时报告时的受控兜底。
 - `[FACT]` Application 通过 `ApplicationContextService.compose_generation_request` 统一构造包含 dynamic default/configured/provider/effective limits 及 provenance、Instruction Plane、Conversation Plane 与 `GenerationRequest.tools` 的最终请求；每次 Provider call 前都经过 Preflight Hard Gate，Provider Integration 只负责原生协议映射。
+- `[FACT]` Application Tool 输出门面统一脱敏正文、结构化 details、进度与资源。`ReadFile` 编号输出和 `ToolResultRead`/`HistoryRead` 的 JSON payload 保留来源 framing/DTO 结构；敏感 option 的名称匹配避免对同一通配前缀重复回溯，不改变 key/auth/token/secret 名称覆盖。
 - `[FACT]` Provider 流中的 `ReasoningPart` 与 `TextPart` 始终保持 typed 边界并按到达顺序投影为公开事件；跨 Provider/model identity 时不把 reasoning 降级为 assistant 正文，`STOP` 只有非空正式 `TextPart` 才能完成，`TurnResult.final_text` 只来自正式正文。
 - `[FACT]` 配置中的逻辑 Model Profile ID 仅供 Application/TUI/命令状态使用；唯一的 `create_application -> create_run -> start_turn` 链路将快照的 `ModelProfile.remote_id` 写入 `GenerationRequest.model`，并按快照的 `reasoning_effort` 形成 `ReasoningOptions`。
 - `[FACT]` 大 Tool Result 由 Application 按 inline/ref 策略物化；只有文本正文写入 Session opaque ref，图片、文件和来源引用按原次序保留在可见结构化结果中；物化失败继续叠加 execution failure、side effect、resource、process 与退出事实。`ToolResultRead` 只通过当前 Session 的 opaque ref 读取有界页，不接受任意路径，也不递归物化另一份结果。
@@ -162,3 +163,5 @@ conda activate re-uthcode
 python -m pytest tests/test_provider_contract.py tests/test_tool_core.py tests/test_agent_loop.py tests/test_system_prompt.py -q
 python -m pytest tests/test_architecture_boundaries.py -q
 ```
+
+2026-10-12 W05 全量 Python 回归覆盖上述 Tool 输出脱敏以及 CLI/TUI/Headless 调用边界；逐条命令与精确结果见 [W05 Feedback](../../work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md)。

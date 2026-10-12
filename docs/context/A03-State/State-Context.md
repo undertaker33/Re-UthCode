@@ -19,6 +19,7 @@ explicit_absence: persistent runtime checkpoint + memory/retrieval
 - `[FACT]` `ApplicationSessionService.read_history_page` 复用同一安全 replay 投影，默认读取最近 30 个完整 semantic unit，再通过不透明游标读取更早页。`SessionFileStore` 从 Transcript JSONL 尾部按块逆读，不先加载完整 Transcript，也不创建持久索引或缓存数据库；分页不拆开同一单元内的 ToolCall/ToolResult，不改变模型 Context 或完整 Session 恢复语义。
 - `[FACT]` 新提交的 Timeline checkpoint 同时保存提交时的 Transcript 序列位置。历史页按块逆读 Timeline，投影落在本页范围内的已提交压缩提示，稳定身份来自 transaction；提示排在该序列之后，重启可恢复，不进入 Provider 消息。不透明游标同时保留 Transcript 与 Timeline 的反读字节边界，旧页不重复扫描较新 Timeline。旧 checkpoint 没有发生位置时不按压缩覆盖范围猜测插入位置；未提交派生记录不产生成功提示。
 - `[FACT]` Session catalog 通过 metadata 与 Transcript 首条 user entry 生成导航行，不加载完整 replay；预览规范化空白并限制为 160 字符，手动标题优先，空 Session 保持空预览。历史增长不会要求为获取首条消息扫描后续内容。
+- `[FACT]` Session metadata 的 archived 状态随 metadata 持久化；目录可分别读取有效或已归档条目。Application 搜索按可信 owner scope 遍历标题和公开 Transcript 文本，包含 archived 命中并只返回有界 snippet，不建立全文索引或改变 Transcript。
 - `[FACT]` 导航 DTO 的 `last_user_message_at` 从现有 Transcript 尾部按有界 semantic page 逆读最新 USER_MESSAGE 或 USER_STEERING 的真实 created_at；未新增持久字段或时间索引。此读取与头部预览分开，不使用恢复会话、assistant 回复或 metadata touch 改写的 last_used_at 代替用户输入时间，也不重建 RunState。
 - `[FACT]` History 的读写、恢复、Tool Result externalization 与 Timeline commit 统一由 `ApplicationSessionService` 承担；已移除仅转发调用的 `ApplicationHistoryService`，不再维护平行 History facade。
 - `[FACT]` 同一 `AgentRun` 的连续 Turn 保留 `messages`；不同 `AgentRun` 完全隔离。
@@ -242,3 +243,8 @@ python -m pytest tests/test_application_runtime.py tests/test_configuration.py t
 python -m pytest tests/test_context_budget_gate.py tests/test_context_compaction.py tests/test_t09_1_context_protocol_e2e.py -q
 python -m pytest tests/test_history_contract.py tests/test_history_paging.py tests/test_session_authority.py tests/test_compaction_process_recovery.py -q
 ```
+
+## W05 工具输出脱敏补充（2026-10-12）
+
+- `[FACT]` `ApplicationToolService` 根据正式 Tool 名称投影公开文本：ReadFile 的编号行前缀在整段正文脱敏期间暂存并恢复，因此保留跨行 quoted-secret 匹配语义和可见行号；`ToolResultRead` 仅改写 JSON `content` 字段，`HistoryRead` 仅递归脱敏 JSON 条目的 `payload`，其他公开 DTO 字段与 JSON 类型保留。格式不符合这些 Tool 的正式公开形状时，走原有整段文本脱敏。
+- `[FACT]` Tool Result 的外部 ref、History Transcript 与 ToolProgress 仍按既有 Application/Session 边界工作；该文本投影不将进度写入 History、不改变 Core `RunState`，也不递归读取任意路径。

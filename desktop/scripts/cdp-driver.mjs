@@ -32,8 +32,20 @@ const targetContains = option("target-contains", "main_window");
 const timeoutMs = Number(option("timeout-ms", "30000"));
 const requestTimeoutMs = Number(option("request-timeout-ms", "5000"));
 const flow = option("flow", "basic");
+const lifecycleStage = option("stage");
+const generalFlows = new Set(["general-real", "general-cancel", "general-invalid-config"]);
+const projectOne = option("project-one");
+const projectTwo = option("project-two");
+const diffProject = option("diff-project");
+const artifactPath = option("artifact-path");
+const reviewMarkdownPath = option("review-markdown-path");
+const reviewTextPath = option("review-text-path");
+const reviewImagePath = option("review-image-path");
+const expectedSessions = option("expected-sessions");
+const generalApiPrompt = "Reply with only this exact token: T12_GENERAL_API_ACCEPTED";
+const generalApiToken = "T12_GENERAL_API_ACCEPTED";
 const planChoice = option("plan-choice", "approve");
-const delayAction = option("delay-action", "pause");
+const delayAction = option("delay-action", flow === "general-cancel" ? "cancel" : "pause");
 const askQuestionCount = Number(option("ask-question-count", "4"));
 const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const skipQuit = process.argv.includes("--no-quit");
@@ -49,6 +61,7 @@ const consoleErrors = [];
 const consoleDiagnostics = [];
 const rendererExceptions = [];
 const screenshots = [];
+const flowEvidence = {};
 let targetEvidence;
 let observedLanguage;
 try {
@@ -89,6 +102,7 @@ async function writeAcceptanceReport(status, error) {
       themes: [...new Set(screenshots.map((item) => item.theme).filter(Boolean))],
       viewports: [...new Map(screenshots.map((item) => [JSON.stringify(item.viewport), item.viewport])).values()],
       runtimePanelLayouts: [...new Set(screenshots.map((item) => item.runtimePanelLayout).filter(Boolean))],
+      flow: flowEvidence,
     },
     failure: error ? { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack ?? null : null } : null,
   };
@@ -311,6 +325,62 @@ async function waitFor(session, description, predicate) {
   }
 }
 
+async function waitForStableObservation(session, description, expression, stableSamples = 3) {
+  let previousSignature = null;
+  let previousDiagnosticSignature = null;
+  let stableCount = 0;
+  let lastValue = null;
+  while (true) {
+    const remaining = remainingBudget(description);
+    lastValue = await session.evaluate(expression);
+    const diagnosticSignature = lastValue ? JSON.stringify(lastValue) : null;
+    if (diagnosticSignature && diagnosticSignature !== previousDiagnosticSignature) {
+      writeLog("acceptance_diagnostic", { description, observation: lastValue });
+      previousDiagnosticSignature = diagnosticSignature;
+    }
+    const signature = lastValue && lastValue.ready !== false ? diagnosticSignature : null;
+    if (signature && signature === previousSignature) stableCount += 1;
+    else {
+      previousSignature = signature;
+      stableCount = signature ? 1 : 0;
+    }
+    if (stableCount >= stableSamples) {
+      writeLog("assertion_pass", { description, value: lastValue, stableSamples });
+      return lastValue;
+    }
+    await sleep(Math.min(100, remaining));
+  }
+}
+
+async function waitForStableObservationWithin(session, description, expression, timeoutMs = 12_000, stableSamples = 3) {
+  const deadline = Math.min(flowDeadline, Date.now() + timeoutMs);
+  let previousSignature = null;
+  let previousDiagnosticSignature = null;
+  let stableCount = 0;
+  let lastValue = null;
+  while (true) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`${description} timed out after ${timeoutMs}ms; last observation=${JSON.stringify(lastValue)}`);
+    lastValue = await session.evaluate(expression);
+    const diagnosticSignature = lastValue ? JSON.stringify(lastValue) : null;
+    if (diagnosticSignature && diagnosticSignature !== previousDiagnosticSignature) {
+      writeLog("acceptance_diagnostic", { description, observation: lastValue });
+      previousDiagnosticSignature = diagnosticSignature;
+    }
+    const signature = lastValue && lastValue.ready !== false ? diagnosticSignature : null;
+    if (signature && signature === previousSignature) stableCount += 1;
+    else {
+      previousSignature = signature;
+      stableCount = signature ? 1 : 0;
+    }
+    if (stableCount >= stableSamples) {
+      writeLog("assertion_pass", { description, value: lastValue, stableSamples });
+      return lastValue;
+    }
+    await sleep(Math.min(100, deadline - Date.now()));
+  }
+}
+
 async function evaluateAction(session, label, expression) {
   remainingBudget(label);
   return session.evaluate(expression);
@@ -339,6 +409,39 @@ async function clickText(session, text) {
 async function clickSelector(session, selector) {
   remainingBudget(`click selector ${selector}`);
   writeLog("action", { action: "click_selector", selector });
+  if (selector === ".composer-send") {
+    const target = await evaluateAction(session, `inspect visible ${selector}`, `(() => {
+      const elements = [...document.querySelectorAll(${JSON.stringify(selector)})];
+      const describe = (element) => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return { disabled: element.disabled, text: (element.innerText || '').trim(), aria: element.getAttribute('aria-label'), display: style.display, visibility: style.visibility, rect: rect.toJSON() };
+      };
+      const element = elements.find((item) => {
+        const style = getComputedStyle(item);
+        const rect = item.getBoundingClientRect();
+        return !item.disabled && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      });
+      if (!element) return { elements: elements.map(describe), target: null };
+      window.__t12ComposerSendProbe = { clickCount: 0 };
+      element.addEventListener('click', () => { window.__t12ComposerSendProbe.clickCount += 1; }, { capture: true, once: true });
+      const rect = element.getBoundingClientRect();
+      return { elements: elements.map(describe), target: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, ...describe(element) } };
+    })()`);
+    if (!target?.target || !Number.isFinite(target.target.x) || !Number.isFinite(target.target.y)) {
+      throw new Error(`visible enabled composer Send control not found: ${JSON.stringify(target)}`);
+    }
+    writeLog("acceptance_diagnostic", { description: "visible composer Send target before click", evidence: target });
+    const clicked = await evaluateAction(session, `click enabled ${selector}`, `(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element || element.disabled) return false;
+      element.click();
+      return { clicked: true, clickCount: window.__t12ComposerSendProbe?.clickCount ?? null };
+    })()`);
+    if (!clicked?.clicked) throw new Error(`visible composer Send control became unavailable: ${JSON.stringify(clicked)}`);
+    writeLog("acceptance_diagnostic", { description: "composer Send click event delivered", evidence: clicked });
+    return;
+  }
   const clicked = await evaluateAction(session, `click selector ${selector}`, `(() => {
     const element = document.querySelector(${JSON.stringify(selector)});
     if (!element) return false;
@@ -759,7 +862,313 @@ async function submitToolFlow(session, expectedToolText, expectedToolRows = 1) {
     await clickText(session, "Allow once");
   }
   await waitFor(session, `Tool result ${expectedToolText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedToolText)})`);
-  await assertSingleDomEntity(session, "Tool timeline DOM rows", '.timeline-entry--tool', expectedToolRows);
+  await assertSingleDomEntity(session, "Tool activity rows", '.timeline-activity-item', expectedToolRows);
+  await waitFor(session, "nested tool disclosures start collapsed", `(() => { const group = document.querySelector('details.timeline-activity-group'); const item = group?.querySelector('details.timeline-activity-item'); return Boolean(group && item && !group.open && !item.open); })()`);
+  const groupExpanded = await evaluateAction(session, "expand tool activity group", `(() => { const summary = document.querySelector('details.timeline-activity-group > summary'); if (!summary) return false; summary.click(); return true; })()`);
+  if (!groupExpanded) throw new Error("tool activity group summary was not available");
+  await waitFor(session, "tool activity group expanded", "document.querySelector('details.timeline-activity-group')?.open === true && document.querySelector('details.timeline-activity-item')?.open === false");
+  await capture(session, "tool-group-expanded");
+  const detailExpanded = await evaluateAction(session, "expand individual tool activity", `(() => { const summary = document.querySelector('details.timeline-activity-item > summary'); if (!summary) return false; summary.click(); return true; })()`);
+  if (!detailExpanded) throw new Error("individual tool activity summary was not available");
+  await waitFor(session, "individual tool activity expanded", "document.querySelector('details.timeline-activity-group')?.open === true && document.querySelector('details.timeline-activity-item')?.open === true");
+  await capture(session, "tool-detail-expanded");
+  await evaluateAction(session, "collapse individual tool activity", "document.querySelector('details.timeline-activity-item > summary')?.click(); true");
+  await waitFor(session, "individual tool activity collapsed", "document.querySelector('details.timeline-activity-item')?.open === false");
+  await evaluateAction(session, "collapse tool activity group", "document.querySelector('details.timeline-activity-group > summary')?.click(); true");
+  await waitFor(session, "tool activity group collapsed", "document.querySelector('details.timeline-activity-group')?.open === false");
+  await capture(session, "tool-folds-collapsed");
+}
+
+async function clickReviewTab(session, label) {
+  const clicked = await evaluateAction(session, `select Review tab ${label}`, `(() => {
+    const tab = [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim().includes(${JSON.stringify(label)}));
+    if (!tab) return false;
+    tab.click();
+    return true;
+  })()`);
+  if (!clicked) throw new Error(`Review tab was not available: ${label}`);
+  await waitFor(session, `Review tab selected ${label}`, `(() => {
+    const tab = [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim().includes(${JSON.stringify(label)}));
+    return tab?.getAttribute('aria-selected') === 'true';
+  })()`);
+}
+
+async function doubleClickReviewArtifact(session, fileName) {
+  const scrolled = await evaluateAction(session, `scroll Review FileCard ${fileName} into the Timeline viewport`, `(() => {
+    const card = [...document.querySelectorAll('.markdown-artifact-attachments .file-card[data-artifact-path]')]
+      .find((item) => (item.getAttribute('data-artifact-path') || '').replaceAll('\\\\', '/').split('/').at(-1) === ${JSON.stringify(fileName)});
+    if (!card) return false;
+    card.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    return true;
+  })()`);
+  if (!scrolled) throw new Error(`Review FileCard was not available to scroll: ${fileName}`);
+  const target = await evaluateAction(session, `inspect Review FileCard ${fileName}`, `(() => {
+    const card = [...document.querySelectorAll('.markdown-artifact-attachments .file-card[data-artifact-path]')]
+      .find((item) => (item.getAttribute('data-artifact-path') || '').replaceAll('\\\\', '/').split('/').at(-1) === ${JSON.stringify(fileName)});
+    if (!card) return null;
+    const rect = card.getBoundingClientRect();
+    const style = getComputedStyle(card);
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, width: rect.width, height: rect.height, visible: style.display !== 'none' && style.visibility !== 'hidden', inViewport: x >= 0 && y >= 0 && x < innerWidth && y < innerHeight, hitTarget: hit === card || card.contains(hit) };
+  })()`);
+  if (!target?.visible || !target.inViewport || !target.hitTarget || !(target.width > 0 && target.height > 0)) throw new Error(`Review FileCard was not clickable in the Timeline viewport: ${fileName} ${JSON.stringify(target)}`);
+  await session.send("Page.bringToFront");
+  for (const clickCount of [1, 2]) {
+    await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x: target.x, y: target.y, button: "left", buttons: 1, clickCount });
+    await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", buttons: 0, clickCount });
+    if (clickCount === 1) await sleep(80);
+  }
+  writeLog("action", { action: "double_click_artifact_file_card", fileName, target: { x: target.x, y: target.y } });
+}
+
+async function dropReviewImageAttachment(session) {
+  if (!reviewImagePath) throw new Error("review flow requires a runner-owned image attachment path");
+  const fileBytes = await readFile(reviewImagePath);
+  if (fileBytes.length === 0) throw new Error("runner-owned Review image attachment was empty");
+  const base64 = fileBytes.toString("base64");
+  const dropped = await evaluateAction(session, "drop a controlled image through the real Composer", `(() => {
+    const target = document.querySelector('.composer');
+    if (!target || typeof DataTransfer !== 'function') return { accepted: false, reason: 'composer-or-datatransfer-unavailable' };
+    const binary = atob(${JSON.stringify(base64)});
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const file = new File([bytes], 'review-attachment.png', { type: 'image/png' });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+    const drop = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer });
+    target.dispatchEvent(drop);
+    return { accepted: drop.defaultPrevented, name: file.name, size: file.size, mimeType: file.type, fileCount: transfer.files.length };
+  })()`);
+  if (!dropped?.accepted || dropped.fileCount !== 1 || dropped.size !== fileBytes.length) {
+    throw new Error(`controlled image did not enter the Composer drop route: ${JSON.stringify(dropped)}`);
+  }
+  const card = await waitFor(session, "imported Session-owned image draft", `(() => {
+    const item = [...document.querySelectorAll('.composer-attachments .file-card[data-file-ref]')].find((candidate) => (candidate.getAttribute('aria-label') || '').startsWith('review-attachment.png'));
+    if (!item) return false;
+    const ref = item.getAttribute('data-file-ref') || '';
+    return { label: item.getAttribute('aria-label'), kind: item.getAttribute('data-file-kind'), refPresent: Boolean(ref), refLooksLikePath: /(?:[A-Za-z]:[\\/]|\\\\)/u.test(ref), hasThumbnail: Boolean(item.querySelector('img')) };
+  })()`);
+  if (card.kind !== "image" || !card.refPresent || card.refLooksLikePath || !card.hasThumbnail) {
+    throw new Error(`image attachment draft did not retain a safe opaque reference and preview: ${JSON.stringify(card)}`);
+  }
+  writeLog("assertion_pass", { description: "a controlled image enters through the actual Composer drop and Attachment RPC, and the draft exposes only an opaque ref/name/thumbnail", value: { ...card, byteLength: dropped.size } });
+  return { ...card, byteLength: dropped.size };
+}
+
+async function doubleClickUserImageAttachment(session) {
+  const target = await evaluateAction(session, "inspect the real sent image Attachment FileCard", `(() => {
+    const card = [...document.querySelectorAll('.timeline-entry--user .timeline-attachments .file-card[data-file-ref]')]
+      .find((item) => (item.getAttribute('aria-label') || '').startsWith('review-attachment.png'));
+    if (!card) return null;
+    const rect = card.getBoundingClientRect();
+    const style = getComputedStyle(card);
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, width: rect.width, height: rect.height, visible: style.display !== 'none' && style.visibility !== 'hidden', label: card.getAttribute('aria-label'), kind: card.getAttribute('data-file-kind'), refPresent: Boolean(card.getAttribute('data-file-ref')) };
+  })()`);
+  if (!target?.visible || target.kind !== "image" || !target.refPresent || !(target.width > 0 && target.height > 0)) {
+    throw new Error(`sent image Attachment FileCard was missing or unsafe: ${JSON.stringify(target)}`);
+  }
+  await session.send("Page.bringToFront");
+  for (const clickCount of [1, 2]) {
+    await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x: target.x, y: target.y, button: "left", buttons: 1, clickCount });
+    await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", buttons: 0, clickCount });
+    if (clickCount === 1) await sleep(80);
+  }
+  await waitFor(session, "safe image Attachment opened in Review", `(() => { const image = document.querySelector('.review-panel .document-review-image img'); return Boolean(image?.getAttribute('src')?.startsWith('data:image/') && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0); })()`);
+  const opened = await evaluateAction(session, "record safe image Attachment Review source", `(() => {
+    const card = [...document.querySelectorAll('.timeline-entry--user .timeline-attachments .file-card[data-file-ref]')].find((item) => (item.getAttribute('aria-label') || '').startsWith('review-attachment.png'));
+    const preview = document.querySelector('.review-panel .document-review-image img');
+    return { label: card?.getAttribute('aria-label') || null, kind: card?.getAttribute('data-file-kind') || null, refPresent: Boolean(card?.getAttribute('data-file-ref')), previewLoaded: Boolean(preview?.getAttribute('src')?.startsWith('data:image/') && preview.complete && preview.naturalWidth > 0 && preview.naturalHeight > 0), previewMime: preview?.getAttribute('src')?.slice(0, preview.getAttribute('src')?.indexOf(';') ?? undefined) || null };
+  })()`);
+  const modalOpened = await evaluateAction(session, "open the Attachment image preview from Review", `(() => {
+    const button = document.querySelector('.review-panel .document-review-image button');
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!modalOpened) throw new Error("Review did not expose the image preview action for the Session attachment");
+  await waitFor(session, "Session attachment full-image modal", `(() => { const image = document.querySelector('.image-preview-modal[role="dialog"] img'); return Boolean(image?.getAttribute('src')?.startsWith('data:image/') && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0); })()`);
+  await capture(session, "review-session-image-attachment-modal");
+  const closed = await evaluateAction(session, "close the Attachment image modal", `(() => {
+    const button = document.querySelector('.image-preview-modal[role="dialog"] > header button');
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!closed) throw new Error("Session attachment image modal did not expose its close action");
+  await waitFor(session, "Attachment modal closed back to its Review owner", `Boolean(!document.querySelector('.image-preview-modal') && document.querySelector('.review-panel .document-review-image img[src^="data:image/"]'))`);
+  return { ...opened, modalOpened: true, modalClosedToReview: true };
+}
+
+async function submitPackagedReviewFlow(session) {
+  if (!reviewMarkdownPath || !reviewTextPath || !reviewImagePath) throw new Error("review flow requires controlled Markdown, text, and image paths");
+  await clickText(session, "New chat");
+  const sessionIdentity = await waitFor(session, "explicit Coding Review Session", `(() => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line)');
+    const label = row?.getAttribute('aria-label') || '';
+    return row && label ? { label, id: label.split(' · ')[1] || null } : false;
+  })()`);
+  if (!sessionIdentity?.id) throw new Error(`explicit Coding Review Session did not expose an identity: ${JSON.stringify(sessionIdentity)}`);
+  const ownerReady = await waitForStableObservation(session, "public Coding Review Session owner ready", `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const selected = document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.getAttribute('aria-label') || '';
+    const selectedId = selected.split(' · ')[1] || null;
+    const mode = document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null;
+    const projectLabel = document.querySelector('button.project-select')?.textContent?.trim() || null;
+    const ready = mode === 'coding' && projectLabel?.includes('T12 Review project') && selectedId === ${JSON.stringify(sessionIdentity.id)} && status?.session_id === selectedId && status?.runtime?.state === 'ready' && status?.active_turn === false;
+    return { ready, mode, projectLabel, selectedSessionId: selectedId, publicSessionId: status?.session_id ?? null, runtimeState: status?.runtime?.state ?? null, activeTurn: status?.active_turn ?? null };
+  })()`);
+  const imageAttachment = await dropReviewImageAttachment(session);
+  await setInput(session, "Message UthCode", "Review the controlled files and process output.");
+  await waitFor(session, "controlled Review prompt ready", `(() => { const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]'); const button = document.querySelector('.composer-send'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()`);
+  await clickSelector(session, ".composer-send");
+  await submitToolFlow(session, expectedText, 2);
+  await waitFor(session, "Review fixture artifacts and process log", `(() => {
+    const timeline = document.querySelector('[aria-label="Chat timeline"]')?.innerText || '';
+    const cards = [...document.querySelectorAll('.markdown-artifact-attachments .file-card[data-artifact-path]')];
+    const paths = cards.map((item) => (item.getAttribute('data-artifact-path') || '').replaceAll('\\\\', '/').toLowerCase());
+    const names = cards.map((item) => (item.getAttribute('aria-label') || '').split(' · ')[0]);
+    const processLogs = [...document.querySelectorAll('[data-process-id]')].some((item) => (item.textContent || '').includes('W05_REVIEW_PROCESS_LOG'));
+    return timeline.includes(${JSON.stringify(expectedText)}) && cards.length === 2 && names.includes('review.md') && names.includes('review.txt')
+      && paths.some((path) => path.endsWith('/review.md')) && paths.some((path) => path.endsWith('/review.txt')) && processLogs;
+  })()`);
+  const artifactCards = await evaluateAction(session, "record formal Review artifact cards", `(() => [...document.querySelectorAll('.markdown-artifact-attachments .file-card[data-artifact-path]')].map((item) => ({ path: item.getAttribute('data-artifact-path'), name: (item.getAttribute('aria-label') || '').split(' · ')[0], kind: item.getAttribute('data-artifact-kind') })))()`);
+  if (artifactCards.length !== 2 || !artifactCards.some((item) => item.name === "review.md") || !artifactCards.some((item) => item.name === "review.txt")) throw new Error(`formal Review Markdown did not resolve the controlled artifacts: ${JSON.stringify(artifactCards)}`);
+  const expectedArtifactPaths = [reviewMarkdownPath, reviewTextPath].map((path) => String(path).replaceAll("\\", "/").toLowerCase());
+  if (artifactCards.some((item) => !expectedArtifactPaths.includes(String(item.path).replaceAll("\\", "/").toLowerCase()))) throw new Error(`Review FileCards resolved outside the exact runner-owned artifact paths: ${JSON.stringify(artifactCards)}`);
+  await waitFor(session, "sent image attachment belongs to the controlled Review Session", `(() => {
+    const entry = [...document.querySelectorAll('.timeline-entry--user')].find((item) => (item.innerText || '').includes('Review the controlled files and process output.'));
+    const card = [...(entry?.querySelectorAll('.timeline-attachments .file-card[data-file-ref]') || [])].find((item) => (item.getAttribute('aria-label') || '').startsWith('review-attachment.png'));
+    return card ? { label: card.getAttribute('aria-label'), kind: card.getAttribute('data-file-kind'), refPresent: Boolean(card.getAttribute('data-file-ref')), hasThumbnail: Boolean(card.querySelector('img')) } : false;
+  })()`);
+  const sentImageAttachment = await doubleClickUserImageAttachment(session);
+
+  const groupOpened = await evaluateAction(session, "expand the real ReadFile activity group", `(() => {
+    const group = document.querySelector('details.timeline-activity-group');
+    if (!group) return { found: false };
+    if (!group.open) group.querySelector('summary')?.click();
+    return { found: true, open: group.open };
+  })()`);
+  if (!groupOpened?.found) throw new Error(`Tool Timeline did not expose its actual activity group: ${JSON.stringify(groupOpened)}`);
+  await waitFor(session, "outer ReadFile activity group expanded", `Boolean(document.querySelector('details.timeline-activity-group')?.open)`);
+  const readFileOpened = await evaluateAction(session, "expand the real ReadFile activity row", `(() => {
+    const item = [...document.querySelectorAll('details.timeline-activity-group details.timeline-activity-item')].find((candidate) => (candidate.getAttribute('aria-label') || '').startsWith('ReadFile:'));
+    if (!item) return { found: false, labels: [...document.querySelectorAll('details.timeline-activity-group .timeline-activity-item')].map((candidate) => candidate.getAttribute('aria-label')) };
+    if (!item.open) item.querySelector('summary')?.click();
+    return { found: true, open: item.open, label: item.getAttribute('aria-label') };
+  })()`);
+  if (!readFileOpened?.found) throw new Error(`ReadFile activity row was not present in the real outer group: ${JSON.stringify(readFileOpened)}`);
+  await waitFor(session, "ReadFile activity row expanded", `(() => [...document.querySelectorAll('details.timeline-activity-group details.timeline-activity-item')].some((item) => (item.getAttribute('aria-label') || '').startsWith('ReadFile:') && item.open))()`);
+  await capture(session, "review-readfile-activity-expanded");
+  const outputAction = await evaluateAction(session, "inspect the real ReadFile output action and its public history DTO", `(async () => {
+    const item = [...document.querySelectorAll('details.timeline-activity-group details.timeline-activity-item')].find((candidate) => (candidate.getAttribute('aria-label') || '').startsWith('ReadFile:'));
+    const button = item?.querySelector('button.timeline-tool-output');
+    const observation = { label: item?.getAttribute('aria-label') || null, status: item?.querySelector('[data-status]')?.getAttribute('data-status') || null, outputButtons: [...(item?.querySelectorAll('button') || [])].map((candidate) => ({ className: candidate.className, text: candidate.textContent?.trim() || '' })), hasOutputPreview: Boolean(item?.querySelector('button.timeline-tool-output')) };
+    if (!button) {
+      const status = await window.uthcode.requestRuntime('status.get', {});
+      const page = await window.uthcode.requestRuntime('history.page', { session_id: status?.session_id, page_size: 50 });
+      const records = Array.isArray(page?.records) ? page.records.filter((record) => record?.tool_name === 'ReadFile').map((record) => ({ sessionId: record.session_id ?? null, toolCallId: record.tool_call_id ?? null, outputRefPresent: typeof record.output_ref === 'string' && record.output_ref.length > 0, outputPreviewLength: typeof record.output_preview === 'string' ? record.output_preview.length : null, previewTruncated: record.output_preview_truncated === true })) : [];
+      return { clicked: false, ...observation, publicHistory: { sessionId: page?.session_id ?? null, recordCount: records.length, records } };
+    }
+    button.click();
+    return { clicked: true, ...observation };
+  })()`);
+  if (!outputAction?.clicked) throw new Error(`ReadFile Timeline row did not expose its real safe output action: ${JSON.stringify(outputAction)}`);
+  await waitFor(session, "bounded ReadFile Review first page", `(() => {
+    const output = document.querySelector('.review-panel__output')?.textContent || '';
+    return output.includes('W05_REVIEW_OUTPUT_BEGIN') && Boolean(document.querySelector('.review-panel__more'));
+  })()`);
+  const firstPage = await evaluateAction(session, "record bounded ReadFile Review page", `(() => ({ tab: document.querySelector('.review-panel__content')?.getAttribute('aria-label') || null, chars: document.querySelector('.review-panel__output')?.textContent?.length || 0, hasStart: (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_BEGIN'), hasMore: Boolean(document.querySelector('.review-panel__more')) }))()`);
+  const moreOutput = await evaluateAction(session, "read next bounded Review page", `(() => { const button = document.querySelector('.review-panel__more'); if (!button || button.disabled) return false; button.click(); return true; })()`);
+  if (!moreOutput) throw new Error("bounded ReadFile Review did not expose its next page");
+  await waitFor(session, "ReadFile Review reaches final output page", `(() => (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_END') && !document.querySelector('.review-panel__more'))()`);
+  const finalOutput = await evaluateAction(session, "record complete bounded Review output", `(() => ({ chars: document.querySelector('.review-panel__output')?.textContent?.length || 0, hasEnd: (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_END'), hasMore: Boolean(document.querySelector('.review-panel__more')) }))()`);
+  await capture(session, "review-tool-output");
+
+  const processLogOpened = await evaluateAction(session, "open Process logs from the real Timeline", `(() => {
+    const details = document.querySelector('details.timeline-process-log');
+    if (!details) return false;
+    if (!details.open) details.querySelector('summary')?.click();
+    const process = [...details.querySelectorAll('.timeline-process-log__process')].find((item) => (item.textContent || '').includes('W05_REVIEW_PROCESS_LOG'));
+    const button = [...(process?.querySelectorAll('button') || [])].find((item) => (item.textContent || '').includes('Review process log'));
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!processLogOpened) throw new Error("actual Process output was not available from the Timeline Review action");
+  await waitFor(session, "Process Review tab contains real process output", `Boolean(document.querySelector('.review-panel__process-output')?.textContent?.includes('W05_REVIEW_PROCESS_LOG'))`);
+  const processTab = await evaluateAction(session, "record Process Review tab", `(() => ({ tab: [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => item.getAttribute('aria-selected') === 'true')?.textContent?.trim() || null, sequences: [...document.querySelectorAll('.review-panel__process-output [data-process-sequence]')].map((item) => item.getAttribute('data-process-sequence')), markerVisible: (document.querySelector('.review-panel__process-output')?.textContent || '').includes('W05_REVIEW_PROCESS_LOG') }))()`);
+  await capture(session, "review-process-log");
+
+  await doubleClickReviewArtifact(session, "review.md");
+  await waitFor(session, "Markdown artifact opened in Review", `Boolean([...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim() === 'review.md')) && Boolean(document.querySelector('.document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY'))`);
+  await clickText(session, "View source");
+  await waitFor(session, "Markdown Review source mode", `Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-code')?.textContent?.includes('# W05 Review Markdown'))`);
+  await clickText(session, "View rendered");
+  await waitFor(session, "Markdown Review rendered mode", `Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY'))`);
+  const markdownTab = await evaluateAction(session, "record Markdown Review modes", `(() => ({ rendered: Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY')), sourceButton: [...document.querySelectorAll('.review-panel [role="tabpanel"] button')].some((item) => (item.textContent || '').includes('View source')) }))()`);
+
+  await doubleClickReviewArtifact(session, "review.txt");
+  await waitFor(session, "text artifact opened in Review", `Boolean([...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim() === 'review.txt')) && Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-code')?.textContent?.includes('W05_REVIEW_TEXT_BODY'))`);
+  const tabsBeforeClose = await evaluateAction(session, "record all actual Review tabs", `(() => [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].map((item) => ({ label: item.textContent?.trim() || '', selected: item.getAttribute('aria-selected') === 'true' })))()`);
+  if (!["ReadFile", "Process log", "review.md", "review.txt"].every((label) => tabsBeforeClose.some((tab) => tab.label.includes(label)))) throw new Error(`Review did not retain all real output/document tabs: ${JSON.stringify(tabsBeforeClose)}`);
+  await clickReviewTab(session, "ReadFile");
+  await waitFor(session, "switch back to safe bounded output tab", `Boolean(document.querySelector('.review-panel__output')?.textContent?.includes('W05_REVIEW_OUTPUT_BEGIN'))`);
+  await clickReviewTab(session, "Process log");
+  await waitFor(session, "switch back to process log tab", `Boolean(document.querySelector('.review-panel__process-output')?.textContent?.includes('W05_REVIEW_PROCESS_LOG'))`);
+  await clickReviewTab(session, "review.md");
+  await clickReviewTab(session, "review.txt");
+  const closeOneTab = await evaluateAction(session, "close only the text Review tab", `(() => {
+    const wrapper = [...document.querySelectorAll('.review-panel__tab')].find((item) => item.querySelector('[role="tab"]')?.textContent?.trim() === 'review.txt');
+    const button = wrapper?.querySelector('button[aria-label^="Close"]');
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!closeOneTab) throw new Error("text Review tab did not expose its own close control");
+  await waitFor(session, "closing one Review tab retains the others", `(() => {
+    const labels = [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].map((item) => item.textContent?.trim() || '');
+    return !labels.includes('review.txt') && ['ReadFile', 'Process log', 'review.md'].every((label) => labels.some((value) => value.includes(label))) && Boolean(document.querySelector('.review-panel'));
+  })()`);
+  const remainingTabs = await evaluateAction(session, "record tabs after one close", `(() => [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].map((item) => item.textContent?.trim() || ''))()`);
+  const closePanel = await evaluateAction(session, "close the complete Review panel", `(() => { const button = document.querySelector('.review-panel__header button'); if (!button) return false; button.click(); return true; })()`);
+  if (!closePanel) throw new Error("Review panel did not expose its close control");
+  await waitFor(session, "Review panel closed", "!document.querySelector('.review-panel') && !document.querySelector('.review-panel__tabs')");
+  await doubleClickReviewArtifact(session, "review.md");
+  await waitFor(session, "reopen document for owner isolation", `Boolean(document.querySelector('.review-panel') && document.querySelector('.review-panel [role="tabpanel"] .document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY'))`);
+  const oldSessionId = sessionIdentity.id;
+  await clickText(session, "New chat");
+  const newIdentity = await waitFor(session, "new explicit Coding Review Session owner", `(() => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line)');
+    const label = row?.getAttribute('aria-label') || '';
+    const id = label.split(' · ')[1] || null;
+    return row && id && id !== ${JSON.stringify(oldSessionId)} ? { label, id } : false;
+  })()`);
+  const newOwnerReady = await waitForStableObservation(session, "new public Coding owner with no stale Review content", `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const selected = document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.getAttribute('aria-label') || '';
+    const selectedId = selected.split(' · ')[1] || null;
+    const review = document.querySelector('.review-panel');
+    const timeline = document.querySelector('[aria-label="Chat timeline"]')?.innerText || '';
+    const staleImageAttachment = [...document.querySelectorAll('.timeline-attachments .file-card[aria-label^="review-attachment.png"]')].length > 0;
+    const ready = selectedId === ${JSON.stringify(newIdentity.id)} && status?.session_id === selectedId && status?.runtime?.state === 'ready' && status?.active_turn === false && !review && !timeline.includes('W05_REVIEW_') && !staleImageAttachment;
+    return { ready, publicSessionId: status?.session_id ?? null, selectedSessionId: selectedId, runtimeState: status?.runtime?.state ?? null, activeTurn: status?.active_turn ?? null, staleReviewVisible: Boolean(review) || timeline.includes('W05_REVIEW_') || staleImageAttachment };
+  })()`);
+  flowEvidence.review = {
+    originalOwner: { mode: ownerReady.mode, projectLabel: ownerReady.projectLabel, sessionId: sessionIdentity.id },
+    output: { firstPage, finalPage: finalOutput },
+    processLog: processTab,
+    artifacts: artifactCards,
+    attachment: { draft: imageAttachment, sentAndReviewed: sentImageAttachment },
+    markdown: markdownTab,
+    tabsBeforeClose,
+    tabsAfterClose: remainingTabs,
+    ownerSwitch: { previousSessionId: oldSessionId, currentSessionId: newIdentity.id, observation: newOwnerReady },
+  };
+  await capture(session, "review-owner-switched");
+  writeLog("assertion_pass", { description: "packaged Coding Review opens real bounded tool output, process output, Markdown and text artifacts; tabs switch/close and old content clears on explicit Session owner change" });
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
 }
 
 async function submitTodoFlow(session, expectedToolText) {
@@ -854,13 +1263,17 @@ async function submitFailureFlow(session) {
   await waitFor(session, `Retry output ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
 }
 
-async function submitDelayedFlow(session) {
-  await waitFor(session, "delayed turn controls", "Boolean(document.querySelector('button[aria-label=\"Pause\"]')) && Boolean(document.querySelector('button[aria-label=\"Cancel\"]'))");
+async function submitDelayedFlow(session, { general = false } = {}) {
+  const controls = general
+    ? "Boolean(document.querySelector('button[aria-label=\"Cancel\"], button[aria-label=\"取消\"]'))"
+    : "Boolean(document.querySelector('button[aria-label=\"Pause\"]')) && Boolean(document.querySelector('button[aria-label=\"Cancel\"]'))";
+  await waitFor(session, "delayed turn controls", controls);
   await capture(session, "delayed-controls");
   if (delayAction === "cancel") {
     writeLog("action", { action: "click_text", text: "Cancel" });
-    await clickText(session, "Cancel");
-    await waitFor(session, "delayed turn cancellation", "!document.querySelector('button[aria-label=\"Cancel\"]') && document.body?.innerText?.includes('cancelled')");
+    const cancelLabel = general && requestedLanguage === "zh-CN" ? "取消" : "Cancel";
+    await clickText(session, cancelLabel);
+    await waitFor(session, "delayed turn cancellation", "!document.querySelector('button[aria-label=\"Cancel\"], button[aria-label=\"取消\"]') && /cancelled|已取消/u.test(document.body?.innerText || '')");
     return;
   }
   await clickText(session, "Pause");
@@ -880,13 +1293,12 @@ async function submitSessionsFlow(session) {
     const ordinal = index + 2;
     await clickText(session, "New chat");
     await waitFor(session, `${ordinal}th conversation header`, "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
-    await waitFor(session, `${ordinal}th Session persisted`, "Boolean(document.querySelector('button.session-line:not(.new-session-line)'))");
     await waitFor(session, `${ordinal}th composer ready`, "Boolean(document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'))");
     await setInput(session, "Message UthCode", prompt);
     await waitFor(session, `${ordinal}th message ready`, "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
-    await clickText(session, "Send");
+    await clickSelector(session, ".composer-send");
     await waitFor(session, `${ordinal}th session output ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes(${JSON.stringify(prompt)}) && text.includes(${JSON.stringify(expectedText)}); })()`);
-    await waitFor(session, "session displays its first user message", `document.querySelector('button.session-line.is-selected')?.innerText?.includes(${JSON.stringify(prompt)})`);
+    await waitFor(session, `${ordinal}th Session persisted after first turn`, `document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.innerText?.includes(${JSON.stringify(prompt)})`);
     sessionRows.push(await evaluateAction(session, "remember session identity", "document.querySelector('button.session-line.is-selected')?.getAttribute('aria-label')"));
   }
   const expandedSessions = await evaluateAction(session, "expand older session rows", `(() => {
@@ -922,7 +1334,7 @@ async function submitSessionsFlow(session) {
 
   await setInput(session, "Message UthCode", "cdp fixture replay continuation");
   await waitFor(session, "replayed message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
-  await clickText(session, "Send");
+  await clickSelector(session, ".composer-send");
   await waitFor(session, `replayed session continuation ${expectedText}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes('cdp fixture replay continuation') && text.includes(${JSON.stringify(expectedText)}); })()`);
   await submitCompactCommand(session);
 }
@@ -1139,6 +1551,773 @@ async function bodyText(session) {
   return evaluateAction(session, "read Renderer body", "document.body?.innerText || \"\"");
 }
 
+async function clickButtonContaining(session, text, selector = "button") {
+  const aliases = {
+    "New chat": ["New chat", "新聊天"],
+    "Search Sessions": ["Search Sessions", "搜索会话"],
+    Rename: ["Rename", "重命名"],
+    Pin: ["Pin", "置顶"],
+    Unpin: ["Unpin", "取消置顶"],
+    "Archive Session": ["Archive Session", "归档会话"],
+    "Restore and open": ["Restore and open", "恢复并打开"],
+    "Open Session": ["Open Session", "打开会话"],
+  };
+  const wanted = aliases[text] ?? [text];
+  const clicked = await evaluateAction(session, `click button containing ${text}`, `(() => {
+    const wanted = ${JSON.stringify(wanted)};
+    const button = [...document.querySelectorAll(${JSON.stringify(selector)})].find((item) => wanted.some((candidate) => (item.textContent || "").includes(candidate)));
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!clicked) {
+    const observed = await evaluateAction(session, `diagnose button containing ${text}`, `(() => [...document.querySelectorAll(${JSON.stringify(selector)})].map((item) => ({ text: (item.textContent || '').trim(), disabled: Boolean(item.disabled), ariaLabel: item.getAttribute('aria-label'), title: item.getAttribute('title') })))()`);
+    throw new Error(`button containing text was not found or was disabled: ${JSON.stringify({ text, wanted, observed })}`);
+  }
+}
+
+async function switchMode(session, mode) {
+  const current = await evaluateAction(session, `read ${mode} mode`, `document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode`);
+  if (current === mode) return;
+  const opened = await evaluateAction(session, "open mode menu", `(() => { const button = document.querySelector('.sidebar-brand-menu-trigger'); if (!button) return false; button.click(); return true; })()`);
+  if (!opened) throw new Error("mode menu trigger is missing");
+  await waitFor(session, "mode menu", "Boolean(document.querySelector('[role=menu]'))");
+  await clickButtonContaining(session, mode === "coding" ? "Coding" : "General", "[role=menu] button");
+  await waitFor(session, `${mode} mode selected`, `document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode === ${JSON.stringify(mode)} && document.querySelector('.sidebar')?.getAttribute('aria-label') === ${JSON.stringify(mode === "coding" ? "Projects" : "General")}`);
+}
+
+async function startProjectSession(session, alias) {
+  const projectState = await evaluateAction(session, `inspect Coding project ${alias}`, `(() => {
+    const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+    if (!project) return null;
+    const disclosure = project.querySelector('button.disclosure');
+    return {
+      alias: project.querySelector('.project-select')?.textContent?.trim() || null,
+      expanded: disclosure?.getAttribute('aria-expanded') === 'true',
+      hasSessionList: Boolean(project.querySelector('.session-list')),
+    };
+  })()`);
+  if (!projectState) {
+    const projects = await evaluateAction(session, 'diagnose visible Coding projects', `([...document.querySelectorAll('.project-item')].map((item) => ({ alias: item.querySelector('.project-select')?.textContent?.trim() || null, disclosure: item.querySelector('button.disclosure')?.getAttribute('aria-expanded') || null })))`);
+    throw new Error(`registered Coding project was not found: ${alias}; visible projects=${JSON.stringify(projects)}`);
+  }
+  if (!projectState.expanded || !projectState.hasSessionList) {
+    const expanded = await evaluateAction(session, `expand Coding project ${alias}`, `(() => {
+      const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+      const disclosure = project?.querySelector('button.disclosure');
+      if (!project || !disclosure) return false;
+      if (disclosure.getAttribute('aria-expanded') === 'true') return true;
+      disclosure.click();
+      return true;
+    })()`);
+    if (!expanded) throw new Error(`Coding project disclosure was not available: ${alias}`);
+    await waitFor(session, `expanded Coding project ${alias}`, `(() => {
+      const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+      return project?.querySelector('button.disclosure')?.getAttribute('aria-expanded') === 'true' && Boolean(project.querySelector('.session-list'));
+    })()`);
+  }
+  const started = await evaluateAction(session, `start new session in ${alias}`, `(() => {
+    const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+    const button = project?.querySelector('button.new-session-line');
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!started) throw new Error(`New Session action was unavailable after expanding Coding project ${alias}`);
+  await waitFor(session, `new conversation in ${alias}`, "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+  await waitFor(session, `selected project ${alias}`, `document.querySelector('.project-item.is-active .project-select')?.textContent?.includes(${JSON.stringify(alias)})`);
+  await waitFor(session, `selected draft Session row in ${alias}`, `(() => {
+    const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+    const row = project?.querySelector('button.session-line.is-selected:not(.new-session-line)');
+    return Boolean(row?.getAttribute('aria-label')?.includes(${JSON.stringify(alias)}));
+  })()`);
+  const owner = await waitForStableObservation(session, `selected Session and public Runtime owner ready in ${alias}`, `(async () => {
+    const project = [...document.querySelectorAll('.project-item')].find((item) => item.querySelector('.project-select')?.textContent?.includes(${JSON.stringify(alias)}));
+    const row = project?.querySelector('button.session-line.is-selected:not(.new-session-line)');
+    const label = row?.getAttribute('aria-label') || '';
+    const sessionId = label.split(' · ')[1] || null;
+    const input = document.querySelector('.composer textarea');
+    const composerReady = Boolean(input && !input.disabled);
+    const mode = document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null;
+    const status = row && sessionId ? await window.uthcode.requestRuntime('status.get', {}) : null;
+    const observation = {
+      sessionId,
+      selectedSession: label || null,
+      publicSessionId: status?.session_id ?? null,
+      runtimeState: status?.runtime?.state ?? null,
+      activeTurn: status?.active_turn ?? null,
+      sessionStatus: status?.session_state?.status ?? null,
+      composerReady,
+      mode,
+    };
+    observation.ready = Boolean(row && sessionId && composerReady && mode === 'coding'
+      && status?.session_id === sessionId
+      && status?.active_turn === false
+      && status?.session_state?.status === 'idle'
+      && status?.runtime?.state === 'ready');
+    return observation;
+  })()`);
+  flowEvidence.lifecycleSessionOwners ??= [];
+  flowEvidence.lifecycleSessionOwners.push(owner);
+}
+
+async function lifecycleTimeoutDiagnostic(session, prompt) {
+  const previousDeadline = flowDeadline;
+  // Preserve a small independent diagnostic window after the user-visible
+  // flow deadline. The main acceptance remains bounded by timeoutMs; this
+  // tail only reads the public UI/Runtime state and captures the failure.
+  flowDeadline = Math.max(flowDeadline, Date.now() + 8_000);
+  let evidence;
+  try {
+    evidence = await session.evaluate(`(async () => {
+    const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+    const timeline = document.querySelector('[aria-label="Chat timeline"]');
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const runtime = document.querySelector('#runtime-panel');
+    let publicStatus = null;
+    let publicStatusError = null;
+    try { publicStatus = await window.uthcode?.requestRuntime('status.get', {}); }
+    catch (error) { publicStatusError = String(error?.message || error); }
+    const alerts = [...document.querySelectorAll('[role="alert"]')].map((item) => (item.innerText || '').trim().slice(0, 180));
+    const assistant = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')].map((item) => (item.innerText || '').trim().slice(0, 180));
+    const monitor = window.__t12LifecycleEventMonitor;
+    monitor?.unsubscribe?.();
+    delete window.__t12LifecycleEventMonitor;
+    return {
+      promptVisible: Boolean(timeline?.innerText?.includes(${JSON.stringify(prompt)})),
+      composerValueLength: input?.value?.length ?? null,
+      composerDisabled: Boolean(input?.disabled || input?.closest('.composer')?.getAttribute('aria-disabled') === 'true'),
+      selectedSession: row?.getAttribute('aria-label') || null,
+      selectedSessionId: row?.getAttribute('aria-label')?.split(' · ')[1] || null,
+      mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null,
+      runtimeText: (runtime?.innerText || '').trim().slice(0, 240),
+      publicStatus: publicStatus ? {
+        sessionId: publicStatus.session_id ?? null,
+        sessionStatus: publicStatus.session_state?.status ?? null,
+        activeTurn: publicStatus.active_turn ?? null,
+        runtimeState: publicStatus.runtime?.state ?? null,
+      } : null,
+      publicStatusError,
+      alerts,
+      assistant,
+      cancelControlVisible: Boolean(document.querySelector('button[aria-label="Cancel"]')),
+      permissionSurfaceVisible: Boolean(document.querySelector('[aria-label="Interaction surface"]')),
+      eventTypes: monitor?.eventTypes ?? [],
+      terminalEvents: monitor?.terminalEvents ?? [],
+      sendProbeClickCount: window.__t12ComposerSendProbe?.clickCount ?? null,
+      sendButtons: [...document.querySelectorAll('.composer-send')].map((button) => {
+        const rect = button.getBoundingClientRect();
+        const style = getComputedStyle(button);
+        return { disabled: button.disabled, text: (button.innerText || '').trim(), aria: button.getAttribute('aria-label'), display: style.display, visibility: style.visibility, rect: rect.toJSON() };
+      }),
+    };
+  })()`);
+  } catch (error) {
+    evidence = { diagnosticFailure: error instanceof Error ? error.message : String(error) };
+  }
+  flowEvidence.lifecycleTimeoutDiagnostic = { prompt, ...evidence };
+  try {
+    await capture(session, "lifecycle-provider-timeout");
+  } catch (error) {
+    flowEvidence.lifecycleTimeoutDiagnostic.screenshotFailure = error instanceof Error ? error.message : String(error);
+  } finally {
+    flowDeadline = previousDeadline;
+  }
+  writeLog("acceptance_diagnostic", { description: "lifecycle provider response timed out", evidence: flowEvidence.lifecycleTimeoutDiagnostic });
+  return evidence;
+}
+
+async function waitForGeneralDraftReady(session) {
+  const owner = await waitForStableObservation(session, "General New chat and public Runtime owner ready", `(async () => {
+    const mode = document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null;
+    const sidebar = document.querySelector('.sidebar')?.getAttribute('aria-label') || null;
+    const input = document.querySelector('.composer textarea');
+    const composerReady = Boolean(input && !input.disabled && input.closest('.composer')?.getAttribute('aria-disabled') !== 'true');
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const selectedSession = row?.getAttribute('aria-label') || null;
+    const selectedSessionId = selectedSession?.split(' · ')[1] || null;
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const observation = {
+      mode,
+      sidebar,
+      selectedSession,
+      selectedSessionId,
+      publicSessionId: status?.session_id ?? null,
+      runtimeState: status?.runtime?.state ?? null,
+      activeTurn: status?.active_turn ?? null,
+      sessionStatus: status?.session_state?.status ?? null,
+      composerReady,
+    };
+    observation.ready = mode === 'general'
+      && sidebar === 'General'
+      && composerReady
+      && status?.runtime?.state === 'ready'
+      && status?.active_turn === false
+      && (!selectedSessionId || !status?.session_id || selectedSessionId === status.session_id);
+    return observation;
+  })()`);
+  return owner;
+}
+
+async function waitForLifecycleSessionOwner(session, description, { sessionId, projectAlias, prompt }) {
+  return waitForStableObservation(session, description, `(async () => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const label = row?.getAttribute('aria-label') || null;
+    const selectedSessionId = label?.split(' · ')[1] || null;
+    const selectedProject = document.querySelector('.project-item.is-active .project-select')?.textContent?.trim() || null;
+    const mode = document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null;
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const sidebarBusy = document.querySelector('.sidebar')?.getAttribute('aria-busy') || null;
+    const cancelVisible = Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]'));
+    const timelineText = document.querySelector('[aria-label="Chat timeline"]')?.innerText || '';
+    const observation = {
+      selectedSession: label,
+      selectedSessionId,
+      selectedProject,
+      mode,
+      publicSessionId: status?.session_id ?? null,
+      runtimeState: status?.runtime?.state ?? null,
+      activeTurn: status?.active_turn ?? null,
+      sessionStatus: status?.session_state?.status ?? null,
+      sidebarBusy,
+      cancelVisible,
+      promptVisible: timelineText.includes(${JSON.stringify(prompt)}),
+    };
+    observation.ready = selectedSessionId === ${JSON.stringify(sessionId)}
+      && (!${JSON.stringify(projectAlias)} || selectedProject === ${JSON.stringify(projectAlias)})
+      && mode === 'coding'
+      && status?.session_id === ${JSON.stringify(sessionId)}
+      && status?.runtime?.state === 'ready'
+      && status?.active_turn === false
+      && ['idle', 'completed'].includes(status?.session_state?.status)
+      && sidebarBusy !== 'true'
+      && !cancelVisible
+      && observation.promptVisible;
+    return observation;
+  })()`);
+}
+
+async function submitLifecyclePrompt(session, prompt, response = expectedText) {
+  await session.evaluate(`(() => {
+    window.__t12LifecycleEventMonitor?.unsubscribe?.();
+    const eventTypes = [];
+    const terminalEvents = [];
+    const terminalTypes = new Set(['turn_completed', 'turn_failed', 'turn_cancelled']);
+    const unsubscribe = window.uthcode?.subscribeAgentEvents?.((event) => {
+      if (typeof event?.type !== 'string') return;
+      eventTypes.push(event.type);
+      if (terminalTypes.has(event.type)) terminalEvents.push({
+        type: event.type,
+        runId: typeof event.run_id === 'string' ? event.run_id : null,
+        turnId: typeof event.turn_id === 'string' ? event.turn_id : null,
+        sessionId: typeof event.session_id === 'string' ? event.session_id : null,
+        projectKey: typeof event.project_key === 'string' ? event.project_key : null,
+        terminationReason: typeof event.termination_reason === 'string' ? event.termination_reason : null,
+        failureReason: typeof event.failure_reason === 'string' ? event.failure_reason : null,
+      });
+    }) || null;
+    window.__t12LifecycleEventMonitor = { eventTypes, terminalEvents, unsubscribe };
+    return Boolean(unsubscribe);
+  })()`);
+  await setInput(session, "Message UthCode", prompt);
+  await waitFor(session, "lifecycle message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
+  await clickSelector(session, ".composer-send");
+  let sendState;
+  try {
+    sendState = await waitFor(session, "lifecycle Send acknowledgment", `(() => {
+      const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+      const promptVisible = Boolean(document.querySelector('[aria-label="Chat timeline"]')?.innerText?.includes(${JSON.stringify(prompt)}));
+      const cancelControlVisible = Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]'));
+      const sendButtons = [...document.querySelectorAll('.composer-send')].map((button) => ({ disabled: button.disabled, text: (button.innerText || '').trim(), aria: button.getAttribute('aria-label') }));
+      const composerValueLength = input?.value?.length ?? null;
+      if (!promptVisible && composerValueLength !== 0 && !cancelControlVisible && !sendButtons.some((button) => button.disabled)) return false;
+      return { promptVisible, composerValueLength, cancelControlVisible, sendProbeClickCount: window.__t12ComposerSendProbe?.clickCount ?? null, sendButtons };
+    })()`);
+  } catch (error) {
+    const diagnostic = await lifecycleTimeoutDiagnostic(session, prompt);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; lifecycle Send acknowledgment state=${JSON.stringify(diagnostic)}`);
+  }
+  try {
+    await waitFor(session, `lifecycle response for ${prompt}`, `(() => { const text = document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText || ''; return text.includes(${JSON.stringify(prompt)}) && text.includes(${JSON.stringify(response)}); })()`);
+  } catch (error) {
+    const diagnostic = await lifecycleTimeoutDiagnostic(session, prompt);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; lifecycle send state=${JSON.stringify({ sendState, diagnostic })}`);
+  }
+  await waitFor(session, `persistent Session for ${prompt}`, "Boolean(document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected'))");
+  const terminal = await waitFor(session, `terminal AgentEvent for ${prompt}`, `(() => {
+    const events = window.__t12LifecycleEventMonitor?.terminalEvents || [];
+    return events.find((event) => ['turn_completed', 'turn_failed', 'turn_cancelled'].includes(event.type)) || false;
+  })()`);
+  if (terminal.type !== 'turn_completed') throw new Error(`lifecycle Turn ended without successful completion: ${JSON.stringify(terminal)}`);
+  const identity = await selectedSessionIdentity(session);
+  const terminalStatus = await waitForStableObservation(session, `public Runtime confirms terminal idle for ${prompt}`, `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const cancelVisible = Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]'));
+    const sessionStatus = status?.session_state?.status ?? null;
+    const runtimeState = status?.runtime?.state ?? null;
+    const ready = status?.active_turn === false
+      && ['idle', 'completed'].includes(sessionStatus)
+      && status?.session_id === ${JSON.stringify(identity?.id)}
+      && runtimeState === 'ready'
+      && !cancelVisible;
+    return { ready, activeTurn: status?.active_turn ?? null, sessionStatus, sessionId: status?.session_id ?? null, runtimeState, cancelVisible };
+  })()`);
+  flowEvidence.lifecycleTurns ??= [];
+  flowEvidence.lifecycleTurns.push({ prompt, selectedSessionId: identity?.id ?? null, terminal, terminalStatus });
+  await session.evaluate("window.__t12LifecycleEventMonitor?.unsubscribe?.(); delete window.__t12LifecycleEventMonitor;");
+}
+
+async function selectedSessionIdentity(session) {
+  return evaluateAction(session, "read selected Session identity", `(() => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    return row ? { label: row.getAttribute('aria-label'), text: row.innerText, id: row.getAttribute('aria-label')?.split(' · ')[1] || null } : null;
+  })()`);
+}
+
+async function mutateSelectedSession(session, actionText) {
+  const opened = await evaluateAction(session, "open selected Session menu", `(() => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const trigger = row?.closest('.session-menu-anchor')?.querySelector('.session-menu-trigger');
+    if (!trigger) return false;
+    trigger.click();
+    return true;
+  })()`);
+  if (!opened) throw new Error("selected Session menu trigger was not found");
+  await waitFor(session, "selected Session menu", "Boolean(document.querySelector('[role=menu]'))");
+  const actionAliases = {
+    Rename: ["Rename", "重命名"],
+    Pin: ["Pin", "置顶"],
+    Unpin: ["Unpin", "取消置顶"],
+    "Archive Session": ["Archive Session", "归档会话"],
+  };
+  const actionLabels = actionAliases[actionText] ?? [actionText];
+  await waitFor(session, `enabled ${actionText} Session action`, `(() => {
+    const labels = ${JSON.stringify(actionLabels)};
+    return [...document.querySelectorAll('[role=menu] button')].some((item) => !item.disabled && labels.some((label) => (item.textContent || '').includes(label)));
+  })()`);
+  if (actionText === "Pin") {
+    const clickEvidence = await evaluateAction(session, "deliver real Pin Session menu click", `(() => {
+      const labels = ${JSON.stringify(actionAliases.Pin)};
+      const button = [...document.querySelectorAll('[role=menu] button')].find((item) => labels.some((label) => (item.textContent || '').trim() === label));
+      if (!button || button.disabled) return { clicked: false, text: button?.textContent?.trim() || null, ariaLabel: button?.getAttribute('aria-label') || null };
+      window.__t12PinActionProbe = { clickCount: 0 };
+      button.addEventListener('click', () => { window.__t12PinActionProbe.clickCount += 1; }, { capture: true, once: true });
+      const evidence = { clicked: true, text: button.textContent.trim(), ariaLabel: button.getAttribute('aria-label'), disabled: button.disabled };
+      button.click();
+      evidence.clickCount = window.__t12PinActionProbe.clickCount;
+      return evidence;
+    })()`);
+    if (!clickEvidence?.clicked || clickEvidence.clickCount !== 1) throw new Error(`real Pin menu click was not delivered: ${JSON.stringify(clickEvidence)}`);
+    flowEvidence.lifecyclePinAction = clickEvidence;
+    return clickEvidence;
+  }
+  await clickButtonContaining(session, actionText, "[role=menu] button");
+}
+
+async function renameSelectedSession(session, title) {
+  await mutateSelectedSession(session, "Rename");
+  await waitFor(session, "Session title input", "Boolean(document.querySelector('input.session-title-input'))");
+  const changed = await evaluateAction(session, "set Session title", `(() => {
+    const input = document.querySelector('input.session-title-input');
+    if (!input) return false;
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
+    if (setter) setter.call(input, ${JSON.stringify(title)}); else input.value = ${JSON.stringify(title)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+    return true;
+  })()`);
+  if (!changed) throw new Error("Session title input disappeared");
+  await waitFor(session, "renamed Session title", `document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected')?.textContent?.includes(${JSON.stringify(title)})`);
+  const settled = await waitForStableObservation(session, "Session rename mutation settled", `(() => {
+    const sidebar = document.querySelector('.sidebar');
+    const selected = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const observation = {
+      sidebarBusy: sidebar?.getAttribute('aria-busy') || null,
+      selectedSession: selected?.getAttribute('aria-label') || null,
+      selectedText: selected?.innerText?.trim() || null,
+    };
+    observation.ready = observation.sidebarBusy !== 'true' && Boolean(selected?.textContent?.includes(${JSON.stringify(title)}));
+    return observation;
+  })()`);
+  flowEvidence.lifecycleRenameSettlements ??= [];
+  flowEvidence.lifecycleRenameSettlements.push(settled);
+}
+
+async function setSelectedSessionPin(session) {
+  const before = await evaluateAction(session, "read pinned Session preference before Pin", "window.uthcode.readPreference('pinnedSessions')");
+  const click = await mutateSelectedSession(session, "Pin");
+  const identity = await selectedSessionIdentity(session);
+  const sessionId = identity?.id;
+  if (!sessionId) throw new Error("selected Session identity was unavailable after Pin");
+  const persisted = await waitForStableObservationWithin(session, "Session pin persisted through the real UI", `(async () => {
+    const preferences = await window.uthcode.readPreference('pinnedSessions');
+    const pins = Array.isArray(preferences) ? preferences : [];
+    const selected = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+    const notices = [...document.querySelectorAll('[role="alert"], [role="status"]')].map((item) => (item.innerText || '').trim().slice(0, 160));
+    return {
+      ready: pins.some((entry) => entry?.sessionId === ${JSON.stringify(sessionId)}),
+      sessionId: ${JSON.stringify(sessionId)},
+      pins,
+      selectedLabel: selected?.getAttribute('aria-label') || null,
+      selectedText: selected?.innerText?.trim() || null,
+      menuOpen: Boolean(document.querySelector('[role=menu]')),
+      notices,
+    };
+  })()`);
+  flowEvidence.lifecyclePin = { sessionId, before: Array.isArray(before) ? before : null, click, persisted };
+  return persisted;
+}
+
+async function openSessionSearch(session, query) {
+  const alreadyOpen = await evaluateAction(session, "check Session search dialog", "Boolean(document.querySelector('[role=dialog][aria-label=\"Search Sessions\"], [role=dialog][aria-label=\"搜索会话\"]'))");
+  if (!alreadyOpen) await clickButtonContaining(session, "Search Sessions", ".sidebar-primary button");
+  await waitFor(session, "Session search dialog", "Boolean(document.querySelector('[role=dialog][aria-label=\"Search Sessions\"], [role=dialog][aria-label=\"搜索会话\"]'))");
+  const changed = await evaluateAction(session, "set Session search query", `(() => {
+    const input = document.querySelector('[role=dialog] input[aria-label=\"Search Session titles or content\"], [role=dialog] input[aria-label=\"搜索会话标题或内容\"]');
+    if (!input) return false;
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
+    if (setter) setter.call(input, ${JSON.stringify(query)}); else input.value = ${JSON.stringify(query)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    const form = input.closest('form');
+    if (!form) return false;
+    form.requestSubmit();
+    return true;
+  })()`);
+  if (!changed) throw new Error("Session search input or form was not found");
+  await waitFor(session, `Session search results for ${query}`, "document.querySelectorAll('[role=dialog] ul > li').length > 0");
+  return evaluateAction(session, "read Session search results", `(() => [...document.querySelectorAll('[role=dialog] ul > li')].map((item) => ({ title: item.querySelector('strong')?.textContent?.trim() || '', owner: item.querySelector('small')?.textContent?.trim() || '', snippet: item.querySelector('p')?.textContent?.trim() || '', action: item.querySelector('button')?.textContent?.trim() || '', archived: /Archived|已归档/u.test(item.querySelector('small')?.textContent || '') })))()`);
+}
+
+async function openSearchHit(session, predicate, actionLabel) {
+  const opened = await evaluateAction(session, `open ${actionLabel} Search result`, `(() => {
+    const hit = [...document.querySelectorAll('[role=dialog] ul > li')].find((item) => ${predicate});
+    const button = hit?.querySelector('button');
+    if (!button || button.disabled || !button.textContent?.includes(${JSON.stringify(actionLabel)})) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!opened) throw new Error(`matching Search result action not found: ${actionLabel}`);
+}
+
+async function runLifecycleFlow(session) {
+  if (!projectOne || !projectTwo || !lifecycleStage) throw new Error("lifecycle requires --stage, --project-one, and --project-two");
+  const title = "T12 Shared Session";
+  const onePrompt = "T12_CODING_ONE_CONTENT";
+  const twoPrompt = "T12_CODING_TWO_CONTENT";
+  const generalPrompt = "T12_GENERAL_CONTENT";
+  if (lifecycleStage === "seed") {
+    await switchMode(session, "coding");
+    await startProjectSession(session, "T12 Coding One");
+    await submitLifecyclePrompt(session, onePrompt);
+    await renameSelectedSession(session, title);
+    const one = await selectedSessionIdentity(session);
+
+    await startProjectSession(session, "T12 Coding Two");
+    await submitLifecyclePrompt(session, twoPrompt);
+    await renameSelectedSession(session, title);
+    const two = await selectedSessionIdentity(session);
+    const pin = await setSelectedSessionPin(session);
+
+    await switchMode(session, "general");
+    const generalUi = await evaluateAction(session, "verify General mode has no project selection", `({ mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode, sidebar: document.querySelector('.sidebar')?.getAttribute('aria-label'), projectButtons: document.querySelectorAll('.project-select').length })`);
+    if (generalUi.mode !== "general" || generalUi.sidebar !== "General" || generalUi.projectButtons !== 0) throw new Error(`General UI exposed a Coding project selection: ${JSON.stringify(generalUi)}`);
+    await clickButtonContaining(session, "New chat", ".sidebar-primary button");
+    await waitFor(session, "new General conversation header", "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+    const generalOwner = await waitForGeneralDraftReady(session);
+    await submitLifecyclePrompt(session, generalPrompt);
+    const general = await selectedSessionIdentity(session);
+    await capture(session, "lifecycle-general-created");
+
+    await switchMode(session, "coding");
+    const hits = await openSessionSearch(session, title);
+    const oneHit = hits.find((hit) => hit.owner.includes("T12 Coding One"));
+    const twoHit = hits.find((hit) => hit.owner.includes("T12 Coding Two"));
+    if (hits.length !== 2 || !oneHit || !twoHit || hits.some((hit) => hit.title !== title || hit.archived)) throw new Error(`same-title Coding Session search did not return both owners: ${JSON.stringify(hits)}`);
+    await openSearchHit(session, `item.querySelector('small')?.textContent?.includes('T12 Coding Two')`, "Open Session");
+    const openedForArchive = await waitForLifecycleSessionOwner(session, "second Coding Session selected owner ready before archive", { sessionId: two.id, projectAlias: "T12 Coding Two", prompt: twoPrompt });
+    await mutateSelectedSession(session, "Archive Session");
+    const archived = await waitForStableObservationWithin(session, "second Coding Session archived through the UI", `(async () => {
+      const matchingRows = [...document.querySelectorAll('button.session-line:not(.new-session-line), button.recent-line')]
+        .filter((item) => item.getAttribute('aria-label')?.includes(${JSON.stringify(two.id)}));
+      const preferences = await window.uthcode.readPreference('pinnedSessions');
+      const pins = Array.isArray(preferences) ? preferences : [];
+      const observation = {
+        sessionId: ${JSON.stringify(two.id)},
+        remainingVisibleRows: matchingRows.map((item) => ({ label: item.getAttribute('aria-label'), text: item.innerText?.trim() || null })),
+        sidebarBusy: document.querySelector('.sidebar')?.getAttribute('aria-busy') || null,
+        stillPinned: pins.some((entry) => entry?.sessionId === ${JSON.stringify(two.id)}),
+        notices: [...document.querySelectorAll('[role="alert"], [role="status"]')].map((item) => (item.innerText || '').trim().slice(0, 160)),
+      };
+      observation.ready = matchingRows.length === 0 && observation.sidebarBusy !== 'true' && observation.stillPinned;
+      return observation;
+    })()`, 20_000);
+    flowEvidence.lifecycle = { stage: "seed", title, projectOne: "T12 Coding One", projectTwo: "T12 Coding Two", sessions: { one, two, general }, generalOwner, pinned: pin.sessionId, searchBeforeArchive: hits, generalUi, openedForArchive, archived };
+    await capture(session, "lifecycle-after-archive");
+  } else if (lifecycleStage === "restore") {
+    const expected = expectedSessions ? JSON.parse(expectedSessions) : null;
+    await switchMode(session, "general");
+    const generalUi = await evaluateAction(session, "verify General mode after restart", `({ mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode, sidebar: document.querySelector('.sidebar')?.getAttribute('aria-label'), projectButtons: document.querySelectorAll('.project-select').length, recent: [...document.querySelectorAll('button.recent-line')].map((item) => ({ label: item.getAttribute('aria-label'), text: item.textContent })) })`);
+    if (generalUi.mode !== "general" || generalUi.sidebar !== "General" || generalUi.projectButtons !== 0 || !generalUi.recent.some((item) => item.text.includes(generalPrompt))) throw new Error(`General owner or recent activity was not restored: ${JSON.stringify(generalUi)}`);
+    const generalHits = await openSessionSearch(session, generalPrompt);
+    if (generalHits.length !== 1 || !generalHits[0].owner.includes("General") || !generalHits[0].snippet.includes(generalPrompt)) throw new Error(`General search did not remain isolated to its Session: ${JSON.stringify(generalHits)}`);
+    await openSearchHit(session, `item.querySelector('small')?.textContent?.includes('General')`, "Open Session");
+    await waitFor(session, "General Session content after restart", `document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText?.includes(${JSON.stringify(generalPrompt)})`);
+    const generalIdentity = await selectedSessionIdentity(session);
+    if (expected?.general?.id && generalIdentity?.id !== expected.general.id) throw new Error(`General Session identity changed across restart: ${JSON.stringify({ expected: expected.general.id, observed: generalIdentity })}`);
+    await switchMode(session, "coding");
+    const activeHits = await openSessionSearch(session, title);
+    const activeOne = activeHits.find((hit) => hit.owner.includes("T12 Coding One") && !hit.archived);
+    const archivedTwo = activeHits.find((hit) => hit.owner.includes("T12 Coding Two") && hit.archived);
+    if (activeHits.length !== 2 || !activeOne || !archivedTwo || activeHits.some((hit) => hit.title !== title)) throw new Error(`Coding Session owner/title/archive search state changed across restart: ${JSON.stringify(activeHits)}`);
+    await openSearchHit(session, `item.querySelector('small')?.textContent?.includes('T12 Coding Two') && /Archived|已归档/u.test(item.querySelector('small')?.textContent || '')`, "Restore and open");
+    await waitFor(session, "restored Coding Session content", `document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText?.includes(${JSON.stringify(twoPrompt)})`);
+    if (!expected?.two?.id) throw new Error("lifecycle restore is missing the seeded Coding Session identity");
+    await waitForLifecycleSessionOwner(session, "restored Coding Session owner ready", { sessionId: expected.two.id, projectAlias: "T12 Coding Two", prompt: twoPrompt });
+    const restored = await selectedSessionIdentity(session);
+    if (!restored?.id || (expected?.two?.id && restored.id !== expected.two.id) || !restored.label?.includes("T12 Coding Two")) throw new Error(`restored Session owner or id changed: ${JSON.stringify({ expected: expected?.two?.id ?? null, restored })}`);
+    const pins = await evaluateAction(session, "verify restored Session pin preference", `window.uthcode.readPreference('pinnedSessions')`);
+    if (!Array.isArray(pins) || !pins.some((entry) => entry?.sessionId === restored.id)) throw new Error(`restored Session lost its pin: ${JSON.stringify({ restored: restored.id, pins })}`);
+    const recentOrder = await evaluateAction(session, "verify restored Coding user activity order", `(() => [...document.querySelectorAll('.recent button.recent-line')].map((item) => item.getAttribute('aria-label') || item.textContent || ''))()`);
+    const twoIndex = recentOrder.findIndex((label) => label.includes(restored.id));
+    const oneId = expected?.one?.id;
+    const oneIndex = oneId ? recentOrder.findIndex((label) => label.includes(oneId)) : -1;
+    if (twoIndex < 0 || (oneIndex >= 0 && twoIndex >= oneIndex)) throw new Error(`restored Session did not retain newer user-activity order: ${JSON.stringify(recentOrder)}`);
+    const finalHits = await openSessionSearch(session, title);
+    if (finalHits.length !== 2 || finalHits.some((hit) => hit.archived || hit.title !== title) || !finalHits.some((hit) => hit.owner.includes("T12 Coding One")) || !finalHits.some((hit) => hit.owner.includes("T12 Coding Two"))) throw new Error(`restored title/owner state did not return to active Coding search: ${JSON.stringify(finalHits)}`);
+    await openSearchHit(session, `item.querySelector('small')?.textContent?.includes('T12 Coding Two')`, "Open Session");
+    await waitFor(session, "reopened restored Session content", `document.querySelector('[aria-label=\"Chat timeline\"]')?.innerText?.includes(${JSON.stringify(twoPrompt)})`);
+    await capture(session, "lifecycle-restored-after-restart");
+    flowEvidence.lifecycle = { stage: "restore", title, activeSearchAfterRestore: finalHits, generalSearch: generalHits, generalUi, restored, pinnedSessionId: restored.id, recentOrder, expectedSessions: expected };
+  } else {
+    throw new Error(`unsupported lifecycle stage: ${lifecycleStage}`);
+  }
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: `packaged Session lifecycle stage ${lifecycleStage} completed through real UI` });
+}
+
+async function runDiffFlow(session) {
+  if (!diffProject) throw new Error("diff requires --diff-project");
+  const opened = await evaluateAction(session, "open current workspace diff from chat", `(() => { const button = document.querySelector('button[aria-label=\"Review current diff\"], button[aria-label=\"查看当前差异\"]'); if (!button) return false; button.click(); return true; })()`);
+  if (!opened) throw new Error("chat entry for the current workspace diff was not available");
+  await waitFor(session, "current diff review panel", "Boolean(document.querySelector('.review-panel .review-panel__diff'))");
+  const evidence = await evaluateAction(session, "inspect real current workspace diff", `(() => {
+    const panel = document.querySelector('.review-panel');
+    const paths = [...(panel?.querySelectorAll('.review-panel__paths li') || [])].map((item) => ({ status: item.querySelector('code')?.textContent?.trim() || '', path: item.querySelector('span')?.textContent?.trim() || '', original: item.querySelector('small')?.textContent?.replace(/^←\\s*/u, '').trim() || '' }));
+    const sections = [...(panel?.querySelectorAll('.review-panel__diff-section') || [])].map((item) => ({ title: item.querySelector('h3')?.textContent?.trim() || '', text: item.querySelector('pre')?.textContent || '' }));
+    return { paths, sections, viewedAt: panel?.querySelector('.review-panel__content-header small')?.textContent?.trim() || '', text: panel?.innerText || '' };
+  })()`);
+  const paths = evidence.paths;
+  const required = ["modified.txt", "added.txt", "deleted.txt", "renamed.txt"];
+  for (const path of required) if (!paths.some((entry) => entry.path === path)) throw new Error(`tracked Git change is missing from actual diff status: ${path}; ${JSON.stringify(paths)}`);
+  if (!paths.some((entry) => entry.path === "renamed.txt" && entry.original === "rename-source.txt")) throw new Error(`tracked rename original path was not shown: ${JSON.stringify(paths)}`);
+  const untrackedStatus = paths.filter((entry) => entry.path === "untracked.txt" || entry.original === "untracked.txt");
+  if (untrackedStatus.some((entry) => entry.status !== "??")) throw new Error(`untracked path did not retain its Git status: ${JSON.stringify(untrackedStatus)}`);
+  const allDiff = evidence.sections.map((section) => section.text).join("\n");
+  if (allDiff.includes("untracked evidence must stay absent")) throw new Error("untracked file contents were incorrectly projected into the real diff sections");
+  if (!allDiff.includes("-old tracked line") || !allDiff.includes("+new tracked line") || !evidence.sections.some((section) => /staged/i.test(section.title)) || !evidence.sections.some((section) => /unstaged/i.test(section.title))) throw new Error(`real staged/unstaged diff content was incomplete: ${JSON.stringify(evidence.sections)}`);
+  if (!evidence.viewedAt || !Number.isFinite(Date.parse(evidence.viewedAt))) throw new Error(`real diff view timestamp was absent or invalid: ${JSON.stringify(evidence.viewedAt)}`);
+  flowEvidence.diff = { project: resolve(diffProject), statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: false, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), viewedAt: evidence.viewedAt, timestampParsed: true };
+  await capture(session, "current-workspace-diff");
+  const previousOwner = await evaluateAction(session, "record owner before changing the current Diff Session", `(() => {
+    const label = document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.getAttribute('aria-label') || '';
+    return { sessionId: label.split(' · ')[1] || null, projectLabel: document.querySelector('button.project-select')?.textContent?.trim() || null };
+  })()`);
+  await clickText(session, "New chat");
+  const nextOwner = await waitFor(session, "new Coding Session selected while Diff is open", `(() => {
+    const row = document.querySelector('button.session-line.is-selected:not(.new-session-line)');
+    const label = row?.getAttribute('aria-label') || '';
+    const sessionId = label.split(' · ')[1] || null;
+    return row && sessionId && sessionId !== ${JSON.stringify(previousOwner.sessionId)} ? { label, sessionId } : false;
+  })()`);
+  const ownerSwitch = await waitForStableObservation(session, "new public Coding owner has no previous Diff tab", `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const selected = document.querySelector('button.session-line.is-selected:not(.new-session-line)')?.getAttribute('aria-label') || '';
+    const selectedSessionId = selected.split(' · ')[1] || null;
+    const reviewVisible = Boolean(document.querySelector('.review-panel'));
+    const staleDiffVisible = Boolean(document.querySelector('.review-panel .review-panel__diff'));
+    const ready = selectedSessionId === ${JSON.stringify(nextOwner.sessionId)} && status?.session_id === selectedSessionId && status?.runtime?.state === 'ready' && status?.active_turn === false && !reviewVisible && !staleDiffVisible;
+    return { ready, selectedSessionId, publicSessionId: status?.session_id ?? null, runtimeState: status?.runtime?.state ?? null, activeTurn: status?.active_turn ?? null, staleDiffVisible: reviewVisible || staleDiffVisible };
+  })()`);
+  flowEvidence.diff.ownerSwitch = { previousOwner, selectedSessionId: nextOwner.sessionId, observation: ownerSwitch };
+  await capture(session, "diff-owner-switched");
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: "packaged chat entry shows tracked current Git diff and view time, then a real Coding Session switch clears the old Diff panel" });
+}
+
+async function runGeneralRealProviderFlow(session) {
+  await switchMode(session, "general");
+  const generalUi = await evaluateAction(session, "verify General mode before real Provider request", `({ mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode, sidebar: document.querySelector('.sidebar')?.getAttribute('aria-label'), projectButtons: document.querySelectorAll('.project-select').length })`);
+  if (generalUi.mode !== "general" || generalUi.sidebar !== "General" || generalUi.projectButtons !== 0) throw new Error(`real Provider request is not in isolated General mode: ${JSON.stringify(generalUi)}`);
+  await clickButtonContaining(session, "New chat", ".sidebar-primary button");
+  await waitFor(session, "new General conversation header", "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+  const owner = await waitForGeneralDraftReady(session);
+  const subscribed = await evaluateAction(session, "subscribe through public AgentEvent API", `(() => {
+    if (typeof window.uthcode?.subscribeAgentEvents !== 'function') return false;
+    const eventTypes = [];
+    const unsubscribe = window.uthcode.subscribeAgentEvents((event) => { if (event && typeof event.type === 'string') eventTypes.push(event.type); });
+    window.__t12GeneralProviderEvents = { eventTypes, unsubscribe };
+    return true;
+  })()`);
+  if (!subscribed) throw new Error("public subscribeAgentEvents API is unavailable");
+  await submitLifecyclePrompt(session, generalApiPrompt, generalApiToken);
+  const final = await waitFor(session, "real General Provider final message", `(() => {
+    const entries = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')];
+    return entries.at(-1)?.innerText?.trim() === ${JSON.stringify(generalApiToken)};
+  })()`);
+  const evidence = await evaluateAction(session, "inspect real General Provider event names only", `(() => {
+    const eventTypes = window.__t12GeneralProviderEvents?.eventTypes ?? [];
+    const counts = Object.fromEntries([...new Set(eventTypes)].map((type) => [type, eventTypes.filter((item) => item === type).length]));
+    const assistant = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')].at(-1)?.innerText?.trim() || '';
+    const row = document.querySelector('button.recent-line.is-selected');
+    const toolActivity = document.querySelectorAll('.timeline-activity-item, .timeline-activity-group').length;
+    const identity = row ? { label: row.getAttribute('aria-label'), id: row.getAttribute('aria-label')?.split(' · ')[1] || null } : null;
+    window.__t12GeneralProviderEvents?.unsubscribe?.();
+    delete window.__t12GeneralProviderEvents;
+    return { eventTypes, counts, assistantExact: assistant === ${JSON.stringify(generalApiToken)}, identity, toolActivity };
+  })()`);
+  const requiredEvents = ["assistant_message_delta", "assistant_message_completed", "turn_completed"];
+  const missing = requiredEvents.filter((type) => !evidence.eventTypes.includes(type));
+  const toolEvents = evidence.eventTypes.filter((type) => /tool|permission/u.test(type));
+  if (!evidence.assistantExact || missing.length > 0 || !evidence.identity?.id || evidence.toolActivity !== 0 || toolEvents.length > 0) {
+    throw new Error(`real General Provider acceptance did not meet stream/final/no-tools requirements: ${JSON.stringify({ assistantExact: evidence.assistantExact, missingEvents: missing, toolEventCount: toolEvents.length, toolActivity: evidence.toolActivity, hasPersistentSession: Boolean(evidence.identity?.id) })}`);
+  }
+  flowEvidence.generalReal = { mode: generalUi.mode, sidebar: generalUi.sidebar, projectButtons: generalUi.projectButtons, owner, eventCounts: evidence.counts, requiredEvents, toolEventCount: toolEvents.length, toolActivity: evidence.toolActivity, finalExact: evidence.assistantExact, sessionId: evidence.identity.id };
+  await capture(session, "general-real-provider-final");
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: "actual configured Provider produced streamed AgentEvent delta and final response in tool-free General mode" });
+}
+
+async function runGeneralCancelFlow(session) {
+  await switchMode(session, "general");
+  const generalUi = await evaluateAction(session, "verify General mode before controlled cancellation", `({ mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode, sidebar: document.querySelector('.sidebar')?.getAttribute('aria-label'), projectButtons: document.querySelectorAll('.project-select').length })`);
+  if (generalUi.mode !== "general" || generalUi.sidebar !== "General" || generalUi.projectButtons !== 0) throw new Error(`controlled cancellation did not run in isolated General mode: ${JSON.stringify(generalUi)}`);
+  await clickButtonContaining(session, "New chat", ".sidebar-primary button");
+  await waitFor(session, "new General conversation header", "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
+  const owner = await waitForGeneralDraftReady(session);
+  const monitorInstalled = await evaluateAction(session, "subscribe to public General cancellation events", `(() => {
+    if (typeof window.uthcode?.subscribeAgentEvents !== 'function') return false;
+    window.__t12GeneralCancelEvents?.unsubscribe?.();
+    const eventTypes = [];
+    const unsubscribe = window.uthcode.subscribeAgentEvents((event) => {
+      if (typeof event?.type === 'string' && ['turn_started', 'turn_completed', 'turn_failed', 'turn_cancelled'].includes(event.type)) eventTypes.push(event.type);
+    });
+    window.__t12GeneralCancelEvents = { eventTypes, unsubscribe };
+    return true;
+  })()`);
+  if (!monitorInstalled) throw new Error("public AgentEvent subscription is unavailable for General cancellation");
+  const prompt = "T12 controlled General cancellation";
+  await setInput(session, "Message UthCode", prompt);
+  await waitFor(session, "General cancellation message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-send'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
+  await clickSelector(session, ".composer-send");
+  let started;
+  try {
+    started = await waitForStableObservationWithin(session, "General delayed turn accepted with public Runtime owner", `(async () => {
+      const status = await window.uthcode.requestRuntime('status.get', {});
+      const row = document.querySelector('button.recent-line.is-selected, button.session-line.is-selected:not(.new-session-line)');
+      const selectedSessionId = row?.getAttribute('aria-label')?.split(' · ')[1] || null;
+      const cancelVisible = Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]'));
+      const terminal = (window.__t12GeneralCancelEvents?.eventTypes || []).find((type) => ['turn_completed', 'turn_failed', 'turn_cancelled'].includes(type)) || null;
+      const eventTypes = [...(window.__t12GeneralCancelEvents?.eventTypes || [])];
+      const observation = {
+        mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null,
+        publicSessionId: status?.session_id ?? null,
+        selectedSessionId,
+        runtimeState: status?.runtime?.state ?? null,
+        activeTurn: status?.active_turn ?? null,
+        sessionStatus: status?.session_state?.status ?? null,
+        promptVisible: (document.querySelector('[aria-label="Chat timeline"]')?.innerText || '').includes(${JSON.stringify(prompt)}),
+        cancelVisible,
+        terminal,
+        eventTypes,
+      };
+      observation.ready = terminal !== null || (observation.mode === 'general' && observation.promptVisible && observation.activeTurn === true && cancelVisible);
+      return observation;
+    })()`, 15_000);
+  } catch (error) {
+    const diagnostic = await evaluateAction(session, "inspect General turn start after Send", `(async () => {
+      const status = await window.uthcode.requestRuntime('status.get', {});
+      const input = document.querySelector('textarea[aria-label="Message UthCode"], textarea[aria-label="发送给 UthCode"]');
+      const row = document.querySelector('button.recent-line.is-selected, button.session-line.is-selected:not(.new-session-line)');
+      return {
+        mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode || null,
+        publicSessionId: status?.session_id ?? null,
+        selectedSessionId: row?.getAttribute('aria-label')?.split(' · ')[1] || null,
+        runtimeState: status?.runtime?.state ?? null,
+        activeTurn: status?.active_turn ?? null,
+        sessionStatus: status?.session_state?.status ?? null,
+        promptVisible: (document.querySelector('[aria-label="Chat timeline"]')?.innerText || '').includes(${JSON.stringify(prompt)}),
+        composerValueLength: input?.value?.length ?? null,
+        sendClickCount: window.__t12ComposerSendProbe?.clickCount ?? null,
+        cancelVisible: Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]')),
+        eventTypes: [...(window.__t12GeneralCancelEvents?.eventTypes || [])],
+      };
+    })()`);
+    flowEvidence.generalCancelStartFailure = { owner, diagnostic };
+    try { await capture(session, "general-cancel-start-failure"); } catch (captureError) { flowEvidence.generalCancelStartFailure.screenshotFailure = captureError instanceof Error ? captureError.message : String(captureError); }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; General public turn-start diagnostic=${JSON.stringify(diagnostic)}`);
+  }
+  if (started.terminal !== null) throw new Error(`General delayed Provider turn reached a terminal event before cancellation controls: ${JSON.stringify(started)}`);
+  if (started.mode !== "general" || !started.promptVisible || started.activeTurn !== true || !started.cancelVisible) throw new Error(`General delayed Provider turn did not expose its real active/cancel state: ${JSON.stringify(started)}`);
+  flowEvidence.generalCancelStarted = { owner, observation: started };
+  await submitDelayedFlow(session, { general: true });
+  const terminal = await waitFor(session, "public General cancellation terminal event", `(() => (window.__t12GeneralCancelEvents?.eventTypes || []).includes('turn_cancelled') ? { type: 'turn_cancelled' } : false)()`);
+  const terminalIdle = await waitForStableObservation(session, "public Runtime confirms cancelled General turn is idle", `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const cancelVisible = Boolean(document.querySelector('button[aria-label="Cancel"], button[aria-label="取消"]'));
+    const observation = { runtimeState: status?.runtime?.state ?? null, activeTurn: status?.active_turn ?? null, sessionStatus: status?.session_state?.status ?? null, sessionId: status?.session_id ?? null, cancelVisible };
+    observation.ready = observation.runtimeState === 'ready' && observation.activeTurn === false && !cancelVisible;
+    return observation;
+  })()`);
+  const evidence = await evaluateAction(session, "inspect controlled General cancellation", `(() => {
+    const text = document.querySelector('[aria-label="Chat timeline"]')?.innerText || '';
+    const row = document.querySelector('button.recent-line.is-selected');
+    const identity = row ? { label: row.getAttribute('aria-label'), id: row.getAttribute('aria-label')?.split(' · ')[1] || null } : null;
+    const assistant = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')].map((item) => item.innerText || '');
+    return { promptVisible: text.includes(${JSON.stringify(prompt)}), identity, assistant, activeCancelControls: document.querySelectorAll('button[aria-label="Cancel"], button[aria-label="取消"]').length };
+  })()`);
+  if (!evidence.promptVisible || !evidence.identity?.id || evidence.assistant.some((text) => text.includes(expectedText)) || evidence.activeCancelControls !== 0) {
+    throw new Error(`controlled General cancellation did not settle without a final answer: ${JSON.stringify({ promptVisible: evidence.promptVisible, hasPersistentSession: Boolean(evidence.identity?.id), finalVisible: evidence.assistant.some((text) => text.includes(expectedText)), activeCancelControls: evidence.activeCancelControls })}`);
+  }
+  await evaluateAction(session, "remove General cancellation event listener", "window.__t12GeneralCancelEvents?.unsubscribe?.(); delete window.__t12GeneralCancelEvents; true");
+  flowEvidence.generalCancel = { mode: generalUi.mode, sidebar: generalUi.sidebar, projectButtons: generalUi.projectButtons, promptVisible: evidence.promptVisible, sessionId: evidence.identity.id, terminal, terminalIdle, finalVisible: false, activeCancelControls: evidence.activeCancelControls };
+  await capture(session, "general-controlled-cancellation");
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: "controlled delayed Provider request was cancelled in General after a real public owner and active-turn readiness check" });
+}
+
+async function runGeneralInvalidConfigFlow(session) {
+  const menuOpened = await evaluateAction(session, "open mode menu for invalid General configuration", `(() => { const button = document.querySelector('.sidebar-brand-menu-trigger'); if (!button) return false; button.click(); return true; })()`);
+  if (!menuOpened) throw new Error("mode menu trigger is missing before invalid General configuration check");
+  await waitFor(session, "mode menu for invalid General configuration", "Boolean(document.querySelector('[role=menu]'))");
+  await clickButtonContaining(session, "General", "[role=menu] button");
+  const openErrorText = requestedLanguage === "zh-CN" ? "无法打开会话，请重试。" : "Session could not be opened. Try again.";
+  const settingsGuidanceText = requestedLanguage === "zh-CN" ? "配置尚未初始化，请配置协议后重试。" : "Configuration is not initialized. Configure a provider and save settings.";
+  await waitFor(session, "General configuration error guidance", `document.body?.innerText?.includes(${JSON.stringify(openErrorText)})`);
+  const failure = await evaluateAction(session, "inspect rejected General mode and error guidance", `(() => ({ mode: document.querySelector('.sidebar-brand-menu-trigger')?.dataset.mode, error: document.querySelector('[data-runtime-error-owner="timeline"]')?.innerText || document.querySelector('.runtime-panel')?.innerText || '', assistantCount: document.querySelectorAll('.timeline-entry--assistant').length }))()`);
+  if (failure.mode === "general" || failure.assistantCount !== 0 || !failure.error.includes(openErrorText)) throw new Error(`invalid configuration was incorrectly presented as a working General chat: ${JSON.stringify(failure)}`);
+  await clickButtonContaining(session, "Settings", ".sidebar-footer button");
+  await waitFor(session, "Settings configuration guidance", `Boolean(document.querySelector('.settings-view')) && document.querySelector('.settings-view__error')?.innerText?.includes(${JSON.stringify(settingsGuidanceText)})`);
+  const settingsGuidance = await evaluateAction(session, "inspect Settings recovery guidance", `document.querySelector('.settings-view__error')?.innerText?.trim() || ''`);
+  const addProvider = await evaluateAction(session, "open a cancellable provider draft", `(() => { const button = document.querySelector('.settings-view .row-add--inline'); if (!button || button.disabled) return false; button.click(); return true; })()`);
+  if (!addProvider) throw new Error("Settings did not offer its existing provider editor for invalid-configuration recovery");
+  await waitFor(session, "provider editor for cancellation", "Boolean(document.querySelector('.settings-editor-modal[role=dialog]'))");
+  const cancelLabel = requestedLanguage === "zh-CN" ? "取消" : "Cancel";
+  await clickButtonContaining(session, cancelLabel, ".settings-editor-modal footer button");
+  await waitFor(session, "provider draft cancelled", "!document.querySelector('.settings-editor-modal') && Boolean(document.querySelector('.settings-view__error'))");
+  const cancelState = await evaluateAction(session, "verify cancelled provider draft", `({ providerRows: document.querySelectorAll('.settings-view .provider-row').length, errorStillVisible: Boolean(document.querySelector('.settings-view__error')), editorVisible: Boolean(document.querySelector('.settings-editor-modal')) })`);
+  if (cancelState.providerRows !== 0 || !cancelState.errorStillVisible || cancelState.editorVisible) throw new Error(`cancelled provider draft changed the invalid Settings projection: ${JSON.stringify(cancelState)}`);
+  const backClicked = await evaluateAction(session, "cancel invalid-configuration recovery", `(() => { const button = document.querySelector('.settings-view__back'); if (!button || button.disabled) return false; button.click(); return true; })()`);
+  if (!backClicked) throw new Error("Settings Back action was unavailable after cancelling the provider draft");
+  await waitFor(session, "return from cancelled invalid-configuration recovery", "!document.querySelector('.settings-view') && Boolean(document.querySelector('.composer textarea'))");
+  flowEvidence.generalInvalidConfig = { attemptedMode: "general", rejectedMode: failure.mode, assistantCount: failure.assistantCount, settingsGuidance, providerDraftCancelled: true, providerRowsAfterCancel: cancelState.providerRows, returnedToChat: true };
+  await capture(session, "general-invalid-config-cancelled");
+  if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+  writeLog("assertion_pass", { description: "invalid General configuration remains a visible failure, Settings offers recovery guidance, and the new provider draft can be cancelled" });
+}
+
 async function run() {
   flowDeadline = Date.now() + timeoutMs;
   writeLog("driver_start", { argv: process.argv.slice(2), cdpPort, timeoutMs, requestTimeoutMs, flow, planChoice, delayAction, askQuestionCount });
@@ -1153,7 +2332,7 @@ async function run() {
     // stable structural landmark so CDP acceptance works in both zh-CN/en.
     await waitFor(session, "UthCode shell", "Boolean(document.querySelector('.sidebar'))");
     await waitFor(session, "Composer", "Boolean(document.querySelector('.composer textarea'))");
-    if (flow !== "visual-fixture" && flow !== "visual") {
+    if (flow !== "visual-fixture" && flow !== "visual" && flow !== "general-invalid-config") {
       await waitFor(session, "Runtime ready", "(() => { const text = document.querySelector('.runtime-panel h2')?.textContent || ''; return text.includes('Ready') || text.includes('就绪'); })()");
     }
 
@@ -1176,10 +2355,12 @@ async function run() {
       if (!observedLanguage) throw new Error("language preference read API is unavailable in the packaged Renderer");
       if (observedLanguage !== requestedLanguage) throw new Error(`requested language ${requestedLanguage} was not observed: ${observedLanguage}`);
       writeLog("assertion_pass", { description: "read requested language", value: observedLanguage });
-      if (flow !== "visual-fixture" && flow !== "visual") {
+      if (flow !== "visual-fixture" && flow !== "visual" && flow !== "general-invalid-config") {
         await waitFor(session, "Runtime ready after language reload", "(() => { const text = document.querySelector('.runtime-panel h2')?.textContent || ''; return text.includes('Ready') || text.includes('就绪'); })()");
-        await waitFor(session, "restored Project", "Boolean(document.querySelector('button.project-select'))");
-        await waitFor(session, "new Session action", "Boolean(document.querySelector('button.new-session-line'))");
+        if (!generalFlows.has(flow)) {
+          await waitFor(session, "restored Project", "Boolean(document.querySelector('button.project-select'))");
+          await waitFor(session, "new Session action", "Boolean(document.querySelector('button.new-session-line'))");
+        }
       }
     }
 
@@ -1236,10 +2417,55 @@ async function run() {
       return;
     }
 
+    if (flow === "lifecycle") {
+      await runLifecycleFlow(session);
+      return;
+    }
+    if (flow === "diff") {
+      await runDiffFlow(session);
+      return;
+    }
+    if (flow === "general-real") {
+      await runGeneralRealProviderFlow(session);
+      return;
+    }
+    if (flow === "general-cancel") {
+      await runGeneralCancelFlow(session);
+      return;
+    }
+    if (flow === "general-invalid-config") {
+      await runGeneralInvalidConfigFlow(session);
+      return;
+    }
+    if (flow === "review") {
+      await submitPackagedReviewFlow(session);
+      return;
+    }
+
     // New Session -> real Provider request -> streamed AgentEvent projection.
     await clickText(session, "New chat");
     await waitFor(session, "new conversation header", "['Session', 'New conversation', '会话', '新对话'].some((value) => document.querySelector('h1')?.textContent?.includes(value))");
-    await waitFor(session, "new Session persisted", "Boolean(document.querySelector('button.session-line:not(.new-session-line)'))");
+    if (flow === "artifact-card") {
+      if (!artifactPath) throw new Error("artifact-card requires --artifact-path");
+      await setInput(session, "Message UthCode", "Please show the controlled image preview.");
+      await waitFor(session, "artifact preview request ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-send'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
+      await clickSelector(session, ".composer-send");
+      await waitFor(session, "assistant Markdown artifact link and FileCard", `(() => { const entry = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')].at(-1); return Boolean(entry?.querySelector('.markdown-artifact-link') && entry?.querySelector('.markdown-artifact-attachments .file-card[data-artifact-path]')); })()`);
+      const artifact = await evaluateAction(session, "inspect rendered artifact link and card", `(() => {
+        const entry = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')].at(-1);
+        const link = entry?.querySelector('.markdown-artifact-link');
+        const card = entry?.querySelector('.markdown-artifact-attachments .file-card');
+        return { linkText: link?.textContent?.trim() || null, cardPath: card?.getAttribute('data-artifact-path') || null, cardKind: card?.getAttribute('data-artifact-kind') || null, cardActionCount: card?.querySelectorAll('.file-card__menu [role="menuitem"]').length ?? 0 };
+      })()`);
+      if (artifact.linkText !== "T12 native image" || artifact.cardPath !== artifactPath || artifact.cardKind !== "image") {
+        throw new Error(`formal Markdown artifact link did not resolve to the expected image FileCard: ${JSON.stringify(artifact)}`);
+      }
+      flowEvidence.artifactCard = artifact;
+      await capture(session, "native-artifact-filecard");
+      writeLog("assertion_pass", { description: "actual Provider Renderer flow produced a Markdown artifact link and bottom image FileCard" });
+      if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
+      return;
+    }
     await assertCommandCandidate(session, "/new");
     await assertCommandCandidate(session, "/do");
     await assertCommandCandidate(session, "/mod", "/model");
@@ -1271,7 +2497,7 @@ async function run() {
     await setInput(session, "Message UthCode", "cdp fixture request");
     await waitFor(session, "message ready", "(() => { const input = document.querySelector('textarea[aria-label=\"Message UthCode\"], textarea[aria-label=\"发送给 UthCode\"]'); const button = document.querySelector('.composer-actions button:last-child'); return Boolean(input?.value.trim()) && Boolean(button && !button.disabled); })()");
     if (flow === "plan") await installPlanDraftBreakpoint(session);
-    await clickText(session, "Send");
+    await clickSelector(session, ".composer-send");
     if (flow === "ask" || flow === "ask-one") {
       await submitAskUserFlow(session);
     } else if (flow === "tool") {
@@ -1296,6 +2522,9 @@ async function run() {
     } else {
       await waitFor(session, `Provider output ${expectedText}`, `document.body?.innerText?.includes(${JSON.stringify(expectedText)})`);
     }
+
+    await waitFor(session, "Session persisted after first submitted turn", `(() => { const row = document.querySelector('button.session-line.is-selected:not(.new-session-line)'); return Boolean(row && row.innerText.includes('cdp fixture request')); })()`);
+    writeLog("assertion_pass", { description: "first user turn created the persistent Session row" });
 
     // Settings, theme, and runtime panel are exercised through actual DOM
     // controls; no renderer state or IPC protocol is injected by the driver.

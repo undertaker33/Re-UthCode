@@ -646,6 +646,22 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     await flush();
     assert.deepEqual(calls.filter((call) => call.method === "workspace.diff")[1]?.params, { project_key: projectPath, path: "src/entry.ts" });
     assert.match(container.querySelector(".review-panel")?.textContent ?? "", /\+ staged path/u);
+    const reviewTabs = () => [...container.querySelectorAll<HTMLButtonElement>(".review-panel__tabs [role='tab']")];
+    assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree", "entry.ts"]);
+    assert.equal(reviewTabs()[1]?.getAttribute("aria-selected"), "true");
+    act(() => { reviewTabs()[0]!.click(); });
+    assert.equal(reviewTabs()[0]?.getAttribute("aria-selected"), "true");
+    assert.equal(container.querySelector(".review-panel__content-header strong")?.textContent, "Current working tree");
+    act(() => { reviewTabs()[1]!.click(); });
+    assert.equal(reviewTabs()[1]?.getAttribute("aria-selected"), "true");
+    assert.equal(container.querySelector(".review-panel__content-header strong")?.textContent, "Current working tree: src/entry.ts");
+    const pathTabClose = [...container.querySelectorAll<HTMLElement>(".review-panel__tab")]
+      .find((tab) => tab.querySelector("[role='tab']")?.textContent === "entry.ts")
+      ?.querySelector<HTMLButtonElement>("button[aria-label]");
+    assert.ok(pathTabClose);
+    act(() => { pathTabClose.click(); });
+    assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree"]);
+    assert.equal(container.querySelector(".review-panel__content-header strong")?.textContent, "Current working tree", "closing an inactive/selected tab keeps the remaining Review tab usable");
 
     const outputButtons = activity.querySelectorAll<HTMLButtonElement>(".timeline-tool-output");
     assert.equal(outputButtons.length, 2);
@@ -673,6 +689,20 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     act(() => { readNewer.click(); });
     await flush();
     assert.deepEqual(calls.find((call) => call.method === "process.read")?.params, { process_id: "process-review", cursor: 1 });
+    assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree", "Read", "Process log: process-review"]);
+    act(() => { reviewTabs()[1]!.click(); });
+    assert.equal(reviewTabs()[1]?.getAttribute("aria-selected"), "true");
+    assert.equal(container.querySelector(".review-panel__output")?.textContent, "firstsecond");
+    act(() => { reviewTabs()[2]!.click(); });
+    assert.equal(reviewTabs()[2]?.getAttribute("aria-selected"), "true");
+    assert.match(container.querySelector(".review-panel__process-output")?.textContent ?? "", /first process line/u);
+    const processTabClose = [...container.querySelectorAll<HTMLElement>(".review-panel__tab")]
+      .find((tab) => tab.querySelector("[role='tab']")?.textContent === "Process log: process-review")
+      ?.querySelector<HTMLButtonElement>("button[aria-label]");
+    assert.ok(processTabClose);
+    act(() => { processTabClose.click(); });
+    assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree", "Read"]);
+    assert.equal(container.querySelector(".review-panel").getAttribute("aria-label"), "File and log review");
 
     act(() => { outputButtons[1]!.click(); });
     await flush();
@@ -709,6 +739,10 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     act(() => { failedDiff.click(); });
     await flush();
     assert.match(container.querySelector(".review-panel")?.textContent ?? "", /unavailable/u);
+    const closePanel = container.querySelector<HTMLButtonElement>(".review-panel__header button[aria-label='Close file preview']");
+    assert.ok(closePanel);
+    act(() => { closePanel.click(); });
+    assert.equal(container.querySelector(".review-panel"), null, "closing the Review panel clears the owner-bound tabs");
   });
 });
 
@@ -1474,10 +1508,12 @@ test("App does not report a lazy turn-start error in a Session opened while the 
   });
 });
 
-test("App keeps a first-turn live tool row in order after new-session navigation and durable history recovery", async () => {
+test("App hydrates externalized tool output after terminal idle without replacing a newer Session draft", async () => {
   const projectPath = "C:/first-turn-navigation";
   let eventListener: ((event: AgentEvent) => void) | null = null;
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let resolveFirstSessionHistory: ((value: JsonValue) => void) | null = null;
+  let firstSessionHistoryRequests = 0;
   const userMessageId = "d95b5ac8e07d4ba28e67ca0b59842ba1";
   const reasoningBeforeId = "74d2ae9ca7904b43a839e2fb95f3c00d";
   const assistantMessageId = "589fe4955b8f45cc9ed85faec24fe2d1";
@@ -1485,7 +1521,7 @@ test("App keeps a first-turn live tool row in order after new-session navigation
   const durableRecords = [
     { record_id: "session-a:1:user::0", session_id: "session-a", sequence: 1, turn_id: "turn-a", message_id: userMessageId, kind: "user", text: "Read sample.xlsx" },
     { record_id: "session-a:3:assistant::0", session_id: "session-a", sequence: 3, turn_id: "turn-a", message_id: reasoningBeforeId, kind: "reasoning", text: "I will inspect the workbook." },
-    { record_id: "tool-record", session_id: "session-a", sequence: 5, run_id: "run-a", turn_id: "turn-a", tool_call_id: "call-a", kind: "tool", tool_name: "ReadDocument", text: "ReadDocument", status: "succeeded", is_error: false },
+    { record_id: "tool-record", session_id: "session-a", sequence: 5, run_id: "run-a", turn_id: "turn-a", tool_call_id: "call-a", kind: "tool", tool_name: "ReadDocument", text: "ReadDocument", status: "succeeded", is_error: false, output_ref: "tool-result-ref:session-a:call-a" },
     { record_id: "session-a:6:assistant::0", session_id: "session-a", sequence: 6, turn_id: "turn-a", message_id: reasoningAfterId, kind: "reasoning", text: "The workbook is readable." },
     { record_id: "session-a:7:assistant::1", session_id: "session-a", sequence: 7, turn_id: "turn-a", message_id: assistantMessageId, kind: "assistant", text: "The workbook has one sheet." },
   ];
@@ -1518,7 +1554,12 @@ test("App keeps a first-turn live tool row in order after new-session navigation
       }
       if (method === "history.page") {
         const sessionId = String(params.session_id ?? "");
-        return { session_id: sessionId, records: sessionId === "session-a" ? durableRecords : [], next_cursor: null, has_more: false };
+        if (sessionId !== "session-a") return { session_id: sessionId, records: [], next_cursor: null, has_more: false };
+        firstSessionHistoryRequests += 1;
+        if (firstSessionHistoryRequests === 1) {
+          return await new Promise<JsonValue>((resolve) => { resolveFirstSessionHistory = resolve; });
+        }
+        return { session_id: sessionId, records: durableRecords, next_cursor: null, has_more: false };
       }
       return {};
     },
@@ -1551,7 +1592,7 @@ test("App keeps a first-turn live tool row in order after new-session navigation
     selectedProjectKey: projectPath,
     expandedProjects: { [projectPath]: true },
   });
-  await withRendererDom(async (_dom, container, root) => {
+  await withRendererDom(async (dom, container, root) => {
     act(() => { root.render(<App initialState={state} api={api} />); });
     const flush = async () => {
       await act(async () => {
@@ -1586,6 +1627,7 @@ test("App keeps a first-turn live tool row in order after new-session navigation
       publish({ type: "turn_completed", run_id: "run-a", turn_id: "turn-a", session_id: "session-a", project_key: projectPath, final_text: "The workbook has one sheet." });
     });
     await flush();
+    assert.ok(resolveFirstSessionHistory, "the completed Session requests its durable first page after terminal idle");
     const liveActivity = container.querySelector<HTMLElement>("details.timeline-activity-group");
     assert.ok(liveActivity, "the live first-turn tool call is shown in an activity group");
     const liveActivitySummary = liveActivity.querySelector("summary");
@@ -1595,11 +1637,30 @@ test("App keeps a first-turn live tool row in order after new-session navigation
     assert.equal(liveActivity.open, true, "the user can expand the activity group");
     assert.equal(liveActivity.querySelectorAll(".timeline-activity-item").length, 1);
     assert.match(liveActivity.textContent ?? "", /ReadDocument/u);
+    assert.equal(liveActivity.querySelector(".timeline-tool-output"), null, "the externalized result is not fabricated from the preview-free live event");
 
     const otherSession = sessionButton("Other session");
     assert.ok(otherSession);
     act(() => { otherSession.click(); });
     await flush();
+    const newerDraft = "keep this newer Session draft";
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    const textareaSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value")?.set;
+    assert.ok(textarea && textareaSetter);
+    act(() => {
+      textarea!.focus();
+      textareaSetter!.call(textarea, newerDraft);
+      textarea!.dispatchEvent(new dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: newerDraft }));
+      textarea!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      textarea!.dispatchEvent(new dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    await flush();
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, newerDraft, "the newer Session draft is established before resolving the old page");
+    act(() => { resolveFirstSessionHistory!({ session_id: "session-a", records: durableRecords, next_cursor: null, has_more: false }); });
+    await flush();
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Other session"), true, "a late first Session page stays under its original owner");
+    assert.equal(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value, newerDraft, "late history does not replace the newer Session draft");
+
     const firstSession = sessionButton("First session");
     assert.ok(firstSession);
     act(() => { firstSession.click(); });
@@ -1612,7 +1673,8 @@ test("App keeps a first-turn live tool row in order after new-session navigation
     assert.ok(recoveredActivity);
     assert.equal(recoveredActivity.querySelectorAll(".timeline-activity-item").length, 1);
     assert.match(recoveredActivity.textContent ?? "", /ReadDocument/u);
-    assert.equal(calls.filter((call) => call.method === "history.page" && call.params.session_id === "session-a").length, 1);
+    assert.ok(recoveredActivity.querySelector(".timeline-tool-output"), "replay metadata adds the durable externalized result action to the live tool row");
+    assert.equal(firstSessionHistoryRequests, 2, "the original late page is cached, then its first page is refreshed on Session return");
     assert.ok(calls.filter((call) => call.method === "session.resume" && call.params.session_id === "session-a").every(() => true));
   });
 });

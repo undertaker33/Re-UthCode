@@ -613,14 +613,10 @@ def _failure(
     )
 
 
-GitWorkspaceQueryTool = GitWorkspaceTool
-
-
 __all__ = [
     "GitCommandResult",
     "GitQueryError",
     "GitUnavailableError",
     "GitWorkspace",
-    "GitWorkspaceQueryTool",
     "GitWorkspaceTool",
 ]

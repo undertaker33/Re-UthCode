@@ -4248,6 +4248,8 @@ async def test_general_runtime_rpc_uses_fixed_owner_and_limits_search_scope(tmp_
         preparation = runtime.get("task")
         assert isinstance(preparation, asyncio.Task)
         await preparation
+        assert runtime["status"] == "idle"
+        assert candidates[-1].runtime_context.workdir == general_workdir
         restored = await bridge.handle_request(
             RequestEnvelope(
                 "general-rpc-restore",
@@ -4409,6 +4411,88 @@ async def test_general_runtime_can_manage_archives_for_registered_coding_owner(
         assert bridge._current_mode() is ApplicationMode.GENERAL
         assert bridge._current_owner_key() == "uthcode:general"
         assert application.session_service.active_session is None
+    finally:
+        await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_archive_uses_parked_owner_writer(
+    tmp_path: Path,
+) -> None:
+    project = (tmp_path / "coding-project").resolve()
+    project.mkdir()
+    home = (tmp_path / "home").resolve()
+    general_workdir = home / ".uthcode"
+    general_workdir.mkdir(parents=True)
+    storage_root = (tmp_path / "sessions").resolve()
+    coding_key = str(project)
+    configuration = EffectiveConfig(
+        default_model="fake/session-archive",
+        providers={"fake": ProviderProfile("fake", ProviderKind.FAKE)},
+        models={
+            "fake/session-archive": ModelProfile(
+                "fake/session-archive", "fake", "session-archive"
+            ),
+        },
+    )
+
+    def make_application(workdir: Path, mode: ApplicationMode) -> UthCodeApplication:
+        return create_application(
+            configuration,
+            provider_builder=lambda _profile, _model: FakeProvider(events=(_completed(),)),
+            runtime_context=ApplicationRuntimeContext.from_system(workdir=workdir),
+            storage_root=storage_root,
+            application_mode=mode,
+        )
+
+    coding_application = make_application(project, ApplicationMode.CODING)
+    coding_session = coding_application.create_session()
+    general_application = make_application(general_workdir, ApplicationMode.GENERAL)
+    general_session = general_application.create_session()
+    bridge = DesktopBridge(
+        application=general_application,
+        home=home,
+        workdir=project,
+    )
+    bridge._catalog_project_keys = {coding_key, "uthcode:general"}
+    bridge._background_runtimes[coding_session.session_id] = {
+        "application": coding_application,
+        "handle": None,
+        "pending_pause": None,
+        "status": "idle",
+        "project_key": coding_key,
+    }
+    try:
+        assert general_application.session_service is not None
+        assert general_application.session_service.active_session is not None
+        assert general_application.session_service.active_session.session_id == general_session.session_id
+        assert coding_application.session_service is not None
+        assert coding_application.session_service.active_session is not None
+        assert coding_application.session_service.active_session.session_id == coding_session.session_id
+
+        result = await bridge.handle_request(
+            RequestEnvelope(
+                "archive-parked-coding-owner",
+                "session.archive",
+                {
+                    "session_id": coding_session.session_id,
+                    "project_key": coding_key,
+                    "archived": True,
+                },
+            )
+        )
+
+        assert result.ok is True and result.result is not None
+        assert result.result["session_id"] == coding_session.session_id
+        assert result.result["project_key"] == coding_key
+        assert result.result["archived"] is True
+        archived = coding_application.session_catalog_metadata(
+            coding_key,
+            archived=True,
+        )
+        assert [item.session_id for item in archived] == [coding_session.session_id]
+        assert general_application.session_service.active_session is not None
+        assert general_application.session_service.active_session.session_id == general_session.session_id
     finally:
         await bridge.shutdown()
 

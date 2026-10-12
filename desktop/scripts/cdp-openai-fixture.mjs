@@ -25,10 +25,22 @@ const port = Number(option("port", "0"));
 const scenario = option("scenario", "stream");
 const logPath = option("log");
 const readyFile = option("ready-file");
+const artifactPath = option("artifact-path");
+const reviewMarkdownPath = option("review-markdown-path");
+const reviewTextPath = option("review-text-path");
 const delayMs = Number(option("delay-ms", "1200"));
 const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const planChoice = option("plan-choice", "approve");
 let requestCount = 0;
+
+if (scenario === "artifact-link" && !artifactPath) {
+  process.stderr.write("cdp-openai-fixture artifact-link requires --artifact-path\n");
+  process.exit(1);
+}
+if (scenario === "review" && (!reviewMarkdownPath || !reviewTextPath)) {
+  process.stderr.write("cdp-openai-fixture review requires Markdown and text artifact paths\n");
+  process.exit(1);
+}
 
 try {
   assertCdpEnvironmentIsolated({
@@ -87,6 +99,37 @@ function fixtureChunks(requestBody) {
   const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
   const hasToolResult = messages.some((message) => message?.role === "tool");
   const hasToolDefinitions = Array.isArray(requestBody.tools) && requestBody.tools.length > 0;
+  if (scenario === "review" && hasToolDefinitions && !hasToolResult) {
+    return [
+      chunk({ role: "assistant" }),
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            id: "call-uthcode-review-read",
+            type: "function",
+            function: { name: "ReadFile", arguments: JSON.stringify({ path: "review-output.txt" }) },
+          },
+          {
+            index: 1,
+            id: "call-uthcode-review-process",
+            type: "function",
+            function: { name: "Bash", arguments: JSON.stringify({ command: "echo W05_REVIEW_PROCESS_LOG", yield_time_ms: 1000 }) },
+          },
+        ],
+      }),
+      chunk({}, "tool_calls", { prompt_tokens: 2, completion_tokens: 4, total_tokens: 6 }),
+    ];
+  }
+  if (scenario === "review") {
+    const markdownPath = reviewMarkdownPath.replaceAll("\\", "/");
+    const textPath = reviewTextPath.replaceAll("\\", "/");
+    return [
+      chunk({ role: "assistant" }),
+      chunk({ content: `W05_REVIEW_READY\n\n[Review Markdown](artifact:${markdownPath})\n\n[Review text](artifact:${textPath})` }),
+      chunk({}, "stop", { prompt_tokens: 2, completion_tokens: 5, total_tokens: 7 }),
+    ];
+  }
   if (scenario === "tool" && hasToolDefinitions && !hasToolResult) {
     return [
       chunk({ role: "assistant" }),
@@ -99,6 +142,14 @@ function fixtureChunks(requestBody) {
         }],
       }),
       chunk({}, "tool_calls", { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 }),
+    ];
+  }
+  if (scenario === "artifact-link") {
+    const path = artifactPath?.replaceAll("\\", "/");
+    return [
+      chunk({ role: "assistant" }),
+      chunk({ content: `Preview this file: [T12 native image](artifact:${path})` }),
+      chunk({}, "stop", { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }),
     ];
   }
   if (scenario === "todo" && hasToolDefinitions && !hasToolResult) {

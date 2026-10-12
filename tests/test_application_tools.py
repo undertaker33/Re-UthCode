@@ -28,7 +28,13 @@ from uthcode.core.provider import (
     Usage,
 )
 from uthcode.core.permission import PermissionMode
-from uthcode.core.tool import ToolExecutionResult, ToolProgress as CoreToolProgress
+from uthcode.core.secrets import SecretValue
+from uthcode.core.tool import (
+    ToolExecutionOutcome,
+    ToolExecutionResult,
+    ToolExecutionStatus,
+    ToolProgress as CoreToolProgress,
+)
 from uthcode.integrations.tools.factory import create_default_tools
 
 
@@ -143,6 +149,92 @@ def test_application_tool_summary_redacts_sensitive_assignments(tmp_path, assign
 
     assert secret not in summary
     assert "<redacted>" in summary
+
+
+def test_tool_result_redacts_key_and_auth_option_suffixes() -> None:
+    service = ApplicationToolService(())
+    content = (
+        "--token token-value --sshkey ssh-key-value --myauth auth-value "
+        "--sshkey_store store-value --keyboard layout-visible"
+    )
+
+    materialized = service.materialize_tool_result(
+        ToolExecutionOutcome(
+            "option-redaction",
+            "HistoryRead",
+            content,
+            False,
+            ToolExecutionStatus.SUCCEEDED,
+        )
+    )
+
+    redacted = materialized.result.content
+    assert all(
+        secret not in redacted
+        for secret in ("token-value", "ssh-key-value", "auth-value", "store-value")
+    )
+    assert "--keyboard layout-visible" in redacted
+
+
+def test_read_file_redaction_keeps_line_numbers_and_multiline_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("W05_READ_FILE_SHORT_SECRET", "2")
+    service = ApplicationToolService(())
+    content = "2\tplain line\n1\tpassword='first\n2\tsecond'\n3\tvisible 2\n"
+
+    materialized = service.materialize_tool_result(
+        ToolExecutionOutcome(
+            "read-file-redaction",
+            "ReadFile",
+            content,
+            False,
+            ToolExecutionStatus.SUCCEEDED,
+        )
+    )
+
+    redacted = materialized.result.content
+    assert redacted.startswith("2\t")
+    assert "\n1\t" in redacted
+    assert "first" not in redacted
+    assert "second" not in redacted
+    assert "\n3\tvisible <redacted>\n" in redacted
+
+
+@pytest.mark.parametrize("source", ("literal", "environment"))
+def test_read_file_redacts_multiline_configured_secrets_and_keeps_line_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    secret = "synthetic-alpha\nsynthetic-beta"
+    options: dict[str, object] = {}
+    if source == "literal":
+        options["secret_values"] = (SecretValue(secret),)
+    else:
+        monkeypatch.setenv("W05_MULTILINE_READ_SECRET", secret)
+        options["secret_env_names"] = ("W05_MULTILINE_READ_SECRET",)
+    service = ApplicationToolService((), **options)  # type: ignore[arg-type]
+    outcome = ToolExecutionOutcome(
+        "read-file-multiline-secret",
+        "ReadFile",
+        "7\tbefore\n8\tsynthetic-alpha\n9\tsynthetic-beta\n10\tafter",
+        False,
+        ToolExecutionStatus.SUCCEEDED,
+        details={"excerpt": secret, "line_count": 4},
+    )
+
+    materialized = service.materialize_tool_result(outcome)
+    redacted = str(materialized.result.content)
+
+    assert redacted == "7\tbefore\n8\t<redacted>\n9\t\n10\tafter"
+    assert "synthetic-alpha" not in redacted
+    assert "synthetic-beta" not in redacted
+    assert materialized.execution.details == {
+        "excerpt": "<redacted>",
+        "line_count": 4,
+    }
+    assert materialized.result.metadata["line_count"] == 4
+    assert materialized.result.metadata["persistence_status"] == "inline"
 
 
 def test_projected_progress_preserves_whitespace_between_reports() -> None:

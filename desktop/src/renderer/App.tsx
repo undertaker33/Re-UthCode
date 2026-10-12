@@ -1053,10 +1053,11 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     dispatch({ type: "history_page_started", projectKey, sessionId });
     const key = sessionRuntimeKey(projectKey, sessionId);
     const history = stateRef.current.sessionHistory[key];
-    // A cached first page is already sufficient for immediate display.  An
-    // error starts a local retry, while a missing key starts the first page
-    // without waiting for the cold runtime preparation below.
+    // Keep a cached first page visible immediately, then refresh it when a
+    // parked Session is presented again so results committed in the
+    // background can hydrate their durable output references.
     if (!history || history.error) void loadHistoryPage(projectKey, sessionId, null, true);
+    else void loadHistoryPage(projectKey, sessionId, null, false, true);
   }, [loadHistoryPage]);
 
   const pollSessionPreparation = useCallback((projectKey: string, sessionId: string) => {
@@ -1272,10 +1273,16 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         const latest = latestTurnIdentity();
         if (knownIdentityMatches(latest.runId, latest.turnId, eventRunId, eventTurnId) && current.selectedProjectKey) {
           await refreshCatalog(current.selectedProjectKey, "message", current.selectedSessionId ?? undefined);
+          if (eventProjectKey && eventSessionId) {
+            // Live tool events carry only the bounded inline preview. Once the
+            // Application releases the completed Turn, replay supplies the
+            // durable output reference for externalized results.
+            await loadHistoryPage(eventProjectKey, eventSessionId, null, false, true);
+          }
         }
       });
     }
-  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, publishTerminalStatus, refreshCatalog, refreshProjectCatalog, reviewOwner, runtimeGeneration, scheduleWorkspaceDiffSummaryRefresh, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
+  }, [cancelTerminalStatusPoll, hasOwner, latestTurnIdentity, loadHistoryPage, publishTerminalStatus, refreshCatalog, refreshProjectCatalog, reviewOwner, runtimeGeneration, scheduleWorkspaceDiffSummaryRefresh, setLatestTurnIdentity, startTerminalStatusConvergence, t]);
 
   const readProcess = useCallback(async (processId: string, cursor: number) => {
     const projectKey = stateRef.current.selectedProjectKey;

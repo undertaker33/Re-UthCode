@@ -1108,6 +1108,30 @@ test("desktop preference persistence accepts only UI metadata and never stores a
   }
 });
 
+test("concurrent desktop preference writes preserve each key and continue after a rejected write", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "uthcode-preference-concurrent-writes-"));
+  const store = new DesktopPreferencesStore(join(directory, "desktop-preferences.json"));
+  try {
+    await Promise.all([
+      store.write("theme", "dark"),
+      store.write("language", "en"),
+      store.write("panelMode", "floating"),
+      store.write("sidebarWidth", 390),
+    ]);
+    const preferences = await store.read();
+    assert.equal(preferences.theme, "dark");
+    assert.equal(preferences.language, "en");
+    assert.equal(preferences.panelMode, "floating");
+    assert.equal(preferences.sidebarWidth, 390);
+
+    await assert.rejects(store.write("unknown" as never, "invalid" as never), /unknown preference/u);
+    await store.write("language", "zh-CN");
+    assert.equal((await store.read()).language, "zh-CN");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("production Runtime wiring projects diagnostics and idle failures without native details", () => {
   const sent: unknown[] = [];
   const targetWindow = {

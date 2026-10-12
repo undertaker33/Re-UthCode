@@ -236,3 +236,10 @@ python -m pytest tests/test_application.py tests/test_application_runtime.py tes
 python -m pytest tests/test_tui.py tests/test_architecture_boundaries.py -q
 python -m pytest tests/test_history_paging.py tests/test_history_prepare_lifecycle.py tests/test_t09_1_context_protocol_e2e.py -q
 ```
+
+## W05 Desktop owner 补充（2026-10-12）
+
+- `[FACT]` Desktop General 与 Coding 的冷 Session 准备使用各自 owner 的工作目录快照：Coding 使用当前已登记项目路径，General 使用固定的 General Runtime 工作目录，不把上一 Coding 项目的 `workdir` 带入 General Application。
+- `[FACT]` 归档目标若仍由停放的 Session Application 持有 writer，Bridge 通过该目标 owner 执行 archive；只有目标不是 parked owner 时才使用当前 Application 的已匹配 Session 路径，避免为同一 Session 再打开 writer。当前 packaged Lifecycle 报告包含 General 切换后搜索、打开 Coding Session 并归档的完整序列。
+- `[FACT]` Desktop `session.search` 在 Coding owner 下检索已登记的 Coding 项目，在 General owner 下只检索 General；返回内容限于公开标题/Transcript snippet，archived 状态随命中返回。`session.archive` 通过真实 Session owner 更新持久 metadata；恢复是同一入口写入 `archived=false`，Settings 与搜索结果都使用这条路径。
+- `[FACT]` Desktop `settings.save` 先持久化用户配置，再按安全边界将新快照应用到已加载 Application。active Turn 使用其已捕获配置，应用状态可为 applied、pending 或 failed；Bridge 在相应边界处理待应用项，并为 failed 保留显式 retry apply 路径。

@@ -737,10 +737,11 @@ async def test_model_switch_after_start_does_not_change_active_turn(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_read_file(
+async def test_application_formal_headless_e2e_uses_bounded_read_file_preview(
     tmp_path: Path,
 ) -> None:
-    hidden_content = "W02-HIDDEN-READFILE-CONTENT"
+    hidden_marker = "W02-HIDDEN-READFILE-CONTENT"
+    hidden_content = ("safe visible prefix " * 90) + hidden_marker
     note = tmp_path / "note.txt"
     note.write_text(hidden_content + "\n", encoding="utf-8")
     call = ToolCallPart("read-call", "ReadFile", {"path": "note.txt"})
@@ -783,9 +784,12 @@ async def test_application_formal_headless_e2e_hides_tool_result_and_uses_real_r
     assert not any(isinstance(event, TurnCancelled) for event in events)
     tool_finished = next(event for event in events if isinstance(event, ToolFinished))
     assert tool_finished.command == "note.txt"
-    assert hidden_content not in tool_finished.to_json()
-    assert hidden_content not in result.to_json()
-    assert hidden_content not in run.snapshot().to_json()
+    assert hidden_marker not in tool_finished.to_json()
+    assert tool_finished.output_preview is not None
+    assert len(tool_finished.output_preview) <= 1024
+    assert tool_finished.output_preview_truncated is True
+    assert hidden_marker not in result.to_json()
+    assert hidden_marker not in run.snapshot().to_json()
 
     second_request = provider.requests[1]
     assert second_request.tools == application.tool_definitions() + (

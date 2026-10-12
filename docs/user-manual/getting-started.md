@@ -54,7 +54,13 @@ uthcode exec --cwd C:\work\my-project "解释这个项目的目录结构"
 
 仓库内的 `desktop/` 提供 Windows 11 x64 Desktop shell，通过 Python Runtime JSONL Bridge 复用当前 Application、Session、Run、Turn、Interaction 和 AgentEvent。它与 TUI 共用用户级 `~/.uthcode/config.toml`，不会创建另一套模型、权限或会话事实。
 
+Desktop 有 Coding 与 General 两种模式。Coding 对话属于已登记项目并遵循该项目的指令；显式创建 Coding Session 会立即登记 Session。General 不绑定项目、不加载 Coding 项目指令，也不向 Provider 提供 Tool；新建 General 对话先作为草稿，首次发送后成为持久 Session。模式切换不会把一个模式的会话或草稿移交给另一个模式。
+
+Settings 对支持的字段自动保存，不提供页面级全局 Save 按钮；Provider/Model 编辑器使用自己的应用与取消动作。运行中的 Turn 保留启动时捕获的配置；已保存的新配置会显示等待空闲边界应用，应用失败时可在 Settings 重试。保存失败也会显示局部状态，用户可以重试。
+
 Desktop 的侧栏从当前项目的 Session catalog 打开或新建对话。Session 切换和项目切换不会取消已在另一 Session 中运行的 Turn：该 Turn 会在后台继续，侧栏显示其 running/waiting/completed/failed/cancelled 状态；再次打开该 Session 会恢复其已提交 replay 和当前安全运行时投影。关闭 Desktop 会取消仍在运行的 Turn；跨进程只恢复已提交的 Session 内容，不恢复活动 Turn 或等待中的交互。
+
+按 `Ctrl+K` 或点击“搜索会话”可按标题或内容查找 Session。Coding 搜索当前已登记的 Coding 项目，General 搜索独立的 General 会话；已归档会话也会出现在结果中，可直接“恢复并打开”。从会话菜单选择“归档会话”可归档空闲 Session；在 Settings 的“归档”分类中可按项目或文本筛选并恢复已归档会话。
 
 命令仍在运行时，模型可从 Bash 结果正文取得真实进程句柄，用于后续输入、读取和停止；续读应使用上一结果的游标，避免反复读取旧日志。需要向交互式命令输入内容时，使用 `Process write`，并读取程序的回应确认输入已生效。它不会自动补回车；Windows CMD 的行输入需携带实际 CR（U+000D）或 CRLF，不能只发送 LF 或字面量 `\r\n`。
 
@@ -67,6 +73,8 @@ Desktop 的侧栏从当前项目的 Session catalog 打开或新建对话。Sess
 展开项目会刷新它已有的会话目录，无需先点击“新会话”，也不会切走当前对话。底部“最近”展示已登记项目中的全部有效会话，包含置顶项目和会话；按最近用户输入时间从新到旧排列，空会话使用创建时间。新消息或运行中的补充输入提交后会更新位置；仅切换会话、展开项目或收到模型回复不会改变这一顺序。
 
 打开长对话时先显示最近 30 个完整交互单元；向上滚动接近顶部时再加载更早历史。工具调用与结果不会拆到两页，加载失败可以在聊天页局部重试，已有内容不清空。首次打开的会话可能显示准备中：历史可以先查看，普通发送需等准备完成；这不会缩减模型上下文，也不会自动在后台加载全部旧页。
+
+工具活动按组折叠显示；点击活动组标题展开，再点击单条 Tool 标题查看细节。输出可用时选择“查看工具输出”，内容会在右侧 Review 面板中打开。Coding 聊天顶部的“查看当前差异”按钮可查看当前工作树；活动详情里显示的变更路径也可直接打开对应 Diff。Review 面板可切换和关闭文件、Diff、工具输出及进程日志标签，也可一次关闭整个面板。
 
 Composer 顶部显示当前 Todo，底部可选择模型与权限并查看 Context ring。`/compact` 执行期间普通输入会锁定，Runtime panel 显示 Context 与 Compact 的实时安全状态；这些界面信息来自 Application 投影，而不是 Desktop 自行计算的会话状态。
 
