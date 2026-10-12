@@ -261,7 +261,7 @@ async function createControlledDiffProject(projectPath) {
   longLines[499] = "DIFF_CHANGED_ROW_500";
   await writeFile(join(projectPath, "long.txt"), `${longLines.join("\n")}\n`, "utf8");
   await writeFile(join(projectPath, "added.txt"), "new staged line\n", "utf8");
-  await writeFile(join(projectPath, "untracked.txt"), "untracked evidence must stay absent\n", "utf8");
+  await writeFile(join(projectPath, "untracked.txt"), "UNTRACKED_DIFF_BODY\n", "utf8");
   runGit(projectPath, ["add", "added.txt"]);
   runGit(projectPath, ["rm", "deleted.txt"]);
   runGit(projectPath, ["mv", "rename-source.txt", "renamed.txt"]);
@@ -420,6 +420,8 @@ async function main() {
   let lifecycleProjectOne;
   let lifecycleProjectTwo;
   let diffProject;
+  let diffUnbornProject;
+  let permissionProject;
   let reviewProject;
   let invalidConfigPath;
   let invalidConfigBaselineHash;
@@ -456,7 +458,18 @@ async function main() {
       await writeFile(join(lifecycleProjectOne, "README.md"), "T12 isolated Coding project one.\n", "utf8");
       await writeFile(join(lifecycleProjectTwo, "README.md"), "T12 isolated Coding project two.\n", "utf8");
     }
-    if (isDiffFlow) diffProject = await createControlledDiffProject(join(host.root, "projects", "controlled-diff"));
+    if (isDiffFlow) {
+      diffProject = await createControlledDiffProject(join(host.root, "projects", "controlled-diff"));
+      diffUnbornProject = join(host.root, "projects", "unborn-diff");
+      await mkdir(diffUnbornProject, { recursive: true });
+      runGit(diffUnbornProject, ["init", "--initial-branch=main"]);
+      await writeFile(join(diffUnbornProject, "new-file.txt"), "UNBORN_NEW_FILE_BODY\n", "utf8");
+    }
+    if (flow === "permission") {
+      permissionProject = join(host.root, "projects", "controlled-permission");
+      await mkdir(permissionProject, { recursive: true });
+      await writeFile(join(permissionProject, ".env"), "CDP_PERMISSION_PUBLIC_MARKER=isolated\n", "utf8");
+    }
     if (flow === "review") reviewProject = await createControlledReviewProject(join(host.root, "projects", "controlled-review"));
     electronContext = await createIsolatedCdpContext({ mode: "electron", prefix: `uthcode-cdp-electron-${runId.slice(0, 8)}-` });
     await mkdir(electronContext.userDataDir, { recursive: true });
@@ -469,11 +482,13 @@ async function main() {
         { path: lifecycleProjectTwo, alias: isSettingsFlow ? "UI Same project" : "T12 Coding Two", pinned: false },
       ]
       : isDiffFlow
-        ? [{ path: diffProject, alias: "T12 Diff project", pinned: false }]
+        ? [{ path: diffProject, alias: "T12 Diff project", pinned: false }, { path: diffUnbornProject, alias: "T12 Unborn Diff", pinned: false }]
+        : flow === "permission"
+          ? [{ path: permissionProject, alias: "T12 Permission fixture", pinned: false }]
         : flow === "review"
           ? [{ path: reviewProject, alias: "T12 Review project", pinned: false }]
           : [{ path: workspaceRoot, alias: "Re-UthCode", pinned: false }];
-    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow || isSettingsFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "review" ? reviewProject : workspaceRoot;
+    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow || isSettingsFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "permission" ? permissionProject : flow === "review" ? reviewProject : workspaceRoot;
     const projectAliases = Object.fromEntries(recentProjects.map((project) => [project.path, project.alias]));
     const desktopPreferences = JSON.stringify({
       language: preferenceLanguage,
@@ -572,7 +587,7 @@ async function main() {
         ...(flow === "review" ? ["--expect-text", "W05_REVIEW_READY"] : []),
         ...(isLifecycleFlow ? ["--stage", stage, "--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo, ...(expectedSessions ? ["--expected-sessions", JSON.stringify(expectedSessions)] : [])] : []),
         ...(isSettingsFlow ? ["--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo] : []),
-        ...(isDiffFlow ? ["--diff-project", diffProject] : []),
+        ...(isDiffFlow ? ["--diff-project", diffProject, "--diff-unborn-project", diffUnbornProject] : []),
         ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
         ...(flow === "ask-one" ? ["--ask-question-count", "1"] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
@@ -742,7 +757,7 @@ async function main() {
   if (secretLeakArtifacts.length > 0) signalFailures.push(`Fixture secret persisted in process artifacts: ${[...new Set(secretLeakArtifacts)].join(", ")}`);
   // Six initial Turns plus one continuation; the plain-text fixture summary
   // fails validation twice before compaction reports its controlled failure.
-  const expectedFixtureRequests = flow === "sessions" ? 9 : isLifecycleFlow ? 3 : isGeneralCancelFlow ? 1 : flow === "review" ? 2 : null;
+  const expectedFixtureRequests = flow === "sessions" ? 9 : isLifecycleFlow || flow === "permission" ? 3 : isGeneralCancelFlow ? 1 : flow === "review" ? 2 : null;
   if (expectedFixtureRequests !== null && fixtureRequests.length !== expectedFixtureRequests) {
     signalFailures.push(`Fixture request count: expected ${expectedFixtureRequests}, observed ${fixtureRequests.length}`);
   }

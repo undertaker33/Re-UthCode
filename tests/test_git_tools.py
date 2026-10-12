@@ -137,6 +137,7 @@ def test_workspace_review_separates_staged_unstaged_and_untracked_state(
     _git(root, "add", "tracked.txt")
     tracked.write_text("unstaged version\n", encoding="utf-8")
     (root / "new file.txt").write_text("untracked body\n", encoding="utf-8")
+    (root / "other new.txt").write_text("other untracked body\n", encoding="utf-8")
 
     result = GitWorkspace(root).review()
 
@@ -146,14 +147,63 @@ def test_workspace_review_separates_staged_unstaged_and_untracked_state(
     assert {entry["path"]: entry["xy"] for entry in entries} == {
         "tracked.txt": "MM",
         "new file.txt": "??",
+        "other new.txt": "??",
     }
     staged = result["staged_diff"]
     unstaged = result["unstaged_diff"]
     assert isinstance(staged, dict) and isinstance(unstaged, dict)
     assert "-before" in staged["text"] and "+staged version" in staged["text"]
     assert "-staged version" in unstaged["text"] and "+unstaged version" in unstaged["text"]
-    assert "untracked body" not in staged["text"] + unstaged["text"]
+    assert "untracked body" not in staged["text"]
+    assert "+untracked body" in unstaged["text"]
+    assert "--- /dev/null" in unstaged["text"]
     assert result["truncated"] is False
+
+    selected = GitWorkspace(root).review(path="new file.txt")
+    assert selected["staged_diff"]["text"] == ""
+    assert "+untracked body" in selected["unstaged_diff"]["text"]
+    assert "other untracked body" not in selected["unstaged_diff"]["text"]
+    assert "staged version" not in selected["unstaged_diff"]["text"]
+
+
+def test_workspace_review_keeps_other_files_when_an_untracked_path_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _repo(tmp_path)
+    (root / "available.txt").write_text("available content\n", encoding="utf-8")
+    disappearing = root / "disappearing.txt"
+    disappearing.write_text("temporary content\n", encoding="utf-8")
+    original_status = GitWorkspace.status
+
+    def status_then_remove(self: GitWorkspace, **kwargs: object) -> dict[str, object]:
+        result = original_status(self, **kwargs)
+        if self.root == root:
+            disappearing.unlink(missing_ok=True)
+        return result
+
+    monkeypatch.setattr(GitWorkspace, "status", status_then_remove)
+    result = GitWorkspace(root).review()
+
+    entries = result["status"]["entries"]
+    disappearing_entry = next(entry for entry in entries if entry["path"] == "disappearing.txt")
+    assert disappearing_entry["review_error"] == "unavailable"
+    assert "+available content" in result["unstaged_diff"]["text"]
+    assert "temporary content" not in result["unstaged_diff"]["text"]
+
+
+def test_untracked_review_honors_cancellation_before_reading_files(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    workspace = GitWorkspace(root)
+    token = CancellationToken()
+    token.cancel()
+
+    with pytest.raises(GitQueryCancelled):
+        workspace._untracked_review_diff(
+            {"entries": [{"xy": "??", "path": "new.txt"}]},
+            selected_paths=(),
+            cancellation=token,
+            remaining_bytes=1024,
+        )
 
 
 def test_workspace_review_reports_rename_and_selected_file_paths(tmp_path: Path) -> None:
@@ -206,6 +256,35 @@ def test_workspace_review_reports_deletion_binary_and_bounded_partial_diff(
     assert large_diff["truncated"] is True
     assert large_diff["size_bytes"] <= 1024
     assert bounded["truncated"] is True
+
+
+def test_workspace_review_reports_untracked_binary_without_exposing_its_contents(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    (root / "new-binary.bin").write_bytes(b"\x00\x01private-binary-marker")
+
+    result = GitWorkspace(root).review()
+
+    status = result["status"]
+    assert isinstance(status, dict)
+    assert any(entry["path"] == "new-binary.bin" and entry["xy"] == "??" for entry in status["entries"])
+    unstaged = result["unstaged_diff"]
+    assert isinstance(unstaged, dict)
+    assert "Binary files /dev/null and b/new-binary.bin differ" in unstaged["text"]
+    assert "private-binary-marker" not in unstaged["text"]
+
+
+def test_workspace_review_bounds_untracked_large_text(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    (root / "large-untracked.txt").write_text("line\n" * 20_000, encoding="utf-8")
+
+    result = GitWorkspace(root, max_output_bytes=1024).review()
+
+    unstaged = result["unstaged_diff"]
+    assert isinstance(unstaged, dict)
+    assert unstaged["truncated"] is True
+    assert unstaged["size_bytes"] <= 1024
+    assert result["truncated"] is True
+    assert "large-untracked.txt" in unstaged["text"]
 
 
 def test_workspace_review_preserves_non_git_and_cancellation_outcomes(

@@ -1,9 +1,10 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { UiIcon } from "./UiIcon";
+import type { UiIconName } from "./UiIcon";
 
 export interface SelectOption { value: string; label: string; disabled?: boolean }
-export interface CustomSelectProps { value: string; options: readonly SelectOption[]; onChange: (value: string) => void; label: string; disabled?: boolean; id?: string; onOpen?: () => void }
+export interface CustomSelectProps { value: string; options: readonly SelectOption[]; onChange: (value: string) => void; label: string; disabled?: boolean; id?: string; onOpen?: () => void; triggerIcon?: UiIconName }
 export function nextEnabledOption(options: readonly SelectOption[], current: number, step: 1 | -1): number {
   let next = current;
   for (let count = 0; count < options.length; count += 1) { next = (next + step + options.length) % options.length; if (!options[next]?.disabled) return next; }
@@ -44,7 +45,7 @@ export function customSelectPosition(rect: DOMRect, optionCount: number, viewpor
   };
 }
 
-export function CustomSelect({ value, options, onChange, label, disabled = false, id, onOpen }: CustomSelectProps) {
+export function CustomSelect({ value, options, onChange, label, disabled = false, id, onOpen, triggerIcon }: CustomSelectProps) {
   const generatedId = useId();
   const listId = `${id ?? generatedId}-listbox`;
   const [open, setOpen] = useState(false);
@@ -111,14 +112,15 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
     if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); if (open) choose(active); else openMenu(); }
   };
   const selected = options.find((item) => item.value === value);
+  const selectedLabel = selected?.label ?? value;
   const themeRoot = root.current?.closest<HTMLElement>(".theme-light, .theme-dark, .theme-system");
   const themeClass = themeRoot && ["theme-light", "theme-dark", "theme-system"].find((name) => themeRoot.classList.contains(name)) || "theme-dark";
   const menu = open && typeof document !== "undefined" ? createPortal(<div className={`custom-select__portal-scope ${themeClass}`} style={{ position: "fixed", inset: 0, zIndex: 1200, pointerEvents: "none", background: "transparent" }}><div ref={list} id={listId} className={`custom-select__list is-${placement}`} style={{ ...menuStyle, zIndex: 1, pointerEvents: "auto" }} role="listbox" aria-label={label}>{options.map((option, index) => <button ref={(element) => { optionRefs.current[index] = element; }} id={`${listId}-option-${index}`} type="button" role="option" title={option.label} key={option.value} aria-selected={option.value === value} tabIndex={index === active ? 0 : -1} className={index === active ? "is-active" : ""} disabled={option.disabled} onPointerMove={() => { if (!option.disabled) setActive(index); }} onClick={() => choose(index)}>{option.label}</button>)}</div></div>, document.body) : null;
-  return <div className="custom-select" ref={root} onKeyDown={keyDown} onBlur={(event) => {
+  return <div className={`custom-select${triggerIcon ? " custom-select--icon-only" : ""}`} ref={root} onKeyDown={keyDown} onBlur={(event) => {
     const next = event.relatedTarget as Node | null;
     if (!root.current?.contains(next) && !list.current?.contains(next)) closeMenu();
   }}>
-    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}><span className="custom-select__value">{selected?.label ?? value}</span><UiIcon name="chevron" /></button>
+    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={triggerIcon ? `${label}: ${selectedLabel}` : label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}>{triggerIcon ? <UiIcon name={triggerIcon} /> : <><span className="custom-select__value">{selectedLabel}</span><UiIcon name="chevron" /></>}</button>
     {menu}
   </div>;
 }

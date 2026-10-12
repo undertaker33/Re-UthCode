@@ -625,14 +625,7 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onRetryApp
     <section className="settings-view" aria-label={t("settings")} aria-busy={state.settingsSaving}>
       <aside ref={settingsNav} className="settings-nav" aria-label={t("settings")}>
         <button type="button" className="settings-view__back" title={t("back")} onClick={onBackWithCleanup} disabled={providerSaving || searchKeySaving}>← {t("back")}</button>
-        <div><h1>{t("settings")}</h1></div>
-        <nav aria-label={t("settingsCategories")}>
-          {(["providers", "general", "tools", "security", "appearance", "archive"] as const).map((category) => <a key={category} className={activeCategory === category ? "is-active" : ""} href={`#settings-${category}`} onClick={(event) => { if (event.defaultPrevented) return; event.preventDefault(); setActiveCategory(category); settingsContent.current?.scrollTo({ top: 0, behavior: "smooth" }); }}>{t(category)}</a>)}
-        </nav>
-      </aside>
-      <div ref={settingsContent} className="settings-content">
-        <header><div><h1>{t(activeCategory)}</h1></div></header>
-        {state.settingsError && <p className="settings-view__error" role="alert">{state.settingsError}</p>}
+        <div className="settings-nav__title"><h1>{t("settings")}</h1></div>
         <div className="settings-global-search" role="search">
           <label className="sr-only" htmlFor="settings-global-search-input">{t("settingsSearch")}</label>
           <UiIcon name="search" />
@@ -644,6 +637,13 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onRetryApp
             </button>) : <p role="status">{t("settingsSearchNoResults")}</p>}
           </div>}
         </div>
+        <nav aria-label={t("settingsCategories")}>
+          {(["providers", "general", "tools", "security", "appearance", "archive"] as const).map((category) => <a key={category} className={activeCategory === category ? "is-active" : ""} href={`#settings-${category}`} onClick={(event) => { if (event.defaultPrevented) return; event.preventDefault(); setActiveCategory(category); settingsContent.current?.scrollTo({ top: 0, behavior: "smooth" }); }}>{t(category)}</a>)}
+        </nav>
+      </aside>
+      <div ref={settingsContent} className="settings-content">
+        <header><div><h1>{t(activeCategory)}</h1></div></header>
+        {state.settingsError && <p className="settings-view__error" role="alert">{state.settingsError}</p>}
         {showSettingsStatus && <div className="settings-autosave-status" role="status" aria-live="polite">
           <span>{state.settingsSaving || searchKeySaving ? t("settingsSaving") : state.settingsWriteFailures > 0 || searchKeyFailed ? t("settingsWriteFailed") : state.settingsApplications.failed > 0
             ? t("settingsApplyFailed") : t("settingsPending")}</span>

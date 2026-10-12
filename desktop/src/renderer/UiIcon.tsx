@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off" | "minimize" | "floating" | "maximize" | "focus" | "file" | "search" | "close";
+export type UiIconName = "plus" | "folder" | "chevron" | "pin" | "edit" | "external" | "trash" | "copy" | "more" | "settings" | "runtime" | "panel" | "compact" | "status" | "check" | "warning" | "todo" | "pause" | "stop" | "send" | "eye" | "eye-off" | "minimize" | "floating" | "maximize" | "focus" | "file" | "search" | "close" | "permission" | "model";
 
 export function UiIcon({ name }: { name: UiIconName }) {
   const paths: Record<UiIconName, ReactNode> = {
@@ -12,6 +12,8 @@ export function UiIcon({ name }: { name: UiIconName }) {
     file: <><path d="M4 2.75h5l3 3v7.5H4z" /><path d="M9 2.75v3h3M5.75 8h4.5M5.75 10.25h4.5" /></>,
     search: <><circle cx="6.8" cy="6.8" r="4.1" /><path d="m10 10 3.2 3.2" /></>,
     close: <path d="m4 4 8 8m0-8-8 8" strokeWidth="1.7" />,
+    permission: <><path d="M8 2.25 13 4v3.3c0 3.05-1.85 4.95-5 6.45-3.15-1.5-5-3.4-5-6.45V4z" /><path d="m5.75 8 1.45 1.45L10.5 6.2" /></>,
+    model: <><path d="m8 2.5 5 2.75v5.5L8 13.5l-5-2.75v-5.5z" /><path d="m3 5.25 5 2.9 5-2.9M8 8.15v5.1" /></>,
     folder: <path d="M2.75 5.25h10.5v7H2.75zM3.25 5.25V3.5h3.2l1.3 1.75" />,
     chevron: <path d="m5 6.25 3 3.25 3-3.25" />,
     pin: <path d="m5.1 3.25 5.8 5.8M9.75 2.75l3.5 3.5-2.2 1.2-2.5 2.5-1.2 2.2-3.5-3.5 2.2-1.2 2.5-2.5zM5.65 10.35l-2.9 2.9" />,

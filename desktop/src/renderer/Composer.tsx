@@ -145,6 +145,11 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   const completionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const hasText = state.composerText.trim().length > 0;
   const codingMode = state.mode === "coding";
+  const sendLabel = state.runtimeState === "restarting"
+    ? t("runtimeRestarting")
+    : state.pendingInteraction !== null || state.terminalStatusPending
+      ? t("waiting")
+      : state.activeTurn ? t("steer") : t("send");
   const slashMode = state.composerText.trimStart().startsWith("/");
   const pending = state.pendingInteraction !== null;
   const terminalStatusPending = state.terminalStatusPending;
@@ -323,7 +328,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   };
 
   return (
-    <section ref={composerRef} className="composer" aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (codingMode && !inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
+    <section ref={composerRef} className="composer" data-empty={state.composerText.length === 0 ? "true" : "false"} data-coding-mode={codingMode ? "true" : "false"} aria-label={t("composer")} aria-disabled={inputLocked || undefined} onDragOver={(event) => { if (codingMode && !inputLocked && !state.activeTurn && event.dataTransfer.types.includes("Files")) event.preventDefault(); }} onDrop={handleDrop} onPaste={handlePaste}>
       {state.todo.length > 0 && <section className="composer-todo todo-strip" tabIndex={0} aria-label={t("tasks")} data-iteration={state.todoIteration}>
         <header><h2><UiIcon name="todo" />{t("tasks")}</h2><span className="todo-strip__count">{state.todo.length}</span></header>
         <ul>{state.todo.map((item, index) => <li key={`${item.content}-${index}`} data-status={item.status}>
@@ -366,13 +371,13 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
           <div className="composer-attachment-actions">
             <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" /></button>
           </div>
-          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
+          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} triggerIcon="permission" disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>}
         <div className="composer-model">
-          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
+          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
         </div>
-        <button className="composer-send" type="button" title={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} aria-label={runtimeRestarting || pending || terminalStatusPending ? (runtimeRestarting ? t("runtimeRestarting") : t("waiting")) : state.activeTurn ? t("steer") : t("send")} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))}><UiIcon name="send" />{runtimeRestarting ? t("runtimeRestarting") : pending || terminalStatusPending ? t("waiting") : state.activeTurn ? t("steer") : t("send")}</button>
+        <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>
       </div>
     </section>
   );

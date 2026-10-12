@@ -252,6 +252,7 @@ function fixtureChunks(requestBody) {
   if (scenario === "permission" && hasToolDefinitions && !hasToolResult) {
     return [
       chunk({ role: "assistant" }),
+      chunk({ reasoning_content: "I will inspect the runner-owned permission fixture." }),
       chunk({
         tool_calls: [{
           index: 0,
@@ -261,6 +262,22 @@ function fixtureChunks(requestBody) {
         }],
       }),
       chunk({}, "tool_calls", { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 }),
+    ];
+  }
+  if (scenario === "permission" && hasToolResult && requestCount === 2) {
+    return [
+      chunk({ role: "assistant" }),
+      chunk({ reasoning_content: "The permission check completed. I will exercise a controlled failed history lookup." }),
+      chunk({ tool_calls: [{ index: 0, id: "call-uthcode-history-failure", type: "function", function: { name: "HistoryRead", arguments: "{}" } }] }),
+      chunk({}, "tool_calls", { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 }),
+    ];
+  }
+  if (scenario === "permission" && hasToolResult) {
+    return [
+      chunk({ role: "assistant" }),
+      chunk({ reasoning_content: "The failed command returned a controlled result. I can now report completion." }),
+      chunk({ content: "fixture response" }),
+      chunk({}, "stop", { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }),
     ];
   }
   if (scenario === "plan" && hasToolDefinitions && !hasToolResult) {

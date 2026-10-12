@@ -677,7 +677,10 @@ class UthCodeApplication:
                     **result,
                     field_name: {
                         **diff,
-                        "text": self.redact_public_text(diff["text"]),
+                    "text": self._redact_workspace_diff_text(
+                        diff["text"],
+                        truncated=diff.get("truncated") is True,
+                    ),
                     },
                 }
         return {
@@ -691,6 +694,78 @@ class UthCodeApplication:
         """Project one Application-owned string through configured-secret redaction."""
 
         return self._tool_service.redact_public_text(value)
+
+    def _redact_workspace_diff_text(
+        self,
+        value: str,
+        *,
+        truncated: bool = False,
+    ) -> str:
+        """Redact added Git rows as source text before restoring their ``+`` markers."""
+
+        def patch_rows(text: str) -> list[str]:
+            rows: list[str] = []
+            line_start = 0
+            while (line_end := text.find("\n", line_start)) >= 0:
+                rows.append(text[line_start : line_end + 1])
+                line_start = line_end + 1
+            if line_start < len(text):
+                rows.append(text[line_start:])
+            return rows
+
+        def line_ending(row: str) -> str:
+            if row.endswith("\r\n"):
+                return "\r\n"
+            return row[-1:] if row.endswith(("\r", "\n")) else ""
+
+        rows = patch_rows(value)
+        projected: list[str] = []
+        index = 0
+        in_hunk = False
+        while index < len(rows):
+            row = rows[index]
+            if row.startswith("diff --"):
+                in_hunk = False
+                projected.append(row)
+                index += 1
+                continue
+            if row.startswith("@@"):
+                in_hunk = True
+                projected.append(row)
+                index += 1
+                continue
+            if not in_hunk or not row.startswith("+"):
+                projected.append(row)
+                index += 1
+                continue
+
+            end = index + 1
+            while (
+                end < len(rows)
+                and in_hunk
+                and rows[end].startswith("+")
+            ):
+                end += 1
+            added_rows = rows[index:end]
+            source = "".join(added_row[1:] for added_row in added_rows)
+            redacted_rows = self._tool_service.redact_public_text(
+                source,
+                preserve_line_breaks=True,
+                incomplete_tail=truncated and end == len(rows),
+            )
+            redacted_rows = patch_rows(redacted_rows)
+            if len(redacted_rows) != len(added_rows):
+                # Preserve patch framing and fail closed if an unusual line
+                # separator prevents the line-preserving redactor from mapping
+                # source rows back to their Git additions.
+                redacted_rows = [
+                    ("<redacted>" if position == 0 else "") + line_ending(row)
+                    for position, row in enumerate(added_rows)
+                ]
+            projected.extend("+" + row for row in redacted_rows)
+            index = end
+
+        return self.redact_public_text("".join(projected))
 
     def _process_runtime(self):
         manager = self._runtime_context.process_manager

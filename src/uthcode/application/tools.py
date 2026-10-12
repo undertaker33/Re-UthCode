@@ -171,9 +171,38 @@ class _SecretRedactor:
                 values.append(value)
         self._secret_values = tuple(values)
 
-    def redact(self, value: str, *, preserve_line_breaks: bool = False) -> str:
+    def redact(
+        self,
+        value: str,
+        *,
+        preserve_line_breaks: bool = False,
+        incomplete_tail: bool = False,
+    ) -> str:
         if not isinstance(value, str):
             raise TypeError("summary values must be strings")
+        if incomplete_tail:
+            hold = min(self.progress_tail_length(value), len(value))
+            while hold < len(value):
+                prefix = value[:-hold] if hold else value
+                additional = self.progress_tail_length(prefix)
+                if additional <= 0:
+                    break
+                next_hold = min(len(value), hold + additional)
+                if next_hold <= hold:
+                    break
+                hold = next_hold
+            if hold:
+                safe_prefix = self.redact(
+                    value[:-hold],
+                    preserve_line_breaks=preserve_line_breaks,
+                )
+                withheld_tail = value[-hold:]
+                safe_tail = (
+                    _preserve_line_breaks(withheld_tail, _REDACTED)
+                    if preserve_line_breaks
+                    else _REDACTED
+                )
+                return safe_prefix + safe_tail
 
         def replacement(match: re.Match[str], visible: str) -> str:
             if preserve_line_breaks:
@@ -463,10 +492,20 @@ class ApplicationToolService:
 
         return self._registry.definitions()
 
-    def redact_public_text(self, value: str) -> str:
+    def redact_public_text(
+        self,
+        value: str,
+        *,
+        preserve_line_breaks: bool = False,
+        incomplete_tail: bool = False,
+    ) -> str:
         """Redact configured and ambient credentials from one public string."""
 
-        return self._redactor.redact(value)
+        return self._redactor.redact(
+            value,
+            preserve_line_breaks=preserve_line_breaks,
+            incomplete_tail=incomplete_tail,
+        )
 
     def ensure_tool(self, tool: Tool) -> None:
         """Add one Application-composed Tool to the existing registry.

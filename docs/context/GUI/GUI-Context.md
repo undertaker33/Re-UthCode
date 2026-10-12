@@ -6,7 +6,7 @@
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md
 snapshot_date: 2026-10-12
-verified_through_commit: 46d3c0d
+verified_through_commit: 701bfc0
 scope: Windows Desktop renderer + Electron bridge + Application session boundary
 source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/ + desktop/tests/ + tests/
 ```
@@ -24,7 +24,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Bridge 同时订阅 Application 的 `process_output`/`process_state` 观察；它们带 `session_id`、`process_id`、单调 sequence、state/exit code 和有界脱敏文本，可以在 `turn.completed` 之后继续进入 Desktop outbox。Bridge outbox 丢弃最旧日志后仍可通过 `process.read(cursor)` 补读，Renderer 每个 Session 只保留有界 process log。
 - `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成且没有 Session-owned 活进程的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application 及其进程。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
-- `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。
+- `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。输入为空时 textarea 固定高度且不允许手动 resize；有文本时保留现有扩展行为。权限和模型选择器使用单个图标触发器，保留本地化可访问名称、键盘选项导航和禁用边界。
 - `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿，并立即将安全附件元数据投影到用户消息正文上方；TurnStarted 补齐消息身份时保留附件。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
 - `[FACT]` 含图片的 `turn.start` 若当前模型 `supports_images` 为 `false` 或未知，会在 Application 预检阶段受控拒绝；Desktop 通过 JSON 业务结果显示本地化设置提示并保留附件草稿，选择支持图片的模型后可重试。
 - `[FACT]` Renderer 的附件导入/预览在跨 IPC await 前捕获 `project_key`、Session、`sessionViewRevision` 和运行代次 owner；返回后只向仍拥有该视图的 Composer 写入草稿或错误，切换 Session 不会把迟到结果污染新 Session，首次惰性创建 Session 仍可正常接收结果。
@@ -39,7 +39,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[BOUNDARY]` 现有 CDP/packaged acceptance 使用隔离 profile、DOM/keyboard/CDP 合成输入和 CSS viewport 观察；它可以证明 Renderer/Bridge/Application 投影与键盘/ARIA/布局合同，但不等同于 native pointer、Windows 原生缩放或人工视觉验收。未具备这些环境时不能把 synthetic viewport 或普通 mouse 对照写成 native input PASS。
 - `[FACT]` 手动 `/compact` 返回操作身份后由 Session 所属的后台任务执行，Bridge 通过带 `session_id`、`project_key`、`operation_id` 的 `compaction_operation` 通知投影进度和结果。Composer 锁定该 Session 的普通输入并提供显式取消入口，`compaction.cancel` 校验 Session/操作身份；状态区分 completed、no_change、cancelled、failed，另保留有效提交 `changed` 与安全 `reason`，Runtime 面板显示原因和提交说明。无需 Compact 的成功 no-op 不伪造一次成功压缩。
 - `[FACT]` Bridge 请求接收仍串行，仅长时间手动压缩脱离该循环；切换 Session 不取消压缩，已停放的压缩运行时保留至终态。`/compact` 启动请求恢复使用普通 RPC 等待上限，不再靠免除 30 秒超时等待整个压缩。普通 RPC 超时只结束当前等待，迟到的合法响应不会把存活 Runtime 判为协议损坏；已超时请求的 ID 保留至响应到达或进程边界结束。关闭时取消活动操作、等待收尾，再关闭 writer；外层 PythonRuntime 保留有界 child 回收边界，重新启动不会自动重试旧压缩。
-- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。设置搜索只匹配本地化名称/说明索引，不扫描配置值或秘密；选择结果会切换分类并定位字段。搜索启用和模型图片能力用可键盘操作的开关呈现。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。支持的字段自动保存；已运行 Turn 保留启动时捕获的配置，保存的新值在安全边界排队应用；成功保存不显示常驻提示，保存中、pending、failed 状态与重试入口仍保留。
+- `[FACT]` Settings 页通过 Configuration 公共出口编辑 Provider、Model、用户默认权限、默认模型、Tavily 搜索启用/key/上限、界面主题和语言。全局设置搜索位于左侧设置标题下、分类导航上方，只索引本地化名称和说明；结果切换分类并定位真实字段，不扫描配置值或秘密。搜索启用和模型图片能力用可键盘操作的开关呈现；搜索框用一个可访问清除按钮。搜索 key 仅存在于 editor-local 草稿和受控配置写入通道，安全投影只显示是否已配置；Desktop preference 不保存 key。支持的字段自动保存；已运行 Turn 保留启动时捕获的配置，保存的新值在安全边界排队应用；成功保存不显示常驻提示，保存中、pending、failed 状态与重试入口仍保留。
 - `[FACT]` Settings 的 Model 编辑保留 `supports_images` 三态能力字段；未知按不支持参与图片输入预检，新模型默认关闭图片输入。自动保存仍遵守配置应用安全边界，Provider/Model 编辑器自身继续使用显式 Apply/Cancel。
 - `[FACT]` Settings 同一配置出口还编辑 `tool_limits.timeout_seconds`、`output_bytes`、`attachment_bytes`；用户值与项目收紧值在配置层得到 configured/effective/source 投影，Renderer 同时显示 search、vision、tool limits、attachment limits 的实际来源。保存只在下一安全边界作用于当前和 background runtime，active/compact 快照沿该边界更新，ProcessSessionManager 中已启动进程继续使用捕获的旧启动参数与旧脱敏投影，项目收紧值不会反写用户配置。
 - `[FACT]` Settings 未编辑搜索密钥时不发送 api_key 或 api_key_configured；正式配置 writer 保留原 TOML literal/env 引用，只有显式 null/空白值才删除。禁用搜索保留凭据来源，但正式工厂不注册 WebSearch；安全配置摘要仍只投影是否已配置，不回传真实密钥。
@@ -48,7 +48,8 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Coding 与 General 是两个 Application mode。Coding 的显式 `session.new` 在首条消息前返回 Session ID 并登记目录；General 的 `New chat` 可先保留无持久 row 的草稿，首次发送后再持久化。General 使用自己的 Application owner，不继承 Coding 项目指令且不提供 Tool。
 - `[FACT]` Sidebar 的 Session 搜索在 Coding 模式覆盖当前已登记的 Coding 项目，在 General 模式仅搜索 General owner；公开标题与 Transcript 片段搜索包括已归档 Session，结果分别提供打开或恢复并打开。Session 菜单可归档条目；Settings 的 Archive 分类可按精确 project key（含 General）和文本筛选并恢复到原 owner，同名项目在选项中可区分。
 - `[FACT]` Settings 页面不使用全局保存按钮；字段或关联组通过配置 Application 自动写入，Provider/Model 编辑器保留显式 Apply/Cancel 草稿语义，失败状态由对应设置控件呈现。
-- `[FACT]` 右侧 Review 面板以当前 Project/Session owner 管理文件、Workspace Diff、Tool output 和 Process log tabs；用户可切换或关闭单个 tab，也可关闭整个面板。聊天顶部 Coding Diff 按钮打开当前工作树差异；范围下拉位于工作区标题和查看时间旁，可切换全部未提交、已暂存或未暂存部分，行视图直接呈现正式 Git unified hunk 的上下文、旧/新行号、新增和删除。hunk count 被脱敏时保留占位符，行号只依据可见数字起始行，不恢复隐藏 count。untracked 项只保留状态/路径，不合成 patch 或增删统计。Tool 活动详情在可用时提供 View tool output；活动组与单条 Tool 活动各自可折叠。
+- `[FACT]` 右侧 Review 面板以当前 Project/Session owner 管理文件、Workspace Diff、Tool output 和 Process log tabs；用户可切换或关闭单个 tab，也可关闭整个面板。聊天顶部 Coding Diff 按钮打开当前工作树差异；紧凑范围下拉位于工作区标题旁，可切换全部未提交、已暂存或未暂存部分；Diff 不显示查看时间，也不保留底部重复空内容段。行视图直接呈现正式 Git unified hunk 的上下文、旧/新行号、新增和删除。hunk count 被脱敏时保留占位符，起始行号仍可用于行号投影，不恢复隐藏 count。未跟踪文本文件在 All/Unstaged 中通过受限、只读的 Git 新文件 patch 显示；patch 沿用 Application 配置秘密脱敏、字节上限和取消控制。二进制、消失或不可读文件只保留真实状态/路径并显示局部不可用提示，不虚构正文或行数。Tool 活动详情在可用时提供 View tool output。
+- `[FACT]` `ChatTimeline` 在当前 Session 内按同一 `turn_id` 将 reasoning、关联 Tool 和交互状态合成一个默认折叠的一级活动组；不带 Turn 身份的独立活动各自保留。这个归组允许实时 reasoning 与没有 `run_id` 的历史 reasoning、Tool 记录在同一 Turn 内合并；展开后 reasoning 直接按原顺序显示，每条 Tool/命令仍可独立二级折叠。失败工具不脱离活动组，一级摘要保留失败数量，命令、受控错误预览和输出入口位于对应的二级详情中；组宽与聊天内容对齐。final assistant 正文仍在组外直接显示，真实待处理 Permission/AskUser 控件仍可操作。History hydrate 合并已排序的持久 sequence 与带 Run/Turn/toolCall identity 的实时交互状态；状态按关联 Tool 或同 Turn 的相邻持久记录锚定，不伪造 sequence，也不把当前 pending interaction 移到旧历史组。折叠组包含压缩提示锚点时，提示仍紧随该组显示。
 - `[FACT]` 聊天 FileCard 与右侧 DocumentPreviewPanel 都可打开 `ImagePreviewModal`。Modal 使用 fixed overlay 和 Workspace 层级；`.document-preview-panel` 保持定位及 resize 手柄，但不建立会将其子 modal 困在低层的 stacking context。modal 的主题颜色继承当前 app shell，关闭后恢复预览入口焦点。
 - `[FACT]` Session replay 可恢复失败 Turn 中已经公开的 reasoning/partial assistant，以及由稳定 `FailureReason`/`TerminationReason` 投影的 failed 状态；Renderer 不保存或解释 Provider 原生异常。
 - `[FACT]` Renderer 将带非空 `turn_id` 的实时失败通知与历史 failure 记录投影为同一个终态失败身份，避免首次加载历史或重叠分页后显示两次。当前历史 DTO 不含 `run_id`；缺少 Turn 身份的通知保留原记录身份，不按错误文本去重，普通状态、不同 Turn 的失败与后续实时内容继续独立显示。

@@ -167,6 +167,28 @@ class GitWorkspace:
             paths = tuple(dict.fromkeys(paired_paths))
         staged = self._diff_paths(paths, cached=True, ref=None, cancellation=cancellation)
         unstaged = self._diff_paths(paths, cached=False, ref=None, cancellation=cancellation)
+        untracked_text, untracked_truncated, unavailable_paths = self._untracked_review_diff(
+            status,
+            selected_paths=paths,
+            cancellation=cancellation,
+            remaining_bytes=max(0, self.max_output_bytes - int(unstaged["size_bytes"])),
+        )
+        if untracked_text:
+            existing_text = str(unstaged["text"])
+            combined_text = existing_text + untracked_text
+            unstaged = {
+                "text": combined_text,
+                "truncated": bool(unstaged["truncated"] or untracked_truncated),
+                "size_bytes": len(combined_text.encode("utf-8", errors="surrogateescape")),
+            }
+        elif untracked_truncated:
+            unstaged = {**unstaged, "truncated": True}
+        if unavailable_paths:
+            status_entries = status.get("entries")
+            if isinstance(status_entries, list):
+                for entry in status_entries:
+                    if isinstance(entry, dict) and entry.get("path") in unavailable_paths:
+                        entry["review_error"] = "unavailable"
         return {
             "status": status,
             "staged_diff": staged,
@@ -177,6 +199,78 @@ class GitWorkspace:
                 or unstaged.get("truncated")
             ),
         }
+
+    def _untracked_review_diff(
+        self,
+        status: Mapping[str, object],
+        *,
+        selected_paths: Sequence[str],
+        cancellation: CancellationToken | None,
+        remaining_bytes: int,
+    ) -> tuple[str, bool, set[str]]:
+        entries = status.get("entries", ())
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+            return "", False, set()
+        selected = set(selected_paths)
+        output = bytearray()
+        truncated = False
+        unavailable_paths: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping) or entry.get("xy") != "??":
+                continue
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str):
+                continue
+            relative_path = _pathspec(raw_path)
+            if selected and relative_path not in selected:
+                continue
+            if cancellation is not None and cancellation.cancelled:
+                raise GitQueryCancelled("Git query cancelled")
+            if remaining_bytes <= 0:
+                truncated = True
+                break
+            try:
+                source = (self.root / Path(relative_path)).resolve(strict=True)
+                source.relative_to(self.root)
+            except (OSError, ValueError):
+                unavailable_paths.add(relative_path)
+                continue
+            if not source.is_file():
+                unavailable_paths.add(relative_path)
+                continue
+            result = self._run(
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--unified=3",
+                "--",
+                "/dev/null",
+                relative_path,
+                allow_failure=True,
+                cancellation=cancellation,
+                output_limit_bytes=remaining_bytes,
+            )
+            # --no-index uses 1 to indicate that the paths differ. A path
+            # which disappeared or could not be read stays a local status fact;
+            # other files in this Review remain available.
+            if result.returncode not in (0, 1):
+                unavailable_paths.add(relative_path)
+                continue
+            chunk = result.stdout
+            if result.truncated:
+                truncated = True
+                # Do not expose a partial final line when the bound cuts
+                # through a credential or other sensitive value.
+                last_line_end = chunk.rfind(b"\n")
+                chunk = chunk[: last_line_end + 1] if last_line_end >= 0 else b""
+            output.extend(chunk)
+            remaining_bytes -= len(chunk)
+            if result.truncated:
+                break
+        return _decode_path(bytes(output)), truncated, unavailable_paths
 
     def _diff_paths(
         self,
@@ -330,9 +424,17 @@ class GitWorkspace:
         *args: str,
         allow_failure: bool = False,
         cancellation: CancellationToken | None = None,
+        output_limit_bytes: int | None = None,
     ) -> GitCommandResult:
         if any(not isinstance(arg, str) or "\x00" in arg for arg in args):
             raise ValueError("Git arguments must be NUL-free strings")
+        if output_limit_bytes is not None and (
+            isinstance(output_limit_bytes, bool)
+            or not isinstance(output_limit_bytes, int)
+            or output_limit_bytes <= 0
+        ):
+            raise ValueError("output_limit_bytes must be a positive integer")
+        output_limit = self.max_output_bytes if output_limit_bytes is None else min(output_limit_bytes, self.max_output_bytes)
         env = os.environ.copy()
         env.update(
             {
@@ -375,7 +477,7 @@ class GitWorkspace:
                     return
                 if not isinstance(chunk, bytes):
                     chunk = bytes(chunk)
-                remaining = self.max_output_bytes - len(target)
+                remaining = output_limit - len(target)
                 if remaining > 0:
                     target.extend(chunk[:remaining])
                 if len(chunk) > max(remaining, 0):

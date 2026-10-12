@@ -49,7 +49,7 @@ export interface WorkspaceDiffView {
   source: "current_working_tree";
   project_key: string;
   viewed_at: string;
-  status: { branch: string | null; entries: Array<{ xy: string; path: string; original_path?: string }>; unborn: boolean; truncated: boolean };
+  status: { branch: string | null; entries: Array<{ xy: string; path: string; original_path?: string; review_error?: "unavailable" }>; unborn: boolean; truncated: boolean };
   staged_diff: { text: string; truncated: boolean; size_bytes: number };
   unstaged_diff: { text: string; truncated: boolean; size_bytes: number };
   truncated: boolean;
@@ -290,7 +290,7 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
     <div className="review-panel__content" role="tabpanel" aria-label={active.title}>
       {active.kind === "document" && <DocumentPreviewPanel preview={active.preview} width={width} minWidth={minWidth} maxWidth={maxWidth} onWidthChange={onWidthChange} onClose={() => onCloseTab(active.id)} embedded />}
       {active.kind === "workspace-diff" && <>
-        <header className="review-panel__content-header review-panel__content-header--diff"><strong>{active.path ? `${t("currentWorkingTree")}: ${active.path}` : t("currentWorkingTree")}</strong>{active.diff && <><small><time dateTime={active.diff.viewed_at}>{new Date(active.diff.viewed_at).toLocaleString()}</time></small><CustomSelect label={t("diffScope")} value={diffScope} options={[{ value: "all", label: t("diffScopeAll") }, { value: "staged", label: t("diffScopeStaged") }, { value: "unstaged", label: t("diffScopeUnstaged") }]} onChange={(value) => setDiffScope(value as WorkspaceDiffScope)} /></>}</header>
+        <header className="review-panel__content-header review-panel__content-header--diff"><strong>{active.path ? `${t("currentWorkingTree")}: ${active.path}` : t("currentWorkingTree")}</strong>{active.diff && <CustomSelect label={t("diffScope")} value={diffScope} options={[{ value: "all", label: t("diffScopeAll") }, { value: "staged", label: t("diffScopeStaged") }, { value: "unstaged", label: t("diffScopeUnstaged") }]} onChange={(value) => setDiffScope(value as WorkspaceDiffScope)} />}</header>
         {active.state === "reviewing" && <p className="review-panel__notice" role="status">{t("workspaceDiffReviewing")}</p>}
         {active.state === "failed" && <p className="review-panel__notice" role="alert">{active.error || t("workspaceDiffUnavailable")}</p>}
         {active.state === "cancelled" && <p className="review-panel__notice" role="status">{t("workspaceDiffCancelled")}</p>}
@@ -299,11 +299,11 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
           <p className="review-panel__source">{active.diff.project_key}{active.diff.status.branch ? ` · ${active.diff.status.branch}` : active.diff.status.unborn ? ` · ${t("unbornBranch")}` : ""}</p>
           {active.diff.status.truncated && <p className="review-panel__notice">{t("previewTruncated")}</p>}
           <div className="review-panel__diff-toolbar"><strong>{t("changedFiles")}</strong></div>
-          {active.diff.status.entries.length > 0 && <ul className="review-panel__paths" aria-label={t("changedFiles")}>{active.diff.status.entries.filter((entry) => workspaceDiffEntryMatchesScope(entry.xy, diffScope)).map((entry, index) => <li key={entry.xy + ":" + entry.path + ":" + index}><code>{entry.xy}</code><span>{entry.path}</span>{entry.original_path && <small>← {entry.original_path}</small>}</li>)}</ul>}
+          {active.diff.status.entries.length > 0 && <ul className="review-panel__paths" aria-label={t("changedFiles")}>{active.diff.status.entries.filter((entry) => workspaceDiffEntryMatchesScope(entry.xy, diffScope)).map((entry, index) => <li key={entry.xy + ":" + entry.path + ":" + index}><code>{entry.xy}</code><span>{entry.path}</span>{entry.original_path && <small>← {entry.original_path}</small>}{entry.review_error === "unavailable" && <small className="review-panel__path-error" role="status">{t("untrackedContentUnavailable")}</small>}</li>)}</ul>}
           {diffSections.length > 0 ? diffSections.map(({ key, scope, section }) => {
             const lines = parseUnifiedDiffLines(section.text);
             return <section key={key} className={"review-panel__diff-section review-panel__diff-section--" + scope} data-diff-scope={scope}><h3>{t(key === "staged_diff" ? "staged" : "unstaged")}{section.truncated && " · " + t("previewTruncated")}</h3><div className="review-panel__diff-lines" role="table" aria-label={t(key === "staged_diff" ? "staged" : "unstaged")}>{lines.map((line, index) => <div className={"review-panel__diff-line review-panel__diff-line--" + line.kind} data-diff-kind={line.kind} role="row" key={index + ":" + line.kind}><span className="review-panel__diff-line-number" role="cell">{line.oldLine ?? ""}</span><span className="review-panel__diff-line-number" role="cell">{line.newLine ?? ""}</span><code role="cell">{line.text || " "}</code></div>)}</div></section>;
-          }) : <p className="review-panel__diff-empty">{t("noDiffContent")}</p>}
+          }) : null}
           {active.diff.truncated && <p className="review-panel__notice">{t("previewTruncated")}</p>}
         </div>}
       </>}

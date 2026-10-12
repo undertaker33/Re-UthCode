@@ -253,7 +253,8 @@ function workspaceDiffFromEvent(value: unknown, expectedProjectKey: string): Wor
     const entry = asObject(value);
     if (typeof entry.xy !== "string" || typeof entry.path !== "string" || !entry.path) return [];
     if (entry.original_path !== undefined && typeof entry.original_path !== "string") return [];
-    return [{ xy: entry.xy, path: entry.path, ...(typeof entry.original_path === "string" ? { original_path: entry.original_path } : {}) }];
+    if (entry.review_error !== undefined && entry.review_error !== "unavailable") return [];
+    return [{ xy: entry.xy, path: entry.path, ...(typeof entry.original_path === "string" ? { original_path: entry.original_path } : {}), ...(entry.review_error === "unavailable" ? { review_error: "unavailable" as const } : {}) }];
   });
   if (entries.length !== status.entries.length) return null;
   return {

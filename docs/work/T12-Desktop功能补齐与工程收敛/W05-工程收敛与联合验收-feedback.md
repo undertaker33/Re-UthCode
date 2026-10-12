@@ -248,3 +248,61 @@ Reviewer 的 P2 文档更正同步到 [`GUI-Context.md`](../../../docs/context/G
 Context-Index 已同步 PR #133 合并、7 项 UI 追加和当前 304/typecheck/package/make/Settings/Diff 证据；GUI 当前事实补充脱敏 hunk count 保持隐藏的行为，用户手册既有 Diff 操作说明已覆盖可见行为。原 T12 Checklist 仍是 40/40；7 项追加 UI 不计入冻结 Checklist 条目。1719/4 skip Python、297 项 Desktop 与 SHA `65aa…` native modal 为之前源码轮次证据，本轮没有重跑 Python、执行新的原生验收或安装生成的 Installer。独立 Reviewer 已只读核对两个最终报告和关键 7 张截图，通过且无新 finding；本轮记录完成后停止 Worker 写入。
 
 勘误：PR133 仅合并前一轮原 W01–W05；本轮 7 项 UI 的实现、独立 Review 与最终 packaged QA 已通过，Git 提交和合并待 Root 完成。
+
+### 用户追加 8 项 UI 的 Renderer 回归更新（2026-10-12）
+
+本轮追加的界面范围在此前 7 项之上，包含左侧 Settings 全局搜索、Diff scope 收紧与无时间展示、未跟踪可读文本正文、空 Composer 稳定高度、Settings 单一清除按钮，以及同一 Turn 的整体活动折叠与 interaction 时间顺序。更新 [GUI 当前事实](../../../docs/context/GUI/GUI-Context.md)、[State 当前事实](../../../docs/context/A03-State/State-Context.md)、[Getting Started](../../../docs/user-manual/getting-started.md) 与 Context-Index；T12 冻结 Checklist 未改，原 40/40 只表示冻结工作包条件。
+
+首轮完整 Desktop npm 有 305 项，299 passed、6 failed；原报告 [`ui-refinement-round2-npm-test.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round2-npm-test.log) 的失败均在 `renderer-attachments.test.tsx`：旧 Diff 时间戳、旧“无可用内容”尾部、未跟踪 status-only，以及把 reasoning 作为独立 timeline-entry 的断言。更新这些测试为当前 UI 合同，保留真实 Diff scope/status 与 lazy Session、背景 owner、迟到历史和 Tool output hydration 检查。实际回归又确认旧 activity group key 把带 Run ID 的 live reasoning 与缺少 Run ID 的同 Turn history reasoning 分到不同组，并生成重复 React key。`ChatTimeline` 现在按当前 Session 中公开的 `turn_id` 归组，同 Turn 的 live/replay reasoning、Tool 与 interaction status 共用一组；缺少 Turn ID 的记录仍各自成组。测试确认两条 reasoning 与 Tool 位于一个懒 Session 回放组，迟到的其他 Turn 保持独立，Session 选择和新草稿不被抢占，外置 Tool output 仍从同一组恢复。
+
+当前执行的受影响 Renderer 命令为 `npm exec -- tsx --test tests/renderer-attachments.test.tsx tests/renderer.test.tsx tests/renderer-chat.test.tsx tests/renderer-state.test.ts tests/renderer-state-ui.test.tsx`：223 passed、0 failed、9.60s、exit 0；输出包含既有 `SidebarInfo` 测试未包入 `act(...)` 的 React warning。`npm run typecheck` (`tsc --noEmit`) exit 0。Root 之前的架构边界 23 passed 与隔离 QA 13 passed 属于本轮尚未变化的现有证据，可按原命令和日志引用。Root 正重跑完整 npm；前一轮 source 变化前的 `npm run package` exit 0 不作为当前包证据，最终 npm、package/make 与 packaged QA 均待 Root 的后续结果。本段没有新的 packaged、native、Installer 或真实 Provider 结果。
+
+范围更正：上一节的“untracked 仅状态/路径、不生成正文”记录的是此前 7 项 UI 轮次。随后用户明确要求 Review 显示真实未跟踪文本文件内容；当前范围依此显示受限的 Unstaged/all 新文件 patch，staged 仍不包含它。二进制、消失或不可读文件保持局部不可用状态，不伪造正文或统计。此前 116 项 Git/Bridge Python 与本段新增 DTO Renderer 回归分别验证后端投影和界面合同；旧记录不作为当前行为描述。
+
+### Reviewer P1/P2 修正：untracked Review 脱敏与窄 Composer（2026-10-12）
+
+Reviewer 发现真实未跟踪文件 diff 将换行分开的配置秘密改写为 `+` 行后，普通整串脱敏未覆盖 `synthetic-alpha\nsynthetic-beta`。Review 投影现仅在 unified diff 的 `@@` hunk 内识别新增源码行，去掉 Git 行首标记后对连续正文复用 Application redactor 的保留换行模式，再恢复 patch 标记；新的 `diff --` 文件头会退出 hunk。这样真实源码首行 `++ literal-alpha-9d41` 对应的 `+++ literal-alpha-9d41` 仍会脱敏，而文件头 `+++ b/...` 不会误入正文。真实隔离 Git/Bridge 回归覆盖 literal 与 env 多行值、该 `++` 边界、未跟踪正文、输出字节上限和截断；命令 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_application_tools.py tests/test_desktop_bridge.py tests/test_git_tools.py --tb=short` 结果为 127 passed、13.95s、exit 0。
+
+第二项 packaged 诊断曾显示 720px 空 Composer 的权限、模型和 Send 控件换成三行，撑高输入区。空 Composer 在窄窗口/侧栏下使用单行网格和图标 Send；Send 仍保留真实 `title` 与 `aria-label`，有内容时原有按钮文字与布局不变。Renderer 回归命令 `npm exec -- tsx --test tests/renderer-attachments.test.tsx` 为 30 passed、0 failed、0 skipped、3.68s、exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0；`git diff --check` exit 0。以上是定向源码验证，不代表本次完整 Desktop 测试或 packaged 复验；Python 脱敏变更使此前包不适用，后续完整验证与重建由 Root 串行执行。未运行 Ruff（既有环境缺少该模块）。
+
+### Reviewer 复审后续修正：截断秘密尾部与宽 Composer（2026-10-12）
+
+Reviewer 复现了 diff 字节上限正好落在多行秘密中间的情况：Git 保留了秘密第一行并设置 `truncated=true`，完整值无法匹配。Application redactor 现可在明确标记为不完整输入时复用既有 `progress_tail_length`，把可能组成已配置秘密的末尾片段一并保留到脱敏边界；Workspace Diff 仅在 Diff 自身被截断且最后一个 added-row 组到达输出末尾时使用此处理，并按原换行恢复 Git patch 行。Bridge 集成回归用真实未跟踪 Git patch 动态计算 byte cap，使其恰好截在 literal 多行秘密两行之间，同时检查完整 literal/env 值、多行片段均未进入 wire、截断事实和输出界限。命令 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_application_tools.py tests/test_desktop_bridge.py tests/test_git_tools.py --tb=short` 结果为 127 passed、18.31s、exit 0。
+
+窄 Composer 复审指出空态 Send 的 30px 宽度也落在宽布局基础规则上，而其文字标签只在窄布局隐藏。固定宽度现仅位于两处隐藏标签的窄 viewport / conversation 容器规则；宽空态和有内容状态按可见文字自然确定按钮宽度。Renderer CSS 回归确认基础规则没有固定宽度、两个窄规则才固定 30px，并继续检查两处窄规则隐藏标签。命令 `npm exec -- tsx --test tests/renderer-attachments.test.tsx` 结果为 30 passed、0 failed、0 skipped、4.33s、exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。`git diff --check` 与 UTF-8 guard 在本次记录后通过。没有运行完整 Desktop npm、package/make 或实际 packaged QA；最终打包及真实界面复验仍待 Root 串行执行，本节定向结果不代替它们。
+
+### Reviewer packaged 复测后续修正：空 Composer 跨断点高度（2026-10-12）
+
+Root 的 packaged Settings 报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791810980060-b975f426/acceptance-report.json) 发现空 Composer 虽已单行工具栏，1280/900 viewport 的 outer/content/padding 为 123/106/17px，720 docked 为 130/112/18px；两处 textarea 均 64px、Send 均为图标且 resize 为 none。差值来自 docked narrow 下 `.composer-input` 的 column `gap: 6px` 和底部 padding 多 1px。空态在该断点现继续使用原 grid 输入行（动作区仍可在旁边布局），并把 docked 空态底 padding 设为 8px，与宽态 9px top + 8px bottom 一致；有内容的 narrow Composer 仍沿用既有纵向布局与间距。Renderer 回归现检查这一 docked-empty grid/padding 覆盖。`npm exec -- tsx --test tests/renderer-attachments.test.tsx` 为 30 passed、0 failed、3.71s、exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。
+
+本次只是 CSS/Renderer 回归修正。之前的 npm 306/306 与 package/make exit 0 均早于此改动，不能作为最终包证据；尚未对本修复构建或重新跑 packaged Settings。Root 负责后续串行刷新与实包比较，本段定向验证不替代高度验收。
+
+最终定向回归在保留 filled Composer 窄态纵向布局断言后重跑：`npm exec -- tsx --test tests/renderer-attachments.test.tsx` 为 30 passed、0 failed、4.29s、exit 0；`npm run typecheck` 重新执行 exit 0。该结果替代上一段同一测试在最终断言加入前的 3.71s 计时记录。
+
+### 最终追加 8 项 UI 收口验收（2026-10-12）
+
+本节更新此前关于窄 Composer 高度、Diff 导航及待构建/待验收的中间状态；旧失败报告保留为诊断历史，不代替以下当前源与最终包证据。本轮 8 项 UI 修改尚未提交或合并。此前 W01–W05 经 PR127–133 合并，前一轮 7 项 UI 经 PR134（`701bfc0`）合并；本轮没有预设 PR 编号。原冻结 Checklist 保持 40/40、`implemented_unarchived`，追加 UI 条件未写入冻结文件。
+
+源码定向证据仍有效：`npm exec -- tsx --test tests/renderer-attachments.test.tsx` 为 30 passed、0 failed、4.29s、exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0；Conda `re-uthcode` 下 `conda run --no-capture-output -n re-uthcode python -m pytest -q tests/test_application_tools.py tests/test_desktop_bridge.py tests/test_git_tools.py --tb=short` 为 127 passed、18.31s、exit 0。架构 23 项和隔离 QA 13 项沿用此前各自命令结果，本轮未重跑。
+
+最终构建与完整 Desktop 测试串行完成：`npm run package`、`npm run make` 均 exit 0，随后 `npm test` 为 306 passed、0 failed、0 skipped、0 cancelled，60,865.8855ms、exit 0。日志分别为 [`ui-refinement-round2-height-package.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round2-height-package.log)、[`ui-refinement-round2-height-make.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round2-height-make.log) 和 [`ui-refinement-round2-height-npm-test.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round2-height-npm-test.log)。两个打包阶段的 bundled Runtime Coding 与 General 独立 prompt initialize/session/status/shutdown smoke 均通过。生成的安装器为 `desktop/out/make/squirrel.windows/x64/UthCode Setup.exe`，204,828,672 bytes，时间 2026-10-12 21:34:12；本轮只生成，未安装。
+
+最终 packaged/CDP 命令均从 `desktop/` 执行，`--port 9361 --timeout-ms 180000`：
+
+```powershell
+node scripts/cdp-packaged-visual-acceptance.mjs --flow settings-ui --language en --port 9361 --timeout-ms 180000
+node scripts/cdp-packaged-visual-acceptance.mjs --flow diff --language zh --port 9361 --timeout-ms 180000
+node scripts/cdp-packaged-visual-acceptance.mjs --flow permission --language en --port 9361 --timeout-ms 180000
+```
+
+Settings 最终报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791812583145-e6e1d467/acceptance-report.json) 为 passed，共 14 张 PNG。它验证了搜索位于侧栏标题下、单一清除按钮、浅色/深色/System 主题和 portal 菜单配色、Model/API Key 等真实字段定位、API Key 保持隐藏、键盘开关保存及同名项目/General Archive owner 筛选；保存全过程没有成功提示闪现。空 Composer 在 1280、900、720 viewport 的外层高度均为 123px、textarea 均为 64px 且 `resize:none`；宽态 Send 标签适配，菜单切换不改变高度，Escape 恢复焦点。代表截图：[侧栏搜索](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791812583145-e6e1d467/settings-sidebar-search-single-clear.png)、[720px 空 Composer](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791812583145-e6e1d467/empty-composer-720.png)。
+
+Diff 最终报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-diff-zh-1791812659437-e1aec125/acceptance-report.json) 为 passed，共 6 张 PNG。工作区标题旁 selector 为 120×28px；页面没有可见时间或重复空段。真实 tracked added/deleted/modified/rename 路径呈现 Git hunk、行号和红绿行；1000 行文件只呈现变更附近 7 行上下文。正式 `?? untracked.txt` 在 All/Unstaged 有受限新增正文，staged 不含该正文；切换 Session 后旧 Diff 清空。另由真实 unborn-project 的 New Session 导航进入后，`new-file.txt` 的 `UNBORN_NEW_FILE_BODY` 以新增行显示，staged 排除且 unstaged 恢复。该 unborn 项目同时出现运行时生成的 `.uthcode/permissions.toml` 路径，因此不将其描述为仅有一个未跟踪路径。代表截图：[未暂存 Diff](../../../desktop/dist/ui-acceptance/w05-diff-zh-1791812659437-e1aec125/current-workspace-diff-unstaged.png)、[unborn 新文件](../../../desktop/dist/ui-acceptance/w05-diff-zh-1791812659437-e1aec125/diff-unborn-new-file.png)。
+
+Permission 最终报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-permission-en-1791812728440-25e5b941/acceptance-report.json) 为 passed，共 4 张 PNG。隔离本地 synthetic Provider 完成预期 3 次 streaming 请求（不是外网真实 Provider）；每次请求提供 16 个 Tool definitions，界面投影为 2 个 Tool activity 条目，其中 1 个失败。单 Turn 有 3 段 reasoning、1 个默认折叠的一级组、无逐段 reasoning 折叠；失败命令在默认折叠的二级详情中，pending Permission 控件保持可操作，已完成的 waiting/answered 状态位于 final 前，活动组与 Composer 等宽。Fixture report 的子进程 exit code 为 1，但 flow、driver 与 Electron 主状态均为 passed/0，3 次预期请求已观察到，fixture stderr 为空且 owned cleanup 标记成功；因此不表述为所有子进程均 exit 0。代表截图：[pending control](../../../desktop/dist/ui-acceptance/w05-permission-en-1791812728440-25e5b941/permission-pending-control.png)、[折叠活动组](../../../desktop/dist/ui-acceptance/w05-permission-en-1791812728440-25e5b941/permission-turn-collapsed.png)、[展开失败命令](../../../desktop/dist/ui-acceptance/w05-permission-en-1791812728440-25e5b941/permission-failed-command-expanded.png)。三个最终报告的 Electron/driver exit code 均为 0，console errors、renderer exceptions、unexplained stderr 均为空，runner-owned cleanup 均成功。CDP viewport 结果不代表本轮原生窗口、系统 DPI 或安装流程验收；本轮未执行外网真实 Provider 请求，也未触碰用户配置、已安装窗口或 `test-file.md`。
+
+GUI-Context、A03-State 与 Getting Started 已包含本轮可长期复用的 Settings、Review Diff、未跟踪文件、空 Composer、Turn 活动组、失败 Tool 与 pending interaction 行为，故本次仅更新 Context-Index 当前状态，不重复扩写上述文档。Context-Index 将 PR134 与本轮尚待 Git 的 8 项 UI 分开记载；W05 最终记录完成后停止 Worker 写入，等待原 Reviewer 终审。
+
+链接勘误：更早的 native 首轮与两份 Lifecycle 历史段把三个产物链接写成 `../../../dist/...`，该相对路径落到仓库根 `dist/`，目标不存在。历史文字和结果保持不变；实际文件位于 [`root-native-first-pass.json`](../../../desktop/dist/ui-acceptance/w05-native-send-20261011-205913/root-native-first-pass.json)、[`w05-lifecycle-en-1791724043266-1b8326c0/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-lifecycle-en-1791724043266-1b8326c0/acceptance-report.json) 与 [`w05-lifecycle-en-1791724295939-009cd3e8/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-lifecycle-en-1791724295939-009cd3e8/acceptance-report.json)；三处目标路径均已核实存在。
+
+最终截图复核补充：当前轮的 [`current-workspace-diff-unstaged.png`](../../../desktop/dist/ui-acceptance/w05-diff-zh-1791812659437-e1aec125/current-workspace-diff-unstaged.png) 中，modified hunk 的 count 实际显示为 `<redacted>`；它支持本轮 count 占位符的实际渲染，不沿用前轮可见数字 count 的截图事实。Permission 报告里的 fixture exit code `1` 是 runner 清理终止记录；本轮仍只记录 3 次预期请求、flow passed 与 driver/Electron exit 0，不写成 fixture exit 0。
