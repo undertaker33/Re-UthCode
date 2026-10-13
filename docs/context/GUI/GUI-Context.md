@@ -5,8 +5,8 @@
 ```text
 context_kind: current-code-context
 context_file: docs/context/GUI/GUI-Context.md
-snapshot_date: 2026-10-12
-verified_through_commit: 701bfc0
+snapshot_date: 2026-10-13
+verified_through_commit: 3bbdcba
 scope: Windows Desktop renderer + Electron bridge + Application session boundary
 source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/uthcode/application/ + desktop/tests/ + tests/
 ```
@@ -24,7 +24,7 @@ source_of_truth: desktop/src/ + src/uthcode/interfaces/desktop/bridge.py + src/u
 - `[FACT]` Bridge 同时订阅 Application 的 `process_output`/`process_state` 观察；它们带 `session_id`、`process_id`、单调 sequence、state/exit code 和有界脱敏文本，可以在 `turn.completed` 之后继续进入 Desktop outbox。Bridge outbox 丢弃最旧日志后仍可通过 `process.read(cursor)` 补读，Renderer 每个 Session 只保留有界 process log。
 - `[FACT]` Desktop 将聊天历史显示与完整运行时准备分开：`history.page` 返回最近页或更早页，`session.resume` 建立或重新激活运行时，不再返回完整 replay。冷 Session 返回 preparing，完成准备后才允许普通发送；已有运行时可直接重新激活。闲置且完成且没有 Session-owned 活进程的 background runtime 会关闭回收，尚未选择的准备结果保留待激活；Desktop 关闭时取消并等待活动任务，再关闭每个 Application 及其进程。
 - `[FACT]` Session metadata 保存可选 `model_ref`。新 Session 取得当前用户级新建默认模型；在一个 Session 内选择模型会预检后依次写回用户级 `default_model` 和该 Session 的 `model_ref`，再刷新该 Session 的 Provider/Context。恢复旧 Session 会先验证再恢复其 `model_ref`，但不会改写后来用于新建 Session 的用户默认模型；异常时尝试回滚配置、metadata 与运行时状态，回滚失败会明确报错；单文件原子写入不构成跨文件或进程退出的全局事务。
-- `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。输入为空时 textarea 固定高度且不允许手动 resize；有文本时保留现有扩展行为。权限和模型选择器使用单个图标触发器，保留本地化可访问名称、键盘选项导航和禁用边界。
+- `[FACT]` Composer 仍走同一 prompt、Slash Command、Steering 与 typed interaction 合同。TodoWrite 的当前 Todo 条显示在 Composer 上方；Plan mode、完成阻断、Permission、AskUser、Provider retry 等状态由事件/Bridge 投影，不由 Renderer 自行决定。空输入 textarea 固定高度且不允许手动 resize，有内容时保留现有扩展行为。权限和模型选择器按 Composer 实际内容宽度响应：达到 600px 时显示当前文字值，模型值按名称自然宽度扩展并受工具栏余量约束；空间较小时使用单个图标触发器。两种状态都保留本地化可访问名称、键盘选项导航和禁用边界。菜单宽度独立于触发器宽度，权限与模型菜单采用适合内容的宽度，并限制在视口范围内及 220px 高度内。活动 Turn 中空白或纯空白输入保持禁用的 Send；有非空白文字后才启用 Steering。空闲 Coding 会话仍可仅用附件提交。
 - `[FACT]` Composer 的附件选择、剪贴板、拖拽和粘贴都先导入当前 Session 的 Application-owned 副本；附件 ref 与 prompt 合并为一次 `turn.start`，仅附件也可提交，提交失败保留草稿，成功后清除当前 Session 草稿，并立即将安全附件元数据投影到用户消息正文上方；TurnStarted 补齐消息身份时保留附件。历史 replay 显示安全附件元数据和图片预览/文件回退，不让 Renderer 读取任意路径。
 - `[FACT]` 含图片的 `turn.start` 若当前模型 `supports_images` 为 `false` 或未知，会在 Application 预检阶段受控拒绝；Desktop 通过 JSON 业务结果显示本地化设置提示并保留附件草稿，选择支持图片的模型后可重试。
 - `[FACT]` Renderer 的附件导入/预览在跨 IPC await 前捕获 `project_key`、Session、`sessionViewRevision` 和运行代次 owner；返回后只向仍拥有该视图的 Composer 写入草稿或错误，切换 Session 不会把迟到结果污染新 Session，首次惰性创建 Session 仍可正常接收结果。

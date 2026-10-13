@@ -145,11 +145,12 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   const completionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const hasText = state.composerText.trim().length > 0;
   const codingMode = state.mode === "coding";
+  const submitPayloadAvailable = hasText || (!state.activeTurn && codingMode && state.composerAttachments.length > 0);
   const sendLabel = state.runtimeState === "restarting"
     ? t("runtimeRestarting")
     : state.pendingInteraction !== null || state.terminalStatusPending
       ? t("waiting")
-      : state.activeTurn ? t("steer") : t("send");
+      : state.activeTurn && hasText ? t("steer") : t("send");
   const slashMode = state.composerText.trimStart().startsWith("/");
   const pending = state.pendingInteraction !== null;
   const terminalStatusPending = state.terminalStatusPending;
@@ -242,8 +243,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
   }, [language, state.configuration, state.currentModelRef, state.modelCandidates]);
 
   const submit = () => {
-    const hasAttachmentOnlyPayload = codingMode && !state.activeTurn && state.composerAttachments.length > 0;
-    if (inputLocked || (!hasText && !hasAttachmentOnlyPayload)) return;
+    if (inputLocked || !submitPayloadAvailable) return;
     void onSubmit(state.composerText, codingMode ? state.composerAttachments : []);
   };
 
@@ -363,7 +363,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
               control from the input action group. The visible control lives in the
               bottom toolbar; this zero-area proxy preserves that DOM contract while
               avoiding a second tab stop or accessible name. */}
-          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))} />
+          <button className="composer-submit-proxy" type="button" tabIndex={-1} aria-hidden="true" onClick={submit} disabled={inputLocked || !submitPayloadAvailable} />
         </div>
       </div>
       <div className="composer-toolbar">
@@ -371,13 +371,13 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
           <div className="composer-attachment-actions">
             <button type="button" title={t("attachmentChoose")} aria-label={t("attachmentChoose")} onClick={() => void onChooseAttachment()} disabled={inputLocked || state.activeTurn}><UiIcon name="plus" /></button>
           </div>
-          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} triggerIcon="permission" disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
+          <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} triggerIcon="permission" preferredMenuWidth={210} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>}
         <div className="composer-model">
-          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
+          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" preferredMenuWidth={320} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
           {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
         </div>
-        <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || (!hasText && (!state.activeTurn && (!codingMode || state.composerAttachments.length === 0)))}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>
+        <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || !submitPayloadAvailable}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>
       </div>
     </section>
   );

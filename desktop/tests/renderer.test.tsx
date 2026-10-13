@@ -4740,7 +4740,7 @@ test("T07 Runtime switch and three layout modes remain operational", async () =>
   assert.match(css, /\.runtime-panel--floating\s*\{[^}]*position:\s*fixed[^}]*width:\s*304px;[^}]*height:\s*304px;[^}]*border-radius:\s*18px/s);
   assert.match(css, /\.runtime-panel--hidden\s*\{\s*display:\s*none;/s);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\s*\{\s*--sidebar-width:\s*196px;/);
-  assert.match(css, /\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s);
+  assert.match(css, /\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/s);
   assert.match(css, /\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column/s);
   assert.match(css, /\.app-shell\.panel-docked \.composer textarea\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*min-height:\s*72px;[^}]*word-break:\s*normal/s);
   assert.match(css, /\.app-shell\.panel-docked \.composer-actions\s*\{[^}]*flex-wrap:\s*wrap;[^}]*justify-content:\s*flex-end/s);
@@ -5199,6 +5199,15 @@ test("CustomSelect viewport geometry chooses a bounded above or below overlay", 
   assert.equal(nearBottom.placement, "above");
   assert.ok(Number(nearBottom.style.top) >= 8);
   assert.ok(Number(nearBottom.style.maxHeight) <= 185);
+  const compactTrigger = { top: 96, bottom: 126, left: 300, right: 330, width: 30, height: 30 } as DOMRect;
+  const wideMenu = customSelectPosition(compactTrigger, 8, 360, 260, 320);
+  assert.equal(wideMenu.style.width, 320, "the menu remains readable instead of inheriting the compact trigger width");
+  assert.equal(wideMenu.style.left, 32, "the wider menu shifts left to stay within viewport margins");
+  const clampedMenu = customSelectPosition(compactTrigger, 8, 220, 260, 320);
+  assert.equal(clampedMenu.style.width, 204, "a preferred width is clamped to the available viewport");
+  assert.equal(clampedMenu.style.left, 8);
+  const longModelMenu = customSelectPosition({ top: 100, bottom: 130, left: 14, right: 44, width: 30, height: 30 } as DOMRect, 40, 500, 700, 320);
+  assert.equal(longModelMenu.style.maxHeight, 220, "long model lists keep the same cap used by placement and scroll inside the menu");
 });
 
 test("Prompt 4 Composer keeps mode authority in slash commands while placing permission/model controls in the bottom row", async () => {
@@ -5222,6 +5231,8 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
   const markup = renderLanguage("en", <Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={(value) => commands.push(value)} onPause={() => undefined} onCancel={() => undefined} />);
   assert.match(markup, /Model: Local Chat/);
   assert.match(markup, /Default permission/);
+  assert.match(markup, /class="custom-select custom-select--responsive-trigger"/u);
+  assert.match(markup, /class="custom-select__value custom-select__responsive-label">Local Chat<\/span>/u);
   assert.match(markup, /\/plan/);
   assert.doesNotMatch(markup, /class="composer-selectors"[^>]*>\s*<button/);
 
@@ -5652,7 +5663,7 @@ test("Prompt 4 theme and responsive CSS contracts cover context ring and compose
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.context-ring__track\s*\{\s*stroke:\s*var\(--line-strong\)/);
   assert.match(css, /\.context-ring__progress\s*\{\s*stroke:\s*var\(--accent-strong\)/);
-  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*grid/);
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-actions\s*\{[^}]*flex-wrap:\s*wrap/);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.composer-model \.custom-select\s*\{\s*width:\s*min\(230px, calc\(100% - 40px\)\)/);
   assert.match(css, /@media \(max-width: 680px\)[\s\S]*?grid-template-columns:\s*var\(--sidebar-width\) minmax\(0, 1fr\)/);

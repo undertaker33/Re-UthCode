@@ -306,3 +306,29 @@ GUI-Context、A03-State 与 Getting Started 已包含本轮可长期复用的 Se
 链接勘误：更早的 native 首轮与两份 Lifecycle 历史段把三个产物链接写成 `../../../dist/...`，该相对路径落到仓库根 `dist/`，目标不存在。历史文字和结果保持不变；实际文件位于 [`root-native-first-pass.json`](../../../desktop/dist/ui-acceptance/w05-native-send-20261011-205913/root-native-first-pass.json)、[`w05-lifecycle-en-1791724043266-1b8326c0/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-lifecycle-en-1791724043266-1b8326c0/acceptance-report.json) 与 [`w05-lifecycle-en-1791724295939-009cd3e8/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-lifecycle-en-1791724295939-009cd3e8/acceptance-report.json)；三处目标路径均已核实存在。
 
 最终截图复核补充：当前轮的 [`current-workspace-diff-unstaged.png`](../../../desktop/dist/ui-acceptance/w05-diff-zh-1791812659437-e1aec125/current-workspace-diff-unstaged.png) 中，modified hunk 的 count 实际显示为 `<redacted>`；它支持本轮 count 占位符的实际渲染，不沿用前轮可见数字 count 的截图事实。Permission 报告里的 fixture exit code `1` 是 runner 清理终止记录；本轮仍只记录 3 次预期请求、flow passed 与 driver/Electron exit 0，不写成 fixture exit 0。
+
+### Composer 响应式选择器与活动 Turn 空输入修正（2026-10-13）
+
+本次追加修正将权限和模型选择器的文字/图标状态绑定到 Composer 实际内容宽度：宽度至少 600px 时显示当前值，空间不足时收为单个图标；菜单宽度不再受紧凑触发器限制，并按视口约束位置和高度（最高 220px）。空白或纯空白输入在活动 Turn 中继续显示禁用 Send，输入非空白文字后才启用 Steering；空闲 Coding 会话的仅附件提交仍保留。空 Composer 固定高度、空 textarea 的 `resize:none` 与有内容输入的既有扩展行为未改变。
+
+在 `desktop/` 执行 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer.test.tsx`，结果为 147 passed、0 failed、0 skipped、0 cancelled，21,535.219ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。首次定向运行有 1 项因临时改变既有 CustomSelect `title` 文案契约失败；恢复原文案后完整定向集通过。此次未运行完整 npm、package/make 或 packaged QA；独立复审已启动，Root 后续负责串行整包构建与 Settings/Delay 实包验收。本节结果不代表其尚未运行的报告。
+
+### Reviewer 复现宽态模型名称截断及修正（2026-10-13）
+
+Root 对此前构建包的 Settings flow 首次报告 [`w05-settings-ui-en-1791853998025-6afc1e85/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791853998025-6afc1e85/acceptance-report.json) 失败：1264px viewport、820px Composer 内容宽度下，`qwen3.7-flash-openai-responses` 仍被固定 280px 模型选择器截断。第二份旧包报告 [`w05-settings-ui-en-1791854108271-51e23864/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791854108271-51e23864/acceptance-report.json) 同样在宽态完整名称断言处失败；它在此之前已实际通过权限/模型菜单 210/320px 宽度、220px 高度与视口边界及 Escape 恢复焦点检查。本次将宽态模型选择器改为内容自然宽度、最大不超过父级 Composer 可用宽度并保留 flex 收缩，未改变 600px 显示文字断点或 599px 以下单图标状态。
+
+新源码定向命令 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer.test.tsx` 结果为 147 passed、0 failed、0 skipped、0 cancelled，21,508.819ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。此前包上的 Delay flow [`w05-delay-en-1791854067355-a4328723/acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-delay-en-1791854067355-a4328723/acceptance-report.json) 实测空/空白 Send disabled、非空 Steering enabled、清空后 disabled、Pause/Cancel 保留且真实取消收口；这是旧包及本地 fixture 证据，不是修复后当前包验收，也不是外网 Provider 测试。当前宽态 CSS 修正尚待 Reviewer 复审及 Root 重跑新包 Settings/Delay flows；未运行 full npm 或 package/make。
+
+### 宽态模型名修正后的最终 Desktop 与 packaged 验收（2026-10-13）
+
+以下新证据来自宽态选择器采用自然宽度后的当前源码，取代前两份旧包 Settings 的长名称失败和“待重跑”状态；旧失败报告仍保留作诊断记录。Root 在 `desktop/` 顺序执行 `npm test`（307 passed、0 failed、0 skipped、0 cancelled，52,100.7974ms，exit 0）、`npm run package`（exit 0）与 `npm run make`（exit 0）。完整测试日志、package 日志和 make 日志分别为 [`ui-refinement-round3-final-npm-test.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round3-final-npm-test.log)、[`ui-refinement-round3-final-package.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round3-final-package.log) 和 [`ui-refinement-round3-final-make.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round3-final-make.log)；两次构建的 bundled Runtime Coding 与 General initialize/session/status/shutdown smoke 均通过。
+
+当前安装器为 [`UthCode Setup.exe`](../../../desktop/out/make/squirrel.windows/x64/UthCode%20Setup.exe)，204,825,088 bytes，2026-10-13 09:22:20 本地时间；仅生成，未安装。
+
+当前包 Settings report [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-settings-ui-en-1791854569786-b342f8af/acceptance-report.json) passed，共 18 张 PNG。1280/900/720 viewport 下 Composer 内容宽度为 728/348/188px，对应文字选择器数为 2/0/0；空 Composer 外层高度 123px、textarea 64px 且 `resize:none`。长模型 `qwen3.7-flash-openai-responses` 在宽态空输入与已输入状态均完整显示，fit 均为 true；窄态填充输入收为图标。Permission 菜单实际为 210×144.375px，顶部 699px、底部 843.375px；Model 菜单为 320×220px，顶部 635px、底部 855px，在 720×900 viewport 内完整显示 6 项（Choose 与 5 个模型），无溢出，Escape 恢复触发器焦点。Root 已目视检查宽态空输入、宽态有输入及活动 Turn 空 Composer 截图。
+
+当前包 Delay report [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/w05-delay-en-1791854593196-5c1f88ea/acceptance-report.json) passed，共 6 张 PNG。空输入是空态且 Send 禁用、标签为 Send，Pause/Cancel 均存在；空白输入仍禁用 Steering，非空文字启用，清空后再次禁用。实际 Cancel 收束了运行中的 Turn。该本地 fixture 共 1 次请求；fixture exit code 1 是 runner 清理终止记录，不代表所有子进程 exit 0，也不是外网 Provider 验收。
+
+上述两个当前包报告的 driver/Electron exit code 均为 0，console errors、renderer exceptions、unexplained stderr 均为空，runner-owned cleanup 均成功。当前修正已通过包级 Settings/Delay 复验；本轮未重新执行原生窗口或系统 DPI 验收，未安装生成的 Installer，未运行外网真实 Provider，也未触碰用户配置、已安装窗口或 `test-file.md`。本轮修改已验收，Git 收口待 Root 处理；前一轮 8 项 UI 已由 PR135（`3bbdcbaf`）合并，不与本轮 pending 修改混记。
+
+最终验收记录勘误（2026-10-13）：上文旧 Settings 失败段中的“820px Composer 内容宽度”应读作“820px Composer 外层宽度”；当前包 Model 菜单段中的“完整显示 6 项”应替换为“包含 6 个 DOM 选项（Choose 与 5 个模型），220px 高的可滚动菜单只同时呈现部分选项，超出部分可滚动查看；菜单自身位于视口内”。原记录保留为历史文字，本 EOF 勘误明确替代这两处不准确表述。
