@@ -264,7 +264,7 @@ async function createControlledDiffProject(projectPath) {
   await writeFile(join(projectPath, "untracked.txt"), "UNTRACKED_DIFF_BODY\n", "utf8");
   runGit(projectPath, ["add", "added.txt"]);
   runGit(projectPath, ["rm", "deleted.txt"]);
-  runGit(projectPath, ["mv", "rename-source.txt", "renamed.txt"]);
+  runGit(projectPath, ["mv", "rename-source.txt", "重命名.txt"]);
   return projectPath;
 }
 
@@ -272,8 +272,9 @@ async function createControlledReviewProject(projectPath) {
   await mkdir(projectPath, { recursive: true });
   const rows = Array.from({ length: 920 }, (_, index) => `W05_REVIEW_OUTPUT_ROW_${String(index + 1).padStart(4, "0")} ${"bounded review content ".repeat(4)}`);
   await writeFile(join(projectPath, "review-output.txt"), ["W05_REVIEW_OUTPUT_BEGIN", ...rows, "W05_REVIEW_OUTPUT_END", ""].join("\n"), "utf8");
-  await writeFile(join(projectPath, "review.md"), "# W05 Review Markdown\n\nW05_REVIEW_MARKDOWN_BODY\n\nA controlled Markdown artifact for the packaged Review flow.\n", "utf8");
+  await writeFile(join(projectPath, "review.md"), "# W05 Review Markdown\n\nW05_REVIEW_MARKDOWN_BODY\n\n中文 Markdown 预览：**加粗**、`行内代码`与列表。\n\n- 文件内容\n- 表格与代码\n\n| 类型 | 展示 |\n| --- | --- |\n| Markdown | 渲染与源码 |\n| 文本 | 行号 |\n\n```python\nprint('review')\n```\n", "utf8");
   await writeFile(join(projectPath, "review.txt"), "W05_REVIEW_TEXT_BODY\n\nA controlled text artifact for the packaged Review flow.\n", "utf8");
+  await writeFile(join(projectPath, "review.py"), "# Controlled source preview\nfrom pathlib import Path\n\ndef describe_file(path: Path) -> str:\n    \"\"\"中文源码与行号预览。\"\"\"\n    return f\"{path.name}: {path.suffix}\"\n\nprint(describe_file(Path(\"review.md\")))\n", "utf8");
   await writeFile(join(projectPath, "review-attachment.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAgklEQVR4nNXOQQ2DABQE0WFM9FRBhDP3aiDBUhFUAVipiOanmSdgdpfPtjPpeL5G+xIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRIncRK3rO9zdOB63KN9iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4/33gV195BAXCa/9ABgAAAABJRU5ErkJggg==", "base64"));
   return projectPath;
 }
@@ -369,6 +370,8 @@ async function main() {
   const executable = win32.isAbsolute(executableOption) ? executableOption : resolvePath(desktopRoot, executableOption);
   const executablePath = win32.normalize(executable);
   const flow = option("flow", "visual");
+  const computerUse = process.argv.includes("--computer-use");
+  if (computerUse && !["review", "diff"].includes(flow)) throw new Error("computer-use checkpoints require review or diff flow");
   const isLifecycleFlow = lifecycleFlows.has(flow);
   const isSettingsFlow = flow === "settings-ui";
   const isDiffFlow = diffFlows.has(flow);
@@ -536,7 +539,7 @@ async function main() {
         "--ready-file", fixtureReadyPath,
         "--plan-chunk-delay-ms", String(planChunkDelayMs),
         ...(flow === "delay" ? ["--delay-ms", "5000"] : []),
-        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
+        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-code-path", join(reviewProject, "review.py"), "--review-image-path", join(reviewProject, "review-attachment.png"), ...(computerUse ? ["--review-live-process"] : [])] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
       ], {
         cwd: desktopRoot,
@@ -574,7 +577,7 @@ async function main() {
         cwd: workspaceRoot,
         env: electronContext.env,
         stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
+        windowsHide: !computerUse,
       });
       electronOutput = collectOutput(electronChild);
       await waitForPackagedTarget(port, Math.min(timeoutMs, 15_000));
@@ -592,13 +595,14 @@ async function main() {
         "--packaged-exe", executablePath,
         "--timeout-ms", String(timeoutMs),
         "--request-timeout-ms", String(requestTimeoutMs),
+        ...(computerUse ? ["--computer-use"] : []),
         "--plan-chunk-delay-ms", String(planChunkDelayMs),
         ...(isProviderFlow ? ["--scenario", fixtureScenario] : []),
         ...(flow === "review" ? ["--expect-text", "W05_REVIEW_READY"] : []),
         ...(isLifecycleFlow ? ["--stage", stage, "--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo, ...(expectedSessions ? ["--expected-sessions", JSON.stringify(expectedSessions)] : [])] : []),
         ...(isSettingsFlow ? ["--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo] : []),
         ...(isDiffFlow ? ["--diff-project", diffProject, "--diff-unborn-project", diffUnbornProject] : []),
-        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
+        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-code-path", join(reviewProject, "review.py"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
         ...(flow === "ask-one" ? ["--ask-question-count", "1"] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
         ...(flow === "delay" || isGeneralCancelFlow ? ["--delay-action", delayAction] : []),
@@ -807,7 +811,7 @@ async function main() {
     viewports: [...new Map(stageDriverReports.flatMap((report) => report?.observed?.viewports ?? []).map((viewport) => [JSON.stringify(viewport), viewport])).values()],
     runtimePanelLayouts: [...new Set(stageDriverReports.flatMap((report) => report?.observed?.runtimePanelLayouts ?? []))],
     flowEvidence: stageDriverReports.map((report) => report?.observed?.flow ?? {}),
-    controlledReviewProject: reviewProject ? { path: reviewProject, alias: "T12 Review project", files: ["review-output.txt", "review.md", "review.txt", "review-attachment.png"] } : null,
+    controlledReviewProject: reviewProject ? { path: reviewProject, alias: "T12 Review project", files: ["review-output.txt", "review.md", "review.txt", "review.py", "review-attachment.png"] } : null,
     realProvider: isRealProviderFlow ? { requested: true, configCopiedIntoIsolatedHome: realProviderConfigCopied, sessionStorageIsolated: isolatedSessionStorageReady, userConfigurationUnchanged: realProviderConfigUnchanged } : null,
     configurationRecovery: isInvalidConfigurationFlow ? { input: "malformed TOML in runner-owned HOME", sessionStorageIsolated: true, configurationUnchanged: invalidConfigUnchanged } : null,
     screenshots: stageDriverReports.flatMap((report) => report?.screenshots ?? []),

@@ -70,7 +70,7 @@ output_bytes = 1048576
 attachment_bytes = 8388608
 ```
 
-Desktop Settings 会显示 configured/effective/source 三类配置事实：configured 是可写入用户配置，effective 是当前工作目录合并后的下一安全边界值，source 会分别标出 search、vision、tool limits 和 attachment limits 来自 default、user 或 project。保存通过同一配置出口校验，并在下一安全边界更新当前和后台运行时；active、background 和 compact 快照在该边界保持一致。已启动进程保留启动时的参数与脱敏投影，不因配置保存重启，项目收紧值也不会反写用户配置。
+配置出口仍提供 configured/effective/source 三类事实：configured 是可写入用户配置，effective 是当前工作目录合并后的下一安全边界值，source 会标出 search、vision、tool limits 和 attachment limits 来自 default、user 或 project。Settings 的 Tools 分类只显示可编辑的搜索与限制项，不再重复展示只读汇总。保存通过同一配置出口校验，并在下一安全边界更新当前和后台运行时；active、background 和 compact 快照在该边界保持一致。已启动进程保留启动时的参数与脱敏投影，不因配置保存重启，项目收紧值也不会反写用户配置。
 
 使用 env 写法时，在启动 UthCode 的终端中设置密钥：
 

@@ -53,7 +53,7 @@ path_migration:
 
 ```text
 status_snapshot: 2026-10-13
-status_note: T12 原 W01–W05 已由 PR127–133 合并，前轮 7 项 UI 由 PR134（701bfc0）合并，上一轮 8 项 UI 已由 PR135（3bbdcbaf）合并。本轮 Composer 响应式选择器和活动 Turn 空白输入修正已通过完整 Desktop、package/make 与 Settings/Delay packaged flow，当前修正待 Root Git 收口；精确证据与范围见 W05 Feedback。冻结 Checklist 仍为原 40/40、implemented_unarchived，目录未归档。Installer 已生成但未安装；本轮未做外网 Provider 或原生窗口验收。
+status_note: T12 原 W01–W05 已由 PR127–133 合并，前轮 7 项 UI 由 PR134（701bfc0）合并，上一轮 8 项 UI 由 PR135（3bbdcbaf）合并，Composer 宽态模型名与活动 Turn 空输入修正已由 PR136（e3c663b）合并。本轮 Composer 右侧控件归组、Tools 分类只读摘要移除、Review Diff 按文件独立折叠，以及 Review 标签、图片预览和 Process log 展示收敛均已完成；完整 Desktop 313/313、package/make 与 Coding/General bundled smoke 通过，当前包文件/日志 Review 的 CDP 与原生验收通过。冻结 Checklist 保持 40/40、implemented_unarchived 且未归档；本轮追加修改待 Root 执行 Git 收口，未预写 PR 编号。最终命令、报告与未执行边界见 W05 Feedback。
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -89,7 +89,7 @@ status_values:
 | --- | --- | --- | --- |
 | F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | 截至 PR #105（`1218e31`），W01～W07 Feedback 齐全，冻结 Checklist 全部勾选，仍未归档。第 10 轮记录最终 Python `1520 passed, 3 skipped`、Desktop `216 passed`、typecheck 及中英文 packaged commands 通过；第 11 轮侧栏修复后记录 Renderer 定向 `101 passed`、typecheck、标准 package/make 与隔离英文 sessions 通过，安装器已生成但未执行安装流程。本次文档同步未重跑上述产品验证；真实 Provider、完整视觉矩阵和用户最终复验仍未完成，详见 W07 Feedback。 |
 | T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-10-10：冻结Checklist 61项完成、0项待验，目录保留未归档。原四项附件/消息身份/工具引用/外部路径修复及后续惰性Session、项目目录/全量Recent、搜索密钥保存、Responses推理事件、Windows PTY收尾/正文句柄和ANSI安全显示经原worker实施、Sol独立复审通过。最终Desktop278 passed/typecheck与串行package/make、bundled Runtime smoke通过，用户确认物理安装版本并完成原生验收；三协议实际SDK用户图/工具图、安装四格式/PDF页图、Windows/Linux PTY、Tavily真实取证、正式Headless官方评分及Desktop联合链均有完整证据。模型参数误用、百炼Responses失败、脚本误判与SWE未解决/空预测按原结果保留，不推导模型排名或所有端点支持。精确命令、版本、原始失败、复用范围及本机报告见原[W01](work/T11-Agent能力补齐/feedback/W01-内容与结果公共合同-feedback.md)、[W03](work/T11-Agent能力补齐/feedback/W03-文档视觉与进程会话-feedback.md)、[W04](work/T11-Agent能力补齐/feedback/W04-联网取证与代码操作-feedback.md)、[W06](work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)末尾。 |
-| T12 | Desktop 功能补齐与工程收敛 | docs/work/T12-Desktop功能补齐与工程收敛/ | 2026-10-13：冻结 Checklist 40/40、implemented_unarchived、未归档；原 W01–W05 经 PR127–133 合并，前轮 7 项 UI 经 PR134（`701bfc0`）合并，上一轮 8 项 UI 经 PR135（`3bbdcbaf`）合并。本轮 Composer 宽态长模型名与活动 Turn 空白输入修正已通过 Renderer 定向测试、typecheck、Desktop 307/307、package/make、bundled Runtime smoke 及当前包 Settings/Delay flows，待 Root Git 收口。详见 [W05 Feedback](work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md) 中的本轮命令、产物和边界。冻结 Checklist 未改写；安装器未安装，未运行外网 Provider 或本轮原生窗口验收。 |
+| T12 | Desktop 功能补齐与工程收敛 | docs/work/T12-Desktop功能补齐与工程收敛/ | 2026-10-13：冻结 Checklist 40/40、implemented_unarchived、未归档；原 W01–W05 经 PR127–133 合并，前轮 UI 由 PR134–136 合并。本轮 Composer 右侧控件归组、Tools 只读摘要移除、Review Diff 按文件独立折叠及文件/日志 Review 细节已实现并验收。最终 Desktop 313 passed，package/make 与 Coding/General bundled smoke 通过；Settings、Delay、Review、Diff packaged flow 和 Review/Diff 原生检查通过。详细版本边界、报告与截图见 [W05 Feedback](work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md)。Checklist 未改；本轮 Git 收口由 Root 处理，不预写 PR 编号。 |
 
 F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷 Session 准备与首屏显示解耦；目录按需读取首条用户消息预览，手动标题优先。手动压缩按 Session 后台执行、支持取消并保留有效 epoch；完成提示按提交时 Transcript 位置从 Timeline 恢复，分页游标保留 Transcript/Timeline 字节边界。Desktop 支持项目整行折叠、悬停信息、Runtime 布局图标、完成后输入焦点恢复与尾部已读清除，侧栏保持纵向滚动并抑制横向溢出。
 

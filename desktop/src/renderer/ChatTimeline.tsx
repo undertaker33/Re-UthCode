@@ -7,6 +7,7 @@ import { UiIcon, type UiIconName } from "./UiIcon";
 import { renderMarkdown } from "./safe-markdown";
 import { FileCard, type FilePreviewMode } from "./FileCard";
 import type { DocumentPreview, WorkspaceDiffView } from "./DocumentPreviewPanel";
+import { diffSectionPaths } from "./workspace-diff-paths";
 
 /** Pixels from the end that still count as being at the bottom. */
 export const TIMELINE_NEAR_BOTTOM_THRESHOLD = 72;
@@ -232,82 +233,6 @@ interface WorkspaceChangeSummary {
   deletions: number;
   filesComplete: boolean;
   linesComplete: boolean;
-}
-
-function readGitDiffPath(source: string, start: number): { value: string; end: number } | null {
-  let index = start;
-  while (index < source.length && /\s/u.test(source[index] ?? "")) index += 1;
-  const quoted = source[index] === '"';
-  if (quoted) index += 1;
-  const bytes: number[] = [];
-  const encoder = new TextEncoder();
-  let closed = !quoted;
-  while (index < source.length) {
-    const character = source[index] ?? "";
-    if (quoted && character === '"') {
-      index += 1;
-      closed = true;
-      break;
-    }
-    if (!quoted && /\s/u.test(character)) break;
-    if (character === "\\") {
-      index += 1;
-      const escaped = source[index] ?? "";
-      if (/[0-7]/u.test(escaped)) {
-        const octal = source.slice(index, index + 3);
-        if (!/^[0-7]{3}$/u.test(octal)) return null;
-        bytes.push(Number.parseInt(octal, 8));
-        index += 3;
-      } else {
-        const decoded: Record<string, number> = { t: 9, n: 10, r: 13, b: 8, f: 12, v: 11, "\\": 92, '"': 34 };
-        const code = decoded[escaped];
-        if (code === undefined) return null;
-        bytes.push(code);
-        index += 1;
-      }
-      continue;
-    }
-    const codePoint = source.codePointAt(index);
-    if (codePoint === undefined) return null;
-    const value = String.fromCodePoint(codePoint);
-    bytes.push(...encoder.encode(value));
-    index += value.length;
-  }
-  if (!closed) return null;
-  return { value: new TextDecoder().decode(Uint8Array.from(bytes)), end: index };
-}
-
-function diffSectionPaths(line: string): string[] {
-  const prefix = "diff --git ";
-  if (!line.startsWith(prefix)) return [];
-  if (line[prefix.length] === '"') {
-    const first = readGitDiffPath(line, prefix.length);
-    if (!first) return [];
-    const second = readGitDiffPath(line, first.end);
-    if (!second || line.slice(second.end).trim() !== "") return [];
-    return Array.from(new Set([first.value.replace(/^a\//u, ""), second.value.replace(/^b\//u, "")].filter(Boolean)));
-  }
-
-  // Git leaves ordinary spaces unquoted, so whitespace tokenization can split
-  // a single path into a fake second path. Accept only an unambiguous ` b/`
-  // boundary from the complete header; otherwise do not attribute hunk stats.
-  const header = line.slice(prefix.length);
-  const boundaries: Array<{ oldPath: string; newPath: string }> = [];
-  let index = header.indexOf(" b/");
-  while (index >= 0) {
-    const oldToken = header.slice(0, index);
-    const newToken = header.slice(index + 1);
-    if (oldToken.startsWith("a/") && newToken.startsWith("b/")) {
-      const oldPath = oldToken.slice(2);
-      const newPath = newToken.slice(2);
-      if (oldPath && newPath) boundaries.push({ oldPath, newPath });
-    }
-    index = header.indexOf(" b/", index + 1);
-  }
-  if (boundaries.length !== 1) return [];
-  const [paths] = boundaries;
-  if (!paths) return [];
-  return Array.from(new Set([paths.oldPath, paths.newPath]));
 }
 
 function parseWorkspaceDiffStats(text: string): Map<string, WorkspaceFileLineStats> {

@@ -28,6 +28,8 @@ const readyFile = option("ready-file");
 const artifactPath = option("artifact-path");
 const reviewMarkdownPath = option("review-markdown-path");
 const reviewTextPath = option("review-text-path");
+const reviewCodePath = option("review-code-path");
+const reviewLiveProcess = process.argv.includes("--review-live-process");
 const delayMs = Number(option("delay-ms", "1200"));
 const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const planChoice = option("plan-choice", "approve");
@@ -114,7 +116,7 @@ function fixtureChunks(requestBody) {
             index: 1,
             id: "call-uthcode-review-process",
             type: "function",
-            function: { name: "Bash", arguments: JSON.stringify({ command: "echo W05_REVIEW_PROCESS_LOG", yield_time_ms: 1000 }) },
+            function: { name: "Bash", arguments: JSON.stringify({ command: "echo W05_REVIEW_PROCESS_LOG && echo W05_REVIEW_STDERR_LOG 1>&2" + (reviewLiveProcess ? " && ping -n 4 127.0.0.1 >nul && echo W05_REVIEW_PROCESS_NEWER && ping -n 121 127.0.0.1 >nul" : ""), yield_time_ms: 1000, ...(reviewLiveProcess ? { timeout_seconds: 600 } : {}) }) },
           },
         ],
       }),
@@ -126,7 +128,7 @@ function fixtureChunks(requestBody) {
     const textPath = reviewTextPath.replaceAll("\\", "/");
     return [
       chunk({ role: "assistant" }),
-      chunk({ content: `W05_REVIEW_READY\n\n[Review Markdown](artifact:${markdownPath})\n\n[Review text](artifact:${textPath})` }),
+      chunk({ content: `W05_REVIEW_READY\n\n[Review Markdown](artifact:${markdownPath})\n\n[Review text](artifact:${textPath})${reviewCodePath ? `\n\n[Review code](artifact:${reviewCodePath.replaceAll("\\", "/")})` : ""}` }),
       chunk({}, "stop", { prompt_tokens: 2, completion_tokens: 5, total_tokens: 7 }),
     ];
   }

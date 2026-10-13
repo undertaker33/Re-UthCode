@@ -123,7 +123,7 @@ test("Settings uses one Provider/Model modal root with transactional Back and Ca
   });
 });
 
-test("Settings displays effective project limits and their source beside the user draft", async () => {
+test("Settings omits the read-only effective summary while keeping editable search and tool limits", async () => {
   await withRendererDom(async (_dom, container, root) => {
     const state = createInitialState({
       configuration: {
@@ -136,12 +136,17 @@ test("Settings displays effective project limits and their source beside the use
     });
     act(() => { root.render(<LanguageProvider value="en"><SettingsView state={state} onRevealApiKey={undefined} onBack={() => undefined} onSave={() => undefined} onThemeChange={() => undefined} onLanguageChange={() => undefined} /></LanguageProvider>); });
     await tick();
-    const summary = container.querySelector<HTMLElement>(".settings-effective");
-    assert.ok(summary);
-    assert.match(summary!.textContent ?? "", /Effective at next safe boundary/u);
-    assert.match(summary!.textContent ?? "", /Max results: 2/u);
-    assert.match(summary!.textContent ?? "", /Tool output limit \(bytes\): 4096/u);
-    assert.match(summary!.textContent ?? "", /Source: project/u);
+    const tools = container.querySelector<HTMLElement>("#settings-tools");
+    assert.ok(tools);
+    assert.equal(tools.querySelector(".settings-effective"), null);
+    assert.equal(tools.textContent?.includes("Effective at next safe boundary"), false);
+    assert.equal(tools.textContent?.includes("Effective search"), false);
+    assert.equal(tools.textContent?.includes("Effective vision"), false);
+    assert.equal(tools.textContent?.includes("Effective tool limits"), false);
+    assert.equal(tools.textContent?.includes("Effective attachment limit"), false);
+    for (const selector of ["#settings-search-enabled", "#settings-search-max-results", "#settings-search-max-bytes", "#settings-tool-timeout", "#settings-tool-output", "#settings-tool-attachment"]) {
+      assert.ok(tools.querySelector(selector), `${selector} remains an editable configuration control`);
+    }
   });
 });
 

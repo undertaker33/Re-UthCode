@@ -373,11 +373,13 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
           </div>
           <CustomSelect label={t("permission")} value={permissionSelectValue(state.permissionMode)} triggerIcon="permission" preferredMenuWidth={210} disabled={inputLocked || state.activeTurn} onChange={(value) => void onCommand(`/permission ${value}`)} options={[{ value: "", label: t("unavailable"), disabled: true }, { value: "default", label: t("default") }, { value: "auto", label: t("auto") }, { value: "full_access", label: t("fullAccess") }]} />
         </div>}
-        <div className="composer-model">
-          <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" preferredMenuWidth={320} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
-          {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
+        <div className="composer-right-controls">
+          <div className="composer-model">
+            <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" preferredMenuWidth={320} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
+            {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
+          </div>
+          <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || !submitPayloadAvailable}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>
         </div>
-        <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || !submitPayloadAvailable}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>
       </div>
     </section>
   );

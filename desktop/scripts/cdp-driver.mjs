@@ -41,6 +41,7 @@ const diffUnbornProject = option("diff-unborn-project");
 const artifactPath = option("artifact-path");
 const reviewMarkdownPath = option("review-markdown-path");
 const reviewTextPath = option("review-text-path");
+const reviewCodePath = option("review-code-path");
 const reviewImagePath = option("review-image-path");
 const expectedSessions = option("expected-sessions");
 const generalApiPrompt = "Reply with only this exact token: T12_GENERAL_API_ACCEPTED";
@@ -50,6 +51,7 @@ const delayAction = option("delay-action", flow === "general-cancel" ? "cancel" 
 const askQuestionCount = Number(option("ask-question-count", "4"));
 const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const skipQuit = process.argv.includes("--no-quit");
+const computerUse = process.argv.includes("--computer-use");
 const screenshotDir = option("screenshot-dir");
 const fixtureHtml = option("fixture-html");
 const reportPath = option("report");
@@ -79,6 +81,22 @@ function writeLog(event, details = {}) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Keep the runner-owned real window alive for native visual inspection. The
+// operator releases each checkpoint explicitly; ordinary CDP runs do not wait.
+async function computerUseCheckpoint(phase) {
+  if (!computerUse) return;
+  if (!screenshotDir) throw new Error("computer-use requires a screenshot directory");
+  const prefix = resolve(screenshotDir, `computer-use-${phase}`);
+  await writeFile(`${prefix}.ready.json`, JSON.stringify({ phase, port: cdpPort, packagedExe, continuePath: `${prefix}.continue` }, null, 2), "utf8");
+  writeLog("computer-use-ready", { phase, continuePath: `${prefix}.continue` });
+  while (Date.now() < flowDeadline) {
+    try { await readFile(`${prefix}.continue`); return; }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    await sleep(250);
+  }
+  throw new Error(`computer-use checkpoint timed out: ${phase}`);
 }
 
 async function writeAcceptanceReport(status, error) {
@@ -315,7 +333,9 @@ class CdpSession {
 
 async function waitFor(session, description, predicate) {
   let lastValue;
+  const deadline = Math.min(flowDeadline, Date.now() + (computerUse ? 30_000 : timeoutMs));
   while (true) {
+    if (Date.now() >= deadline) throw new Error(`CDP condition timed out: ${description}`);
     const remaining = remainingBudget(description);
     lastValue = await session.evaluate(predicate);
     if (lastValue) {
@@ -331,7 +351,9 @@ async function waitForStableObservation(session, description, expression, stable
   let previousDiagnosticSignature = null;
   let stableCount = 0;
   let lastValue = null;
+  const deadline = Math.min(flowDeadline, Date.now() + (computerUse ? 30_000 : timeoutMs));
   while (true) {
+    if (Date.now() >= deadline) throw new Error(`CDP observation timed out: ${description}`);
     const remaining = remainingBudget(description);
     lastValue = await session.evaluate(expression);
     const diagnosticSignature = lastValue ? JSON.stringify(lastValue) : null;
@@ -963,6 +985,7 @@ async function doubleClickUserImageAttachment(session) {
     const card = [...document.querySelectorAll('.timeline-entry--user .timeline-attachments .file-card[data-file-ref]')]
       .find((item) => (item.getAttribute('aria-label') || '').startsWith('review-attachment.png'));
     if (!card) return null;
+    card.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
     const rect = card.getBoundingClientRect();
     const style = getComputedStyle(card);
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, width: rect.width, height: rect.height, visible: style.display !== 'none' && style.visibility !== 'hidden', label: card.getAttribute('aria-label'), kind: card.getAttribute('data-file-kind'), refPresent: Boolean(card.getAttribute('data-file-ref')) };
@@ -1031,12 +1054,12 @@ async function submitPackagedReviewFlow(session) {
     const paths = cards.map((item) => (item.getAttribute('data-artifact-path') || '').replaceAll('\\\\', '/').toLowerCase());
     const names = cards.map((item) => (item.getAttribute('aria-label') || '').split(' · ')[0]);
     const processLogs = [...document.querySelectorAll('[data-process-id]')].some((item) => (item.textContent || '').includes('W05_REVIEW_PROCESS_LOG'));
-    return timeline.includes(${JSON.stringify(expectedText)}) && cards.length === 2 && names.includes('review.md') && names.includes('review.txt')
+    return timeline.includes(${JSON.stringify(expectedText)}) && cards.length === ${reviewCodePath ? 3 : 2} && names.includes('review.md') && names.includes('review.txt')
       && paths.some((path) => path.endsWith('/review.md')) && paths.some((path) => path.endsWith('/review.txt')) && processLogs;
   })()`);
   const artifactCards = await evaluateAction(session, "record formal Review artifact cards", `(() => [...document.querySelectorAll('.markdown-artifact-attachments .file-card[data-artifact-path]')].map((item) => ({ path: item.getAttribute('data-artifact-path'), name: (item.getAttribute('aria-label') || '').split(' · ')[0], kind: item.getAttribute('data-artifact-kind') })))()`);
-  if (artifactCards.length !== 2 || !artifactCards.some((item) => item.name === "review.md") || !artifactCards.some((item) => item.name === "review.txt")) throw new Error(`formal Review Markdown did not resolve the controlled artifacts: ${JSON.stringify(artifactCards)}`);
-  const expectedArtifactPaths = [reviewMarkdownPath, reviewTextPath].map((path) => String(path).replaceAll("\\", "/").toLowerCase());
+  if (artifactCards.length !== (reviewCodePath ? 3 : 2) || !artifactCards.some((item) => item.name === "review.md") || !artifactCards.some((item) => item.name === "review.txt")) throw new Error(`formal Review Markdown did not resolve the controlled artifacts: ${JSON.stringify(artifactCards)}`);
+  const expectedArtifactPaths = [reviewMarkdownPath, reviewTextPath, reviewCodePath].filter(Boolean).map((path) => String(path).replaceAll("\\", "/").toLowerCase());
   if (artifactCards.some((item) => !expectedArtifactPaths.includes(String(item.path).replaceAll("\\", "/").toLowerCase()))) throw new Error(`Review FileCards resolved outside the exact runner-owned artifact paths: ${JSON.stringify(artifactCards)}`);
   await waitFor(session, "sent image attachment belongs to the controlled Review Session", `(() => {
     const entry = [...document.querySelectorAll('.timeline-entry--user')].find((item) => (item.innerText || '').includes('Review the controlled files and process output.'));
@@ -1044,6 +1067,23 @@ async function submitPackagedReviewFlow(session) {
     return card ? { label: card.getAttribute('aria-label'), kind: card.getAttribute('data-file-kind'), refPresent: Boolean(card.getAttribute('data-file-ref')), hasThumbnail: Boolean(card.querySelector('img')) } : false;
   })()`);
   const sentImageAttachment = await doubleClickUserImageAttachment(session);
+
+  const processLogOpened = await evaluateAction(session, "open Process logs from the real Timeline", `(() => {
+    const details = document.querySelector('details.timeline-process-log');
+    if (!details) return false;
+    if (!details.open) details.querySelector('summary')?.click();
+    const process = [...details.querySelectorAll('.timeline-process-log__process')].find((item) => (item.textContent || '').includes('W05_REVIEW_PROCESS_LOG'));
+    const button = [...(process?.querySelectorAll('button') || [])].find((item) => (item.textContent || '').includes('Review process log'));
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!processLogOpened) throw new Error("actual Process output was not available from the Timeline Review action");
+  await waitFor(session, "Process Review tab contains real process output", `Boolean(document.querySelector('.review-panel__process-output')?.textContent?.includes('W05_REVIEW_PROCESS_LOG'))`);
+  const processTab = await evaluateAction(session, "record Process Review tab", `(() => ({ tab: [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => item.getAttribute('aria-selected') === 'true')?.textContent?.trim() || null, sequences: [...document.querySelectorAll('.review-panel__process-output [data-process-sequence]')].map((item) => item.getAttribute('data-process-sequence')), markerVisible: (document.querySelector('.review-panel__process-output')?.textContent || '').includes('W05_REVIEW_PROCESS_LOG') }))()`);
+  await capture(session, "review-process-log");
+
+  await computerUseCheckpoint("process-log-observation");
 
   const groupOpened = await evaluateAction(session, "expand the real ReadFile activity group", `(() => {
     const group = document.querySelector('details.timeline-activity-group');
@@ -1081,26 +1121,13 @@ async function submitPackagedReviewFlow(session) {
     return output.includes('W05_REVIEW_OUTPUT_BEGIN') && Boolean(document.querySelector('.review-panel__more'));
   })()`);
   const firstPage = await evaluateAction(session, "record bounded ReadFile Review page", `(() => ({ tab: document.querySelector('.review-panel__content')?.getAttribute('aria-label') || null, chars: document.querySelector('.review-panel__output')?.textContent?.length || 0, hasStart: (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_BEGIN'), hasMore: Boolean(document.querySelector('.review-panel__more')) }))()`);
+  await computerUseCheckpoint("tool-output-first-page");
   const moreOutput = await evaluateAction(session, "read next bounded Review page", `(() => { const button = document.querySelector('.review-panel__more'); if (!button || button.disabled) return false; button.click(); return true; })()`);
-  if (!moreOutput) throw new Error("bounded ReadFile Review did not expose its next page");
+  const readByComputerUse = computerUse && !moreOutput && await session.evaluate("(document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_END') && !document.querySelector('.review-panel__more')");
+  if (!moreOutput && !readByComputerUse) throw new Error("bounded ReadFile Review did not expose its next page");
   await waitFor(session, "ReadFile Review reaches final output page", `(() => (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_END') && !document.querySelector('.review-panel__more'))()`);
   const finalOutput = await evaluateAction(session, "record complete bounded Review output", `(() => ({ chars: document.querySelector('.review-panel__output')?.textContent?.length || 0, hasEnd: (document.querySelector('.review-panel__output')?.textContent || '').includes('W05_REVIEW_OUTPUT_END'), hasMore: Boolean(document.querySelector('.review-panel__more')) }))()`);
   await capture(session, "review-tool-output");
-
-  const processLogOpened = await evaluateAction(session, "open Process logs from the real Timeline", `(() => {
-    const details = document.querySelector('details.timeline-process-log');
-    if (!details) return false;
-    if (!details.open) details.querySelector('summary')?.click();
-    const process = [...details.querySelectorAll('.timeline-process-log__process')].find((item) => (item.textContent || '').includes('W05_REVIEW_PROCESS_LOG'));
-    const button = [...(process?.querySelectorAll('button') || [])].find((item) => (item.textContent || '').includes('Review process log'));
-    if (!button) return false;
-    button.click();
-    return true;
-  })()`);
-  if (!processLogOpened) throw new Error("actual Process output was not available from the Timeline Review action");
-  await waitFor(session, "Process Review tab contains real process output", `Boolean(document.querySelector('.review-panel__process-output')?.textContent?.includes('W05_REVIEW_PROCESS_LOG'))`);
-  const processTab = await evaluateAction(session, "record Process Review tab", `(() => ({ tab: [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => item.getAttribute('aria-selected') === 'true')?.textContent?.trim() || null, sequences: [...document.querySelectorAll('.review-panel__process-output [data-process-sequence]')].map((item) => item.getAttribute('data-process-sequence')), markerVisible: (document.querySelector('.review-panel__process-output')?.textContent || '').includes('W05_REVIEW_PROCESS_LOG') }))()`);
-  await capture(session, "review-process-log");
 
   await doubleClickReviewArtifact(session, "review.md");
   await waitFor(session, "Markdown artifact opened in Review", `Boolean([...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim() === 'review.md')) && Boolean(document.querySelector('.document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY'))`);
@@ -1110,10 +1137,25 @@ async function submitPackagedReviewFlow(session) {
   await waitFor(session, "Markdown Review rendered mode", `Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY'))`);
   const markdownTab = await evaluateAction(session, "record Markdown Review modes", `(() => ({ rendered: Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-markdown')?.textContent?.includes('W05_REVIEW_MARKDOWN_BODY')), sourceButton: [...document.querySelectorAll('.review-panel [role="tabpanel"] button')].some((item) => (item.textContent || '').includes('View source')) }))()`);
 
+  if (reviewCodePath) {
+    await doubleClickReviewArtifact(session, "review.py");
+    await waitFor(session, "Python source artifact opened with line numbers and highlighting", `(() => { const code = document.querySelector('.review-panel .document-preview-code[data-language="python"]'); return Boolean(code?.textContent?.includes('def describe_file') && code.querySelector('.document-preview-code__line-number') && code.querySelector('.token')); })()`);
+    await capture(session, "review-python-source");
+  }
+
   await doubleClickReviewArtifact(session, "review.txt");
   await waitFor(session, "text artifact opened in Review", `Boolean([...document.querySelectorAll('.review-panel__tabs [role="tab"]')].find((item) => (item.textContent || '').trim() === 'review.txt')) && Boolean(document.querySelector('.review-panel [role="tabpanel"] .document-preview-code')?.textContent?.includes('W05_REVIEW_TEXT_BODY'))`);
   const tabsBeforeClose = await evaluateAction(session, "record all actual Review tabs", `(() => [...document.querySelectorAll('.review-panel__tabs [role="tab"]')].map((item) => ({ label: item.textContent?.trim() || '', selected: item.getAttribute('aria-selected') === 'true' })))()`);
   if (!["ReadFile", "Process log", "review.md", "review.txt"].every((label) => tabsBeforeClose.some((tab) => tab.label.includes(label)))) throw new Error(`Review did not retain all real output/document tabs: ${JSON.stringify(tabsBeforeClose)}`);
+  const documentChrome = await waitFor(session, "active document tab stays visible without a duplicate embedded close", `(() => {
+    const nav = document.querySelector('.review-panel__tabs');
+    const selected = nav?.querySelector('[role="tab"][aria-selected="true"]')?.parentElement;
+    if (!nav || !selected) return false;
+    const bounds = nav.getBoundingClientRect(); const tab = selected.getBoundingClientRect();
+    const duplicateClose = Boolean(document.querySelector('.document-preview-content > header button[aria-label="Close file preview"]'));
+    return tab.left >= bounds.left - 1 && tab.right <= bounds.right + 1 && !duplicateClose ? { visible: true, duplicateClose: false, selected: selected.textContent?.trim() } : false;
+  })()`);
+  await computerUseCheckpoint("documents-and-logs");
   await clickReviewTab(session, "ReadFile");
   await waitFor(session, "switch back to safe bounded output tab", `Boolean(document.querySelector('.review-panel__output')?.textContent?.includes('W05_REVIEW_OUTPUT_BEGIN'))`);
   await clickReviewTab(session, "Process log");
@@ -1161,9 +1203,11 @@ async function submitPackagedReviewFlow(session) {
     output: { firstPage, finalPage: finalOutput },
     processLog: processTab,
     artifacts: artifactCards,
+    sourceCode: reviewCodePath ? { name: "review.py", language: "python", lineNumbers: true, highlighted: true } : null,
     attachment: { draft: imageAttachment, sentAndReviewed: sentImageAttachment },
     markdown: markdownTab,
     tabsBeforeClose,
+    documentChrome,
     tabsAfterClose: remainingTabs,
     ownerSwitch: { previousSessionId: oldSessionId, currentSessionId: newIdentity.id, observation: newOwnerReady },
   };
@@ -1273,15 +1317,17 @@ async function submitDelayedFlow(session, { general = false } = {}) {
   await waitFor(session, "accepted active draft cleared", "document.querySelector('.composer textarea')?.value === ''");
   const emptyAction = await evaluateAction(session, "observe empty active Composer action", `(() => { const input = document.querySelector('.composer textarea'); const button = document.querySelector('.composer-send'); return { empty: input?.value === '', disabled: button?.disabled, label: button?.getAttribute('aria-label'), pause: Boolean(document.querySelector('button[aria-label="Pause"]')), cancel: Boolean(document.querySelector('button[aria-label="Cancel" ]')) }; })()`);
   if (!emptyAction.empty || !emptyAction.disabled || /Steer|引导/u.test(emptyAction.label || '')) throw new Error(`empty active Composer exposed Steering: ${JSON.stringify(emptyAction)}`);
+  const emptyAlignment = await verifyComposerRightAlignment(session, "active empty Composer right alignment");
   await capture(session, "active-composer-empty-disabled");
   await setInput(session, "Message UthCode", "   ");
   await waitFor(session, "whitespace active Composer cannot steer", "document.querySelector('.composer-send')?.disabled === true && !/Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
   await setInput(session, "Message UthCode", "Inspect this additional context");
   await waitFor(session, "text enables actual Steering control", "document.querySelector('.composer-send')?.disabled === false && /Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
+  const textAlignment = await verifyComposerRightAlignment(session, "active text Composer right alignment");
   await capture(session, "active-composer-text-steering");
   await setInput(session, "Message UthCode", "");
   await waitFor(session, "clearing draft removes Steering", "document.querySelector('.composer-send')?.disabled === true && !/Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
-  flowEvidence.steeringDraft = { emptyAction, whitespaceDisabled: true, textEnabled: true, clearedDisabled: true };
+  flowEvidence.steeringDraft = { emptyAction, emptyAlignment, textAlignment, whitespaceDisabled: true, textEnabled: true, clearedDisabled: true };
   }
   await capture(session, "delayed-controls");
   if (delayAction === "cancel") {
@@ -2113,6 +2159,19 @@ async function runLifecycleFlow(session) {
   writeLog("assertion_pass", { description: `packaged Session lifecycle stage ${lifecycleStage} completed through real UI` });
 }
 
+async function verifyComposerRightAlignment(session, label) {
+  const observed = await waitForStableObservationWithin(session, label, `(() => {
+    const toolbar = document.querySelector('.composer-toolbar')?.getBoundingClientRect();
+    const model = document.querySelector('.composer-model')?.getBoundingClientRect();
+    const selector = document.querySelector('.composer-model .custom-select')?.getBoundingClientRect();
+    const context = document.querySelector('.composer-model .context-ring')?.getBoundingClientRect();
+    const send = document.querySelector('.composer-send')?.getBoundingClientRect();
+    return { ready: Boolean(toolbar?.width && model?.width && selector?.width && send?.width), toolbarRight: toolbar?.right, modelLeft: model?.left, modelRight: model?.right, selectorRight: selector?.right, contextLeft: context?.left ?? null, contextRight: context?.right ?? null, sendLeft: send?.left, sendRight: send?.right };
+  })()`, 3_000);
+  if (Math.abs(observed.toolbarRight - observed.sendRight) > 1 || observed.modelRight > observed.sendLeft + 1 || (observed.contextLeft !== null && (observed.selectorRight > observed.contextLeft + 1 || observed.contextRight > observed.modelRight + 1))) throw new Error(`Composer right controls were not aligned: ${JSON.stringify(observed)}`);
+  return observed;
+}
+
 async function verifyEmptyComposer(session) {
   await waitFor(session, "empty Composer ready", "document.querySelector('.composer textarea')?.value === '' && !document.querySelector('.settings-view')");
   const observations = [];
@@ -2130,6 +2189,7 @@ async function verifyEmptyComposer(session) {
       return { ready: Boolean(input && input.value === '' && rect?.height), width: innerWidth, contentWidth, visibleLabels, height: rect?.height, verticalPadding, contentHeight: rect ? rect.height - verticalPadding : null, inputHeight: input?.getBoundingClientRect().height, resize: input ? getComputedStyle(input).resize : null, iconSelectors: selectors.filter((node) => node.querySelector('.custom-select__trigger > svg')).length };
     })()`, 3_000);
     if (observed.resize !== "none" || observed.iconSelectors !== 2 || observed.visibleLabels !== (observed.contentWidth >= 600 ? 2 : 0)) throw new Error(`empty Composer responsive controls were incorrect: ${JSON.stringify(observed)}`);
+    observed.rightAlignment = await verifyComposerRightAlignment(session, "empty Composer right alignment " + width);
     observations.push(observed);
     await capture(session, "empty-composer-" + width);
   }
@@ -2147,6 +2207,7 @@ async function verifyEmptyComposer(session) {
     return { ready: document.querySelector('.app-shell')?.classList.contains('panel-hidden') && Boolean(button && label && icon), labelVisible: Boolean(visible), buttonWidth: rect?.width, labelWidth: labelRect?.width, iconWidth: iconRect?.width, fits: Boolean(rect && labelRect && iconRect && (!visible || (labelRect.left >= rect.left && labelRect.right <= rect.right && iconRect.left >= rect.left && iconRect.right <= rect.right && iconRect.right <= labelRect.left))) };
   })()`, 3_000);
   if (!wideSend.labelVisible || !wideSend.fits) throw new Error(`wide empty Send label did not fit: ${JSON.stringify(wideSend)}`);
+  const wideAlignment = await verifyComposerRightAlignment(session, "wide empty Composer right alignment");
   await capture(session, "empty-composer-wide-visible-send");
   const wideSelectors = await evaluateAction(session, "wide Composer exposes complete selected labels", `(() => {
     const nodes = [...document.querySelectorAll('.composer .custom-select__value')];
@@ -2155,12 +2216,14 @@ async function verifyEmptyComposer(session) {
   const wideLabelsComplete = wideSelectors.count === 2 && wideSelectors.labels.every((item) => item.visible && item.fits) && wideSelectors.labels.some((item) => item.text === 'qwen3.7-flash-openai-responses');
   await setInput(session, "Message UthCode", "Responsive draft");
   await waitFor(session, "filled wide Composer retains complete selected labels", "[...document.querySelectorAll('.composer .custom-select__value')].every((node) => getComputedStyle(node).display !== 'none' && node.scrollWidth <= node.clientWidth + 1)");
+  const filledWideAlignment = await verifyComposerRightAlignment(session, "filled wide Composer right alignment");
   await capture(session, "filled-composer-wide-labels");
   await setInput(session, "Message UthCode", "");
   await setSelect(session, "Runtime panel layout", "docked");
   await session.send("Emulation.setDeviceMetricsOverride", { width: 720, height: 900, deviceScaleFactor: 1, mobile: false });
   await setInput(session, "Message UthCode", "Responsive draft");
   await waitFor(session, "filled narrow Composer uses icon triggers", "[...document.querySelectorAll('.composer .custom-select__value')].every((node) => getComputedStyle(node).display === 'none')");
+  const filledNarrowAlignment = await verifyComposerRightAlignment(session, "filled narrow Composer right alignment");
   await capture(session, "filled-composer-narrow-icons");
   await setInput(session, "Message UthCode", "");
   const before = observations[0].inputHeight;
@@ -2186,7 +2249,7 @@ async function verifyEmptyComposer(session) {
   }
   await session.send("Emulation.clearDeviceMetricsOverride");
   if (!wideLabelsComplete) throw new Error(`wide Composer labels were missing or clipped: ${JSON.stringify(wideSelectors)}`);
-  return { observations, wideSend, wideSelectors, menus, filledResponsive: true, menuHeightStable: true, keyboardEscape: true };
+  return { observations, wideSend, wideSelectors, menus, wideAlignment, filledWideAlignment, filledNarrowAlignment, filledResponsive: true, menuHeightStable: true, keyboardEscape: true };
 }
 
 async function verifyPermissionActivity(session) {
@@ -2379,6 +2442,12 @@ async function runSettingsUiFlow(session) {
   await capture(session, "settings-sidebar-search-single-clear");
   await clearSearch();
   await category("tools");
+  const toolsSummary = await evaluateAction(session, "removed tools effective-summary rows and retained editable settings", `(() => {
+    const tools = document.querySelector('#settings-tools');
+    const fields = ['settings-search-enabled', 'settings-search-key', 'settings-tool-timeout', 'settings-tool-output', 'settings-tool-attachment'];
+    return { summaryAbsent: !tools?.querySelector('.settings-effective'), editableFields: fields.filter((id) => tools?.querySelector('#' + id)).length, fieldCount: fields.length };
+  })()`);
+  if (!toolsSummary.summaryAbsent || toolsSummary.editableFields !== toolsSummary.fieldCount) throw new Error(`Tools settings retained removed rows or lost editable fields: ${JSON.stringify(toolsSummary)}`);
   const before = await evaluateAction(session, "focus web search switch", "(() => { const input = document.querySelector('#settings-search-enabled[role=switch]'); if (!input) throw new Error('switch missing'); input.focus(); return input.checked; })()");
   await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: " ", code: "Space", windowsVirtualKeyCode: 32 });
   await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32 });
@@ -2404,9 +2473,27 @@ async function runSettingsUiFlow(session) {
   if (successFlashes.length) throw new Error(`Settings success message flashed during actual saves: ${JSON.stringify(successFlashes)}`);
   await clickText(session, "Back to chat");
   const emptyComposer = await verifyEmptyComposer(session);
-  flowEvidence.settingsUi = { archives, themes, fields, savedSwitch, searchPlacement, clearCount, successFlashes, emptyComposer, archiveProjects: projects, generalFilter: true, exactOwnerFilter: true, emptySearch: true, modalEscape: true };
+  flowEvidence.settingsUi = { archives, themes, fields, savedSwitch, toolsSummary, searchPlacement, clearCount, successFlashes, emptyComposer, archiveProjects: projects, generalFilter: true, exactOwnerFilter: true, emptySearch: true, modalEscape: true };
   if (!skipQuit) await evaluateAction(session, "close isolated Settings shell", "window.uthcode.closeShell()");
   writeLog("assertion_pass", { description: "actual packaged Settings themes, field search, keyboard switch, archive owner filtering and narrow rendering" });
+}
+
+async function verifyDefaultDiffFiles(session, label) {
+  const observed = await waitForStableObservationWithin(session, label, `(() => {
+    const files = [...document.querySelectorAll('details.review-panel__diff-file')];
+    return { ready: files.length > 0, files: files.map((file) => ({ path: file.dataset.filePath, open: file.open, title: file.querySelector('summary')?.textContent?.trim() || '' })) };
+  })()`, 3_000);
+  if (!observed.files[0]?.open || observed.files.slice(1).some((file) => file.open) || observed.files.some((file) => !file.path || !file.title) || new Set(observed.files.map((file) => file.path)).size !== observed.files.length) throw new Error(`Diff did not default to one open file with independent named headers: ${JSON.stringify(observed)}`);
+  return observed;
+}
+
+async function revealDiffFile(session, path) {
+  await evaluateAction(session, "expand actual Diff file " + path, `(() => {
+    const file = [...document.querySelectorAll('details.review-panel__diff-file')].find((item) => item.dataset.filePath === ${JSON.stringify(path)});
+    if (!file) throw new Error('Diff file header missing');
+    if (!file.open) file.querySelector('summary')?.click();
+  })()`);
+  await waitFor(session, "Diff file is open " + path, `[...document.querySelectorAll('details.review-panel__diff-file')].some((file) => file.dataset.filePath === ${JSON.stringify(path)} && file.open)`);
 }
 
 async function runDiffFlow(session) {
@@ -2414,16 +2501,31 @@ async function runDiffFlow(session) {
   const opened = await evaluateAction(session, "open current workspace diff from chat", `(() => { const button = document.querySelector('button[aria-label=\"Review current diff\"], button[aria-label=\"查看当前差异\"]'); if (!button) return false; button.click(); return true; })()`);
   if (!opened) throw new Error("chat entry for the current workspace diff was not available");
   await waitFor(session, "current diff review panel", "Boolean(document.querySelector('.review-panel .review-panel__diff'))");
+  const defaultFiles = await verifyDefaultDiffFiles(session, "initial Diff defaults to the first file only");
+  await capture(session, "current-workspace-diff-initial");
+  await computerUseCheckpoint("workspace-diff");
+  await evaluateAction(session, "open the second Diff file independently", "document.querySelectorAll('details.review-panel__diff-file')[1]?.querySelector('summary')?.click()");
+  await waitFor(session, "first two Diff files open independently", "(() => { const files = [...document.querySelectorAll('details.review-panel__diff-file')]; return files.length > 1 && files[0].open && files[1].open && files.slice(2).every((file) => !file.open); })()");
+  await capture(session, "current-workspace-diff-independent-files");
+  await session.send("Page.bringToFront");
+  await evaluateAction(session, "close only the second Diff file and focus the first header", "(() => { const files = document.querySelectorAll('details.review-panel__diff-file'); files[1]?.querySelector('summary')?.click(); files[0]?.querySelector('summary')?.focus(); })()");
+  await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: "\r", unmodifiedText: "\r" });
+  await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await waitFor(session, "keyboard collapses the first Diff file", "[...document.querySelectorAll('details.review-panel__diff-file')].every((file) => !file.open)");
+  await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: "\r", unmodifiedText: "\r" });
+  await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await verifyDefaultDiffFiles(session, "keyboard restores the first file independently");
+  for (const file of defaultFiles.files) await revealDiffFile(session, file.path);
   const evidence = await evaluateAction(session, "inspect real current workspace diff", `(() => {
     const panel = document.querySelector('.review-panel');
-    const paths = [...(panel?.querySelectorAll('.review-panel__paths li') || [])].map((item) => ({ status: item.querySelector('code')?.textContent?.trim() || '', path: item.querySelector('span')?.textContent?.trim() || '', original: item.querySelector('small')?.textContent?.replace(/^←\\s*/u, '').trim() || '' }));
+    const paths = [...(panel?.querySelectorAll('details.review-panel__diff-file') || [])].map((item) => ({ status: item.querySelector('summary code')?.textContent?.trim() || '', path: item.dataset.filePath || '', original: item.querySelector('summary small')?.textContent?.replace(/^←\\s*/u, '').trim() || '' }));
     const sections = [...(panel?.querySelectorAll('.review-panel__diff-section') || [])].map((item) => ({ scope: item.dataset.diffScope, title: item.querySelector('h3')?.textContent?.trim() || '', text: [...item.querySelectorAll('.review-panel__diff-line code')].map((line) => line.textContent || '').join('\\n') }));
     const rows = [...(panel?.querySelectorAll('[data-diff-kind]') || [])].map((item) => ({ kind: item.dataset.diffKind, text: item.querySelector('code')?.textContent, numbers: [...item.querySelectorAll('.review-panel__diff-line-number')].map((number) => number.textContent), background: getComputedStyle(item).backgroundColor }));
     const trigger = panel?.querySelector('.review-panel__content-header .custom-select__trigger');
     const rect = trigger?.getBoundingClientRect();
     return { paths, sections, rows, viewedAt: panel?.querySelector('.review-panel__content-header time')?.dateTime || '', selectorInHeader: Boolean(trigger), selectorSize: rect ? { width: rect.width, height: rect.height } : null, emptyParagraphs: panel?.querySelectorAll('.review-panel__diff-empty').length || 0, text: panel?.innerText || '' };
   })()`);
-  await capture(session, "current-workspace-diff-initial");
+  await capture(session, "current-workspace-diff-all-expanded");
   writeLog("acceptance_diagnostic", {
     description: "initial packaged Diff evidence from controlled Git fixture",
     evidence: {
@@ -2435,9 +2537,9 @@ async function runDiffFlow(session) {
     },
   });
   const paths = evidence.paths;
-  const required = ["modified.txt", "added.txt", "deleted.txt", "renamed.txt", "long.txt"];
+  const required = ["modified.txt", "added.txt", "deleted.txt", "重命名.txt", "long.txt"];
   for (const path of required) if (!paths.some((entry) => entry.path === path)) throw new Error(`tracked Git change is missing from actual diff status: ${path}; ${JSON.stringify(paths)}`);
-  if (!paths.some((entry) => entry.path === "renamed.txt" && entry.original === "rename-source.txt")) throw new Error(`tracked rename original path was not shown: ${JSON.stringify(paths)}`);
+  if (!paths.some((entry) => entry.path === "重命名.txt" && entry.original === "rename-source.txt")) throw new Error(`tracked rename original path was not shown: ${JSON.stringify(paths)}`);
   const untrackedStatus = paths.filter((entry) => entry.path === "untracked.txt" || entry.original === "untracked.txt");
   if (untrackedStatus.length !== 1 || untrackedStatus[0].path !== "untracked.txt" || untrackedStatus[0].status !== "??" || untrackedStatus[0].original !== "") throw new Error(`All uncommitted scope must show exactly one untracked.txt entry with Git status ??: ${JSON.stringify(untrackedStatus)}`);
   const allDiff = evidence.sections.map((section) => section.text).join("\n");
@@ -2455,7 +2557,7 @@ async function runDiffFlow(session) {
   if (!allDiff.includes("DIFF_CONTEXT_ROW_497") || !allDiff.includes("DIFF_CHANGED_ROW_500") || allDiff.includes("DIFF_CONTEXT_ROW_1\n") || evidence.rows.filter((row) => row.kind === "context").length > 12) throw new Error("1000-line file was not restricted to change hunks and nearby context");
   if (!evidence.selectorInHeader || !evidence.sections.some((section) => section.scope === "staged") || !evidence.sections.some((section) => section.scope === "unstaged")) throw new Error("actual scope selector or sourced patch sections were absent");
   if (evidence.viewedAt || evidence.emptyParagraphs || !evidence.selectorSize || evidence.selectorSize.width > 145 || evidence.selectorSize.height > 32) throw new Error(`Diff header was not compact or retained removed content: ${JSON.stringify(evidence)}`);
-  flowEvidence.diff = { project: resolve(diffProject), statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: true, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), visibleTimestampAbsent: true, emptyParagraphsAbsent: true, selectorSize: evidence.selectorSize };
+  flowEvidence.diff = { project: resolve(diffProject), defaultFiles, independentDisclosure: true, keyboardDisclosure: true, statusPaths: paths, untrackedStatusPaths: untrackedStatus, untrackedContentInDiff: true, sections: evidence.sections.map((section) => ({ title: section.title, lines: section.text.split(/\r?\n/u).length })), visibleTimestampAbsent: true, emptyParagraphsAbsent: true, selectorSize: evidence.selectorSize };
   await capture(session, "current-workspace-diff");
   const scopeEvidence = [];
   for (const [value, labels] of [["staged", ["Staged", "已暂存"]], ["unstaged", ["Unstaged", "未暂存"]]]) {
@@ -2464,11 +2566,12 @@ async function runDiffFlow(session) {
     await waitFor(session, "Diff scope options", "Boolean(document.querySelector('[role=listbox]'))");
     const selected = await evaluateAction(session, "select Diff scope option", `(() => { const button = [...document.querySelectorAll('[role=option]')].find((item) => ${JSON.stringify(labels)}.includes(item.textContent?.trim())); if (!button) return false; button.click(); return true; })()`);
     if (!selected) throw new Error("Diff scope option was absent: " + value);
-    const scoped = await waitFor(session, "only selected Diff scope", `(() => { const scopes = [...document.querySelectorAll('.review-panel__diff-section')].map((item) => item.dataset.diffScope); return scopes.length === 1 && scopes[0] === ${JSON.stringify(value)} ? { scopes, paths: [...document.querySelectorAll('.review-panel__paths li span')].map((item) => item.textContent?.trim() || '') } : false; })()`);
-    const expectedPaths = value === "staged" ? ["added.txt", "deleted.txt", "renamed.txt"] : ["long.txt", "modified.txt", "untracked.txt"];
+    const scoped = await waitFor(session, "only selected Diff scope", `(() => { const scopes = [...document.querySelectorAll('.review-panel__diff-section')].map((item) => item.dataset.diffScope); return scopes.length > 0 && scopes.every((scope) => scope === ${JSON.stringify(value)}) ? { scopes, paths: [...document.querySelectorAll('details.review-panel__diff-file')].map((item) => item.dataset.filePath || '') } : false; })()`);
+    const expectedPaths = value === "staged" ? ["added.txt", "deleted.txt", "重命名.txt"] : ["long.txt", "modified.txt", "untracked.txt"];
     const actualPaths = [...scoped.paths].sort();
     if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) throw new Error(`${value} Diff scope paths were missing, extra, or out of contract: ${JSON.stringify({ expectedPaths, actualPaths })}`);
-    scopeEvidence.push({ value, ...scoped });
+    const scopedDefaults = await verifyDefaultDiffFiles(session, value + " Diff defaults to the first file only");
+    scopeEvidence.push({ value, ...scoped, defaultFiles: scopedDefaults });
     await capture(session, "current-workspace-diff-" + value);
   }
   flowEvidence.diff = { ...flowEvidence.diff, selectorInHeader: true, removedColor, addedColor, longFileLines: 1000, renderedContextRows: evidence.rows.filter((row) => row.kind === "context").length, scopes: scopeEvidence };
@@ -2502,17 +2605,22 @@ async function runDiffFlow(session) {
   await evaluateAction(session, "open actual new Session in unborn project", `(() => { const button = [...document.querySelectorAll('button.project-select')].find((item) => item.getAttribute('aria-label') === ${JSON.stringify(unbornProjectLabel)})?.closest('.project-item')?.querySelector('button.new-session-line'); if (!button) throw new Error('unborn project New session entry missing'); button.click(); })()`);
   await waitFor(session, "unborn Coding project ready", `(async () => { const status = await window.uthcode.requestRuntime('status.get', {}); return status?.project_key === ${JSON.stringify(diffUnbornProject)} && status?.runtime?.state === 'ready'; })()`);
   await clickSelector(session, 'button[aria-label="Review current diff"], button[aria-label="查看当前差异"]');
+  const unbornDefaults = await verifyDefaultDiffFiles(session, "unborn Diff defaults to the first file only");
+  await revealDiffFile(session, "new-file.txt");
   const unborn = await waitFor(session, "actual new-file-only Git patch", `(() => {
     const panel = document.querySelector('.review-panel');
     const row = [...(panel?.querySelectorAll('[data-diff-kind="added"] code') || [])].find((item) => item.textContent === 'UNBORN_NEW_FILE_BODY');
-    return row ? { content: row.textContent, paths: [...panel.querySelectorAll('.review-panel__paths li span')].map((item) => item.textContent), emptyParagraphs: panel.querySelectorAll('.review-panel__diff-empty').length, visibleTimestamp: Boolean(panel.querySelector('time')) } : false;
+    return row && row.getBoundingClientRect().height > 0 ? { content: row.textContent, paths: [...panel.querySelectorAll('details.review-panel__diff-file')].map((item) => item.dataset.filePath), emptyParagraphs: panel.querySelectorAll('.review-panel__diff-empty').length, visibleTimestamp: Boolean(panel.querySelector('time')) } : false;
   })()`);
   if (unborn.emptyParagraphs || unborn.visibleTimestamp || !unborn.paths.includes("new-file.txt")) throw new Error(`unborn Diff was incorrect: ${JSON.stringify(unborn)}`);
-  flowEvidence.diff.unborn = unborn;
+  flowEvidence.diff.unborn = { ...unborn, defaultFiles: unbornDefaults };
   await capture(session, "diff-unborn-new-file");
+  await computerUseCheckpoint("workspace-unborn");
   await setSelect(session, requestedLanguage === "en" ? "Diff scope" : "Diff 范围", requestedLanguage === "en" ? "Staged" : "已暂存");
-  await waitFor(session, "unborn staged scope has no new-file body or empty paragraph", "!document.querySelector('.review-panel__diff')?.textContent.includes('UNBORN_NEW_FILE_BODY') && !document.querySelector('.review-panel__diff-empty') && document.querySelectorAll('.review-panel__paths li').length === 0");
+  await waitFor(session, "unborn staged scope has no new-file body or empty paragraph", "!document.querySelector('.review-panel__diff')?.textContent.includes('UNBORN_NEW_FILE_BODY') && !document.querySelector('.review-panel__diff-empty') && document.querySelectorAll('details.review-panel__diff-file').length === 0");
   await setSelect(session, requestedLanguage === "en" ? "Diff scope" : "Diff 范围", requestedLanguage === "en" ? "Unstaged" : "未暂存");
+  await verifyDefaultDiffFiles(session, "unborn unstaged Diff defaults to the first file only");
+  await revealDiffFile(session, "new-file.txt");
   await waitFor(session, "unborn unstaged scope restores actual new-file body", "document.querySelector('.review-panel__diff')?.textContent.includes('UNBORN_NEW_FILE_BODY')");
   flowEvidence.diff.unborn.scopeFiltering = true;
   if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");

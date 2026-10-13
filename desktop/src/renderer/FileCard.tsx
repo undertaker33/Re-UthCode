@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { ArtifactDescriptor, DesktopAttachmentDraft } from "../desktop-api";
 import { useTranslation, type TranslationKey } from "./i18n";
 import type { DocumentPreview } from "./DocumentPreviewPanel";
@@ -94,10 +94,22 @@ export interface ImagePreviewModalProps {
 export function ImagePreviewModal({ src, alt, onClose }: ImagePreviewModalProps) {
   const { t } = useTranslation();
   const dialogRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const dragRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+
+  useLayoutEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      setZoom((value) => Math.min(8, Math.max(0.25, value * (event.deltaY < 0 ? 1.12 : 0.89))));
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, []);
 
   useEffect(() => {
     restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -137,11 +149,6 @@ export function ImagePreviewModal({ src, alt, onClose }: ImagePreviewModalProps)
     };
   }, [onClose]);
 
-  const onWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setZoom((value) => Math.min(8, Math.max(0.25, value * (event.deltaY < 0 ? 1.12 : 0.89))));
-  };
-
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -157,7 +164,7 @@ export function ImagePreviewModal({ src, alt, onClose }: ImagePreviewModalProps)
   return <div className="image-preview-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <div ref={dialogRef} className="image-preview-modal" role="dialog" aria-modal="true" aria-label={alt} tabIndex={-1}>
       <header><strong>{alt}</strong><button type="button" aria-label={t("closePreview")} onClick={onClose}><UiIcon name="close" /></button></header>
-      <div className="image-preview-stage" onWheel={onWheel} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerCancel={endDrag}><img src={src} alt={alt} draggable={false} style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})` }} /></div>
+      <div ref={stageRef} className="image-preview-stage" onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerCancel={endDrag}><img src={src} alt={alt} draggable={false} style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})` }} /></div>
       <footer><span>{Math.round(zoom * 100)}%</span><button type="button" onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }); }}>{t("resetPreview")}</button></footer>
     </div>
   </div>;
