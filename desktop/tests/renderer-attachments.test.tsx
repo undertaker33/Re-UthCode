@@ -253,6 +253,30 @@ test("empty Composer marks the compact state while keeping its submit label acce
   assert.match(populated, /<span class="composer-send__label">Send<\/span>/u);
 });
 
+test("active Composer keeps an empty or whitespace draft disabled until Steering has text", () => {
+  for (const composerText of ["", " \n\t "]) {
+    const markup = renderToStaticMarkup(renderComposer(createInitialState({
+      language: "en",
+      composerText,
+      composerAttachments: [],
+      activeTurn: true,
+      turnStatus: "running",
+    })));
+    assert.match(markup, /class="composer-send"[^>]*title="Send" aria-label="Send" disabled=""/u, "empty Steering is not labeled or styled like an enabled blue action");
+    assert.match(markup, /class="composer-submit-proxy"[^>]*disabled=""/u, "the hidden submit hook observes the same empty-text rule");
+  }
+
+  const activeDraft = renderToStaticMarkup(renderComposer(createInitialState({
+    language: "en",
+    composerText: "continue the current task",
+    composerAttachments: [],
+    activeTurn: true,
+    turnStatus: "running",
+  })));
+  assert.match(activeDraft, /class="composer-send"[^>]*title="Steer" aria-label="Steer"/u);
+  assert.doesNotMatch(activeDraft, /class="composer-send"[^>]*title="Steer" aria-label="Steer" disabled=""/u);
+});
+
 test("RendererErrorBoundary reports only its fixed boundary code and recovers locally", async () => {
   const globalObject = globalThis as unknown as Record<string, unknown>;
   const previousApi = globalObject.uthcode;
@@ -896,17 +920,19 @@ test("Python document preview renders syntax tokens with dark and light theme co
 test("document preview composer adapts to conversation-column width", async () => {
   const css = await (await import("node:fs/promises")).readFile(new URL("../src/renderer/app.css", import.meta.url), "utf8");
   assert.match(css, /\.app-shell\.document-preview-visible > main\s*\{[^}]*container-name:\s*conversation;[^}]*container-type:\s*inline-size/su);
-  const compactComposer = css.split("@container conversation (max-width: 720px)")[1]?.split("@container conversation (max-width: 380px)")[0];
-  const narrowComposer = css.split("@container conversation (max-width: 380px)")[1];
-  assert.ok(compactComposer);
+  assert.match(css, /\.composer\s*\{[^}]*container-name:\s*composer-controls;[^}]*container-type:\s*inline-size/su);
+  const narrowComposer = css.split("@container conversation (max-width: 720px)")[1]?.split("@container composer-controls (min-width: 600px)")[0];
+  const wideComposer = css.split("@container composer-controls (min-width: 600px)")[1];
   assert.ok(narrowComposer);
-  assert.match(compactComposer, /\.composer-toolbar\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/su);
-  assert.match(compactComposer, /\.composer-model\s*\{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-row:\s*2/su);
-  assert.match(compactComposer, /\.composer-send\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*1;[^}]*white-space:\s*nowrap/su);
-  assert.match(compactComposer, /\.composer-attachment-actions button\s*\{[^}]*white-space:\s*nowrap/su);
-  assert.match(narrowComposer, /\.composer-selectors\s*\{[^}]*display:\s*grid;[^}]*grid-column:\s*1 \/ -1/su);
-  assert.match(narrowComposer, /\.composer-model\s*\{[^}]*grid-row:\s*2/su);
-  assert.match(narrowComposer, /\.composer-send\s*\{[^}]*grid-row:\s*2/su);
+  assert.ok(wideComposer);
+  assert.match(narrowComposer, /\.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/su, "compact controls stay on one row when the conversation column narrows");
+  assert.match(css, /\.composer \.custom-select--responsive-trigger\s*\{[^}]*width:\s*30px;[^}]*min-width:\s*30px;[^}]*flex:\s*0 0 30px/su);
+  assert.match(wideComposer, /\.composer-selectors \.custom-select--responsive-trigger\s*\{[^}]*width:\s*138px/su);
+  assert.match(wideComposer, /\.composer-model \.custom-select--responsive-trigger,[\s\S]*?\.composer-model \.custom-select--responsive-trigger\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%;[^}]*flex:\s*0 1 auto/su, "wide model label uses its natural width while remaining constrained by available Composer space");
+  assert.match(wideComposer, /\.custom-select__responsive-label\s*\{[^}]*display:\s*block/su);
+  assert.match(wideComposer, /\.custom-select__trigger > \.ui-icon:nth-of-type\(2\)\s*\{[^}]*display:\s*block/su);
+  assert.match(narrowComposer, /\.composer-attachment-actions button\s*\{[^}]*white-space:\s*nowrap/su);
+  assert.doesNotMatch(css, /@container conversation \(max-width: 380px\)/u, "the former stacked toolbar does not reappear on a very narrow panel");
   assert.match(css, /\.composer\[data-empty="true"\] \.composer-toolbar\s*\{[^}]*grid-template-columns:\s*max-content minmax\(0, 1fr\) max-content;[^}]*grid-template-rows:\s*auto/su);
   const compactEmptySendRules = [...css.matchAll(/\.composer\[data-empty="true"\] \.composer-send\s*\{([^}]*)\}/gu)].map((match) => match[1] ?? "");
   assert.equal(compactEmptySendRules.length, 3, "the base rule stays content-sized and only narrow rules constrain the icon trigger");
@@ -914,10 +940,11 @@ test("document preview composer adapts to conversation-column width", async () =
   assert.match(compactEmptySendRules[1] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
   assert.match(compactEmptySendRules[2] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
   const narrowViewportRules = css.slice(css.lastIndexOf("@media (max-width: 820px)"), css.lastIndexOf("@container conversation (max-width: 720px)"));
-  const narrowConversationRules = css.slice(css.lastIndexOf("@container conversation (max-width: 720px)"));
+  const narrowConversationRules = css.slice(css.lastIndexOf("@container conversation (max-width: 720px)"), css.lastIndexOf("@container composer-controls (min-width: 600px)"));
   assert.match(narrowViewportRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
   assert.match(narrowConversationRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
-  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*6px/su, "filled Composer keeps its existing stacked narrow layout");
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*6px/su, "filled text entry keeps its existing stacked narrow layout");
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/su, "the filled toolbar does not wrap as the text area grows");
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer\[data-empty="true"\]\s*\{\s*padding-bottom:\s*8px;/su);
   assert.match(css, /\.app-shell\.panel-docked \.composer\[data-empty="true"\] \.composer-input\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*gap:\s*8px/su);
 });

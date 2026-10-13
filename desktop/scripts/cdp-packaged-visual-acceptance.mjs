@@ -323,7 +323,7 @@ async function waitForPackagedTarget(port, timeoutMs) {
   throw new Error(`packaged Electron target did not appear on fixed port ${port}: ${lastError}`);
 }
 
-function fixtureConfiguration(baseUrl, supportsImages = false) {
+function fixtureConfiguration(baseUrl, supportsImages = false, displayName = "CDP fixture", readableMenuProfiles = false) {
   return [
     'default_model = "fixture/fixture-model"',
     'default_permission_mode = "default"',
@@ -336,7 +336,7 @@ function fixtureConfiguration(baseUrl, supportsImages = false) {
     '[models."fixture/fixture-model"]',
     'provider = "fixture"',
     'remote_id = "fixture-model"',
-    'display_name = "CDP fixture"',
+    `display_name = "${displayName}"`,
     // The Desktop bootstrap prompt is larger than the smallest legal test
     // window. Keep the fixture model generous enough to reach the Provider
     // request so each acceptance flow exercises the intended boundary.
@@ -344,6 +344,15 @@ function fixtureConfiguration(baseUrl, supportsImages = false) {
     "max_output_tokens = 256",
     ...(supportsImages ? ["supports_images = true"] : []),
     "",
+    ...(readableMenuProfiles ? Array.from({ length: 4 }, (_, index) => [
+      `[models."fixture/menu-model-${index}"]`,
+      'provider = "fixture"',
+      `remote_id = "menu-model-${index}"`,
+      `display_name = "Fixture model ${index} with a readable long display name"`,
+      "context_window = 128000",
+      "max_output_tokens = 256",
+      "",
+    ]).flat() : []),
   ].join("\n");
 }
 
@@ -526,6 +535,7 @@ async function main() {
         "--scenario", fixtureScenario,
         "--ready-file", fixtureReadyPath,
         "--plan-chunk-delay-ms", String(planChunkDelayMs),
+        ...(flow === "delay" ? ["--delay-ms", "5000"] : []),
         ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
       ], {
@@ -550,7 +560,7 @@ async function main() {
       // Visual/shell flows still bootstrap the real Runtime status path. Give
       // them the same valid user-config shape without starting a Provider
       // server or making any network request.
-      const configuration = fixtureConfiguration("http://127.0.0.1:1/v1");
+      const configuration = fixtureConfiguration("http://127.0.0.1:1/v1", false, isSettingsFlow ? "qwen3.7-flash-openai-responses" : "CDP fixture", isSettingsFlow);
       await writeFile(electronContext.configPath, configuration, "utf8");
       const hostConfigDirectory = join(host.env.HOME, ".uthcode");
       await mkdir(hostConfigDirectory, { recursive: true });

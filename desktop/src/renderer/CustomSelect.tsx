@@ -4,7 +4,7 @@ import { UiIcon } from "./UiIcon";
 import type { UiIconName } from "./UiIcon";
 
 export interface SelectOption { value: string; label: string; disabled?: boolean }
-export interface CustomSelectProps { value: string; options: readonly SelectOption[]; onChange: (value: string) => void; label: string; disabled?: boolean; id?: string; onOpen?: () => void; triggerIcon?: UiIconName }
+export interface CustomSelectProps { value: string; options: readonly SelectOption[]; onChange: (value: string) => void; label: string; disabled?: boolean; id?: string; onOpen?: () => void; triggerIcon?: UiIconName; preferredMenuWidth?: number }
 export function nextEnabledOption(options: readonly SelectOption[], current: number, step: 1 | -1): number {
   let next = current;
   for (let count = 0; count < options.length; count += 1) { next = (next + step + options.length) % options.length; if (!options[next]?.disabled) return next; }
@@ -25,14 +25,15 @@ const MENU_GAP = 5;
 const VIEWPORT_MARGIN = 8;
 const MENU_MAX_HEIGHT = 220;
 
-export function customSelectPosition(rect: DOMRect, optionCount: number, viewportWidth: number, viewportHeight: number): CustomSelectPosition {
+export function customSelectPosition(rect: DOMRect, optionCount: number, viewportWidth: number, viewportHeight: number, preferredMenuWidth = rect.width): CustomSelectPosition {
   const estimatedHeight = Math.min(MENU_MAX_HEIGHT, Math.max(42, optionCount * 32 + 10));
   const spaceAbove = Math.max(0, rect.top - VIEWPORT_MARGIN - MENU_GAP);
   const spaceBelow = Math.max(0, viewportHeight - rect.bottom - VIEWPORT_MARGIN - MENU_GAP);
   const placement = spaceAbove >= estimatedHeight || spaceAbove >= spaceBelow ? "above" : "below";
   const availableHeight = placement === "above" ? spaceAbove : spaceBelow;
   const menuHeight = Math.min(estimatedHeight, Math.max(0, availableHeight));
-  const width = Math.max(0, Math.min(rect.width, viewportWidth - VIEWPORT_MARGIN * 2));
+  const maximumWidth = Math.max(0, viewportWidth - VIEWPORT_MARGIN * 2);
+  const width = Math.max(0, Math.min(Math.max(rect.width, preferredMenuWidth), maximumWidth));
   const left = Math.max(VIEWPORT_MARGIN, Math.min(rect.left, viewportWidth - width - VIEWPORT_MARGIN));
   return {
     placement,
@@ -40,12 +41,12 @@ export function customSelectPosition(rect: DOMRect, optionCount: number, viewpor
       top: placement === "above" ? Math.max(VIEWPORT_MARGIN, rect.top - MENU_GAP - menuHeight) : rect.bottom + MENU_GAP,
       left,
       width,
-      maxHeight: Math.max(0, availableHeight),
+      maxHeight: Math.min(MENU_MAX_HEIGHT, Math.max(0, availableHeight)),
     },
   };
 }
 
-export function CustomSelect({ value, options, onChange, label, disabled = false, id, onOpen, triggerIcon }: CustomSelectProps) {
+export function CustomSelect({ value, options, onChange, label, disabled = false, id, onOpen, triggerIcon, preferredMenuWidth }: CustomSelectProps) {
   const generatedId = useId();
   const listId = `${id ?? generatedId}-listbox`;
   const [open, setOpen] = useState(false);
@@ -80,6 +81,7 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
       options.length,
       Math.max(document.documentElement.clientWidth, window.innerWidth),
       Math.max(document.documentElement.clientHeight, window.innerHeight),
+      preferredMenuWidth,
     );
     setPlacement(position.placement);
     setMenuStyle(position.style);
@@ -113,14 +115,15 @@ export function CustomSelect({ value, options, onChange, label, disabled = false
   };
   const selected = options.find((item) => item.value === value);
   const selectedLabel = selected?.label ?? value;
+  const triggerDescription = triggerIcon && !label.includes(selectedLabel) ? `${label}: ${selectedLabel}` : label;
   const themeRoot = root.current?.closest<HTMLElement>(".theme-light, .theme-dark, .theme-system");
   const themeClass = themeRoot && ["theme-light", "theme-dark", "theme-system"].find((name) => themeRoot.classList.contains(name)) || "theme-dark";
   const menu = open && typeof document !== "undefined" ? createPortal(<div className={`custom-select__portal-scope ${themeClass}`} style={{ position: "fixed", inset: 0, zIndex: 1200, pointerEvents: "none", background: "transparent" }}><div ref={list} id={listId} className={`custom-select__list is-${placement}`} style={{ ...menuStyle, zIndex: 1, pointerEvents: "auto" }} role="listbox" aria-label={label}>{options.map((option, index) => <button ref={(element) => { optionRefs.current[index] = element; }} id={`${listId}-option-${index}`} type="button" role="option" title={option.label} key={option.value} aria-selected={option.value === value} tabIndex={index === active ? 0 : -1} className={index === active ? "is-active" : ""} disabled={option.disabled} onPointerMove={() => { if (!option.disabled) setActive(index); }} onClick={() => choose(index)}>{option.label}</button>)}</div></div>, document.body) : null;
-  return <div className={`custom-select${triggerIcon ? " custom-select--icon-only" : ""}`} ref={root} onKeyDown={keyDown} onBlur={(event) => {
+  return <div className={`custom-select${triggerIcon ? " custom-select--responsive-trigger" : ""}`} ref={root} onKeyDown={keyDown} onBlur={(event) => {
     const next = event.relatedTarget as Node | null;
     if (!root.current?.contains(next) && !list.current?.contains(next)) closeMenu();
   }}>
-    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={triggerIcon ? `${label}: ${selectedLabel}` : label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}>{triggerIcon ? <UiIcon name={triggerIcon} /> : <><span className="custom-select__value">{selectedLabel}</span><UiIcon name="chevron" /></>}</button>
+    <button ref={trigger} id={id} type="button" className="custom-select__trigger" title={label} aria-label={triggerDescription} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} disabled={disabled} onClick={() => { if (open) closeMenu(); else openMenu(); }}>{triggerIcon ? <><UiIcon name={triggerIcon} /><span className="custom-select__value custom-select__responsive-label">{selectedLabel}</span><UiIcon name="chevron" /></> : <><span className="custom-select__value">{selectedLabel}</span><UiIcon name="chevron" /></>}</button>
     {menu}
   </div>;
 }

@@ -1269,6 +1269,20 @@ async function submitDelayedFlow(session, { general = false } = {}) {
     ? "Boolean(document.querySelector('button[aria-label=\"Cancel\"], button[aria-label=\"取消\"]'))"
     : "Boolean(document.querySelector('button[aria-label=\"Pause\"]')) && Boolean(document.querySelector('button[aria-label=\"Cancel\"]'))";
   await waitFor(session, "delayed turn controls", controls);
+  if (!general) {
+  await waitFor(session, "accepted active draft cleared", "document.querySelector('.composer textarea')?.value === ''");
+  const emptyAction = await evaluateAction(session, "observe empty active Composer action", `(() => { const input = document.querySelector('.composer textarea'); const button = document.querySelector('.composer-send'); return { empty: input?.value === '', disabled: button?.disabled, label: button?.getAttribute('aria-label'), pause: Boolean(document.querySelector('button[aria-label="Pause"]')), cancel: Boolean(document.querySelector('button[aria-label="Cancel" ]')) }; })()`);
+  if (!emptyAction.empty || !emptyAction.disabled || /Steer|引导/u.test(emptyAction.label || '')) throw new Error(`empty active Composer exposed Steering: ${JSON.stringify(emptyAction)}`);
+  await capture(session, "active-composer-empty-disabled");
+  await setInput(session, "Message UthCode", "   ");
+  await waitFor(session, "whitespace active Composer cannot steer", "document.querySelector('.composer-send')?.disabled === true && !/Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
+  await setInput(session, "Message UthCode", "Inspect this additional context");
+  await waitFor(session, "text enables actual Steering control", "document.querySelector('.composer-send')?.disabled === false && /Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
+  await capture(session, "active-composer-text-steering");
+  await setInput(session, "Message UthCode", "");
+  await waitFor(session, "clearing draft removes Steering", "document.querySelector('.composer-send')?.disabled === true && !/Steer|引导/u.test(document.querySelector('.composer-send')?.getAttribute('aria-label') || '')");
+  flowEvidence.steeringDraft = { emptyAction, whitespaceDisabled: true, textEnabled: true, clearedDisabled: true };
+  }
   await capture(session, "delayed-controls");
   if (delayAction === "cancel") {
     writeLog("action", { action: "click_text", text: "Cancel" });
@@ -2111,9 +2125,11 @@ async function verifyEmptyComposer(session) {
       const rect = composer?.getBoundingClientRect();
       const style = composer ? getComputedStyle(composer) : null;
       const verticalPadding = style ? parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) : 0;
-      return { ready: Boolean(input && input.value === '' && rect?.height), width: innerWidth, height: rect?.height, verticalPadding, contentHeight: rect ? rect.height - verticalPadding : null, inputHeight: input?.getBoundingClientRect().height, resize: input ? getComputedStyle(input).resize : null, iconSelectors: selectors.filter((node) => node.classList.contains('custom-select--icon-only') && node.querySelector('.custom-select__trigger > svg') && !node.querySelector('.custom-select__value')).length };
+      const contentWidth = composer ? composer.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) : 0;
+      const visibleLabels = selectors.filter((node) => { const value = node.querySelector('.custom-select__value'); return value && getComputedStyle(value).display !== 'none' && value.getBoundingClientRect().width > 0; }).length;
+      return { ready: Boolean(input && input.value === '' && rect?.height), width: innerWidth, contentWidth, visibleLabels, height: rect?.height, verticalPadding, contentHeight: rect ? rect.height - verticalPadding : null, inputHeight: input?.getBoundingClientRect().height, resize: input ? getComputedStyle(input).resize : null, iconSelectors: selectors.filter((node) => node.querySelector('.custom-select__trigger > svg')).length };
     })()`, 3_000);
-    if (observed.resize !== "none" || observed.iconSelectors !== 2) throw new Error(`empty Composer controls were incorrect: ${JSON.stringify(observed)}`);
+    if (observed.resize !== "none" || observed.iconSelectors !== 2 || observed.visibleLabels !== (observed.contentWidth >= 600 ? 2 : 0)) throw new Error(`empty Composer responsive controls were incorrect: ${JSON.stringify(observed)}`);
     observations.push(observed);
     await capture(session, "empty-composer-" + width);
   }
@@ -2132,18 +2148,45 @@ async function verifyEmptyComposer(session) {
   })()`, 3_000);
   if (!wideSend.labelVisible || !wideSend.fits) throw new Error(`wide empty Send label did not fit: ${JSON.stringify(wideSend)}`);
   await capture(session, "empty-composer-wide-visible-send");
+  const wideSelectors = await evaluateAction(session, "wide Composer exposes complete selected labels", `(() => {
+    const nodes = [...document.querySelectorAll('.composer .custom-select__value')];
+    return { count: nodes.length, labels: nodes.map((node) => ({ text: node.textContent, visible: getComputedStyle(node).display !== 'none', fits: node.scrollWidth <= node.clientWidth + 1 })) };
+  })()`);
+  const wideLabelsComplete = wideSelectors.count === 2 && wideSelectors.labels.every((item) => item.visible && item.fits) && wideSelectors.labels.some((item) => item.text === 'qwen3.7-flash-openai-responses');
+  await setInput(session, "Message UthCode", "Responsive draft");
+  await waitFor(session, "filled wide Composer retains complete selected labels", "[...document.querySelectorAll('.composer .custom-select__value')].every((node) => getComputedStyle(node).display !== 'none' && node.scrollWidth <= node.clientWidth + 1)");
+  await capture(session, "filled-composer-wide-labels");
+  await setInput(session, "Message UthCode", "");
   await setSelect(session, "Runtime panel layout", "docked");
+  await session.send("Emulation.setDeviceMetricsOverride", { width: 720, height: 900, deviceScaleFactor: 1, mobile: false });
+  await setInput(session, "Message UthCode", "Responsive draft");
+  await waitFor(session, "filled narrow Composer uses icon triggers", "[...document.querySelectorAll('.composer .custom-select__value')].every((node) => getComputedStyle(node).display === 'none')");
+  await capture(session, "filled-composer-narrow-icons");
+  await setInput(session, "Message UthCode", "");
   const before = observations[0].inputHeight;
+  const menus = [];
   for (const selector of [".composer-selectors .custom-select__trigger", ".composer-model .custom-select__trigger"]) {
     await clickSelector(session, selector);
     await waitFor(session, "icon selector opens actual options", "Boolean(document.querySelector('[role=listbox] [role=option]'))");
     const height = await evaluateAction(session, "empty textarea height with options open", "document.querySelector('.composer textarea').getBoundingClientRect().height");
     if (Math.abs(height - before) > 1) throw new Error("empty input height changed when a selector opened");
+    const menu = await waitForStableObservationWithin(session, "readable narrow Composer menu", `(() => {
+      const list = document.querySelector('[role=listbox]');
+      const rect = list?.getBoundingClientRect();
+      const options = [...(list?.querySelectorAll('[role=option]') || [])];
+      return { ready: Boolean(rect?.width && options.length), width: rect?.width, height: rect?.height, top: rect?.top, bottom: rect?.bottom, left: rect?.left, right: rect?.right, viewport: innerWidth, viewportHeight: innerHeight, optionWidths: options.map((node) => node.getBoundingClientRect().width), optionHeights: options.map((node) => node.getBoundingClientRect().height), overflow: options.some((node) => node.scrollWidth > node.clientWidth + 1), labels: options.map((node) => node.textContent) };
+    })()`, 3_000);
+    const requiredWidth = selector.includes('composer-model') ? 320 : 210;
+    if (menu.width < Math.min(requiredWidth, menu.viewport - 16) - 1 || menu.left < 7 || menu.right > menu.viewport - 7 || menu.top < 7 || menu.bottom > menu.viewportHeight - 7 || menu.height > 221 || menu.overflow || menu.optionHeights.some((value) => value > 96)) throw new Error(`Composer menu collapsed or overflowed: ${JSON.stringify(menu)}`);
+    menus.push({ selector, ...menu });
+    await capture(session, selector.includes('composer-model') ? "composer-narrow-model-menu" : "composer-narrow-permission-menu");
     await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
     await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
     await waitFor(session, "icon selector Escape restores focus", `!document.querySelector('[role=listbox]') && document.activeElement === document.querySelector(${JSON.stringify(selector)})`);
   }
-  return { observations, wideSend, menuHeightStable: true, keyboardEscape: true };
+  await session.send("Emulation.clearDeviceMetricsOverride");
+  if (!wideLabelsComplete) throw new Error(`wide Composer labels were missing or clipped: ${JSON.stringify(wideSelectors)}`);
+  return { observations, wideSend, wideSelectors, menus, filledResponsive: true, menuHeightStable: true, keyboardEscape: true };
 }
 
 async function verifyPermissionActivity(session) {
