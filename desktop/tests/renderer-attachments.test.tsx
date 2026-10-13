@@ -89,7 +89,8 @@ test("Review Diff scopes preserve Git status and render actual unified hunk line
     const tab = { kind: "workspace-diff" as const, id: "diff-tab", title: "Working tree", owner, state: "completed" as const, diff };
     await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="diff-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
     assert.equal(container.querySelectorAll(".review-panel__diff-section").length, 2);
-    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["staged.py", "unstaged.py", "untracked.txt"]);
+    assert.deepEqual([...container.querySelectorAll(".review-panel__diff-file > summary span")].map((path) => path.textContent), ["staged.py", "unstaged.py", "untracked.txt"]);
+    assert.deepEqual([...container.querySelectorAll<HTMLDetailsElement>(".review-panel__diff-file")].map((file) => file.open), [true, false, false], "only the first file starts expanded");
     const diffHeader = container.querySelector(".review-panel__content-header--diff");
     assert.ok(diffHeader);
     assert.match(diffHeader.textContent ?? "", /Current working tree/u);
@@ -110,8 +111,8 @@ test("Review Diff scopes preserve Git status and render actual unified hunk line
     assert.ok(stagedOption);
     act(() => { stagedOption!.click(); });
     assert.deepEqual([...container.querySelectorAll(".review-panel__diff-section")].map((section) => section.getAttribute("data-diff-scope")), ["staged"]);
-    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["staged.py"]);
-    assert.equal(container.querySelector(".review-panel__paths")?.textContent?.includes("untracked.txt"), false, "untracked status is not converted to synthetic patch content");
+    assert.deepEqual([...container.querySelectorAll(".review-panel__diff-file > summary span")].map((path) => path.textContent), ["staged.py"]);
+    assert.equal(container.querySelector(".review-panel__diff-file")?.textContent?.includes("untracked.txt"), false, "untracked status is not converted to synthetic patch content in a staged view");
     assert.deepEqual(parseUnifiedDiffLines("@@ -2,2 +4,2 @@ context\n same\n-old\n+new").map((line) => [line.kind, line.oldLine, line.newLine]), [
       ["hunk", null, null],
       ["context", 2, 4],
@@ -127,13 +128,105 @@ test("Review Diff scopes preserve Git status and render actual unified hunk line
   });
 });
 
+test("Review keeps the selected tab visible by scrolling only the tab strip and avoids duplicate embedded close controls", async () => {
+  await withRendererDom(async (dom, container, root) => {
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/review-tabs", sessionId: "session", viewRevision: 1, ownerKey: "C:/review-tabs" };
+    const tabs = Array.from({ length: 4 }, (_, index) => {
+      const name = `review-${index + 1}.txt`;
+      return { kind: "document" as const, id: `document-${index + 1}`, title: name, owner, preview: { asset: { display_name: name, mime_type: "text/plain" }, text: `body ${index + 1}` } };
+    });
+    const render = (activeTabId: string) => <LanguageProvider value="en"><ReviewPanel tabs={tabs} activeTabId={activeTabId} width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>;
+    await act(async () => { root.render(render(tabs[0]!.id)); });
+    const nav = container.querySelector<HTMLElement>(".review-panel__tabs");
+    const reviewPanel = container.querySelector<HTMLElement>(".review-panel");
+    assert.ok(nav);
+    assert.ok(reviewPanel);
+    Object.defineProperty(nav, "clientWidth", { configurable: true, value: 200 });
+    Object.defineProperty(nav, "clientLeft", { configurable: true, value: 0 });
+    Object.defineProperty(nav, "scrollLeft", { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(nav, "getBoundingClientRect", { configurable: true, value: () => ({ left: 100, right: 300, width: 200, top: 20, bottom: 58, height: 38 }) });
+    const selected = container.querySelector<HTMLElement>(`.review-panel__tab:nth-child(4)`);
+    assert.ok(selected);
+    Object.defineProperty(selected, "getBoundingClientRect", { configurable: true, value: () => {
+      const left = 270 - nav.scrollLeft;
+      return { left, right: left + 80, width: 80, top: 20, bottom: 47, height: 27 };
+    } });
+    await act(async () => { root.render(render(tabs[3]!.id)); });
+    assert.equal(nav.scrollLeft, 50, "the selected tab is brought into view with the tab strip's horizontal scroll position");
+    const wrapperRect = selected.getBoundingClientRect();
+    const navRect = nav.getBoundingClientRect();
+    assert.ok(wrapperRect.left >= navRect.left && wrapperRect.right <= navRect.right, "the active tab and its close button are inside the visible tab strip");
+    assert.equal(reviewPanel.scrollLeft, 0, "tab selection does not scroll the Review panel or chat ancestors");
+    assert.equal(container.querySelector(".document-preview-content .document-preview-panel__close"), null, "the embedded document header has no second close action");
+    assert.ok(container.querySelector(".review-panel__tab > button:nth-child(2)"), "the active tab keeps its tab-close action");
+    assert.ok(container.querySelector(".review-panel__header > button"), "the Review panel keeps its close-all action");
+  });
+});
+
+test("Review process output labels streams and omits empty ordinary chunks while retaining status", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/process-review", sessionId: "session", viewRevision: 1, ownerKey: "C:/process-review" };
+    const processId = "process-streams";
+    const entries: ProcessLogEntry[] = [
+      { processId, sequence: 1, stream: "stdout", text: "stdout line" },
+      { processId, sequence: 2, stream: "stderr", text: "stderr line" },
+      { processId, sequence: 3, stream: "stdout", text: "later stdout" },
+      { processId, sequence: 4, stream: "stdout", text: "" },
+      { processId, sequence: 5, stream: "stdout", text: "final stdout bytes", state: "exited", exitCode: 0 },
+      { processId, sequence: 6, stream: "status", text: "", state: "exited", exitCode: 0 },
+    ];
+    const tab = { kind: "process-log" as const, id: "process-tab", title: `Process log: ${processId}`, owner, processId, entries, reader: { nextCursor: 5, earliestCursor: 1, cursorExpired: false, state: "exited", expired: false, loading: false, error: null } };
+    await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId={tab.id} width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
+    const rows = [...container.querySelectorAll<HTMLElement>(".review-panel__process-entry")];
+    assert.deepEqual(rows.map((row) => row.getAttribute("data-process-stream")), ["stdout", "stderr", "stdout", "stdout", "status"]);
+    assert.deepEqual(rows.map((row) => row.querySelector("small")?.textContent), ["stdout", "stderr", "stdout", "stdout · exited", "status · exited"]);
+    assert.deepEqual(rows.map((row) => row.querySelector("pre")?.textContent), ["stdout line", "stderr line", "later stdout", "final stdout bytes", "exited"]);
+    assert.equal(container.querySelector('[data-process-sequence="4"]'), null, "an empty ordinary output chunk does not create a blank card");
+    assert.equal(container.querySelector('[data-process-sequence="5"][data-process-stream="stdout"] pre')?.textContent, "final stdout bytes", "the state label does not replace non-empty output");
+    assert.ok(container.querySelector('[data-process-sequence="6"][data-process-stream="status"]'), "the terminal status entry remains visible");
+  });
+});
+
+test("image Review header uses its MIME type while standalone previews keep a close action", () => {
+  const preview = { asset: { display_name: "review-image.png", mime_type: "image/png" }, text: "", imageSrc: "data:image/png;base64,AAAA" };
+  const markup = renderToStaticMarkup(<LanguageProvider value="en"><DocumentPreviewPanel
+    preview={preview}
+    width={460}
+    minWidth={220}
+    maxWidth={700}
+    onWidthChange={() => undefined}
+    onClose={() => undefined}
+  /></LanguageProvider>);
+  assert.match(markup, /<small>image\/png<\/small>/u);
+  assert.match(markup, /class="document-preview-panel__close"/u);
+  assert.doesNotMatch(markup, /<small>plain<\/small>/u);
+
+  const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/review-image", sessionId: "session", viewRevision: 1, ownerKey: "C:/review-image" };
+  const tab = { kind: "document" as const, id: "image-tab", title: "review-image.png", owner, preview };
+  const embeddedMarkup = renderToStaticMarkup(<LanguageProvider value="en"><ReviewPanel
+    tabs={[tab]}
+    activeTabId={tab.id}
+    width={460}
+    minWidth={220}
+    maxWidth={700}
+    onWidthChange={() => undefined}
+    onSelectTab={() => undefined}
+    onCloseTab={() => undefined}
+    onClose={() => undefined}
+    onReadToolOutput={() => undefined}
+    onReadProcess={() => undefined}
+  /></LanguageProvider>);
+  assert.match(embeddedMarkup, /<small>image\/png<\/small>/u);
+  assert.doesNotMatch(embeddedMarkup, /<small>plain<\/small>/u);
+});
+
 test("Review Diff renders untracked text patches and leaves empty scopes without a footer", async () => {
   await withRendererDom(async (dom, container, root) => {
     const diff = {
       source: "current_working_tree" as const,
       project_key: "C:/workspace-empty",
       viewed_at: "2026-10-12T01:00:00Z",
-      status: { branch: "main", unborn: false, truncated: false, entries: [{ xy: "??", path: "new.txt" }] },
+      status: { branch: "main", unborn: false, truncated: false, entries: [{ xy: "??", path: "new.txt" }, { xy: "??", path: "unavailable.bin", review_error: "unavailable" as const }] },
       staged_diff: { text: "", truncated: false, size_bytes: 0 },
       unstaged_diff: {
         text: "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+new file body\n",
@@ -146,8 +239,12 @@ test("Review Diff renders untracked text patches and leaves empty scopes without
     const tab = { kind: "workspace-diff" as const, id: "empty-diff-tab", title: "Working tree", owner, state: "completed" as const, diff };
     await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="empty-diff-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
     assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 0);
-    assert.deepEqual([...container.querySelectorAll(".review-panel__paths li span")].map((path) => path.textContent), ["new.txt"]);
+    const fileRows = [...container.querySelectorAll<HTMLDetailsElement>(".review-panel__diff-file")];
+    assert.deepEqual(fileRows.map((file) => file.querySelector("summary span")?.textContent), ["new.txt", "unavailable.bin"]);
+    assert.deepEqual(fileRows.map((file) => file.open), [true, false]);
     assert.equal(container.querySelector('[data-diff-kind="added"] code')?.textContent, "new file body");
+    assert.match(fileRows[1]?.querySelector('[role="status"]')?.textContent ?? "", /content is unavailable/u);
+    assert.equal(fileRows[1]?.querySelector(".review-panel__diff-section"), null, "unavailable content keeps its path/status explanation without fabricating a patch");
     const scope = container.querySelector<HTMLButtonElement>('.review-panel__content-header--diff [aria-label="Diff scope"]');
     assert.ok(scope);
     act(() => { scope!.click(); });
@@ -158,6 +255,88 @@ test("Review Diff renders untracked text patches and leaves empty scopes without
     assert.equal(container.querySelectorAll(".review-panel__diff-empty").length, 0, "an empty scope does not add a redundant empty-state footer");
     assert.equal(container.querySelectorAll(".review-panel__diff-section").length, 0);
     assert.equal(container.querySelector('[data-diff-kind="added"] code'), null, "the untracked patch appears only in the unstaged scope");
+  });
+});
+
+test("Review Diff keeps one independently collapsible file header across staged and unstaged patches", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const path = "src/file with spaces.ts";
+    const diff = {
+      source: "current_working_tree" as const,
+      project_key: "C:/workspace-files",
+      viewed_at: "2026-10-13T00:00:00Z",
+      status: { branch: "main", unborn: false, truncated: false, entries: [{ xy: "MM", path }, { xy: " M", path: "src/second.ts" }] },
+      staged_diff: {
+        text: 'diff --git "a/src/file with spaces.ts" "b/src/file with spaces.ts"\n--- "a/src/file with spaces.ts"\n+++ "b/src/file with spaces.ts"\n@@ -1 +1 @@\n-old staged\n+new staged\n',
+        truncated: false,
+        size_bytes: 140,
+      },
+      unstaged_diff: {
+        text: 'diff --git "a/src/file with spaces.ts" "b/src/file with spaces.ts"\n@@ -1 +1 @@\n-old unstaged\n+new unstaged\ndiff --git a/src/second.ts b/src/second.ts\n@@ -2 +2 @@\n-old second\n+new second\n',
+        truncated: false,
+        size_bytes: 170,
+      },
+      truncated: false,
+    };
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/workspace-files", sessionId: "session", viewRevision: 1, ownerKey: "C:/workspace-files" };
+    const tab = { kind: "workspace-diff" as const, id: "files-tab", title: "Working tree", owner, state: "completed" as const, diff };
+    await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="files-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
+    const files = [...container.querySelectorAll<HTMLDetailsElement>(".review-panel__diff-file")];
+    assert.equal(files.length, 2, "a file modified in both scopes has one summary, not two");
+    assert.deepEqual(files.map((file) => file.getAttribute("data-file-path")), [path, "src/second.ts"]);
+    assert.deepEqual(files.map((file) => file.querySelector("summary code")?.textContent), ["MM", " M"]);
+    assert.deepEqual(files.map((file) => file.open), [true, false]);
+    assert.ok(files.every((file) => file.querySelector("summary > .ui-icon--chevron")?.getAttribute("aria-hidden") === "true"), "file headers show a decorative expand/collapse indicator");
+    assert.deepEqual([...files[0]!.querySelectorAll(".review-panel__diff-section")].map((section) => section.getAttribute("data-diff-scope")), ["staged", "unstaged"]);
+    assert.equal(files[0]!.querySelectorAll('[data-diff-kind="removed"] code').length, 2);
+    files[1]!.querySelector<HTMLElement>("summary")?.click();
+    assert.equal(files[0]!.open, true, "opening a second file leaves the first file open");
+    assert.equal(files[1]!.open, true);
+    files[1]!.querySelector<HTMLElement>("summary")?.click();
+    assert.equal(files[1]!.open, false, "each file can be closed without changing its neighbors");
+  });
+});
+
+test("Review Diff groups mixed-quoted rename hunks by the decoded file path", async () => {
+  await withRendererDom(async (_dom, container, root) => {
+    const renamedPath = "重命名.txt";
+    const diff = {
+      source: "current_working_tree" as const,
+      project_key: "C:/workspace-renames",
+      viewed_at: "2026-10-13T00:00:00Z",
+      status: { branch: "main", unborn: false, truncated: false, entries: [
+        { xy: " R", path: renamedPath, original_path: "old.txt" },
+        { xy: " R", path: "new file.txt", original_path: renamedPath },
+        { xy: " M", path: "other.txt" },
+        { xy: "A ", path: "staged-1" },
+      ] },
+      staged_diff: {
+        text: "diff --git a/staged-1 b/staged-1\n@@ -0,0 +1 @@\n+staged body\n",
+        truncated: false,
+        size_bytes: 62,
+      },
+      unstaged_diff: {
+        text: 'diff --git a/old.txt "b/\\351\\207\\215\\345\\221\\275\\345\\220\\215.txt"\nrename from old.txt\nrename to ' + renamedPath + '\n@@ -1 +1 @@\n-old body\n+renamed body\ndiff --git "a/\\351\\207\\215\\345\\221\\275\\345\\220\\215.txt" b/new file.txt\nrename from ' + renamedPath + '\nrename to new file.txt\n@@ -1 +1 @@\n-old renamed\n+new file\ndiff --git a/other.txt b/other.txt\n@@ -1 +1 @@\n-old other\n+new other\ndiff --git a/unknown.txt c/unknown.txt\n@@ -0,0 +1 @@\n+unknown payload\n',
+        truncated: false,
+        size_bytes: 250,
+      },
+      truncated: false,
+    };
+    const owner = { generation: 1, mode: "coding" as const, projectKey: "C:/workspace-renames", sessionId: "session", viewRevision: 1, ownerKey: "C:/workspace-renames" };
+    const tab = { kind: "workspace-diff" as const, id: "rename-tab", title: "Working tree", owner, state: "completed" as const, diff };
+    await act(async () => { root.render(<LanguageProvider value="en"><ReviewPanel tabs={[tab]} activeTabId="rename-tab" width={360} minWidth={220} maxWidth={700} onWidthChange={() => undefined} onSelectTab={() => undefined} onCloseTab={() => undefined} onClose={() => undefined} onReadToolOutput={() => undefined} onReadProcess={() => undefined} /></LanguageProvider>); });
+    const files = [...container.querySelectorAll<HTMLDetailsElement>(".review-panel__diff-file")];
+    assert.deepEqual(files.map((file) => file.getAttribute("data-file-path")), [renamedPath, "new file.txt", "other.txt", "staged-1", "unstaged-4"]);
+    assert.deepEqual(files.map((file) => file.open), [true, false, false, false, false]);
+    assert.equal(files[0]?.querySelector("summary small")?.textContent, "← old.txt");
+    assert.equal(files[0]?.querySelector('[data-diff-kind="added"] code')?.textContent, "renamed body");
+    assert.equal(files[0]?.querySelector('[data-diff-kind="removed"] code')?.textContent, "old body");
+    assert.equal(files[1]?.querySelector("summary small")?.textContent, `← ${renamedPath}`);
+    assert.equal(files[1]?.querySelector('[data-diff-kind="added"] code')?.textContent, "new file");
+    assert.equal(files[1]?.querySelector('[data-diff-kind="removed"] code')?.textContent, "old renamed");
+    assert.equal(files[0]?.textContent?.includes("old renamed"), false, "the reverse mixed-quoted rename patch belongs to its decoded destination path");
+    assert.equal(files[0]?.textContent?.includes("unknown payload"), false, "an unparseable multi-file chunk is not attached to the first known file");
+    assert.ok(files[4]?.textContent?.includes("diff --git a/unknown.txt c/unknown.txt"), "the unknown chunk keeps its original header and body");
   });
 });
 
@@ -437,7 +616,7 @@ test("T09 chat image attachment opens in the shared review tab and keeps the zoo
     if (method === "attachment.preview") return { attachment: { ...attachment, preview_kind: "image", data_url: attachment.data_url } };
     return method === "status.get" ? { active_turn: false } : {};
   });
-  await withRendererDom(async (_dom, container, root) => {
+  await withRendererDom(async (dom, container, root) => {
     act(() => { root.render(<App api={api} initialState={createInitialState({
       language: "en",
       runtimeState: "ready",
@@ -446,7 +625,7 @@ test("T09 chat image attachment opens in the shared review tab and keeps the zoo
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     const card = container.querySelector<HTMLElement>(".timeline-attachments .file-card");
     assert.ok(card);
-    act(() => { card.dispatchEvent(new _dom.window.MouseEvent("dblclick", { bubbles: true })); });
+    act(() => { card.dispatchEvent(new dom.window.MouseEvent("dblclick", { bubbles: true })); });
     await act(async () => { for (let index = 0; index < 3; index += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     assert.equal(container.querySelectorAll(".review-panel").length, 1);
     assert.equal(container.querySelector(".document-review-image img")?.getAttribute("src"), attachment.data_url);
@@ -455,6 +634,12 @@ test("T09 chat image attachment opens in the shared review tab and keeps the zoo
     act(() => { imageButton.click(); });
     assert.ok(container.querySelector(".image-preview-modal[role='dialog']"), "the right-panel preview retains the existing zoom and focus modal");
     assert.ok(container.querySelector(".image-preview-modal footer button"));
+    const stage = container.querySelector<HTMLElement>(".image-preview-stage");
+    assert.ok(stage);
+    const wheel = new dom.window.WheelEvent("wheel", { deltaY: -1, cancelable: true, bubbles: true });
+    act(() => { stage.dispatchEvent(wheel); });
+    assert.equal(wheel.defaultPrevented, true, "native zoom consumes the wheel event so the underlying chat does not scroll");
+    assert.match(container.querySelector(".image-preview-modal footer")?.textContent ?? "", /112%/u);
   });
 });
 
@@ -730,7 +915,7 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
         ? { ref: params.ref, content: "first", offset: 0, next_offset: 5, total_bytes: 11, sha256: "a".repeat(64), eof: false }
         : { ref: params.ref, content: "second", offset: 5, next_offset: 11, total_bytes: 11, sha256: "a".repeat(64), eof: true };
     }
-    if (method === "process.read") return { process_id: params.process_id ?? "process-review", entries: [], next_cursor: params.cursor ?? 1, earliest_cursor: 0, state: "running" };
+    if (method === "process.read") return { process_id: params.process_id ?? "process-review", entries: [{ sequence: 2, stream: "stdout", text: "continued process output" }, { sequence: 3, stream: "stderr", text: "continued stderr output" }], next_cursor: 3, earliest_cursor: 0, state: "exited", exit_code: 0 };
     if (method === "project.sessions") return { sessions: project.sessions };
     if (method === "session.resume") return { session_id: params.session_id ?? null, replay: [], run: null };
     if (method === "history.page") return { session_id: params.session_id ?? null, records: [], next_cursor: null, has_more: false };
@@ -835,6 +1020,13 @@ test("T09 App reviews the kickoff event, bounded output pages, process log, and 
     act(() => { readNewer.click(); });
     await flush();
     assert.deepEqual(calls.find((call) => call.method === "process.read")?.params, { process_id: "process-review", cursor: 1 });
+    assert.match(container.querySelector(".review-panel__process-output")?.textContent ?? "", /continued process output/u);
+    const loadedStdout = container.querySelector<HTMLElement>('[data-process-sequence="2"][data-process-stream="stdout"]');
+    const loadedStderr = container.querySelector<HTMLElement>('[data-process-sequence="3"][data-process-stream="stderr"]');
+    assert.equal(loadedStdout?.querySelector("small")?.textContent, "stdout · exited");
+    assert.equal(loadedStdout?.querySelector("pre")?.textContent, "continued process output", "process.read_loaded preserves the returned text alongside its authoritative state");
+    assert.equal(loadedStderr?.querySelector("small")?.textContent, "stderr · exited");
+    assert.equal(loadedStderr?.querySelector("pre")?.textContent, "continued stderr output");
     assert.deepEqual(reviewTabs().map((tab) => tab.textContent), ["Current working tree", "Read", "Process log: process-review"]);
     act(() => { reviewTabs()[1]!.click(); });
     assert.equal(reviewTabs()[1]?.getAttribute("aria-selected"), "true");
@@ -926,6 +1118,8 @@ test("document preview composer adapts to conversation-column width", async () =
   assert.ok(narrowComposer);
   assert.ok(wideComposer);
   assert.match(narrowComposer, /\.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/su, "compact controls stay on one row when the conversation column narrows");
+  assert.match(css, /\.composer-toolbar\s*\{[^}]*justify-content:\s*space-between/su, "the toolbar reserves the left side for permission/attachments and the right side for model/context/send");
+  assert.match(css, /\.composer-right-controls\s*\{[^}]*margin-left:\s*auto/su);
   assert.match(css, /\.composer \.custom-select--responsive-trigger\s*\{[^}]*width:\s*30px;[^}]*min-width:\s*30px;[^}]*flex:\s*0 0 30px/su);
   assert.match(wideComposer, /\.composer-selectors \.custom-select--responsive-trigger\s*\{[^}]*width:\s*138px/su);
   assert.match(wideComposer, /\.composer-model \.custom-select--responsive-trigger,[\s\S]*?\.composer-model \.custom-select--responsive-trigger\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%;[^}]*flex:\s*0 1 auto/su, "wide model label uses its natural width while remaining constrained by available Composer space");
@@ -933,20 +1127,44 @@ test("document preview composer adapts to conversation-column width", async () =
   assert.match(wideComposer, /\.custom-select__trigger > \.ui-icon:nth-of-type\(2\)\s*\{[^}]*display:\s*block/su);
   assert.match(narrowComposer, /\.composer-attachment-actions button\s*\{[^}]*white-space:\s*nowrap/su);
   assert.doesNotMatch(css, /@container conversation \(max-width: 380px\)/u, "the former stacked toolbar does not reappear on a very narrow panel");
-  assert.match(css, /\.composer\[data-empty="true"\] \.composer-toolbar\s*\{[^}]*grid-template-columns:\s*max-content minmax\(0, 1fr\) max-content;[^}]*grid-template-rows:\s*auto/su);
-  const compactEmptySendRules = [...css.matchAll(/\.composer\[data-empty="true"\] \.composer-send\s*\{([^}]*)\}/gu)].map((match) => match[1] ?? "");
-  assert.equal(compactEmptySendRules.length, 3, "the base rule stays content-sized and only narrow rules constrain the icon trigger");
-  assert.doesNotMatch(compactEmptySendRules[0] ?? "", /(?:min-)?width:\s*30px/u);
-  assert.match(compactEmptySendRules[1] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
-  assert.match(compactEmptySendRules[2] ?? "", /width:\s*30px;[^}]*min-width:\s*30px/u);
-  const narrowViewportRules = css.slice(css.lastIndexOf("@media (max-width: 820px)"), css.lastIndexOf("@container conversation (max-width: 720px)"));
-  const narrowConversationRules = css.slice(css.lastIndexOf("@container conversation (max-width: 720px)"), css.lastIndexOf("@container composer-controls (min-width: 600px)"));
-  assert.match(narrowViewportRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
-  assert.match(narrowConversationRules, /\.composer\[data-empty="true"\] \.composer-send__label\s*\{\s*display:\s*none/su);
+  assert.doesNotMatch(css, /\.composer\[data-empty="true"\] \.composer-toolbar\s*\{[^}]*grid-template-columns/u, "empty content does not switch to a separate toolbar layout");
+  assert.match(css, /@container composer-controls \(max-width: 599px\)[\s\S]*?\.composer \.composer-send\s*\{[^}]*width:\s*30px;[^}]*min-width:\s*30px/su, "the narrow send icon shares the compact control rail in every turn state");
+  assert.match(css, /@container composer-controls \(max-width: 599px\)[\s\S]*?\.composer \.composer-send__label\s*\{\s*display:\s*none/su);
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-input\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*6px/su, "filled text entry keeps its existing stacked narrow layout");
   assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer-toolbar\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/su, "the filled toolbar does not wrap as the text area grows");
-  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer\[data-empty="true"\]\s*\{\s*padding-bottom:\s*8px;/su);
-  assert.match(css, /\.app-shell\.panel-docked \.composer\[data-empty="true"\] \.composer-input\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*gap:\s*8px/su);
+  assert.match(css, /\.app-shell\.panel-docked \.composer\[data-empty="true"\]\s*\{\s*padding-bottom:\s*8px;/su, "the narrow docked empty composer keeps its fixed height");
+  assert.match(css, /@media \(max-width: 820px\)[\s\S]*?\.app-shell\.panel-docked \.composer\[data-empty="true"\] \.composer-input\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*gap:\s*8px/su, "the empty docked input row avoids the filled state's extra vertical gap");
+});
+
+test("Composer keeps mode controls left and model, context, and send together on the right", async () => {
+  const common = { runtimeState: "ready" as const, currentModelRef: "provider/model", modelCandidates: ["provider/model"], configuration: { models: { "provider/model": { display_name: "Model" } } } };
+  const states = [
+    createInitialState({ ...common, mode: "coding", composerText: "" }),
+    createInitialState({ ...common, mode: "coding", composerText: "draft" }),
+    createInitialState({ ...common, mode: "coding", composerText: "", activeTurn: true, turnStatus: "running", run: { run_id: "run-active" } }),
+    createInitialState({ ...common, mode: "coding", composerText: "continue", activeTurn: true, turnStatus: "running", run: { run_id: "run-active" } }),
+    createInitialState({ ...common, mode: "general", composerText: "draft" }),
+  ];
+  await withRendererDom(async (_dom, container, root) => {
+    for (const state of states) {
+      await act(async () => { root.render(<LanguageProvider value="en"><Composer state={state} onChange={() => undefined} onSubmit={() => undefined} onCommand={() => undefined} onPause={() => undefined} onCancel={() => undefined} /></LanguageProvider>); });
+      const toolbar = container.querySelector<HTMLElement>(".composer-toolbar");
+      const right = toolbar?.querySelector<HTMLElement>(":scope > .composer-right-controls");
+      assert.ok(toolbar);
+      assert.ok(right);
+      assert.ok(right.querySelector(":scope > .composer-model"));
+      assert.ok(right.querySelector(":scope > .composer-send"));
+      assert.equal(right.querySelector(":scope > .composer-model .context-ring") !== null, state.mode === "coding");
+      const left = toolbar.querySelector<HTMLElement>(":scope > .composer-selectors");
+      assert.equal(left !== null, state.mode === "coding");
+      if (left) {
+        assert.ok(left.querySelector(".custom-select__trigger"));
+        assert.ok(left.compareDocumentPosition(right) & container.ownerDocument.defaultView!.Node.DOCUMENT_POSITION_FOLLOWING, "permission stays before the right-aligned model controls");
+      }
+      assert.equal(right.querySelector(".composer-send")?.getAttribute("aria-label"), state.activeTurn && state.composerText.trim() ? "Steer" : "Send");
+      assert.equal(right.querySelector<HTMLButtonElement>(".composer-send")?.disabled, !state.composerText.trim() && (state.activeTurn || state.composerAttachments.length === 0), "empty active-turn steering stays disabled while idle attachment-only submission remains available");
+    }
+  });
 });
 
 test("App keeps a draft and renders attachment removal failures on the local card", async () => {

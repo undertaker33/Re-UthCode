@@ -332,3 +332,70 @@ Root 对此前构建包的 Settings flow 首次报告 [`w05-settings-ui-en-17918
 上述两个当前包报告的 driver/Electron exit code 均为 0，console errors、renderer exceptions、unexplained stderr 均为空，runner-owned cleanup 均成功。当前修正已通过包级 Settings/Delay 复验；本轮未重新执行原生窗口或系统 DPI 验收，未安装生成的 Installer，未运行外网真实 Provider，也未触碰用户配置、已安装窗口或 `test-file.md`。本轮修改已验收，Git 收口待 Root 处理；前一轮 8 项 UI 已由 PR135（`3bbdcbaf`）合并，不与本轮 pending 修改混记。
 
 最终验收记录勘误（2026-10-13）：上文旧 Settings 失败段中的“820px Composer 内容宽度”应读作“820px Composer 外层宽度”；当前包 Model 菜单段中的“完整显示 6 项”应替换为“包含 6 个 DOM 选项（Choose 与 5 个模型），220px 高的可滚动菜单只同时呈现部分选项，超出部分可滚动查看；菜单自身位于视口内”。原记录保留为历史文字，本 EOF 勘误明确替代这两处不准确表述。
+
+### Composer 工具栏、Settings Tools 分类与逐文件 Diff（2026-10-13）
+
+本轮追加的三项界面调整已实现：Composer 将权限/附件操作与模型、Context ring、Send 分为左右两组；Settings Tools 分类移除“下一安全边界生效的配置”及四条只读有效值汇总，实际联网搜索和工具限制编辑项保留；Review Diff 以每个文件的独立折叠头呈现当前范围内容，默认展开首项，允许同时展开多个文件。同一文件具有 staged 与 unstaged patch 时共用一条文件头，内部保留两段范围内容；范围切换重置该范围的默认首项。文件头保留 Git 状态、当前路径及可用的 rename 源路径；无 patch 的状态项仍显示路径/status，明确标为 unavailable 的内容显示局部说明且不合成差异正文。Git quoted path 解析抽到 Renderer 共享 helper，继续复用现有 Git 路径语义。
+
+在 `desktop/` 执行 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer-settings.test.tsx`，最终为 46 passed、0 failed、0 skipped、0 cancelled，9,971.293ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。定向回归覆盖每文件独立折叠、staged/unstaged 同文件合并、quoted 空格路径、不可用文件状态与正文缺席、Tools 编辑控件保留和 Composer 两侧 DOM/Send 状态。首轮临时断言将无附件的 idle 空 Send 误当成可用；按现有“只有真实附件的 idle Coding 可附件-only 提交”合同修正测试后通过。类型检查也曾捕获重复的共享 helper import，去重后通过。
+
+本轮源码/测试写集合为 `desktop/src/renderer/{ChatTimeline.tsx,Composer.tsx,DocumentPreviewPanel.tsx,SettingsView.tsx,app.css,locales/en.ts,locales/zh-CN.ts,workspace-diff-paths.ts}` 与 `desktop/tests/{renderer-attachments.test.tsx,renderer-settings.test.tsx}`；当前事实、使用说明与索引分别同步至 [GUI-Context](../../context/GUI/GUI-Context.md)、[Getting Started](../../user-manual/getting-started.md) 和 [Context-Index](../../Context-Index.md)。Root 独自维护 packaged QA 脚本，本 Worker 未改其写集合；完整 Desktop、package/make 和本轮文件/日志审阅实际截图尚待 Root 运行。之前的包级证据不替代本轮新 UI 验收。未读取或触碰 `test-file.md`，未改冻结 Checklist/Prompt/Spec，未执行 Git 写操作。
+
+定向复测补记：移除已无调用的 `.review-panel__diff-empty` 样式与 `viewedAt` 本地化键后，重新执行同一 Renderer 命令，最终结果为 46 passed、0 failed、0 skipped、0 cancelled，11,148.2764ms，exit 0；`npm run typecheck` 同轮 exit 0。此复测计时与命令结果替代本节前一条较早的 9,971.293ms 记录，通关数量相同。
+
+最终定向检查在移除已无调用的 Diff 时间栏样式后再次执行：Renderer 两文件 46 passed、0 failed、0 skipped、0 cancelled，9,579.1637ms，exit 0；`npm run typecheck` exit 0。本结果替代本节此前两条 Renderer 计时；构建与 packaged file/log review 仍待 Root 执行。
+
+### Reviewer P2 收敛与配置手册更正（2026-10-13）
+
+原 Reviewer 复审补充了三个窄范围问题，均已在本轮修正：窄屏 docked 空 Composer 的外层输入区曾继续使用已填内容的纵向列布局，空的 actions 容器仍产生额外 gap；现仅在空态恢复两列输入/动作布局，保留有内容时原有窄屏布局。Diff 文件 `summary` 的原生 marker 被通用 summary 样式隐藏，现提供随折叠状态旋转的装饰性 chevron。共享 Git header 路径解析此前不能把 mixed-quoted rename hunk 归到已知文件，现支持 unquoted 旧路径与 quoted/octal-escaped 新路径组合；无法解析的后续 chunk 仍单独保留，不错挂到首文件。`renderer-attachments.test.tsx` 覆盖空态布局规则、逐文件指示符和多文件 mixed-quoted rename 归属及未知 chunk 边界。
+
+定向命令 `\.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer-settings.test.tsx`（在 `desktop/`）结果为 47 passed、0 failed、0 skipped、0 cancelled，9,964.4698ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。当前事实索引更新为 47/47；[GUI-Context](../../context/GUI/GUI-Context.md)、[Getting Started](../../user-manual/getting-started.md) 保留既有本轮说明。[Configuration](../../user-manual/configuration.md) 现说明配置出口仍提供 configured/effective/source 合并事实，而 Tools 分类只显示可编辑搜索与限制项，不再宣称页面展示已移除的只读摘要。
+
+本轮修复后尚未由 Worker 运行完整 Desktop 或 package/make；Root 将按序执行并进行新的文件/日志审阅验收。此前完整测试和旧包报告不替代修复后的最终产物证据。本节追加后，源码与测试写入停止，交同 Reviewer 复审；未触碰 QA 脚本、冻结工作包文件、Git 状态或用户 `test-file.md`。
+命令记法更正：上一段命令代码块误多写了一个前导反斜杠；实际运行命令为 `.\node_modules\.bin\tx.cmd --test tests/renderer-attachments.test.tsx tests/renderer-settings.test.tsx`，在 `desktop/`，结果仍为上文记录的 47/47。此次更正只澄清命令文本，不改变测试或计时结果。
+
+命令文本最终更正：以上一条记录误写的命令为准内容的替代说明，实际执行命令是 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer-settings.test.tsx`（工作目录 `desktop/`），结果仍为 47/47。此前两条命令记法均有排版错误，此句给出唯一准确命令，不改变实际测试结果。
+
+### Reviewer mixed-quote rename 反向路径修正（2026-10-13）
+
+原 Reviewer 复审发现上一轮仅覆盖 unquoted 旧路径 + quoted 新路径；quoted/octal-escaped 中文旧路径后接含空格的 unquoted 新路径时，共享 header parser 把新路径截在首个空格，Diff hunk 会落到 synthetic 文件头。现仅对已确认 quoted `a/` 首路径且剩余 header 以 `b/` 开始的 unquoted 第二路径读取完整余段；不改其他 Git/API 行为。多文件 Renderer 回归现在同时覆盖两个混合引号方向、双方 rename hunk 的归属、文件头顺序以及未知 header chunk 不错挂。
+
+定向命令 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx tests/renderer-settings.test.tsx`（工作目录 `desktop/`）结果为 47 passed、0 failed、0 skipped、0 cancelled，9,833.6639ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。此改动之后的完整 Desktop 测试、package/make 和 packaged QA 尚待 Root 串行刷新；此前中间包不代表修复后的最终证据。源码与测试写入在本节追加后停止，交原 Reviewer 复审；未运行构建、未改 QA 脚本或用户 `test-file.md`。
+### Native 文件与日志 Review finding 修复（2026-10-13）
+
+Root 的隔离窗口文件/日志审阅发现激活的 Review 标签可能滚出横向标签栏、嵌入式文档头与标签栏重复关闭、空 stdout/stderr 正文仍可能携带真实终态，以及图片头部错误显示 Prism 的 `plain`。Renderer 现仅水平滚动标签栏以露出当前标签；嵌入文档不再提供重复关闭按钮，独立预览关闭、单标签关闭和 Review 整体关闭仍保留；普通空日志块在无正文且无状态时省略，stdout/stderr 等流携带的 `state` 继续以原 stream 标签显示；图片预览头显示资源 `mime_type`，文本和代码仍显示语言。
+
+随后原生图片缩放发现 `wheel` 事件在被动监听器中调用 `preventDefault`，Electron stderr 留下 `Unable to preventDefault inside passive event listener invocation.`，关闭弹层后底层聊天也会滚动。ImagePreviewModal 现对预览 stage 注册 `{ passive: false }` 的原生 wheel listener，并在卸载时移除；缩放边界及现有按钮/键盘重置不变。
+
+在 `desktop/` 执行 ` .\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx`（命令文本前多余空格）得到 37 passed、0 failed、0 skipped、0 cancelled，9,831.7334ms，exit 0；实际命令为 ` .\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx` 去掉行内排版前导空格；`npm run typecheck`（`tsc --noEmit`）exit 0。回归覆盖活动标签栏局部滚动、关闭入口边界、stdout 空正文的 exited 状态保留、普通空块省略、独立与嵌入图片 MIME 标签，以及 wheel 事件被取消且缩放至 112%。原生截图是 finding 来源；这些最新源码的原生/打包复测尚未运行，Root 将继续验收。本 Worker 未运行 full npm、package/make 或操作原生窗口，未改 QA scripts，也未触碰用户 `test-file.md`。
+
+命令记法勘误：本节上一段测试命令的排版有误，实际执行命令为 `\.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx`（工作目录 `desktop/`），结果仍为 37 passed、0 failed、0 skipped、0 cancelled，9,831.7334ms，exit 0；`npm run typecheck` 同轮 exit 0。此句替代上一段中对命令的错误转写，不改变验证结果。
+
+
+命令记法勘误：前述本轮测试命令转写有误；实际执行命令为 `.\node_modules\.bin\tsx.cmd --test tests/renderer-attachments.test.tsx`（工作目录 `desktop/`），37 passed、0 failed、0 skipped、0 cancelled，9,831.7334ms，exit 0；同轮 `npm run typecheck` exit 0。此句覆盖此前命令路径的错误转写，不改变执行结果。
+
+### Reviewer P2：process.read_loaded 正文与终态同时保留（2026-10-13）
+
+原 Reviewer 发现 `process.read_loaded` 会把返回页的 `state` 复制到每个 `ProcessLogEntry`；Review 行用 state 替换正文，导致 continuation 返回的 stdout/stderr 内容可能只剩 `exited` 或 `running`。现在 stream 标签单独显示状态，正文优先显示非空 `entry.text`，仅空正文时才用 state 占位；读取 reducer 与其状态归属不变。组件回归覆盖非空正文与 `state=exited` 共存，App 集成回归通过真实 `process.read` 响应触发 `process_read_loaded`，验证 stdout/stderr 正文和各自的 `exited` 标识同时保留。
+
+在 `desktop/` 执行 `node_modules/.bin/tsx.cmd --test tests/renderer-attachments.test.tsx`，结果为 37 passed、0 failed、0 skipped、0 cancelled，10,069.1839ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。此前 Review/native 修复仍需 Root 最新包复验；本 Worker 未运行完整 npm、package/make 或原生窗口。修复后源码和测试停止写入，交原 Reviewer 复审。
+
+### Reviewer active Review tab 可见范围补正（2026-10-13）
+
+最终包 QA 发现此前滚动范围只测量选中的 tab 按钮，标签文字能露出但同一 `.review-panel__tab` 内的关闭按钮仍可能被标签栏裁切。现在 active ref 挂在包裹 tab 与 close 的整个 span；范围计算仍只调整 Review tabs nav 的水平 `scrollLeft`。Renderer 回归使用完整 wrapper 的边界验证标题与关闭按钮同时位于可见标签栏内。
+
+在 `desktop/` 执行 `node_modules/.bin/tsx.cmd --test tests/renderer-attachments.test.tsx`，结果为 37 passed、0 failed、0 skipped、0 cancelled，9,906.5774ms，exit 0；`npm run typecheck`（`tsc --noEmit`）exit 0。最新源码尚待 Reviewer 复审及 Root 的新包/native 复拍；本 Worker 未修改 QA 脚本、未构建或操作窗口。
+
+### 最终完整测试、构建与文件/日志审阅验收（2026-10-13）
+
+Root 在 `desktop/` 串行完成本轮最终交付验证。完整 Desktop `npm test` 为 313 passed、0 failed、0 skipped、0 cancelled，54,242.2115ms，exit 0；`npm run package` 与 `npm run make` 均 exit 0，两者的 bundled Runtime Coding/General 初始化、Session、状态和关闭 smoke 均通过。实际日志为 [`ui-refinement-round4-delivery-npm-test.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-delivery-npm-test.log)、[`ui-refinement-round4-delivery-package.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-delivery-package.log) 和 [`ui-refinement-round4-delivery-make.log`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-delivery-make.log)。生成的安装器 [`UthCode Setup.exe`](../../../desktop/out/make/squirrel.windows/x64/UthCode%20Setup.exe) 为 204,828,160 bytes，时间 2026-10-13 17:41:17；只生成，未安装。
+
+最终 Review 报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-native-review-complete/acceptance-report.json) passed，含 10 张 CDP 截图；实际原生操作的 20 张 PNG 清单为 [`native-screenshots.json`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-native-review-complete/native-screenshots.json)，截图索引见 [`screenshots.md`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-native-review-complete/screenshots.md)。原生 Review 实际检查了文本、Markdown、Python 源码/行号、图片 MIME 与图片预览；当前 tab 及其关闭按钮完整可见，单 tab、预览和整体面板关闭入口各自工作。图片 modal 滚轮缩放到 112%、重置到 100%，底层聊天不随滚轮移动，Electron stderr 未出现 passive-listener warning。Tool output 首页读取 65,536 bytes 后通过 Read newer 到达 114,025 bytes/end 并保留正文；Process Review 实测 running、续读 stdout/stderr、新正文、退出状态与正文并存。报告顶层 flow passed、driver/Electron exit 0，console errors、renderer exceptions 和 unexplained stderr 均为 0，owned cleanup 成功；fixture 的清理终止记录为 exit 1，因此不表述为所有子进程均 exit 0。
+
+最终 Diff 报告 [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-native-diff-complete/acceptance-report.json) passed，含 8 张 CDP 截图。当前原生验收检查了真实 added/deleted/modified 与中文 rename 状态和原路径、1000 行文件的变更邻近上下文、未跟踪文本与 unborn 项目新文件；All/staged/unstaged 范围、默认首文件折叠、逐文件独立展开与键盘操作均已实测。此处只描述实际 Git 状态和截图行为；mixed-quoted header 的双向解析由独立 Renderer 回归覆盖，不将其说成原生动态 header 测试。Diff 的 driver/Electron exit 0、console errors、renderer exceptions、unexplained stderr 为 0，owned cleanup 成功。
+
+Settings [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-settings-verified/acceptance-report.json)（18 张截图）与 Delay [`acceptance-report.json`](../../../desktop/dist/ui-acceptance/ui-refinement-round4-delay-verified/acceptance-report.json)（6 张截图）使用前一最终源码包的实际报告；最后源码变化仅涉及 Review tab wrapper 的可见范围，Settings 与 Delay 行为未变，故沿用这些未受影响证据，不称为本次最终包重跑。四份报告均记录 flow passed、driver/Electron 0、无 console/renderer/unexplained stderr，owned cleanup 成功；各 fixture 清理退出码按报告保留，不推导所有子进程正常退出。
+
+最终验收的 UI 范围已关闭。此次没有进行 Windows 系统 DPI 验收或安装生成的安装器；Settings/Delay 使用本地受控 fixture，不代表外网真实 Provider。原生与 CDP 结果分别记录，未相互替代。冻结 Checklist 仍为 40/40，`implemented_unarchived` 状态不变；W01–W05 和 PR127–136 的历史归属不变，本轮 Git 收口由 Root 处理，不预写 PR 编号。GUI 与用户操作说明已更新：[GUI-Context](../../../docs/context/GUI/GUI-Context.md)、[Getting Started](../../../docs/user-manual/getting-started.md)；当前索引已同步：[Context-Index](../../../docs/Context-Index.md)。
+
+最终验收措辞勘误（2026-10-13）：上文工具输出续读按钮名称应为 `Read more`，不是 `Read newer`。上文所称四份报告“flow passed”具体指 wrapper 判定字段 `exit.status=passed`；driver 与 Electron 的退出码属于各自的 `exit` 记录，错误、异常、stderr 与 cleanup 也分别核对，不把它们合称为顶层 flow 字段。“默认首文件折叠”应为“默认展开第一文件，其余折叠”，与实际原生验收一致。

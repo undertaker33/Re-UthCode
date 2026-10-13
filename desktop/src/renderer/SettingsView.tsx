@@ -78,14 +78,14 @@ interface SettingsSearchTarget {
 
 const SETTINGS_SEARCH_TARGETS: readonly SettingsSearchTarget[] = [
   { category: "providers", fieldId: "settings-default-model", labelKey: "defaultModel", keywords: ["providers", "model"] },
-  { category: "tools", fieldId: "settings-search-enabled", labelKey: "webSearch", keywords: ["searchSettings", "effectiveSearch"] },
+  { category: "tools", fieldId: "settings-search-enabled", labelKey: "webSearch", keywords: ["searchSettings"] },
   { category: "tools", fieldId: "settings-search-key", labelKey: "searchApiKey", keywords: ["webSearch", "searchSettings"] },
   { category: "tools", fieldId: "settings-search-max-results", labelKey: "searchMaxResults", keywords: ["webSearch", "searchSettings"] },
   { category: "tools", fieldId: "settings-search-max-bytes", labelKey: "searchMaxBytes", keywords: ["webSearch", "searchSettings"] },
   { category: "tools", fieldId: "settings-search-timeout", labelKey: "searchTimeout", keywords: ["webSearch", "searchSettings"] },
   { category: "tools", fieldId: "settings-tool-timeout", labelKey: "toolTimeout", keywords: ["toolLimits"] },
-  { category: "tools", fieldId: "settings-tool-output", labelKey: "toolOutputBytes", keywords: ["toolLimits", "effectiveToolLimits"] },
-  { category: "tools", fieldId: "settings-tool-attachment", labelKey: "toolAttachmentBytes", keywords: ["toolLimits", "effectiveAttachmentLimits"] },
+  { category: "tools", fieldId: "settings-tool-output", labelKey: "toolOutputBytes", keywords: ["toolLimits"] },
+  { category: "tools", fieldId: "settings-tool-attachment", labelKey: "toolAttachmentBytes", keywords: ["toolLimits"] },
   { category: "general", fieldId: "settings-general-title", labelKey: "about", keywords: ["product"] },
   { category: "archive", fieldId: "settings-archive-project-filter", labelKey: "archiveProjectFilter", keywords: ["archive"] },
   { category: "archive", fieldId: "settings-archive-text-filter", labelKey: "archiveTextFilter", keywords: ["archive"] },
@@ -216,11 +216,6 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onRetryApp
   const { t } = useTranslation();
   const settingsInteractionLocked = () => providerSaving || searchKeySaving;
   const effective = effectiveLayer(state.configuration);
-  const effectiveSearch = effective?.search ?? draft.search ?? {};
-  const effectiveLimits = effective?.tool_limits ?? draft.tool_limits ?? {};
-  const effectiveModelRef = typeof effective?.default_model === "string" ? effective.default_model : draft.default_model;
-  const effectiveModel = effectiveModelRef ? effective?.models?.[effectiveModelRef] : undefined;
-  const effectiveSource = state.configuration?.source ?? {};
 
   useEffect(() => {
     if (!state.configuration || configurationInitialized.current) return;
@@ -668,13 +663,6 @@ export function SettingsView({ state, onRevealApiKey, onBack, onSave, onRetryApp
           })}</div> : <div className="settings-empty" role="status"><strong>{t("noProviders")}</strong><p>{t("emptySettings")}</p></div>}
         </section>
         <section className={`settings-section${activeCategory === "tools" ? "" : " settings-section--inactive"}`} id="settings-tools" aria-labelledby="settings-tools-title" aria-hidden={activeCategory !== "tools" || undefined}><div className="settings-section__heading"><div><p className="eyebrow">03</p><h2 id="settings-tools-title">{t("tools")}</h2></div></div>
-          <div className="settings-effective" aria-label={t("effectiveSettings")}>
-            <p className="settings-row__group-label">{t("effectiveSettings")}</p>
-            <div className="settings-row"><span className="settings-row__label">{t("effectiveSearch")}</span><span className="settings-row__value">{t("webSearch")}: {settingText(effectiveSearch.enabled)} · {t("searchMaxResults")}: {settingText(effectiveSearch.max_results)} · {t("searchMaxBytes")}: {settingText(effectiveSearch.max_fetch_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.search ?? "default"}</small></span></div>
-            <div className="settings-row"><span className="settings-row__label">{t("effectiveVision")}</span><span className="settings-row__value">{settingText(effectiveModel?.supports_images)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.vision ?? "default"}</small></span></div>
-            <div className="settings-row"><span className="settings-row__label">{t("effectiveToolLimits")}</span><span className="settings-row__value">{t("toolOutputBytes")}: {settingText(effectiveLimits.output_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.tool_limits ?? "default"}</small></span></div>
-            <div className="settings-row"><span className="settings-row__label">{t("effectiveAttachmentLimits")}</span><span className="settings-row__value">{t("toolAttachmentBytes")}: {settingText(effectiveLimits.attachment_bytes)}<small className="settings-row__hint">{t("effectiveSource")}: {effectiveSource.attachment_limits ?? "default"}</small></span></div>
-          </div>
           {(() => {
             const search = draft.search ?? {};
             const searchEnabled = search.enabled === true;

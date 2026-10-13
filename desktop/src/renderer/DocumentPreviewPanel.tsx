@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Prism, { Token, type TokenStream } from "prismjs";
 import "prismjs/components/prism-batch";
 import "prismjs/components/prism-bash";
@@ -28,6 +28,7 @@ import { useTranslation } from "./i18n";
 import type { ProcessLogEntry, ProcessReaderState } from "./state";
 import { CustomSelect } from "./CustomSelect";
 import { UiIcon } from "./UiIcon";
+import { diffSectionPaths } from "./workspace-diff-paths";
 
 export interface DocumentPreview {
   asset: FileCardAsset;
@@ -96,6 +97,68 @@ function workspaceDiffEntryMatchesScope(xy: string, scope: WorkspaceDiffScope): 
   const worktreeStatus = xy[1] ?? " ";
   if (scope === "staged") return indexStatus !== " " && indexStatus !== "?";
   return xy === "??" || worktreeStatus !== " ";
+}
+
+interface WorkspaceDiffPatch {
+  scope: Exclude<WorkspaceDiffScope, "all">;
+  text: string;
+  truncated: boolean;
+}
+
+interface WorkspaceDiffFile {
+  key: string;
+  path: string;
+  entry?: WorkspaceDiffView["status"]["entries"][number];
+  patches: WorkspaceDiffPatch[];
+}
+
+function splitDiffFiles(text: string, scope: Exclude<WorkspaceDiffScope, "all">, truncated: boolean): Array<{ paths: string[]; text: string; scope: typeof scope; truncated: boolean }> {
+  const lines = text.replace(/\r\n?/gu, "\n").split("\n");
+  const starts = lines.flatMap((line, index) => line.startsWith("diff --git ") ? [index] : []);
+  if (starts.length === 0) return text.trim() ? [{ paths: [], text, scope, truncated }] : [];
+  const chunks = starts.map((start, index) => {
+    const end = starts[index + 1] ?? lines.length;
+    const chunkLines = lines.slice(start, end);
+    return {
+      paths: diffSectionPaths(chunkLines[0] ?? ""),
+      text: chunkLines.join("\n"),
+      scope,
+      truncated: truncated && index === starts.length - 1,
+    };
+  });
+  if (starts[0] && lines.slice(0, starts[0]).some((line) => line.trim())) {
+    chunks.unshift({ paths: [], text: lines.slice(0, starts[0]).join("\n"), scope, truncated: false });
+  }
+  return chunks;
+}
+
+function workspaceDiffFiles(diff: WorkspaceDiffView, selectedScope: WorkspaceDiffScope): WorkspaceDiffFile[] {
+  const entries = diff.status.entries.filter((entry) => workspaceDiffEntryMatchesScope(entry.xy, selectedScope));
+  const files: WorkspaceDiffFile[] = entries.map((entry) => ({ key: entry.path, path: entry.path, entry, patches: [] }));
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const sections = [
+    { scope: "staged" as const, section: diff.staged_diff },
+    { scope: "unstaged" as const, section: diff.unstaged_diff },
+  ].filter(({ scope }) => selectedScope === "all" || selectedScope === scope);
+
+  for (const { scope, section } of sections) {
+    const chunks = splitDiffFiles(section.text, scope, section.truncated);
+    chunks.forEach((chunk, index) => {
+      const currentPath = chunk.paths.at(-1);
+      const entry = entries.find((candidate) => candidate.path === currentPath)
+        ?? entries.find((candidate) => chunk.paths.includes(candidate.path) || (candidate.original_path !== undefined && chunk.paths.includes(candidate.original_path)))
+        ?? (chunk.paths.length === 0 && entries.length === 1 ? entries[0] : undefined);
+      const path = entry?.path ?? currentPath ?? `${scope}-${index + 1}`;
+      let file = byPath.get(path);
+      if (!file) {
+        file = { key: `patch:${scope}:${path}`, path, patches: [] };
+        files.push(file);
+        byPath.set(path, file);
+      }
+      file.patches.push({ scope, text: chunk.text, truncated: chunk.truncated });
+    });
+  }
+  return files;
 }
 
 interface ReviewTabOwner extends DocumentPreviewOwner { ownerKey: string; }
@@ -193,6 +256,7 @@ export function DocumentPreviewPanel({ preview, width, minWidth, maxWidth, onWid
   const resizeLimitsRef = useRef({ minWidth, maxWidth, onWidthChange });
   resizeLimitsRef.current = { minWidth, maxWidth, onWidthChange };
   const language = prismLanguage(preview.asset);
+  const formatLabel = preview.imageSrc ? preview.asset.mime_type || fileExtension(preview.asset) : language;
   const isMarkdown = fileKind(preview.asset) === "markdown" || language === "markdown";
   const normalizedText = preview.text.replace(/\r\n?/gu, "\n");
   const lines = normalizedText.split("\n");
@@ -226,7 +290,7 @@ export function DocumentPreviewPanel({ preview, width, minWidth, maxWidth, onWid
   const PanelElement = embedded ? "div" : "aside";
   return <PanelElement className={embedded ? "document-preview-content" : "document-preview-panel"} aria-label={`${t("filePreview")}: ${fileDisplayName(preview.asset)}`}>
     {!embedded && <button className="document-preview-panel__resize" type="button" aria-label={t("resizeFilePreview")} onPointerDown={(event) => { startRef.current = { x: event.clientX, width }; event.currentTarget.setPointerCapture?.(event.pointerId); }} />}
-    <header><div><strong>{fileDisplayName(preview.asset)}</strong><small>{language}</small></div><div className="document-preview-panel__actions">{isMarkdown && <button type="button" onClick={() => setMarkdownMode((value) => value === "render" ? "source" : "render")}>{markdownMode === "render" ? t("viewSource") : t("viewRendered")}</button>}{preview.onOpen && <button type="button" onClick={openTruncated}>{t("artifactOpen")}</button>}<button type="button" aria-label={t("closeFilePreview")} onClick={onClose}><UiIcon name="close" /></button></div></header>
+    <header><div><strong>{fileDisplayName(preview.asset)}</strong><small>{formatLabel}</small></div><div className="document-preview-panel__actions">{isMarkdown && <button type="button" onClick={() => setMarkdownMode((value) => value === "render" ? "source" : "render")}>{markdownMode === "render" ? t("viewSource") : t("viewRendered")}</button>}{preview.onOpen && <button type="button" onClick={openTruncated}>{t("artifactOpen")}</button>}{!embedded && <button className="document-preview-panel__close" type="button" aria-label={t("closeFilePreview")} onClick={onClose}><UiIcon name="close" /></button>}</div></header>
     <div className="document-preview-panel__body">{preview.imageSrc && /^data:[^,]+,/u.test(preview.imageSrc)
       ? <div className="document-review-image"><button type="button" aria-label={t("filePreview")} onClick={() => setImageModalOpen(true)}><img src={preview.imageSrc} alt={fileDisplayName(preview.asset)} /></button>{imageModalOpen && <ImagePreviewModal src={preview.imageSrc} alt={fileDisplayName(preview.asset)} onClose={() => setImageModalOpen(false)} />}</div>
       : isMarkdown && markdownMode === "render"
@@ -257,6 +321,8 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
   const { t } = useTranslation();
   const active = tabs.find((tab) => tab.id === activeTabId) ?? tabs.at(-1);
   const [diffScope, setDiffScope] = useState<WorkspaceDiffScope>("all");
+  const tabsNavRef = useRef<HTMLElement | null>(null);
+  const activeTabRef = useRef<HTMLSpanElement | null>(null);
   const resizeStart = useRef<{ x: number; width: number } | null>(null);
   const resizeLimits = useRef({ minWidth, maxWidth, onWidthChange });
   resizeLimits.current = { minWidth, maxWidth, onWidthChange };
@@ -271,18 +337,24 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
     window.addEventListener("pointerup", up);
     return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
   }, []);
+  useLayoutEffect(() => {
+    const nav = tabsNavRef.current;
+    const selected = activeTabRef.current;
+    if (!nav || !selected) return;
+    const navRect = nav.getBoundingClientRect();
+    const selectedRect = selected.getBoundingClientRect();
+    const visibleLeft = navRect.left + nav.clientLeft;
+    const visibleRight = visibleLeft + nav.clientWidth;
+    if (selectedRect.left < visibleLeft) nav.scrollLeft -= visibleLeft - selectedRect.left;
+    else if (selectedRect.right > visibleRight) nav.scrollLeft += selectedRect.right - visibleRight;
+  }, [active?.id, tabs.length]);
   if (!active) return null;
-  const diffSections = active.kind === "workspace-diff" && active.diff
-    ? (["staged_diff", "unstaged_diff"] as const)
-      .map((key) => ({ key, scope: key === "staged_diff" ? "staged" as const : "unstaged" as const, section: active.diff![key] }))
-      .filter(({ scope }) => diffScope === "all" || diffScope === scope)
-      .filter(({ section }) => section.text.trim().length > 0)
-    : [];
+  const diffFiles = active.kind === "workspace-diff" && active.diff ? workspaceDiffFiles(active.diff, diffScope) : [];
   return <aside className="document-preview-panel review-panel" aria-label={t("reviewTitle")}>
     <button className="document-preview-panel__resize" type="button" aria-label={t("resizeFilePreview")} onPointerDown={(event) => { resizeStart.current = { x: event.clientX, width }; event.currentTarget.setPointerCapture?.(event.pointerId); }} />
     <header className="review-panel__header"><strong>{t("reviewTitle")}</strong><button type="button" aria-label={t("closeFilePreview")} onClick={onClose}><UiIcon name="close" /></button></header>
-    <nav className="review-panel__tabs" role="tablist" aria-label={t("reviewTitle")}>
-      {tabs.map((tab) => <span className="review-panel__tab" key={tab.id}>
+    <nav ref={tabsNavRef} className="review-panel__tabs" role="tablist" aria-label={t("reviewTitle")}>
+      {tabs.map((tab) => <span ref={active.id === tab.id ? activeTabRef : null} className="review-panel__tab" key={tab.id}>
         <button type="button" role="tab" aria-selected={active.id === tab.id} onClick={() => onSelectTab(tab.id)}>{tab.title}</button>
         <button type="button" aria-label={t("closeFilePreview") + ": " + tab.title} onClick={() => onCloseTab(tab.id)}><UiIcon name="close" /></button>
       </span>)}
@@ -299,11 +371,13 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
           <p className="review-panel__source">{active.diff.project_key}{active.diff.status.branch ? ` · ${active.diff.status.branch}` : active.diff.status.unborn ? ` · ${t("unbornBranch")}` : ""}</p>
           {active.diff.status.truncated && <p className="review-panel__notice">{t("previewTruncated")}</p>}
           <div className="review-panel__diff-toolbar"><strong>{t("changedFiles")}</strong></div>
-          {active.diff.status.entries.length > 0 && <ul className="review-panel__paths" aria-label={t("changedFiles")}>{active.diff.status.entries.filter((entry) => workspaceDiffEntryMatchesScope(entry.xy, diffScope)).map((entry, index) => <li key={entry.xy + ":" + entry.path + ":" + index}><code>{entry.xy}</code><span>{entry.path}</span>{entry.original_path && <small>← {entry.original_path}</small>}{entry.review_error === "unavailable" && <small className="review-panel__path-error" role="status">{t("untrackedContentUnavailable")}</small>}</li>)}</ul>}
-          {diffSections.length > 0 ? diffSections.map(({ key, scope, section }) => {
-            const lines = parseUnifiedDiffLines(section.text);
-            return <section key={key} className={"review-panel__diff-section review-panel__diff-section--" + scope} data-diff-scope={scope}><h3>{t(key === "staged_diff" ? "staged" : "unstaged")}{section.truncated && " · " + t("previewTruncated")}</h3><div className="review-panel__diff-lines" role="table" aria-label={t(key === "staged_diff" ? "staged" : "unstaged")}>{lines.map((line, index) => <div className={"review-panel__diff-line review-panel__diff-line--" + line.kind} data-diff-kind={line.kind} role="row" key={index + ":" + line.kind}><span className="review-panel__diff-line-number" role="cell">{line.oldLine ?? ""}</span><span className="review-panel__diff-line-number" role="cell">{line.newLine ?? ""}</span><code role="cell">{line.text || " "}</code></div>)}</div></section>;
-          }) : null}
+          {diffFiles.map((file, index) => <details key={`${diffScope}:${file.key}`} className="review-panel__diff-file" data-file-path={file.entry?.path ?? file.path} data-file-status={file.entry?.xy} open={index === 0}>
+            <summary><UiIcon name="chevron" /><code>{file.entry?.xy ?? ""}</code><span>{file.path}</span>{file.entry?.original_path && <small>← {file.entry.original_path}</small>}{file.entry?.review_error === "unavailable" && <small className="review-panel__path-error" role="status">{t("untrackedContentUnavailable")}</small>}</summary>
+            {file.patches.map((patch, patchIndex) => {
+              const lines = parseUnifiedDiffLines(patch.text);
+              return <section key={`${patch.scope}:${patchIndex}`} className={`review-panel__diff-section review-panel__diff-section--${patch.scope}`} data-diff-scope={patch.scope}><h3>{t(patch.scope === "staged" ? "staged" : "unstaged")}{patch.truncated && " · " + t("previewTruncated")}</h3><div className="review-panel__diff-lines" role="table" aria-label={t(patch.scope === "staged" ? "staged" : "unstaged")}>{lines.map((line, lineIndex) => <div className={`review-panel__diff-line review-panel__diff-line--${line.kind}`} data-diff-kind={line.kind} role="row" key={lineIndex + ":" + line.kind}><span className="review-panel__diff-line-number" role="cell">{line.oldLine ?? ""}</span><span className="review-panel__diff-line-number" role="cell">{line.newLine ?? ""}</span><code role="cell">{line.text || " "}</code></div>)}</div></section>;
+            })}
+          </details>)}
           {active.diff.truncated && <p className="review-panel__notice">{t("previewTruncated")}</p>}
         </div>}
       </>}
@@ -320,7 +394,7 @@ export function ReviewPanel({ tabs, activeTabId, width, minWidth, maxWidth, onWi
         <header className="review-panel__content-header"><strong>{active.title}</strong><small>{active.reader.state || t("unavailable")}</small></header>
         {active.reader.error && <p className="review-panel__notice" role="alert">{active.reader.error}</p>}
         {active.reader.cursorExpired && <p className="review-panel__notice">{t("processCursorExpired")} · {active.reader.earliestCursor}</p>}
-        <div className="review-panel__process-output">{active.entries.map((entry) => <pre key={`${active.processId}:${entry.sequence}`} data-process-sequence={entry.sequence}>{entry.stream === "status" ? `[status] ${entry.state || entry.text || "updated"}` : entry.text}</pre>)}</div>
+        <div className="review-panel__process-output">{active.entries.filter((entry) => entry.stream === "status" || entry.text.length > 0 || Boolean(entry.state)).map((entry) => <div className="review-panel__process-entry" key={`${active.processId}:${entry.sequence}`} data-process-sequence={entry.sequence} data-process-stream={entry.stream}><small>{entry.stream}{entry.state ? ` · ${entry.state}` : ""}</small><pre>{entry.text || entry.state || "updated"}</pre></div>)}</div>
         {active.reader.loading && <p className="review-panel__notice" role="status">{t("loading")}</p>}
         {active.reader.state === "running" && active.reader.nextCursor > 0 && <button className="review-panel__more" type="button" disabled={active.reader.loading} onClick={() => onReadProcess(active.processId, active.reader.nextCursor)}>{t("readNewer")}</button>}
       </>}
