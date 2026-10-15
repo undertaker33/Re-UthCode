@@ -30,6 +30,7 @@ from uthcode.application import (
     EffectiveConfig,
     GenerationCompleted,
     Message,
+    ModelSelected,
     ModelProfile,
     OpenModelPicker,
     PermissionApprovalChoice,
@@ -277,6 +278,14 @@ class _BlockingCompactApplication(_FakeApplication):
         if cancellation is None:
             cancellation = CancellationToken()
         return await self.compact_operation.run(cancellation)
+
+
+class _ModelSwitchApplication(_FakeApplication):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_service = SimpleNamespace(
+            active_session=SimpleNamespace(session_id="model-switch-session")
+        )
 
 
 class _NonCooperativeCompactApplication(_BlockingCompactApplication):
@@ -2916,6 +2925,204 @@ async def test_manual_compact_returns_an_operation_and_scopes_cancel_to_session(
         for item in events
     )
     await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_operation_protocol_scopes_start_status_and_cancel_to_session() -> None:
+    application = _ModelSwitchApplication()
+    bridge = DesktopBridge(application=application)
+    first_dispatch_started = asyncio.Event()
+    release_first = asyncio.Event()
+    dispatch_count = 0
+    received: list[dict[str, object]] = []
+
+    async def dispatch(
+        invocation: object,
+        *,
+        application: object | None = None,
+        image_handling: str | None = None,
+        expected_session_id: str | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> CommandOutcome:
+        nonlocal dispatch_count
+        dispatch_count += 1
+        received.append({
+            "invocation": invocation,
+            "application": application,
+            "image_handling": image_handling,
+            "expected_session_id": expected_session_id,
+            "cancellation": cancellation,
+        })
+        if dispatch_count == 1:
+            first_dispatch_started.set()
+            assert cancellation is not None
+            await release_first.wait()
+            assert not cancellation.cancelled
+            return CommandOutcome(
+                OutcomeStatus.SUCCESS,
+                ui_action=ModelSelected("text/ref"),
+                invocation=invocation,  # type: ignore[arg-type]
+            )
+        assert cancellation is not None
+        await cancellation.wait()
+        return CommandOutcome(
+            OutcomeStatus.EXECUTION_ERROR,
+            error_code="image_summarization_failed",
+            invocation=invocation,  # type: ignore[arg-type]
+        )
+
+    bridge._dispatcher.dispatch_async = dispatch  # type: ignore[method-assign]
+    try:
+        wrong_session_start = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-stale-start",
+                "command.execute",
+                {
+                    "text": "/model text/ref",
+                    "image_handling": "summarize",
+                    "expected_session_id": "other-session",
+                    "operation_id": "stale-start",
+                },
+            )
+        )
+        assert wrong_session_start.ok is False
+        assert wrong_session_start.error is not None
+        assert wrong_session_start.error.kind == "stale_operation"
+        assert dispatch_count == 0, "a stale captured Session cannot start model selection work"
+
+        started = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-start",
+                "command.execute",
+                {
+                    "text": "/model text/ref",
+                    "image_handling": "summarize",
+                    "expected_session_id": "model-switch-session",
+                    "operation_id": "model-switch-success",
+                },
+            )
+        )
+        assert started.ok is True and started.result is not None
+        assert started.result["code"] == "model_switch_started"
+        assert started.result["params"] == {
+            "operation_id": "model-switch-success",
+            "session_id": "model-switch-session",
+            "model_ref": "text/ref",
+        }
+        await first_dispatch_started.wait()
+        assert received[0]["image_handling"] == "summarize"
+        assert received[0]["expected_session_id"] == "model-switch-session"
+
+        running = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-running",
+                "model.switch.status",
+                {"session_id": "model-switch-session", "operation_id": "model-switch-success"},
+            )
+        )
+        assert running.ok is True and running.result is not None
+        assert running.result["state"] == "running"
+
+        wrong_session_cancel = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-wrong-cancel",
+                "model.switch.cancel",
+                {"session_id": "other-session", "operation_id": "model-switch-success"},
+            )
+        )
+        assert wrong_session_cancel.ok is False
+        assert wrong_session_cancel.error is not None
+        assert wrong_session_cancel.error.kind == "stale_operation"
+        assert isinstance(received[0]["cancellation"], CancellationToken)
+        assert received[0]["cancellation"].cancelled is False  # type: ignore[union-attr]
+
+        wrong_session_status = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-wrong-status",
+                "model.switch.status",
+                {"session_id": "other-session", "operation_id": "model-switch-success"},
+            )
+        )
+        assert wrong_session_status.ok is False
+        assert wrong_session_status.error is not None
+        assert wrong_session_status.error.kind == "stale_operation"
+
+        release_first.set()
+        first_operation = bridge._model_switch_operations["model-switch-success"]
+        first_task = first_operation["task"]
+        assert isinstance(first_task, asyncio.Task)
+        await first_task
+        completed = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-completed",
+                "model.switch.status",
+                {"session_id": "model-switch-session", "operation_id": "model-switch-success"},
+            )
+        )
+        assert completed.ok is True and completed.result is not None
+        assert completed.result["state"] == "completed"
+        assert completed.result["result"]["code"] == "model_selected"  # type: ignore[index]
+        expired = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-expired",
+                "model.switch.status",
+                {"session_id": "model-switch-session", "operation_id": "model-switch-success"},
+            )
+        )
+        assert expired.ok is False
+        assert expired.error is not None and expired.error.kind == "stale_operation"
+
+        cancelled_start = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-cancel-start",
+                "command.execute",
+                {
+                    "text": "/model text/ref",
+                    "image_handling": "placeholder",
+                    "expected_session_id": "model-switch-session",
+                    "operation_id": "model-switch-cancelled",
+                },
+            )
+        )
+        assert cancelled_start.ok is True and cancelled_start.result is not None
+        await asyncio.sleep(0)
+        wrong_session_cancel = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-cancel-wrong-owner",
+                "model.switch.cancel",
+                {"session_id": "other-session", "operation_id": "model-switch-cancelled"},
+            )
+        )
+        assert wrong_session_cancel.ok is False
+        cancelled = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-cancel",
+                "model.switch.cancel",
+                {"session_id": "model-switch-session", "operation_id": "model-switch-cancelled"},
+            )
+        )
+        assert cancelled.ok is True
+        assert cancelled.result == {
+            "accepted": True,
+            "operation_id": "model-switch-cancelled",
+            "session_id": "model-switch-session",
+        }
+        second_operation = bridge._model_switch_operations["model-switch-cancelled"]
+        second_task = second_operation["task"]
+        assert isinstance(second_task, asyncio.Task)
+        await second_task
+        cancelled_status = await bridge.handle_request(
+            RequestEnvelope(
+                "model-switch-cancelled-status",
+                "model.switch.status",
+                {"session_id": "model-switch-session", "operation_id": "model-switch-cancelled"},
+            )
+        )
+        assert cancelled_status.ok is True and cancelled_status.result is not None
+        assert cancelled_status.result["state"] == "cancelled"
+        assert cancelled_status.result["result"]["code"] == "model_switch_cancelled"  # type: ignore[index]
+    finally:
+        await bridge.shutdown()
 
 
 @pytest.mark.asyncio

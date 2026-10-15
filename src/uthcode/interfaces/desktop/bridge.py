@@ -155,6 +155,8 @@ _METHODS = frozenset(
         "turn.resume",
         "turn.cancel",
         "compaction.cancel",
+        "model.switch.cancel",
+        "model.switch.status",
         "command.complete",
         "command.execute",
         "status.get",
@@ -884,6 +886,7 @@ class DesktopBridge:
         # map owns only the per-Session task/token/identity needed to route a
         # cancellation and to keep a parked Session runtime alive.
         self._compaction_operations: dict[str, dict[str, object]] = {}
+        self._model_switch_operations: dict[str, dict[str, object]] = {}
         # Durable configuration writes may be pending or may fail to apply to
         # an idle live Application. Keep aggregate status by object identity;
         # runtime ownership stays in the current/background runtime maps.
@@ -1965,6 +1968,10 @@ class DesktopBridge:
             return await self._turn_cancel(params)
         if method == "compaction.cancel":
             return await self._compaction_cancel(params)
+        if method == "model.switch.cancel":
+            return self._model_switch_cancel(params)
+        if method == "model.switch.status":
+            return self._model_switch_status(params)
         if method == "command.complete":
             return self._command_complete(params)
         if method == "command.execute":
@@ -4354,6 +4361,106 @@ class DesktopBridge:
             "session_id": session_id,
         }
 
+    def _model_switch_cancel(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"session_id", "operation_id"}, method="model.switch.cancel")
+        session_id = _text_param(params, "session_id")
+        operation_id = _text_param(params, "operation_id")
+        operation = self._model_switch_operations.get(operation_id)
+        if (
+            operation is None
+            or operation.get("session_id") != session_id
+            or operation.get("state") != "running"
+        ):
+            raise BridgeError("stale_operation", "model switch is no longer active")
+        token = operation.get("token")
+        if not isinstance(token, CancellationToken) or not token.cancel():
+            raise BridgeError("stale_operation", "model switch is no longer active")
+        return {"accepted": True, "operation_id": operation_id, "session_id": session_id}
+
+    def _model_switch_status(self, params: Mapping[str, object]) -> dict[str, object]:
+        _require_params(params, {"session_id", "operation_id"}, method="model.switch.status")
+        session_id = _text_param(params, "session_id")
+        operation_id = _text_param(params, "operation_id")
+        operation = self._model_switch_operations.get(operation_id)
+        if operation is None or operation.get("session_id") != session_id:
+            raise BridgeError("stale_operation", "model switch is no longer available")
+        state = operation.get("state")
+        result = {
+            "operation_id": operation_id,
+            "session_id": session_id,
+            "state": state,
+        }
+        if state != "running":
+            completed = operation.get("result")
+            if isinstance(completed, Mapping):
+                result["result"] = dict(completed)
+            self._model_switch_operations.pop(operation_id, None)
+        return result
+
+    async def _run_model_switch_operation(
+        self,
+        operation: dict[str, object],
+        *,
+        invocation: object,
+        application: object,
+        image_handling: str,
+        expected_session_id: str,
+        token: CancellationToken,
+    ) -> None:
+        try:
+            outcome = await self._dispatcher.dispatch_async(
+                invocation,
+                application=application,
+                image_handling=image_handling,
+                expected_session_id=expected_session_id,
+                cancellation=token,
+            )
+            if outcome is None:
+                raise RuntimeError("model switch command was not dispatched")
+            result = self._command_result(outcome, invocation=invocation)
+            result["params"] = self._command_params(
+                getattr(invocation, "canonical", None),
+                outcome.ui_action,
+                result["status"],
+            )
+            self._finalize_command_code(result)
+            if token.cancelled:
+                result = {
+                    "command": "model",
+                    "status": OutcomeStatus.EXECUTION_ERROR.value,
+                    "code": "model_switch_cancelled",
+                    "params": {},
+                    "ui_action": None,
+                }
+            operation["result"] = result
+            operation["state"] = (
+                "cancelled"
+                if token.cancelled
+                else "completed"
+                if result.get("status") == OutcomeStatus.SUCCESS.value
+                else "failed"
+            )
+        except asyncio.CancelledError:
+            token.cancel()
+            operation["state"] = "cancelled"
+            operation["result"] = {
+                "command": "model",
+                "status": OutcomeStatus.EXECUTION_ERROR.value,
+                "code": "model_switch_cancelled",
+                "params": {},
+                "ui_action": None,
+            }
+            return
+        except Exception:
+            operation["state"] = "cancelled" if token.cancelled else "failed"
+            operation["result"] = {
+                "command": "model",
+                "status": OutcomeStatus.EXECUTION_ERROR.value,
+                "code": "model_switch_cancelled" if token.cancelled else "image_summarization_failed",
+                "params": {},
+                "ui_action": None,
+            }
+
     @staticmethod
     def _parse_response(value: object) -> object:
         if not isinstance(value, Mapping):
@@ -4547,7 +4654,10 @@ class DesktopBridge:
         return result
 
     async def _command_execute(self, params: Mapping[str, object]) -> dict[str, object]:
-        _require_params(params, {"text"}, method="command.execute")
+        allowed = {"text", "image_handling", "expected_session_id", "operation_id"}
+        unknown = set(params).difference(allowed)
+        if "text" not in params or unknown:
+            raise BridgeError("invalid_request", "command.execute parameters are invalid")
         text = _text_param(params, "text")
         if self._pending_pause() is not None:
             raise BridgeError("interaction_pending", "pending interaction captures this input")
@@ -4557,6 +4667,43 @@ class DesktopBridge:
             raise BridgeError("invalid_request", "command text is invalid") from None
         if invocation.is_bare_slash:
             raise BridgeError("usage_error", "bare slash is not a command")
+        image_handling_value = params.get("image_handling")
+        if image_handling_value is not None:
+            if image_handling_value not in {"placeholder", "summarize"}:
+                raise BridgeError("invalid_request", "image_handling is invalid")
+            expected_session_id = _text_param(params, "expected_session_id")
+            operation_id = _text_param(params, "operation_id")
+            if len(operation_id) > 128:
+                raise BridgeError("invalid_request", "operation_id is too long")
+            if (
+                not invocation.is_executable
+                or invocation.canonical != "model"
+                or len(invocation.args) != 1
+            ):
+                raise BridgeError("invalid_request", "image handling requires one /model target")
+            if self._pending_pause() is not None:
+                raise BridgeError("interaction_pending", "pending interaction captures this input")
+            if self._active_handle is not None:
+                raise BridgeError("turn_active", "/model is unavailable during an active Turn")
+            application = self._require_application()
+            active_session = getattr(
+                getattr(application, "session_service", None),
+                "active_session",
+                None,
+            )
+            if active_session is None or getattr(active_session, "session_id", None) != expected_session_id:
+                raise BridgeError("stale_operation", "model switch Session is no longer active")
+            if self._current_compaction_operation() is not None:
+                raise BridgeError("compaction_active", "model selection is unavailable during compaction")
+            return self._start_model_switch_operation(
+                invocation,
+                application=application,
+                image_handling=str(image_handling_value),
+                expected_session_id=expected_session_id,
+                operation_id=operation_id,
+            )
+        if "expected_session_id" in params or "operation_id" in params:
+            raise BridgeError("invalid_request", "model switch selection is incomplete")
         canonical = invocation.canonical
         if canonical == "compact" and invocation.is_executable:
             if self._active_handle is not None:
@@ -4654,6 +4801,55 @@ class DesktopBridge:
                 params_value["run"] = self._snapshot()
         self._finalize_command_code(result)
         return result
+
+    def _start_model_switch_operation(
+        self,
+        invocation: object,
+        *,
+        application: object,
+        image_handling: str,
+        expected_session_id: str,
+        operation_id: str,
+    ) -> dict[str, object]:
+        if operation_id in self._model_switch_operations:
+            raise BridgeError("duplicate_operation_id", "model switch operation already exists")
+        if len(self._model_switch_operations) >= 8:
+            for previous_id, previous in tuple(self._model_switch_operations.items()):
+                if previous.get("state") != "running":
+                    self._model_switch_operations.pop(previous_id, None)
+            if len(self._model_switch_operations) >= 8:
+                raise BridgeError("operation_limit", "too many model switch operations are active")
+        token = CancellationToken()
+        operation: dict[str, object] = {
+            "operation_id": operation_id,
+            "session_id": expected_session_id,
+            "model_ref": getattr(invocation, "args", (None,))[0],
+            "state": "running",
+            "token": token,
+        }
+        task = asyncio.create_task(
+            self._run_model_switch_operation(
+                operation,
+                invocation=invocation,
+                application=application,
+                image_handling=image_handling,
+                expected_session_id=expected_session_id,
+                token=token,
+            )
+        )
+        operation["task"] = task
+        self._model_switch_operations[operation_id] = operation
+        return {
+            "command": "model",
+            "status": OutcomeStatus.SUCCESS.value,
+            "code": "model_switch_started",
+            "params": {
+                "operation_id": operation_id,
+                "session_id": expected_session_id,
+                "model_ref": operation["model_ref"],
+            },
+            "ui_action": None,
+        }
 
     def _require_application(self) -> object:
         if self._application is None:
@@ -5098,6 +5294,18 @@ class DesktopBridge:
                     token.cancel()
                 except Exception:
                     pass
+        model_switch_operations = [
+            operation
+            for operation in self._model_switch_operations.values()
+            if isinstance(operation, dict) and operation.get("state") == "running"
+        ]
+        for operation in model_switch_operations:
+            token = operation.get("token")
+            if isinstance(token, CancellationToken):
+                try:
+                    token.cancel()
+                except Exception:
+                    pass
         tasks: list[asyncio.Task[None]] = []
         if isinstance(self._turn_task, asyncio.Task):
             tasks.append(self._turn_task)
@@ -5119,6 +5327,11 @@ class DesktopBridge:
         tasks.extend(
             operation["task"]
             for operation in workspace_diff_operations
+            if isinstance(operation.get("task"), asyncio.Task)
+        )
+        tasks.extend(
+            operation["task"]
+            for operation in model_switch_operations
             if isinstance(operation.get("task"), asyncio.Task)
         )
         seen_tasks: set[int] = set()
@@ -5181,6 +5394,7 @@ class DesktopBridge:
             self._unbind_process_events(application)
         self._background_runtimes.clear()
         self._compaction_operations.clear()
+        self._model_switch_operations.clear()
         self._session_search_operations.clear()
         self._workspace_diff_operations.clear()
         self._pending_process_operations.clear()

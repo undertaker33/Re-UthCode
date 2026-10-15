@@ -192,3 +192,89 @@ Reviewer未重跑Worker219项全套、runtime-process、打包smoke、真实Prov
 ### 总控：合并后的Bundled Runtime验证
 
 在W02 merge `51df763` 上，以既有 re-uthcode/Python3.12.13 环境执行 `desktop/ npm run build:runtime`，退出码0。PyInstaller onedir产物为 `desktop/.runtime/uthcode-runtime`；真实bundled Runtime的Coding/General initialize/session/status/shutdown JSONL及不同Prompt Context smoke通过。无真实Provider请求、Renderer或packaged/native视觉验收；该运行时为后续W03可运行Desktop准备。
+
+## 2026-10-14：General 联网搜索与图片历史模型切换
+
+### 本次用户授权与实现边界
+
+- 用户最新授权允许隔离的 General Application 使用既有公开网页搜索能力，覆盖早先“General 不提供 Tool”的决定。General 只复用现有 `WebFetch`、可信用户级搜索可用时的 `WebSearch` 和当前 Session 网络结果的 `ToolResultRead`；不会加载 Coding 项目配置、指令或项目权限规则，不注册 `HistoryRead`、本地文件、Bash、Process、Git、补丁或计划控制 Tool。搜索关闭或 key 不可用时不注册 `WebSearch`；现有 user ASK/DENY、逐跳权限、脱敏和取消边界保留。
+- 大型 WebFetch/WebSearch 结果在 Session-owned 结果服务中外置后，General 允许当前 Session 的 `ToolResultRead` 续读 opaque ref。它不接受文件路径或其他 Session ref；此闭环复用原 AgentLoop 和 ToolExecutor，没有新增聊天搜索接口。
+- 已有含图片历史切换至纯文本模型时，弹窗提供“压缩并切换”或“占位后切换”。前者复用当前视觉模型及现有 image-aware compact；后者只在目标 Provider projection 写安全的“图片未读取”占位。选中的确认按钮在 operation 完成前显示 busy/spinner，取消、失败和导航不会把旧 Session 的迟到结果提交到另一 Session。原 Transcript、附件、native snapshot 与 ToolCall/ToolResult 配对保留；切回视觉模型可重新读取原图，新图片仍受目标模型能力预检。原图转述、图片历史请求投影和切换回滚均由现有 Application/AgentLoop 路径承担。
+- 实施没有修改冻结 Prompt、Spec、Tasks 或 Checklist，也没有读取或改写真实用户配置、`.env` 或未跟踪 `test-file.md`。旧 PR137 已合并 main 的基线仍为既有事实；本段不预写本轮 PR/Git 结果。
+
+### 当前修改与本地证据
+
+- General Tool 工厂按最终 allowlist 创建网络工具，`ApplicationToolService` 将 Session 结果持久化与 Session 工具注册解耦：General 保留真实 Session provider 和 `ToolResultRead`，但不注册 `HistoryRead`。General 用户权限 loader 明确排除项目规则；Windows HTTPS URL 规范化修复也由真实 WebFetch 权限用例覆盖。
+- 新增真实 Application/HTTP mock 回归覆盖 General WebFetch 大结果外置、两次 ToolResultRead 分页及关闭/恢复后同 ref 续读；启用搜索时按真实 Tavily 请求边界验证固定参数、无 secret 回传、可选 WebSearch 与精确工具集合；用户级 ASK/DENY 生效且 Coding 项目规则不进入 General。联网请求使用本地 HTTP mock，不连接真实 Tavily 或付费 Provider。
+- 图片测试使用可解析 PNG 与本地 Fake Provider，验证 summarize 请求带真实 `ImagePart`、无 Tools，目标 text 请求无图片且保留原 Turn 文字/Tool 语义；placeholder 请求同样不携带图像，恢复 Session 后依旧占位，切回视觉模型能读取原始图片；失败、取消与新图片拒绝边界均覆盖。
+- `desktop/tests/renderer-attachments.test.tsx` 新增三个真实 DOM/App 集成回归：placeholder 操作 busy 到 authoritative model 更新；Yes 仅确认按钮显示 spinner、双选择禁用，失败保留旧模型并可重试成功；导航取消 operation 且迟到 completed poll 不污染新 Session。`tests/test_desktop_bridge.py` 覆盖 start/status/cancel JSONL 操作、expected-session 校验、跨 Session 访问拒绝、completed/cancelled 投影和 terminal ref 清理。
+- `conda run -n re-uthcode python -m pytest -q tests/test_attachments.py tests/test_application_runtime.py tests/test_permission_rules.py tests/test_desktop_bridge.py::test_general_runtime_can_manage_archives_for_registered_coding_owner tests/test_desktop_bridge.py::test_coding_runtime_can_manage_general_archives_without_changing_owner tests/test_architecture_boundaries.py::test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path tests/test_application_tools.py tests/test_tool_result_persistence.py`：143 passed，7.50s，退出码 0。
+- `conda run -n re-uthcode python -m pytest -q tests/test_desktop_bridge.py::test_model_switch_operation_protocol_scopes_start_status_and_cancel_to_session tests/test_desktop_bridge.py::test_command_result_projects_application_business_error_code`：2 passed，0.46s，退出码 0。
+- `conda run -n re-uthcode python -m pytest -q tests/test_architecture_boundaries.py`：23 passed，4.81s，退出码 0。
+- `desktop/ npm run typecheck`：退出码 0，3.34s。`desktop/ npx tsx --test tests/renderer-attachments.test.tsx`：40 passed，0 failed，12.21s；`desktop/ npx tsx --test tests/preload.test.ts tests/main-bundle.test.ts`：19 passed，0 failed，5.41s。
+- 文档维护映射更新了 Tools 清单、用户手册、AgentRuntime/State/Orchestration/GUI 当前事实、Core Design 和 Context Index。改动文档通过 UTF-8/U+FFFD/常见乱码/Markdown fence 与新增链接检查；`git diff --check` 退出码 0，仅有仓库既有 LF→CRLF 提示。
+
+### 尚待总控验证
+
+- 当前没有真实外网 Tavily/Provider 请求，也没有运行本轮 `npm test` 全集、package/make、bundled Runtime 或 packaged/native visual acceptance。真实 PNG 的原生 Composer 导入、原生 Yes/No 按钮、延迟 Provider 响应期间 spinner、实际请求 wire 与恢复/失败截图由总控本轮隔离 fixture 和最终构建验证；本段不把其列为已通过。
+- 本地定向用例通过后源码、测试和文档停止修改，交独立 Reviewer 复审；后续实际 build/native 结果由总控按运行证据追加。
+
+## 2026-10-15：复审修复与 Worker 最终定向验证
+
+- 对本节较早进展中“切回视觉模型可重新读取原图”的表述作当前实现澄清：选择“占位后切换”不会压缩 Timeline，因此后来切回视觉模型时仍可读取原图；选择图片感知压缩后，原始 Transcript、附件、native snapshot 和工具配对仍保留供历史查看，但压缩提交不会被普通视觉请求撤销，也不会自动把原图重新注入请求。普通 compact 后的视觉模型请求同样遵循已提交 Timeline。旧记录保留原貌，本段说明最终产品边界。
+- 独立复审促使补上三个实际竞态：model-switch status 返回时复查捕获的 Session/操作 owner；迟到 kickoff 仅取消其自身 operation；超时和显式取消继续持有原 operation 身份并用 Bridge 状态核对最终模型，避免 cancel 与已完成操作交错后 UI/Backend 分歧。Renderer DOM 回归覆盖 Session 导航后的旧 completed、status timeout 后的已完成/取消、以及显式取消遇到 stale cancel 后收到 completed。
+- 移除普通视觉请求对已覆盖图片 Timeline 的自动回卷。`start_turn` Provider 请求回归验证普通 compact 后仍包含已提交的压缩文本及本轮新文本，且不重新附加旧 `ImagePart`；这也避免普通自动 compact 候选因旧图片回注而被重新判为无缩减。
+- Worker 最终定向验证：`conda run -n re-uthcode python -m pytest -q tests/test_attachments.py -k "context_compaction_preserves_source or text_model_switch_can_project_image_history_as_safe_placeholder or text_model_switch_summarizes_real_image or placeholder_projection_survives_session_resume"`：4 passed、12 deselected，2.15s，退出码 0。
+- Worker 最终定向验证：`desktop/ npx tsx --test tests/renderer-attachments.test.tsx`：43 passed、0 failed，12.41s，退出码 0；覆盖本轮模型切换所有权、spinner、失败重试、导航、timeout 和取消竞态。
+- Worker 最终定向验证：`desktop/ npm run typecheck`：退出码 0，约 3.30s。
+- Worker 未运行全量 `npm test`、package/make、bundled Runtime 或 packaged/native visual acceptance。Root 已接管全量 Desktop 测试、最终构建和原生验收；独立 Reviewer 复审待完成。本轮没有真实外网搜索或付费 Provider 请求；General 网络行为仍由隔离 HTTP mock 回归验证。
+
+## 2026-10-15 补充：未启动操作时取消模型选择
+
+- 复核发现图片处理弹窗刚打开、尚未选定处理方式时没有 Bridge operation；这时 Cancel 应关闭弹窗，不能等待一个不存在的 operation。失败重试回到未运行状态时也适用同一行为。运行中的 operation 仍保持原 owner，待 Bridge 状态解决后关闭或展示实际结果。
+- `desktop/ npx tsx --test --test-name-pattern='App closes an unstarted image model choice when Cancel is clicked' tests/renderer-attachments.test.tsx`：1 passed，0 failed，1.53s，退出码 0。新增 DOM 回归确认初始取消关闭弹窗且不发送取消 RPC。
+- `desktop/ npm run typecheck`：退出码 0，3.78s。本补充的定向检查在 Root 全量 Desktop 测试之后运行；Root 全量结果不包含本测试，二者分别记录。
+
+## 2026-10-15 Root 全量 Desktop 测试
+
+- Root 执行本轮最终 `desktop/ npm test`：319 passed、0 failed、0 skipped、0 cancelled，53785.6234ms，退出码 0。日志位于 `desktop/dist/ui-acceptance/general-search-model-final-npm-test.log`。
+- 该全量测试在“未启动操作时取消模型选择”新增回归前执行；该回归随后单独 1/1 通过，并单独运行 `npm run typecheck` 退出码 0。此处没有将尚未实施的 package/make、bundled Runtime、packaged/native visual acceptance 记为通过。
+
+## 2026-10-15 补充：模型下拉快速选择丢失
+
+- Root 的隔离原生流程在“占位后切换到文本模型，再快速切回视觉模型”时发现，菜单打开会调用 `executeCommand("/model")`；此异步请求占用 `commandInFlightRef`，紧接着的 `/model <ref>` 选择因此被静默跳过。原生验收报告 `desktop/dist/ui-acceptance/general-search-model-native-20261015-r2` 只在回切 Vision 这一分支失败，未用旧包掩盖。
+- Renderer 去掉下拉 `onOpen` 对 Slash Command 的重复调用，模型候选在本地合并已加载的 `configuration.models` 和现有 `modelCandidates`；因此菜单打开不等待 RPC，配置候选可立即选中。独立输入 Slash `/model` 的命令执行及其 completion 查询保持原路径。唯一读取点被删除后，同时移除无调用方的 `modelPickerOpen` 字段与 Reducer 写入。
+- 新真实 App 回归把 `modelCandidates` 留空，仅依靠 `configuration.models` 提供 Text Model；打开菜单后立即点击，断言没有额外 `/model` 打开请求、实际 `/model text/ref` 到达 Bridge，且 Renderer/backend 模型均变更。
+- `desktop/ npx tsx --test --test-name-pattern='App applies an immediately selected configured model without a competing open-picker command|Prompt 4 Composer keeps mode authority|T10 Coding picker and control receipts|/model completion displays the friendly label' tests/renderer-attachments.test.tsx tests/renderer.test.tsx`：4 passed、0 failed，1.5558s，退出码 0。覆盖快速选择、Slash `/model` completion，以及原模型选择/会话草稿回归。
+- `desktop/ npx tsx --test tests/renderer-attachments.test.tsx`：45 passed、0 failed、0 skipped/cancelled，12692.3592ms，退出码 0。
+- `desktop/ npm run typecheck`：退出码 0，3.6406s。`rg -n "modelPickerOpen" desktop/src desktop/tests` 无匹配，退出码 1（预期无剩余字段或调用点）。
+- 此修复后 Root 将重跑完整 `npm test` 并执行正式 make/native 验收；此前 319/319 全量测试是在该原生发现之前运行，不作为本次修复的全量通过证据。独立 Reviewer 对本修复的最终确认待完成。
+
+## 2026-10-15 Root 最终复审、构建与原生验收
+
+### 独立复审、完整测试与构建
+
+- 独立 Reviewer 对最终源码、测试、QA 和文档复审通过。
+- Root 在最终快速模型选择修复后执行 Desktop 完整测试：npm test 321 passed、0 failed、0 skipped、0 cancelled，55,076.5032ms，退出码 0。日志：desktop/dist/ui-acceptance/general-search-model-final-npm-test.log。
+- 首轮 npm run package 退出码 0，日志：desktop/dist/ui-acceptance/general-search-model-package.log。最终 npm run make 退出码 0，日志：desktop/dist/ui-acceptance/general-search-model-final-make.log；包含正式 package/Squirrel、Coding 与 General bundled JSONL smoke。生成 desktop/out/make/squirrel.windows/x64/UthCode Setup.exe，未执行安装。
+- 最终原生验收基于重新构建的 packaged app；没有用修复前旧包代替。
+
+### 原生 model-images 验收
+
+Root 执行（工作目录 desktop/）：
+
+node scripts/cdp-packaged-visual-acceptance.mjs --language zh --flow model-images --computer-use --timeout-ms 900000 --request-timeout-ms 30000 --port 9457 --output dist/ui-acceptance/general-search-model-native-20261015-r4
+
+desktop/dist/ui-acceptance/general-search-model-native-20261015-r4 报告的 exit.status 为 passed，driver 和 Electron 退出码均为 0，consoleErrors=[]、rendererExceptions=[]。四个 owned temporary roots 均记录 Removed=true。Fixture runner 清理阶段记录 exit 1，因此这里只记录报告、driver/Electron 和临时目录的实际状态，不推断所有子进程均以 0 退出。验收目录保留 8 张 PNG（报告列出 6 张，另含 2 张 native 截图），包括 native-model-image-choice 与 native-model-image-summarizing。
+
+验收实际使用原生 Composer 导入图片并操作模型选择器。No 分支点击占位后，在同一 Session 的文本请求中保留原始文字、imageCount=0 且没有 caption；切换到视觉模型后，原图仍可用。Yes 分支点击转述后，只有当前确认按钮显示 spinner，两个处理选择均禁用且 Cancel 仍可用；视觉模型发出真实图片输入、无 Tools 的 caption 请求，完成后文本模型请求保留 caption 和原始文字且 imageCount=0。两个分支的 Session ID 均保持不变，原图卡片仍在历史中。
+
+Provider wire 观测共 6 次：视觉模型 imageCount=1；No 后文本模型 imageCount=0、无 caption、保留原文字；切回视觉模型 imageCount=1；Yes 转述请求由视觉模型携带图片且不带 Tools；随后文本模型请求携带 caption、原文字且 imageCount=0；General 工具定义精确为 WebFetch、WebSearch、ToolResultRead。
+
+### 原生验收迭代与未验证边界
+
+- r1 新会话验收曾因仅等待 textarea 可用而过早拖入图片，导致 drop 超时；Root 将 QA 等待条件改为确认选中 Session/public owner、sidebar 和 attachment-ready 后再导入。
+- r2 No 分支通过，但快速切回视觉模型失败，定位到 Composer 打开模型菜单时的重复 /model 请求占用命令锁。Worker 移除该重复请求，并用 modelCandidates=[] 的 App 回归验证模型可直接从已加载的 configuration.models 快速选择；该修复经 Reviewer 通过，最终 r4 原生流程覆盖并通过。
+- r3 Computer Use 期间用户物理按下 Esc，中断了 CUA；Root 停止当次 owned driver 后由 runner 清理。该轮是中断记录，不计为通过验收。
+- Yes caption 由本地 fixture 模拟，实际验证的是图片输入和摘要交接的请求结构与界面行为，不代表真实视觉描述质量。没有调用真实 Qwen、DeepSeek 或 Tavily，也没有运行安装器安装流程。
+- 本轮未读取或修改真实用户配置、.env 或未跟踪 test-file.md，未新增工作包目录。Git 收口由 Root 按既有授权执行，结果见总控最终交付；本反馈不预写本轮 PR 编号。

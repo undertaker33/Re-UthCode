@@ -16,7 +16,7 @@ UthCode 是一个面向本地项目的 AI 编程助手。它既可以在终端�
 - 提供 Plan Mode、计划审阅和任务状态跟踪。
 - 同时提供交互式 TUI 与适合脚本调用的 `exec` 模式。
 - `desktop/` 提供 Windows Desktop shell；它通过 Python Runtime JSONL Bridge 复用同一 Application、Session、Run、Turn、Interaction 和 AgentEvent，不另建一套产品状态。
-- Desktop 提供 Coding 与 General 两种入口：Coding 绑定已登记项目，General 不继承项目指令且不向模型提供 Tool；两者复用同一 Application。
+- Desktop 提供 Coding 与 General 两种入口：Coding 绑定已登记项目；General 不继承项目指令，只向 Provider 暴露 WebFetch、可信用户级 WebSearch（启用时）和当前 Session 的 ToolResultRead；两者复用同一 Application。
 - Desktop 支持跨会话后台运行、长对话历史分页、可取消的手动上下文压缩，以及可调整宽度的侧栏与 Runtime 面板；压缩完成提示会随会话历史保留。
 
 ## 快速开始

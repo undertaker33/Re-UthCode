@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from functools import partial
 from importlib import import_module
 from os import PathLike
 from pathlib import Path
@@ -457,9 +458,24 @@ def create_application(
         supplied_tools = () if tools is None else tuple(tools)
         if supplied_tools:
             raise ValueError("General mode cannot be composed with Tools")
-        tool_values: tuple[Tool, ...] = ()
-        tool_builder = None
-        session_provider = None
+        tool_builder = partial(
+            create_default_tools,
+            tool_names=("WebFetch", "WebSearch"),
+        )
+        tool_values = tuple(
+            tool_builder(
+                runtime_context.workdir,
+                attachment_service=attachment_service,
+                session_provider=lambda: session_service.active_session,
+                process_manager=process_manager,
+                search_configuration=config.search,
+                tool_limits=config.tool_limits,
+                web_transport=web_transport,
+                redirect_authorizer=_redirect_authorizer,
+            )
+        )
+        session_provider = lambda: session_service.active_session
+        session_tool_names = ("ToolResultRead",)
     else:
         tool_values = (
             create_default_tools(
@@ -478,6 +494,7 @@ def create_application(
         )
         tool_builder = create_default_tools
         session_provider = lambda: session_service.active_session
+        session_tool_names = None
     secret_values = tuple(
         profile.api_key
         for profile in config.providers.values()
@@ -501,6 +518,7 @@ def create_application(
             workdir=runtime_context.workdir,
             secret_values=secret_values,
             session_provider=session_provider,
+            session_tool_names=session_tool_names,
             tool_result_policy=tool_result_policy_for_output_limit(
                 config.tool_limits.output_bytes,
             ),
@@ -508,7 +526,13 @@ def create_application(
         permission_rules_loader=(
             (lambda: load_permission_rules(cwd=runtime_context.workdir))
             if mode is ApplicationMode.CODING
-            else None
+            else (
+                lambda: load_permission_rules(
+                    cwd=runtime_context.workdir,
+                    home=_instruction_user_root(config).parent,
+                    include_project=False,
+                )
+            )
         ),
         instruction_loader=loader,
         context_service=ApplicationContextService(prompt_source=prompt_source),

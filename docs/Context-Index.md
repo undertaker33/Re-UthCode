@@ -3,7 +3,7 @@
 ```text
 context_kind: current-code-context
 context_file: docs/Context-Index.md
-  snapshot_date: 2026-09-14
+  snapshot_date: 2026-10-15
 document_language: zh-CN
 target_reader: coding-agent
 source_of_truth: src/ + desktop/src/ + tests/ + desktop/tests/
@@ -44,16 +44,16 @@ path_migration:
 
 | 层级 | 目录 | 图中职责 | 当前代码事实 | 首选任务关键词 |
 | --- | --- | --- | --- | --- |
-| 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、固定 PLAN 非 READ 与 unfinished-task 控制检查 | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
+| 执行 | [`context/A01-AgentRuntime/AgentRuntime-Context.md`](context/A01-AgentRuntime/AgentRuntime-Context.md) | Provider、Tool、ReAct、Agent Loop、固定控制检查 | 已有单 Agent、显式串行 ReAct Runtime、Coding Tool View；General 只使用 WebFetch、可信用户级 WebSearch 和当前 Session 的 ToolResultRead | Provider、Prompt、Tool、模型流、Agent Loop、工具调用、控制边界 |
 | 控制 | [`context/A02-Control/Control-Context.md`](context/A02-Control/Control-Context.md) | 权限、Sandbox、Ask User、暂停恢复、Steering | 已有权限、Ask User、暂停恢复、取消、固定控制检查；AskUser 为 1—4 题，选择题始终有自由输入且不再接受旧 `allow_other`/“Other”分支；无 OS Sandbox、动态控制 registry | Permission、审批、安全边界、暂停、恢复、询问用户、取消、Steering |
-| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering、Process 观察 | 已有 Run/Turn、事件、Session v3、Transcript/Timeline、Context Budget/Gate、L4/L5、HistoryRead、Plan/Todo 与安全状态投影；Session-owned Process ring/cursor 和 Turn 外持续日志由 Application 投影；持久化失败与预算参数集中见状态层文档；无跨进程 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、Process、历史 |
-| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode、Process 生命周期 | 已有单 Agent Application、CLI/TUI/Desktop、惰性 Session 与共享命令/Compact/HistoryRead 用例；Desktop 按 Session 保留后台运行时和活进程，并由 Application 事件路由到 Renderer；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Process、Plan/Task、Steering |
+| 状态 | [`context/A03-State/State-Context.md`](context/A03-State/State-Context.md) | Context、Session History、Memory、Todo/Plan、任务进度、Steering、Process 观察 | 已有 Run/Turn、事件、Session v3、Transcript/Timeline、Context Budget/Gate、L4/L5、HistoryRead、Plan/Todo 与安全状态投影；图片历史切换文本模型通过确认后的摘要或请求占位投影，不修改原 Transcript/附件；Session-owned Process ring/cursor 和 Turn 外持续日志由 Application 投影；持久化失败与预算参数集中见状态层文档；无跨进程 Runtime checkpoint、Memory/retrieval | RunState、Turn、Event、Context、Snapshot、Usage、Session、Plan/Task、Process、历史 |
+| 编排 | [`context/A04-Orchestration/Orchestration-Context.md`](context/A04-Orchestration/Orchestration-Context.md) | Application、入口、CLI/TUI/Desktop、Session、Plan/Task、Steering、Slash Mode、Process 生命周期 | 已有单 Agent Application、CLI/TUI/Desktop、惰性 Session 与共享命令/Compact；General 只用 WebFetch、可信用户级 WebSearch 和当前 Session 的 ToolResultRead，不读取 Coding 项目配置或项目权限规则；Desktop 按 Session 保留后台运行时和活进程，并由 Application 事件路由到 Renderer；无 Subagent、任务拆分器、Multi-Agent | Application、入口、组装、命令、TUI、Desktop、CLI、Session、Process、Plan/Task、Steering |
 
 ## current-status
 
 ```text
-status_snapshot: 2026-10-13
-status_note: T12 原 W01–W05 已由 PR127–133 合并，前轮 7 项 UI 由 PR134（701bfc0）合并，上一轮 8 项 UI 由 PR135（3bbdcbaf）合并，Composer 宽态模型名与活动 Turn 空输入修正已由 PR136（e3c663b）合并。本轮 Composer 右侧控件归组、Tools 分类只读摘要移除、Review Diff 按文件独立折叠，以及 Review 标签、图片预览和 Process log 展示收敛均已完成；完整 Desktop 313/313、package/make 与 Coding/General bundled smoke 通过，当前包文件/日志 Review 的 CDP 与原生验收通过。冻结 Checklist 保持 40/40、implemented_unarchived 且未归档；本轮追加修改待 Root 执行 Git 收口，未预写 PR 编号。最终命令、报告与未执行边界见 W05 Feedback。
+status_snapshot: 2026-10-15
+status_note: T12 原 W01–W05 已由 PR127–133 合并，前轮 7 项 UI 由 PR134（701bfc0）合并，上一轮 8 项 UI 由 PR135（3bbdcbaf）合并，Composer 宽态模型名与活动 Turn 空输入修正由 PR136（e3c663b）合并，后续基线 PR137 已合并 main。本轮 General 复用既有 WebFetch、可信用户级 WebSearch 与 Session-owned ToolResultRead；图片历史跨模型处理、切换竞态与普通 compact 后视觉 Timeline 回卷问题已修复，独立复审、完整 Desktop 测试、最终 make 和 packaged/native 验收均通过。冻结 Checklist 保持 40/40、implemented_unarchived 且未归档。Git 收口由 Root 按既有授权执行，结果见总控最终交付；本索引不预写本轮 PR 编号。最终证据与限制见 W02 Feedback EOF；既有 W05 验收仍见 [W05 Feedback](work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md)。
 status_scope: docs/work 直接任务包子目录 + docs/work/archive 直接子目录
 status_values:
   archived: 工作包已由用户移动至 docs/work/archive/
@@ -89,7 +89,7 @@ status_values:
 | --- | --- | --- | --- |
 | F03 | Context 冻结收口、工程收敛与 Desktop 体验优化 | `docs/work/F03-Context冻结收口与工程收敛及Desktop体验优化/` | 截至 PR #105（`1218e31`），W01～W07 Feedback 齐全，冻结 Checklist 全部勾选，仍未归档。第 10 轮记录最终 Python `1520 passed, 3 skipped`、Desktop `216 passed`、typecheck 及中英文 packaged commands 通过；第 11 轮侧栏修复后记录 Renderer 定向 `101 passed`、typecheck、标准 package/make 与隔离英文 sessions 通过，安装器已生成但未执行安装流程。本次文档同步未重跑上述产品验证；真实 Provider、完整视觉矩阵和用户最终复验仍未完成，详见 W07 Feedback。 |
 | T11 | Agent 能力补齐 | `docs/work/T11-Agent能力补齐/` | 2026-10-10：冻结Checklist 61项完成、0项待验，目录保留未归档。原四项附件/消息身份/工具引用/外部路径修复及后续惰性Session、项目目录/全量Recent、搜索密钥保存、Responses推理事件、Windows PTY收尾/正文句柄和ANSI安全显示经原worker实施、Sol独立复审通过。最终Desktop278 passed/typecheck与串行package/make、bundled Runtime smoke通过，用户确认物理安装版本并完成原生验收；三协议实际SDK用户图/工具图、安装四格式/PDF页图、Windows/Linux PTY、Tavily真实取证、正式Headless官方评分及Desktop联合链均有完整证据。模型参数误用、百炼Responses失败、脚本误判与SWE未解决/空预测按原结果保留，不推导模型排名或所有端点支持。精确命令、版本、原始失败、复用范围及本机报告见原[W01](work/T11-Agent能力补齐/feedback/W01-内容与结果公共合同-feedback.md)、[W03](work/T11-Agent能力补齐/feedback/W03-文档视觉与进程会话-feedback.md)、[W04](work/T11-Agent能力补齐/feedback/W04-联网取证与代码操作-feedback.md)、[W06](work/T11-Agent能力补齐/feedback/W06-外部评测与整包验收-feedback.md)末尾。 |
-| T12 | Desktop 功能补齐与工程收敛 | docs/work/T12-Desktop功能补齐与工程收敛/ | 2026-10-13：冻结 Checklist 40/40、implemented_unarchived、未归档；原 W01–W05 经 PR127–133 合并，前轮 UI 由 PR134–136 合并。本轮 Composer 右侧控件归组、Tools 只读摘要移除、Review Diff 按文件独立折叠及文件/日志 Review 细节已实现并验收。最终 Desktop 313 passed，package/make 与 Coding/General bundled smoke 通过；Settings、Delay、Review、Diff packaged flow 和 Review/Diff 原生检查通过。详细版本边界、报告与截图见 [W05 Feedback](work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md)。Checklist 未改；本轮 Git 收口由 Root 处理，不预写 PR 编号。 |
+| T12 | Desktop 功能补齐与工程收敛 | docs/work/T12-Desktop功能补齐与工程收敛/ | 2026-10-15：冻结 Checklist 40/40、implemented_unarchived、未归档；原 W01–W05 经 PR127–133 合并，前轮 UI 由 PR134–136 合并，后续 PR137 已合并 main。本轮 General 联网能力与图片历史模型切换已实施，普通 compact 后视觉请求不再回卷已覆盖 Timeline，Renderer 所有权/取消/超时及模型快速选择竞态已修复并经独立复审通过。最终 Desktop npm test 为 321/321，最终 make 与 packaged/native model-images 验收均通过；installer 已生成但未安装。真实 Provider 质量、真实 Tavily/Qwen/DeepSeek 请求及安装流程未验证。Git 收口由 Root 按既有授权执行，结果见总控最终交付；不预写本轮 PR 编号。精确证据和边界见 W02 Feedback EOF；此前 W05 的完整 Desktop、package/make、bundled smoke、CDP 与原生证据见 [W05 Feedback](work/T12-Desktop功能补齐与工程收敛/W05-工程收敛与联合验收-feedback.md)。Checklist 未改。
 
 F03 当前增补能力：历史按最近 30 个完整 semantic unit 分页，冷 Session 准备与首屏显示解耦；目录按需读取首条用户消息预览，手动标题优先。手动压缩按 Session 后台执行、支持取消并保留有效 epoch；完成提示按提交时 Transcript 位置从 Timeline 恢复，分页游标保留 Transcript/Timeline 字节边界。Desktop 支持项目整行折叠、悬停信息、Runtime 布局图标、完成后输入焦点恢复与尾部已读清除，侧栏保持纵向滚动并抑制横向溢出。
 

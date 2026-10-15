@@ -174,6 +174,8 @@ export const RUNTIME_METHODS = [
   "turn.resume",
   "turn.cancel",
   "compaction.cancel",
+  "model.switch.cancel",
+  "model.switch.status",
   "command.complete",
   "command.execute",
   "status.get",

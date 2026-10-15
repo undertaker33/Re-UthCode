@@ -276,6 +276,19 @@ interface PendingProcessPermission {
   submitting: boolean;
 }
 
+interface PendingModelImageSwitch {
+  generation: number;
+  mode: RendererState["mode"];
+  projectKey: string | null;
+  sessionId: string;
+  viewRevision: number;
+  modelRef: string;
+  operationId: string | null;
+  handling: "placeholder" | "summarize" | null;
+  busy: boolean;
+  error: string | null;
+}
+
 interface SessionSearchContext {
   sequence: number;
   operationId: string;
@@ -488,12 +501,15 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   const interactionSubmitRef = useRef<string | null>(null);
   const cancelInFlightRef = useRef(false);
   const [pendingProcessPermission, setPendingProcessPermission] = useState<PendingProcessPermission | null>(null);
+  const [pendingModelImageSwitch, setPendingModelImageSwitch] = useState<PendingModelImageSwitch | null>(null);
   const [reviewPanel, setReviewPanel] = useState<ReviewPanelState>({ tabs: [], activeTabId: null });
   const reviewPanelRef = useRef(reviewPanel);
   reviewPanelRef.current = reviewPanel;
   const [workspaceDiffSummary, setWorkspaceDiffSummary] = useState<WorkspaceDiffSummaryState | null>(null);
   const [documentPreviewWidth, setDocumentPreviewWidth] = useState(460);
   const pendingProcessPermissionRef = useRef<PendingProcessPermission | null>(null);
+  const pendingModelImageSwitchRef = useRef<PendingModelImageSwitch | null>(null);
+  const modelSwitchSequenceRef = useRef(0);
   const processStopInFlightRef = useRef<string | null>(null);
   const processPermissionSubmitRef = useRef<string | null>(null);
   const processPermissionReleaseRef = useRef<string | null>(null);
@@ -1818,8 +1834,26 @@ export function App({ api: explicitApi, initialState }: AppProps) {
         dispatch({ type: "notice", text: t("commandFailed") });
         return;
       }
-      dispatch({ type: "command_result", result, notice: commandResultNotice(result, t) });
       const source = asObject(result);
+      const ownerSessionId = owner.sessionId;
+      if (source.code === "image_input_unsupported" && source.command === "model" && ownerSessionId) {
+        const match = text.trim().match(/^\/model\s+([^\s]+)(?:\s|$)/i);
+        if (match?.[1]) {
+          const pending: PendingModelImageSwitch = {
+            ...owner,
+            sessionId: ownerSessionId,
+            modelRef: match[1],
+            operationId: null,
+            handling: null,
+            busy: false,
+            error: null,
+          };
+          pendingModelImageSwitchRef.current = pending;
+          setPendingModelImageSwitch(pending);
+          return;
+        }
+      }
+      dispatch({ type: "command_result", result, notice: commandResultNotice(result, t) });
       if (source.code === "compact_started") {
         const params = asObject(source.params);
         const operationId = stringValue(params.operation_id);
@@ -3171,6 +3205,206 @@ export function App({ api: explicitApi, initialState }: AppProps) {
     setPendingProcessPermission(null);
     void releaseProcessPermission(pending);
   }, [releaseProcessPermission, state.selectedProjectKey, state.selectedSessionId]);
+
+  const cancelModelImageSwitch = useCallback((close = true) => {
+    const pending = pendingModelImageSwitchRef.current;
+    if (!pending) return;
+    if (close) {
+      pendingModelImageSwitchRef.current = null;
+      setPendingModelImageSwitch(null);
+    }
+    if (pending.operationId) {
+      void send("model.switch.cancel", {
+        session_id: pending.sessionId,
+        operation_id: pending.operationId,
+      }).catch(() => undefined);
+    }
+  }, [send]);
+
+  useEffect(() => {
+    const pending = pendingModelImageSwitchRef.current;
+    if (!pending) return;
+    if (
+      pending.generation === runtimeGeneration()
+      && pending.mode === state.mode
+      && pending.projectKey === state.selectedProjectKey
+      && pending.sessionId === state.selectedSessionId
+      && pending.viewRevision === state.sessionViewRevision
+    ) return;
+    cancelModelImageSwitch();
+  }, [cancelModelImageSwitch, runtimeGeneration, state.mode, state.selectedProjectKey, state.selectedSessionId, state.sessionViewRevision]);
+
+  useEffect(() => () => {
+    const pending = pendingModelImageSwitchRef.current;
+    pendingModelImageSwitchRef.current = null;
+    if (pending?.operationId) {
+      void send("model.switch.cancel", {
+        session_id: pending.sessionId,
+        operation_id: pending.operationId,
+      }).catch(() => undefined);
+    }
+  }, [send]);
+
+  const chooseModelImageSwitch = useCallback(async (imageHandling: "placeholder" | "summarize") => {
+    let pending = pendingModelImageSwitchRef.current;
+    if (!pending || pending.busy || !api || !pending.sessionId) return;
+    const ownsPending = () => {
+      const current = stateRef.current;
+      return pendingModelImageSwitchRef.current?.operationId === pending?.operationId
+        && isMounted()
+        && runtimeGeneration() === pending?.generation
+        && current.mode === pending?.mode
+        && current.selectedProjectKey === pending?.projectKey
+        && current.selectedSessionId === pending?.sessionId
+        && current.sessionViewRevision === pending?.viewRevision
+        && !hasOwner();
+    };
+    if ((hasOwner() || stateRef.current.runtimeState === "restarting")
+      && (!(await waitForRuntimeUserAccess()) || hasOwner() || stateRef.current.runtimeState === "restarting")) return;
+    if (!ownsPending()) return;
+    modelSwitchSequenceRef.current += 1;
+    const operationId = `model-switch-${Date.now()}-${modelSwitchSequenceRef.current}`;
+    pending = { ...pending, operationId, handling: imageHandling, busy: true, error: null };
+    pendingModelImageSwitchRef.current = pending;
+    setPendingModelImageSwitch(pending);
+    try {
+      const started = asObject(await send("command.execute", {
+        text: `/model ${pending.modelRef}`,
+        image_handling: imageHandling,
+        expected_session_id: pending.sessionId,
+        operation_id: operationId,
+      }));
+      if (!ownsPending()) {
+        void send("model.switch.cancel", {
+          session_id: pending.sessionId,
+          operation_id: operationId,
+        }).catch(() => undefined);
+        return;
+      }
+      if (started.code !== "model_switch_started") {
+        throw new Error("model switch was not started");
+      }
+      while (ownsPending()) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 120));
+        if (!ownsPending()) break;
+        const statusValue = await send("model.switch.status", {
+          session_id: pending.sessionId,
+          operation_id: operationId,
+        });
+        if (!ownsPending()) return;
+        const status = asObject(statusValue);
+        if (status.state === "running") continue;
+        const result = asObject(status.result);
+        if (status.state === "completed" && isDesktopCommandResult(result) && result.code === "model_selected") {
+          pendingModelImageSwitchRef.current = null;
+          setPendingModelImageSwitch(null);
+          dispatch({ type: "command_result", result, notice: commandResultNotice(result, t) });
+          await refreshRuntimeStatus();
+          return;
+        }
+        if (status.state === "cancelled") {
+          pendingModelImageSwitchRef.current = null;
+          setPendingModelImageSwitch(null);
+          return;
+        }
+        const failed = {
+          ...pending,
+          operationId: null,
+          handling: null,
+          busy: false,
+          error: t("modelImageSwitchFailed"),
+        };
+        pendingModelImageSwitchRef.current = failed;
+        setPendingModelImageSwitch(failed);
+        return;
+      }
+    } catch {
+      if (ownsPending()) {
+        // A renderer timeout only releases its waiter; the Bridge operation
+        // can still finish. Cancel this captured Session/operation and keep
+        // the dialog busy until its terminal state or authoritative model is
+        // known. Never clear the operation identity while it may still run.
+        try {
+          await send("model.switch.cancel", {
+            session_id: pending.sessionId,
+            operation_id: operationId,
+          });
+        } catch {
+          // A stale operation may already have completed and been consumed;
+          // status below distinguishes that race from a live operation.
+        }
+        while (ownsPending()) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
+          if (!ownsPending()) return;
+          let recoveryStatus: JsonObject;
+          try {
+            recoveryStatus = asObject(await send("model.switch.status", {
+              session_id: pending.sessionId,
+              operation_id: operationId,
+            }));
+          } catch {
+            continue;
+          }
+          if (!ownsPending()) return;
+          const recoveryError = runtimeBusinessErrorKind(recoveryStatus);
+          if (recoveryError === "stale_operation") {
+            let currentStatus: unknown;
+            try {
+              currentStatus = await send("status.get", {});
+            } catch {
+              continue;
+            }
+            if (!ownsPending()) return;
+            const currentModel = stringValue(asObject(asObject(currentStatus).application).current_model);
+            if (!currentModel) continue;
+            dispatch({ type: "status_loaded", result: currentStatus });
+            if (currentModel === pending.modelRef) {
+              pendingModelImageSwitchRef.current = null;
+              setPendingModelImageSwitch(null);
+              return;
+            }
+            const failed = {
+              ...pending,
+              operationId: null,
+              handling: null,
+              busy: false,
+              error: t("modelImageSwitchFailed"),
+            };
+            pendingModelImageSwitchRef.current = failed;
+            setPendingModelImageSwitch(failed);
+            return;
+          }
+          if (recoveryStatus.state === "running") continue;
+          const recoveryResult = asObject(recoveryStatus.result);
+          if (recoveryStatus.state === "completed" && isDesktopCommandResult(recoveryResult) && recoveryResult.code === "model_selected") {
+            pendingModelImageSwitchRef.current = null;
+            setPendingModelImageSwitch(null);
+            dispatch({ type: "command_result", result: recoveryResult, notice: commandResultNotice(recoveryResult, t) });
+            await refreshRuntimeStatus();
+            return;
+          }
+          if (recoveryStatus.state === "cancelled") {
+            pendingModelImageSwitchRef.current = null;
+            setPendingModelImageSwitch(null);
+            return;
+          }
+          if (recoveryStatus.state === "failed") {
+            const failed = {
+              ...pending,
+              operationId: null,
+              handling: null,
+              busy: false,
+              error: t("modelImageSwitchFailed"),
+            };
+            pendingModelImageSwitchRef.current = failed;
+            setPendingModelImageSwitch(failed);
+            return;
+          }
+        }
+      }
+    }
+  }, [api, hasOwner, isMounted, refreshRuntimeStatus, runtimeGeneration, send, t, waitForRuntimeUserAccess]);
+
   const processPermissionInteraction: PendingInteraction | null = pendingProcessPermission
     ? {
       kind: "permission_required",
@@ -3276,10 +3510,55 @@ export function App({ api: explicitApi, initialState }: AppProps) {
   } as CSSProperties;
   return <LanguageProvider value={state.language}>
     <div className={`app-shell ${themeClass} panel-${shellPanelMode}${state.focusMode ? " focus-mode" : ""}${state.view === "settings" ? " settings-shell" : ""}${reviewPanelVisible ? " document-preview-visible" : ""}`} style={shellStyle}>
-       {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar mode={state.mode} projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onProjectDisclosureChange={setProjectDisclosure} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} onSwitchMode={(mode) => void switchMode(mode)} onSearch={(query) => void searchSessions(query)} onCancelSearch={cancelSessionSearch} searchResults={sessionSearch.results} searchPending={sessionSearch.pending} searchError={sessionSearch.error} onRestoreSearchHit={(hit) => void restoreSearchHit(hit)} onArchiveSession={(project, session, archived) => void archiveSession(project, session, archived)} /></RendererErrorBoundary>}
+      {state.view === "chat" && !state.focusMode && <RendererErrorBoundary name="sidebar"><Sidebar mode={state.mode} projects={state.projects} selectedProjectKey={state.selectedProjectKey} selectedSessionId={state.selectedSessionId} activeTurn={state.activeTurn || state.terminalStatusPending || state.compactionStatus.state === "running"} sessionMutationBusy={state.sessionMutationBusy} expandedProjects={state.expandedProjects} onProjectExpandedChange={setProjectExpanded} onProjectDisclosureChange={setProjectDisclosure} onNewSession={newSession} onOpenProject={openProject} onResumeSession={(project, sessionId) => void resumeSession(project, sessionId)} onAliasChange={aliasChange} onTogglePin={togglePin} onToggleSessionPin={toggleSessionPin} onRenameSession={renameSession} onMoveSession={moveSession} onCopySessionId={copySessionId} onOpenExplorer={openExplorer} onRemoveProject={removeProject} onOpenSettings={() => void loadSettings()} onSwitchMode={(mode) => void switchMode(mode)} onSearch={(query) => void searchSessions(query)} onCancelSearch={cancelSessionSearch} searchResults={sessionSearch.results} searchPending={sessionSearch.pending} searchError={sessionSearch.error} onRestoreSearchHit={(hit) => void restoreSearchHit(hit)} onArchiveSession={(project, session, archived) => void archiveSession(project, session, archived)} /></RendererErrorBoundary>}
       <main id="workspace-main" aria-label={t("workspace")}>{content}</main>
-       {state.view === "chat" && state.mode === "coding" && !state.focusMode && !reviewPanelVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
-       {reviewPanelVisible && <RendererErrorBoundary name="review-panel"><ReviewPanel tabs={visibleReviewTabs} activeTabId={activeReviewTabId} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onSelectTab={(id) => updateReviewPanel((current) => ({ ...current, activeTabId: id }))} onCloseTab={closeReviewTab} onClose={closeReviewPanel} onReadToolOutput={(id) => void readToolOutputPage(id)} onReadProcess={readProcess} /></RendererErrorBoundary>}
+      {pendingModelImageSwitch && <div className="model-image-switch-backdrop">
+        <section
+          id="model-image-switch-dialog"
+          className="model-image-switch-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="model-image-switch-title"
+          aria-describedby="model-image-switch-description"
+          aria-busy={pendingModelImageSwitch.busy}
+        >
+          <h2 id="model-image-switch-title">{t("modelImageSwitchTitle")}</h2>
+          <p id="model-image-switch-description">{t("modelImageSwitchPrompt")}</p>
+          {pendingModelImageSwitch.error && <p className="model-image-switch-error" role="alert">{pendingModelImageSwitch.error}</p>}
+          <div className="model-image-switch-actions">
+            <button
+              id="model-image-switch-summarize"
+              className="accent-button"
+              type="button"
+              disabled={pendingModelImageSwitch.busy}
+              onClick={() => void chooseModelImageSwitch("summarize")}
+            >
+              {pendingModelImageSwitch.busy && pendingModelImageSwitch.handling === "summarize" && <span className="model-image-switch-spinner" aria-hidden="true" />}
+              {pendingModelImageSwitch.busy && pendingModelImageSwitch.handling === "summarize" ? t("modelImageSwitchWorking") : t("modelImageSwitchSummarize")}
+            </button>
+            <button
+              id="model-image-switch-placeholder"
+              className="model-image-switch-secondary"
+              type="button"
+              disabled={pendingModelImageSwitch.busy}
+              onClick={() => void chooseModelImageSwitch("placeholder")}
+            >
+              {pendingModelImageSwitch.busy && pendingModelImageSwitch.handling === "placeholder" && <span className="model-image-switch-spinner" aria-hidden="true" />}
+              {pendingModelImageSwitch.busy && pendingModelImageSwitch.handling === "placeholder" ? t("modelImageSwitchWorking") : t("modelImageSwitchPlaceholder")}
+            </button>
+            <button
+              id="model-image-switch-cancel"
+              className="model-image-switch-cancel"
+              type="button"
+              onClick={() => cancelModelImageSwitch(!pendingModelImageSwitchRef.current?.operationId)}
+            >
+              {t("cancel")}
+            </button>
+          </div>
+        </section>
+      </div>}
+      {state.view === "chat" && state.mode === "coding" && !state.focusMode && !reviewPanelVisible && <RendererErrorBoundary name="runtime-panel"><RuntimePanel id={RUNTIME_PANEL_ID} state={state} visible={runtimeVisible} drawer={narrowViewport && state.panelMode === "floating"} onPanelModeChange={setPanelMode} onClose={closeRuntimeDrawer} onRestoreToggleFocus={restoreRuntimeToggleFocus} /></RendererErrorBoundary>}
+      {reviewPanelVisible && <RendererErrorBoundary name="review-panel"><ReviewPanel tabs={visibleReviewTabs} activeTabId={activeReviewTabId} width={effectiveDocumentPreviewWidth} minWidth={documentPreviewMinWidth} maxWidth={documentPreviewMaxWidth} onWidthChange={setDocumentPreviewWidth} onSelectTab={(id) => updateReviewPanel((current) => ({ ...current, activeTabId: id }))} onCloseTab={closeReviewTab} onClose={closeReviewPanel} onReadToolOutput={(id) => void readToolOutputPage(id)} onReadProcess={readProcess} /></RendererErrorBoundary>}
       {wideLayout && <ResizeSeparator side="sidebar" value={state.sidebarWidth} bounds={widthBounds.sidebar} label={t("resizeSidebar")} onPreview={(value) => setSidebarWidth(value)} onCommit={(value) => setSidebarWidth(value, true)} />}
       {wideLayout && state.mode === "coding" && state.panelMode === "docked" && !reviewPanelVisible && <ResizeSeparator side="runtime" value={state.runtimePanelWidth} bounds={widthBounds.runtime} label={t("resizeRuntimePanel")} onPreview={(value) => setRuntimePanelWidth(value)} onCommit={(value) => setRuntimePanelWidth(value, true)} />}
     </div>

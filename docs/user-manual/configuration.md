@@ -57,6 +57,8 @@ timeout_seconds = 20.0
 
 默认 `enabled = false`。`api_key` 只允许写在用户配置中，可使用 literal 或 `env:VARIABLE_NAME`；解析后仅作为内部 `SecretValue` 在请求边界取值，不进入 Prompt、History、Event、日志、Snapshot、diagnostics 或 Eval artifact。项目配置只能关闭搜索或收紧 `max_results`、`max_fetch_bytes`、`timeout_seconds`，不能写搜索凭据、重定向端点，也不能在用户未配置时启用搜索。
 
+General 与 Coding 复用同一份可信用户级搜索设置。General 使用独立的用户配置加载路径，不读取当前 Coding 项目的配置或项目权限规则；项目级搜索收紧只作用于 Coding。
+
 Desktop Settings 的 Search 区域保存启用状态、固定 provider、key 输入和三个上限字段。key 输入只在 editor-local 草稿和受控配置写入通道存在，安全设置回读只显示是否已配置；当前可见 Session 有 active Turn 时，整次设置保存会被拒绝，既有运行时不会因保存而重启。
 
 保存其他设置而未编辑搜索 key 时，会保留已有的 literal 或 `env:` 引用；主动清空 key 输入框并保存才会删除它。关闭搜索保留已配置的 key，但不向模型提供 `WebSearch`；只打开启用开关而未配置 key，也不会提供该工具。

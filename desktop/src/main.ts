@@ -568,6 +568,33 @@ export function registerIpcHandlers(options: MainIpcOptions): () => void {
       if (typeof payload.params.operation_id !== "string" || !payload.params.operation_id) {
         throw new MainBoundaryError("invalid_runtime_request", "Session search operation is invalid");
       }
+    } else if (payload.method === "model.switch.cancel" || payload.method === "model.switch.status") {
+      assertRuntimeParams(payload.params, payload.method, ["session_id", "operation_id"]);
+      if (
+        typeof payload.params.session_id !== "string" || !payload.params.session_id ||
+        typeof payload.params.operation_id !== "string" || !payload.params.operation_id ||
+        payload.params.operation_id.length > 128
+      ) {
+        throw new MainBoundaryError("invalid_runtime_request", "Model switch operation is invalid");
+      }
+    } else if (payload.method === "command.execute") {
+      assertRuntimeParams(payload.params, payload.method, ["text"], ["image_handling", "expected_session_id", "operation_id"]);
+      if (typeof payload.params.text !== "string" || !payload.params.text.trim() || payload.params.text.length > 32768) {
+        throw new MainBoundaryError("invalid_runtime_request", "Command text is invalid");
+      }
+      const hasImageHandling = "image_handling" in payload.params;
+      if (hasImageHandling) {
+        if (
+          (payload.params.image_handling !== "placeholder" && payload.params.image_handling !== "summarize") ||
+          typeof payload.params.expected_session_id !== "string" || !payload.params.expected_session_id ||
+          typeof payload.params.operation_id !== "string" || !payload.params.operation_id ||
+          payload.params.operation_id.length > 128
+        ) {
+          throw new MainBoundaryError("invalid_runtime_request", "Model switch selection is invalid");
+        }
+      } else if ("expected_session_id" in payload.params || "operation_id" in payload.params) {
+        throw new MainBoundaryError("invalid_runtime_request", "Model switch selection is incomplete");
+      }
     } else if (payload.method === "session.archive") {
       assertRuntimeParams(payload.params, payload.method, ["session_id", "project_key", "archived"]);
       if (typeof payload.params.session_id !== "string" || !payload.params.session_id || typeof payload.params.archived !== "boolean") {

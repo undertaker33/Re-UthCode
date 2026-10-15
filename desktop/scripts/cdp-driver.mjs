@@ -2662,12 +2662,12 @@ async function runGeneralRealProviderFlow(session) {
   const missing = requiredEvents.filter((type) => !evidence.eventTypes.includes(type));
   const toolEvents = evidence.eventTypes.filter((type) => /tool|permission/u.test(type));
   if (!evidence.assistantExact || missing.length > 0 || !evidence.identity?.id || evidence.toolActivity !== 0 || toolEvents.length > 0) {
-    throw new Error(`real General Provider acceptance did not meet stream/final/no-tools requirements: ${JSON.stringify({ assistantExact: evidence.assistantExact, missingEvents: missing, toolEventCount: toolEvents.length, toolActivity: evidence.toolActivity, hasPersistentSession: Boolean(evidence.identity?.id) })}`);
+    throw new Error(`real General Provider acceptance did not meet this prompt's stream/final/no-tool-activity requirements: ${JSON.stringify({ assistantExact: evidence.assistantExact, missingEvents: missing, toolEventCount: toolEvents.length, toolActivity: evidence.toolActivity, hasPersistentSession: Boolean(evidence.identity?.id) })}`);
   }
   flowEvidence.generalReal = { mode: generalUi.mode, sidebar: generalUi.sidebar, projectButtons: generalUi.projectButtons, owner, eventCounts: evidence.counts, requiredEvents, toolEventCount: toolEvents.length, toolActivity: evidence.toolActivity, finalExact: evidence.assistantExact, sessionId: evidence.identity.id };
   await capture(session, "general-real-provider-final");
   if (!skipQuit) await evaluateAction(session, "close UthCode shell", "window.uthcode.closeShell()");
-  writeLog("assertion_pass", { description: "actual configured Provider produced streamed AgentEvent delta and final response in tool-free General mode" });
+  writeLog("assertion_pass", { description: "actual configured Provider produced streamed AgentEvent delta and final response in General mode without invoking Tools" });
 }
 
 async function runGeneralCancelFlow(session) {
@@ -2798,6 +2798,113 @@ async function runGeneralInvalidConfigFlow(session) {
   writeLog("assertion_pass", { description: "invalid General configuration remains a visible failure, Settings offers recovery guidance, and the new provider draft can be cancelled" });
 }
 
+async function runModelImageSwitchFlow(session) {
+  const textModelRef = "fixture/menu-model-0";
+  const textModelLabel = "Fixture model 0 with a readable long display name";
+  const visionModelRef = "fixture/fixture-model";
+  const dialogSelector = '#model-image-switch-dialog, .model-image-switch-dialog, [data-testid="model-image-switch-dialog"]';
+  const buttonSelector = (name) => `#${name}, .${name}, [data-testid="${name}"]`;
+  const readModel = async () => evaluateAction(session, "read authoritative model and Session", `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    return { model: status?.application?.current_model, sessionId: status?.session?.session_id ?? status?.session_id ?? null };
+  })()`);
+  const awaitModel = async (ref) => waitFor(session, `model committed: ${ref}`, `(async () => {
+    const status = await window.uthcode.requestRuntime('status.get', {});
+    const label = document.querySelector('.composer-model .custom-select__value')?.textContent || '';
+    return status?.application?.current_model === ${JSON.stringify(ref)}
+      && label.includes(${JSON.stringify(ref === textModelRef ? textModelLabel : "Vision fixture")})
+      && !document.querySelector(${JSON.stringify(dialogSelector)});
+  })()`);
+  const selectModel = async (label) => {
+    await clickSelector(session, '.composer-model .custom-select__trigger');
+    await waitFor(session, `model option: ${label}`, `Boolean(document.querySelector('[role="option"][title=${JSON.stringify(label)}]'))`);
+    await clickSelector(session, `[role="option"][title=${JSON.stringify(label)}]`);
+  };
+  const sendMessage = async (prompt) => {
+    const before = await evaluateAction(session, "count assistant messages before real Turn", "document.querySelectorAll('.timeline-entry--assistant .timeline-content').length");
+    await setInput(session, "Message UthCode", prompt);
+    await waitFor(session, "real Turn input ready", "Boolean(document.querySelector('.composer-send') && !document.querySelector('.composer-send').disabled)");
+    await clickSelector(session, '.composer-send');
+    await waitFor(session, "real Turn completed", `(() => {
+      const entries = [...document.querySelectorAll('.timeline-entry--assistant .timeline-content')];
+      return entries.length > ${before} && entries.at(-1)?.innerText.includes('fixture response')
+      && !document.querySelector('.composer-actions button[aria-label="Cancel"], .composer-actions button[aria-label="取消"]');
+    })()`);
+  };
+  const newImageSession = async () => {
+    const previous = await selectedSessionIdentity(session);
+    await clickText(session, "New chat");
+    await waitForStableObservation(session, "new image Session owner and attachment input ready", `(async () => {
+      const row = document.querySelector('button.session-line.is-selected:not(.new-session-line), button.recent-line.is-selected');
+      const selectedId = row?.getAttribute('aria-label')?.split(' · ')[1] || null;
+      const status = await window.uthcode.requestRuntime('status.get', {});
+      const input = document.querySelector('.composer textarea');
+      const attach = document.querySelector('.composer-attachment-actions button');
+      const ready = Boolean(selectedId && selectedId !== ${JSON.stringify(previous?.id ?? null)}
+        && status?.session_id === selectedId && status?.active_turn === false
+        && document.querySelector('.sidebar')?.getAttribute('aria-busy') !== 'true'
+        && input && !input.disabled && input.closest('.composer')?.getAttribute('aria-disabled') !== 'true'
+        && attach && !attach.disabled);
+      return { ready, selectedId, publicSessionId: status?.session_id ?? null };
+    })()`);
+    await dropReviewImageAttachment(session);
+    await sendMessage('MODEL_IMAGE_ORIGINAL_PROMPT: describe this controlled image and retain this text.');
+    const identity = await selectedSessionIdentity(session);
+    if (!identity?.id) throw new Error("image fixture Session has no durable identity");
+    return identity;
+  };
+  const awaitDialog = async () => waitFor(session, "image-history model choice modal", `(() => {
+    const dialog = document.querySelector(${JSON.stringify(dialogSelector)});
+    return Boolean(dialog && dialog.getAttribute('role') === 'dialog'
+      && document.querySelector(${JSON.stringify(buttonSelector('model-image-switch-summarize'))})
+      && document.querySelector(${JSON.stringify(buttonSelector('model-image-switch-placeholder'))}));
+  })()`);
+
+  const placeholderOwner = await newImageSession();
+  await selectModel(textModelLabel);
+  await awaitDialog();
+  await capture(session, 'model-image-choice-placeholder');
+  await computerUseCheckpoint('model-image-placeholder');
+  if (!computerUse) await clickSelector(session, buttonSelector('model-image-switch-placeholder'));
+  await awaitModel(textModelRef);
+  await sendMessage('MODEL_IMAGE_PLACEHOLDER_CONTINUATION');
+  const placeholderIdentity = await selectedSessionIdentity(session);
+  if (placeholderIdentity?.id !== placeholderOwner.id) throw new Error('placeholder switch changed Session ownership');
+  await capture(session, 'model-image-placeholder-committed');
+
+  await selectModel('Vision fixture');
+  await awaitModel(visionModelRef);
+  const summaryOwner = await newImageSession();
+  await selectModel(textModelLabel);
+  await awaitDialog();
+  await capture(session, 'model-image-choice-summarize');
+  await computerUseCheckpoint('model-image-summarize');
+  if (!computerUse) await clickSelector(session, buttonSelector('model-image-switch-summarize'));
+  const busy = await waitFor(session, "image summary confirm button is busy", `(() => {
+    const button = document.querySelector(${JSON.stringify(buttonSelector('model-image-switch-summarize'))});
+    const dialog = document.querySelector(${JSON.stringify(dialogSelector)});
+    if (!button || dialog?.getAttribute('aria-busy') !== 'true' || !button.disabled) return false;
+    const animated = [...button.querySelectorAll('*')].some((item) => getComputedStyle(item).animationName !== 'none');
+    return animated ? { disabled: button.disabled, ariaBusy: dialog.getAttribute('aria-busy'), animated: true } : false;
+  })()`);
+  await capture(session, 'model-image-summarizing-spinner');
+  await computerUseCheckpoint('model-image-summarizing');
+  if (computerUse) await writeFile(resolve(screenshotDir, 'caption.continue'), 'release controlled caption response\n', 'utf8');
+  await awaitModel(textModelRef);
+  await sendMessage('MODEL_IMAGE_SUMMARY_CONTINUATION');
+  const summaryIdentity = await selectedSessionIdentity(session);
+  if (summaryIdentity?.id !== summaryOwner.id) throw new Error('summary switch changed Session ownership');
+  const retainedImage = await evaluateAction(session, "original image remains in chat after summary", "Boolean(document.querySelector('.timeline-attachments .file-card[data-file-kind=\"image\"][data-file-ref]'))");
+  if (!retainedImage) throw new Error('summary switch removed the original image attachment');
+  await capture(session, 'model-image-summary-committed');
+
+  await switchMode(session, 'general');
+  await sendMessage('MODEL_GENERAL_SEARCH_TOOLS_VISIBLE');
+  await capture(session, 'general-network-tools-chat');
+  flowEvidence.modelImages = { placeholderOwner, placeholderIdentity, summaryOwner, summaryIdentity, busy, retainedImage, finalModel: (await readModel()).model, generalToolsWithOwnedResultRead: true };
+  if (!skipQuit) await evaluateAction(session, 'close controlled model switch shell', 'window.uthcode.closeShell()');
+}
+
 async function run() {
   flowDeadline = Date.now() + timeoutMs;
   writeLog("driver_start", { argv: process.argv.slice(2), cdpPort, timeoutMs, requestTimeoutMs, flow, planChoice, delayAction, askQuestionCount });
@@ -2919,6 +3026,10 @@ async function run() {
     }
     if (flow === "general-invalid-config") {
       await runGeneralInvalidConfigFlow(session);
+      return;
+    }
+    if (flow === "model-images") {
+      await runModelImageSwitchFlow(session);
       return;
     }
     if (flow === "review") {

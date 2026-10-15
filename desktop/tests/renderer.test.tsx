@@ -5252,7 +5252,7 @@ test("Prompt 4 Composer keeps mode authority in slash commands while placing per
     const modelOption = Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>(".custom-select__list button")).find((button) => button.textContent === "remote-chat");
     assert.ok(modelOption);
     act(() => { modelOption?.click(); });
-    assert.deepEqual(commands, ["/permission full_access", "/model", "/model remote/fallback"]);
+    assert.deepEqual(commands, ["/permission full_access", "/model remote/fallback"]);
   });
 });
 
@@ -5333,7 +5333,6 @@ test("T10 Coding picker and control receipts preserve a text-plus-attachment dra
           if (text === "/permission auto") return { command: "permission", status: "success", code: "permission_mode_selected", params: {}, ui_action: { type: "permission_mode_selected", mode: "auto", warning: false } };
           if (text === "/permission full_access" || text === "/model provider/business") return { command: "control", status: "execution_error", code: "command_failed", params: {}, ui_action: null };
           if (text === "/permission default" || text === "/model provider/rpc") throw new Error("synthetic control RPC failure");
-          if (text === "/model") return { command: "model", status: "success", code: "model_picker_opened", params: {}, ui_action: { type: "open_model_picker" } };
           if (text === "/model provider/chosen") return { command: "model", status: "success", code: "model_selected", params: { model_ref: "provider/chosen" }, ui_action: { type: "model_selected", model_ref: "provider/chosen" } };
         }
         return {};
@@ -5381,7 +5380,7 @@ test("T10 Coding picker and control receipts preserve a text-plus-attachment dra
 
     const modelTrigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
     assert.ok(modelTrigger);
-    act(() => { modelTrigger!.click(); }); // also requests /model and command.complete
+    act(() => { modelTrigger!.click(); }); // opens the already available model options locally
     await flush();
     assertDraft();
     const focusedOption = dom.window.document.activeElement as HTMLButtonElement;
@@ -5394,7 +5393,7 @@ test("T10 Coding picker and control receipts preserve a text-plus-attachment dra
     await chooseModel("Chosen Model");
     assert.equal(calls.filter((call) => call.method === "turn.start" || call.method === "turn.steer").length, 0, "control picker operations never create or steer a Turn");
     assert.deepEqual(calls.filter((call) => call.method === "command.execute").map((call) => call.params.text), [
-      "/permission auto", "/permission full_access", "/permission default", "/model", "/model provider/business", "/model provider/rpc", "/model provider/chosen",
+      "/permission auto", "/permission full_access", "/permission default", "/model provider/business", "/model provider/rpc", "/model provider/chosen",
     ]);
   });
 });

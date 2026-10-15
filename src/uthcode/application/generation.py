@@ -41,12 +41,14 @@ from uthcode.core.provider import (
     ProviderPort,
     ReasoningOptions,
     SourcePart,
+    TextPart,
     ToolCallPart,
     ToolDefinition,
     ToolResultPart,
     Usage,
 )
 from uthcode.core.history import (
+    Timeline,
     TranscriptEntry,
     transcript_entries_for_failed_turn,
     transcript_entries_from_message,
@@ -141,6 +143,12 @@ class ImageInputUnsupportedError(ProviderConfigurationError):
     """Stable Application business fact for a model/image capability refusal."""
 
     code = "image_input_unsupported"
+
+
+class ImageSummaryFailedError(ProviderConfigurationError):
+    """A requested image-aware compaction did not cover its source images."""
+
+    code = "image_summarization_failed"
 
 
 class WorkspaceReviewError(RuntimeError):
@@ -251,6 +259,94 @@ def _transcript_has_images(entries: object, *, after_sequence: int = 0) -> bool:
             ):
                 return True
     return False
+
+
+def _image_parts_in_entries(entries: Sequence[TranscriptEntry]) -> tuple[ImagePart, ...]:
+    """Return validated-shaped image references embedded in Transcript entries."""
+
+    images: list[ImagePart] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, Mapping):
+            if value.get("type") == "image":
+                asset_ref = value.get("asset_ref")
+                mime_type = value.get("mime_type")
+                if isinstance(asset_ref, str) and isinstance(mime_type, str):
+                    try:
+                        images.append(
+                            ImagePart(
+                                asset_ref,
+                                mime_type,
+                                value.get("width") if isinstance(value.get("width"), int) else None,
+                                value.get("height") if isinstance(value.get("height"), int) else None,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        raise ProviderConfigurationError(
+                            "Session image metadata is invalid"
+                        ) from None
+                return
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for child in value:
+                collect(child)
+
+    for entry in entries:
+        collect(entry.payload)
+    return tuple(images)
+
+
+def _placeholder_for_image(part: ImagePart) -> TextPart:
+    reference = part.asset_ref
+    if reference.startswith("attachment:"):
+        pieces = reference.split(":", 2)
+        reference = pieces[2] if len(pieces) == 3 and pieces[2] else "stored image"
+    elif "://" in reference or "/" in reference or "\\" in reference:
+        reference = "stored image"
+    details = [part.mime_type]
+    if part.width is not None and part.height is not None:
+        details.append(f"{part.width}x{part.height}")
+    return TextPart(
+        "[Image not read: this model does not support image input. "
+        f"Reference: {reference}; metadata: {', '.join(details)}. "
+        "The original image remains in Session history.]"
+    )
+
+
+def _project_message_images_to_text(message: Message) -> Message:
+    """Replace image content and native image snapshots at the Provider edge."""
+
+    image_indices: set[int] = set()
+
+    def project_part(part: object, index: int) -> object:
+        if isinstance(part, ImagePart):
+            image_indices.add(index)
+            return _placeholder_for_image(part)
+        if isinstance(part, ToolResultPart):
+            content_parts: list[object] = []
+            for content_part in part.content.parts:
+                projected = project_part(content_part, index)
+                content_parts.append(projected)
+            if len(content_parts) != len(part.content.parts) or any(
+                before is not after
+                for before, after in zip(part.content.parts, content_parts, strict=True)
+            ):
+                return replace(part, content=tuple(content_parts))
+        return part
+
+    projected_parts = tuple(
+        project_part(part, index) for index, part in enumerate(message.parts)
+    )
+    if not image_indices:
+        return message
+    return replace(
+        message,
+        parts=projected_parts,
+        native_items=tuple(
+            item for item in message.native_items if item.sequence_index not in image_indices
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,8 +496,13 @@ class UthCodeApplication:
             tool_service = ApplicationToolService(())
         if not isinstance(tool_service, ApplicationToolService):
             raise TypeError("tool_service must be an ApplicationToolService")
-        if self._application_mode is ApplicationMode.GENERAL and tool_service.definitions():
-            raise ValueError("General mode cannot be composed with Tools")
+        if self._application_mode is ApplicationMode.GENERAL and any(
+            definition.name not in {"WebFetch", "WebSearch", "ToolResultRead"}
+            for definition in tool_service.definitions()
+        ):
+            raise ValueError(
+                "General mode only permits WebFetch, WebSearch, and ToolResultRead"
+            )
         if permission_rules_loader is not None and not callable(permission_rules_loader):
             raise TypeError("permission_rules_loader must be callable or None")
         if instruction_loader is not None and not isinstance(instruction_loader, InstructionLoader):
@@ -936,7 +1037,7 @@ class UthCodeApplication:
 
     def _agent_tool_definitions(self) -> tuple[ToolDefinition, ...]:
         if self._application_mode is ApplicationMode.GENERAL:
-            return ()
+            return self._tool_service.definitions()
         return self._tool_service.definitions() + (
             ASK_USER_TOOL_DEFINITION,
             TODO_WRITE_TOOL_DEFINITION,
@@ -1002,13 +1103,11 @@ class UthCodeApplication:
         if attachment_service is None or session_service is None:
             raise RuntimeError("configuration reload requires the existing Session services")
         loader = self._instruction_loader
-        if self._application_mode is ApplicationMode.GENERAL:
-            new_tools = ()
-        else:
-            tool_builder = self._tool_builder
-            if tool_builder is None:
-                raise RuntimeError("configuration reload requires the existing Tool builder")
-            new_tools = tool_builder(
+        tool_builder = self._tool_builder
+        if tool_builder is None:
+            raise RuntimeError("configuration reload requires the existing Tool builder")
+        new_tools = tuple(
+            tool_builder(
                 self._runtime_context.workdir,
                 on_path_access=(loader.activate_for_path if loader is not None else None),
                 attachment_service=attachment_service,
@@ -1018,6 +1117,13 @@ class UthCodeApplication:
                 tool_limits=configuration.tool_limits,
                 redirect_authorizer=authorize_redirect,
             )
+        )
+        if self._application_mode is ApplicationMode.GENERAL and any(
+            getattr(getattr(tool, "definition", None), "name", None)
+            not in {"WebFetch", "WebSearch"}
+            for tool in new_tools
+        ):
+            raise RuntimeError("General mode Tool builder returned an unsupported Tool")
         secret_values = tuple(
             item.api_key
             for item in configuration.providers.values()
@@ -1029,9 +1135,10 @@ class UthCodeApplication:
             new_tools,
             workdir=self._runtime_context.workdir,
             secret_values=secret_values,
-            session_provider=(
-                (lambda: session_service.active_session)
-                if self._application_mode is ApplicationMode.CODING
+            session_provider=lambda: session_service.active_session,
+            session_tool_names=(
+                ("ToolResultRead",)
+                if self._application_mode is ApplicationMode.GENERAL
                 else None
             ),
             tool_result_policy=tool_result_policy_for_output_limit(
@@ -1453,8 +1560,6 @@ class UthCodeApplication:
     ) -> ToolResultReadPage:
         """Read bounded output only through the active owner Session boundary."""
 
-        if self._application_mode is not ApplicationMode.CODING:
-            raise SessionOperationError("unknown", session_id=session_id)
         if self._session_service is None:
             raise SessionOperationError("storage", session_id=session_id)
         active = self._session_service.active_session
@@ -1504,6 +1609,8 @@ class UthCodeApplication:
         self,
         *,
         cancellation: CancellationToken | None = None,
+        image_aware: bool = False,
+        required_sequence_end: int | None = None,
     ) -> CompactionResult:
         """Run one manual compaction operation with caller-owned cancellation."""
 
@@ -1520,6 +1627,16 @@ class UthCodeApplication:
             cancellation = CancellationToken()
         elif not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
+        if not isinstance(image_aware, bool):
+            raise TypeError("image_aware must be a boolean")
+        if required_sequence_end is not None and (
+            isinstance(required_sequence_end, bool)
+            or not isinstance(required_sequence_end, int)
+            or required_sequence_end < 0
+        ):
+            raise ValueError("required_sequence_end must be a non-negative integer or None")
+        if image_aware and required_sequence_end is None:
+            raise ValueError("image-aware compaction requires an image sequence boundary")
         initial_sequence_end = active.timeline.sequence_end
 
         def cancelled_result() -> CompactionResult:
@@ -1533,7 +1650,11 @@ class UthCodeApplication:
             )
 
         try:
-            return await self._compact_session_impl(cancellation=cancellation)
+            return await self._compact_session_impl(
+                cancellation=cancellation,
+                image_aware=image_aware,
+                required_sequence_end=required_sequence_end,
+            )
         except GenerationCancelled:
             if not cancellation.cancelled:
                 raise
@@ -1559,6 +1680,8 @@ class UthCodeApplication:
         self,
         *,
         cancellation: CancellationToken | None = None,
+        image_aware: bool = False,
+        required_sequence_end: int | None = None,
     ) -> CompactionResult:
         """Run one manual L4 pass through the active Session's Context path.
 
@@ -1578,11 +1701,19 @@ class UthCodeApplication:
                 "Session History durability is unknown; reconcile before compacting"
             )
         owner_session = session
+        initial_sequence_end = owner_session.timeline.sequence_end
         if cancellation is None:
             cancellation = CancellationToken()
         elif not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be a CancellationToken or None")
         cancellation.raise_if_cancelled()
+        if image_aware and (
+            required_sequence_end is None
+            or isinstance(required_sequence_end, bool)
+            or not isinstance(required_sequence_end, int)
+            or required_sequence_end <= owner_session.timeline.sequence_end
+        ):
+            raise ValueError("image-aware compaction requires uncovered image history")
 
         provider = self._provider
         model_profile = self.current_model
@@ -1659,7 +1790,15 @@ class UthCodeApplication:
                 ),
                 publish=False,
             )
-            return request
+            return self._project_images_for_model(
+                request,
+                supports_images=(
+                    manual_model_profile.supports_images
+                    if manual_model_profile is not None
+                    else None
+                ),
+                expected_session_id=owner_session.session_id,
+            )
 
         async def manual_prospective(
             timeline_value,
@@ -1735,7 +1874,13 @@ class UthCodeApplication:
                 before_count = account_generation_request(before_request).input_tokens
                 after_count = account_generation_request(after_request).input_tokens
             cancellation.raise_if_cancelled()
-            if after_count >= before_count:
+            image_coverage_reached = (
+                image_aware
+                and required_sequence_end is not None
+                and candidate.timeline is not None
+                and candidate.timeline.sequence_end >= required_sequence_end
+            )
+            if after_count >= before_count and not image_coverage_reached:
                 return replace(
                     candidate,
                     timeline=previous_timeline,
@@ -1753,30 +1898,85 @@ class UthCodeApplication:
         async def continue_manual(timeline_value) -> Mapping[str, object]:
             request, source = await manual_prospective(timeline_value)
             count = manual_count(request, source)
+            image_coverage_pending = (
+                image_aware
+                and required_sequence_end is not None
+                and timeline_value.sequence_end < required_sequence_end
+            )
+            # The model-switch action asks us to make the selected image
+            # history readable to a text model. Once that exact history is
+            # covered, do not continue compacting unrelated recent context
+            # merely to reach the ordinary manual-compaction target.
+            continue_for_budget = (
+                not image_aware and count > budget.retained_target
+            )
             return {
-                "continue": count > budget.retained_target,
+                "continue": continue_for_budget or image_coverage_pending,
                 "retained_target": budget.retained_target,
                 "post_epoch_input_usage": count,
-                "low_water_reached": count <= budget.retained_target,
+                "low_water_reached": (
+                    (image_aware or count <= budget.retained_target)
+                    and not image_coverage_pending
+                ),
             }
 
+        def image_parts_for_entries(entries: Sequence[TranscriptEntry]) -> tuple[ImagePart, ...]:
+            if not image_aware:
+                return ()
+            parts = _image_parts_in_entries(entries)
+            for part in parts:
+                self._validate_asset_ref(
+                    part.asset_ref,
+                    expected_session_id=owner_session.session_id,
+                    image_dimensions=(part.width, part.height),
+                )
+            return parts
+
+        def image_summary_accounting(
+            image_parts: tuple[ImagePart, ...],
+        ) -> Mapping[str, object] | None:
+            if not image_parts:
+                return None
+            image_request = GenerationRequest(
+                messages=(Message("user", image_parts),),
+                model=remote_model_id,
+            )
+            return self._image_accounting(
+                image_request,
+                expected_session_id=owner_session.session_id,
+            )
+
         async def summarize_epoch(epoch: CompactionEpoch) -> str:
+            source_entries = tuple(
+                entry for unit in epoch.units for entry in unit.entries
+            )
+            image_parts = image_parts_for_entries(source_entries)
             return await _summarize_compaction_epoch_with_provider(
                 provider,
                 remote_model_id,
                 budget,
                 epoch,
                 cancellation=cancellation,
+                image_parts=image_parts,
+                image_accounting=image_summary_accounting(image_parts),
                 usage_sink=self._record_provider_request_usage,
             )
 
         async def summarize_subpass(epoch: CompactionSubpass) -> str:
+            source_entries = tuple(
+                entry
+                for entry in owner_session.transcript.entries
+                if epoch.sequence_start <= entry.sequence <= epoch.sequence_end
+            )
+            image_parts = image_parts_for_entries(source_entries)
             return await _summarize_compaction_epoch_with_provider(
                 provider,
                 remote_model_id,
                 budget,
                 epoch,
                 cancellation=cancellation,
+                image_parts=image_parts,
+                image_accounting=image_summary_accounting(image_parts),
                 usage_sink=self._record_provider_request_usage,
             )
 
@@ -1836,7 +2036,7 @@ class UthCodeApplication:
             ),
             trigger="manual",
         )
-        if result.failure in {
+        if not image_aware and result.failure in {
             "no_safe_epoch",
             "no_reduction",
             "epoch_limit_reached",
@@ -1854,6 +2054,29 @@ class UthCodeApplication:
             )
             self._context_service.finalize_compaction(result)
             self._context_service.finish_compaction(result, trigger="manual")
+        if image_aware:
+            current_session = self._session_service.active_session
+            current_timeline = (
+                current_session.timeline
+                if current_session is not None
+                and current_session.session_id == owner_session.session_id
+                else owner_session.timeline
+            )
+            if (
+                result.failure is not None
+                or required_sequence_end is None
+                or current_timeline is None
+                or current_timeline.sequence_end < required_sequence_end
+            ):
+                return replace(
+                    result,
+                    timeline=current_timeline,
+                    summary=current_timeline.summary if current_timeline is not None else None,
+                    changed=(current_timeline.sequence_end > initial_sequence_end)
+                    if current_timeline is not None
+                    else False,
+                    failure=result.failure or "image_coverage_incomplete",
+                )
         return result
 
     def _commit_timeline_candidate(
@@ -2102,6 +2325,31 @@ class UthCodeApplication:
         raise ImageInputUnsupportedError(
             "selected model does not explicitly support image input in Session history"
         )
+
+    def _project_images_for_model(
+        self,
+        request: GenerationRequest,
+        *,
+        supports_images: bool | None,
+        expected_session_id: str | None,
+    ) -> GenerationRequest:
+        if supports_images is True:
+            return request
+        messages = tuple(
+            _project_message_images_to_text(message)
+            for message in request.messages
+        )
+        if messages == request.messages:
+            return request
+        metadata = dict(request.metadata)
+        metadata.update(
+            self._request_metadata(
+                replace(request, messages=messages),
+                expected_session_id=expected_session_id,
+            )
+        )
+        metadata["image_projection"] = "omitted_with_placeholder"
+        return replace(request, messages=messages, metadata=metadata)
 
     def _validate_asset_ref(
         self,
@@ -3348,11 +3596,6 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
-        self._preflight_model_images(
-            candidate_model,
-            transcript=snapshot.transcript,
-            timeline=snapshot.timeline,
-        )
         provider_limits = self._resolve_model_limits_sync_strict(
             candidate_model.remote_id,
             provider=candidate_provider,
@@ -3375,11 +3618,6 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
-        self._preflight_model_images(
-            candidate_model,
-            transcript=snapshot.transcript,
-            timeline=snapshot.timeline,
-        )
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
@@ -3393,11 +3631,6 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
-        self._preflight_model_images(
-            candidate_model,
-            transcript=session.transcript,
-            timeline=session.timeline,
-        )
         provider_limits = self._resolve_model_limits_sync_strict(
             candidate_model.remote_id,
             provider=candidate_provider,
@@ -3419,11 +3652,6 @@ class UthCodeApplication:
         if not model_ref or model_ref == self._current_model_ref:
             return
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
-        self._preflight_model_images(
-            candidate_model,
-            transcript=session.transcript,
-            timeline=session.timeline,
-        )
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
@@ -3460,23 +3688,134 @@ class UthCodeApplication:
             context_budget,
         )
 
-    async def select_model_async(self, model_ref: str) -> ModelProfile:
-        """Select a model after resolving its Provider ceiling on this loop."""
+    async def select_model_async(
+        self,
+        model_ref: str,
+        *,
+        image_handling: str | None = None,
+        expected_session_id: str | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> ModelProfile:
+        """Select a model and explicitly resolve image history when requested."""
+
+        if image_handling not in (None, "placeholder", "summarize"):
+            raise ValueError("image_handling must be placeholder, summarize, or None")
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id
+        ):
+            raise ValueError("expected_session_id must be a non-empty string or None")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        token = cancellation or CancellationToken()
+        token.raise_if_cancelled()
 
         candidate_model, candidate_provider = self._model_selection_candidate(model_ref)
         active = self._session_service.active_session if self._session_service is not None else None
-        self._preflight_model_images(
-            candidate_model,
-            transcript=None if active is None else active.transcript,
-            timeline=None if active is None else active.timeline,
+        if expected_session_id is not None and (
+            active is None or active.session_id != expected_session_id
+        ):
+            raise ImageSummaryFailedError("active Session changed during model selection")
+        owner_session = active
+        state_generation = self._model_state_generation
+        transcript = None if owner_session is None else owner_session.transcript
+        timeline = None if owner_session is None else owner_session.timeline
+        has_uncovered_images = _transcript_has_images(
+            () if transcript is None else transcript.entries,
+            after_sequence=0 if timeline is None else timeline.sequence_end,
         )
+        required_sequence_end: int | None = None
+        if candidate_model.supports_images is True:
+            image_handling = None
+        elif has_uncovered_images and image_handling is None:
+            self._preflight_model_images(
+                candidate_model,
+                transcript=transcript,
+                timeline=timeline,
+            )
+        elif has_uncovered_images and image_handling == "summarize":
+            current_profile = self.current_model
+            if current_profile is None or current_profile.supports_images is not True:
+                raise ImageSummaryFailedError(
+                    "the current model cannot summarize image history"
+                )
+            if owner_session is None:
+                raise ImageSummaryFailedError("image history has no active Session")
+            covered_end = owner_session.timeline.sequence_end
+            image_entries = tuple(
+                entry
+                for entry in owner_session.transcript.entries
+                if entry.sequence > covered_end and _image_parts_in_entries((entry,))
+            )
+            if not image_entries:
+                raise ImageSummaryFailedError("image history could not be read")
+            image_parts = tuple(
+                part
+                for entry in image_entries
+                for part in _image_parts_in_entries((entry,))
+            )
+            if not image_parts:
+                raise ImageSummaryFailedError("image history could not be read")
+            for part in image_parts:
+                self._validate_asset_ref(
+                    part.asset_ref,
+                    expected_session_id=owner_session.session_id,
+                    image_dimensions=(part.width, part.height),
+                )
+            required_sequence_end = max(entry.sequence for entry in image_entries)
+
         provider_limits = await _resolve_model_limits_async(
             candidate_provider,
             candidate_model.remote_id,
+            cancellation=token,
         )
         context_budget = self._model_context_budget(candidate_model, provider_limits)
-        # No await follows this point: cancellation can only interrupt the
-        # resolver preflight, before config/model/limit/Context publication.
+        token.raise_if_cancelled()
+        if self._model_state_generation != state_generation:
+            raise ImageSummaryFailedError("model selection changed during preflight")
+        if owner_session is not None and (
+            self._session_service is None
+            or self._session_service.active_session is not owner_session
+            or (
+                expected_session_id is not None
+                and owner_session.session_id != expected_session_id
+            )
+        ):
+            raise ImageSummaryFailedError("active Session changed during model selection")
+        if has_uncovered_images and image_handling == "summarize":
+            try:
+                result = await self.compact_session(
+                    cancellation=token,
+                    image_aware=True,
+                    required_sequence_end=required_sequence_end,
+                )
+            except (GenerationCancelled, CancelledError):
+                raise ImageSummaryFailedError("image summarization was cancelled") from None
+            if token.cancelled:
+                raise ImageSummaryFailedError("image summarization was cancelled")
+            if result.failure is not None:
+                raise ImageSummaryFailedError("image history could not be summarized")
+            token.raise_if_cancelled()
+            current_session = (
+                self._session_service.active_session
+                if self._session_service is not None
+                else None
+            )
+            if (
+                current_session is not owner_session
+                or current_session is None
+                or current_session.session_id != owner_session.session_id
+                or current_session.timeline.sequence_end < int(required_sequence_end or 0)
+                or self._model_state_generation != state_generation
+            ):
+                raise ImageSummaryFailedError("image summary no longer belongs to this Session")
+        token.raise_if_cancelled()
+        if self._model_state_generation != state_generation:
+            raise ImageSummaryFailedError("model selection changed during preflight")
+        if owner_session is not None and (
+            self._session_service is None
+            or self._session_service.active_session is not owner_session
+        ):
+            raise ImageSummaryFailedError("active Session changed during model selection")
         return self._commit_model_selection(
             candidate_model,
             candidate_provider,
@@ -3755,11 +4094,12 @@ class UthCodeApplication:
                     if timeline_override is _ACTIVE_TIMELINE
                     else timeline_override
                 )
+                transcript_value = active_transcript()
                 request, _snapshot = self._context_service.compose_generation_request(
                     process_messages,
                     run_id=state.run_id,
                     session_id=active_session_id(),
-                    transcript=active_transcript(),
+                    transcript=transcript_value,
                     instruction_loader=self._instruction_loader,
                     runtime_context=self._runtime_prompt_context(runtime_context),
                     timeline=timeline_value,  # type: ignore[arg-type]
@@ -3778,6 +4118,15 @@ class UthCodeApplication:
                         expected_session_id=active_session_id(),
                     ),
                     publish=publish,
+                )
+                request = self._project_images_for_model(
+                    request,
+                    supports_images=(
+                        model_profile.supports_images
+                        if model_profile is not None
+                        else None
+                    ),
+                    expected_session_id=active_session_id(),
                 )
                 return replace(
                     request,
@@ -3801,11 +4150,12 @@ class UthCodeApplication:
                     if timeline_override is _ACTIVE_TIMELINE
                     else timeline_override
                 )
+                transcript_value = active_transcript()
                 request, _snapshot = self._context_service.compose_generation_request(
                     process_messages,
                     run_id=state.run_id,
                     session_id=active_session_id(),
-                    transcript=active_transcript(),
+                    transcript=transcript_value,
                     instruction_loader=self._instruction_loader,
                     runtime_context=self._runtime_prompt_context(runtime_context),
                     timeline=timeline_value,  # type: ignore[arg-type]
@@ -3827,6 +4177,15 @@ class UthCodeApplication:
                         expected_session_id=active_session_id(),
                     ),
                     publish=publish,
+                )
+                request = self._project_images_for_model(
+                    request,
+                    supports_images=(
+                        model_profile.supports_images
+                        if model_profile is not None
+                        else None
+                    ),
+                    expected_session_id=active_session_id(),
                 )
                 return replace(
                     request,

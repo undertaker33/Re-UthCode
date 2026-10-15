@@ -22,7 +22,7 @@ const desktopRoot = fileURLToPath(new URL("../", import.meta.url));
 const workspaceRoot = resolvePath(fileURLToPath(new URL("../../", import.meta.url)));
 const driverPath = fileURLToPath(new URL("./cdp-driver.mjs", import.meta.url));
 const fixturePath = fileURLToPath(new URL("./cdp-openai-fixture.mjs", import.meta.url));
-const providerFlows = new Set(["stream", "tool", "review", "todo", "ask", "ask-one", "permission", "plan", "failure", "delay", "sessions", "general-cancel"]);
+const providerFlows = new Set(["stream", "tool", "review", "model-images", "todo", "ask", "ask-one", "permission", "plan", "failure", "delay", "sessions", "general-cancel"]);
 const commandFlows = new Set(["commands"]);
 const lifecycleFlows = new Set(["lifecycle"]);
 const diffFlows = new Set(["diff"]);
@@ -371,7 +371,7 @@ async function main() {
   const executablePath = win32.normalize(executable);
   const flow = option("flow", "visual");
   const computerUse = process.argv.includes("--computer-use");
-  if (computerUse && !["review", "diff"].includes(flow)) throw new Error("computer-use checkpoints require review or diff flow");
+  if (computerUse && !["review", "diff", "model-images"].includes(flow)) throw new Error("computer-use checkpoints require review, diff or model-images flow");
   const isLifecycleFlow = lifecycleFlows.has(flow);
   const isSettingsFlow = flow === "settings-ui";
   const isDiffFlow = diffFlows.has(flow);
@@ -482,7 +482,7 @@ async function main() {
       await mkdir(permissionProject, { recursive: true });
       await writeFile(join(permissionProject, ".env"), "CDP_PERMISSION_PUBLIC_MARKER=isolated\n", "utf8");
     }
-    if (flow === "review") reviewProject = await createControlledReviewProject(join(host.root, "projects", "controlled-review"));
+    if (flow === "review" || flow === "model-images") reviewProject = await createControlledReviewProject(join(host.root, "projects", "controlled-review"));
     electronContext = await createIsolatedCdpContext({ mode: "electron", prefix: `uthcode-cdp-electron-${runId.slice(0, 8)}-` });
     await mkdir(electronContext.userDataDir, { recursive: true });
     isolatedSessionStorageReady = true;
@@ -497,10 +497,10 @@ async function main() {
         ? [{ path: diffProject, alias: "T12 Diff project", pinned: false }, { path: diffUnbornProject, alias: "T12 Unborn Diff", pinned: false }]
         : flow === "permission"
           ? [{ path: permissionProject, alias: "T12 Permission fixture", pinned: false }]
-        : flow === "review"
+        : flow === "review" || flow === "model-images"
           ? [{ path: reviewProject, alias: "T12 Review project", pinned: false }]
           : [{ path: workspaceRoot, alias: "Re-UthCode", pinned: false }];
-    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow || isSettingsFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "permission" ? permissionProject : flow === "review" ? reviewProject : workspaceRoot;
+    const selectedProjectKey = isRealProviderFlow || isGeneralCancelFlow || isInvalidConfigurationFlow ? null : isLifecycleFlow || isSettingsFlow ? lifecycleProjectOne : isDiffFlow ? diffProject : flow === "permission" ? permissionProject : flow === "review" || flow === "model-images" ? reviewProject : workspaceRoot;
     const projectAliases = Object.fromEntries(recentProjects.map((project) => [project.path, project.alias]));
     const desktopPreferences = JSON.stringify({
       language: preferenceLanguage,
@@ -539,6 +539,7 @@ async function main() {
         "--ready-file", fixtureReadyPath,
         "--plan-chunk-delay-ms", String(planChunkDelayMs),
         ...(flow === "delay" ? ["--delay-ms", "5000"] : []),
+        ...(flow === "model-images" && computerUse ? ["--caption-release-file", join(output, "caption.continue")] : []),
         ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-code-path", join(reviewProject, "review.py"), "--review-image-path", join(reviewProject, "review-attachment.png"), ...(computerUse ? ["--review-live-process"] : [])] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
       ], {
@@ -550,7 +551,7 @@ async function main() {
       fixtureOutput = collectOutput(fixtureChild);
       fixtureReady = await waitForJsonFile(fixtureReadyPath, Math.min(timeoutMs, 15_000));
       if (!fixtureReady?.baseUrl) throw new Error("packaged CDP fixture did not report a base URL");
-      const configuration = fixtureConfiguration(fixtureReady.baseUrl, flow === "review");
+      const configuration = fixtureConfiguration(fixtureReady.baseUrl, flow === "review" || flow === "model-images", flow === "model-images" ? "Vision fixture" : "CDP fixture", flow === "model-images") + (flow === "model-images" ? '\n[search]\nenabled = true\napi_key = "env:UTHCODE_CDP_SEARCH_KEY"\n' : "");
       await writeFile(electronContext.configPath, configuration, "utf8");
       // The packaged Runtime resolves its user config from HOME. Keep that
       // path inside the runner-owned host profile as well; the launcher-owned
@@ -559,6 +560,7 @@ async function main() {
       await mkdir(hostConfigDirectory, { recursive: true });
       await writeFile(join(hostConfigDirectory, "config.toml"), configuration, "utf8");
       electronContext.env.UTHCODE_CDP_FIXTURE_KEY = "fixture-test-key";
+      if (flow === "model-images") electronContext.env.UTHCODE_CDP_SEARCH_KEY = "fixture-search-key";
     } else if (!isRealProviderFlow) {
       // Visual/shell flows still bootstrap the real Runtime status path. Give
       // them the same valid user-config shape without starting a Provider
@@ -602,7 +604,8 @@ async function main() {
         ...(isLifecycleFlow ? ["--stage", stage, "--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo, ...(expectedSessions ? ["--expected-sessions", JSON.stringify(expectedSessions)] : [])] : []),
         ...(isSettingsFlow ? ["--project-one", lifecycleProjectOne, "--project-two", lifecycleProjectTwo] : []),
         ...(isDiffFlow ? ["--diff-project", diffProject, "--diff-unborn-project", diffUnbornProject] : []),
-        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-code-path", join(reviewProject, "review.py"), "--review-image-path", join(reviewProject, "review-attachment.png")] : []),
+        ...(flow === "review" ? ["--review-markdown-path", join(reviewProject, "review.md"), "--review-text-path", join(reviewProject, "review.txt"), "--review-code-path", join(reviewProject, "review.py")] : []),
+        ...(flow === "review" || flow === "model-images" ? ["--review-image-path", join(reviewProject, "review-attachment.png")] : []),
         ...(flow === "ask-one" ? ["--ask-question-count", "1"] : []),
         ...(flow === "plan" ? ["--plan-choice", planChoice] : []),
         ...(flow === "delay" || isGeneralCancelFlow ? ["--delay-action", delayAction] : []),
@@ -759,7 +762,7 @@ async function main() {
   if (driverStderrRaw.unexplained.length > 0) signalFailures.push(`Driver stderr: ${driverStderrRaw.unexplained.length} unexplained line(s)`);
   if (fixtureStderr.unexplained.length > 0) signalFailures.push(`Fixture stderr: ${fixtureStderr.unexplained.length} unexplained line(s)`);
   if (isRealProviderFlow && realProviderConfigUnchanged !== true) signalFailures.push("user-level Provider configuration was not confirmed unchanged");
-  const persistedSecretMarkers = ["fixture-test-key", "raw-native-secret"];
+  const persistedSecretMarkers = ["fixture-test-key", "fixture-search-key", "raw-native-secret"];
   const secretLeakArtifacts = [
     combinedElectronStdout,
     combinedElectronStderr,
@@ -771,7 +774,7 @@ async function main() {
   if (secretLeakArtifacts.length > 0) signalFailures.push(`Fixture secret persisted in process artifacts: ${[...new Set(secretLeakArtifacts)].join(", ")}`);
   // Six initial Turns plus one continuation; the plain-text fixture summary
   // fails validation twice before compaction reports its controlled failure.
-  const expectedFixtureRequests = flow === "sessions" ? 9 : isLifecycleFlow || flow === "permission" ? 3 : isGeneralCancelFlow ? 1 : flow === "review" ? 2 : null;
+  const expectedFixtureRequests = flow === "sessions" ? 9 : isLifecycleFlow || flow === "permission" ? 3 : isGeneralCancelFlow ? 1 : flow === "review" ? 2 : flow === "model-images" ? 6 : null;
   if (expectedFixtureRequests !== null && fixtureRequests.length !== expectedFixtureRequests) {
     signalFailures.push(`Fixture request count: expected ${expectedFixtureRequests}, observed ${fixtureRequests.length}`);
   }
@@ -783,15 +786,30 @@ async function main() {
   }
   if (isLifecycleFlow && (
     fixtureRequests.slice(0, 2).some((request) => request.toolCount <= 0)
-    || fixtureRequests.slice(2).some((request) => request.toolCount !== 0)
+    || fixtureRequests.slice(2).some((request) => JSON.stringify([...(request.toolNames ?? [])].sort()) !== JSON.stringify(["ToolResultRead", "WebFetch"]))
   )) {
-    signalFailures.push("Lifecycle fixture expected two Coding requests with registered tools followed by one tool-free General request");
+    signalFailures.push("Lifecycle fixture expected two Coding requests followed by General WebFetch and owned ToolResultRead");
   }
   if (flow === "review" && (fixtureRequests[0]?.toolCount < 2 || fixtureRequests[1]?.messageRoles?.filter((role) => role === "tool").length !== 2)) {
     signalFailures.push("Review fixture expected one Coding request with two real Tools followed by their two Tool results");
   }
-  if (isGeneralCancelFlow && fixtureRequests.some((request) => request.toolCount !== 0)) {
-    signalFailures.push("General cancellation fixture unexpectedly exposed tools");
+  if (flow === "model-images") {
+    const [first, placeholder, second, caption, summary, general] = fixtureRequests;
+    if (first?.imageCount !== 1 || second?.imageCount !== 1 || caption?.imageCount !== 1 || caption?.toolCount !== 0 || caption?.model !== "fixture-model") {
+      signalFailures.push("image-switch fixture did not send real images to the original vision Provider for both history and caption");
+    }
+    if (placeholder?.model !== "menu-model-0" || placeholder?.imageCount !== 0 || placeholder?.captionVisible !== false || placeholder?.originalPromptVisible !== true) {
+      signalFailures.push("placeholder continuation did not preserve original text while excluding images without a caption request");
+    }
+    if (summary?.model !== "menu-model-0" || summary?.imageCount !== 0 || summary?.captionVisible !== true || summary?.originalPromptVisible !== true) {
+      signalFailures.push("summary continuation did not retain the original text and real caption while excluding image payloads");
+    }
+    if (JSON.stringify([...(general?.toolNames ?? [])].sort()) !== JSON.stringify(["ToolResultRead", "WebFetch", "WebSearch"])) {
+      signalFailures.push("General Provider definitions must contain WebFetch, configured WebSearch and owned ToolResultRead only");
+    }
+  }
+  if (isGeneralCancelFlow && fixtureRequests.some((request) => JSON.stringify([...(request.toolNames ?? [])].sort()) !== JSON.stringify(["ToolResultRead", "WebFetch"]))) {
+    signalFailures.push("General cancellation fixture must expose WebFetch and owned ToolResultRead only");
   }
   if (isInvalidConfigurationFlow && invalidConfigUnchanged !== true) {
     signalFailures.push("runner-owned invalid configuration was not confirmed unchanged");

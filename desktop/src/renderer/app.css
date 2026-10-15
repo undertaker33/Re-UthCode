@@ -375,6 +375,18 @@ details[open] > summary .timeline-disclosure-caret { transform: rotate(225deg) t
 @keyframes compaction-spin { to { transform: rotate(360deg); } }
 @keyframes compaction-dot { 0%, 70%, 100% { opacity: .25; } 35% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .compaction-spinner, .compaction-dots span { animation: none; } }
+.model-image-switch-backdrop { position: fixed; z-index: 1200; inset: 0; display: grid; place-items: center; overflow: auto; padding: 24px; background: rgb(0 0 0 / 58%); }
+.model-image-switch-dialog { box-sizing: border-box; width: min(440px, 100%); border: 1px solid var(--line-strong); border-radius: 14px; padding: 22px; color: var(--text); background: var(--surface); box-shadow: 0 20px 60px var(--shadow); }
+.model-image-switch-dialog h2 { margin: 0 0 10px; font-size: 16px; font-weight: 620; }
+.model-image-switch-dialog > p { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.model-image-switch-dialog > .model-image-switch-error { margin-top: -8px; color: var(--danger); }
+.model-image-switch-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.model-image-switch-actions button { display: inline-flex; min-height: 34px; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--line-strong); border-radius: 7px; padding: 0 11px; color: var(--text); background: var(--raised); font-size: 11px; }
+.model-image-switch-actions .accent-button { border-color: var(--accent); color: var(--on-accent); background: var(--accent-action); }
+.model-image-switch-actions .model-image-switch-cancel { border-color: transparent; color: var(--muted); background: transparent; }
+.model-image-switch-actions button:disabled { opacity: .55; cursor: wait; }
+.model-image-switch-spinner { display: inline-block; width: 12px; height: 12px; flex: 0 0 12px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: compaction-spin .8s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .model-image-switch-spinner { animation: none; } }
 .renderer-error-boundary { display: flex; min-width: 0; min-height: 42px; align-items: center; justify-content: center; gap: 10px; margin: 10px; border: 1px solid color-mix(in srgb, var(--danger) 58%, var(--line)); border-left: 3px solid var(--danger); border-radius: 9px; padding: 10px 12px; color: var(--text); background: var(--surface); font-size: 11px; }
 .renderer-error-boundary span { min-width: 0; overflow-wrap: anywhere; }
 .renderer-error-boundary button { flex: 0 0 auto; min-height: 28px; border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 9px; color: var(--text); background: var(--raised); font-size: 10px; }

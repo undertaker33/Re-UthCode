@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 
 from uthcode.application import (
@@ -14,6 +16,7 @@ from uthcode.application import (
     ModelProfile,
     ProviderKind,
     ProviderProfile,
+    SearchConfiguration,
     SessionOperationError,
     UthCodeApplication,
     create_application,
@@ -26,10 +29,13 @@ from uthcode.core.provider import (
     ProviderIdentity,
     ProviderResponse,
     ReasoningDelta,
+    ToolCallPart,
+    ToolResultPart,
     TextDelta,
     TextPart,
     Usage,
 )
+from uthcode.core.permission import PermissionMode
 from uthcode.integrations.providers.fake import FakeProvider
 from uthcode.integrations.session_files import SessionWriter
 
@@ -429,7 +435,7 @@ async def test_active_turn_keeps_its_provider_and_model_snapshot(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_general_application_is_tool_free_across_create_reload_and_recovery(
+async def test_general_application_isolated_tools_across_create_reload_and_recovery(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "coding-project"
@@ -451,24 +457,38 @@ async def test_general_application_is_tool_free_across_create_reload_and_recover
     assert application.session_service.project_key == "uthcode:general"
     assert application.instruction_loader is not None
     assert application.instruction_loader.project_root is None
-    assert application.tool_definitions() == ()
-    assert application._agent_tool_definitions() == ()
+    assert [item.name for item in application.tool_definitions()] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
+    assert [item.name for item in application._agent_tool_definitions()] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
     session = application.create_session("general-session")
     assert session.project_key == "uthcode:general"
 
     first_result = await application.create_run().start_turn("hello").result()
     assert first_result.final_text == "remote-one"
     first_request = application.provider.recorded_requests[-1]
-    assert first_request.tools == ()
+    assert [item.name for item in first_request.tools] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
     assert "日常文本交流" in first_request.system_prompt
     assert "coding-only instruction" not in first_request.system_prompt
     assert str(project) not in first_request.system_prompt
 
     application.reload_configuration(config)
-    assert application.tool_definitions() == ()
+    assert [item.name for item in application.tool_definitions()] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
     second_result = await application.create_run().start_turn("again").result()
     assert second_result.final_text == "remote-one"
-    assert application.provider.recorded_requests[-1].tools == ()
+    assert [
+        item.name for item in application.provider.recorded_requests[-1].tools
+    ] == ["WebFetch", "ToolResultRead"]
     application.close()
 
     recovered = create_application(
@@ -480,11 +500,17 @@ async def test_general_application_is_tool_free_across_create_reload_and_recover
     )
     resumed = recovered.resume_session("general-session")
     assert resumed.project_key == "uthcode:general"
-    assert recovered.tool_definitions() == ()
+    assert [item.name for item in recovered.tool_definitions()] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
     restart_result = await recovered.create_run().start_turn("after restart").result()
     assert restart_result.final_text == "remote-one"
     restart_request = recovered.provider.recorded_requests[-1]
-    assert restart_request.tools == ()
+    assert [item.name for item in restart_request.tools] == [
+        "WebFetch",
+        "ToolResultRead",
+    ]
     assert "日常文本交流" in restart_request.system_prompt
     assert "coding-only instruction" not in restart_request.system_prompt
     recovered.close()
@@ -501,3 +527,345 @@ async def test_general_application_is_tool_free_across_create_reload_and_recover
     with pytest.raises(SessionOperationError):
         coding.resume_session("general-session")
     coding.close()
+
+
+@pytest.mark.asyncio
+async def test_general_search_tools_follow_user_configuration_on_create_reload_and_restart(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "coding-project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("coding-only instruction", encoding="utf-8")
+    runtime_context = ApplicationRuntimeContext.from_system(workdir=project)
+    enabled_config = replace(
+        _config(tmp_path),
+        search=SearchConfiguration(enabled=True, api_key="isolated-search-key"),
+    )
+    disabled_config = replace(
+        enabled_config,
+        search=SearchConfiguration(enabled=True, api_key=None),
+    )
+    storage_root = tmp_path / "sessions"
+
+    application = create_application(
+        enabled_config,
+        provider_builder=_builder,
+        runtime_context=runtime_context,
+        storage_root=storage_root,
+        web_transport=object(),
+        application_mode=ApplicationMode.GENERAL,
+    )
+    try:
+        assert [item.name for item in application.tool_definitions()] == [
+            "WebFetch",
+            "WebSearch",
+            "ToolResultRead",
+        ]
+        result = await application.create_run().start_turn("search the public web").result()
+        assert result.final_text == "remote-one"
+        request = application.provider.recorded_requests[-1]
+        assert [item.name for item in request.tools] == [
+            "WebFetch",
+            "WebSearch",
+            "ToolResultRead",
+        ]
+        assert "coding-only instruction" not in request.system_prompt
+        assert str(project) not in request.system_prompt
+
+        application.reload_configuration(disabled_config)
+        assert [item.name for item in application.tool_definitions()] == [
+            "WebFetch",
+            "ToolResultRead",
+        ]
+        await application.create_run().start_turn("search is now disabled").result()
+        assert [
+            item.name for item in application.provider.recorded_requests[-1].tools
+        ] == ["WebFetch", "ToolResultRead"]
+    finally:
+        application.close()
+
+    recovered = create_application(
+        enabled_config,
+        provider_builder=_builder,
+        runtime_context=runtime_context,
+        storage_root=storage_root,
+        web_transport=object(),
+        application_mode=ApplicationMode.GENERAL,
+    )
+    try:
+        assert [item.name for item in recovered.tool_definitions()] == [
+            "WebFetch",
+            "WebSearch",
+            "ToolResultRead",
+        ]
+        await recovered.create_run().start_turn("search after restart").result()
+        assert [
+            item.name for item in recovered.provider.recorded_requests[-1].tools
+        ] == ["WebFetch", "WebSearch", "ToolResultRead"]
+    finally:
+        recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_general_executes_existing_search_through_local_http_fixture(
+    tmp_path: Path,
+) -> None:
+    class _SearchProvider(FakeProvider):
+        async def stream(self, request, *, cancellation):  # type: ignore[no-untyped-def]
+            self.requests.append(request)
+            cancellation.raise_if_cancelled()
+            if len(self.requests) == 1:
+                call = ToolCallPart(
+                    "general-search-call",
+                    "WebSearch",
+                    {"query": "fixture query", "max_results": 1},
+                )
+                yield GenerationCompleted(
+                    ProviderResponse(
+                        message=Message("assistant", (call,)),
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        usage=Usage(),
+                    )
+                )
+                return
+            assert any(
+                isinstance(part, ToolResultPart)
+                for message in request.messages
+                for part in message.parts
+            )
+            yield _completed("GENERAL_SEARCH_FIXTURE_COMPLETED")
+
+    search_provider = _SearchProvider(
+        identity=ProviderIdentity("local", "fixture", "remote-one"),
+        model_limits=TEST_LIMITS,
+    )
+    captured: list[dict[str, object]] = []
+
+    def handle_search(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "answer": "not projected",
+                "results": [
+                    {
+                        "title": "Fixture result",
+                        "url": "https://example.com/public",
+                        "content": "GENERAL_SEARCH_RESULT_MARKER",
+                    }
+                ],
+                "usage": {"credits": 1},
+            },
+            request=request,
+        )
+
+    config = replace(
+        _config(tmp_path),
+        sources=(ConfigSource("user", tmp_path / ".uthcode" / "config.toml"),),
+        search=SearchConfiguration(enabled=True, api_key="isolated-search-key"),
+    )
+    application = create_application(
+        config,
+        provider_builder=lambda _profile, _model: search_provider,
+        runtime_context=ApplicationRuntimeContext.from_system(workdir=tmp_path),
+        storage_root=tmp_path / "sessions",
+        web_transport=httpx.MockTransport(handle_search),
+        application_mode=ApplicationMode.GENERAL,
+    )
+    try:
+        run = application.create_run()
+        run.set_permission_mode(PermissionMode.FULL_ACCESS)
+        result = await run.start_turn("Search the public web for the fixture query").result()
+        assert result.final_text == "GENERAL_SEARCH_FIXTURE_COMPLETED"
+        assert len(captured) == 1
+        assert captured[0]["api_key"] == "isolated-search-key"
+        assert captured[0]["search_depth"] == "basic"
+        assert captured[0]["include_answer"] is False
+        assert captured[0]["query"] == "fixture query"
+        assert [tool.name for tool in search_provider.recorded_requests[0].tools] == [
+            "WebFetch",
+            "WebSearch",
+            "ToolResultRead",
+        ]
+        tool_results = [
+            part
+            for message in search_provider.recorded_requests[-1].messages
+            for part in message.parts
+            if isinstance(part, ToolResultPart)
+        ]
+        assert tool_results
+        assert "GENERAL_SEARCH_RESULT_MARKER" in repr(tool_results)
+        assert "not projected" not in repr(tool_results)
+        assert "isolated-search-key" not in repr(result)
+        assert "isolated-search-key" not in repr(application.diagnostics())
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_general_webfetch_large_result_is_readable_and_recovers_from_session(
+    tmp_path: Path,
+) -> None:
+    late_marker = "GENERAL_WEBFETCH_LATE_BODY_MARKER"
+
+    class _FetchProvider(FakeProvider):
+        async def stream(self, request, *, cancellation):  # type: ignore[no-untyped-def]
+            self.requests.append(request)
+            cancellation.raise_if_cancelled()
+            assert [item.name for item in request.tools] == [
+                "WebFetch",
+                "ToolResultRead",
+            ]
+            if len(self.requests) == 1:
+                call = ToolCallPart(
+                    "general-webfetch-call",
+                    "WebFetch",
+                    {"url": "https://example.com/large", "max_bytes": 50_000},
+                )
+            elif len(self.requests) == 2:
+                fetched = next(
+                    part
+                    for message in request.messages
+                    for part in message.parts
+                    if isinstance(part, ToolResultPart)
+                    and part.tool_call_id == "general-webfetch-call"
+                )
+                assert fetched.metadata["persistence_status"] == "externalized"
+                assert "Use ToolResultRead" in str(fetched.content)
+                reference = fetched.metadata["ref"]
+                call = ToolCallPart(
+                    "general-webfetch-read-1",
+                    "ToolResultRead",
+                    {"ref": reference, "offset": 0, "limit": 2048},
+                )
+            elif len(self.requests) == 3:
+                first_page_result = next(
+                    part
+                    for message in request.messages
+                    for part in message.parts
+                    if isinstance(part, ToolResultPart)
+                    and part.tool_call_id == "general-webfetch-read-1"
+                )
+                first_page = json.loads(str(first_page_result.content))
+                assert first_page["offset"] == 0
+                assert late_marker not in first_page["content"]
+                call = ToolCallPart(
+                    "general-webfetch-read-2",
+                    "ToolResultRead",
+                    {
+                        "ref": first_page["ref"],
+                        "offset": first_page["next_offset"],
+                        "limit": 2048,
+                    },
+                )
+            elif len(self.requests) == 4:
+                second_page_result = next(
+                    part
+                    for message in request.messages
+                    for part in message.parts
+                    if isinstance(part, ToolResultPart)
+                    and part.tool_call_id == "general-webfetch-read-2"
+                )
+                second_page = json.loads(str(second_page_result.content))
+                assert second_page["offset"] > 0
+                assert late_marker in second_page["content"]
+                yield _completed("GENERAL_WEBFETCH_FIXTURE_COMPLETED")
+                return
+            else:
+                raise AssertionError("unexpected General WebFetch Provider request")
+            yield GenerationCompleted(
+                ProviderResponse(
+                    message=Message("assistant", (call,)),
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    usage=Usage(),
+                )
+            )
+
+    body = "x" * 2400 + late_marker + "z" * 9000
+    fetch_provider = _FetchProvider(
+        identity=ProviderIdentity("local", "fixture", "remote-one"),
+        model_limits=TEST_LIMITS,
+    )
+
+    def handle_fetch(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://example.com/large"
+        return httpx.Response(
+            200,
+            content=body.encode("utf-8"),
+            headers={"content-type": "text/plain; charset=utf-8"},
+            request=request,
+        )
+
+    config = _config(tmp_path)
+    runtime_context = ApplicationRuntimeContext.from_system(workdir=tmp_path)
+    storage_root = tmp_path / "sessions"
+    application = create_application(
+        config,
+        provider_builder=lambda _profile, _model: fetch_provider,
+        runtime_context=runtime_context,
+        storage_root=storage_root,
+        web_transport=httpx.MockTransport(handle_fetch),
+        application_mode=ApplicationMode.GENERAL,
+    )
+    session_id = "general-webfetch-session"
+    try:
+        application.create_session(session_id)
+        run = application.create_run()
+        run.set_permission_mode(PermissionMode.FULL_ACCESS)
+        result = await run.start_turn("Read the full public fixture page").result()
+        assert result.final_text == "GENERAL_WEBFETCH_FIXTURE_COMPLETED"
+        assert len(fetch_provider.recorded_requests) == 4
+        assert all(
+            [item.name for item in request.tools] == ["WebFetch", "ToolResultRead"]
+            for request in fetch_provider.recorded_requests
+        )
+        history = application.session_history_page(session_id)
+        output_record = next(
+            record
+            for record in history.records
+            if record.kind == "tool" and record.output_ref is not None
+        )
+        reference = output_record.output_ref
+        assert reference is not None
+        first_page = application.read_tool_result_page(
+            session_id,
+            reference,
+            offset=0,
+            limit=2048,
+        )
+        assert first_page.eof is False
+        second_page = application.read_tool_result_page(
+            session_id,
+            reference,
+            offset=first_page.next_offset,
+            limit=2048,
+        )
+        assert late_marker in second_page.content
+        assert second_page.ref == reference
+    finally:
+        application.close()
+
+    recovered = create_application(
+        config,
+        provider_builder=_builder,
+        runtime_context=runtime_context,
+        storage_root=storage_root,
+        web_transport=httpx.MockTransport(handle_fetch),
+        application_mode=ApplicationMode.GENERAL,
+    )
+    try:
+        recovered.resume_session(session_id)
+        assert [item.name for item in recovered.tool_definitions()] == [
+            "WebFetch",
+            "ToolResultRead",
+        ]
+        recovered_page = recovered.read_tool_result_page(
+            session_id,
+            reference,
+            offset=first_page.next_offset,
+            limit=2048,
+        )
+        assert late_marker in recovered_page.content
+        assert recovered_page.ref == reference
+    finally:
+        recovered.close()

@@ -116,7 +116,7 @@ export function ContextRing({ usage, language, translate }: ContextRingProps) {
 }
 
 export interface ComposerProps {
-  state: Pick<RendererState, "mode" | "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "modelPickerOpen" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
+  state: Pick<RendererState, "mode" | "runtimeState" | "composerText" | "composerAttachments" | "activeTurn" | "terminalStatusPending" | "turnStatus" | "pendingInteraction" | "commandCandidates" | "argumentCandidates" | "commandUsage" | "commandArgumentPrompt" | "run" | "permissionMode" | "modelCandidates" | "contextUsage" | "compactionStatus" | "currentModelRef" | "configuration" | "todo" | "todoIteration">;
   sessionPreparationStatus?: "preparing" | "ready" | "failed";
   onChange: (text: string) => void;
   onSubmit: (text: string, attachments: readonly DesktopAttachmentDraft[]) => void | Promise<void>;
@@ -236,6 +236,7 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
     const refs = new Set<string>();
     if (state.currentModelRef) refs.add(state.currentModelRef);
     for (const model of state.modelCandidates) if (model.trim()) refs.add(model);
+    for (const model of Object.keys(state.configuration?.models ?? {})) if (model.trim()) refs.add(model);
     return [
       { value: "", label: t("chooseModel"), disabled: true },
       ...[...refs].map((modelRef) => ({ value: modelRef, label: modelDisplayName(state.configuration, modelRef) })),
@@ -375,7 +376,15 @@ export function Composer({ state, sessionPreparationStatus, onChange, onSubmit, 
         </div>}
         <div className="composer-right-controls">
           <div className="composer-model">
-            <CustomSelect label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")} value={state.currentModelRef ?? ""} triggerIcon="model" preferredMenuWidth={320} onOpen={() => { if (!state.modelPickerOpen) void onCommand("/model"); }} onChange={(value) => void onCommand(`/model ${value}`)} disabled={inputLocked || state.activeTurn} options={modelOptions} />
+          <CustomSelect
+            label={state.currentModelRef ? `${t("model")}: ${modelDisplayName(state.configuration, state.currentModelRef)}` : t("model")}
+            value={state.currentModelRef ?? ""}
+            triggerIcon="model"
+            preferredMenuWidth={320}
+            onChange={(value) => void onCommand(`/model ${value}`)}
+            disabled={inputLocked || state.activeTurn}
+            options={modelOptions}
+          />
             {codingMode && <ContextRing usage={state.contextUsage} language={language} translate={(key) => t(key)} />}
           </div>
           <button className="composer-send" type="button" title={sendLabel} aria-label={sendLabel} onClick={submit} disabled={inputLocked || !submitPayloadAvailable}><UiIcon name="send" /><span className="composer-send__label">{sendLabel}</span></button>

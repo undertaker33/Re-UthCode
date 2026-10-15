@@ -341,7 +341,6 @@ export interface RendererState {
   /** Runtime preparation is independent from the already-visible history page. */
   sessionPreparation: Record<string, SessionPreparationState>;
   modelCandidates: string[];
-  modelPickerOpen: boolean;
   activeTurn: boolean;
   /** A terminal event was rendered, but Application has not released its active handle yet. */
   terminalStatusPending: boolean;
@@ -434,7 +433,6 @@ export const DEFAULT_RENDERER_STATE: RendererState = {
   sessionPreparation: {},
   pendingSteeringMessageIds: {},
   modelCandidates: [],
-  modelPickerOpen: false,
   activeTurn: false,
   terminalStatusPending: false,
   sessionMutationBusy: false,
@@ -2037,7 +2035,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
       return { ...state, commandCandidates: candidates, argumentCandidates, commandUsage: textValue(source.usage) || null, commandArgumentPrompt: textValue(source.argument_prompt) || null };
     }
     case "model_candidates":
-      return { ...state, modelCandidates: [...action.values], modelPickerOpen: true };
+      return { ...state, modelCandidates: [...action.values] };
     case "turn_accepted": {
       const submission = action.submission;
       if (submission && (submission.mode !== state.mode
@@ -2239,7 +2237,7 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
         const next = actionValue.restored === true
           ? applySessionResumed(cached, { session_id: actionValue.session_id, replay, run, active_turn: params?.active_turn, model_ref: params?.model_ref }, false, providerRequestUsageFromResult(params), true)
           : { ...permissionUnknownAtRunBoundary(cached, run, false), selectedSessionId: actionValue.session_id, timeline: [], todo: [], todoIteration: 0, activeTurn: params?.active_turn === true, terminalStatusPending: false, turnStatus: params?.active_turn === true ? "running" as const : "idle" as const, pendingInteraction: null, contextUsage: contextUsageAtBoundary(), lastProviderRequestUsage: providerRequestUsageAtBoundary(), compactionStatus: { state: "idle" as const, trigger: null, changed: null }, ...(typeof params?.model_ref === "string" ? { currentModelRef: params.model_ref, sessionModels: { ...cached.sessionModels, [actionValue.session_id]: params.model_ref } } : {}), sessionViewRevision: state.sessionViewRevision + 1 };
-        const presented = activateComposerDraft({ ...next, pendingSteeringMessageIds: {}, commandOutput: notice, notice, modelPickerOpen: false }, state.mode, next.selectedProjectKey, actionValue.session_id);
+        const presented = activateComposerDraft({ ...next, pendingSteeringMessageIds: {}, commandOutput: notice, notice }, state.mode, next.selectedProjectKey, actionValue.session_id);
         return presented;
       }
       if (actionValue?.type === "clear_transcript") return { ...state, timeline: [], pendingSteeringMessageIds: {}, commandOutput: notice };
@@ -2268,9 +2266,8 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
             sessions: project.sessions.map((session) => session.session_id === state.selectedSessionId ? { ...session, model_ref: selectedModelRef } : session),
           }))
           : state.projects;
-        return { ...state, run, permissionMode, currentModelRef, sessionModels, projects, contextUsage, commandOutput: notice, notice, modelPickerOpen: false };
+        return { ...state, run, permissionMode, currentModelRef, sessionModels, projects, contextUsage, commandOutput: notice, notice };
       }
-      if (actionValue?.type === "open_model_picker") return { ...state, modelPickerOpen: true, commandOutput: notice, notice };
       return { ...state, commandOutput: notice, notice };
     }
     case "composer_text":
@@ -2311,7 +2308,6 @@ function reduceRendererStateInner(state: RendererState, action: RendererAction):
           commandOutput: null,
           composerText: "",
           modelCandidates: [],
-          modelPickerOpen: false,
           notice: null,
           runtimeError: null,
           runtimeState: "stopped",

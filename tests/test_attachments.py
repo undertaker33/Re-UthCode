@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import struct
@@ -30,9 +31,13 @@ from uthcode.core.provider import (
     Message,
     MessageInput,
     ModelLimits,
+    NativeItem,
     ProviderConfigurationError,
+    ProviderError,
     ProviderIdentity,
     ProviderResponse,
+    ToolCallPart,
+    ToolResultPart,
     TextPart,
     Usage,
 )
@@ -675,6 +680,18 @@ async def test_context_compaction_preserves_source_shrinks_request_and_allows_te
         )
         assert account_generation_request(after_request).input_tokens < account_generation_request(before_request).input_tokens
 
+        visual_result = await application.create_run().start_turn("AFTER_COMPACT_MARKER").result()
+        assert visual_result.status is RunStatus.COMPLETED
+        visual_request = vision.recorded_requests[-1]
+        visual_serialized = repr(tuple(message.to_dict() for message in visual_request.messages))
+        assert "compressed image evidence" in visual_serialized
+        assert "AFTER_COMPACT_MARKER" in visual_serialized
+        assert not any(
+            isinstance(part, ImagePart)
+            for message in visual_request.messages
+            for part in message.parts
+        ), "a visual Provider request must respect the committed compacted Timeline"
+
         application.select_model("text/ref")
         assert application.current_model_ref == "text/ref"
         text_result = await application.create_run().start_turn("continue in text").result()
@@ -685,5 +702,438 @@ async def test_context_compaction_preserves_source_shrinks_request_and_allows_te
             for message in text.requests[-1].messages
             for part in message.parts
         )
+    finally:
+        application.close()
+
+
+def _image_and_tool_history(session, imported) -> tuple[object, ...]:  # type: ignore[no-untyped-def]
+    session_id = session.session_id
+    turn_id = "image-and-tool-turn"
+    user = transcript_entries_from_message(
+        session_id,
+        turn_id,
+        1,
+        Message(
+            "user",
+            (
+                TextPart("USER_TEXT_MARKER: compare this evidence"),
+                ImagePart(imported.asset_ref, imported.mime_type),
+            ),
+            native_items=(
+                NativeItem(
+                    "vision",
+                    "test",
+                    "vision-model",
+                    sequence_index=1,
+                    kind="image_snapshot",
+                    payload={"snapshot_marker": "PRESERVE_NATIVE_IMAGE"},
+                ),
+            ),
+        ),
+    )
+    tool_call = transcript_entries_from_message(
+        session_id,
+        turn_id,
+        3,
+        Message("assistant", (ToolCallPart("search-call-1", "WebSearch", {"query": "marker"}),)),
+    )
+    tool_result = transcript_entries_from_message(
+        session_id,
+        turn_id,
+        4,
+        Message(
+            "tool",
+            (
+                ToolResultPart(
+                    "search-call-1",
+                    (
+                        TextPart("TOOL_RESULT_MARKER: public result"),
+                        ImagePart(imported.asset_ref, imported.mime_type),
+                    ),
+                ),
+            ),
+        ),
+    )
+    final = transcript_entries_from_message(
+        session_id,
+        turn_id,
+        5,
+        Message("assistant", (TextPart("ASSISTANT_TEXT_MARKER: completed turn"),)),
+    )
+    entries = (*user, *tool_call, *tool_result, *final)
+    outcome = session.append_transcript(entries)
+    assert outcome.transcript_appended is True
+    return entries
+
+
+@pytest.mark.asyncio
+async def test_text_model_switch_can_project_image_history_as_safe_placeholder(
+    tmp_path: Path,
+) -> None:
+    vision = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.vision"),
+    )
+    text = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.text"),
+    )
+    application = _app_with_fake_provider(
+        tmp_path,
+        providers={"vision/ref": vision, "text/ref": text},
+    )
+    session = application.new_session_for_command()
+    try:
+        imported = application.import_attachment(
+            _PNG,
+            display_name="history.png",
+            mime_type="image/png",
+        )
+        original_entries = _image_and_tool_history(session, imported)
+        with pytest.raises(ProviderConfigurationError) as unsupported:
+            await application.select_model_async("text/ref")
+        assert getattr(unsupported.value, "code", None) == "image_input_unsupported"
+        assert application.current_model_ref == "vision/ref"
+
+        await application.select_model_async(
+            "text/ref",
+            image_handling="placeholder",
+            expected_session_id=session.session_id,
+        )
+        assert application.current_model_ref == "text/ref"
+        assert session.transcript.entries == original_entries
+        assert application.attachment_service is not None
+        assert application.attachment_service.read(session.session_id, imported.ref) == _PNG
+
+        result = await application.create_run().start_turn("NEXT_TURN_MARKER").result()
+        assert result.status is RunStatus.COMPLETED
+        request = text.recorded_requests[-1]
+        serialized = repr(tuple(message.to_dict() for message in request.messages))
+        assert "USER_TEXT_MARKER" in serialized
+        assert "TOOL_RESULT_MARKER" in serialized
+        assert "ASSISTANT_TEXT_MARKER" in serialized
+        assert "NEXT_TURN_MARKER" in serialized
+        assert "Image not read" in serialized
+        assert imported.ref in serialized
+        assert "attachment:" not in serialized
+        assert "PRESERVE_NATIVE_IMAGE" not in serialized
+        assert not any(
+            isinstance(part, ImagePart)
+            for message in request.messages
+            for part in message.parts
+        )
+        assert request.metadata["image_accounting"]["image_count"] == 0
+
+        await application.select_model_async(
+            "vision/ref",
+            expected_session_id=session.session_id,
+        )
+        vision_result = await application.create_run().start_turn("VIEW_IMAGE_AGAIN").result()
+        assert vision_result.status is RunStatus.COMPLETED
+        restored_request = vision.recorded_requests[-1]
+        restored_parts = tuple(
+            part
+            for message in restored_request.messages
+            for part in message.parts
+        )
+        restored_images = tuple(
+            part
+            for message in restored_request.messages
+            for item in message.parts
+            for part in (
+                (item,)
+                if isinstance(item, ImagePart)
+                else item.content.parts
+                if isinstance(item, ToolResultPart)
+                else ()
+            )
+            if isinstance(part, ImagePart)
+        )
+        assert len(restored_images) == 2
+        assert any(
+            item.payload.get("snapshot_marker") == "PRESERVE_NATIVE_IMAGE"
+            for message in restored_request.messages
+            for item in message.native_items
+        )
+        restored_serialized = repr(
+            tuple(message.to_dict() for message in restored_request.messages)
+        )
+        assert "USER_TEXT_MARKER" in restored_serialized
+        assert "search-call-1" in restored_serialized
+        assert "TOOL_RESULT_MARKER" in restored_serialized
+        assert "ASSISTANT_TEXT_MARKER" in restored_serialized
+        assert "VIEW_IMAGE_AGAIN" in restored_serialized
+        assert any(
+            entry.payload.get("native_items")
+            for entry in session.transcript.entries
+        )
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_text_model_switch_summarizes_real_image_and_keeps_original_history(
+    tmp_path: Path,
+) -> None:
+    class _ImageSummaryProvider(FakeProvider):
+        async def stream(
+            self,
+            request,
+            *,
+            cancellation: CancellationToken,
+        ) -> AsyncIterator[object]:
+            self.requests.append(request)
+            cancellation.raise_if_cancelled()
+            if request.metadata.get("context_image_summary_request") is True:
+                assert request.tools == ()
+                image_parts = [
+                    part
+                    for message in request.messages
+                    for part in message.parts
+                    if isinstance(part, ImagePart)
+                ]
+                assert image_parts
+                prompt = "\n".join(
+                    part.text
+                    for message in request.messages
+                    for part in message.parts
+                    if isinstance(part, TextPart)
+                )
+                assert "USER_TEXT_MARKER" in prompt
+                assert "search-call-1" in prompt
+                assert "TOOL_RESULT_MARKER" in prompt
+                coverage = json.loads(
+                    prompt.split("Required coverage (copy only these Turn IDs):\n", 1)[1]
+                )
+                response = {
+                    "entries": [
+                        {
+                            "turn_id": item["turn_id"],
+                            "summary": (
+                                "MODEL_IMAGE_CAPTION: visible test image; "
+                                "USER_TEXT_MARKER; WebSearch search-call-1; "
+                                "TOOL_RESULT_MARKER; ASSISTANT_TEXT_MARKER"
+                            ),
+                            "refs": item["refs"],
+                        }
+                        for item in coverage
+                    ],
+                    "coverage": [item["turn_id"] for item in coverage],
+                }
+                yield _completed(json.dumps(response, ensure_ascii=False))
+                return
+            yield _completed()
+
+    vision = _ImageSummaryProvider(
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.vision")
+    )
+    text = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.text"),
+    )
+    application = _app_with_fake_provider(
+        tmp_path,
+        providers={"vision/ref": vision, "text/ref": text},
+    )
+    session = application.new_session_for_command()
+    try:
+        imported = application.import_attachment(
+            _PNG,
+            display_name="history.png",
+            mime_type="image/png",
+        )
+        original_entries = _image_and_tool_history(session, imported)
+        await application.select_model_async(
+            "text/ref",
+            image_handling="summarize",
+            expected_session_id=session.session_id,
+        )
+        assert application.current_model_ref == "text/ref"
+        assert session.transcript.entries == original_entries
+        assert session.timeline.sequence_end == original_entries[-1].sequence
+        assert "MODEL_IMAGE_CAPTION" in session.timeline.summary
+        assert application.attachment_service is not None
+        assert application.attachment_service.read(session.session_id, imported.ref) == _PNG
+        summary_request = next(
+            request
+            for request in vision.recorded_requests
+            if request.metadata.get("context_image_summary_request") is True
+        )
+        assert summary_request.tools == ()
+        assert any(
+            isinstance(part, ImagePart)
+            for message in summary_request.messages
+            for part in message.parts
+        )
+        assert summary_request.metadata["image_accounting"]["image_count"] == 2
+        assert summary_request.metadata["image_accounting"]["image_estimate_available"] is True
+        assert summary_request.metadata["image_accounting"]["source"] == "attachment_store"
+
+        result = await application.create_run().start_turn("NEXT_TURN_MARKER").result()
+        assert result.status is RunStatus.COMPLETED
+        request = text.recorded_requests[-1]
+        serialized = repr(tuple(message.to_dict() for message in request.messages))
+        assert "MODEL_IMAGE_CAPTION" in serialized
+        assert "USER_TEXT_MARKER" in serialized
+        assert "search-call-1" in serialized
+        assert "TOOL_RESULT_MARKER" in serialized
+        assert "ASSISTANT_TEXT_MARKER" in serialized
+        assert "NEXT_TURN_MARKER" in serialized
+        assert "PRESERVE_NATIVE_IMAGE" not in serialized
+        assert not any(
+            isinstance(part, ImagePart)
+            for message in request.messages
+            for part in message.parts
+        )
+        assert request.metadata["image_accounting"]["image_count"] == 0
+    finally:
+        application.close()
+
+
+@pytest.mark.asyncio
+async def test_placeholder_projection_survives_session_resume_and_rejects_new_images(
+    tmp_path: Path,
+) -> None:
+    text = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.text"),
+    )
+    vision = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.vision"),
+    )
+    first = _app_with_fake_provider(
+        tmp_path,
+        providers={"vision/ref": vision, "text/ref": text},
+    )
+    recovered: UthCodeApplication | None = None
+    session = first.new_session_for_command()
+    session_id = session.session_id
+    try:
+        imported = first.import_attachment(
+            _PNG,
+            display_name="history.png",
+            mime_type="image/png",
+        )
+        original_entries = _image_and_tool_history(session, imported)
+        await first.select_model_async(
+            "text/ref",
+            image_handling="placeholder",
+            expected_session_id=session_id,
+        )
+        assert session.model_ref == "text/ref"
+        assert session.transcript.entries == original_entries
+        first.close()
+
+        recovered_text = FakeProvider(
+            events=(_completed(),),
+            model_limits=ModelLimits(max_input_tokens=256_000, source="test.text"),
+        )
+        recovered = _app_with_fake_provider(
+            tmp_path,
+            providers={"vision/ref": vision, "text/ref": recovered_text},
+        )
+        resumed = recovered.resume_session(session_id)
+        assert resumed.model_ref == "text/ref"
+        assert recovered.current_model_ref == "text/ref"
+        assert resumed.transcript.entries == original_entries
+
+        result = await recovered.create_run().start_turn("AFTER_RESUME_MARKER").result()
+        assert result.status is RunStatus.COMPLETED
+        request = recovered_text.recorded_requests[-1]
+        serialized = repr(tuple(message.to_dict() for message in request.messages))
+        assert "AFTER_RESUME_MARKER" in serialized
+        assert "USER_TEXT_MARKER" in serialized
+        assert "TOOL_RESULT_MARKER" in serialized
+        assert "Image not read" in serialized
+        assert not any(
+            isinstance(part, ImagePart)
+            for message in request.messages
+            for part in message.parts
+        )
+        assert request.metadata["image_accounting"]["image_count"] == 0
+
+        new_attachment = recovered.import_attachment(
+            _PNG,
+            display_name="new-image.png",
+            mime_type="image/png",
+        )
+        assert recovered.attachment_service is not None
+        image = recovered.attachment_service.part(
+            session_id,
+            new_attachment.ref,
+            kind="image",
+        )
+        provider_calls = len(recovered_text.recorded_requests)
+        with pytest.raises(ProviderConfigurationError) as unsupported:
+            recovered.create_run().start_turn(MessageInput((image,)))
+        assert getattr(unsupported.value, "code", None) == "image_input_unsupported"
+        assert recovered.current_model_ref == "text/ref"
+        assert len(recovered_text.recorded_requests) == provider_calls
+    finally:
+        if recovered is not None:
+            recovered.close()
+        else:
+            first.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_provider", [False, True])
+async def test_failed_or_cancelled_image_switch_keeps_model_and_session_preference(
+    tmp_path: Path,
+    cancel_during_provider: bool,
+) -> None:
+    vision = FakeProvider(
+        events=(_completed(),) if cancel_during_provider else (),
+        delay=0.5 if cancel_during_provider else 0.0,
+        error=None if cancel_during_provider else ProviderError("private provider detail"),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.vision"),
+    )
+    text = FakeProvider(
+        events=(_completed(),),
+        model_limits=ModelLimits(max_input_tokens=256_000, source="test.text"),
+    )
+    application = _app_with_fake_provider(
+        tmp_path,
+        providers={"vision/ref": vision, "text/ref": text},
+    )
+    session = application.new_session_for_command()
+    session_model_before = session.model_ref
+    model_before = application.current_model_ref
+    token = CancellationToken()
+    try:
+        imported = application.import_attachment(
+            _PNG,
+            display_name="history.png",
+            mime_type="image/png",
+        )
+        _image_and_tool_history(session, imported)
+
+        async def switch() -> None:
+            await application.select_model_async(
+                "text/ref",
+                image_handling="summarize",
+                expected_session_id=session.session_id,
+                cancellation=token,
+            )
+
+        if cancel_during_provider:
+            task = asyncio.create_task(switch())
+            for _ in range(100):
+                if vision.recorded_requests:
+                    break
+                await asyncio.sleep(0.01)
+            assert vision.recorded_requests
+            token.cancel()
+            with pytest.raises(ProviderConfigurationError) as failed:
+                await task
+        else:
+            with pytest.raises(ProviderConfigurationError) as failed:
+                await switch()
+        assert getattr(failed.value, "code", None) == "image_summarization_failed"
+        assert "private provider detail" not in str(failed.value)
+        assert application.current_model_ref == model_before
+        assert session.model_ref == session_model_before
+        assert session.timeline.sequence_end == 0
     finally:
         application.close()

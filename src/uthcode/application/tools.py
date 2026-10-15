@@ -421,6 +421,7 @@ class ApplicationToolService:
         secret_env_names: Sequence[str] = (),
         secret_values: Sequence[SecretValue] = (),
         session_provider: Callable[[], object | None] | None = None,
+        session_tool_names: Sequence[str] | None = None,
         tool_result_policy: ToolResultPolicy | None = None,
         history_read_policy: HistoryReadPolicy | None = None,
     ) -> None:
@@ -440,6 +441,21 @@ class ApplicationToolService:
         if session_provider is not None and not callable(session_provider):
             raise TypeError("session_provider must be callable or None")
         self._session_provider = session_provider
+        registered_session_tools = (
+            ("ToolResultRead", "HistoryRead")
+            if session_tool_names is None and session_provider is not None
+            else (() if session_tool_names is None else tuple(session_tool_names))
+        )
+        if (
+            not all(isinstance(name, str) for name in registered_session_tools)
+            or len(set(registered_session_tools)) != len(registered_session_tools)
+            or set(registered_session_tools).difference({"ToolResultRead", "HistoryRead"})
+        ):
+            raise ValueError(
+                "session_tool_names may contain ToolResultRead and HistoryRead once each"
+            )
+        if registered_session_tools and session_provider is None:
+            raise ValueError("session tools require a session_provider")
         self._tool_result_policy = (
             ToolResultPolicy() if tool_result_policy is None else tool_result_policy
         )
@@ -450,21 +466,24 @@ class ApplicationToolService:
         )
         if not isinstance(self._history_read_policy, HistoryReadPolicy):
             raise TypeError("history_read_policy must be a HistoryReadPolicy or None")
-        if session_provider is not None:
-            tool_values = (
-                *tool_values,
+        session_tools: list[Tool] = []
+        if "ToolResultRead" in registered_session_tools:
+            session_tools.append(
                 ToolResultReadTool(
                     self._read_tool_result_page,
                     session_provider,
                     policy=self._tool_result_policy,
-                ),
+                )
+            )
+        if "HistoryRead" in registered_session_tools:
+            session_tools.append(
                 HistoryReadTool(
                     self._read_history_page,
                     session_provider,
                     policy=self._history_read_policy,
-                ),
+                )
             )
-        self._registry = ToolRegistry(tool_values)
+        self._registry = ToolRegistry((*tool_values, *session_tools))
         self._executor = ToolExecutor(self._registry)
         self._redactor = _SecretRedactor(secret_env_names, secret_values)
         self._workdir = (

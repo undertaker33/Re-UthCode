@@ -30,6 +30,7 @@ def create_default_tools(
     tool_limits: Mapping[str, object] | object | None = None,
     web_transport: object | None = None,
     redirect_authorizer: Callable[[str], object] | None = None,
+    tool_names: Sequence[str] | None = None,
 ) -> tuple[Tool, ...]:
     """Create one isolated, ordered set of the built-in tools.
 
@@ -42,9 +43,12 @@ def create_default_tools(
     it.
     """
 
-    resolver = WorkspacePathResolver(workdir)
-    tracker = FileReadTracker()
-    manager = process_manager or ProcessSessionManager()
+    selected_names: frozenset[str] | None = None
+    if tool_names is not None:
+        selected_values = tuple(tool_names)
+        if not all(isinstance(name, str) and name for name in selected_values):
+            raise TypeError("tool_names must contain non-empty strings")
+        selected_names = frozenset(selected_values)
     web_max_bytes = _search_value(search_configuration, "max_fetch_bytes", 2 * 1024 * 1024)
     web_timeout = _search_value(search_configuration, "timeout_seconds", 20.0)
     tool_timeout = _search_value(tool_limits, "timeout_seconds", None)
@@ -98,6 +102,56 @@ def create_default_tools(
         result.setdefault("display_name", getattr(value, "display_name", display_name))
         return result
 
+    network_only = selected_names is not None and selected_names.issubset(
+        {"WebFetch", "WebSearch"}
+    )
+    extended_tools_enabled = attachment_service is not None or process_manager is not None
+    network_tools: list[Tool] = []
+    if extended_tools_enabled or network_only:
+        if selected_names is None or "WebFetch" in selected_names:
+            network_tools.append(
+                FetchWebTool(
+                    max_bytes=web_max_bytes,
+                    timeout_seconds=web_timeout,
+                    transport=web_transport,
+                    redirect_authorizer=redirect_authorizer,
+                    asset_writer=write_asset if attachment_service is not None else None,
+                )
+            )
+        search_enabled = (
+            search_configuration.get("enabled", False)
+            if isinstance(search_configuration, Mapping)
+            else getattr(search_configuration, "enabled", False)
+        )
+        search_key = (
+            search_configuration.get("api_key")
+            if isinstance(search_configuration, Mapping)
+            else getattr(search_configuration, "api_key", None)
+        )
+        if (
+            (selected_names is None or "WebSearch" in selected_names)
+            and search_configuration is not None
+            and search_enabled
+            and search_key is not None
+        ):
+            network_tools.append(
+                TavilySearchTool(
+                    search_configuration,
+                    transport=web_transport,
+                )
+            )
+
+    if network_only:
+        if not all(isinstance(tool, ToolPlanningMetadata) for tool in network_tools):
+            raise TypeError("all built-in tools must declare planning_access")
+        return tuple(
+            tool for tool in network_tools if tool.definition.name in selected_names
+        )
+
+    resolver = WorkspacePathResolver(workdir)
+    tracker = FileReadTracker()
+    manager = process_manager or ProcessSessionManager()
+
     base_tools: list[Tool] = [
         ReadFileTool(resolver, tracker, on_path_access=on_path_access),
         WriteFileTool(resolver, tracker, on_path_access=on_path_access),
@@ -114,7 +168,7 @@ def create_default_tools(
     # Existing embedders that request the historical six-tool factory without
     # a Session keep that stable shape.  The formal Application composition
     # always supplies its AttachmentService and receives the extended set.
-    if attachment_service is not None or process_manager is not None:
+    if extended_tools_enabled:
         base_tools.extend(
             (
                 ReadDocumentTool(
@@ -143,34 +197,12 @@ def create_default_tools(
                         max_output_bytes=output_limit,
                     ),
                 ),
-                FetchWebTool(
-                    max_bytes=web_max_bytes,
-                    timeout_seconds=web_timeout,
-                    transport=web_transport,
-                    redirect_authorizer=redirect_authorizer,
-                    asset_writer=write_asset if attachment_service is not None else None,
-                ),
             )
         )
-        if search_configuration is not None:
-            enabled = (
-                search_configuration.get("enabled", False)
-                if isinstance(search_configuration, Mapping)
-                else getattr(search_configuration, "enabled", False)
-            )
-            key = (
-                search_configuration.get("api_key")
-                if isinstance(search_configuration, Mapping)
-                else getattr(search_configuration, "api_key", None)
-            )
-            if enabled and key is not None:
-                base_tools.append(
-                    TavilySearchTool(
-                        search_configuration,
-                        transport=web_transport,
-                    )
-                )
+        base_tools.extend(network_tools)
     tools: Sequence[Tool] = tuple(base_tools)
+    if selected_names is not None:
+        tools = tuple(tool for tool in tools if tool.definition.name in selected_names)
     if not all(isinstance(tool, ToolPlanningMetadata) for tool in tools):
         raise TypeError("all built-in tools must declare planning_access")
     return tuple(tools)
