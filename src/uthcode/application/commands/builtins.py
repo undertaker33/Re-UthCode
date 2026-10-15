@@ -96,14 +96,23 @@ async def _model(context: CommandContext) -> OpenModelPicker | ModelSelected:
     if not callable(select_model):
         raise CommandExecutionError("Application 不支持模型切换")
     try:
-        result = select_model(model_ref)
+        selection_options = {
+            "image_handling": context.image_handling,
+            "expected_session_id": context.expected_session_id,
+            "cancellation": context.cancellation,
+        }
+        if any(value is not None for value in selection_options.values()):
+            result = select_model(model_ref, **selection_options)
+        else:
+            result = select_model(model_ref)
         if inspect.isawaitable(result):
             await result
     except Exception as exc:
-        if getattr(exc, "code", None) == "image_input_unsupported":
+        code = getattr(exc, "code", None)
+        if code in {"image_input_unsupported", "image_summarization_failed"}:
             raise CommandExecutionError(
                 _MODEL_SWITCH_FAILURE,
-                code="image_input_unsupported",
+                code=code,
             ) from None
         raise CommandExecutionError(_MODEL_SWITCH_FAILURE) from None
     return ModelSelected(model_ref)

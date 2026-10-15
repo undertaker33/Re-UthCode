@@ -1,6 +1,6 @@
 # UthCode 可用 Tool
 
-正式 Application 当前共实现 **17 个基础 Tool 名称**：12 个 Integration 执行工具、2 个当前 Session 作用域的证据读取工具和 3 个由 Core 处理的控制工具。用户级搜索配置有效且启用时，再增加可选的 `WebSearch`，总数为 18 个。实际向模型提供哪些 Tool，取决于当前行为模式。
+Coding Application 当前共实现 **17 个基础 Tool 名称**：12 个 Integration 执行工具、2 个当前 Session 作用域的证据读取工具和 3 个由 Core 处理的控制工具。用户级搜索配置有效且启用时，再增加可选的 `WebSearch`，总数为 18 个。实际向模型提供哪些 Tool，取决于当前 Application mode 与行为模式。
 
 ## 默认执行工具
 
@@ -21,11 +21,11 @@
 
 这 12 个 Tool 进入普通 Tool Registry，执行前会完成参数准备、路径或命令分析以及权限判断。`ReadDocument`、`ViewImage`、`Process`、`GitWorkspace` 和 `WebFetch` 的只读定义在 Plan Mode 可见；`Process` 的 `write`、`resize`、`stop` 操作仍分别进入输入、写入或破坏性权限判断，`ApplyPatch` 在 Plan Mode 隐藏。
 
-Desktop General 模式使用独立的 General Application，不绑定 Coding 项目指令，并以空 Tool 列表构造 Provider 请求。因此本页的 Tool 清单适用于工具可见的 Coding 运行；General 请求不会收到这些工具。
+Desktop General 模式使用独立的 General Application，不绑定 Coding 项目指令或项目权限规则。它只构造公开网页能力：`WebFetch`、启用可信用户级搜索后才有的 `WebSearch`，以及读取该 General Session 自己的大网络结果所需的 `ToolResultRead`。General 不注册 `HistoryRead`、文件、Bash、Process、Git、ApplyPatch 或 Core 计划控制工具。
 
 `ReadFile` 按路径读取 UTF-8 文本，不接受附件 `asset_ref`，不解析 PDF、Office 文档或图片；文档使用 `ReadDocument`，图片使用 `ViewImage`。路径读取仍经过既有权限判断，外部路径需要相应授权。已经随当前用户消息提交的图片可直接观察，无需把显示文件名猜成路径。
 
-启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。它只调用固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
+启用可信用户级搜索配置后，`WebSearch` 也进入普通 Tool Registry。Coding 和 General 都复用这一正式 Tool 与固定 Tavily endpoint，使用 `search_depth=basic` 和 `include_answer=false`；结果中的来源和用量可继续读取，凭据不会出现在 Tool Result、事件或历史中。
 
 注册 `WebSearch` 需要用户级搜索启用且已配置 API key；仅勾选启用而缺少 key 时，模型不会收到此工具。普通设置保存保留未编辑的搜索凭据，显式清空才删除；`WebFetch` 仍独立可用，其抓取网页不消耗 Tavily 搜索额度。
 
@@ -75,7 +75,7 @@ Desktop General 模式使用独立的 General Application，不绑定 Coding 项
 | `ToolResultRead` | 使用当前 Session 的 opaque ref 读取大 Tool Result 的有界页 |
 | `HistoryRead` | 使用当前 Session 的 opaque Transcript ref 读取原始历史的有界页 |
 
-`ToolResultRead` 只接受当前 Session 发出的 ref、offset 和 limit；它不能读取任意文件路径，也不会把上一 Session 的 ref 带入当前 Session。大结果仍保留完整内容，模型先收到 bounded preview，再按需调用该 Tool。
+`ToolResultRead` 只接受当前 Session 发出的 ref、offset 和 limit；它不能读取任意文件路径，也不会把上一 Session 的 ref 带入当前 Session。大结果仍保留完整内容，模型先收到 bounded preview，再按需调用该 Tool。General 仅用它续读本 Session 中由 `WebFetch` 或 `WebSearch` 生成的外置结果；UI 的 `tool_result.read` 也要求结果所属 Session 当前处于已验证的 owner 运行时。
 
 ## Core 控制工具
 
@@ -103,6 +103,8 @@ Plan 草稿通过公开的 `PlanContentDelta` 事件增量投影自然语言文�
 | 默认执行模式（搜索已配置） | 上述工具加 `WebSearch` | 18 |
 | Plan Mode | 9 个只读 Integration 定义、`ToolResultRead`、`HistoryRead`、`AskUserQuestion`、`ProposePlan` | 13 |
 | Plan Mode（搜索已配置） | 上述工具加只读 `WebSearch` | 14 |
+| General | `WebFetch`、`ToolResultRead` | 2 |
+| General（搜索已配置） | 上述工具加 `WebSearch` | 3 |
 
 Plan Mode 中的 `Bash` 以及 `Process` 的只读查询可以准备；写入、停止、resize 或其他非 `READ` 操作会在 trusted preflight 后、Permission 前由 Agent Loop 的固定检查受控拒绝。`ReadDocument`/`ViewImage` 仅在当前模型声明支持所需输入且 Session 资源可用时形成有效请求。
 

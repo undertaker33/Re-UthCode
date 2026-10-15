@@ -54,7 +54,7 @@ uthcode exec --cwd C:\work\my-project "解释这个项目的目录结构"
 
 仓库内的 `desktop/` 提供 Windows 11 x64 Desktop shell，通过 Python Runtime JSONL Bridge 复用当前 Application、Session、Run、Turn、Interaction 和 AgentEvent。它与 TUI 共用用户级 `~/.uthcode/config.toml`，不会创建另一套模型、权限或会话事实。
 
-Desktop 有 Coding 与 General 两种模式。Coding 对话属于已登记项目并遵循该项目的指令；显式创建 Coding Session 会立即登记 Session。General 不绑定项目、不加载 Coding 项目指令，也不向 Provider 提供 Tool；新建 General 对话先作为草稿，首次发送后成为持久 Session。模式切换不会把一个模式的会话或草稿移交给另一个模式。
+Desktop 有 Coding 与 General 两种模式。Coding 对话属于已登记项目并遵循该项目的指令；显式创建 Coding Session 会立即登记 Session。General 不绑定项目、不加载 Coding 项目指令或项目权限规则；它只向 Provider 提供 `WebFetch`、启用可信用户级搜索后才有的 `WebSearch`，以及读取当前 Session 网络结果的 `ToolResultRead`。新建 General 对话先作为草稿，首次发送后成为持久 Session。模式切换不会把一个模式的会话或草稿移交给另一个模式。
 
 Settings 对支持的字段自动保存，不提供页面级全局 Save 按钮；Provider/Model 编辑器使用自己的应用与取消动作。左侧导航标题下的搜索框可按设置名称或说明搜索并跳转到相应分类或字段，布尔开关可用键盘操作；主题选择遵循浅色、深色或系统设置。Tools 分类直接列出可编辑的联网搜索与工具限制设置。成功保存后不显示常驻提示，保存中、等待应用和失败状态仍会显示，失败时可重试。运行中的 Turn 保留启动时捕获的配置；已保存的新配置会等待空闲边界应用。
 

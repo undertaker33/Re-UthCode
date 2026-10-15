@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import inspect
 
+from uthcode.core.provider import CancellationToken
+
 from .models import (
     CommandDefinition,
     CommandInvocation,
@@ -32,6 +34,9 @@ class CommandContext:
     registry: CommandRegistry
     invocation: CommandInvocation
     application: object | None
+    image_handling: str | None = None
+    expected_session_id: str | None = None
+    cancellation: CancellationToken | None = None
 
 
 class CommandDispatcher:
@@ -53,11 +58,24 @@ class CommandDispatcher:
         invocation: CommandInvocation,
         *,
         application: object | None = None,
+        image_handling: str | None = None,
+        expected_session_id: str | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> CommandOutcome | None:
         """Dispatch one command while awaiting an async Application handler."""
 
         if not isinstance(invocation, CommandInvocation):
             raise TypeError("invocation must be CommandInvocation")
+        if image_handling not in (None, "placeholder", "summarize"):
+            raise ValueError("image_handling must be placeholder, summarize, or None")
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id
+        ):
+            raise ValueError("expected_session_id must be a non-empty string or None")
+        if cancellation is not None and not isinstance(cancellation, CancellationToken):
+            raise TypeError("cancellation must be a CancellationToken or None")
+        if image_handling is not None and invocation.canonical != "model":
+            raise ValueError("image handling can only accompany /model")
         if not invocation.is_slash or invocation.is_bare_slash:
             return None
         if invocation.unknown:
@@ -87,6 +105,9 @@ class CommandDispatcher:
             registry=self._registry,
             invocation=invocation,
             application=selected_application,
+            image_handling=image_handling,
+            expected_session_id=expected_session_id,
+            cancellation=cancellation,
         )
         try:
             result = self._run_handler(definition, context)
@@ -112,12 +133,18 @@ class CommandDispatcher:
         text: str,
         *,
         application: object | None = None,
+        image_handling: str | None = None,
+        expected_session_id: str | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> CommandOutcome | None:
         """Parse and dispatch one input through the awaitable path."""
 
         return await self.dispatch_async(
             self._parser.parse(text),
             application=application,
+            image_handling=image_handling,
+            expected_session_id=expected_session_id,
+            cancellation=cancellation,
         )
 
     @staticmethod

@@ -422,7 +422,7 @@ def test_t06_pause_control_and_ask_tool_have_no_duplicate_runtime_path() -> None
     assert ast.unparse(general_mode.test) == (
         "self._application_mode is ApplicationMode.GENERAL"
     )
-    assert ast.unparse(general_mode.body[0]) == "return ()"
+    assert ast.unparse(general_mode.body[0]) == "return self._tool_service.definitions()"
     coding_tools = ast.unparse(helper.body[-1])
     assert "self._tool_service.definitions()" in coding_tools
     assert "ASK_USER_TOOL_DEFINITION" in coding_tools

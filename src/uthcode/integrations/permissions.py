@@ -294,6 +294,12 @@ def _normalize_resource(value: str, *, path: Path, field: str) -> str:
     if "\x00" in value:
         raise PermissionConfigurationError("resource contains a null byte", path=path, field=field)
     normalized = value.replace("\\", "/")
+    # Permission resources may be public URLs as well as filesystem paths.
+    # `os.path.normpath` collapses the `://` delimiter on Windows (and some
+    # other path implementations), making configured WebFetch Guards fail to
+    # match the actual normalized URL supplied by the Tool.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", normalized):
+        return normalized
     return os.path.normpath(normalized).replace("\\", "/")
 
 
@@ -501,10 +507,22 @@ def load_permission_rules(
     *,
     cwd: str | os.PathLike[str] | Path | None = None,
     home: str | os.PathLike[str] | Path | None = None,
+    include_project: bool = True,
 ) -> RuleSet:
-    """Create files if needed and return one immutable permission snapshot."""
+    """Create selected lifecycle files and return one permission snapshot."""
 
-    paths = discover_permission_paths(cwd=cwd, home=home)
+    if not isinstance(include_project, bool):
+        raise TypeError("include_project must be a boolean")
+    if include_project:
+        paths = discover_permission_paths(cwd=cwd, home=home)
+    else:
+        home_path = resolve_user_home(physical_path(home) if home is not None else None)
+        user_path = _ensure_file(
+            home_path / ".uthcode" / "permissions.toml",
+            PERMISSIONS_USER_TEMPLATE,
+            user=True,
+        )
+        paths = (("user", user_path),)
     rules: list[Rule] = list(default_guard_rules())
     project_index = 0
     for kind, path in paths:

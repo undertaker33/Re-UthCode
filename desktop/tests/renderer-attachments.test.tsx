@@ -2149,6 +2149,584 @@ test("App localizes the image capability refusal and keeps the attachment for re
   await runCase("zh-CN", resources["zh-CN"].turnImageInputUnsupported);
 });
 
+interface ModelImageSwitchFixture {
+  calls: Array<{ method: string; params: Record<string, JsonValue> }>;
+  activeSessionId: string;
+  modelBySession: Record<string, string>;
+  override: ((method: string, params: Record<string, JsonValue>, fixture: ModelImageSwitchFixture) => JsonValue | undefined | Promise<JsonValue | undefined>) | null;
+  api: DesktopApi;
+  state: ReturnType<typeof createInitialState>;
+}
+
+function createModelImageSwitchFixture(): ModelImageSwitchFixture {
+  const projectPath = "C:/model-image-switch";
+  const sessions = [
+    { session_id: "session-a", title: "Image history" },
+    { session_id: "session-b", title: "Other session" },
+  ];
+  const project: ProjectState = {
+    path: projectPath,
+    projectKey: projectPath,
+    alias: "Model switch",
+    pinned: false,
+    sessions,
+    catalogFresh: true,
+  };
+  const configuration = {
+    default_model: "vision/ref",
+    default_permission_mode: "default" as const,
+    providers: { provider: { kind: "openai_compat", api_key_configured: true } },
+    models: {
+      "vision/ref": { provider_profile_id: "provider", remote_id: "vision", display_name: "Vision Model", supports_images: true },
+      "text/ref": { provider_profile_id: "provider", remote_id: "text", display_name: "Text Model", supports_images: false },
+      "other/ref": { provider_profile_id: "provider", remote_id: "other", display_name: "Other Session Model", supports_images: true },
+    },
+  };
+  const fixture = {
+    calls: [] as Array<{ method: string; params: Record<string, JsonValue> }>,
+    activeSessionId: "session-a",
+    modelBySession: { "session-a": "vision/ref", "session-b": "other/ref" },
+    override: null,
+  } as ModelImageSwitchFixture;
+  const preferences = {
+    theme: "light",
+    language: "en",
+    panelMode: "docked",
+    sidebarWidth: 286,
+    runtimePanelWidth: 318,
+    recentProjects: [{ path: projectPath, alias: project.alias, pinned: false }],
+    projectAliases: {},
+    pinnedProjectKeys: [],
+    pinnedSessions: [],
+    expandedProjects: { [projectPath]: true },
+    selectedProjectKey: projectPath,
+    selectedSessionId: "session-a",
+  };
+  fixture.api = {
+    openProject: async () => null,
+    openProjectInExplorer: async () => undefined,
+    copyText: async () => undefined,
+    closeShell: async () => undefined,
+    requestRuntime: async (method, params) => {
+      fixture.calls.push({ method, params });
+      const overridden = await fixture.override?.(method, params, fixture);
+      if (overridden !== undefined) return overridden;
+      if (method === "runtime.initialize") return { state: "ready", run: { run_id: "run-model-switch", status: "idle" } };
+      if (method === "settings.get") return { configuration };
+      if (method === "status.get") {
+        return {
+          active_turn: false,
+          run: { run_id: `run-${fixture.activeSessionId}`, status: "idle" },
+          application: { current_model: fixture.modelBySession[fixture.activeSessionId] ?? "vision/ref" },
+        };
+      }
+      if (method === "project.sessions") return { sessions };
+      if (method === "session.resume") {
+        fixture.activeSessionId = String(params.session_id ?? "");
+        return {
+          session_id: fixture.activeSessionId,
+          replay: [],
+          run: { run_id: `run-${fixture.activeSessionId}`, status: "idle" },
+          model_ref: fixture.modelBySession[fixture.activeSessionId] ?? null,
+        };
+      }
+      if (method === "command.complete") return { candidates: [], argument_candidates: ["text/ref"] };
+      return {};
+    },
+    subscribeAgentEvents: () => () => undefined,
+    readPreference: async (key) => preferences[key] as never,
+    writePreference: async () => preferences as never,
+    chooseAttachment: async () => null,
+    pasteAttachment: async () => null,
+  };
+  fixture.state = createInitialState({
+    language: "en",
+    runtimeState: "ready",
+    composerText: "/model text/ref",
+    projects: [project],
+    selectedProjectKey: projectPath,
+    selectedSessionId: "session-a",
+    expandedProjects: { [projectPath]: true },
+    currentModelRef: "vision/ref",
+    configuration,
+  });
+  return fixture;
+}
+
+test("App switches an image Session with placeholders and keeps the selected button busy until authoritative completion", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let operationId = "";
+  let pollCount = 0;
+  fixture.override = (method, params, owner) => {
+    if (method !== "command.execute") return undefined;
+    const text = String(params.text ?? "");
+    if (text === "/model text/ref" && params.image_handling === undefined) {
+      return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+    }
+    if (text === "/model text/ref" && params.image_handling === "placeholder") {
+      operationId = String(params.operation_id ?? "");
+      assert.equal(params.expected_session_id, "session-a");
+      return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+    }
+    if (method === "model.switch.status") return undefined;
+    return undefined;
+  };
+  const originalOverride = fixture.override;
+  fixture.override = async (method, params, owner) => {
+    const command = await originalOverride?.(method, params, owner);
+    if (command !== undefined) return command;
+    if (method === "model.switch.status") {
+      assert.equal(params.session_id, "session-a");
+      assert.equal(params.operation_id, operationId);
+      pollCount += 1;
+      if (pollCount === 1) return { operation_id: operationId, session_id: "session-a", state: "running" };
+      owner.modelBySession["session-a"] = "text/ref";
+      return {
+        operation_id: operationId,
+        session_id: "session-a",
+        state: "completed",
+        result: { command: "model", status: "success", code: "model_selected", params: { model_ref: "text/ref" }, ui_action: { type: "model_selected", model_ref: "text/ref" } },
+      };
+    }
+    return undefined;
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => {
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); });
+    };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    assert.ok(container.querySelector("#model-image-switch-dialog"), "unsupported image history opens the explicit choice dialog");
+    const placeholder = container.querySelector<HTMLButtonElement>("#model-image-switch-placeholder");
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    assert.ok(placeholder && summarize);
+    act(() => { placeholder.click(); });
+    await flush();
+    const dialog = container.querySelector<HTMLElement>("#model-image-switch-dialog");
+    assert.equal(dialog?.getAttribute("aria-busy"), "true");
+    assert.equal(placeholder.disabled, true);
+    assert.equal(summarize.disabled, true);
+    assert.equal(placeholder.querySelector(".model-image-switch-spinner") !== null, true, "the selected action alone displays the spinner");
+    assert.equal(summarize.querySelector(".model-image-switch-spinner"), null);
+    assert.ok(fixture.calls.some((call) => call.method === "command.execute" && call.params.image_handling === "placeholder" && call.params.expected_session_id === "session-a"));
+    await flush(135);
+    assert.equal(container.querySelector("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true", "the operation remains busy while status is running");
+    await flush(135);
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null, "completion closes the dialog only after the Bridge reports the selected model");
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Text Model");
+    assert.equal(fixture.modelBySession["session-a"], "text/ref");
+    assert.ok(fixture.calls.some((call) => call.method === "model.switch.status" && call.params.operation_id === operationId));
+  });
+});
+
+test("App closes an unstarted image model choice when Cancel is clicked", async () => {
+  const fixture = createModelImageSwitchFixture();
+  fixture.override = (method, params) => {
+    if (method === "command.execute" && params.image_handling === undefined) {
+      return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+    }
+    return undefined;
+  };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    assert.ok(container.querySelector("#model-image-switch-dialog"), "unsupported image history opens the choice dialog");
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "false");
+
+    const cancel = container.querySelector<HTMLButtonElement>("#model-image-switch-cancel");
+    assert.ok(cancel);
+    act(() => { cancel.click(); });
+    await flush();
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null, "Cancel closes a choice with no running Bridge operation");
+    assert.equal(fixture.calls.some((call) => call.method === "model.switch.cancel"), false, "there is no operation to cancel");
+  });
+});
+
+test("App applies an immediately selected configured model without a competing open-picker command", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let markPickerRequestStarted: (() => void) | null = null;
+  const pickerRequestStarted = new Promise<void>((resolve) => { markPickerRequestStarted = resolve; });
+  let releasePickerRequest: ((result: JsonValue) => void) | null = null;
+  let pickerRequestSeen = false;
+  let selectedModelRequests = 0;
+  fixture.override = (method, params, owner) => {
+    if (method !== "command.execute") return undefined;
+    const text = String(params.text ?? "");
+    if (text === "/model") {
+      pickerRequestSeen = true;
+      markPickerRequestStarted?.();
+      return new Promise<JsonValue>((resolve) => { releasePickerRequest = resolve; });
+    }
+    if (text === "/model text/ref") {
+      selectedModelRequests += 1;
+      owner.modelBySession["session-a"] = "text/ref";
+      return {
+        command: "model",
+        status: "success",
+        code: "model_selected",
+        params: { model_ref: "text/ref" },
+        ui_action: { type: "model_selected", model_ref: "text/ref" },
+      };
+    }
+    return undefined;
+  };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async () => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }); };
+    await flush();
+    const trigger = container.querySelector<HTMLButtonElement>(".composer-model .custom-select__trigger");
+    assert.ok(trigger);
+    act(() => { trigger.click(); });
+    await flush();
+    const target = [..._dom.window.document.querySelectorAll<HTMLButtonElement>(".composer-model [role=option], .custom-select__list [role=option]")]
+      .find((option) => option.textContent?.includes("Text Model"));
+    assert.ok(target, "the configured model is available before opening requires a backend command");
+
+    // Yield only until the old onOpen command has had a chance to reach the
+    // bridge; selection then occurs immediately while that request is pending.
+    await Promise.race([pickerRequestStarted, new Promise<void>((resolve) => setTimeout(resolve, 0))]);
+    act(() => { target.click(); });
+    await flush();
+    const modelCommandTexts = fixture.calls
+      .filter((call) => call.method === "command.execute")
+      .map((call) => String(call.params.text ?? ""));
+
+    if (releasePickerRequest) {
+      releasePickerRequest({ command: "model", status: "success", code: "model_picker_opened", params: {}, ui_action: { type: "open_model_picker" } });
+      await flush();
+    }
+    assert.equal(pickerRequestSeen, false, "opening the selector does not enqueue a redundant /model command");
+    assert.equal(selectedModelRequests, 1, "the immediate option click reaches the selected model command");
+    assert.deepEqual(modelCommandTexts, ["/model text/ref"]);
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Text Model");
+    assert.equal(fixture.modelBySession["session-a"], "text/ref");
+  });
+});
+
+test("App keeps the Yes confirmation busy through failure, then allows a successful retry", async () => {
+  const fixture = createModelImageSwitchFixture();
+  const operations: string[] = [];
+  let pollCount = 0;
+  fixture.override = (method, params) => {
+    if (method === "command.execute") {
+      const text = String(params.text ?? "");
+      if (text === "/model text/ref" && params.image_handling === undefined) {
+        return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+      }
+      if (text === "/model text/ref" && params.image_handling === "summarize") {
+        const operationId = String(params.operation_id ?? "");
+        operations.push(operationId);
+        return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+      }
+    }
+    if (method === "model.switch.status") {
+      const operationId = String(params.operation_id ?? "");
+      pollCount += 1;
+      if (pollCount === 1) return { operation_id: operationId, session_id: "session-a", state: "running" };
+      if (pollCount === 2) return { operation_id: operationId, session_id: "session-a", state: "failed" };
+      fixture.modelBySession["session-a"] = "text/ref";
+      return {
+        operation_id: operationId,
+        session_id: "session-a",
+        state: "completed",
+        result: { command: "model", status: "success", code: "model_selected", params: { model_ref: "text/ref" }, ui_action: { type: "model_selected", model_ref: "text/ref" } },
+      };
+    }
+    return undefined;
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    const placeholder = container.querySelector<HTMLButtonElement>("#model-image-switch-placeholder");
+    assert.ok(summarize && placeholder);
+    act(() => { summarize.click(); });
+    await flush();
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true");
+    assert.equal(summarize.disabled, true);
+    assert.equal(placeholder.disabled, true);
+    assert.ok(summarize.querySelector(".model-image-switch-spinner"));
+    assert.equal(placeholder.querySelector(".model-image-switch-spinner"), null);
+    await flush(135);
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true");
+    await flush(135);
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "false");
+    assert.match(container.querySelector("#model-image-switch-dialog")?.textContent ?? "", /current model is still selected|current model is still/u);
+    assert.equal(fixture.modelBySession["session-a"], "vision/ref", "failure keeps the original model authoritative");
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Vision Model");
+    act(() => { summarize.click(); });
+    await flush();
+    assert.equal(operations.length, 2, "the failed choice can be retried with a fresh operation identity");
+    assert.notEqual(operations[0], operations[1]);
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true");
+    await flush(135);
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null);
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Text Model");
+  });
+});
+
+test("App cancels an image model operation on Session navigation and ignores its late completion", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let operationId = "";
+  let resolveLateStatus: ((result: JsonValue) => void) | null = null;
+  let statusRequested: (() => void) | null = null;
+  const statusStarted = new Promise<void>((resolve) => { statusRequested = resolve; });
+  fixture.override = (method, params) => {
+    if (method === "command.execute") {
+      const text = String(params.text ?? "");
+      if (text === "/model text/ref" && params.image_handling === undefined) {
+        return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+      }
+      if (text === "/model text/ref" && params.image_handling === "summarize") {
+        operationId = String(params.operation_id ?? "");
+        return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+      }
+    }
+    if (method === "model.switch.status") {
+      statusRequested?.();
+      return new Promise<JsonValue>((resolve) => { resolveLateStatus = resolve; });
+    }
+    if (method === "model.switch.cancel") return { accepted: true, operation_id: params.operation_id ?? "", session_id: params.session_id ?? "" };
+    return undefined;
+  };
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    assert.ok(summarize);
+    act(() => { summarize.click(); });
+    await flush();
+    await flush(135);
+    await statusStarted;
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true");
+    const otherSession = [...container.querySelectorAll<HTMLButtonElement>("button.session-line")].find((button) => button.textContent?.includes("Other session"));
+    assert.ok(otherSession);
+    act(() => { otherSession.click(); });
+    await flush();
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null, "navigation closes the old Session's choice");
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Other session"), true);
+    assert.ok(fixture.calls.some((call) => call.method === "model.switch.cancel" && call.params.session_id === "session-a" && call.params.operation_id === operationId));
+    assert.equal(fixture.activeSessionId, "session-b");
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    const textareaSetter = Object.getOwnPropertyDescriptor(_dom.window.HTMLTextAreaElement.prototype, "value")?.set;
+    assert.ok(textarea && textareaSetter);
+    act(() => {
+      textarea!.focus();
+      textareaSetter!.call(textarea, "/model text/ref");
+      textarea!.dispatchEvent(new _dom.window.InputEvent("input", { bubbles: true, inputType: "insertText", data: "/model text/ref" }));
+      textarea!.dispatchEvent(new _dom.window.Event("change", { bubbles: true }));
+      textarea!.dispatchEvent(new _dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Unidentified" }));
+    });
+    const submitAgain = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submitAgain);
+    act(() => { submitAgain.click(); });
+    await flush();
+    assert.ok(container.querySelector("#model-image-switch-dialog"), "Session B now owns a separate pending model choice");
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Other Session Model");
+    const statusCallsBeforeLateResult = fixture.calls.filter((call) => call.method === "status.get").length;
+    fixture.modelBySession["session-a"] = "text/ref";
+    assert.ok(resolveLateStatus);
+    await act(async () => {
+      resolveLateStatus!({
+        operation_id: operationId,
+        session_id: "session-a",
+        state: "completed",
+        result: { command: "model", status: "success", code: "model_selected", params: { model_ref: "text/ref" }, ui_action: { type: "model_selected", model_ref: "text/ref" } },
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    assert.equal(container.querySelector(".session-line.is-selected")?.textContent?.includes("Other session"), true);
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Other Session Model", "the late completion cannot project Session A's model into Session B");
+    assert.ok(container.querySelector("#model-image-switch-dialog"), "the late Session A completion cannot clear Session B's pending choice");
+    assert.equal(fixture.calls.filter((call) => call.method === "status.get").length, statusCallsBeforeLateResult, "the stale completion cannot refresh or dispatch its model into the new owner");
+  });
+});
+
+test("App cancels the captured model operation after a status timeout and waits for cancellation", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let operationId = "";
+  let statusCalls = 0;
+  fixture.override = async (method, params) => {
+    if (method === "command.execute") {
+      const text = String(params.text ?? "");
+      if (text === "/model text/ref" && params.image_handling === undefined) {
+        return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+      }
+      if (text === "/model text/ref" && params.image_handling === "summarize") {
+        operationId = String(params.operation_id ?? "");
+        return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+      }
+    }
+    if (method === "model.switch.status") {
+      statusCalls += 1;
+      if (statusCalls === 1) throw new Error("renderer request timed out");
+      return { operation_id: operationId, session_id: "session-a", state: "cancelled" };
+    }
+    if (method === "model.switch.cancel") {
+      assert.equal(params.session_id, "session-a");
+      assert.equal(params.operation_id, operationId);
+      return { accepted: true, operation_id: operationId, session_id: "session-a" };
+    }
+    return undefined;
+  };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    assert.ok(summarize);
+    act(() => { summarize.click(); });
+    await flush(500);
+    assert.ok(fixture.calls.some((call) => call.method === "model.switch.cancel" && call.params.session_id === "session-a" && call.params.operation_id === operationId));
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null, "the dialog closes after Bridge confirms cancellation");
+    assert.equal(fixture.modelBySession["session-a"], "vision/ref", "the model remains unchanged after confirmed cancellation");
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Vision Model");
+  });
+});
+
+test("App reconciles a timed-out status whose Bridge operation already completed", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let operationId = "";
+  let statusCalls = 0;
+  fixture.override = async (method, params, owner) => {
+    if (method === "command.execute") {
+      const text = String(params.text ?? "");
+      if (text === "/model text/ref" && params.image_handling === undefined) {
+        return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+      }
+      if (text === "/model text/ref" && params.image_handling === "summarize") {
+        operationId = String(params.operation_id ?? "");
+        return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+      }
+    }
+    if (method === "model.switch.status") {
+      statusCalls += 1;
+      if (statusCalls === 1) {
+        owner.modelBySession["session-a"] = "text/ref";
+        throw new Error("terminal status response timed out after Bridge completion");
+      }
+      return { __uthcode_runtime_error: { kind: "stale_operation", message: "operation is no longer available" } };
+    }
+    if (method === "model.switch.cancel") {
+      assert.equal(params.session_id, "session-a");
+      assert.equal(params.operation_id, operationId);
+      return { __uthcode_runtime_error: { kind: "stale_operation", message: "operation is no longer active" } };
+    }
+    return undefined;
+  };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    assert.ok(summarize);
+    act(() => { summarize.click(); });
+    await flush(500);
+    assert.ok(fixture.calls.some((call) => call.method === "model.switch.cancel" && call.params.session_id === "session-a" && call.params.operation_id === operationId));
+    assert.ok(fixture.calls.some((call) => call.method === "status.get"), "a consumed terminal operation falls back to authoritative Runtime status");
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null);
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Text Model", "the UI follows the model actually committed by the Bridge");
+    assert.equal(fixture.modelBySession["session-a"], "text/ref");
+  });
+});
+
+test("App keeps an explicit cancel owner until Bridge resolves a completion race", async () => {
+  const fixture = createModelImageSwitchFixture();
+  let operationId = "";
+  let statusCalls = 0;
+  let resolveLateStatus: ((result: JsonValue) => void) | null = null;
+  let markSecondStatusRequested: (() => void) | null = null;
+  const secondStatusRequested = new Promise<void>((resolve) => { markSecondStatusRequested = resolve; });
+  fixture.override = (method, params) => {
+    if (method === "command.execute") {
+      const text = String(params.text ?? "");
+      if (text === "/model text/ref" && params.image_handling === undefined) {
+        return { command: "model", status: "execution_error", code: "image_input_unsupported", params: {}, ui_action: null };
+      }
+      if (text === "/model text/ref" && params.image_handling === "summarize") {
+        operationId = String(params.operation_id ?? "");
+        return { command: "model", status: "success", code: "model_switch_started", params: { operation_id: operationId, session_id: "session-a", model_ref: "text/ref" }, ui_action: null };
+      }
+    }
+    if (method === "model.switch.status") {
+      statusCalls += 1;
+      if (statusCalls === 1) return { operation_id: operationId, session_id: "session-a", state: "running" };
+      markSecondStatusRequested?.();
+      return new Promise<JsonValue>((resolve) => { resolveLateStatus = resolve; });
+    }
+    if (method === "model.switch.cancel") {
+      assert.equal(params.session_id, "session-a");
+      assert.equal(params.operation_id, operationId);
+      return { __uthcode_runtime_error: { kind: "stale_operation", message: "operation already completed" } };
+    }
+    return undefined;
+  };
+
+  await withRendererDom(async (_dom, container, root) => {
+    act(() => { root.render(<App initialState={fixture.state} api={fixture.api} />); });
+    const flush = async (delay = 0) => { await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, delay)); }); };
+    await flush();
+    const submit = container.querySelector<HTMLButtonElement>(".composer-send");
+    assert.ok(submit);
+    act(() => { submit.click(); });
+    await flush();
+    const summarize = container.querySelector<HTMLButtonElement>("#model-image-switch-summarize");
+    assert.ok(summarize);
+    act(() => { summarize.click(); });
+    await flush(280);
+    await secondStatusRequested;
+    const cancel = container.querySelector<HTMLButtonElement>("#model-image-switch-cancel");
+    assert.ok(cancel);
+    act(() => { cancel.click(); });
+    await flush();
+    assert.equal(container.querySelector<HTMLElement>("#model-image-switch-dialog")?.getAttribute("aria-busy"), "true", "a stale cancel response keeps the operation owner until its status is known");
+    fixture.modelBySession["session-a"] = "text/ref";
+    assert.ok(resolveLateStatus);
+    await act(async () => {
+      resolveLateStatus!({
+        operation_id: operationId,
+        session_id: "session-a",
+        state: "completed",
+        result: { command: "model", status: "success", code: "model_selected", params: { model_ref: "text/ref" }, ui_action: { type: "model_selected", model_ref: "text/ref" } },
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    assert.equal(container.querySelector("#model-image-switch-dialog"), null);
+    assert.equal(container.querySelector(".composer-model .custom-select__trigger")?.getAttribute("aria-label"), "Model: Text Model", "the selector follows the operation that actually committed before cancellation");
+  });
+});
+
 test("App drops an attachment import or preview that finishes after Session navigation", async () => {
   const projectPath = "C:/attachment-owner";
   let resolveImport: ((value: JsonValue) => void) | null = null;

@@ -11,7 +11,7 @@ uthcode exec [--cwd PATH] [--model MODEL_REF] [PROMPT]
 
 Windows Desktop 的 Composer 和 Settings 使用同一个 Application/Command/Configuration 公共出口；Slash 命令的名称、参数、权限和 Session 语义与本页 TUI 参考一致。Desktop 为每个已打开的持久 Session 保留独立运行时投影：切换会话或项目不会取消另一个 Session 的 active Turn，后台状态显示在侧栏；跨进程仍只恢复已提交的 Session 内容。
 
-Desktop 的 Coding 与 General 模式共用命令入口，但 General 不绑定 Coding 项目、项目指令或 Tool。命令表列出共享命令语义，不表示 General 会获得 Coding 工具。
+Desktop 的 Coding 与 General 模式共用命令入口。General 不绑定 Coding 项目、项目指令或项目权限规则；它只提供 `WebFetch`、可信用户级搜索启用后提供 `WebSearch`，以及续读本 Session 网络结果的 `ToolResultRead`。它不会提供文件、Shell、Process、Git、HistoryRead 或计划控制工具。命令表列出共享命令语义，不表示 General 会获得 Coding 工具。
 
 `Bash` 是唯一的进程启动 Tool。`yield_time_ms` 只决定当前调用等待多久，`timeout_seconds` 才是可选的进程总寿命限制；没有显式 timeout 时，后台服务不会因 ToolCall 返回而自动终止。返回的 `process_id` 只在所属 Application/Session 中有效，可用 `Process` 的 `list`、`read`、`write`、`stop` 和 `resize` 操作继续观察或控制。`read` 使用有界增量游标，游标过期时按返回的最早位置续读；stdin/EOF 是独立的执行输入授权。Desktop 在 Turn 完成后仍接收该 Session 的有界、脱敏进程日志，Session 关闭时才统一回收其进程。
 
@@ -40,6 +40,8 @@ Desktop 的 Coding 与 General 模式共用命令入口，但 General 不绑定 
 上表就是当前 Registry 的全部命令；未列出的 Slash 名称返回“未知命令”。`/compact` 不接受额外参数（例如 `/compact -- focus` 是用法错误）。`/new`、`/resume`、`/compact` 和 `/status` 均已接入正式 Application/Session 路径；Compact 的取消、解析失败、无安全 epoch 和一次 overflow retry 都会以受控 outcome 返回。
 
 在 Desktop 中，Composer 的 `/model` 候选可显示模型的 `display_name`，但提交的仍是配置中的 Model Profile ID。`/plan`、`/do`、`/compact`、`/status` 与 typed interaction 都走 Bridge 的同一 Command/Turn 边界；运行中的 Turn 的 Todo 显示在 Composer 上方，Context ring 和 Runtime panel 只显示 Application 的安全状态投影。
+
+Desktop 切换到不支持图片的模型时，如果当前 Session 仍有未压缩的图片历史，会先询问如何处理。选择“压缩并切换”会用当前视觉模型沿用现有图片感知压缩，将可读描述写入 Timeline 后再切换；选择“占位后切换”会在发给纯文本模型的请求中说明图片未读取。取消或处理失败会保留当前模型。原始 Transcript、附件和 ToolCall/ToolResult 配对保持不变；占位路径不压缩历史，之后切回视觉模型仍能读取原图。压缩路径保留原始记录供历史查看，但不会撤销已提交的压缩或在后续请求中自动重新注入原图。新提交的图片仍要求当前模型明确支持图片输入。
 
 Context 的 `exact` 只表示当前 Provider 提供了可靠的 preflight count；Provider count 不可用时会显示标注来源的 local estimate，首次还没有可编译请求时显示 `unavailable`。Provider 未提供 cache read/write 字段时也保持 `not_available`，不会用默认零值冒充缓存命中。
 

@@ -13,7 +13,7 @@
  */
 
 import { createServer } from "node:http";
-import { appendFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { assertCdpEnvironmentIsolated } from "./cdp-test-guard.mjs";
 
 function option(name, fallback = undefined) {
@@ -30,6 +30,7 @@ const reviewMarkdownPath = option("review-markdown-path");
 const reviewTextPath = option("review-text-path");
 const reviewCodePath = option("review-code-path");
 const reviewLiveProcess = process.argv.includes("--review-live-process");
+const captionReleaseFile = option("caption-release-file");
 const delayMs = Number(option("delay-ms", "1200"));
 const planChunkDelayMs = Number(option("plan-chunk-delay-ms", "250"));
 const planChoice = option("plan-choice", "approve");
@@ -47,7 +48,7 @@ if (scenario === "review" && (!reviewMarkdownPath || !reviewTextPath)) {
 try {
   assertCdpEnvironmentIsolated({
     label: "cdp-openai-fixture",
-    outputPaths: [logPath, readyFile].filter(Boolean),
+    outputPaths: [logPath, readyFile, captionReleaseFile].filter(Boolean),
   });
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -101,6 +102,13 @@ function fixtureChunks(requestBody) {
   const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
   const hasToolResult = messages.some((message) => message?.role === "tool");
   const hasToolDefinitions = Array.isArray(requestBody.tools) && requestBody.tools.length > 0;
+  if (scenario === "model-images" && !hasToolDefinitions && imageCount(requestBody) > 0) {
+    return [
+      chunk({ role: "assistant" }),
+      chunk({ content: "MODEL_IMAGE_ORIGINAL_PROMPT asked to describe the controlled image; assistant replied fixture response. MODEL_IMAGE_CAPTION: a small controlled image, with its original attachment retained." }),
+      chunk({}, "stop", { prompt_tokens: 2, completion_tokens: 16, total_tokens: 18 }),
+    ];
+  }
   if (scenario === "review" && hasToolDefinitions && !hasToolResult) {
     return [
       chunk({ role: "assistant" }),
@@ -335,6 +343,10 @@ async function sendSse(response, chunks, interChunkDelayMs = 0) {
   response.end("data: [DONE]\n\n");
 }
 
+function imageCount(requestBody) {
+  return (Array.isArray(requestBody.messages) ? requestBody.messages : []).reduce((count, message) => count + (Array.isArray(message?.content) ? message.content.filter((part) => part?.type === "image_url").length : 0), 0);
+}
+
 const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     json(response, 200, { ok: true, scenario, requests: requestCount });
@@ -356,6 +368,11 @@ const server = createServer(async (request, response) => {
     toolCount: Array.isArray(requestBody.tools) ? requestBody.tools.length : 0,
     toolNames: Array.isArray(requestBody.tools) ? requestBody.tools.map((item) => item?.function?.name ?? item?.name).filter((item) => typeof item === "string") : [],
     messageRoles: Array.isArray(requestBody.messages) ? requestBody.messages.map((item) => item?.role) : [],
+    ...(scenario === "model-images" ? {
+      imageCount: imageCount(requestBody),
+      captionVisible: JSON.stringify(requestBody.messages ?? []).includes("MODEL_IMAGE_CAPTION"),
+      originalPromptVisible: JSON.stringify(requestBody.messages ?? []).includes("MODEL_IMAGE_ORIGINAL_PROMPT"),
+    } : {}),
   });
   const failureRequests = scenario === "retry" ? 3 : 1;
   if ((scenario === "failure" || scenario === "retry") && requestCount <= failureRequests) {
@@ -365,6 +382,18 @@ const server = createServer(async (request, response) => {
     return;
   }
   if (scenario === "delay") await new Promise((resolve) => setTimeout(resolve, delayMs));
+  if (scenario === "model-images" && imageCount(requestBody) > 0 && !requestBody.tools?.length) {
+    if (captionReleaseFile) {
+      const deadline = Date.now() + 180000;
+      let released = false;
+      while (Date.now() < deadline) {
+        try { await readFile(captionReleaseFile); released = true; break; }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (!released) { json(response, 504, { error: { message: "caption fixture release timed out", type: "server_error" } }); return; }
+    } else await new Promise((resolve) => setTimeout(resolve, 10000));
+  }
   if (requestBody.stream === true) {
     await sendSse(response, fixtureChunks(requestBody), scenario === "plan" ? planChunkDelayMs : 0);
   } else {

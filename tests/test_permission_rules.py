@@ -114,6 +114,56 @@ def test_non_git_discovery_only_uses_current_workdir(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("decision", [Decision.ASK, Decision.DENY])
+def test_user_only_permission_snapshot_keeps_user_guards_and_ignores_project_rules(
+    tmp_path: Path,
+    decision: Decision,
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    (workdir / ".git").mkdir()
+    _write_user_permission(
+        home,
+        f"""[guard]
+[[guard.rules]]
+decision = "{decision.value}"
+tool = "WebFetch"
+action = "fetch"
+effect = "external"
+resource = "https://example.com/private/page"
+scope = "outside"
+
+[policy]
+""",
+    )
+    project_file = _write(
+        workdir / ".uthcode" / "permissions.toml",
+        _policy_rule("coding-project-allow", "allow"),
+    )
+
+    rules = load_permission_rules(cwd=workdir, home=home, include_project=False)
+
+    assert any(
+        rule.source == "user" and rule.decision is decision
+        for rule in rules.guard_rules
+    )
+    assert not any(rule.source.startswith("project:") for rule in rules.rules)
+    action = PermissionAction(
+        tool="WebFetch",
+        action="fetch",
+        effect=Effect.EXTERNAL,
+        resource="https://example.com/private/page",
+        scope=ResourceScope.OUTSIDE,
+    )
+    user_guard = next(rule for rule in rules.guard_rules if rule.source == "user")
+    assert user_guard.matches(action), user_guard
+    assert PermissionEvaluator(rules).evaluate(action).decision is decision
+    assert project_file.read_text(encoding="utf-8") == _policy_rule(
+        "coding-project-allow", "allow"
+    )
+
+
 def test_same_source_uses_deny_then_ask_then_allow(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_user_permission(

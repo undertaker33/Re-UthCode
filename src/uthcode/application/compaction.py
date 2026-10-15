@@ -9,7 +9,7 @@ for durable Timeline commits.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 
 from uthcode.core.compaction import (
@@ -31,6 +31,7 @@ from uthcode.core.provider import (
     CancellationToken,
     GenerationCompleted,
     GenerationRequest,
+    ImagePart,
     InvalidProviderResponseError,
     Message,
     ProviderPort,
@@ -229,6 +230,8 @@ async def summarize_compaction_epoch_with_provider(
     *,
     cancellation: CancellationToken,
     aging: bool = False,
+    image_parts: tuple[ImagePart, ...] = (),
+    image_accounting: Mapping[str, object] | None = None,
     usage_sink: Callable[[Usage], None] | None = None,
 ) -> str:
     """Build and run the shared tool-free Hard-gated Context Provider call."""
@@ -277,8 +280,20 @@ async def summarize_compaction_epoch_with_provider(
     else:  # pragma: no cover - typed caller boundary
         raise TypeError("unsupported compaction epoch")
 
+    if not all(isinstance(part, ImagePart) for part in image_parts):
+        raise TypeError("image_parts must contain ImagePart values")
+    if image_accounting is not None and not isinstance(image_accounting, Mapping):
+        raise TypeError("image_accounting must be a mapping or None")
+    if image_parts:
+        system_prompt += (
+            " Attached ImageParts are the actual images referenced by the raw "
+            "Transcript evidence. Inspect them and include only visible facts "
+            "in the summary for their source Turns. Preserve the source Turn's "
+            "user and assistant text and the exact ToolCall-to-ToolResult "
+            "relationships; replace only the visual content with its caption."
+        )
     compact_request = GenerationRequest(
-        messages=(Message("user", (TextPart(payload),)),),
+        messages=(Message("user", (TextPart(payload), *image_parts)),),
         system_prompt=system_prompt,
         model=remote_model_id,
         tools=(),
@@ -287,6 +302,19 @@ async def summarize_compaction_epoch_with_provider(
         temperature=0.0,
         metadata=metadata,
     )
+    if image_parts:
+        compact_request = replace(
+            compact_request,
+            metadata={
+                **dict(compact_request.metadata),
+                **(
+                    {"image_accounting": dict(image_accounting)}
+                    if image_accounting is not None
+                    else {}
+                ),
+                "context_image_summary_request": True,
+            },
+        )
     prepared = await prepare_compaction_request_async(
         provider,
         compact_request,
